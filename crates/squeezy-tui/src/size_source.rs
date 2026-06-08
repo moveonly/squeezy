@@ -19,11 +19,12 @@
 //!
 //! Every method speaks the same tuple crossterm does:
 //! `(columns, rows)` — i.e. `(width, height)`. The two existing call
-//! sites already bind it that way:
+//! sites already bind it that way (in `transcript_overlay_max_scroll`
+//! and `TerminalGuard::paint_main` respectively):
 //!
 //! ```ignore
-//! let (width, height) = terminal_size().ok()?;          // lib.rs ~2194
-//! let (w, h)          = terminal_size().map_err(..)?;    // lib.rs ~18206
+//! let (width, height) = terminal_size().ok()?;          // transcript_overlay_max_scroll
+//! let (w, h)          = terminal_size().map_err(..)?;    // paint_main
 //! ```
 //!
 //! Implementations and the [`FixedSize`] test helper preserve that

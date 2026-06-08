@@ -67,6 +67,25 @@ impl DetailPolicy {
     }
 }
 
+/// Mirror `crate::OverlayDetail` onto the owned [`DetailPolicy`]. The match is
+/// deliberately EXHAUSTIVE (no `_` arm): if a new `OverlayDetail` variant is
+/// added upstream this stops compiling here, forcing a conscious decision about
+/// how the row model should fold/expand for it instead of silently defaulting.
+impl From<&crate::OverlayDetail> for DetailPolicy {
+    fn from(detail: &crate::OverlayDetail) -> Self {
+        match detail {
+            crate::OverlayDetail::Collapsed => DetailPolicy::Collapsed,
+            crate::OverlayDetail::Expanded => DetailPolicy::Expanded,
+        }
+    }
+}
+
+impl From<crate::OverlayDetail> for DetailPolicy {
+    fn from(detail: crate::OverlayDetail) -> Self {
+        DetailPolicy::from(&detail)
+    }
+}
+
 /// Coarse classification of the entry a row came from. Owned here (rather than
 /// re-exposing the crate-private `TranscriptEntryKind`) so the row model stays
 /// a stable, self-contained surface even as the inner enum grows variants.
@@ -82,8 +101,13 @@ pub(crate) enum RowKind {
     SlashEcho,
 }
 
-impl RowKind {
-    fn from_entry_kind(kind: &crate::TranscriptEntryKind) -> Self {
+/// Project the crate-private `crate::TranscriptEntryKind` onto the owned
+/// [`RowKind`]. The match is deliberately EXHAUSTIVE (no `_` arm): adding a new
+/// upstream `TranscriptEntryKind` variant breaks compilation here, forcing the
+/// row model to classify it instead of silently mislabelling it. This is the
+/// drift guard that keeps [`RowKind`] honest as the inner enum grows.
+impl From<&crate::TranscriptEntryKind> for RowKind {
+    fn from(kind: &crate::TranscriptEntryKind) -> Self {
         match kind {
             crate::TranscriptEntryKind::Message(_) => RowKind::Message,
             crate::TranscriptEntryKind::ToolResult(_) => RowKind::ToolResult,
@@ -93,6 +117,14 @@ impl RowKind {
             crate::TranscriptEntryKind::Reasoning(_) => RowKind::Reasoning,
             crate::TranscriptEntryKind::SlashEcho(_) => RowKind::SlashEcho,
         }
+    }
+}
+
+impl RowKind {
+    /// Thin wrapper over the [`From<&crate::TranscriptEntryKind>`] drift guard,
+    /// kept for call sites that read more clearly as a named constructor.
+    fn from_entry_kind(kind: &crate::TranscriptEntryKind) -> Self {
+        RowKind::from(kind)
     }
 }
 
@@ -239,8 +271,9 @@ fn attribute_rows(
             out.push((id, kind));
         }
     }
-    // Pad any rows beyond the last entry's prefix onto the final entry, and any
-    // shortfall onto the first entry, so attribution covers every wrapped row.
+    // Pad any shortfall (wrapped rows the per-entry prefixes didn't cover) with
+    // the LAST attributed entry, falling back to the FIRST entry only when
+    // nothing was attributed at all, so attribution covers every wrapped row.
     if out.len() < total {
         let last = *out.last().unwrap_or(&(
             EntryId(entries[0].id),
@@ -418,5 +451,50 @@ mod tests {
     fn row_id_and_entry_id_are_ordered() {
         assert!(RowId(1) < RowId(2));
         assert!(EntryId(1) < EntryId(2));
+    }
+
+    // --- Drift guards: keep the owned mirror enums exhaustive vs. lib.rs ---
+
+    #[test]
+    fn detail_policy_mirrors_every_overlay_detail_variant() {
+        // Round-trips every `crate::OverlayDetail` value through the owned
+        // `DetailPolicy` mapping. If a variant is added upstream the EXHAUSTIVE
+        // match below stops compiling, which is the drift guard.
+        for detail in [crate::OverlayDetail::Collapsed, crate::OverlayDetail::Expanded] {
+            let policy = DetailPolicy::from(detail);
+            let expected = match detail {
+                crate::OverlayDetail::Collapsed => DetailPolicy::Collapsed,
+                crate::OverlayDetail::Expanded => DetailPolicy::Expanded,
+            };
+            assert_eq!(policy, expected);
+            // The owned `expand_all` bit must agree with the upstream one for
+            // every variant, so the two enums can't drift on the only bit the
+            // pipeline actually reads.
+            assert_eq!(policy.expand_all(), detail.expand_all());
+            // `&OverlayDetail` and owned `OverlayDetail` conversions agree.
+            assert_eq!(DetailPolicy::from(&detail), policy);
+        }
+    }
+
+    /// Compile-time exhaustiveness guard for the `RowKind` mapping. Listing every
+    /// `crate::TranscriptEntryKind` variant here means adding a new upstream
+    /// variant breaks this test's compilation as well as
+    /// [`RowKind::from_entry_kind`], so the classification is never silently
+    /// skipped. Never called with real data — its job is to compile.
+    #[allow(dead_code)]
+    fn row_kind_for_every_entry_kind(kind: &crate::TranscriptEntryKind) -> RowKind {
+        let mapped = match kind {
+            crate::TranscriptEntryKind::Message(_) => RowKind::Message,
+            crate::TranscriptEntryKind::ToolResult(_) => RowKind::ToolResult,
+            crate::TranscriptEntryKind::Log(_) => RowKind::Log,
+            crate::TranscriptEntryKind::PlanCard(_) => RowKind::PlanCard,
+            crate::TranscriptEntryKind::Diff(_) => RowKind::Diff,
+            crate::TranscriptEntryKind::Reasoning(_) => RowKind::Reasoning,
+            crate::TranscriptEntryKind::SlashEcho(_) => RowKind::SlashEcho,
+        };
+        // Must agree with the production mapping for the same input.
+        debug_assert_eq!(mapped, RowKind::from(kind));
+        debug_assert_eq!(mapped, RowKind::from_entry_kind(kind));
+        mapped
     }
 }

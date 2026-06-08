@@ -5474,6 +5474,105 @@ fn capped_footer_height_reserves_one_row_for_history() {
     }
 }
 
+#[test]
+fn term_display_width_is_two_for_wide_rendered_glyphs() {
+    // The VS Code wide-moon fix: these glyphs measure 1 cell in unicode-width
+    // but some terminals (xterm.js) draw them two columns wide. The helper
+    // forces 2 so a full-width footer row never overflows the last column.
+    // One representative from each special-cased range plus its bounds.
+    for glyph in [
+        "○", // U+25CB
+        "●", // U+25CF
+        "◐", // U+25D0  (low bound of the 25D0..=25D7 disc range)
+        "◗", // U+25D7  (high bound of that range)
+        "☽", // U+263D
+        "☾", // U+263E
+        "✶", // U+2736  (low bound of the spinner range 2736..=273D)
+        "✽", // U+273D  (high bound of the spinner range)
+    ] {
+        assert_eq!(
+            term_display_width(glyph),
+            2,
+            "wide-rendered glyph {glyph:?} must report width 2",
+        );
+    }
+}
+
+#[test]
+fn term_display_width_matches_unicode_for_ordinary_text() {
+    // A CJK char is genuinely wide (unicode-width 2) and is NOT in the special
+    // set, so the helper passes its real width through unchanged.
+    assert_eq!(term_display_width("好"), 2, "CJK char is width 2");
+    // Plain ASCII is one column and untouched.
+    assert_eq!(term_display_width("a"), 1, "ASCII is width 1");
+    // A narrow box-drawing glyph just outside the disc range stays width 1,
+    // proving the ranges are not over-broad.
+    assert_eq!(term_display_width("│"), 1, "narrow rail glyph is width 1");
+}
+
+#[test]
+fn is_wide_rendered_glyph_classifies_the_special_set() {
+    // True for every special-cased glyph the footer mirror must reserve two
+    // columns for...
+    for c in ['○', '●', '◐', '◑', '◒', '◓', '◔', '◕', '◖', '◗', '☽', '☾'] {
+        assert!(is_wide_rendered_glyph(c), "{c:?} must be wide-rendered");
+    }
+    for c in ['✶', '✷', '✸', '✹', '✺', '✻', '✼', '✽'] {
+        assert!(is_wide_rendered_glyph(c), "spinner {c:?} must be wide-rendered");
+    }
+    // ...and false for ordinary text and for glyphs just outside the ranges.
+    for c in ['a', 'Z', ' ', '好', '│', '◌', '✾'] {
+        assert!(
+            !is_wide_rendered_glyph(c),
+            "{c:?} (U+{:04X}) must NOT be treated as wide",
+            c as u32,
+        );
+    }
+}
+
+#[test]
+fn footer_content_height_empty_buffer_is_one() {
+    // An all-blank buffer has no content rows; the footer still occupies at
+    // least one row so it anchors to the bottom.
+    let buf = Buffer::empty(Rect::new(0, 0, 10, 5));
+    assert_eq!(footer_content_height(&buf), 1);
+}
+
+#[test]
+fn footer_content_height_counts_through_last_nonblank_row() {
+    // Content on the very last row means the whole area height is content.
+    let mut buf = Buffer::empty(Rect::new(0, 0, 10, 5));
+    buf.set_string(0, 4, "x", Style::default());
+    assert_eq!(footer_content_height(&buf), buf.area.height);
+}
+
+#[test]
+fn footer_content_height_ignores_trailing_blank_rows() {
+    // Content only on row 0 with blank filler below: height is 1, so the
+    // trailing Min(0) filler is dropped and scrollback keeps the rest.
+    let mut buf = Buffer::empty(Rect::new(0, 0, 10, 5));
+    buf.set_string(0, 0, "header", Style::default());
+    assert_eq!(footer_content_height(&buf), 1);
+}
+
+#[test]
+fn footer_content_height_treats_colored_background_as_content() {
+    // A row of only spaces but with a non-Reset background is NOT blank — it is
+    // a painted bar (e.g. a highlighted composer row), so it counts as content.
+    let mut buf = Buffer::empty(Rect::new(0, 0, 4, 3));
+    buf.set_string(
+        0,
+        2,
+        "    ",
+        Style::default().bg(Color::Blue),
+    );
+    assert_eq!(
+        footer_content_height(&buf),
+        3,
+        "a space-only row with bg != Reset must count as non-blank",
+    );
+}
+
 #[tokio::test]
 async fn mode_switch_is_refused_during_active_turn() {
     let mut agent = test_agent(SessionMode::Build);
