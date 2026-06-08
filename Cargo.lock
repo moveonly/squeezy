@@ -3288,6 +3288,7 @@ dependencies = [
  "tree-sitter-toml-updated",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
+ "unicode-width",
 ]
 
 [[package]]

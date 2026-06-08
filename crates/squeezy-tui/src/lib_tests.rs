@@ -5306,24 +5306,39 @@ async fn slash_clear_without_session_log_still_wipes_the_transcript() {
     );
 }
 
+/// True if `bytes` contains a DECSTBM set-scroll-region sequence
+/// (`ESC [ <digits/;> r`) — the scroll-region primitive the append-only
+/// renderer must never emit for history.
+fn ansi_contains_set_scroll_region(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'r' {
+                return true;
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 #[test]
-fn hard_terminal_clear_resets_inline_flush_to_the_fresh_transcript() {
+fn hard_terminal_clear_reflushes_fresh_transcript_from_top() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::system("Conversation cleared."));
 
-    let mut startup_flushed = false;
-    let mut transcript_flushed_len = 2;
-    reset_inline_flush_after_hard_clear(&mut startup_flushed, &mut transcript_flushed_len);
-
-    assert!(
-        !startup_flushed,
-        "the startup card should be repainted after the hard terminal clear",
-    );
-    assert_eq!(
-        transcript_flushed_len, 0,
-        "fresh-session transcript must flush from index zero",
-    );
-
+    // After a hard `/clear`, the append-only renderer resets its flush
+    // bookkeeping (startup_flushed=false, transcript_flushed_len=0) inside
+    // `clear_scrollback_and_visible`, so the next frame re-emits the whole
+    // fresh transcript — startup card included — onto the cleared screen.
+    let startup_flushed = false;
+    let transcript_flushed_len = 0usize;
     let lines = inline_history_lines_for_flush(
         &app,
         80,
@@ -5337,43 +5352,126 @@ fn hard_terminal_clear_resets_inline_flush_to_the_fresh_transcript() {
 }
 
 #[test]
-fn hard_terminal_clear_replays_startup_at_top_of_fresh_screen() {
+fn append_only_history_emits_plain_newline_terminated_text() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::system("Conversation cleared."));
 
+    // The append-only renderer commits finished history to native scrollback as
+    // ordinary styled text lines (the terminal owns scroll + reflow), never via
+    // ratatui's `insert_before` scroll-region machinery.
     let lines = inline_history_lines_for_flush(&app, 80, true, 0, app.transcript.len());
-    let height = fresh_inline_history_height(visual_line_count(&lines, 80), 20);
-    assert_eq!(
-        fresh_inline_cursor_row(height, 20),
-        height,
-        "the rebuilt inline viewport should start immediately after the replayed history",
+    let buffer = render_lines_to_owned_buffer(&lines, 80);
+    let mut out: Vec<u8> = Vec::new();
+    emit_buffer_as_lines(&mut out, &buffer, true).expect("emit history lines");
+
+    // Text content is verified on the plain rendering (the emitted bytes
+    // interleave SGR codes between glyphs, so substring checks must ignore them).
+    let plain = lines_to_plain_text(&lines);
+    assert!(plain.contains("Squeezy v"), "{plain}");
+    assert!(plain.contains("Conversation cleared."), "{plain}");
+    assert!(
+        out.ends_with(b"\r\n"),
+        "history lines are newline-terminated so the terminal scrolls them into scrollback",
+    );
+    // No reverse-index (ESC M) and no DECSTBM set-scroll-region (ESC [ ... r):
+    // those are exactly the scroll-region primitives append-only avoids.
+    assert!(
+        !out.windows(2).any(|w| w == b"\x1bM"),
+        "history must not use reverse-index scrolling",
+    );
+    assert!(
+        !ansi_contains_set_scroll_region(&out),
+        "history must not set a DECSTBM scroll region",
+    );
+}
+
+#[test]
+fn emit_buffer_as_lines_respects_trailing_newline() {
+    let mut buf = Buffer::empty(Rect::new(0, 0, 3, 2));
+    buf.set_string(0, 0, "ab", Style::default());
+    buf.set_string(0, 1, "cd", Style::default());
+
+    // History uses a trailing newline (so the footer starts on a fresh row);
+    // the footer's final row must NOT, or it would scroll one extra row and
+    // push the footer off the bottom.
+    let mut with = Vec::new();
+    emit_buffer_as_lines(&mut with, &buf, true).expect("emit");
+    assert!(
+        with.ends_with(b"\r\n"),
+        "trailing_newline=true ends with CRLF"
     );
 
-    let mut backend = TestBackend::new(80, 20);
-    draw_lines_at_top(&mut backend, lines, 80, height).expect("draw fresh history");
-
-    let buffer = backend.buffer();
-    let rows = (0..20)
-        .map(|y| {
-            let mut row = String::new();
-            for x in 0..80 {
-                row.push_str(buffer[(x, y)].symbol());
-            }
-            row
-        })
-        .collect::<Vec<_>>();
-    let first_nonblank = rows
-        .iter()
-        .position(|row| !row.trim().is_empty())
-        .expect("fresh history should render");
-
-    assert_eq!(
-        first_nonblank,
-        0,
-        "fresh replay must not leave blank rows above the startup card:\n{}",
-        rows.join("\n")
+    let mut without = Vec::new();
+    emit_buffer_as_lines(&mut without, &buf, false).expect("emit");
+    assert!(
+        !without.ends_with(b"\r\n"),
+        "trailing_newline=false must not end with CRLF",
     );
-    assert!(rows[0].contains("Squeezy v"), "{}", rows.join("\n"));
+    let text = String::from_utf8_lossy(&without);
+    assert!(text.contains("ab") && text.contains("cd"), "{text}");
+}
+
+#[test]
+fn emit_buffer_as_lines_skips_wide_grapheme_continuation_cells() {
+    // A wide grapheme (好) occupies two buffer cells; ratatui blanks the second
+    // (continuation) cell. Emission must print the glyph once and skip the
+    // continuation — otherwise the line serializes as `好 x` and every column
+    // after it shifts. Regression test for the CJK/wide-emoji handling.
+    let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+    buf.set_string(0, 0, "好x", Style::default());
+    let mut out = Vec::new();
+    emit_buffer_as_lines(&mut out, &buf, false).expect("emit");
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("好x"),
+        "wide glyph then next cell, no gap: {text:?}"
+    );
+    assert!(
+        !text.contains("好 x"),
+        "the blanked continuation cell must not be emitted: {text:?}",
+    );
+}
+
+#[test]
+fn idle_footer_repaint_produces_no_diff() {
+    // The common idle/no-change frame must emit zero cells: rendering the same
+    // footer twice yields an empty buffer diff, so the cell-diff paint path is a
+    // no-op and the footer never flickers when nothing changed.
+    let app = test_app(SessionMode::Build);
+    let a = render_footer_to_buffer(&app, 80, 18, None);
+    let b = render_footer_to_buffer(&app, 80, 18, None);
+    assert!(
+        a.diff(&b).is_empty(),
+        "an unchanged footer must produce no cell diff",
+    );
+}
+
+#[test]
+fn capped_footer_height_reserves_one_row_for_history() {
+    // The footer must never fill the whole terminal: capping at term_height-1
+    // keeps footer_origin >= 1 so the parked cursor is never on row 0 (where the
+    // next frame's relative FromCursorDown clear would wipe the whole screen and
+    // destroy the append-only history band).
+    assert_eq!(capped_footer_height(3, 50), 3, "short footer kept as-is");
+    assert_eq!(
+        capped_footer_height(50, 50),
+        49,
+        "footer as tall as the terminal is capped to leave one history row"
+    );
+    assert_eq!(
+        capped_footer_height(99, 20),
+        19,
+        "an over-tall footer is capped to term_height - 1"
+    );
+    assert_eq!(capped_footer_height(0, 50), 1, "footer is at least one row");
+    // Degenerate tiny terminals must not underflow or report zero height.
+    assert_eq!(capped_footer_height(5, 1), 1);
+    assert_eq!(capped_footer_height(5, 0), 1);
+    // For every plausible terminal height, footer_origin = h - cap stays >= 1.
+    for h in 2..=120u16 {
+        let cap = capped_footer_height(h, h);
+        assert!(h - cap >= 1, "footer_origin must stay >= 1 at height {h}");
+    }
 }
 
 #[tokio::test]
