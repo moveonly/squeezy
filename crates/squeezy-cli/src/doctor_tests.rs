@@ -105,6 +105,7 @@ fn mcp_fixture(enabled: bool, transport: McpTransport) -> McpServerConfig {
         bearer_token_env_var: None,
         http_headers: BTreeMap::new(),
         env_http_headers: BTreeMap::new(),
+        cwd: None,
     }
 }
 

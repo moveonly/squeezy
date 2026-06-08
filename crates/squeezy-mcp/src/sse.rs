@@ -30,9 +30,13 @@ use rmcp::{
 };
 use tracing::{debug, warn};
 
-/// Minimum interval between automatic reconnect attempts when the SSE stream
-/// ends without a recoverable cause.
-const SSE_RECONNECT_DELAY: Duration = Duration::from_millis(1000);
+/// Initial delay between automatic reconnect attempts when the SSE stream ends.
+const SSE_RECONNECT_DELAY_INITIAL: Duration = Duration::from_millis(1000);
+/// Maximum delay between reconnect attempts (exponential back-off ceiling).
+const SSE_RECONNECT_DELAY_MAX: Duration = Duration::from_secs(30);
+/// Number of consecutive reconnect failures before the worker gives up.
+/// A Windows service that closes immediately would otherwise spin forever.
+const SSE_RECONNECT_MAX_ATTEMPTS: u32 = 10;
 
 /// Errors raised by the SSE transport worker.
 #[derive(Debug, thiserror::Error)]
@@ -117,6 +121,14 @@ impl Worker for SseClientWorker {
             "established legacy MCP SSE session"
         );
 
+        // Reconnect state: exponential back-off starting at 1 s, capped at
+        // 30 s, with a hard limit on consecutive failures. The delay is
+        // computed from the attempt count so no separate mutable variable is
+        // needed. A successful reconnect (endpoint event received) resets the
+        // counter. This prevents a Windows local service that exits immediately
+        // from spinning indefinitely while the session is held open by the agent.
+        let mut reconnect_attempts: u32 = 0;
+
         loop {
             tokio::select! {
                 _ = context.cancellation_token.cancelled() => {
@@ -160,11 +172,40 @@ impl Worker for SseClientWorker {
                             }
                         }
                         None => {
-                            // Stream ended; reopen the GET after a short
-                            // back-off. Each new session re-advertises its
-                            // POST endpoint, so we replace the one we are
-                            // using rather than reusing the stale URL.
-                            tokio::time::sleep(SSE_RECONNECT_DELAY).await;
+                            // Stream ended; reopen after an exponentially
+                            // increasing back-off up to SSE_RECONNECT_DELAY_MAX.
+                            // Each new session re-advertises its POST endpoint, so
+                            // we replace the stale URL rather than reusing it.
+                            reconnect_attempts += 1;
+                            if reconnect_attempts > SSE_RECONNECT_MAX_ATTEMPTS {
+                                return Err(WorkerQuitReason::fatal(
+                                    SseTransportError::Closed,
+                                    "SSE stream closed repeatedly; giving up after max reconnect attempts",
+                                ));
+                            }
+                            // Compute back-off from attempt count: 1 s, 2 s,
+                            // 4 s, …, capped at SSE_RECONNECT_DELAY_MAX.
+                            let delay = {
+                                let exponent = reconnect_attempts.saturating_sub(1).min(5);
+                                (SSE_RECONNECT_DELAY_INITIAL * 2u32.pow(exponent))
+                                    .min(SSE_RECONNECT_DELAY_MAX)
+                            };
+                            warn!(
+                                target: "squeezy::mcp::sse",
+                                sse_url = %self.sse_url,
+                                attempt = reconnect_attempts,
+                                delay_ms = delay.as_millis(),
+                                "SSE stream ended; reconnecting"
+                            );
+                            // Race the back-off sleep against cancellation so
+                            // that session shutdown is not delayed by up to the
+                            // full SSE_RECONNECT_DELAY_MAX ceiling.
+                            tokio::select! {
+                                _ = context.cancellation_token.cancelled() => {
+                                    return Err(WorkerQuitReason::Cancelled);
+                                }
+                                _ = tokio::time::sleep(delay) => {}
+                            }
                             let response = match self.open_stream().await {
                                 Ok(response) => response,
                                 Err(error) => {
@@ -176,7 +217,15 @@ impl Worker for SseClientWorker {
                             };
                             frames = sse_frame_stream(response);
                             match read_endpoint(&self.sse_url, &mut frames).await {
-                                Ok(new_endpoint) => endpoint_url = new_endpoint,
+                                Ok(new_endpoint) => {
+                                    endpoint_url = new_endpoint;
+                                    // The server is reachable again: reset the
+                                    // attempt counter so the next stream drop
+                                    // starts back-off from 1 s. Servers that
+                                    // never push proactively (only reply to
+                                    // tool calls) benefit from this reset too.
+                                    reconnect_attempts = 0;
+                                }
                                 Err(error) => {
                                     return Err(WorkerQuitReason::fatal(
                                         error,
