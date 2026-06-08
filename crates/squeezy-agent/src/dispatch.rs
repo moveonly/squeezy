@@ -35,12 +35,6 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use squeezy_vcs::{DiffSnapshot as VcsDiffSnapshot, RollbackResult as VcsRollbackResult};
 
-/// Typed slash command parsed from a slash-prefixed input string. Each
-/// variant matches exactly one entry in `SLASH_COMMANDS` (with `/jobs`,
-/// `/job`, `/job-cancel` kept as documented aliases of `/tasks`,
-/// `/task`, `/task-cancel`).
-///
-/// String-only payloads are intentional: UI-specific types like
 /// Subcommand for `/compact`. Exactly one of these variants is active at a
 /// time, eliminating the invalid two-bool state (`undo: true, history: true`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -55,6 +49,12 @@ pub enum CompactSubcommand {
     History,
 }
 
+/// Typed slash command parsed from a slash-prefixed input string. Each
+/// variant matches exactly one entry in `SLASH_COMMANDS` (with `/jobs`,
+/// `/job`, `/job-cancel` kept as documented aliases of `/tasks`,
+/// `/task`, `/task-cancel`).
+///
+/// String-only payloads are intentional: UI-specific types like
 /// `ConfigSectionId` live in higher crates and are only meaningful to the
 /// TUI renderer. Keeping the payloads as `String` lets the dispatch layer
 /// stay in `squeezy-agent` without pulling in TUI types.
