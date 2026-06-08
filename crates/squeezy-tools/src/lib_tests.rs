@@ -13222,16 +13222,16 @@ fn sensitive_path_matcher_expands_windows_userprofile() {
 
 #[test]
 fn sensitive_path_matcher_expands_windows_appdata() {
-    // Use a pattern that is ONLY reachable after %APPDATA% is expanded:
-    // "testuser/AppData/Roaming" is part of the expanded value but never
-    // appears in the literal token "%APPDATA%/.aws/credentials". This
-    // verifies the expansion code path without relying on a negative
-    // assertion that the backstop scan might satisfy through other means.
+    // The pattern "sqzapptest" is a single path segment that appears inside
+    // the APPDATA value we configure but NEVER in the literal command token
+    // "%APPDATA%/.aws/credentials". After expansion the token becomes
+    // "C:/Users/sqzapptest/AppData/Roaming/.aws/credentials", and
+    // token_contains_sensitive_base will find the "sqzapptest" segment.
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let custom_patterns = vec!["testuser/AppData/Roaming".to_string()];
+    let custom_patterns = vec!["sqzapptest".to_string()];
     let previous = env::var_os("APPDATA");
     unsafe {
-        env::set_var("APPDATA", "C:/Users/testuser/AppData/Roaming");
+        env::set_var("APPDATA", "C:/Users/sqzapptest/AppData/Roaming");
     }
     let result = shell_command_references_sensitive_path(
         "type %APPDATA%/.aws/credentials",
@@ -13245,6 +13245,6 @@ fn sensitive_path_matcher_expands_windows_appdata() {
     }
     assert!(
         result.is_some(),
-        "%APPDATA% should expand to include testuser/AppData/Roaming"
+        "%APPDATA% expansion should expose the sqzapptest segment"
     );
 }
