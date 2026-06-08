@@ -5364,6 +5364,165 @@ api_key_env = "OPENAI_API_KEY"
 }
 
 #[test]
+fn provider_config_debug_redacts_secret_fields() {
+    let mut compatible_headers = BTreeMap::new();
+    compatible_headers.insert(
+        "Authorization".to_string(),
+        "Bearer debug-compatible-secret".to_string(),
+    );
+    let mut azure_headers = BTreeMap::new();
+    azure_headers.insert(
+        "api-key".to_string(),
+        "debug-azure-header-secret".to_string(),
+    );
+    let mut request_metadata = BTreeMap::new();
+    request_metadata.insert("team".to_string(), "platform".to_string());
+
+    let rendered = [
+        format!(
+            "{:?}",
+            OpenAiCompatibleConfig {
+                preset: OpenAiCompatiblePreset::Custom,
+                api_key_env: "CUSTOM_API_KEY".to_string(),
+                api_key: Some("debug-compatible-api-key".to_string()),
+                base_url: "https://example.test/v1".to_string(),
+                extra_headers: compatible_headers,
+                transport: ProviderTransportConfig::default(),
+                account_id: None,
+                gateway_id: None,
+                deployment_id: None,
+                cf_ai_gateway: None,
+                use_oauth: false,
+            }
+        ),
+        format!(
+            "{:?}",
+            OpenAiConfig {
+                api_key_env: "OPENAI_API_KEY".to_string(),
+                api_key: Some("debug-openai-api-key".to_string()),
+                base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
+                organization: None,
+                project: None,
+                service_tier: None,
+                transport: ProviderTransportConfig::default(),
+            }
+        ),
+        format!(
+            "{:?}",
+            AnthropicConfig {
+                api_key_env: "ANTHROPIC_API_KEY".to_string(),
+                api_key: Some("debug-anthropic-api-key".to_string()),
+                base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
+                transport: ProviderTransportConfig::default(),
+            }
+        ),
+        format!(
+            "{:?}",
+            GoogleConfig {
+                api_key_env: "GOOGLE_API_KEY".to_string(),
+                api_key: Some("debug-google-api-key".to_string()),
+                base_url: DEFAULT_GOOGLE_BASE_URL.to_string(),
+                transport: ProviderTransportConfig::default(),
+            }
+        ),
+        format!(
+            "{:?}",
+            AzureOpenAiConfig {
+                api_key_env: "AZURE_OPENAI_API_KEY".to_string(),
+                api_key: Some("debug-azure-api-key".to_string()),
+                base_url: "https://azure.example.test".to_string(),
+                api_version: DEFAULT_AZURE_OPENAI_API_VERSION.to_string(),
+                deployment_name_map: BTreeMap::new(),
+                extra_headers: azure_headers,
+                use_entra_id: true,
+                entra_bearer_token: Some("debug-entra-token".to_string()),
+                transport: ProviderTransportConfig::default(),
+            }
+        ),
+        format!(
+            "{:?}",
+            BedrockConfig {
+                region: DEFAULT_BEDROCK_REGION.to_string(),
+                base_url: None,
+                bearer_token: Some("debug-bedrock-bearer-token".to_string()),
+                request_metadata,
+                transport: ProviderTransportConfig::default(),
+            }
+        ),
+        format!(
+            "{:?}",
+            OllamaConfig {
+                base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
+                route_style: OllamaRoute::Native,
+                api_key_env: "OLLAMA_API_KEY".to_string(),
+                api_key: Some("debug-ollama-api-key".to_string()),
+                keep_alive: Some("24h".to_string()),
+                transport: ProviderTransportConfig::default(),
+            }
+        ),
+    ]
+    .join("\n");
+
+    for secret in [
+        "debug-compatible-secret",
+        "debug-compatible-api-key",
+        "debug-openai-api-key",
+        "debug-anthropic-api-key",
+        "debug-google-api-key",
+        "debug-azure-header-secret",
+        "debug-azure-api-key",
+        "debug-entra-token",
+        "debug-bedrock-bearer-token",
+        "debug-ollama-api-key",
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "Debug output must redact {secret:?}; got: {rendered}"
+        );
+    }
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+    assert!(
+        rendered.contains("Authorization") && rendered.contains("api-key"),
+        "Debug output should keep header names visible: {rendered}"
+    );
+}
+
+#[test]
+fn ollama_config_reads_api_key_and_keep_alive_with_env_precedence() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "ollama"
+
+[providers.ollama]
+base_url = "http://localhost:11434/api"
+route_style = "openai_compatible"
+api_key_env = "OLLAMA_TOML_KEY"
+api_key = "ollama-inline-secret"
+keep_alive = "24h"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |name| match name {
+        "OLLAMA_API_KEY_ENV" => Some("OLLAMA_ENV_KEY".to_string()),
+        "OLLAMA_KEEP_ALIVE" => Some("30m".to_string()),
+        _ => None,
+    });
+
+    match config.provider {
+        ProviderConfig::Ollama(ollama) => {
+            assert_eq!(ollama.route_style, OllamaRoute::OpenAiCompatible);
+            assert_eq!(ollama.api_key_env, "OLLAMA_ENV_KEY");
+            assert_eq!(ollama.api_key.as_deref(), Some("ollama-inline-secret"));
+            assert_eq!(ollama.keep_alive.as_deref(), Some("30m"));
+        }
+        other => panic!("expected Ollama provider, got {other:?}"),
+    }
+}
+
+#[test]
 fn memory_scope_doc_records_deferred_tool_decision() {
     let scope_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
