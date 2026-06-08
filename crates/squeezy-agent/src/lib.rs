@@ -6427,14 +6427,15 @@ impl TurnRuntime {
                      The skill will refuse rather than improvise.",
                     missing.join(", ")
                 );
-                let _ = self
-                    .tx
-                    .send(AgentEvent::SkillActivationWarning {
-                        turn_id: self.turn_id,
-                        name: skill.clone(),
-                        message,
-                    })
-                    .await;
+                // Use try_send (non-blocking) to avoid adding a new await point
+                // inside the per-turn activation hot path, which would increase
+                // the async future size and risk stack overflows on constrained
+                // platforms.
+                let _ = self.tx.try_send(AgentEvent::SkillActivationWarning {
+                    turn_id: self.turn_id,
+                    name: skill.clone(),
+                    message,
+                });
             }
             Some(format_skill_tool_dep_warnings(&missing_deps))
         };
