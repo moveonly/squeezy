@@ -306,12 +306,6 @@ pub fn parser_feature_coverage_report(parsed_files: &[ParsedFile]) -> ParserFeat
                 body_hit_kind_id(body_hit.kind),
             );
         }
-        for diagnostic in &parsed.diagnostics {
-            increment_count(
-                &mut coverage.confidence_distribution,
-                diagnostic.confidence.id(),
-            );
-        }
     }
 
     let mut languages = by_language.into_values().collect::<Vec<_>>();
@@ -1049,7 +1043,10 @@ fn record_parse_error_diagnostics(root: Node<'_>, ctx: &mut ExtractContext<'_>) 
         return;
     }
 
-    let parse_error_count = count_parse_error_nodes(root).max(1);
+    let parse_error_count = count_parse_error_nodes(root);
+    if parse_error_count == 0 {
+        return;
+    }
     let mut error_nodes = Vec::new();
     collect_smallest_parse_error_nodes(root, &mut error_nodes);
     if error_nodes.is_empty() {
@@ -1094,7 +1091,7 @@ fn record_missing_node_diagnostic(node: Node<'_>, ctx: &mut ExtractContext<'_>) 
         language: Some(ctx.file.language),
         node_kind: Some(node_kind),
         parent_kind,
-        parse_error_count: None,
+        parse_error_count: Some(1),
         excerpt: source_excerpt_for_node(node, ctx.source),
         partial_parse: Some(PartialParseSummary {
             parse_error_count: 1,
@@ -1128,7 +1125,7 @@ fn collect_smallest_parse_error_nodes<'tree>(node: Node<'tree>, out: &mut Vec<No
             collect_smallest_parse_error_nodes(child, out);
         }
     }
-    if !child_with_error && node.is_error() {
+    if !child_with_error && (node.is_error() || node.is_missing()) {
         out.push(node);
     }
 }
