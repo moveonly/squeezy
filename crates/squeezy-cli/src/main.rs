@@ -14,7 +14,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use squeezy_agent::{Agent, AgentEvent, RequestUserInputResponse, ToolApprovalDecision};
+use squeezy_agent::{
+    Agent, AgentEvent, RequestUserInputResponse, SessionReplayReport, ToolApprovalDecision,
+};
 use squeezy_core::{
     AppConfig, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpServerConfig,
     McpTransport, ModelProfile, OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode,
@@ -2206,9 +2208,10 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             let resolved = resolve_session_input(&store, id)?;
             let report = Agent::replay_session(config, &resolved).await?;
             if *json {
+                let body = session_replay_report_for_cli(&report)?;
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&report).map_err(|err| {
+                    serde_json::to_string_pretty(&body).map_err(|err| {
                         SqueezyError::Tool(format!("failed to serialize replay report: {err}"))
                     })?
                 );
@@ -3342,6 +3345,28 @@ fn session_replay_for_cli_with_mapping(
         "events": events,
         "warnings": tape.warnings,
     }))
+}
+
+fn session_replay_report_for_cli(
+    report: &SessionReplayReport,
+) -> squeezy_core::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(report)
+        .map_err(|err| SqueezyError::Parse(format!("failed to serialize replay report: {err}")))?;
+    let mut session_id_map = BTreeMap::new();
+    add_public_session_id_mapping(&mut session_id_map, &report.session_id);
+    sanitize_session_ids_in_value(&mut value, &session_id_map);
+    let Some(object) = value.as_object_mut() else {
+        return Err(SqueezyError::Parse(
+            "replay report did not serialize to an object".to_string(),
+        ));
+    };
+    object.remove("session_id");
+    let public_id = session_id_map
+        .get(&report.session_id)
+        .cloned()
+        .unwrap_or_else(|| PublicSessionHandle::for_store_id(&report.session_id).0);
+    object.insert("id".to_string(), serde_json::Value::String(public_id));
+    Ok(value)
 }
 
 fn session_events_for_cli(

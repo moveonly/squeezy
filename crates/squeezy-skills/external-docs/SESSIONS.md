@@ -45,7 +45,8 @@ squeezy sessions cleanup
 ```
 
 CLI surfaces (`sessions list`, `sessions show`, `sessions list --json`,
-and `sessions show --json`) publish session identifiers as opaque
+`sessions show --json`, and `sessions replay --json`) publish session
+identifiers as opaque
 `sess_<16hex>` public handles. Every command that consumes a
 `<session_id>` accepts that public handle directly, so the
 `sessions list → sessions resume/fork/show/replay/export/report/archive`

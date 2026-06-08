@@ -287,6 +287,29 @@ fn session_cli_json_uses_public_id_field() {
 }
 
 #[test]
+fn session_cli_replay_report_uses_public_id_field() {
+    let report = SessionReplayReport {
+        session_id: "session-123".to_string(),
+        turns: 1,
+        events_replayed: 2,
+        request_count: 1,
+        tool_results: 0,
+        final_answer: "resumed session-123".to_string(),
+    };
+
+    let report_json = session_replay_report_for_cli(&report).expect("replay report json");
+    let rendered = serde_json::to_string(&report_json).expect("render report");
+    assert!(report_json.get("session_id").is_none());
+    assert!(
+        report_json["id"]
+            .as_str()
+            .expect("public id string")
+            .starts_with("sess_")
+    );
+    assert!(!rendered.contains("session-123"));
+}
+
+#[test]
 fn session_cli_events_rewrite_raw_session_ids() {
     let metadata = SessionMetadata {
         session_id: "child-session".to_string(),
