@@ -188,18 +188,23 @@ fn grid_from_term(term: &Term<NoopListener>) -> Grid {
     let on_alt = term.mode().contains(TermMode::ALT_SCREEN);
     let alt_screen = if on_alt { viewport.clone() } else { Vec::new() };
 
-    // Logical cursor, clamped into the viewport. `display_offset` is 0 after a
-    // settled replay (we never scroll back), so the cursor point is already
-    // viewport-relative.
+    // Logical cursor. `display_offset` is 0 after a settled replay (we never
+    // scroll back), so the cursor point is already viewport-relative.
     let cur = grid.cursor.point;
+    // Pre-clamp logical row: this is the raw signal the cursor-in-bounds
+    // invariant asserts on. It may exceed `screen_lines` when the emulator
+    // drifts the cursor below the live region (the xterm.js bug) — clamping it
+    // first (as `cursor` does) would make that invariant vacuously pass.
+    let logical_cursor_row = cur.line.0;
     let cursor_col = (cur.column.0 as u16).min(cols.saturating_sub(1) as u16);
-    let cursor_row = cur.line.0.clamp(0, rows.saturating_sub(1) as i32) as u16;
+    let cursor_row = logical_cursor_row.clamp(0, rows.saturating_sub(1) as i32) as u16;
 
     Grid {
         viewport,
         alt_screen,
         scrollback,
         cursor: (cursor_col, cursor_row),
+        logical_cursor_row,
         // The append-only renderer's "live begins here" row. For a reflowed
         // replay the live region is the whole viewport, so the top is 0.
         base_y: 0,

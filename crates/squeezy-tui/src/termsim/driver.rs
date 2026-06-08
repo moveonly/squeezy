@@ -60,11 +60,12 @@ fn scratch_workspace() -> PathBuf {
 /// The two surfaces answer different invariant questions. The append-only
 /// inline stream (`log`) is what real terminals replay, so the emulator legs
 /// assert cursor-in-bounds and no horizon stacking against *its* reconstructed
-/// grid. The fullscreen `render()` snapshot (`final_frame`) is the main-view
-/// surface still in use at this stage of the migration (§8.2 note): the
-/// composer-horizon / latest-response / turn-divider invariants assert against
-/// it because the inline path commits history to scrollback the emulator grid
-/// does not surface.
+/// grid — and, on reflow-capable legs (alacritty) that rebuild the committed
+/// scrollback, latest-response survival too. The fullscreen `render()` snapshot
+/// (`final_frame`) is the main-view surface still in use at this stage of the
+/// migration (§8.2 note): the composer-horizon / turn-divider invariants assert
+/// against it, as does latest-response for the fixed-grid vt100 leg, which keeps
+/// no scrollback the emulator grid could surface.
 pub(crate) struct ScenarioRun {
     /// The captured append-only ANSI byte stream + per-frame marks.
     pub log: CaptureLog,

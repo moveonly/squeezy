@@ -24,8 +24,6 @@ use squeezy_llm::LlmProvider;
 // crate-private append-only paint helpers. Gated so the default
 // `testing` build never compiles it.
 #[cfg(feature = "term-matrix")]
-use std::io::Write as _;
-#[cfg(feature = "term-matrix")]
 use std::sync::Mutex;
 
 use squeezy_tools::{McpElicitationKind, McpElicitationRequest, McpElicitationResponse};
@@ -532,28 +530,7 @@ mod capture {
     use super::*;
     use crate::size_source::FixedSize;
     use crate::termsim::{CaptureLog, FrameMark, Step};
-    use crossterm::execute;
-    use crossterm::terminal::{Clear, ClearType, DisableLineWrap, EnableLineWrap};
     use ratatui::backend::CrosstermBackend;
-
-    /// Inline viewport height the production guard pins itself to; the
-    /// capture terminal mirrors it so ratatui's inline construction
-    /// behaves identically. Kept in sync with `lib.rs`'s constant.
-    const INLINE_VIEWPORT_HEIGHT: u16 = crate::INLINE_VIEWPORT_HEIGHT;
-
-    /// Mutable paint bookkeeping the append-only renderer threads across
-    /// frames. Mirrors the subset of `TerminalGuard` state that
-    /// `paint_main` reads/writes: which history has flushed, the last
-    /// flushed turn-divider generation, and whether a footer is on
-    /// screen (so the next frame erases it). A standalone struct keeps
-    /// this off the public `TuiHarness` surface.
-    #[derive(Default)]
-    struct PaintState {
-        startup_flushed: bool,
-        transcript_flushed_len: usize,
-        turn_divider_flushed_generation: Option<u64>,
-        footer_painted: bool,
-    }
 
     impl TuiHarness {
         /// Drive a scripted [`Step`] sequence against the real
@@ -611,7 +588,10 @@ mod capture {
             // Scripted terminal size: `Resize` steps mutate this, and the
             // paint reads it instead of crossterm's global `size()`.
             let mut size = FixedSize(self.width, self.height);
-            let mut paint = PaintState::default();
+            // Shared production bookkeeping: `capture_paint` drives the exact
+            // same `crate::paint_main_inner` the production guard does, so this
+            // is the same type the guard threads across frames.
+            let mut paint = crate::PaintBookkeeping::default();
             let mut log = CaptureLog::default();
 
             for step in steps {
@@ -705,17 +685,20 @@ mod capture {
         }
     }
 
-    /// One append-only frame, byte-for-byte the same compound op
-    /// `TerminalGuard::paint_main` emits, but driven by an injected
-    /// [`FixedSize`] instead of crossterm's global `terminal_size()` so a
-    /// scripted `Resize` actually changes what the paint reads. Reuses
-    /// the crate-private renderer helpers so the captured ANSI matches
-    /// production exactly.
+    /// One append-only frame, driven through the *exact* production paint
+    /// path: it calls the shared [`crate::paint_main_inner`] that
+    /// [`TerminalGuard::paint_main`] also calls, so the captured ANSI is
+    /// byte-for-byte what production emits. The only capture-specific knobs
+    /// are where `(w, h)` comes from (an injected [`FixedSize`] so a scripted
+    /// `Resize` actually changes what the paint reads, instead of crossterm's
+    /// global `terminal_size()`) and that it always wraps in the DEC 2026
+    /// synchronized update (matching a synchronized-capable production
+    /// terminal). There is no re-inlined copy of the emitter to drift.
     fn capture_paint(
         terminal: &mut Terminal<CrosstermBackend<crate::terminal_writer::TerminalWriter>>,
         app: &mut TuiApp,
         size: FixedSize,
-        paint: &mut PaintState,
+        paint: &mut crate::PaintBookkeeping,
     ) -> Result<()> {
         use crate::size_source::SizeSource as _;
         let (w, h) = size
@@ -724,79 +707,12 @@ mod capture {
         if w == 0 || h == 0 {
             return Ok(());
         }
-        // Match `paint_main`: render two columns narrower so a glyph the
-        // terminal draws wider than unicode-width can't overflow.
-        let content_w = w.saturating_sub(2).max(1);
-
-        // History flush bookkeeping (the `prepare_history` body, inlined
-        // so the paint state lives in `PaintState` rather than the guard).
-        let flush_to = crate::settling_flush_boundary(app);
-        let (history_lines, flushed_divider_generation) =
-            crate::inline_history_lines_for_flush_with_turn_divider(
-                app,
-                content_w,
-                !paint.startup_flushed,
-                paint.transcript_flushed_len,
-                flush_to,
-                paint.turn_divider_flushed_generation,
-            );
-        if let Some(generation) = flushed_divider_generation {
-            paint.turn_divider_flushed_generation = Some(generation);
-        }
-        paint.startup_flushed = true;
-        paint.transcript_flushed_len = flush_to;
-
-        let divider_gen = paint.turn_divider_flushed_generation;
-        let footer = crate::render_footer_to_buffer(
-            app,
-            content_w,
-            INLINE_VIEWPORT_HEIGHT.min(h),
-            divider_gen,
-        );
-        let footer_h = crate::capped_footer_height(crate::footer_content_height(&footer), h);
-        let history = (!history_lines.is_empty())
-            .then(|| crate::render_lines_to_owned_buffer(&history_lines, content_w));
-
-        let had_footer = paint.footer_painted;
         let backend = terminal.backend_mut();
-        let body = (|| -> std::io::Result<()> {
-            // Capture path always wraps in the DEC 2026 synchronized
-            // update, matching a synchronized-capable production terminal.
-            backend.write_all(crate::BEGIN_SYNCHRONIZED_UPDATE.as_bytes())?;
-            if had_footer {
-                execute!(backend, Clear(ClearType::FromCursorDown))?;
-            }
-            if let Some(hist) = history.as_ref() {
-                for y in 0..hist.area.height {
-                    backend.write_all(b"\r")?;
-                    crate::emit_buffer_row_styled(backend, hist, y, content_w)?;
-                    backend.write_all(b"\r\n")?;
-                }
-            }
-            execute!(backend, DisableLineWrap)?;
-            for y in 0..footer_h {
-                backend.write_all(b"\r")?;
-                crate::emit_buffer_row_styled(backend, &footer, y, content_w)?;
-                execute!(backend, Clear(ClearType::UntilNewLine))?;
-                if y + 1 < footer_h {
-                    backend.write_all(b"\r\n")?;
-                }
-            }
-            execute!(backend, EnableLineWrap)?;
-            if footer_h > 1 {
-                execute!(backend, crossterm::cursor::MoveToPreviousLine(footer_h - 1))?;
-            } else {
-                execute!(backend, crossterm::cursor::MoveToColumn(0))?;
-            }
-            Ok(())
-        })();
-        let _ = execute!(backend, EnableLineWrap);
-        let _ = backend.write_all(crate::END_SYNCHRONIZED_UPDATE.as_bytes());
-        let flushed = backend.flush();
-
-        paint.footer_painted = true;
-        app.footer_origin = h.saturating_sub(footer_h);
-        body.and(flushed)
+        // Hard-wire `synchronized = true`: the capture stream models a
+        // synchronized-capable production terminal, so every captured frame is
+        // wrapped in the DEC 2026 Begin/End update — the contract the emulator
+        // replay legs (and `split_frames`) rely on.
+        crate::paint_main_inner(app, backend, w, h, paint, /* synchronized = */ true)
             .map_err(|e| SqueezyError::Terminal(e.to_string()))
     }
 }

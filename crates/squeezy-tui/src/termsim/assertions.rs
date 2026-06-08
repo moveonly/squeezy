@@ -47,18 +47,24 @@ fn is_composer_horizon(row: &str) -> bool {
     false
 }
 
+/// Viewport row indices that carry a live composer horizon. Exposed so a
+/// scenario test can assert the exact horizon count (e.g. "exactly one live
+/// composer, zero stacked") rather than only the `<= 1` upper bound.
+pub(crate) fn composer_horizon_rows(grid: &Grid) -> Vec<usize> {
+    grid.viewport
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| is_composer_horizon(row))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// At most one live composer horizon: count viewport rows that are a composer
 /// horizon and fail if more than one. This encodes the stacked-divider
 /// regression (VS Code / xterm.js drifting the cursor and re-emitting the
 /// composer) directly.
 pub(crate) fn at_most_one_composer_horizon(grid: &Grid) -> Result<(), String> {
-    let matches: Vec<usize> = grid
-        .viewport
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| is_composer_horizon(row))
-        .map(|(i, _)| i)
-        .collect();
+    let matches = composer_horizon_rows(grid);
     if matches.len() > 1 {
         return Err(format!(
             "expected <= 1 composer horizon in the viewport, found {} (rows {:?})",
@@ -133,17 +139,24 @@ pub(crate) fn latest_response_present(grid: &Grid, expected_tail: &str) -> Resul
     ))
 }
 
-/// The cursor row must stay within `[0, h)`, never orphaned below content.
-/// `mark.h` is the terminal height in effect for the frame the grid was read
-/// from.
+/// The cursor row must stay within `[0, h)`, never orphaned above the viewport
+/// top or below the live region. `mark.h` is the terminal height in effect for
+/// the frame the grid was read from.
+///
+/// Asserts on [`Grid::logical_cursor_row`] — the emulator's PRE-clamp cursor
+/// row — not [`Grid::cursor`].`1`. The backends clamp the displayed cursor into
+/// `[0, screen_lines)` by construction, so checking the clamped value can never
+/// fail; the logical row is the raw signal that genuinely surfaces a cursor
+/// drifting below the live region (the xterm.js `DriftsByBelowWrapDelta` bug)
+/// or above its top.
 pub(crate) fn cursor_row_in_bounds(grid: &Grid, mark: FrameMark) -> Result<(), String> {
-    let (_, row) = grid.cursor;
     if mark.h == 0 {
         return Ok(());
     }
-    if row >= mark.h {
+    let row = grid.logical_cursor_row;
+    if row < 0 || row >= mark.h as i32 {
         return Err(format!(
-            "cursor row {row} escaped the viewport bounds [0, {})",
+            "logical cursor row {row} escaped the viewport bounds [0, {})",
             mark.h,
         ));
     }

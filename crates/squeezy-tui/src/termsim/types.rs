@@ -45,8 +45,21 @@ pub(crate) struct Grid {
     pub alt_screen: Vec<String>,
     /// Committed scrollback above the viewport (oldest first).
     pub scrollback: Vec<String>,
-    /// Cursor position as `(col, row)` within the viewport.
+    /// Cursor position as `(col, row)` within the viewport. The `row` here is
+    /// the emulator's cursor CLAMPED into `[0, screen_lines)` — an
+    /// always-in-grid projection for display. Use [`Grid::logical_cursor_row`]
+    /// for the bounds invariant.
     pub cursor: (u16, u16),
+    /// Pre-clamp logical cursor row in viewport-relative space, as the
+    /// emulator reports it BEFORE any clamp into `[0, screen_lines)`. May be
+    /// negative (cursor above the viewport top) or `>= height` (drifted below
+    /// the live region — the xterm.js bug). `cursor.1` is the clamped,
+    /// always-in-grid projection; this is the raw signal the
+    /// cursor-in-bounds invariant must assert on, because clamping it into the
+    /// grid first would make that invariant vacuously pass. `i32` (not `u16`)
+    /// so an above-top or below-fold cursor is representable rather than
+    /// saturating — that representability is the whole point.
+    pub logical_cursor_row: i32,
     /// Row of the viewport top within the full (scrollback + viewport)
     /// space; the append-only renderer's notion of where "live" begins.
     pub base_y: u16,

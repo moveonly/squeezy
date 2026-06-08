@@ -37,6 +37,9 @@ fn newlines_advance_rows_and_track_cursor() {
     assert_eq!(grid.viewport[0], "line one");
     assert_eq!(grid.viewport[1], "line two");
     assert_eq!(grid.cursor, (8, 1));
+    // The pre-clamp logical row is populated and, with the cursor in-grid,
+    // matches the clamped row.
+    assert_eq!(grid.logical_cursor_row, 1);
 }
 
 #[test]

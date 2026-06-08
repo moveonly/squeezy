@@ -209,6 +209,7 @@ const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1006h";
 /// reporting. This is only used while the transcript overlay is in its
 /// explicit scrollbar-drag mode; native unmodified text selection needs
 /// mouse reporting disabled, so drag capture cannot be the overlay default.
+#[cfg(test)]
 const ENABLE_MOUSE_DRAG_CAPTURE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 // The matching disable sequence (1000l, 1006l) is already part of
 // `DISABLE_MOUSE_MODES`, so the Drop tear-down covers undoing this
@@ -242,6 +243,13 @@ const TITLE_NOTIFICATION_GLYPH: &str = "●";
 const MAX_INPUT_EVENTS_PER_POLL: usize = 128;
 const MAX_TRANSCRIPT_DRAG_INPUT_EVENTS_PER_POLL: usize = 4096;
 
+// The transcript-overlay alt-screen sequences no longer have a production
+// caller: the fullscreen renderer enters the alternate screen once in `enter`
+// and renders the overlay as a state on the same terminal (no per-overlay
+// swap). These free functions are retained under `#[cfg(test)]` because byte
+// tests still assert the exact alt-screen / mouse-mode sequences they emit, and
+// the Phase 2 exit mirror may reuse them.
+#[cfg(test)]
 fn enter_transcript_overlay_screen<W: Write>(writer: &mut W) -> io::Result<()> {
     execute!(
         writer,
@@ -253,6 +261,7 @@ fn enter_transcript_overlay_screen<W: Write>(writer: &mut W) -> io::Result<()> {
     )
 }
 
+#[cfg(test)]
 fn leave_transcript_overlay_screen<W: Write>(
     writer: &mut W,
     restore_mouse_capture: bool,
@@ -269,6 +278,7 @@ fn leave_transcript_overlay_screen<W: Write>(
     Ok(())
 }
 
+#[cfg(test)]
 fn set_transcript_overlay_mouse_mode<W: Write>(
     writer: &mut W,
     scrollbar_drag: bool,
@@ -18218,78 +18228,211 @@ fn exit_hint(session_id: Option<&str>) -> Option<String> {
     })
 }
 
+/// Mutable bookkeeping the append-only renderer ([`paint_main_inner`]) threads
+/// across frames: which history has flushed to native scrollback, the last
+/// flushed turn-divider generation, and whether a footer is currently on
+/// screen (so the next frame's `FromCursorDown` clear knows to erase it).
+///
+/// A standalone struct so the production guard ([`TerminalGuard`]) and the
+/// term-matrix capture harness (`testing::capture`) share one shape and one
+/// emitter — the capture path can never re-implement (and so never drift
+/// from) the production flush/footer logic. `pub(crate)` so the capture module
+/// can construct and own one.
+///
+/// `startup_flushed` / `transcript_flushed_len` / `turn_divider_flushed_generation`
+/// track the scrollback flush; `footer_painted` is whether a footer is on
+/// screen at the parked cursor and must be erased before the next repaint. It
+/// is false only right after the screen was cleared (startup, `/clear`); it
+/// stays true across a Ctrl+T overlay round-trip, since `LeaveAlternateScreen`
+/// restores the main buffer with the old footer (which must then be erased).
+#[derive(Default)]
+pub(crate) struct PaintBookkeeping {
+    pub(crate) startup_flushed: bool,
+    pub(crate) transcript_flushed_len: usize,
+    pub(crate) turn_divider_flushed_generation: Option<u64>,
+    pub(crate) footer_painted: bool,
+}
+
 struct TerminalGuard {
-    /// `Option` so we can drop and rebuild the ratatui `Terminal`.
-    /// Inline `Viewport::Inline(N)` terminal pinned to the bottom N
-    /// rows of the main buffer. Always `Some` after `enter`.
+    /// `Option` so we can drop and rebuild the ratatui `Terminal`, and
+    /// so `Drop` can `take` it for emergency teardown.
+    /// Fullscreen terminal (`Viewport::Fullscreen`), or inline
+    /// (`Viewport::Inline(N)`) only under `SQUEEZY_INLINE_REPRO`.
+    /// Always `Some` after `enter`.
     terminal: Option<Terminal<CrosstermBackend<TerminalWriter>>>,
-    /// Secondary fullscreen terminal used only when the configured
-    /// mode is inline and the transcript overlay is open. Built
-    /// lazily on the first overlay open so a session that never
-    /// opens the overlay never pays for it. Once constructed it
-    /// stays alive for the rest of the session — re-using it
-    /// avoids ratatui's `Terminal::with_options(Inline(N))`
-    /// `append_lines` scroll-up that fires on every fresh inline
-    /// Terminal construction (the bug that ghosted the pre-overlay
-    /// viewport above the new one on overlay close).
-    overlay_terminal: Option<Terminal<CrosstermBackend<TerminalWriter>>>,
-    /// True while the inline guard is currently routing draws to the
-    /// alt-screen overlay terminal (the transcript overlay is open).
-    overlay_screen_active: bool,
-    /// True after we have applied the transcript overlay's mouse policy
-    /// to the terminal. Needed because the overlay temporarily overrides
-    /// the main screen's opt-in mouse capture even in alternate-screen mode.
-    overlay_mouse_override_active: bool,
-    /// Whether the overlay currently has drag capture enabled for its
-    /// right-side scrollbar. When false, native terminal selection/copy is
-    /// left available inside the overlay.
-    overlay_mouse_capture: bool,
-    /// Whether the user opted into mouse capture for the main screen.
-    /// The transcript overlay disables mouse reporting so normal text
-    /// selection/copy works there, then restores this setting when it closes.
+    /// Resolved once in `enter` from `SQUEEZY_INLINE_REPRO`. When true the
+    /// guard runs the legacy append-only inline `paint_main` path (an escape
+    /// hatch for reproducing the inline renderer); when false it runs the
+    /// default fullscreen alt-screen renderer.
+    inline_repro: bool,
+    /// True after `enter` emits `EnterAlternateScreen`; cleared by `Drop`
+    /// (and by Phase 2's `finish_fullscreen`). Idempotence guard so the
+    /// alt-screen is left exactly once. False in the inline-repro path,
+    /// which never enters the alternate screen.
+    alt_screen_active: bool,
+    /// Whether mouse capture is enabled for the main screen. Defaults on in
+    /// fullscreen (alt-screen norm) unless `SQUEEZY_MOUSE_CAPTURE=0`. When on,
+    /// the click registry is live; Shift+drag / Shift+wheel are the native
+    /// selection / scrollback escape hatch. Recorded at `enter` time; Phase 2
+    /// reads it to restore the main mouse policy when the transcript overlay
+    /// closes.
+    #[allow(dead_code)]
     mouse_capture: bool,
     exit_hint: Option<String>,
-    startup_flushed: bool,
-    transcript_flushed_len: usize,
-    turn_divider_flushed_generation: Option<u64>,
-    /// Append-only renderer state (cargo / indicatif model). The main view does
-    /// not use ratatui's inline `Viewport`/`insert_before`; instead every finished
-    /// transcript line is written to native scrollback as plain `\r\n` text — the
-    /// terminal owns the whole history, scrollback, and reflow — and the footer
-    /// (everything `render_inline` draws) is PRINTED as a contiguous block just
-    /// below the latest history line, then erased each frame with a
-    /// `FromCursorDown` clear anchored to a cursor parked at the footer's top row.
-    /// Printing (not absolute-positioning) the footer lets the terminal reflow it
-    /// together with that parked cursor on resize, so the clear always finds it.
-    ///
-    /// `footer_painted` is whether a footer is currently on screen at the parked
-    /// cursor and must be erased before the next repaint. It is false only right
-    /// after the screen was cleared (startup, `/clear`); it stays true across a
-    /// Ctrl+T overlay round-trip, since `LeaveAlternateScreen` restores the main
-    /// buffer with the old footer (which must then be erased).
-    footer_painted: bool,
+    /// Inline-repro (`SQUEEZY_INLINE_REPRO`) append-only paint bookkeeping.
+    /// Unused on the default fullscreen path; kept so the escape-hatch
+    /// `paint_main` path still compiles. Shared verbatim with the term-matrix
+    /// capture harness via [`paint_main_inner`], so the two paths can never
+    /// diverge on what history has flushed or whether a footer is on screen.
+    book: PaintBookkeeping,
     /// Resolved DEC 2026 synchronized-output flag. Computed once at
     /// startup from the user's [`TuiSynchronizedOutput`] policy plus
     /// terminal-capability detection; consulted around every frame
     /// draw to wrap output in Begin/End Synchronized Update sequences.
     synchronized_output: bool,
+    /// Source of the current terminal dimensions. Production uses
+    /// [`crate::size_source::RealSize`] (delegates to `crossterm::terminal::size`);
+    /// tests inject a [`crate::size_source::FixedSize`] so the inline-repro
+    /// `paint_main` path can be driven at a deterministic size with no real TTY.
+    size_source: Box<dyn crate::size_source::SizeSource>,
 }
 
 impl TerminalGuard {
-    /// The terminal that should receive the next draw. Routes to
-    /// `overlay_terminal` while the alt-screen overlay is up, back
-    /// to the primary `terminal` otherwise.
+    /// The single terminal that receives every draw. There is no overlay
+    /// terminal swap in fullscreen: Ctrl+T / config / status-line are rendered
+    /// states on this same terminal, selected inside `render`.
     fn term(&mut self) -> &mut Terminal<CrosstermBackend<TerminalWriter>> {
-        if self.overlay_screen_active {
-            self.overlay_terminal
-                .as_mut()
-                .expect("overlay terminal must be built when overlay-screen is active")
-        } else {
-            self.terminal
-                .as_mut()
-                .expect("primary terminal lost — unreachable after `enter`")
-        }
+        self.terminal
+            .as_mut()
+            .expect("primary terminal lost — unreachable after `enter`")
     }
+}
+
+/// Resolve the mouse-capture policy from the environment. Capture defaults ON
+/// in fullscreen (the alt-screen norm: click-to-focus / scroll / drag are part
+/// of the UI). Only the literal `SQUEEZY_MOUSE_CAPTURE=0` disables it; any other
+/// value (including empty) leaves it on. Factored out with an injected `env_get`
+/// so it is exercised without mutating real process env (racy across the test
+/// thread pool).
+fn resolve_mouse_capture<F>(env_get: F) -> bool
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    env_get("SQUEEZY_MOUSE_CAPTURE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// Resolve the inline-repro escape hatch from the environment.
+/// `SQUEEZY_INLINE_REPRO=1` (or any non-empty, non-`0` value) selects the legacy
+/// append-only inline renderer; default OFF means the product fullscreen
+/// alt-screen path. Injected `env_get` keeps it testable without process-env
+/// mutation.
+fn resolve_inline_repro<F>(env_get: F) -> bool
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    env_get("SQUEEZY_INLINE_REPRO")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+}
+
+/// Emit the terminal startup setup sequence into `writer`: the keyboard
+/// enhancement flags, then either the fullscreen alt-screen entry (the product
+/// path) or the inline-repro entry (escape hatch), and finally mouse capture
+/// when enabled. This is the byte-emitting half of [`TerminalGuard::enter`],
+/// factored out so a test can drive the exact same sequence into a
+/// [`TerminalWriter::Capture`] sink with no real TTY (and no `enable_raw_mode`),
+/// the same single-source pattern as [`paint_main_inner`].
+///
+/// * Fullscreen (`inline_repro == false`): `EnterAlternateScreen` plus
+///   alternate-scroll, clear, home, bracketed paste, focus reporting, and a
+///   hidden hardware cursor.
+/// * Inline-repro (`inline_repro == true`): never enters the alternate screen;
+///   resets + clears the visible buffer in the normal buffer instead.
+fn emit_terminal_enter_setup<W: Write>(
+    writer: &mut W,
+    inline_repro: bool,
+    mouse_capture: bool,
+) -> io::Result<()> {
+    let _ = execute!(
+        writer,
+        DisableModifyOtherKeys,
+        PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
+    );
+    if inline_repro {
+        // Inline viewport: the TUI pins itself to the bottom rows and flushes
+        // finished output up into the terminal's own scrollback.
+        execute!(
+            writer,
+            Print(RESET_AND_CLEAR_VISIBLE),
+            Print(DISABLE_MOUSE_MODES),
+            DisableAlternateScroll,
+            EnableBracketedPaste,
+            EnableFocusChange,
+            // Append-only renders the caret as a glyph (`┃`) inside the footer,
+            // so keep the hardware cursor hidden for the whole session; Drop
+            // restores it via `show_cursor`.
+            Hide
+        )?;
+    } else {
+        // Fullscreen: enter the alternate screen, clear it, home the cursor,
+        // and enable bracketed paste / focus reporting. The hardware cursor
+        // stays hidden (the caret is a rendered glyph); Drop shows it again.
+        execute!(
+            writer,
+            EnterAlternateScreen,
+            Print(DISABLE_MOUSE_MODES),
+            EnableAlternateScroll,
+            Clear(ClearType::All),
+            MoveTo(0, 0),
+            EnableBracketedPaste,
+            EnableFocusChange,
+            Hide
+        )?;
+    }
+    if mouse_capture {
+        execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))?;
+    }
+    Ok(())
+}
+
+/// Emit the emergency-teardown sequence into `writer`: the byte-emitting half of
+/// [`TerminalGuard`]'s `Drop`. Restores terminal modes and — only when
+/// `alt_screen_active` — leaves the alternate screen. Writes NO user-facing
+/// content and runs NO render/transcript mirror (that is owned by the clean-exit
+/// path), so it is safe to run from `Drop`, a panic hook, or a signal handler.
+///
+/// Deliberately never emits `\x1b[3J` (the scrollback wipe): after
+/// `LeaveAlternateScreen` the pre-launch normal buffer is restored, so the
+/// user's pre-launch scrollback is preserved on every normal exit. Factored out
+/// so a test can assert the exact teardown bytes against a [`TerminalWriter::Capture`]
+/// sink with no real TTY.
+fn emit_terminal_emergency_teardown<W: Write>(
+    writer: &mut W,
+    alt_screen_active: bool,
+) -> io::Result<()> {
+    // Leave the alternate screen iff we are still in it. The inline-repro path
+    // never entered alt-screen, so this is skipped there.
+    if alt_screen_active {
+        execute!(
+            writer,
+            DisableAlternateScroll,
+            Print(DISABLE_MOUSE_MODES),
+            LeaveAlternateScreen
+        )?;
+    }
+    execute!(
+        writer,
+        PopKeyboardEnhancementFlags,
+        Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
+        DisableModifyOtherKeys,
+        DisableBracketedPaste,
+        DisableFocusChange,
+        DisableAlternateScroll,
+        Print(DISABLE_MOUSE_MODES),
+        Print("\x1b]0;\x07")
+    )
 }
 
 impl TerminalGuard {
@@ -18302,64 +18445,77 @@ impl TerminalGuard {
         // `SQUEEZY_TUI_WRITE_LOG` is set. When unset the wrapper is a
         // thin pass-through.
         let mut writer = TerminalWriter::from_env(io::stdout());
-        let _ = execute!(
-            writer,
-            DisableModifyOtherKeys,
-            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
-        );
-        // Mouse capture is opt-in: it hijacks native text selection
-        // and terminal scrollback (Shift+drag / Shift+wheel become the
-        // escape hatch, which is friction users shouldn't pay by
-        // default). When off, the click registry sleeps and `>`/`v`
-        // disclosure buttons are still reachable via the keyboard
-        // chord (`Ctrl+X Q` for the queue overlay).
-        // Opt in with `SQUEEZY_MOUSE_CAPTURE=1`.
-        let mouse_capture = std::env::var_os("SQUEEZY_MOUSE_CAPTURE")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
-        // Inline viewport: the TUI pins itself to the bottom rows and flushes
-        // finished output up into the terminal's own scrollback. Full-screen
-        // surfaces (the transcript overlay, config screen) are transient
-        // alt-screen swaps, handled by `sync_overlay_screen`.
-        execute!(
-            writer,
-            Print(RESET_AND_CLEAR_VISIBLE),
-            Print(DISABLE_MOUSE_MODES),
-            DisableAlternateScroll,
-            EnableBracketedPaste,
-            EnableFocusChange,
-            // Append-only renders the caret as a glyph (`┃`) inside the footer,
-            // so keep the hardware cursor hidden for the whole session; Drop
-            // restores it via `show_cursor`.
-            Hide
-        )
-        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        if mouse_capture {
-            execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))
-                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        }
+        // Mouse capture defaults ON in fullscreen (the alt-screen norm:
+        // click-to-focus / scroll / drag are part of the UI). It hijacks
+        // native text selection and scrollback, so Shift+drag / Shift+wheel
+        // are the escape hatch. Only the literal `SQUEEZY_MOUSE_CAPTURE=0`
+        // disables it; any other value (including empty) leaves it on.
+        let mouse_capture = resolve_mouse_capture(|key| std::env::var_os(key));
+        // `SQUEEZY_INLINE_REPRO=1` selects the legacy append-only inline
+        // renderer (an escape hatch for reproducing inline behaviour). Default
+        // OFF: the product path is the fullscreen alt-screen renderer.
+        let inline_repro = resolve_inline_repro(|key| std::env::var_os(key));
+        // Emit the whole startup setup sequence (keyboard flags, alt-screen /
+        // inline entry, bracketed paste / focus, mouse capture) through the
+        // shared free helper so a test can drive the exact same bytes into a
+        // `Capture` writer with no real TTY — the same single-source pattern as
+        // `paint_main_inner` / the term-matrix capture harness.
+        emit_terminal_enter_setup(&mut writer, inline_repro, mouse_capture)
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         let backend = CrosstermBackend::new(writer);
-        let terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
-            },
-        )
-        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        let viewport = if inline_repro {
+            Viewport::Inline(INLINE_VIEWPORT_HEIGHT)
+        } else {
+            Viewport::Fullscreen
+        };
+        let terminal = Terminal::with_options(backend, TerminalOptions { viewport })
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         Ok(Self {
             terminal: Some(terminal),
-            overlay_terminal: None,
-            overlay_screen_active: false,
-            overlay_mouse_override_active: false,
-            overlay_mouse_capture: false,
+            inline_repro,
+            // Inline-repro never enters the alternate screen.
+            alt_screen_active: !inline_repro,
             mouse_capture,
             exit_hint: None,
-            startup_flushed: false,
-            transcript_flushed_len: 0,
-            turn_divider_flushed_generation: None,
-            footer_painted: false,
+            book: PaintBookkeeping::default(),
             synchronized_output,
+            size_source: Box::new(crate::size_source::RealSize),
         })
+    }
+
+    /// Build a guard wired to a headless [`TerminalWriter::Capture`] backend at a
+    /// deterministic `(w, h)` (via [`crate::size_source::FixedSize`]), so
+    /// [`Self::draw_app`] routing — and the bytes each branch emits — can be
+    /// asserted with no real TTY. Returns the guard plus the shared sink the
+    /// caller reads the emitted ANSI from.
+    ///
+    /// Uses a fixed-area viewport so the fullscreen `render()` branch never hits
+    /// ratatui's autoresize (which queries the real terminal); the append-only
+    /// `paint_main` branch reads its size from the injected `FixedSize`. No
+    /// startup setup bytes are emitted — the enter sequence is covered directly
+    /// against [`emit_terminal_enter_setup`].
+    #[cfg(test)]
+    fn for_capture_test(
+        inline_repro: bool,
+        w: u16,
+        h: u16,
+    ) -> (Self, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let sink: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = CrosstermBackend::new(TerminalWriter::capture(sink.clone()));
+        let viewport = Viewport::Fixed(Rect::new(0, 0, w.max(1), h.max(1)));
+        let terminal = Terminal::with_options(backend, TerminalOptions { viewport })
+            .expect("capture terminal builds with a fixed viewport");
+        let guard = Self {
+            terminal: Some(terminal),
+            inline_repro,
+            alt_screen_active: !inline_repro,
+            mouse_capture: true,
+            exit_hint: None,
+            book: PaintBookkeeping::default(),
+            synchronized_output: false,
+            size_source: Box::new(crate::size_source::FixedSize(w, h)),
+        };
+        (guard, sink)
     }
 
     fn set_exit_hint(&mut self, exit_hint: Option<String>) {
@@ -18411,38 +18567,35 @@ impl TerminalGuard {
 
     fn draw_app(&mut self, app: &mut TuiApp) -> Result<()> {
         self.apply_terminal_title(app)?;
-        // Promote into / demote out of the alt-screen overlay buffer based on
-        // whether the transcript overlay is open. Must run before any draw
-        // because it swaps which terminal `term()` returns.
-        self.sync_overlay_screen(app.transcript_overlay.is_some())?;
-        self.sync_overlay_mouse_mode(
-            app.transcript_overlay
-                .as_ref()
-                .map(|state| state.mode.mouse_capture()),
-        )?;
         if app.pending_resize {
-            // Just clear the flag; `paint_main` re-reads the terminal size every
-            // frame and re-anchors the footer to the new bottom, erasing the old
-            // footer via a cursor-relative clear that follows the reflow. The
-            // terminal reflows committed scrollback itself.
+            // Ratatui autoresizes the fullscreen terminal cleanly on the next
+            // `draw` (no inline `append_lines` stranding), so just clear the
+            // flag. The inline-repro `paint_main` likewise re-reads the size
+            // every frame, so the flag is a no-op nudge on both paths.
             app.pending_resize = false;
         }
-        if self.overlay_screen_active {
-            // Overlay path: the transcript overlay owns the whole alternate
-            // screen. Render it fullscreen into the overlay terminal, exactly
-            // as before — no append-only footer here.
-            let terminal = self.term();
-            return terminal
-                .draw(|frame| render(frame, app))
-                .map(|_| ())
-                .map_err(|err| SqueezyError::Terminal(err.to_string()));
+        if self.inline_repro {
+            // Legacy append-only inline path (escape hatch).
+            if app.terminal_clear_pending {
+                self.clear_scrollback_and_visible()?;
+                app.terminal_clear_pending = false;
+            }
+            return self.paint_main(app);
         }
-        // Main append-only path.
+        // Fullscreen: one full-frame draw. `render` dispatches main view vs.
+        // transcript-overlay / config / status-line surfaces purely from `app`
+        // state, so Ctrl+T / config / status-line render on this same terminal
+        // — no alt-screen swap.
         if app.terminal_clear_pending {
-            self.clear_scrollback_and_visible()?;
+            // `/clear` in fullscreen: ratatui owns the whole alt-screen buffer
+            // and the next `draw` repaints it; just clear the flag.
             app.terminal_clear_pending = false;
         }
-        self.paint_main(app)
+        let terminal = self.term();
+        terminal
+            .draw(|frame| render(frame, app))
+            .map(|_| ())
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
 
     /// Append-only main-view paint, in the cargo / indicatif model. Every
@@ -18462,249 +18615,36 @@ impl TerminalGuard {
     /// below the conversation (it sits at the bottom once history fills the
     /// screen), like cargo's progress bar or the Claude Code composer. The whole
     /// compound op is wrapped in one DEC 2026 synchronized update.
+    ///
+    /// Thin wrapper: it resolves the live terminal size and synchronized-output
+    /// flag, then defers every byte of emission and all flush/footer
+    /// bookkeeping to the free [`paint_main_inner`]. The term-matrix capture
+    /// harness drives that same `paint_main_inner` against an injected
+    /// `FixedSize` and a capture backend, so the captured ANSI stream is
+    /// byte-for-byte what this production path emits — there is no re-inlined
+    /// copy to drift.
     fn paint_main(&mut self, app: &mut TuiApp) -> Result<()> {
-        let (w, h) = terminal_size().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        // Read the size through the injectable `SizeSource` (production:
+        // `RealSize` -> `crossterm::terminal::size`; tests: `FixedSize`) so the
+        // append-only paint can be driven at a deterministic size with no TTY.
+        let (w, h) = self
+            .size_source
+            .size()
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         if w == 0 || h == 0 {
             return Ok(());
         }
-        // Render the footer + history TWO columns narrower than the terminal so an
-        // ambiguous-width glyph the terminal draws wider than unicode-width measured
-        // (☽ ◐ ● ✷ are 2 cols in VS Code, 1 to unicode-width) can't overflow the
-        // last column.
-        let content_w = w.saturating_sub(2).max(1);
-        let history_lines = self.prepare_history(app, content_w);
-        let divider_gen = self.turn_divider_flushed_generation;
-        let footer =
-            render_footer_to_buffer(app, content_w, INLINE_VIEWPORT_HEIGHT.min(h), divider_gen);
-        let footer_h = capped_footer_height(footer_content_height(&footer), h);
-        let history = (!history_lines.is_empty())
-            .then(|| render_lines_to_owned_buffer(&history_lines, content_w));
-
-        // Whether a footer is currently on screen at the parked cursor and must be
-        // erased before repainting. False only when the screen was just cleared:
-        // the first paint after startup or `/clear` (both home the cursor and
-        // clear the screen). It stays TRUE across a Ctrl+T overlay round-trip —
-        // `LeaveAlternateScreen` restores the main buffer with the old footer and
-        // its parked cursor, so that footer must be erased.
-        let had_footer = self.footer_painted;
         let synchronized = self.synchronized_output;
-
-        let backend = self.term().backend_mut();
-        let body = (|| -> io::Result<()> {
-            if synchronized {
-                backend.write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes())?;
-            }
-            // 1. Erase the previous footer. The cursor is parked at its top row;
-            //    the terminal reflows that cursor with the footer on resize, so
-            //    this clear erases it wherever the reflow moved it.
-            if had_footer {
-                execute!(backend, Clear(ClearType::FromCursorDown))?;
-            }
-            // 2. Commit new finished history as plain `\r\n` lines. The terminal
-            //    appends them above the (now-erased) footer position and scrolls
-            //    older lines into native scrollback — they are never lost.
-            if let Some(hist) = history.as_ref() {
-                for y in 0..hist.area.height {
-                    backend.write_all(b"\r")?;
-                    emit_buffer_row_styled(backend, hist, y, content_w)?;
-                    backend.write_all(b"\r\n")?;
-                }
-            }
-            // 3. Print the footer as a contiguous block. Autowrap off so one buffer
-            //    row maps to one physical row (making the cursor-up park below
-            //    exact); no trailing newline so printing the last row can't scroll
-            //    the footer. Clear-to-EOL per row wipes any stale tail.
-            execute!(backend, DisableLineWrap)?;
-            for y in 0..footer_h {
-                backend.write_all(b"\r")?;
-                emit_buffer_row_styled(backend, &footer, y, content_w)?;
-                execute!(backend, Clear(ClearType::UntilNewLine))?;
-                if y + 1 < footer_h {
-                    backend.write_all(b"\r\n")?;
-                }
-            }
-            execute!(backend, EnableLineWrap)?;
-            // 4. Park the cursor back at the footer's TOP row so the next frame's
-            //    erase (and the terminal's reflow tracking) is anchored there.
-            if footer_h > 1 {
-                execute!(backend, MoveToPreviousLine(footer_h - 1))?;
-            } else {
-                execute!(backend, MoveToColumn(0))?;
-            }
-            Ok(())
-        })();
-        // Restore autowrap and close the synchronized update even on error.
-        let _ = execute!(backend, EnableLineWrap);
-        if synchronized {
-            let _ = backend.write_all(END_SYNCHRONIZED_UPDATE.as_bytes());
-        }
-        let flushed = backend.flush();
-
-        self.footer_painted = true;
-        // Click mapping: once history fills the screen (the normal interactive
-        // case) the footer sits on the bottom `footer_h` rows. Before that it
-        // floats higher, but a pristine startup screen has no clickable history.
-        app.footer_origin = h.saturating_sub(footer_h);
-        body.and(flushed)
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))
-    }
-
-    /// Advance the scrollback-flush bookkeeping and return the finished
-    /// transcript lines to commit this frame (empty when nothing new settled).
-    /// Mirrors the bookkeeping the old `flush_history` kept, minus the
-    /// inline-viewport machinery.
-    fn prepare_history(&mut self, app: &TuiApp, width: u16) -> Vec<Line<'static>> {
-        let flush_to = settling_flush_boundary(app);
-        let (lines, flushed_divider_generation) = inline_history_lines_for_flush_with_turn_divider(
-            app,
-            width,
-            !self.startup_flushed,
-            self.transcript_flushed_len,
-            flush_to,
-            self.turn_divider_flushed_generation,
-        );
-        if let Some(generation) = flushed_divider_generation {
-            self.turn_divider_flushed_generation = Some(generation);
-        }
-        self.startup_flushed = true;
-        self.transcript_flushed_len = flush_to;
-        lines
-    }
-
-    /// Reconcile the alt-screen-for-overlay swap state with the
-    /// caller's request. No-op when we're already in alt-screen mode
-    /// for the whole session, or when the requested state already
-    /// matches. Otherwise:
-    ///
-    /// - **Inline → overlay**: drop the inline `Terminal` so its
-    ///   writer releases stdout, send `EnterAlternateScreen`
-    ///   directly, then build a fresh fullscreen `Terminal` over a
-    ///   new stdout writer. The original inline-mode terminal
-    ///   scrollback is preserved by the terminal emulator's main
-    ///   buffer; the overlay paints into the separate alt-screen
-    ///   buffer.
-    /// - **Overlay → inline**: reverse — drop the alt-screen
-    ///   `Terminal`, send `LeaveAlternateScreen` (which restores the
-    ///   main buffer with all the pre-overlay scrollback intact),
-    ///   then build a fresh `Viewport::Inline` `Terminal` to resume
-    ///   painting the bottom-anchored TUI viewport.
-    fn sync_overlay_screen(&mut self, want_overlay_full: bool) -> Result<()> {
-        match (self.overlay_screen_active, want_overlay_full) {
-            (false, true) => self.enter_overlay_screen(),
-            (true, false) => self.leave_overlay_screen(),
-            _ => Ok(()),
-        }
-    }
-
-    fn sync_overlay_mouse_mode(&mut self, overlay_mouse_capture: Option<bool>) -> Result<()> {
-        match overlay_mouse_capture {
-            Some(scrollbar_drag) => {
-                if self.overlay_mouse_override_active
-                    && self.overlay_mouse_capture == scrollbar_drag
-                {
-                    return Ok(());
-                }
-                let terminal = self.term();
-                set_transcript_overlay_mouse_mode(terminal.backend_mut(), scrollbar_drag, false)
-                    .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-                self.overlay_mouse_override_active = true;
-                self.overlay_mouse_capture = scrollbar_drag;
-                Ok(())
-            }
-            None => {
-                if !self.overlay_mouse_override_active {
-                    return Ok(());
-                }
-                let restore_main_mouse_capture = self.mouse_capture;
-                let terminal = self.term();
-                set_transcript_overlay_mouse_mode(
-                    terminal.backend_mut(),
-                    false,
-                    restore_main_mouse_capture,
-                )
-                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-                self.overlay_mouse_override_active = false;
-                self.overlay_mouse_capture = false;
-                Ok(())
-            }
-        }
-    }
-
-    fn enter_overlay_screen(&mut self) -> Result<()> {
-        // Lazily build the alt-screen ratatui `Terminal` the first
-        // time the overlay opens. `Viewport::Fullscreen` is the
-        // important detail: ratatui's fullscreen construction does
-        // NOT call `append_lines`, so it never scrolls main-buffer
-        // content. The terminal stays alive for the rest of the
-        // session — subsequent opens just re-enter alt-screen via
-        // ANSI without rebuilding the ratatui state.
-        if self.overlay_terminal.is_none() {
-            let writer = TerminalWriter::from_env(io::stdout());
-            let backend = CrosstermBackend::new(writer);
-            self.overlay_terminal = Some(
-                Terminal::new(backend).map_err(|err| SqueezyError::Terminal(err.to_string()))?,
-            );
-        }
-        // Switch the terminal emulator into the alt-screen buffer.
-        // Write through the inline Terminal's backend so the bytes
-        // serialize with any pending inline output.
-        {
-            let inline = self
-                .terminal
-                .as_mut()
-                .expect("primary inline terminal lost — unreachable after `enter`");
-            enter_transcript_overlay_screen(inline.backend_mut())
-                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        }
-        // Force the overlay terminal to paint from scratch — its
-        // internal "previously drawn" buffer is stale (from the
-        // last overlay open, or empty on first use) but the
-        // alt-screen buffer we're about to draw into is blank.
-        self.overlay_terminal
+        // Split the borrows so `book` and the terminal backend are disjoint:
+        // `term()` would borrow all of `self`, colliding with `&mut self.book`.
+        let book = &mut self.book;
+        let backend = self
+            .terminal
             .as_mut()
-            .expect("just built / persistent")
-            .clear()
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        self.overlay_screen_active = true;
-        Ok(())
-    }
-
-    fn leave_overlay_screen(&mut self) -> Result<()> {
-        // Last write through the overlay Terminal's backend before
-        // we leave alt-screen — same reasoning as
-        // `enter_overlay_screen`: serialize the escape sequence
-        // with any final overlay-render bytes.
-        {
-            let overlay = self
-                .overlay_terminal
-                .as_mut()
-                .expect("overlay terminal must be built when overlay-screen is active");
-            leave_transcript_overlay_screen(overlay.backend_mut(), self.mouse_capture)
-                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        }
-        self.overlay_mouse_override_active = false;
-        self.overlay_mouse_capture = false;
-        // The terminal emulator has restored the main buffer. The
-        // pre-overlay inline TUI viewport content (input row,
-        // status, hint) is still sitting in the bottom rows where
-        // it was when alt-screen entered, because we never touched
-        // the main buffer during the overlay. The inline Terminal's
-        // internal "last drawn" state still matches that visible
-        // content, so the next `draw` diffs against the correct
-        // baseline and only emits cells that genuinely changed.
-        //
-        // What CAN have changed during the overlay: new transcript
-        // entries (committed reasoning, assistant message) that
-        // arrived while we were suppressing `flush_history`. The
-        // next `draw_app` call commits them as plain `\r\n` lines and
-        // reprints the footer.
-        self.overlay_screen_active = false;
-        // Keep `footer_painted = true`: `LeaveAlternateScreen` restored the main
-        // buffer with the pre-overlay footer AND the cursor parked at its top, so
-        // the next paint must ERASE that footer (FromCursorDown) before
-        // repainting — exactly the steady-state path. Resetting it to false would
-        // skip the erase and stack a second footer.
-        Ok(())
+            .expect("primary terminal lost — unreachable after `enter`")
+            .backend_mut();
+        paint_main_inner(app, backend, w, h, book, synchronized)
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
 
     fn apply_terminal_title(&mut self, app: &mut TuiApp) -> Result<()> {
@@ -18743,14 +18683,146 @@ impl TerminalGuard {
                 .and_then(|()| backend.flush())
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         }
-        self.startup_flushed = false;
-        self.transcript_flushed_len = 0;
-        self.turn_divider_flushed_generation = None;
+        self.book.startup_flushed = false;
+        self.book.transcript_flushed_len = 0;
+        self.book.turn_divider_flushed_generation = None;
         // Fresh screen: next paint re-flushes history from the top and clears
         // the footer region before painting it absolutely.
-        self.footer_painted = false;
+        self.book.footer_painted = false;
         Ok(())
     }
+}
+
+/// One append-only main-view frame, emitted byte-for-byte into `backend` —
+/// the single source of truth for the cargo / indicatif paint, shared by the
+/// production [`TerminalGuard::paint_main`] and the term-matrix capture harness
+/// (`testing::capture`).
+///
+/// Every finished transcript line is committed to the terminal's native
+/// scrollback as plain `\r\n` text, so the terminal owns the entire history —
+/// its scrollback AND its reflow on resize. Nothing the user has seen can be
+/// lost or stranded. The footer (everything `render_inline` draws) is PRINTED
+/// as a contiguous block right below the latest history line, and erased each
+/// frame with a `FromCursorDown` clear anchored to a cursor parked at the
+/// footer's top row. Because the footer is printed (not absolute-positioned),
+/// the terminal reflows it together with that parked cursor on resize, so the
+/// clear always lands on it: a width drag can't strand a divider per width, and
+/// a shrink simply scrolls older history into recoverable scrollback.
+///
+/// This path never calls `Terminal::draw`/`insert_before`, so ratatui's inline
+/// autoresize (`append_lines`) never fires. The whole compound op is wrapped in
+/// one DEC 2026 synchronized update when `synchronized` is set.
+///
+/// `(w, h)` is the terminal size the frame is painted at — the production path
+/// passes the live `terminal_size()`; the capture path passes its injected
+/// `FixedSize` so a scripted `Resize` actually changes what the paint reads.
+/// `book` advances the flush/footer bookkeeping in place; `app.footer_origin`
+/// is updated so click mapping points at the parked footer.
+pub(crate) fn paint_main_inner(
+    app: &mut TuiApp,
+    backend: &mut impl io::Write,
+    w: u16,
+    h: u16,
+    book: &mut PaintBookkeeping,
+    synchronized: bool,
+) -> io::Result<()> {
+    // Render the footer + history TWO columns narrower than the terminal so an
+    // ambiguous-width glyph the terminal draws wider than unicode-width measured
+    // (☽ ◐ ● ✷ are 2 cols in VS Code, 1 to unicode-width) can't overflow the
+    // last column.
+    let content_w = w.saturating_sub(2).max(1);
+
+    // Advance the scrollback-flush bookkeeping and collect the finished
+    // transcript lines to commit this frame (empty when nothing new settled).
+    // This was the old `prepare_history` body, folded in so the bookkeeping
+    // lives in `book` and the whole frame is single-sourced.
+    let flush_to = settling_flush_boundary(app);
+    let (history_lines, flushed_divider_generation) =
+        inline_history_lines_for_flush_with_turn_divider(
+            app,
+            content_w,
+            !book.startup_flushed,
+            book.transcript_flushed_len,
+            flush_to,
+            book.turn_divider_flushed_generation,
+        );
+    if let Some(generation) = flushed_divider_generation {
+        book.turn_divider_flushed_generation = Some(generation);
+    }
+    book.startup_flushed = true;
+    book.transcript_flushed_len = flush_to;
+
+    let divider_gen = book.turn_divider_flushed_generation;
+    let footer =
+        render_footer_to_buffer(app, content_w, INLINE_VIEWPORT_HEIGHT.min(h), divider_gen);
+    let footer_h = capped_footer_height(footer_content_height(&footer), h);
+    let history = (!history_lines.is_empty())
+        .then(|| render_lines_to_owned_buffer(&history_lines, content_w));
+
+    // Whether a footer is currently on screen at the parked cursor and must be
+    // erased before repainting. False only when the screen was just cleared:
+    // the first paint after startup or `/clear` (both home the cursor and clear
+    // the screen). It stays TRUE across a Ctrl+T overlay round-trip —
+    // `LeaveAlternateScreen` restores the main buffer with the old footer and
+    // its parked cursor, so that footer must be erased.
+    let had_footer = book.footer_painted;
+
+    let body = (|| -> io::Result<()> {
+        if synchronized {
+            backend.write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes())?;
+        }
+        // 1. Erase the previous footer. The cursor is parked at its top row;
+        //    the terminal reflows that cursor with the footer on resize, so
+        //    this clear erases it wherever the reflow moved it.
+        if had_footer {
+            execute!(backend, Clear(ClearType::FromCursorDown))?;
+        }
+        // 2. Commit new finished history as plain `\r\n` lines. The terminal
+        //    appends them above the (now-erased) footer position and scrolls
+        //    older lines into native scrollback — they are never lost.
+        if let Some(hist) = history.as_ref() {
+            for y in 0..hist.area.height {
+                backend.write_all(b"\r")?;
+                emit_buffer_row_styled(backend, hist, y, content_w)?;
+                backend.write_all(b"\r\n")?;
+            }
+        }
+        // 3. Print the footer as a contiguous block. Autowrap off so one buffer
+        //    row maps to one physical row (making the cursor-up park below
+        //    exact); no trailing newline so printing the last row can't scroll
+        //    the footer. Clear-to-EOL per row wipes any stale tail.
+        execute!(backend, DisableLineWrap)?;
+        for y in 0..footer_h {
+            backend.write_all(b"\r")?;
+            emit_buffer_row_styled(backend, &footer, y, content_w)?;
+            execute!(backend, Clear(ClearType::UntilNewLine))?;
+            if y + 1 < footer_h {
+                backend.write_all(b"\r\n")?;
+            }
+        }
+        execute!(backend, EnableLineWrap)?;
+        // 4. Park the cursor back at the footer's TOP row so the next frame's
+        //    erase (and the terminal's reflow tracking) is anchored there.
+        if footer_h > 1 {
+            execute!(backend, MoveToPreviousLine(footer_h - 1))?;
+        } else {
+            execute!(backend, MoveToColumn(0))?;
+        }
+        Ok(())
+    })();
+    // Restore autowrap and close the synchronized update even on error.
+    let _ = execute!(backend, EnableLineWrap);
+    if synchronized {
+        let _ = backend.write_all(END_SYNCHRONIZED_UPDATE.as_bytes());
+    }
+    let flushed = backend.flush();
+
+    book.footer_painted = true;
+    // Click mapping: once history fills the screen (the normal interactive
+    // case) the footer sits on the bottom `footer_h` rows. Before that it
+    // floats higher, but a pristine startup screen has no clickable history.
+    app.footer_origin = h.saturating_sub(footer_h);
+    body.and(flushed)
 }
 
 /// Lay out the live "footer" (everything `render_inline` draws) into an
@@ -18999,43 +19071,28 @@ fn apply_modifier_diff<W: io::Write>(out: &mut W, from: Modifier, to: Modifier) 
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Emergency-only teardown: restore the terminal modes and (if still
+        // active) leave the alternate screen, but write NO user-facing content
+        // and run NO render/mirror. The clean exit + transcript mirror is owned
+        // by Phase 2's `finish_fullscreen`; `alt_screen_active` is the
+        // idempotence contract so the alt-screen is left exactly once even when
+        // both paths run.
         let _ = disable_raw_mode();
-        // If we exited while the overlay-screen swap was active,
-        // leave the alt-screen buffer first so the user's main-buffer
-        // scrollback (the inline conversation history) is what stays
-        // visible after the process tears down. The overlay terminal
-        // owns the writer that's currently routed to alt-screen.
-        if self.overlay_screen_active
-            && let Some(overlay) = self.overlay_terminal.as_mut()
-        {
-            let _ = leave_transcript_overlay_screen(overlay.backend_mut(), false);
-            self.overlay_screen_active = false;
-            self.overlay_mouse_override_active = false;
-            self.overlay_mouse_capture = false;
-        }
-        // Drop the overlay terminal explicitly so its writer
-        // releases stdout before the primary terminal does its
-        // teardown writes below.
-        drop(self.overlay_terminal.take());
         let Some(terminal) = self.terminal.as_mut() else {
             return;
         };
-        let _ = execute!(
-            terminal.backend_mut(),
-            PopKeyboardEnhancementFlags,
-            Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
-            DisableModifyOtherKeys,
-            DisableBracketedPaste,
-            DisableFocusChange,
-            DisableAlternateScroll,
-            Print(DISABLE_MOUSE_MODES),
-            Print("\x1b]0;\x07"),
-            Print(CLEAR_SCROLLBACK_AND_VISIBLE)
-        );
-        let _ = terminal.show_cursor();
-        if let Some(hint) = &self.exit_hint {
-            let _ = writeln!(terminal.backend_mut(), "{hint}");
+        {
+            let backend = terminal.backend_mut();
+            // Single-source the teardown bytes through the shared free helper so
+            // a test asserts the exact `LeaveAlternateScreen` + mode-restore
+            // stream (and the absence of a transcript mirror / `\x1b[3J`) against
+            // a `Capture` sink. `alt_screen_active` is the idempotence contract
+            // so the alt-screen is left exactly once even when a clean-exit path
+            // already ran.
+            let _ = emit_terminal_emergency_teardown(backend, self.alt_screen_active);
+            self.alt_screen_active = false;
         }
+        let _ = terminal.show_cursor();
     }
 }
 

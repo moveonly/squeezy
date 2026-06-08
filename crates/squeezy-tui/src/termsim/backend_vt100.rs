@@ -102,6 +102,11 @@ fn screen_to_grid(screen: &vt100::Screen) -> Grid {
         // separate scrollback buffer is not part of the §8.5 surface.
         scrollback: Vec::new(),
         cursor: (cursor_col, cursor_row),
+        // vt100 is a fixed grid, so the cursor is always in-grid by
+        // construction: the logical row equals the clamped row. Populated
+        // uniformly so the cursor-in-bounds invariant reads one field for
+        // every leg, even though this one is vacuously in-bounds.
+        logical_cursor_row: cursor_row as i32,
         base_y: 0,
     }
 }

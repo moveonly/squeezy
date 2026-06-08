@@ -14,11 +14,16 @@
 //!   use at this stage of the migration. The §8.5 *content* invariants —
 //!   ≤ 1 composer horizon, no duplicated turn divider, latest response present
 //!   after resize — assert against it, because the inline path commits history
-//!   to scrollback the emulator grid never surfaces.
+//!   to scrollback the fixed-grid emulator never surfaces.
 //! * The **append-only inline** stream (`log`), replayed through each emulator
-//!   leg, is what real terminals show. The cursor-in-bounds invariant asserts
-//!   against *its* reconstructed grid, per backend, so an emulator that drifts
-//!   the cursor below the live region (the actual xterm.js bug) is caught.
+//!   leg, is what real terminals show. The cursor-in-bounds and
+//!   one-composer-horizon invariants assert against *its* reconstructed grid,
+//!   per backend, so an emulator that drifts the cursor below the live region
+//!   (the actual xterm.js bug) is caught. Latest-response survival ALSO asserts
+//!   against this inline grid on reflow-capable legs (alacritty), which rebuild
+//!   the committed scrollback the append-only path flushes off the viewport;
+//!   the fixed-grid vt100 leg keeps no scrollback, so for it latest-response
+//!   still relies on the fullscreen surface above.
 
 use super::assertions;
 use super::driver::{ScenarioRun, run_scenario};
@@ -68,8 +73,9 @@ fn assert_fullscreen_invariants(scenario: &Scenario, run: &ScenarioRun) {
 }
 
 /// Replay the captured inline stream through one backend and assert the
-/// per-emulator invariants (cursor bounds against the final frame size, no
-/// horizon stacking in the reconstructed live region).
+/// per-emulator invariants: cursor bounds against the final frame size, no
+/// horizon stacking in the reconstructed live region, and — on reflow-capable
+/// legs that surface committed scrollback — latest-response survival.
 fn assert_emulator_invariants(
     scenario: &Scenario,
     backend_name: &str,
@@ -93,6 +99,19 @@ fn assert_emulator_invariants(
     // composer; it must never stack a second horizon.
     assertions::at_most_one_composer_horizon(&grid)
         .unwrap_or_else(|e| panic!("[{} / {backend_name}] inline replay: {e}", scenario.name));
+
+    // History-survives: the latest committed response must still be present in
+    // (viewport ∪ scrollback) after the resize storm, asserted against the
+    // CAPTURED inline grid this leg reconstructed. Gated to backends that
+    // surface scrollback: only a reflow-capable leg (alacritty) rebuilds the
+    // committed history the append-only path flushes off the viewport. The
+    // fixed-grid vt100 leg discards it (its `scrollback` stays empty by
+    // construction), so running this against vt100 would assert against an
+    // always-empty buffer — exactly the tautology this gate removes.
+    if emulator.profile().reflows {
+        assertions::latest_response_present(&grid, &run.latest_response_tail)
+            .unwrap_or_else(|e| panic!("[{} / {backend_name}] inline replay: {e}", scenario.name));
+    }
 }
 
 /// Run every shipped scenario against both Rust emulator legs and the

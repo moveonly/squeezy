@@ -37,6 +37,8 @@ fn replays_known_ansi_into_fixed_grid() {
     );
     // cursor_position() is (row, col); Grid stores (col, row).
     assert_eq!(grid.cursor, (2, 1), "cursor sits just past CD on row 1");
+    // Fixed grid: the logical row equals the clamped row and is populated.
+    assert_eq!(grid.logical_cursor_row, 1);
     assert!(grid.alt_screen.is_empty(), "no alt screen was entered");
     assert!(
         grid.scrollback.is_empty(),

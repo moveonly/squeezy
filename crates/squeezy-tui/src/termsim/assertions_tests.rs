@@ -57,14 +57,23 @@ fn cursor_bounds_checks_against_frame_height() {
         w: 80,
         h: 24,
     };
+    // The invariant reads the PRE-clamp `logical_cursor_row`, not the clamped
+    // `cursor.1` (which the backends keep in-grid by construction).
     let in_bounds = Grid {
-        cursor: (5, 3),
+        logical_cursor_row: 3,
         ..Grid::default()
     };
     assert!(cursor_row_in_bounds(&in_bounds, mark).is_ok());
-    let escaped = Grid {
-        cursor: (5, 24),
+    // Below the live region (the xterm.js drift): logical row >= h.
+    let escaped_below = Grid {
+        logical_cursor_row: 24,
         ..Grid::default()
     };
-    assert!(cursor_row_in_bounds(&escaped, mark).is_err());
+    assert!(cursor_row_in_bounds(&escaped_below, mark).is_err());
+    // Above the viewport top: a negative logical row also escapes bounds.
+    let escaped_above = Grid {
+        logical_cursor_row: -1,
+        ..Grid::default()
+    };
+    assert!(cursor_row_in_bounds(&escaped_above, mark).is_err());
 }

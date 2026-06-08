@@ -7883,6 +7883,366 @@ fn modify_other_keys_reset_uses_xterm_sequence() {
     assert_eq!(disable, "\x1b[>4;0m");
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1 — fullscreen terminal lifecycle (TerminalGuard).
+//
+// These exercise the byte-emitting seams the production guard now delegates to
+// (`emit_terminal_enter_setup`, `emit_terminal_emergency_teardown`), the env
+// policy resolvers (`resolve_mouse_capture` / `resolve_inline_repro`), and the
+// `draw_app` renderer routing — all against a headless `TerminalWriter::Capture`
+// sink with a deterministic `FixedSize`, so there is no real TTY and no PTY.
+// ---------------------------------------------------------------------------
+
+/// `\x1b[?7l` — crossterm's `DisableLineWrap`. The append-only `paint_main`
+/// frame brackets the footer print with `DisableLineWrap`/`EnableLineWrap`; the
+/// fullscreen `render()` draw never toggles autowrap. This single byte sequence
+/// is therefore an unambiguous "this was the inline paint path" marker.
+const DISABLE_LINE_WRAP: &str = "\x1b[?7l";
+
+/// True when a row carries a live composer horizon: a `☽` followed (after
+/// optional spaces) by one of the horizon dash glyphs. Mirrors the term-matrix
+/// `is_composer_horizon` matcher (which lives behind the `term-matrix` feature,
+/// so it is re-encoded here for the default-feature lib tests).
+fn row_is_composer_horizon(row: &str) -> bool {
+    let dashes = ['─', '╌', '┈'];
+    let mut chars = row.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '☽' {
+            continue;
+        }
+        let mut lookahead = chars.clone();
+        while matches!(lookahead.peek(), Some(' ')) {
+            lookahead.next();
+        }
+        if matches!(lookahead.peek(), Some(d) if dashes.contains(d)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn sink_to_string(sink: &Arc<StdMutex<Vec<u8>>>) -> String {
+    let bytes = sink.lock().expect("capture sink lock").clone();
+    String::from_utf8(bytes).expect("captured ANSI is valid utf8")
+}
+
+/// Strip CSI / OSC escape sequences from a captured stream, leaving only the
+/// glyphs that land on screen. ratatui positions each row with a `CUP`
+/// (`\x1b[<row>;<col>H`) cursor move and styles cells with interleaved `SGR`
+/// sequences rather than newlines, so the visible composer horizon (`☽───…`) is
+/// only contiguous text once those escapes are removed.
+fn strip_ansi(ansi: &str) -> String {
+    let mut out = String::with_capacity(ansi.len());
+    let mut chars = ansi.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            // CSI: `\x1b[` … final byte in 0x40..=0x7e.
+            Some('[') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC: `\x1b]` … terminated by BEL or ST (`\x1b\`).
+            Some(']') => {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' {
+                        if matches!(chars.peek(), Some('\\')) {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            // Any other escape: drop the single following byte.
+            _ => {
+                chars.next();
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn fullscreen_enter_emits_alt_screen_enter_sequence() {
+    let mut bytes = Vec::new();
+    emit_terminal_enter_setup(
+        &mut bytes, /* inline_repro = */ false, /* mouse_capture = */ true,
+    )
+    .expect("emit fullscreen enter setup");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    // The defining contract: fullscreen enters the alternate screen.
+    assert!(
+        ansi.contains("\x1b[?1049h"),
+        "fullscreen enter must emit EnterAlternateScreen, got {ansi:?}"
+    );
+    // Alternate-scroll (wheel -> arrow keys) and bracketed paste / focus
+    // reporting come up with it.
+    assert!(
+        ansi.contains("\x1b[?1007h"),
+        "fullscreen enter must enable alternate-scroll"
+    );
+    // Mouse capture is on by default in fullscreen.
+    assert!(
+        ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
+        "fullscreen enter must enable mouse click capture by default"
+    );
+    // The inline-repro reset/clear of the NORMAL buffer must NOT appear: the
+    // fullscreen path owns the alternate buffer, never the normal one.
+    assert!(
+        !ansi.contains(RESET_AND_CLEAR_VISIBLE),
+        "fullscreen enter must not reset/clear the normal buffer"
+    );
+}
+
+#[test]
+fn fullscreen_enter_respects_mouse_capture_disabled() {
+    let mut bytes = Vec::new();
+    emit_terminal_enter_setup(
+        &mut bytes, /* inline_repro = */ false, /* mouse_capture = */ false,
+    )
+    .expect("emit fullscreen enter setup, mouse off");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    assert!(
+        ansi.contains("\x1b[?1049h"),
+        "fullscreen still enters the alternate screen with mouse capture off"
+    );
+    assert!(
+        !ansi.contains(ENABLE_MOUSE_CLICK_CAPTURE),
+        "SQUEEZY_MOUSE_CAPTURE=0 must suppress mouse click capture"
+    );
+}
+
+#[test]
+fn inline_repro_enter_does_not_enter_alt_screen() {
+    let mut bytes = Vec::new();
+    emit_terminal_enter_setup(
+        &mut bytes, /* inline_repro = */ true, /* mouse_capture = */ true,
+    )
+    .expect("emit inline-repro enter setup");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    assert!(
+        !ansi.contains("\x1b[?1049h"),
+        "inline-repro escape hatch must never enter the alternate screen"
+    );
+    assert!(
+        ansi.contains(RESET_AND_CLEAR_VISIBLE),
+        "inline-repro resets and clears the normal buffer instead"
+    );
+}
+
+#[test]
+fn mouse_capture_defaults_on_unless_disabled() {
+    // Default ON when the var is unset.
+    assert!(
+        resolve_mouse_capture(|_| None),
+        "mouse capture defaults on when SQUEEZY_MOUSE_CAPTURE is unset"
+    );
+    // Only the literal "0" disables it.
+    assert!(
+        !resolve_mouse_capture(
+            |key| (key == "SQUEEZY_MOUSE_CAPTURE").then(|| std::ffi::OsString::from("0"))
+        ),
+        "SQUEEZY_MOUSE_CAPTURE=0 disables mouse capture"
+    );
+    // Any other value (including empty) leaves it on.
+    assert!(
+        resolve_mouse_capture(
+            |key| (key == "SQUEEZY_MOUSE_CAPTURE").then(|| std::ffi::OsString::from("1"))
+        ),
+        "SQUEEZY_MOUSE_CAPTURE=1 keeps mouse capture on"
+    );
+    assert!(
+        resolve_mouse_capture(|key| (key == "SQUEEZY_MOUSE_CAPTURE").then(std::ffi::OsString::new)),
+        "an empty SQUEEZY_MOUSE_CAPTURE value leaves mouse capture on"
+    );
+}
+
+#[test]
+fn inline_repro_defaults_off_unless_enabled() {
+    assert!(
+        !resolve_inline_repro(|_| None),
+        "inline-repro defaults off when SQUEEZY_INLINE_REPRO is unset"
+    );
+    assert!(
+        resolve_inline_repro(
+            |key| (key == "SQUEEZY_INLINE_REPRO").then(|| std::ffi::OsString::from("1"))
+        ),
+        "SQUEEZY_INLINE_REPRO=1 selects the inline escape hatch"
+    );
+    assert!(
+        !resolve_inline_repro(
+            |key| (key == "SQUEEZY_INLINE_REPRO").then(|| std::ffi::OsString::from("0"))
+        ),
+        "SQUEEZY_INLINE_REPRO=0 stays on the fullscreen path"
+    );
+    assert!(
+        !resolve_inline_repro(|key| (key == "SQUEEZY_INLINE_REPRO").then(std::ffi::OsString::new)),
+        "an empty SQUEEZY_INLINE_REPRO value stays on the fullscreen path"
+    );
+}
+
+#[tokio::test]
+async fn draw_app_routes_main_view_through_render_not_paint_main() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hello from the model"));
+
+    // Fullscreen (inline_repro = false): draw_app must drive the fullscreen
+    // `render()` path, not the append-only `paint_main`.
+    let (mut guard, sink) =
+        TerminalGuard::for_capture_test(/* inline_repro = */ false, 120, 40);
+    guard.draw_app(&mut app).expect("fullscreen draw_app");
+    let ansi = sink_to_string(&sink);
+
+    // Positive signal: the fullscreen frame rendered the main view, which pins
+    // the composer horizon (`☽` + dashes) at the bottom. ratatui interleaves SGR
+    // escapes between the moon coin and the dashes, so match on the de-escaped
+    // glyph stream.
+    let plain = strip_ansi(&ansi);
+    assert!(
+        row_is_composer_horizon(&plain),
+        "fullscreen render() must draw the composer horizon main view"
+    );
+    // Negative signal: the append-only paint brackets its footer with
+    // DisableLineWrap; the fullscreen draw never does. Its absence proves we did
+    // not fall through to paint_main.
+    assert!(
+        !ansi.contains(DISABLE_LINE_WRAP),
+        "fullscreen draw_app must not run the append-only paint_main path"
+    );
+}
+
+#[tokio::test]
+async fn draw_app_routes_inline_repro_through_paint_main() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hello from the model"));
+
+    // Inline-repro: draw_app must drive the append-only paint_main path. Its
+    // size now comes from the injected FixedSize, so this is deterministic with
+    // no real TTY.
+    let (mut guard, sink) =
+        TerminalGuard::for_capture_test(/* inline_repro = */ true, 120, 40);
+    guard.draw_app(&mut app).expect("inline-repro draw_app");
+    let ansi = sink_to_string(&sink);
+
+    // The append-only footer paint is the only path that toggles autowrap.
+    assert!(
+        ansi.contains(DISABLE_LINE_WRAP),
+        "inline-repro draw_app must run the append-only paint_main path"
+    );
+}
+
+#[test]
+fn emergency_teardown_leaves_alt_screen_and_restores_modes_without_mirror() {
+    let mut bytes = Vec::new();
+    emit_terminal_emergency_teardown(&mut bytes, /* alt_screen_active = */ true)
+        .expect("emit emergency teardown");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    // Leaves the alternate screen.
+    let leave_pos = ansi
+        .find("\x1b[?1049l")
+        .expect("emergency teardown must leave the alternate screen");
+    // Restores terminal modes: keyboard enhancement pop, bracketed paste off,
+    // focus reporting off, mouse modes off, title cleared.
+    assert!(
+        ansi.contains(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
+        "teardown must reset keyboard enhancement flags"
+    );
+    assert!(
+        ansi.contains(DISABLE_MOUSE_MODES),
+        "teardown must disable mouse modes"
+    );
+    assert!(
+        ansi.contains("\x1b[?2004l"),
+        "teardown must disable bracketed paste"
+    );
+    // Mode restore happens AFTER leaving the alternate buffer so it lands on the
+    // restored normal buffer.
+    let reset_pos = ansi
+        .find(RESET_KEYBOARD_ENHANCEMENT_FLAGS)
+        .expect("teardown emits keyboard reset");
+    assert!(
+        reset_pos > leave_pos,
+        "mode restore must come after LeaveAlternateScreen"
+    );
+
+    // Emergency teardown must NOT mirror the transcript or purge scrollback:
+    // a clean exit owns the mirror; Drop only restores terminal state. The
+    // scrollback-wipe `\x1b[3J` would destroy the user's pre-launch scrollback.
+    assert!(
+        !ansi.contains("\x1b[3J"),
+        "emergency teardown must never purge scrollback (\\x1b[3J)"
+    );
+    assert!(
+        !ansi.contains(CLEAR_SCROLLBACK_AND_VISIBLE),
+        "emergency teardown must not emit the /clear scrollback-wipe sequence"
+    );
+}
+
+#[test]
+fn emergency_teardown_skips_leave_alt_screen_for_inline_repro() {
+    // The inline-repro path never entered the alternate screen, so teardown must
+    // not emit LeaveAlternateScreen for it (alt_screen_active = false).
+    let mut bytes = Vec::new();
+    emit_terminal_emergency_teardown(&mut bytes, /* alt_screen_active = */ false)
+        .expect("emit emergency teardown, inline-repro");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    assert!(
+        !ansi.contains("\x1b[?1049l"),
+        "inline-repro teardown must not leave an alternate screen it never entered"
+    );
+    // Modes are still restored.
+    assert!(
+        ansi.contains(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
+        "inline-repro teardown still restores keyboard enhancement flags"
+    );
+    assert!(
+        ansi.contains(DISABLE_MOUSE_MODES),
+        "inline-repro teardown still disables mouse modes"
+    );
+}
+
+#[test]
+fn dropping_fullscreen_guard_emits_leave_alt_screen_and_no_mirror() {
+    // Full lifecycle through Drop: construct a fullscreen guard on a capture
+    // sink, then drop it and inspect the teardown bytes. Proves the production
+    // `Drop` (which delegates to `emit_terminal_emergency_teardown`) leaves the
+    // alternate screen exactly once and writes no transcript mirror.
+    let (guard, sink) = TerminalGuard::for_capture_test(/* inline_repro = */ false, 80, 24);
+    drop(guard);
+    let ansi = sink_to_string(&sink);
+
+    assert!(
+        ansi.contains("\x1b[?1049l"),
+        "dropping a fullscreen guard must leave the alternate screen"
+    );
+    assert!(
+        !ansi.contains("\x1b[3J"),
+        "Drop must not purge the user's pre-launch scrollback"
+    );
+    // No mirrored history: the only content is mode-restore control bytes, never
+    // assistant text.
+    assert!(
+        !ansi.contains("hello from the model"),
+        "Drop is emergency-only and must not mirror transcript content"
+    );
+}
+
 #[test]
 fn inline_history_flush_contains_startup_and_new_transcript() {
     let mut app = test_app(SessionMode::Build);
