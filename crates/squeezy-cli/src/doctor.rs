@@ -757,18 +757,18 @@ fn skills_check(config: &AppConfig) -> Check {
         let mut total_specs = 0usize;
         let mut hook_skills: Vec<String> = Vec::new();
         for summary in summaries.iter().filter(|s| !s.disabled) {
-            if let Ok(loaded) = catalog.load(&summary.name) {
-                if !loaded.hooks.is_empty() {
-                    let count: usize = loaded
-                        .hooks
-                        .values()
-                        .flat_map(|matchers| matchers.iter())
-                        .map(|m| m.hooks.len())
-                        .sum();
-                    if count > 0 {
-                        total_specs += count;
-                        hook_skills.push(summary.name.clone());
-                    }
+            if let Ok(loaded) = catalog.load(&summary.name)
+                && !loaded.hooks.is_empty()
+            {
+                let count: usize = loaded
+                    .hooks
+                    .values()
+                    .flat_map(|matchers| matchers.iter())
+                    .map(|m| m.hooks.len())
+                    .sum();
+                if count > 0 {
+                    total_specs += count;
+                    hook_skills.push(summary.name.clone());
                 }
             }
         }
