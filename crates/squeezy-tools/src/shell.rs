@@ -653,6 +653,11 @@ impl ToolRegistry {
             {
                 // The Windows sandbox owns its own pipes + scrubbed env; the PTY
                 // and `squeezy ask` socket paths do not apply on this backend.
+                // ConPTY is not wired for the sandbox path either, so record
+                // the same tty_degraded signal as the non-sandbox tokio path.
+                if tty {
+                    tty_degraded = true;
+                }
                 let _ = tty;
                 drop(shell_ask_approver);
                 let spec = build_win_spec(&self.shell_sandbox, &self.root, sandbox_plan);

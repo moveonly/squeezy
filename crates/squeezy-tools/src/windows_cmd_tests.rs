@@ -75,6 +75,40 @@ fn flags_shutdown_commands() {
 }
 
 #[test]
+fn flags_new_and_disable_localuser() {
+    assert!(is_destructive_windows_segment("New-LocalUser -Name foo"));
+    assert!(is_destructive_windows_segment(
+        "Disable-LocalUser -Name foo"
+    ));
+}
+
+#[test]
+fn flags_clear_recyclebin() {
+    assert!(is_destructive_windows_segment(
+        "Clear-RecycleBin -Force -Confirm:$false"
+    ));
+}
+
+#[test]
+fn flags_format_volume() {
+    assert!(is_destructive_windows_segment(
+        "Format-Volume -DriveLetter C -Force"
+    ));
+}
+
+#[test]
+fn flags_remove_service() {
+    assert!(is_destructive_windows_segment("Remove-Service -Name MySvc"));
+}
+
+#[test]
+fn flags_bcdedit_deletevalue() {
+    assert!(is_destructive_windows_segment(
+        "bcdedit /deletevalue {default} safeboot"
+    ));
+}
+
+#[test]
 fn flags_start_process_runas() {
     assert!(is_destructive_windows_segment(
         "Start-Process powershell -Verb RunAs"
@@ -82,6 +116,26 @@ fn flags_start_process_runas() {
     assert!(is_destructive_windows_segment(
         "Start-Process pwsh -Verb RunAs"
     ));
+    assert!(is_destructive_windows_segment(
+        "Start-Process cmd -Verb RunAs"
+    ));
+    assert!(is_destructive_windows_segment(
+        "Start-Process cmd.exe -Verb RunAs"
+    ));
+}
+
+#[test]
+fn flags_del_quiet_force_without_recursive() {
+    // /Q /F together is also flagged as destructive (quiet + force-delete
+    // read-only files) even without /S — documents the deliberate precedence.
+    assert!(is_destructive_windows_segment("del /Q /F C:\\tmp"));
+}
+
+#[test]
+fn ignores_del_without_s_q_f() {
+    // A plain del that is neither recursive nor force+quiet must not trigger.
+    assert!(!is_destructive_windows_segment("del /Q foo.txt"));
+    assert!(!is_destructive_windows_segment("del /F foo.txt"));
 }
 
 #[test]

@@ -12085,6 +12085,17 @@ fn linux_seccomp_plan_does_not_export_ask_socket() {
     let seccomp_plan = fake_sandbox_plan("linux-direct-syscalls", true);
     assert!(!seccomp_plan.exports_ask_socket());
 
+    // The Windows sandbox backends spawn via raw Win32 with a scrubbed env
+    // and have no AF_UNIX `squeezy ask` transport; they must NOT export the
+    // socket so we don't advertise an unusable capability.
+    for backend in ["windows-restricted-token", "windows-elevated"] {
+        let plan = fake_sandbox_plan(backend, false);
+        assert!(
+            !plan.exports_ask_socket(),
+            "backend {backend} must not export the ask socket (no AF_UNIX transport)",
+        );
+    }
+
     // Backends without the AF_UNIX deny still advertise the ask socket.
     for backend in [
         "none",

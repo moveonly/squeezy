@@ -158,7 +158,6 @@ impl ShellProgram {
         }
     }
 
-    #[cfg(any(unix, target_os = "windows"))]
     fn git_bash(command: &str) -> Option<Self> {
         if let Ok(path) = std::env::var("SQUEEZY_GIT_BASH_PATH")
             && std::path::Path::new(&path).is_file()

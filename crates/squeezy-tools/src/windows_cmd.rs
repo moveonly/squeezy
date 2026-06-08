@@ -65,7 +65,12 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     let flag_matches = |flag: &str| tokens.iter().any(|t| t.eq_ignore_ascii_case(flag));
 
     match first.as_str() {
-        "del" | "erase" => return flag_matches("/s") || flag_matches("/q") && flag_matches("/f"),
+        // `del /S` alone (recursive) or `del /Q /F` (quiet + force-delete
+        // read-only, without confirmation) are both treated as destructive.
+        // Parentheses make the intended precedence explicit.
+        "del" | "erase" => {
+            return flag_matches("/s") || (flag_matches("/q") && flag_matches("/f"));
+        }
         "rd" | "rmdir" => return flag_matches("/s"),
         "format" | "diskpart" => return true,
         "vssadmin" => return flag_matches("delete"),
