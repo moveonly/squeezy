@@ -653,6 +653,7 @@ fn windows_restricted_plan(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_shell_sandbox_plan_with_probe(
     command: &str,
     analysis: &ShellPermissionAnalysis,

@@ -542,13 +542,13 @@ impl ToolRegistry {
         // active, even when filesystem/network isolation is unavailable.
         let sandbox_metadata = {
             let mut meta = sandbox_plan.metadata();
-            if let Some(status) = win_job_object_status {
-                if let Some(obj) = meta.as_object_mut() {
-                    obj.insert(
-                        "win_job_object_status".to_string(),
-                        Value::String(status.to_string()),
-                    );
-                }
+            if let Some(status) = win_job_object_status
+                && let Some(obj) = meta.as_object_mut()
+            {
+                obj.insert(
+                    "win_job_object_status".to_string(),
+                    Value::String(status.to_string()),
+                );
             }
             meta
         };
