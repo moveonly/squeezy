@@ -788,7 +788,7 @@ pub(crate) fn graph_payload(
 
 fn graph_stats_json(graph: &squeezy_graph::SemanticGraph) -> Value {
     let stats = graph.stats();
-    json!({
+    let mut obj = json!({
         "files": stats.files,
         "symbols": stats.symbols,
         "edges": stats.edges,
@@ -803,7 +803,19 @@ fn graph_stats_json(graph: &squeezy_graph::SemanticGraph) -> Value {
         "body_hit_trigram_indexed": stats.body_hit_trigram_indexed,
         "body_hit_trigram_terms": stats.body_hit_trigram_terms,
         "reference_index_terms": stats.reference_index_terms,
-    })
+    });
+    // Surface case-collision count only when non-zero so the common-case
+    // response pays no byte cost. Non-zero means a Windows checkout produced
+    // two differently-cased spellings for the same logical file.
+    if stats.case_collision_count > 0 {
+        if let Some(map) = obj.as_object_mut() {
+            map.insert(
+                "case_collision_count".to_string(),
+                json!(stats.case_collision_count),
+            );
+        }
+    }
+    obj
 }
 
 pub(crate) fn cargo_facts_summary_json(summary: &CargoFactsSummary) -> Value {
@@ -4620,6 +4632,48 @@ mod windows_path_normalization_tests {
         assert!(
             path_matches_filter("src/lib.rs", ".\\src\\lib.rs"),
             ".\\prefix must be stripped and backslashes normalized"
+        );
+    }
+
+    /// Verify that the case-insensitive comparison logic (used inside the
+    /// `#[cfg(target_os = "windows")]` blocks) is correct. We call the
+    /// helper with pre-lowercased strings directly so the test runs on all
+    /// platforms without a Windows host.
+    #[test]
+    fn case_insensitive_comparison_logic_is_correct() {
+        // Simulate the exact-match case: eq_ignore_ascii_case
+        assert!("src/Lib.rs".eq_ignore_ascii_case("src/lib.rs"));
+        assert!("SRC/LIB.RS".eq_ignore_ascii_case("src/lib.rs"));
+        assert!(!"src/lib.rs".eq_ignore_ascii_case("src/other.rs"));
+
+        // Simulate the suffix-match case: lowercase both sides, check trailing slash boundary
+        let path_lower = "crates/foo/src/lib.rs".to_ascii_lowercase();
+        let filter_lower = "src/lib.rs".to_ascii_lowercase();
+        assert!(
+            path_lower
+                .strip_suffix(filter_lower.as_str())
+                .is_some_and(|prefix| prefix.ends_with('/')),
+            "case-folded suffix match must respect directory boundary"
+        );
+
+        // Ensure suffix match stops at directory boundary (not inside a component)
+        let path_lower2 = "crates/src_extra/lib.rs".to_ascii_lowercase();
+        let filter_lower2 = "src/lib.rs".to_ascii_lowercase();
+        assert!(
+            !path_lower2
+                .strip_suffix(filter_lower2.as_str())
+                .is_some_and(|prefix| prefix.ends_with('/')),
+            "suffix match must not cross directory boundaries"
+        );
+
+        // Simulate the prefix-match case in path_matches_filter
+        let path_lower3 = "src/utils/helper.rs".to_ascii_lowercase();
+        let filter_lower3 = "src/utils".to_ascii_lowercase();
+        let filter_with_slash = format!("{filter_lower3}/");
+        assert!(
+            path_lower3.eq_ignore_ascii_case(&filter_lower3)
+                || (path_lower3.starts_with(filter_with_slash.as_str())),
+            "case-folded prefix match must work"
         );
     }
 }

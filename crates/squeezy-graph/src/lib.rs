@@ -359,6 +359,11 @@ pub struct GraphStats {
     pub body_hit_trigram_indexed: bool,
     pub body_hit_trigram_terms: usize,
     pub reference_index_terms: usize,
+    /// Number of path pairs whose lowercase spellings collide. Non-zero on
+    /// Windows when a checkout produces two differently-cased spellings for
+    /// the same logical file. Surfaced in graph-status output so operators
+    /// can detect Windows casing-drift artefacts.
+    pub case_collision_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -446,12 +451,12 @@ pub struct SemanticGraph {
     /// indexed file. On case-insensitive filesystems (Windows) this index
     /// lets path-filter helpers skip linear scans and avoids redundant
     /// `canonicalize` calls during watcher event reconciliation.
-    pub files_by_normalized_id: HashMap<String, FileId>,
+    pub(crate) files_by_normalized_id: HashMap<String, FileId>,
     /// Case-collision log: pairs of `FileId` strings whose lowercase forms
     /// are equal. Populated during `rebuild_indexes`; empty on well-formed
     /// repositories, non-empty on Windows when a checkout leaves two
     /// differently-cased spellings for the same logical path.
-    pub case_collisions: Vec<(String, String)>,
+    pub(crate) case_collisions: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -650,6 +655,7 @@ impl SemanticGraph {
             body_hit_trigram_indexed: self.body_hit_trigram_indexed,
             body_hit_trigram_terms: self.body_hit_trigram_index.len(),
             reference_index_terms: self.references_by_text.len(),
+            case_collision_count: self.case_collisions.len(),
         }
     }
 
@@ -3111,16 +3117,24 @@ fn normalize_cargo_file_id(root: &Path, path: &str) -> Option<String> {
         if let Ok(rel) = path.strip_prefix(root) {
             rel.to_path_buf()
         } else {
-            let path_lower = path.to_string_lossy().to_ascii_lowercase();
-            let root_lower = root.to_string_lossy().to_ascii_lowercase();
-            let path_lower_norm = path_lower.replace('\\', "/");
-            let root_lower_norm = root_lower.replace('\\', "/");
-            let root_prefix = if root_lower_norm.ends_with('/') {
-                root_lower_norm.clone()
+            // Case-insensitive prefix strip: use lowercase for *comparison* only,
+            // then slice the original slash-normalized path so relative-path
+            // casing (e.g. `src/MyModule.cs`) is preserved in the FileId.
+            let path_str = path.to_string_lossy();
+            let path_norm = path_str.replace('\\', "/");
+            let root_str = root.to_string_lossy();
+            let root_norm = root_str.replace('\\', "/");
+            let path_lower = path_norm.to_ascii_lowercase();
+            let root_lower = root_norm.to_ascii_lowercase();
+            let root_prefix = if root_lower.ends_with('/') {
+                root_lower.clone()
             } else {
-                format!("{root_lower_norm}/")
+                format!("{root_lower}/")
             };
-            let remainder = path_lower_norm.strip_prefix(&root_prefix)?;
+            // Verify the match, then use the prefix length to slice the
+            // original (correctly-cased) normalized path.
+            path_lower.strip_prefix(&root_prefix)?;
+            let remainder = &path_norm[root_prefix.len()..];
             Path::new(remainder).to_path_buf()
         }
     } else {

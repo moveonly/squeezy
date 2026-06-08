@@ -8960,30 +8960,31 @@ fn normalize_cargo_file_id_handles_relative_and_excluded_paths() {
 #[test]
 fn normalize_cargo_file_id_case_insensitive_fallback() {
     // Build a root path from the temp directory and construct a path that
-    // differs from the root only in casing. On Windows, drive-letter case
-    // differences (C:\ vs c:\) produce this; we simulate it by uppercasing
-    // the root's string representation.
+    // differs from the root prefix only in casing (simulating a Windows
+    // drive-letter or directory-case mismatch). The *relative* portion retains
+    // its original casing so we can assert it is preserved in the output.
     let root = temp_root("cargo-norm-case");
-    let root = root.as_path();
+    let root_norm = root.to_string_lossy().replace('\\', "/");
 
-    let inside = root.join("src").join("lib.rs");
-    let inside_str = inside.to_string_lossy().into_owned();
-
-    // Exact-case: strip_prefix succeeds directly.
+    // Exact-case path with a mixed-case relative portion.
+    let exact_path = format!("{root_norm}/src/MyModule.cs");
     assert_eq!(
-        super::normalize_cargo_file_id(root, &inside_str),
-        Some("src/lib.rs".to_string()),
+        super::normalize_cargo_file_id(&root, &exact_path),
+        Some("src/MyModule.cs".to_string()),
+        "exact case must return the relative path with its original casing"
     );
 
-    // Upper-cased variant: strip_prefix fails, fallback must still resolve.
-    let upper_str = inside_str.to_ascii_uppercase();
-    // Only run this sub-check on platforms where the uppercased path actually
-    // differs from the original (i.e. the path has at least one ASCII letter).
-    if upper_str != inside_str {
+    // Construct a path where the root prefix differs in casing but the
+    // relative portion stays at original casing. This simulates the Windows
+    // scenario where the diagnostic reports `C:\work\src\MyModule.cs` while
+    // the workspace root is `c:\work`.
+    let upper_root = root_norm.to_ascii_uppercase();
+    if upper_root != root_norm {
+        let case_mismatch_path = format!("{upper_root}/src/MyModule.cs");
         assert_eq!(
-            super::normalize_cargo_file_id(root, &upper_str),
-            Some("src/lib.rs".to_string()),
-            "case-insensitive fallback must resolve when path casing differs from root casing"
+            super::normalize_cargo_file_id(&root, &case_mismatch_path),
+            Some("src/MyModule.cs".to_string()),
+            "case-insensitive fallback must preserve the relative path's original casing"
         );
     }
 }

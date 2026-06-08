@@ -273,12 +273,28 @@ pub(crate) fn dotnet_configured_source_facts(
         "csproj" | "directory-build-props" | "directory-build-targets" => {
             let mut facts = Vec::new();
             for value in tag_values(source, "Compile") {
-                if value.ends_with(".cs") {
-                    facts.push(("configured_source", value, "MSBuild Compile item"));
+                if value.ends_with(".cs") || value.to_ascii_lowercase().ends_with(".cs") {
+                    // Normalize backslashes so Windows-style `src\Program.cs`
+                    // produces the same path form as `.sln` project paths.
+                    let normalized = if value.contains('\\') {
+                        value.replace('\\', "/")
+                    } else {
+                        value
+                    };
+                    facts.push(("configured_source", normalized, "MSBuild Compile item"));
                 }
             }
             for value in tag_values(source, "ProjectReference") {
-                facts.push(("project_reference", value, "MSBuild ProjectReference item"));
+                let normalized = if value.contains('\\') {
+                    value.replace('\\', "/")
+                } else {
+                    value
+                };
+                facts.push((
+                    "project_reference",
+                    normalized,
+                    "MSBuild ProjectReference item",
+                ));
             }
             facts
         }

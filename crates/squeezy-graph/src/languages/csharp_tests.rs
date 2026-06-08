@@ -3,6 +3,33 @@ use squeezy_workspace::FileRecord;
 
 use super::*;
 
+#[test]
+fn dotnet_configured_source_facts_normalizes_backslashes() {
+    // Windows .csproj files use backslash paths; the provider must convert
+    // them to forward slashes to match the workspace crawler's FileId format.
+    let csproj_source = r#"<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <Compile Include="src\Program.cs" />
+    <Compile Include="src\Models\User.cs" />
+    <ProjectReference Include="..\Other\Other.csproj" />
+  </ItemGroup>
+</Project>"#;
+    let facts = dotnet_configured_source_facts("csproj", csproj_source);
+    let paths: Vec<&str> = facts.iter().map(|(_, v, _)| v.as_str()).collect();
+    assert!(
+        paths.contains(&"src/Program.cs"),
+        "backslash Compile path must be normalized to forward slash, got: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"src/Models/User.cs"),
+        "nested backslash path must be normalized, got: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"../Other/Other.csproj"),
+        "backslash ProjectReference must be normalized, got: {paths:?}"
+    );
+}
+
 fn csharp_file_record(relative_path: &str) -> FileRecord {
     FileRecord {
         id: FileId::new(relative_path),
