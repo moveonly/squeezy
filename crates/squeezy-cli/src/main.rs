@@ -1247,7 +1247,7 @@ fn skills_paths(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
             source: "XDG_DATA_HOME/squeezy/skills or $HOME/.local/share/squeezy/skills",
         });
     }
-    for (_i, extra) in s.extra_roots.iter().enumerate() {
+    for extra in &s.extra_roots {
         entries.push(PathEntry {
             tier: "extra_root",
             path: extra.clone(),
