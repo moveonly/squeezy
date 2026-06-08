@@ -39,13 +39,14 @@ Squeezy ships a small purpose-built frontmatter reader, not a full YAML parser. 
     - Rust declaration
     - dependency path
   ```
+- Block scalars (`|` literal, `>` folded) with optional chomping/indent indicators for multi-line string values, e.g. a long `description` wrapped in `>-`.
 - Comments on their own line beginning with `#`.
 
-Block scalars (`|`, `>`), trailing inline comments on a value line, escape sequences inside quoted strings, anchors/aliases, and nested mappings are not supported. Malformed `SKILL.md` files are skipped with a `tracing` warning and the rest of the catalog still loads.
+Trailing inline comments on a value line, escape sequences inside quoted strings, anchors/aliases, and nested mappings are not supported. Malformed `SKILL.md` files are skipped with a `tracing` warning and the rest of the catalog still loads.
 
 ## Discovery
 
-Squeezy discovers skills from four locations, from lowest to highest precedence:
+Squeezy discovers skills from five locations, from lowest to highest precedence:
 
 1. `~/.agents/skills/` (compat user)
 2. `~/.squeezy/skills/` (native user)

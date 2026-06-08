@@ -5010,7 +5010,7 @@ fn extract_doc_citations_from_body(body: &str) -> Vec<HelpCitation> {
 }
 
 async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> DocHelpResolution {
-    if !deps.config.subagents.enabled {
+    if !deps.config.subagents.enabled || deps.config.subagents.help_strict_local {
         return DocHelpResolution::skipped();
     }
     let config_inspect = deps.config.inspect_redacted();
@@ -5078,6 +5078,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
             body: execution.summary,
             citations,
             config_sections: Vec::new(),
+            source: squeezy_skills::HelpAnswerSource::DocHelpModel,
         })
     } else {
         None
@@ -6421,6 +6422,19 @@ impl TurnRuntime {
                     missing = ?missing,
                     "skill manifest declares tool_deps that are not available in this session"
                 );
+                let message = format!(
+                    "skill `{skill}` requires tool(s) not available in this session: {}. \
+                     The skill will refuse rather than improvise.",
+                    missing.join(", ")
+                );
+                let _ = self
+                    .tx
+                    .send(AgentEvent::SkillActivationWarning {
+                        turn_id: self.turn_id,
+                        name: skill.clone(),
+                        message,
+                    })
+                    .await;
             }
             Some(format_skill_tool_dep_warnings(&missing_deps))
         };

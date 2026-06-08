@@ -187,6 +187,13 @@ enum Command {
         #[command(subcommand)]
         command: ProvidersCommand,
     },
+    #[command(
+        about = "Show a local Squeezy help topic from bundled docs (same corpus as /help in the TUI)"
+    )]
+    Help {
+        /// Topic name (e.g. skills, providers, config). Omit to list all topics.
+        topic: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -325,6 +332,15 @@ enum SkillsCommand {
     Install {
         #[arg(long, help = "Overwrite an existing target directory")]
         force: bool,
+    },
+    #[command(
+        about = "Show full metadata, triggers, config state, and optional body preview for a skill"
+    )]
+    Show {
+        /// Skill name to inspect.
+        name: String,
+        #[arg(long, help = "Include the first 400 characters of the skill body")]
+        preview: bool,
     },
 }
 
@@ -585,6 +601,7 @@ async fn run() -> squeezy_core::Result<()> {
             return handle_refresh_models(args).await;
         }
         Some(Command::Providers { command }) => return handle_providers_command(command),
+        Some(Command::Help { topic }) => return handle_help_command(topic.as_deref(), &cli),
         None => {}
     }
 
@@ -1146,7 +1163,88 @@ fn handle_skills_command(command: &SkillsCommand, cli: &Cli) -> squeezy_core::Re
         SkillsCommand::Disable(args) => skills_set_enabled(cli, args, false),
         SkillsCommand::Validate { json } => skills_validate(cli, *json),
         SkillsCommand::Install { force } => skills_install(cli, *force),
+        SkillsCommand::Show { name, preview } => skills_show(cli, name, *preview),
     }
+}
+
+fn skills_show(cli: &Cli, name: &str, preview: bool) -> squeezy_core::Result<()> {
+    let config = config_from_cli(cli)?;
+    let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
+    let summaries = catalog.summaries();
+    let Some(summary) = summaries.iter().find(|s| s.name == name) else {
+        return Err(squeezy_core::SqueezyError::Config(format!(
+            "skill `{name}` not found; run `squeezy skills list` to see discovered skills"
+        )));
+    };
+    println!("name:         {}", summary.name);
+    println!("description:  {}", summary.description);
+    if let Some(wu) = &summary.when_to_use {
+        println!("when_to_use:  {wu}");
+    }
+    println!("source:       {}", summary.source.as_str());
+    println!(
+        "state:        {}",
+        if summary.disabled {
+            "disabled"
+        } else if catalog.ambiguous_names().contains(&summary.name) {
+            "ambiguous (duplicate name at same precedence)"
+        } else {
+            "enabled"
+        }
+    );
+    println!("context_mode: {}", summary.context_mode.as_str());
+    println!("location:     {}", summary.location.display());
+    if let Some(manifest) = &summary.manifest {
+        if !manifest.tool_deps.is_empty() {
+            println!("tool_deps:    {}", manifest.tool_deps.join(", "));
+        }
+        if let Some(icon) = &manifest.icon {
+            println!("icon:         {icon}");
+        }
+        if let Some(hint) = &manifest.prompt_hint {
+            println!("prompt_hint:  {hint}");
+        }
+    }
+    // Show ambiguous triggers for this skill.
+    let ambiguous_triggers = catalog.ambiguous_triggers();
+    if !ambiguous_triggers.is_empty() {
+        let skill_triggers: Vec<_> = ambiguous_triggers
+            .iter()
+            .filter(|t| {
+                // Re-discover by loading; if it fails, skip quietly.
+                catalog
+                    .load(&summary.name)
+                    .ok()
+                    .map(|s| s.summary.name == summary.name)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !skill_triggers.is_empty() {
+            let listed = skill_triggers
+                .iter()
+                .map(|t| format!("`{t}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("ambiguous triggers: {listed}");
+        }
+    }
+    if preview {
+        match catalog.load(name) {
+            Ok(loaded) => {
+                let body = &loaded.body;
+                let shown = if body.len() > 400 {
+                    format!("{}…", &body[..400])
+                } else {
+                    body.clone()
+                };
+                println!("\n--- body preview ---\n{shown}");
+            }
+            Err(err) => {
+                println!("body preview: (error loading skill: {err})");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn skills_install(cli: &Cli, force: bool) -> squeezy_core::Result<()> {
@@ -1211,11 +1309,25 @@ fn skills_list(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
         println!("No skills discovered.");
         return Ok(());
     }
-    let mut rows: Vec<[String; 4]> = Vec::with_capacity(summaries.len() + 1);
+    // Warn about ambiguous triggers so users see them without running validate.
+    let ambiguous_triggers = catalog.ambiguous_triggers();
+    if !ambiguous_triggers.is_empty() {
+        let list = ambiguous_triggers
+            .iter()
+            .map(|t| format!("`{t}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "warning: ambiguous trigger phrase(s) declared by multiple skills — auto-activation skipped for {list}. Use `/skill <name>` or `load_skill` to select explicitly, or run `squeezy skills validate` for details.\n"
+        );
+    }
+    const DESC_MAX: usize = 48;
+    let mut rows: Vec<[String; 5]> = Vec::with_capacity(summaries.len() + 1);
     rows.push([
         "NAME".to_string(),
         "STATE".to_string(),
         "SOURCE".to_string(),
+        "DESCRIPTION".to_string(),
         "LOCATION".to_string(),
     ]);
     for summary in &summaries {
@@ -1226,10 +1338,16 @@ fn skills_list(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
         } else {
             "enabled"
         };
+        let desc = if summary.description.len() <= DESC_MAX {
+            summary.description.clone()
+        } else {
+            format!("{}…", &summary.description[..DESC_MAX])
+        };
         rows.push([
             summary.name.clone(),
             state.to_string(),
             summary.source.as_str().to_string(),
+            desc,
             summary.location.display().to_string(),
         ]);
     }
@@ -1238,14 +1356,16 @@ fn skills_list(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
         .collect::<Vec<_>>();
     for row in rows {
         println!(
-            "{:<w0$}  {:<w1$}  {:<w2$}  {}",
+            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {}",
             row[0],
             row[1],
             row[2],
             row[3],
+            row[4],
             w0 = widths[0],
             w1 = widths[1],
             w2 = widths[2],
+            w3 = widths[3],
         );
     }
     Ok(())
@@ -1262,6 +1382,9 @@ fn skills_set_enabled(
     })
 }
 
+/// Maximum body size (in bytes) before `skills validate` emits a size warning.
+const SKILL_BODY_WARN_BYTES: usize = 32_768; // 32 KB
+
 fn skills_validate(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
     let config = config_from_cli(cli)?;
     // Walk every configured skill root directly rather than iterating
@@ -1269,31 +1392,62 @@ fn skills_validate(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
     // files (parse errors, invalid names) with a tracing warn; validate
     // must surface those failures, so it scans the filesystem itself.
     let raw_results = squeezy_skills::validate_skill_dirs(&config.workspace_root, &config.skills);
-    // Build the catalog separately for ambiguous-name detection.
+    // Build the catalog separately for ambiguous-name/trigger detection.
     let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
+    let ambiguous_trigger_set = catalog.ambiguous_triggers();
 
     let mut diagnostics: Vec<serde_json::Value> = Vec::new();
     let mut ok = 0usize;
     let mut errored = 0usize;
     let mut ambiguous = 0usize;
+    let mut warned = 0usize;
     for result in &raw_results {
-        let mut issues: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
         if let Err(err) = &result.outcome {
-            issues.push(err.clone());
+            errors.push(err.clone());
         }
-        // Also flag ambiguous names for skills that parsed successfully.
+        // Flag ambiguous names for skills that parsed successfully.
         if let Some(name) = &result.name
             && catalog.ambiguous_names().contains(name)
         {
             ambiguous += 1;
-            issues.push(
+            errors.push(
                 "duplicate name at same precedence; auto-trigger activation skipped".to_string(),
             );
         }
-        if issues.is_empty() {
+        // Extended authoring lint: check for ambiguous triggers, oversized bodies,
+        // and missing hook scripts when the file parses successfully.
+        if result.outcome.is_ok()
+            && let Some(_name) = &result.name
+        {
+            if let Ok(content) = fs::read_to_string(&result.path) {
+                let skill_dir = result.path.parent().unwrap_or(std::path::Path::new("."));
+                let lint_issues = squeezy_skills::lint_skill_extended(
+                    &content,
+                    skill_dir,
+                    ambiguous_trigger_set,
+                    SKILL_BODY_WARN_BYTES,
+                );
+                for (severity, message) in lint_issues {
+                    if severity == "warning" {
+                        warnings.push(message);
+                    } else {
+                        errors.push(message);
+                    }
+                }
+            }
+        }
+
+        let has_errors = !errors.is_empty();
+        let has_warnings = !warnings.is_empty();
+        if has_errors {
+            errored += 1;
+        } else if has_warnings {
+            warned += 1;
             ok += 1;
         } else {
-            errored += 1;
+            ok += 1;
         }
         let display_name = result.name.as_deref().unwrap_or(
             result
@@ -1303,10 +1457,14 @@ fn skills_validate(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("?"),
         );
+        let mut all_issues = errors.clone();
+        all_issues.extend(warnings.iter().map(|w| format!("warning: {w}")));
         diagnostics.push(serde_json::json!({
             "name": result.name,
             "location": result.path,
-            "issues": issues,
+            "errors": errors,
+            "warnings": warnings,
+            "issues": all_issues,
             "display_name": display_name,
         }));
     }
@@ -1318,6 +1476,7 @@ fn skills_validate(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
                 "skills": diagnostics,
                 "summary": {
                     "ok": ok,
+                    "warned": warned,
                     "errored": errored,
                     "ambiguous": ambiguous,
                     "total": total,
@@ -1331,27 +1490,41 @@ fn skills_validate(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
                 .get("display_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
-            let issues = entry
-                .get("issues")
+            let errors = entry
+                .get("errors")
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.len())
                 .unwrap_or(0);
-            if issues == 0 {
-                println!("ok      {name}");
-            } else {
+            let warnings = entry
+                .get("warnings")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.len())
+                .unwrap_or(0);
+            if errors > 0 {
                 println!("error   {name}");
-                if let Some(issue_arr) = entry.get("issues").and_then(|v| v.as_array()) {
-                    for issue in issue_arr {
-                        if let Some(text) = issue.as_str() {
-                            println!("          {text}");
+                if let Some(arr) = entry.get("errors").and_then(|v| v.as_array()) {
+                    for item in arr {
+                        if let Some(text) = item.as_str() {
+                            println!("          error:   {text}");
                         }
                     }
                 }
+            } else if warnings > 0 {
+                println!("warn    {name}");
+                if let Some(arr) = entry.get("warnings").and_then(|v| v.as_array()) {
+                    for item in arr {
+                        if let Some(text) = item.as_str() {
+                            println!("          warning: {text}");
+                        }
+                    }
+                }
+            } else {
+                println!("ok      {name}");
             }
         }
         println!(
-            "{} ok, {} error(s), {} ambiguous, {} total",
-            ok, errored, ambiguous, total
+            "{} ok, {} warning(s), {} error(s), {} ambiguous, {} total",
+            ok, warned, errored, ambiguous, total
         );
     }
     if errored > 0 || ambiguous > 0 {
@@ -3160,6 +3333,19 @@ fn show_telemetry_notice_once(config: &AppConfig) {
         let _ = fs::create_dir_all(parent);
     }
     let _ = fs::write(path, b"shown\n");
+}
+
+fn handle_help_command(topic: Option<&str>, cli: &Cli) -> squeezy_core::Result<()> {
+    let config = config_from_cli(cli)?;
+    let config_inspect = config.inspect_redacted();
+    let help = squeezy_skills::SqueezyHelp::new(config_inspect);
+    let answer = match topic {
+        None | Some("") => help.topic_index(),
+        Some(t) => help.answer_topic(t),
+    };
+    let rendered = answer.render_markdown();
+    println!("{rendered}");
+    Ok(())
 }
 
 fn telemetry_notice_path() -> PathBuf {

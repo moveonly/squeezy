@@ -5677,6 +5677,7 @@ pub struct SubagentSettings {
     pub max_summary_tokens: Option<u32>,
     pub max_runtime_secs: Option<u64>,
     pub include_transcript: Option<bool>,
+    pub help_strict_local: Option<bool>,
 }
 
 impl SubagentSettings {
@@ -5695,6 +5696,7 @@ impl SubagentSettings {
                 "max_summary_tokens",
                 "max_runtime_secs",
                 "include_transcript",
+                "help_strict_local",
             ],
             source,
             path,
@@ -5761,6 +5763,12 @@ impl SubagentSettings {
                 source,
                 &field(path, "include_transcript"),
             )?,
+            help_strict_local: bool_value(
+                table,
+                "help_strict_local",
+                source,
+                &field(path, "help_strict_local"),
+            )?,
         })
     }
 
@@ -5785,6 +5793,7 @@ impl SubagentSettings {
         replace_if_some(&mut self.max_summary_tokens, next.max_summary_tokens);
         replace_if_some(&mut self.max_runtime_secs, next.max_runtime_secs);
         replace_if_some(&mut self.include_transcript, next.include_transcript);
+        replace_if_some(&mut self.help_strict_local, next.help_strict_local);
     }
 }
 
@@ -5809,6 +5818,13 @@ pub struct SubagentConfig {
     /// (`summary`, `supporting_receipts`, `files_touched`), keeping the
     /// parent loop's context tight.
     pub include_transcript: bool,
+    /// When `true`, unknown `/help` topics that lack a curated local answer
+    /// are refused with a pointer to docs rather than escalated to the
+    /// DocHelp provider subagent. Useful for offline or cost-sensitive
+    /// sessions. Defaults to `false` (DocHelp escalation enabled when
+    /// `subagents.enabled = true`).
+    #[serde(default)]
+    pub help_strict_local: bool,
 }
 
 impl SubagentConfig {
@@ -5877,6 +5893,10 @@ impl SubagentConfig {
                 .as_deref()
                 .map(parse_enabled_bool)
                 .unwrap_or(settings.include_transcript.unwrap_or(false)),
+            help_strict_local: get_var("SQUEEZY_HELP_STRICT_LOCAL")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.help_strict_local.unwrap_or(false)),
         }
     }
 }
@@ -5895,6 +5915,7 @@ impl Default for SubagentConfig {
             max_summary_tokens: DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
             max_runtime_secs: None,
             include_transcript: false,
+            help_strict_local: false,
         }
     }
 }

@@ -18,8 +18,8 @@ pub mod prompt_templates;
 pub mod render;
 
 pub use help::{
-    APPROVAL_POLICY_DOC_PATH, BundledDoc, HelpAnswer, HelpCitation, HelpStatus, SqueezyHelp,
-    bundled_doc, bundled_doc_paths, bundled_docs, matches_squeezy_help_input,
+    APPROVAL_POLICY_DOC_PATH, BundledDoc, HelpAnswer, HelpAnswerSource, HelpCitation, HelpStatus,
+    SqueezyHelp, bundled_doc, bundled_doc_paths, bundled_docs, matches_squeezy_help_input,
     relevant_docs_for_input, slash_command_help_names,
 };
 pub use prompt_templates::{
@@ -205,7 +205,7 @@ pub enum SkillContextMode {
 }
 
 impl SkillContextMode {
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Inline => "inline",
             Self::Fork => "fork",
@@ -711,19 +711,15 @@ impl SkillCatalog {
                 self.active_body_cap_chars,
             )
         } else {
-            // Metadata-only mode: all included, none body-truncated.
-            let rendered = render::render_active_skills_metadata(skills, self.active_budget_chars);
-            let included = if rendered.is_some() { skills.len() } else { 0 };
-            let dropped = skills.len().saturating_sub(included);
-            (
-                rendered,
-                render::SkillActivationMetrics {
-                    total: skills.len(),
-                    included,
-                    dropped,
-                    body_truncated: 0,
-                },
-            )
+            // Metadata-only mode: body_truncated is always 0, but included/dropped
+            // must come from the actual rendering pass because low-priority skills
+            // can be dropped when the metadata block exceeds the budget.
+            let (rendered, mut metrics) = render::render_active_skills_metadata_with_metrics(
+                skills,
+                self.active_budget_chars,
+            );
+            metrics.body_truncated = 0;
+            (rendered, metrics)
         }
     }
 
@@ -1203,7 +1199,7 @@ pub struct SkillDiscoverySummary {
     pub ambiguous: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SkillMetadata {
     name: String,
     description: String,
@@ -1229,6 +1225,73 @@ fn parse_explicit_skill_command(input: &str) -> Option<(&str, &str)> {
     }
     let task = parts.next().unwrap_or("").trim_start();
     Some((name, task))
+}
+
+/// Extended authoring lint for a single `SKILL.md` file.
+///
+/// Returns a list of `(severity, message)` pairs where severity is either
+/// `"error"` or `"warning"`. Callers pass the file content, the skill's
+/// parent directory (for script-existence checks), and the set of trigger
+/// phrases that are ambiguous across the catalog.
+///
+/// This is a best-effort scan: the first parse error terminates the lint
+/// early. An empty return means no issues were found.
+pub fn lint_skill_extended(
+    content: &str,
+    skill_dir: &std::path::Path,
+    ambiguous_triggers: &std::collections::BTreeSet<String>,
+    body_warn_bytes: usize,
+) -> Vec<(&'static str, String)> {
+    let Ok((meta, body)) = parse_skill_file(content) else {
+        return Vec::new();
+    };
+    let mut issues: Vec<(&'static str, String)> = Vec::new();
+
+    // Oversized body.
+    if body.len() > body_warn_bytes {
+        issues.push((
+            "warning",
+            format!(
+                "body is {} bytes (>{} bytes); consider splitting or summarising to reduce context cost",
+                body.len(),
+                body_warn_bytes
+            ),
+        ));
+    }
+
+    // Ambiguous trigger phrases.
+    for trigger in &meta.triggers {
+        let normalised = trigger.trim().to_ascii_lowercase();
+        if ambiguous_triggers.contains(&normalised) {
+            issues.push((
+                "warning",
+                format!(
+                    "trigger `{trigger}` is declared by more than one skill; \
+                     auto-activation skipped for this phrase"
+                ),
+            ));
+        }
+    }
+
+    // Missing hook scripts (hooks referencing relative script paths).
+    for matchers in meta.hooks.values() {
+        for matcher in matchers {
+            for hook in &matcher.hooks {
+                let cmd = hook.command.trim();
+                if cmd.starts_with("scripts/") || cmd.starts_with("./scripts/") {
+                    let script_path = skill_dir.join(cmd);
+                    if !script_path.exists() {
+                        issues.push((
+                            "warning",
+                            format!("hook command `{cmd}` references a script that does not exist"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    issues
 }
 
 fn parse_skill_file(content: &str) -> std::result::Result<(SkillMetadata, String), String> {
