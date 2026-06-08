@@ -11704,6 +11704,7 @@ fn shell_best_effort_falls_back_when_sandbox_dies_without_output() {
         raw_spillover: None,
         tty_downgraded: false,
         windows_job_assigned: None,
+        windows_timeout_job_cleanup_ok: None,
     };
 
     let reason =
@@ -11858,6 +11859,7 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
         raw_spillover: None,
         tty_downgraded: false,
         windows_job_assigned: None,
+        windows_timeout_job_cleanup_ok: None,
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run)

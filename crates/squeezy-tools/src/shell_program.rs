@@ -47,7 +47,9 @@ impl ShellProgram {
     ///   `/D /S /C` for cmd).
     ///
     /// The resolved shell binary is cached for the process lifetime and
-    /// invalidated when `SQUEEZY_SHELL` or `SQUEEZY_GIT_BASH_PATH` changes.
+    /// invalidated when `SQUEEZY_SHELL` changes. Only the default (no
+    /// override) shell path is cached; override and git-bash paths bypass
+    /// the cache because they involve per-call env-var reads of their own.
     /// This avoids repeated `which::which` PATH walks on Windows for every
     /// shell tool call.
     pub(crate) fn for_command(command: &str) -> Self {
@@ -175,6 +177,17 @@ impl ShellProgram {
                 "/C".to_string(),
                 command.to_string(),
             ],
+        }
+    }
+
+    /// Reset the per-process shell cache. Only available in test builds; call
+    /// this in test setup when the expected default shell may differ between
+    /// tests (e.g. after a PATH change or before testing the
+    /// `pwsh → powershell → cmd.exe` fallback chain).
+    #[cfg(test)]
+    pub(crate) fn reset_shell_cache() {
+        if let Ok(mut guard) = SHELL_BASE_CACHE.lock() {
+            *guard = None;
         }
     }
 

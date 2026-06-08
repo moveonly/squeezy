@@ -14349,12 +14349,10 @@ fn emit_tool_telemetry(
             &fallback.backend,
         ));
     }
-    // Windows: fire the same telemetry dimension so Windows shell backend
-    // degradation is separable from Unix fallback behavior in dashboards.
+    // Windows: fire a separate telemetry event so Windows shell backend
+    // degradation is separable from Unix sandbox runtime failures in dashboards.
     if let Some(degraded) = shell_windows_degraded_from_result(result) {
-        telemetry.spawn(TelemetryEvent::shell_sandbox_best_effort_fallback(
-            &degraded.backend,
-        ));
+        telemetry.spawn(TelemetryEvent::shell_windows_degraded(&degraded.backend));
     }
 }
 
@@ -14389,23 +14387,20 @@ async fn maybe_emit_shell_sandbox_fallback_warning(
         return;
     }
     // Windows: every shell run uses `windows-job-object` with no FS/network
-    // isolation. Emit the warning once per session so the TUI can display
-    // the same safety banner that Unix best_effort fallbacks receive.
+    // isolation. Emit the dedicated Windows warning once per session so the
+    // TUI can display a Windows-specific safety notice.
     if let Some(ShellWindowsDegraded {
         backend,
+        filesystem,
         first_in_session,
-        ..
     }) = shell_windows_degraded_from_result(result)
         && first_in_session
     {
         let _ = tx
-            .send(AgentEvent::ShellSandboxBestEffortFallback {
+            .send(AgentEvent::ShellWindowsDegraded {
                 turn_id,
                 backend,
-                // Windows degradation is not a runtime fallback; use 0
-                // as the count sentinel so callers can distinguish it from
-                // a Unix sandbox failure.
-                fallback_count: 0,
+                filesystem,
             })
             .await;
     }
@@ -17593,6 +17588,16 @@ pub enum AgentEvent {
         turn_id: TurnId,
         backend: String,
         fallback_count: u64,
+    },
+    /// Fires once per session on Windows when the first shell result reports
+    /// `windows-job-object` or `best_effort_unavailable` filesystem isolation.
+    /// Unlike [`ShellSandboxBestEffortFallback`] this is not a runtime
+    /// failure; it describes the steady-state Windows sandbox posture and lets
+    /// the TUI display a Windows-specific safety notice.
+    ShellWindowsDegraded {
+        turn_id: TurnId,
+        backend: String,
+        filesystem: String,
     },
     /// Per-turn progress callout emitted every few tool calls so a user
     /// watching a live transcript can see cost accumulating before the

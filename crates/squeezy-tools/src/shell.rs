@@ -79,6 +79,10 @@ pub(crate) struct ShellRunOutcome {
     /// means creation or assignment failed and process-tree cleanup is
     /// best-effort only.
     pub(crate) windows_job_assigned: Option<bool>,
+    /// Result of `TerminateJobObject` called during a timeout cleanup.
+    /// `None` when not on Windows, not timed out, or no job object was held.
+    /// `Some(false)` means descendants may survive the timeout.
+    pub(crate) windows_timeout_job_cleanup_ok: Option<bool>,
 }
 
 struct ShellRunRequest<'a> {
@@ -419,6 +423,7 @@ impl ToolRegistry {
             raw_spillover,
             tty_downgraded,
             windows_job_assigned,
+            windows_timeout_job_cleanup_ok,
         } = run;
 
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
@@ -546,18 +551,32 @@ impl ToolRegistry {
                 }),
             );
         }
-        if let Some(assigned) = windows_job_assigned {
-            insert_content_field(
-                &mut raw_content,
-                "windows",
-                json!({
-                    "job_object_assigned": assigned,
-                    "cleanup_note": if assigned {
+        if windows_job_assigned.is_some() || windows_timeout_job_cleanup_ok.is_some() {
+            let mut windows_info = serde_json::Map::new();
+            if let Some(assigned) = windows_job_assigned {
+                windows_info.insert("job_object_assigned".to_string(), json!(assigned));
+                windows_info.insert(
+                    "cleanup_note".to_string(),
+                    json!(if assigned {
                         "process tree will be terminated with the job"
                     } else {
                         "Job Object assignment failed; only direct child is covered by kill_on_drop"
-                    }
-                }),
+                    }),
+                );
+            }
+            if let Some(cleanup_ok) = windows_timeout_job_cleanup_ok {
+                windows_info.insert("timeout_job_cleanup".to_string(), json!(cleanup_ok));
+                if !cleanup_ok {
+                    windows_info.insert(
+                        "timeout_cleanup_note".to_string(),
+                        json!("TerminateJobObject failed on timeout; descendant processes may still be running"),
+                    );
+                }
+            }
+            insert_content_field(
+                &mut raw_content,
+                "windows",
+                serde_json::Value::Object(windows_info),
             );
         }
         if tty_downgraded {
@@ -875,10 +894,16 @@ impl ToolRegistry {
         let status = tokio::select! {
             _ = cancel.cancelled() => {
                 terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                // Mirror the correct cleanup status: only call terminate when
+                // the process was actually assigned to the job.  If assignment
+                // failed, the job object is empty and TerminateJobObject would
+                // report success while descendants survive.
                 #[cfg(windows)]
-                let cancel_job_cleanup_ok = if let Some(job) = shell_job.as_ref() {
-                    Some(job.terminate(1).is_ok())
+                let cancel_job_cleanup_ok = if windows_job_assigned == Some(true) {
+                    shell_job.as_ref().map(|job| job.terminate(1).is_ok())
                 } else {
+                    // Assignment failed or no job object: direct child is
+                    // covered by kill_on_drop, but descendants may survive.
                     windows_job_assigned.map(|_| false)
                 };
                 #[cfg(not(windows))]
@@ -894,13 +919,24 @@ impl ToolRegistry {
         };
 
         let timed_out = status.is_err();
+        #[cfg(windows)]
+        let mut windows_timeout_job_cleanup_ok: Option<bool> = None;
+        #[cfg(not(windows))]
+        let windows_timeout_job_cleanup_ok: Option<bool> = None;
         let exit_status = match status {
             Ok(Ok(status)) => Some(status),
             Err(_) => {
                 terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
                 #[cfg(windows)]
-                if let Some(job) = shell_job.as_ref() {
-                    let _ = job.terminate(1);
+                {
+                    // Only terminate the job when the process was actually
+                    // assigned; an empty job object would silently succeed
+                    // while descendants survive.
+                    windows_timeout_job_cleanup_ok = if windows_job_assigned == Some(true) {
+                        shell_job.as_ref().map(|job| job.terminate(1).is_ok())
+                    } else {
+                        windows_job_assigned.map(|_| false)
+                    };
                 }
                 None
             }
@@ -942,6 +978,7 @@ impl ToolRegistry {
             raw_spillover,
             tty_downgraded,
             windows_job_assigned,
+            windows_timeout_job_cleanup_ok,
         })
     }
 }

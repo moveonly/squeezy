@@ -687,6 +687,7 @@ async fn run_agent_with_config(
             | AgentEvent::ReasoningDelta { .. }
             | AgentEvent::ReasoningSegment { .. }
             | AgentEvent::ShellSandboxBestEffortFallback { .. }
+            | AgentEvent::ShellWindowsDegraded { .. }
             | AgentEvent::TurnRouted { .. } => {}
         }
     }
