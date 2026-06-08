@@ -4,7 +4,7 @@ use clap::Args;
 use serde_json::json;
 use squeezy_core::{
     AppConfig, McpServerConfig, McpTransport, ProviderConfig, ProviderSettings, Result,
-    SettingsFile, default_settings_path,
+    SettingsFile, SqueezyError, default_settings_path,
 };
 use squeezy_llm::{
     KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
@@ -469,16 +469,27 @@ fn graph_store_check(config: &AppConfig) -> Check {
         },
         Err(error) => {
             // On Windows, another agent process holding graph.redb open will
-            // cause a sharing-violation error; distinguish that from a real
-            // open failure so the user isn't told persistence is broken.
-            let is_locked = error
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("sharing violation")
-                || error
-                    .to_string()
-                    .to_ascii_lowercase()
-                    .contains("access is denied");
+            // fail this probe with ERROR_SHARING_VIOLATION (32) or
+            // ERROR_LOCK_VIOLATION (33); occasionally ERROR_ACCESS_DENIED (5).
+            // Distinguish that from a real open failure so the user isn't told
+            // persistence is broken when it's actually just another live
+            // Squeezy session. The literal Win32 messages for codes 32/33 do
+            // *not* contain the phrase "sharing violation", so we match by
+            // `raw_os_error()` first (when we can recover the underlying
+            // `io::Error`), and fall back to substring markers that *do*
+            // appear in those messages ("being used by another process",
+            // "another process has locked").
+            let text = error.to_string();
+            let is_locked = match &error {
+                SqueezyError::Io(io_err) => matches!(io_err.raw_os_error(), Some(5 | 32 | 33)),
+                _ => false,
+            } || {
+                let lower = text.to_ascii_lowercase();
+                lower.contains("being used by another process")
+                    || lower.contains("another process has locked")
+                    || lower.contains("sharing violation")
+                    || lower.contains("access is denied")
+            };
             if is_locked {
                 Check {
                     name: "graph_store".to_string(),
@@ -493,7 +504,7 @@ fn graph_store_check(config: &AppConfig) -> Check {
                     name: "graph_store".to_string(),
                     status: Status::Warn,
                     detail: format!(
-                        "{error}; graph persistence will be disabled until graph.redb can be opened: {}",
+                        "{text}; graph persistence will be disabled until graph.redb can be opened: {}",
                         path.display()
                     ),
                 }
@@ -526,10 +537,38 @@ fn user_global_storage_check(config: &AppConfig) -> Check {
     }
 }
 
+/// Substrings (lowercased) that mark a path component as belonging to a
+/// known consumer cloud-sync client root. Matches the spellings that
+/// real-world Windows / macOS / Linux installers create; the heuristic is
+/// intentionally over-eager — false positives cost a single doctor warn,
+/// while a missed sync mount can cost the user repeated cache corruption
+/// when the agent races the sync engine.
+const SYNCED_FOLDER_MARKERS: &[&str] = &[
+    "onedrive",
+    "dropbox",
+    "googledrive",
+    "google drive",
+    "drive file stream",
+    "drivefs",
+    "icloud drive",
+    "icloud-drive",
+    "icloud_drive",
+    "icloud~drive",
+    "syncthing",
+    "pcloud",
+    "sync.com",
+    "nextcloud",
+    "owncloud",
+    "yandex.disk",
+    "yandexdisk",
+];
+
 fn workspace_looks_synced(path: &std::path::Path) -> bool {
     path.components().any(|component| {
         let name = component.as_os_str().to_string_lossy().to_ascii_lowercase();
-        name.contains("onedrive") || name.contains("dropbox")
+        SYNCED_FOLDER_MARKERS
+            .iter()
+            .any(|marker| name.contains(marker))
     })
 }
 

@@ -167,18 +167,44 @@ impl SqueezyStore {
                         );
                     }
                     Err(rotate_err) => {
-                        // Rotation blocked (e.g. Windows file lock). Delete and
-                        // bootstrap fresh — we cannot safely use a store with
-                        // a mismatched schema, and the old data is still on disk.
-                        let _ = fs::remove_file(&path);
-                        bootstrap_store(workspace_root, cache_root)?;
-                        tracing::warn!(
-                            target: "squeezy::store",
-                            on_disk_version,
-                            schema_version = SCHEMA_VERSION,
-                            rotate_error = %rotate_err,
-                            "state.redb schema mismatch; rotation failed, existing store deleted and reinitialised without migration",
-                        );
+                        // The plain `fs::rename` rotation above goes through
+                        // Win32 `MoveFileExW` *without* the `\\?\` extended-path
+                        // prefix, so it loses on paths past MAX_PATH. Retry via
+                        // `fs_util::replace_file`, which adds the prefix (and
+                        // `MOVEFILE_REPLACE_EXISTING`). When that succeeds we
+                        // still get a backup + table copy; only when both
+                        // attempts fail do we fall through to the destructive
+                        // reset.
+                        match fs_util::replace_file(&path, &backup) {
+                            Ok(()) => {
+                                bootstrap_store(workspace_root, cache_root)?;
+                                copy_state_tables(&backup, &path)?;
+                                tracing::warn!(
+                                    target: "squeezy::store",
+                                    on_disk_version,
+                                    schema_version = SCHEMA_VERSION,
+                                    backup = %backup.display(),
+                                    rotate_error = %rotate_err,
+                                    "state.redb schema mismatch; rename rotation failed but extended-path replace succeeded; existing store backed up and reinitialised",
+                                );
+                            }
+                            Err(replace_err) => {
+                                // Both rotation attempts blocked (e.g.
+                                // Windows file lock). Delete and bootstrap
+                                // fresh — we cannot safely use a store with
+                                // a mismatched schema.
+                                let _ = fs::remove_file(&path);
+                                bootstrap_store(workspace_root, cache_root)?;
+                                tracing::warn!(
+                                    target: "squeezy::store",
+                                    on_disk_version,
+                                    schema_version = SCHEMA_VERSION,
+                                    rotate_error = %rotate_err,
+                                    replace_error = %replace_err,
+                                    "state.redb schema mismatch; rotation failed, existing store deleted and reinitialised without migration",
+                                );
+                            }
+                        }
                     }
                 }
                 open_database(&path)?
@@ -633,16 +659,36 @@ impl GraphStore {
                         );
                     }
                     Err(rotate_err) => {
-                        // Rotation blocked (e.g. Windows file lock). Delete and
-                        // reinitialise fresh without the backup.
-                        let _ = fs::remove_file(&path);
-                        tracing::warn!(
-                            target: "squeezy::store",
-                            on_disk_version,
-                            schema_version = GRAPH_SCHEMA_VERSION,
-                            rotate_error = %rotate_err,
-                            "graph.redb schema mismatch; rotation failed, existing graph cache deleted and reinitialised",
-                        );
+                        // Same extended-path retry as the state-store path:
+                        // try `replace_file` (MoveFileExW + `\\?\`) before
+                        // deleting, so paths past MAX_PATH still get the
+                        // friendly backup.
+                        match fs_util::replace_file(&path, &backup) {
+                            Ok(()) => {
+                                tracing::warn!(
+                                    target: "squeezy::store",
+                                    on_disk_version,
+                                    schema_version = GRAPH_SCHEMA_VERSION,
+                                    backup = %backup.display(),
+                                    rotate_error = %rotate_err,
+                                    "graph.redb schema mismatch; rename rotation failed but extended-path replace succeeded; existing graph cache backed up and reinitialised",
+                                );
+                            }
+                            Err(replace_err) => {
+                                // Both rotation attempts blocked (e.g.
+                                // Windows file lock). Delete and reinitialise
+                                // fresh without the backup.
+                                let _ = fs::remove_file(&path);
+                                tracing::warn!(
+                                    target: "squeezy::store",
+                                    on_disk_version,
+                                    schema_version = GRAPH_SCHEMA_VERSION,
+                                    rotate_error = %rotate_err,
+                                    replace_error = %replace_err,
+                                    "graph.redb schema mismatch; rotation failed, existing graph cache deleted and reinitialised",
+                                );
+                            }
+                        }
                     }
                 }
                 bootstrap_graph_store(&path)?;
@@ -994,11 +1040,26 @@ pub struct CacheDiagnostics {
     pub backup_total_bytes: u64,
 }
 
+/// Outcome of [`prune_cache_backups`]. Partial failures land in
+/// `failed_files` instead of short-circuiting the prune so the caller can
+/// surface a per-file summary (the doctor row uses both halves), but
+/// callers that previously pattern-matched `Err(io::ErrorKind::…)` on the
+/// old signature would silently miss those failures — hence `#[must_use]`
+/// and [`Self::errored`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[must_use = "CachePruneReport carries partial failures in `failed_files`; ignore only intentionally"]
 pub struct CachePruneReport {
     pub removed_files: Vec<CacheFileReport>,
     pub removed_bytes: u64,
     pub failed_files: Vec<(PathBuf, String)>,
+}
+
+impl CachePruneReport {
+    /// `Some` iff at least one backup failed to delete. Lets callers test
+    /// for partial failure without re-checking the `failed_files` field.
+    pub fn errored(&self) -> Option<&[(PathBuf, String)]> {
+        (!self.failed_files.is_empty()).then_some(self.failed_files.as_slice())
+    }
 }
 
 pub fn cache_diagnostics(
@@ -1267,10 +1328,19 @@ fn decode<T: DeserializeOwned>(value: &[u8]) -> Result<T> {
 }
 
 fn store_error(error: impl std::fmt::Display) -> SqueezyError {
-    SqueezyError::Tool(format!(
-        "store error: {}",
-        fs_util::windows_storage_hint(&error)
-    ))
+    // The Windows storage hint mentions file locks / AV / sync clients, which
+    // is appropriate for IO-shaped failures (sharing violation, access denied,
+    // etc.) and misleading for JSON decode, schema migration, or other
+    // redb-internal errors. `std::io::Error`'s `Display` impl always includes
+    // the `(os error N)` suffix, so we gate the hint on that marker — IO
+    // errors keep the explanation, structured-data errors stay terse.
+    let text = error.to_string();
+    let formatted = if text.contains("os error") {
+        fs_util::windows_storage_hint(&text)
+    } else {
+        text
+    };
+    SqueezyError::Tool(format!("store error: {formatted}"))
 }
 
 fn receipt_key(tool_name: &str, stable_output_sha256: &str) -> String {

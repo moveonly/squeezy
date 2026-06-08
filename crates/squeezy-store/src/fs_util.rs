@@ -105,28 +105,37 @@ pub fn windows_storage_hint(error: &dyn std::fmt::Display) -> String {
 }
 
 pub(crate) fn unique_temp_path(path: &Path) -> PathBuf {
-    let stem = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("squeezy-state");
+    let stem = temp_stem(path);
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    for attempt in 0..32u32 {
-        let nonce = randomish_nonce();
-        let tmp = parent.join(format!(
-            ".{stem}.{}.{}.{}.tmp",
-            std::process::id(),
-            nonce,
-            attempt
-        ));
-        if !tmp.exists() {
-            return tmp;
-        }
+    let nonce = randomish_nonce();
+    // The 128-bit nonce plus pid is collision-proof in practice, so we skip
+    // the `Path::exists()` probe that used to gate this call. `create_new(true)`
+    // in `write_bytes_atomically` is itself atomic and will surface
+    // `AlreadyExists` to the caller on the astronomically unlikely collision.
+    parent.join(format!(".{stem}.{}.{nonce}.tmp", std::process::id()))
+}
+
+/// Build a stable, identifiable temp-file stem for `path`. Prefers the
+/// file name's UTF-8 form so the temp visually matches the destination on
+/// directory listings. Falls back to a hex encoding of the underlying
+/// bytes when the file name is not UTF-8 (rare on Windows, possible on
+/// Unix) so the temp still encodes the destination uniquely instead of
+/// collapsing every non-UTF-8 name onto the synthetic `"squeezy-state"`
+/// stem the previous implementation used.
+fn temp_stem(path: &Path) -> String {
+    let Some(name) = path.file_name() else {
+        return "squeezy-state".to_string();
+    };
+    if let Some(text) = name.to_str() {
+        return text.to_string();
     }
-    parent.join(format!(
-        ".{stem}.{}.{}.tmp",
-        std::process::id(),
-        randomish_nonce()
-    ))
+    let bytes = name.as_encoded_bytes();
+    let mut out = String::with_capacity(bytes.len() * 2 + 9);
+    out.push_str("squeezy-");
+    for byte in bytes {
+        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{byte:02x}"));
+    }
+    out
 }
 
 fn annotate_replace_error(error: io::Error) -> SqueezyError {
@@ -160,36 +169,76 @@ fn json_error(error: serde_json::Error) -> SqueezyError {
 
 fn randomish_nonce() -> u128 {
     let mut bytes = [0u8; 16];
-    if getrandom::fill(&mut bytes).is_ok() {
-        return u128::from_le_bytes(bytes);
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => u128::from_le_bytes(bytes),
+        Err(error) => {
+            tracing::warn!(
+                target: "squeezy::store",
+                %error,
+                "getrandom failed; falling back to system-time nanos for temp-path nonce",
+            );
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        }
     }
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0)
 }
 
 #[cfg(windows)]
 fn replace_file_windows(from: &Path, to: &Path) -> io::Result<()> {
-    use std::{ffi::OsString, iter, os::windows::ffi::OsStrExt};
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
-    // MoveFileExW does not honour the long-path registry setting.  For paths
-    // longer than MAX_PATH, use the \\?\ extended-length prefix.  That prefix
+    // MoveFileExW does not honour the long-path registry setting. For paths
+    // longer than MAX_PATH, use the `\\?\` extended-length prefix. That prefix
     // requires (a) an absolute path and (b) only backslash separators — forward
-    // slashes are not accepted.  Normalise any forward slashes before prefixing.
+    // slashes are not accepted.
+    //
+    // We work directly on the UTF-16 (`encode_wide`) representation rather than
+    // round-tripping through `to_string_lossy` so that the rare non-UTF-8
+    // (unpaired-surrogate) `OsString` segments Windows admits are preserved
+    // verbatim instead of being silently replaced with U+FFFD before the
+    // Win32 call.
+    //
+    // Three absolute-path shapes are recognised:
+    //   * `\\?\...`         — already in extended form; pass through unchanged.
+    //   * `\\server\share\` — UNC; rewritten to `\\?\UNC\server\share\` so the
+    //                         long-path limit also lifts for network shares.
+    //   * everything else absolute — get a plain `\\?\` prefix.
     fn wide(path: &Path) -> Vec<u16> {
-        let as_str = path.as_os_str().to_string_lossy();
-        // Normalise forward slashes → backslashes required by \\?\ paths.
-        let normalised = as_str.replace('/', "\\");
-        let extended: OsString = if path.is_absolute() && !normalised.starts_with(r"\\") {
-            OsString::from(format!(r"\\?\{normalised}"))
+        const BACKSLASH: u16 = b'\\' as u16;
+        const QUESTION_MARK: u16 = b'?' as u16;
+
+        let normalised: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .map(|c| if c == b'/' as u16 { BACKSLASH } else { c })
+            .collect();
+        let starts_with_double_backslash =
+            normalised.len() >= 2 && normalised[0] == BACKSLASH && normalised[1] == BACKSLASH;
+        let already_extended = starts_with_double_backslash
+            && normalised.len() >= 4
+            && normalised[2] == QUESTION_MARK
+            && normalised[3] == BACKSLASH;
+
+        let mut buf: Vec<u16> = Vec::with_capacity(normalised.len() + 8);
+        if already_extended || !path.is_absolute() {
+            buf.extend_from_slice(&normalised);
+        } else if starts_with_double_backslash {
+            // `\\server\share\...` -> `\\?\UNC\server\share\...`. The
+            // `\\?\UNC\` prefix ends with a backslash, so skip the two
+            // leading backslashes from `normalised` to avoid doubling them.
+            buf.extend(r"\\?\UNC\".encode_utf16());
+            buf.extend_from_slice(&normalised[2..]);
         } else {
-            OsString::from(normalised)
-        };
-        extended.encode_wide().chain(iter::once(0)).collect()
+            buf.extend(r"\\?\".encode_utf16());
+            buf.extend_from_slice(&normalised);
+        }
+        buf.push(0);
+        buf
     }
 
     let from = wide(from);

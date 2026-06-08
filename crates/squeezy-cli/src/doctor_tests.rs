@@ -411,12 +411,46 @@ fn graph_store_check_opens_existing_redb_in_tempdir() {
 #[test]
 fn user_global_storage_warns_for_synced_workspace_with_default_cache() {
     let mut config = AppConfig::from_env();
-    config.workspace_root = PathBuf::from(r"C:\Users\dev\OneDrive\repo");
+    // Use forward slashes so the path parses into multiple components on
+    // both Windows and Unix; `workspace_looks_synced` is component-based
+    // and the substring `onedrive` matches case-insensitively either way.
+    config.workspace_root = PathBuf::from("/home/dev/OneDrive/repo");
     config.cache.root = None;
     let check = user_global_storage_check(&config);
     assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
     assert!(check.detail.contains("synced folder"));
     assert!(check.detail.contains("[cache].root"));
+}
+
+#[test]
+fn workspace_looks_synced_matches_known_cloud_clients() {
+    let positive = [
+        "/home/dev/OneDrive/repo",
+        "/home/dev/Dropbox/work/repo",
+        "/Users/dev/Library/CloudStorage/GoogleDrive-me/repo",
+        "/Users/dev/Library/CloudStorage/iCloud Drive/repo",
+        "/home/dev/Nextcloud/code",
+        "/home/dev/Syncthing/repo",
+        "/home/dev/pCloud Drive/repo",
+    ];
+    for path in positive {
+        assert!(
+            workspace_looks_synced(std::path::Path::new(path)),
+            "expected sync detection for {path}",
+        );
+    }
+    let negative = [
+        "/home/dev/code/squeezy",
+        "/Users/dev/Documents/repo",
+        "/tmp/sandbox",
+        "/home/dev/toolbox",
+    ];
+    for path in negative {
+        assert!(
+            !workspace_looks_synced(std::path::Path::new(path)),
+            "did not expect sync detection for {path}",
+        );
+    }
 }
 
 #[test]

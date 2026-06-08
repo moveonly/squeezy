@@ -268,46 +268,17 @@ impl SessionStore {
         {
             return entries;
         }
-        let (mut entries, raw_lines) = {
-            let Ok(file) = fs::File::open(&path) else {
-                return Vec::new();
-            };
-            let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
-            let mut reader = BufReader::new(file);
-            let mut line = String::new();
-            let mut raw_lines = 0usize;
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(_) => return Vec::new(),
-                }
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(trimmed) else {
-                    continue;
-                };
-                raw_lines += 1;
-                match by_id.get(&entry.session_id) {
-                    Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => {
-                        continue;
-                    }
-                    _ => {
-                        by_id.insert(entry.session_id.clone(), entry);
-                    }
-                }
-            }
-            (by_id.into_values().collect::<Vec<_>>(), raw_lines)
+        let Ok(raw_entries) = read_global_index_entries(&path) else {
+            return Vec::new();
         };
-        // Drop all but the most-recent `GLOBAL_INDEX_MAX_ENTRIES` so the index
-        // can never grow unbounded with a user's lifetime session count. The
-        // newest-first return order below is what the picker consumes.
-        entries.sort_by_key(|entry| std::cmp::Reverse(entry.last_event_at_ms));
-        let trimmed_to_cap = entries.len() > GLOBAL_INDEX_MAX_ENTRIES;
-        entries.truncate(GLOBAL_INDEX_MAX_ENTRIES);
+        let raw_lines = raw_entries.len();
+        // `compact_global_index_entries` is shared with `rewrite_global_index`
+        // so the dedup-by-id + cap policy lives in one place. Both callers
+        // agree on "newest `last_event_at_ms` wins" and the
+        // `GLOBAL_INDEX_MAX_ENTRIES` ceiling; only the post-compaction
+        // ordering differs (this caller surfaces newest-first by
+        // `started_at_ms`; the rewriter persists oldest-first).
+        let mut entries = compact_global_index_entries(raw_entries);
         let oversized = fs::metadata(&path)
             .map(|meta| meta.len() > GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES)
             .unwrap_or(false);
@@ -315,7 +286,7 @@ impl SessionStore {
         // the cap, or dedup collapsed duplicate appends). Rewriting an already
         // minimal, all-distinct index on every read — as the byte-threshold
         // alone did — is pure write+fsync waste that scales with history.
-        if oversized && (trimmed_to_cap || raw_lines > entries.len()) {
+        if oversized && raw_lines > entries.len() {
             let mut ordered: Vec<&GlobalSessionIndexEntry> = entries.iter().collect();
             // Compact in oldest-first order so future appends keep the newest
             // entries at the tail — matches how readers see time.
@@ -1300,6 +1271,11 @@ fn lock_append_path(path: &Path) -> std::io::Result<fs::File> {
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    // `truncate(false)` is the `OpenOptions` default, but clippy's
+    // `suspicious_open_options` lint requires an explicit choice when
+    // `create(true).write(true)` is set so a reader of the call site does
+    // not have to remember which side of the default the call falls on.
+    // Lock files are zero-byte sentinels; preserving any contents is fine.
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -2923,34 +2899,23 @@ fn cache_global_index(path: &Path, entries: &[GlobalSessionIndexEntry]) {
 }
 
 /// Replace the global session index file with the supplied entries via a
-/// unique tmp + replace so concurrent readers never see a half-written file. The
-/// caller chooses the iteration order; readers re-sort by
-/// `started_at_ms`.
+/// unique tmp + replace so concurrent readers never see a half-written
+/// file. The caller chooses the iteration order; readers re-sort by
+/// `started_at_ms`. Dedup + cap goes through
+/// [`compact_global_index_entries`] so the policy stays in lock-step with
+/// the reader path in `list_global_index`.
 fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let lock = lock_append_path(path)?;
-    let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
-    for entry in read_global_index_entries(path)? {
-        match by_id.get(&entry.session_id) {
-            Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => continue,
-            _ => {
-                by_id.insert(entry.session_id.clone(), entry);
-            }
-        }
-    }
-    for entry in entries {
-        match by_id.get(&entry.session_id) {
-            Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => continue,
-            _ => {
-                by_id.insert(entry.session_id.clone(), (*entry).clone());
-            }
-        }
-    }
-    let mut compacted: Vec<GlobalSessionIndexEntry> = by_id.into_values().collect();
-    compacted.sort_by_key(|entry| std::cmp::Reverse(entry.last_event_at_ms));
-    compacted.truncate(GLOBAL_INDEX_MAX_ENTRIES);
+    let existing = read_global_index_entries(path)?;
+    let merged = existing
+        .into_iter()
+        .chain(entries.iter().map(|entry| (*entry).clone()));
+    let mut compacted = compact_global_index_entries(merged);
+    // Persist oldest-first so subsequent appends keep the newest entries
+    // at the tail — matches how readers see time.
     compacted.sort_by_key(|entry| entry.started_at_ms);
     let tmp = fs_util::unique_temp_path(path);
     {
@@ -2973,6 +2938,29 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
     // when `lock` drops regardless.
     let _ = lock.unlock();
     Ok(())
+}
+
+/// Apply the dedup-by-`session_id` (keep the entry with the largest
+/// `last_event_at_ms`) and the `GLOBAL_INDEX_MAX_ENTRIES` cap to
+/// `entries`. Returns the compacted set sorted newest-first by
+/// `last_event_at_ms`; callers that need a different iteration order
+/// (e.g. oldest-first for on-disk layout) re-sort the returned vector.
+fn compact_global_index_entries(
+    entries: impl IntoIterator<Item = GlobalSessionIndexEntry>,
+) -> Vec<GlobalSessionIndexEntry> {
+    let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
+    for entry in entries {
+        match by_id.get(&entry.session_id) {
+            Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => continue,
+            _ => {
+                by_id.insert(entry.session_id.clone(), entry);
+            }
+        }
+    }
+    let mut compacted: Vec<GlobalSessionIndexEntry> = by_id.into_values().collect();
+    compacted.sort_by_key(|entry| std::cmp::Reverse(entry.last_event_at_ms));
+    compacted.truncate(GLOBAL_INDEX_MAX_ENTRIES);
+    compacted
 }
 
 fn read_global_index_entries(path: &Path) -> std::io::Result<Vec<GlobalSessionIndexEntry>> {

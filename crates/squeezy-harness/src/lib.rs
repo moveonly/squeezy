@@ -654,11 +654,18 @@ async fn run_agent_with_config(
                 break;
             }
             AgentEvent::Failed { error, .. } => {
+                // Shut the agent down before deleting its workspace so the
+                // background event-loop drops every redb handle it owns.
+                // Without this, the subsequent `remove_dir_all` races the
+                // agent's exclusive lock on `state.redb` / `graph.redb` on
+                // Windows. See `Agent::shutdown` in `squeezy-agent`.
                 agent.shutdown().await;
                 let _ = fs::remove_dir_all(&root);
                 return Err(error);
             }
             AgentEvent::Cancelled { .. } => {
+                // Same rationale as `Failed` above: shutdown before
+                // workspace teardown to release the Windows redb locks.
                 agent.shutdown().await;
                 let _ = fs::remove_dir_all(&root);
                 return Err(SqueezyError::Agent("task was cancelled".to_string()));
@@ -692,6 +699,9 @@ async fn run_agent_with_config(
             | AgentEvent::TurnRouted { .. } => {}
         }
     }
+    // Final success path: shut down the agent before removing the workspace
+    // so its redb handles release the Windows exclusive lock. See the
+    // `Agent::shutdown` docstring in `squeezy-agent`.
     agent.shutdown().await;
     let _ = fs::remove_dir_all(&root);
     metrics.output_bytes = final_answer.len() as u64;
