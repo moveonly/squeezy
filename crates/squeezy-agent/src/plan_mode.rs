@@ -106,7 +106,7 @@ pub(crate) fn canonicalize_active_plan_path(active: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(active).ok()
 }
 
-/// Like [`is_active_plan_path`] but accepts a pre-canonicalized active
+/// Exact-match active-plan check that accepts a pre-canonicalized active
 /// plan path, avoiding a redundant `canonicalize` call on the active side.
 pub(crate) fn is_active_plan_path_with_canon(target: &Path, active_canon: &Path) -> bool {
     let Ok(target_canon) = std::fs::canonicalize(target) else {
