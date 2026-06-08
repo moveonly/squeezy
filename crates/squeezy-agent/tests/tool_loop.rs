@@ -643,14 +643,16 @@ fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs() {
 fn delegate_subagent_stops_on_round_input_ceiling_with_best_effort() {
     run_high_stack_test(async {
         let root = temp_workspace("delegate_input_ceiling");
-        // A file with many matching lines so the subagent's round-0 `grep`
-        // returns a sizeable result. After the (preview-bounded) result lands
-        // in the subagent conversation, its round-1 request (conversation items
-        // ~3000 tokens + request overhead) clears the 2k ceiling, while the
-        // parent's small post-delegate conversation (user msg + summary,
-        // <100 conversation tokens) stays under the 2k ceiling even after
-        // adding request overhead — isolating the gate to the subagent.
-        let needles = "fn needle_marker() {} // matchable line\n".repeat(400);
+        // Deliberately long match lines so the grep output is large enough
+        // to gate the subagent even after adding request overhead (instructions
+        // + tool schemas). 400 repetitions × ~160 chars/line gives 250 matches
+        // (DEFAULT_MAX_MATCHES) × ~170 chars ≈ 42.5 KB ≈ 10,600 conv tokens.
+        // The parent's post-delegate conversation is tiny (<100 tokens), so
+        // even with several thousand tokens of request overhead added to both,
+        // a ceiling of 8000 keeps the parent free and gates the subagent.
+        let long_line = "fn needle_marker_aaa_bbb_ccc_ddd_eee_fff() {} \
+                         // deliberately long matchable line to produce large grep output\n";
+        let needles = long_line.repeat(400);
         fs::write(root.join("src.rs"), needles).expect("write source");
 
         let provider = Arc::new(ScriptedProvider::new(vec![
@@ -705,12 +707,12 @@ fn delegate_subagent_stops_on_round_input_ceiling_with_best_effort() {
         ]));
 
         let mut config = config_for(root.clone());
-        // 2000-token ceiling: the subagent's round-1 conversation (~3000+
-        // conversation tokens from grep results alone) plus request overhead
-        // exceeds this comfortably. The parent's post-delegate round has only
-        // a few hundred conversation tokens and stays under 2000 even after
-        // request overhead (instructions + tool schemas) is added.
-        config.max_round_input_tokens = Some(2000);
+        // 8000-token ceiling: the subagent's round-1 conversation (~10,600
+        // tokens from grep results alone) easily exceeds this even after
+        // subtracting any request overhead. The parent's post-delegate
+        // conversation is tiny (~80 tokens), so it stays under 8000 even
+        // after adding the full instructions + tool-schema overhead.
+        config.max_round_input_tokens = Some(8000);
         let agent = Agent::new(config, provider.clone());
 
         drain_turn(agent.start_turn("audit the tree".to_string(), CancellationToken::new())).await;
