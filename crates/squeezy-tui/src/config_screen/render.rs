@@ -25,21 +25,25 @@ const MCP_STATUS_COLUMN_WIDTH: usize = 36;
 /// project hash for the Local tier so the user can grep `~/.squeezy/projects/`
 /// for the exact directory.
 ///
-/// Uses `$HOME` first for Unix compatibility; falls back to `dirs::home_dir()`
-/// so Windows paths under `%USERPROFILE%` also shorten correctly.
+/// Uses `squeezy_core::cached_home_dir()` (process-global cached result) so
+/// the Windows profile-directory lookup happens at most once regardless of how
+/// many times this function is called per frame. Comparison uses
+/// `Path::starts_with` which is case-insensitive on Windows, avoiding false
+/// mismatches when drive letters or usernames differ in casing between the
+/// resolved home path and a config-file path built from a separate source.
 fn display_path(path: &std::path::Path) -> String {
     let full = path.display().to_string();
-    let home_candidate = std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(dirs::home_dir);
-    if let Some(home) = home_candidate {
-        let home_str = home.display().to_string();
-        if !home_str.is_empty()
-            && let Some(rest) = full.strip_prefix(&home_str)
-        {
-            return format!("~{rest}");
+    if let Some(home) = squeezy_core::cached_home_dir() {
+        if path.starts_with(&home) {
+            let rest = path
+                .strip_prefix(&home)
+                .map(|r| r.display().to_string())
+                .unwrap_or_default();
+            return if rest.is_empty() {
+                "~".to_string()
+            } else {
+                format!("~{}{rest}", std::path::MAIN_SEPARATOR)
+            };
         }
     }
     full

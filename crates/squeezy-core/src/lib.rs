@@ -9784,15 +9784,48 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 pub fn default_squeezy_skills_dir() -> PathBuf {
-    home_dir_path()
-        .map(|home| home.join(DEFAULT_SQUEEZY_SKILLS_DIR))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR))
+    // On Unix, skills live in the home dotdir for parity with the existing
+    // ~/.squeezy convention. On Windows (and other non-Unix platforms) there
+    // is no $HOME dotdir convention, so we follow the same root as the user
+    // settings file and use `dirs::config_dir()/squeezy/skills` — keeping
+    // skills and settings under the same %APPDATA%\squeezy umbrella.
+    #[cfg(unix)]
+    {
+        home_dir_path()
+            .map(|home| home.join(DEFAULT_SQUEEZY_SKILLS_DIR))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR))
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(config) = dirs::config_dir() {
+            return config.join("squeezy").join("skills");
+        }
+        home_dir_path()
+            .map(|home| home.join(DEFAULT_SQUEEZY_SKILLS_DIR))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR))
+    }
 }
 
 pub fn default_agent_compat_skills_dir() -> PathBuf {
-    home_dir_path()
-        .map(|home| home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
+    // Mirror the same platform-aware logic as `default_squeezy_skills_dir`.
+    // On Windows, use `dirs::data_dir()/agents/skills` so the agent-compat
+    // directory is also rooted under a stable user-data location rather than
+    // a dotdir relative to the home directory.
+    #[cfg(unix)]
+    {
+        home_dir_path()
+            .map(|home| home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
+    }
+    #[cfg(not(unix))]
+    {
+        if let Some(data) = dirs::data_dir() {
+            return data.join("agents").join("skills");
+        }
+        home_dir_path()
+            .map(|home| home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
+    }
 }
 
 fn expand_home_path(path: PathBuf) -> PathBuf {
@@ -9805,6 +9838,13 @@ fn expand_home_path(path: PathBuf) -> PathBuf {
     if let Some(rest) = path_str.strip_prefix("~/") {
         return home_dir_path().map(|home| home.join(rest)).unwrap_or(path);
     }
+    // On Windows, TOML authors may write `~\subdir` (backslash separator).
+    // `PathBuf::to_str` on Windows preserves the separator as `\\` in the
+    // string representation, so we also check for that prefix.
+    #[cfg(windows)]
+    if let Some(rest) = path_str.strip_prefix("~\\") {
+        return home_dir_path().map(|home| home.join(rest)).unwrap_or(path);
+    }
     path
 }
 
@@ -9814,10 +9854,18 @@ fn expand_home_path(path: PathBuf) -> PathBuf {
 /// `HOMEDRIVE`+`HOMEPATH` or a known-folder registry entry) still
 /// resolve `~` correctly.
 ///
-/// The result is cached for the lifetime of the process. On Windows,
+/// The result is cached in a process-global `OnceLock`. On Windows,
 /// profile and redirected-folder lookups can be noticeably slower than
-/// a simple env-var read; caching removes the per-call overhead.
-fn home_dir_path() -> Option<PathBuf> {
+/// a simple env-var read; caching removes the per-call overhead and
+/// avoids repeated Win32 `GetUserProfileDirectory` calls during
+/// config-screen rendering.
+///
+/// **Testing note**: because this function caches on first call, the
+/// `dirs::home_dir()` fallback cannot be exercised in a test that runs in
+/// a process where `$HOME` is already set. Coverage of the Windows-without-
+/// `$HOME` path requires a separate process invocation (e.g. an integration
+/// test that unsets `HOME` and calls the binary directly).
+pub fn cached_home_dir() -> Option<PathBuf> {
     static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
@@ -9827,6 +9875,10 @@ fn home_dir_path() -> Option<PathBuf> {
         })
         .as_deref()
         .map(PathBuf::from)
+}
+
+fn home_dir_path() -> Option<PathBuf> {
+    cached_home_dir()
 }
 
 /// Walks up the directory tree from `start` looking for `squeezy.toml`.
@@ -10074,7 +10126,6 @@ pub fn user_settings_template() -> &'static str {
 # Windows: TOML path values require backslash-escaping or forward slashes:
 #   user_dir = "C:\\Users\\me\\.squeezy\\skills"   # escaped backslashes
 #   user_dir = "C:/Users/me/.squeezy/skills"        # forward slashes work too
-# PowerShell: $env:SQUEEZY_SETTINGS_PATH = "C:\Users\me\squeezy\settings.toml"
 # active_budget_chars = 4000          # legacy absolute cap; used only when active_budget_mode is unset
 # active_body_cap_chars = 16000
 # preamble_enabled = true

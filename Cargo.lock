@@ -3244,7 +3244,6 @@ version = "0.1.0"
 dependencies = [
  "ansi-to-tui",
  "crossterm",
- "dirs",
  "futures-util",
  "ignore",
  "lru",
