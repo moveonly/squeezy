@@ -35,9 +35,9 @@ use config_browse::handle_browse_command;
 use doctor::DoctorArgs;
 use providers::{ProvidersCommand, handle_providers_command};
 use squeezy_store::{
-    BugReportOptions, CleanupMode, RepoProfileLoad, SemanticSupport, SessionMetadata, SessionQuery,
-    SessionStatus, SessionStore, default_bug_report_path, ensure_repo_profile,
-    parse_bug_report_section, refresh_repo_profile,
+    BugReportOptions, CleanupMode, RepoProfileLoad, STALE_RUNNING_SESSION_THRESHOLD_MS,
+    SemanticSupport, SessionMetadata, SessionQuery, SessionStatus, SessionStore,
+    default_bug_report_path, ensure_repo_profile, parse_bug_report_section, refresh_repo_profile,
 };
 use squeezy_telemetry::{
     FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
@@ -1705,11 +1705,24 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
     match command {
         SessionsCommand::List(args) => {
             let sessions = store.list(&session_query_from_args(args)?)?;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
             for session in sessions {
+                let stale_marker = if session.status == SessionStatus::Running
+                    && now_ms.saturating_sub(session.started_at_ms)
+                        > STALE_RUNNING_SESSION_THRESHOLD_MS
+                {
+                    " [stale-running]"
+                } else {
+                    ""
+                };
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}{}\t{}\t{}\t{}\t{}",
                     session.session_id,
                     session.status.as_str(),
+                    stale_marker,
                     session.started_at_ms,
                     session.branch.unwrap_or_else(|| "-".to_string()),
                     session.provider,
@@ -1746,6 +1759,9 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             println!("mode={}", record.metadata.mode.as_str());
             println!("events={}", record.metadata.event_count);
             println!("event_warnings={}", record.event_warnings);
+            if let Some(ref tape) = record.replay {
+                println!("replay_warnings={}", tape.warnings);
+            }
             println!("redactions={}", record.metadata.redactions);
             println!("resume_available={}", record.metadata.resume_available);
             if let Some(reason) = record.metadata.resume_unavailable_reason {
@@ -1756,6 +1772,26 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             }
             if let Some(summary) = record.metadata.latest_summary {
                 println!("latest_summary={}", summary.replace('\n', " "));
+            }
+            // Warn when a session is still marked running but its last event
+            // is old — this suggests the process was killed (SIGKILL, power loss,
+            // terminal teardown) before finalization.
+            if record.metadata.status == SessionStatus::Running {
+                let last_ms = record
+                    .metadata
+                    .ended_at_ms
+                    .unwrap_or(record.metadata.started_at_ms);
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if now_ms.saturating_sub(last_ms) > STALE_RUNNING_SESSION_THRESHOLD_MS {
+                    eprintln!(
+                        "warning: session is marked running but last event was >{}h ago; \
+                         the process may have been killed before finalization",
+                        STALE_RUNNING_SESSION_THRESHOLD_MS / (3600 * 1000)
+                    );
+                }
             }
             Ok(())
         }

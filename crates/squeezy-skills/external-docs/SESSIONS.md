@@ -3,9 +3,18 @@
 Squeezy writes redacted local session history so prior work can be found and
 resumed without remembering a provider response id.
 
-By default, session state lives under `.squeezy/sessions/` in the workspace.
+By default, session state lives under `.squeezy/sessions/` in the workspace —
+this is workspace-local state that is safe to delete or move per-project.
 If `[cache].root` is set and `[session].log_dir` is unset, sessions live under
 `<cache.root>/sessions`. `[session].log_retention_days` defaults to 30 days.
+
+A separate user-global cross-project session index lives under
+`$HOME/.squeezy/sessions/index.jsonl` (or `$XDG_STATE_HOME/squeezy/sessions/index.jsonl`
+when `XDG_STATE_HOME` is set on Linux). This index is an append-only cache used
+by the resume picker to surface sessions from sibling repos; the authoritative
+source is the per-project session directory. The global index is safe to delete —
+it will be repopulated on next use. Run `squeezy doctor` to see the resolved paths
+for both stores, the memory file, and whether XDG variables are honoured.
 
 Each session directory contains:
 
@@ -123,7 +132,11 @@ so subsequent turns add to the running totals rather than replacing them.
 `archived/<id>/`, recoverable with `squeezy sessions unarchive <id>`); pass
 `--purge` to hard-delete instead. The retention sweep
 skips sessions that are still `running` (only explicit ids can remove a
-Running session, in case it was orphaned by a crash).
+Running session, in case it was orphaned by a crash). `squeezy sessions list`
+marks sessions that have been in the `running` state for more than 24 hours with
+`[stale-running]`; these are likely orphaned by a SIGKILL, power loss, or
+terminal teardown before finalization. `squeezy sessions show <id>` additionally
+warns on stderr when displaying a stale-running session.
 
 Routine per-turn events (tool calls, tool results, approvals, deltas) append
 to `events.jsonl` without rewriting `metadata.json`; the on-disk metadata is
