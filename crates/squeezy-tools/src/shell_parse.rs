@@ -1583,7 +1583,7 @@ fn windows_segment_has_output_flag(segment: &str) -> bool {
     let tokens: Vec<&str> = lower.split_whitespace().collect();
     tokens.iter().any(|tok| {
         matches!(
-            tok.as_ref(),
+            *tok,
             "-outfile"
                 | "-filepath"
                 | "-literalpath"
