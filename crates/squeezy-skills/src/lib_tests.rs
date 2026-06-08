@@ -2336,10 +2336,12 @@ fn register_skill_hooks_installs_one_handler_per_spec() {
                     SkillHookSpec {
                         command: "true".to_string(),
                         once: false,
+                        kind_valid: true,
                     },
                     SkillHookSpec {
                         command: "true".to_string(),
                         once: true,
+                        kind_valid: true,
                     },
                 ],
             }],
@@ -2422,6 +2424,7 @@ fn skill_hook_fires_on_matching_event_and_skips_others() {
     let spec = SkillHookSpec {
         command: script.display().to_string(),
         once: false,
+        kind_valid: true,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),
@@ -2482,6 +2485,7 @@ fn skill_hook_once_self_removes_after_first_run() {
     let spec = SkillHookSpec {
         command: script.display().to_string(),
         once: true,
+        kind_valid: true,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),
@@ -2533,6 +2537,7 @@ fn skill_hook_once_retries_after_failed_first_run() {
     let spec = SkillHookSpec {
         command: script.display().to_string(),
         once: true,
+        kind_valid: true,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),

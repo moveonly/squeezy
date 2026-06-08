@@ -15,16 +15,22 @@ The internal hook system has two layers:
 
 - `AgentHook` / `AgentHookBus`: typed integration hooks for Squeezy-owned
   extensions that can mutate request, tool-call, and tool-result views.
-- `HookRegistry` / `HookHandler`: event-keyed dispatch used by skill hook
-  scripts and current agent dispatch sites.
+- `HookRegistry` / `HookHandler`: event-indexed dispatch used by skill hook
+  scripts and current agent dispatch sites. Handlers registered via
+  `register_for_event` are dispatched in O(matching handlers); handlers
+  registered via `register` observe all events.
 
-The current skill hook surface is intentionally smaller than the internal enum.
-`SKILL.md` frontmatter accepts `PreTurn`, `PreToolUse`, `PostToolUse`,
-`PostTool`, `PreCompact`, `PostCompact`, `SubagentStart`, and
-`PermissionRequest` (plus snake_case aliases). Internal events such as
-`Setup`, `SessionStart`, `Stop`, `PostToolUseFailure`, `PermissionDenied`,
-`SubagentStop`, and `UserPromptSubmit` may be dispatched by the hook registry
-or typed hook bus, but they are not accepted in skill frontmatter today.
+The skill hook frontmatter parser accepts all internal hook events (PascalCase
+or snake_case aliases): `PreTurn`, `PreToolUse`, `PostToolUse`,
+`PostToolUseFailure`, `PostTool`, `PreCompact`, `PostCompact`,
+`SubagentStart`, `SubagentStop`, `PermissionRequest`, `PermissionDenied`,
+`UserPromptSubmit`, `SessionStart`, `Stop`, and `Setup`.
+
+Enforcement semantics apply only to `PreToolUse` and `PermissionRequest`: a
+non-zero hook exit blocks the action. All other events are observation-only
+from the skill hook surface — a non-zero exit is logged but does not affect
+the outcome. Skill hook stdout is always ignored; mutations are only available
+to typed in-process `AgentHook` handlers.
 
 Skill hook commands run through `sh -c` from the skill directory with
 `SQUEEZY_HOOK_PAYLOAD`, `SQUEEZY_SKILL_DIR`, and `SQUEEZY_SKILL_NAME` set.

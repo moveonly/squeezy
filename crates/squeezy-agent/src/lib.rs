@@ -13644,17 +13644,20 @@ fn dispatch_post_tool(
 }
 
 /// Fan out a `HookPayload::PermissionRequest` before the permission
-/// engine renders a verdict. Audit handlers see every gated request
-/// — including those the engine auto-allows or auto-denies without
-/// surfacing an approval prompt.
+/// engine renders a verdict. Returns the first handler-supplied deny
+/// message (in registration order) so the caller can short-circuit
+/// normal policy evaluation with `ApprovalDecision::Denied`, matching
+/// the enforcement contract documented on
+/// [`HookEvent::is_enforcement_capable`]. Returns `None` when the
+/// registry is empty or every handler returned `allow=true`.
 fn dispatch_permission_request(
     registry: &HookRegistry,
     turn_id: TurnId,
     call: &ToolCall,
     request: &PermissionRequest,
-) {
+) -> Option<String> {
     if registry.is_empty() {
-        return;
+        return None;
     }
     let results = registry.dispatch(HookPayload::PermissionRequest {
         capability: request.capability.as_str().to_string(),
@@ -13663,6 +13666,25 @@ fn dispatch_permission_request(
         call_id: call.call_id.clone(),
         target: Some(request.target.clone()).filter(|value| !value.is_empty()),
     });
+    let mut deny_message: Option<String> = None;
+    for (idx, result) in results.iter().enumerate() {
+        if !result.allow && deny_message.is_none() {
+            let reason = result
+                .message
+                .clone()
+                .unwrap_or_else(|| "permission request denied by hook".to_string());
+            tracing::info!(
+                target: "squeezy::hooks",
+                turn_id = %turn_id,
+                tool_name = %call.name,
+                call_id = %call.call_id,
+                handler_index = idx,
+                message = %reason,
+                "PermissionRequest handler denied permission"
+            );
+            deny_message = Some(reason);
+        }
+    }
     log_tool_observational_results(
         "PermissionRequest",
         turn_id,
@@ -13670,6 +13692,7 @@ fn dispatch_permission_request(
         &call.call_id,
         &results,
     );
+    deny_message
 }
 
 /// Fan out a `HookPayload::PermissionDenied` whenever the verdict
@@ -14694,9 +14717,16 @@ async fn permission_decision_for_request(
     // PermissionRequest fires once per decision attempt, before any
     // verdict is computed. Lets audit handlers record every gated
     // request — including those resolved by an auto-allow rule or
-    // mode policy before the user is asked.
+    // mode policy before the user is asked. A non-zero exit from a
+    // skill hook returns `allow=false` which is now enforced here,
+    // consistent with PreToolUse denial semantics.
     if let Some(registry) = context.hooks.as_ref() {
-        dispatch_permission_request(registry, context.turn_id, call, &request);
+        if let Some(deny_reason) =
+            dispatch_permission_request(registry, context.turn_id, call, &request)
+        {
+            dispatch_permission_denied(registry, context.turn_id, call, &request, &deny_reason);
+            return ApprovalDecision::Denied(deny_reason);
+        }
     }
     let active_mode = load_session_mode(&context.session_mode);
     let session_id_for_plan_mode = context.session_id_for_plan_mode();

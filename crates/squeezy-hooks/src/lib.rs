@@ -34,9 +34,10 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Convenience alias for the boxed futures returned by [`AgentHook`]
 /// methods. The trait stays object-safe by erasing the concrete
@@ -87,6 +88,18 @@ pub enum HookEvent {
     /// Fired the first time the agent boots in a workspace, or when a
     /// maintenance task (config migration, index rebuild) completes.
     Setup,
+}
+
+impl HookEvent {
+    /// Returns `true` for events where a handler deny result is actually
+    /// enforced by the agent loop. Observation-only events accept the
+    /// deny field in [`HookResult`] but the caller ignores it.
+    ///
+    /// This lets documentation, parsers, and diagnostic tools clearly
+    /// separate enforcement-capable events from observation-only events.
+    pub fn is_enforcement_capable(self) -> bool {
+        matches!(self, HookEvent::PreToolUse | HookEvent::PermissionRequest)
+    }
 }
 
 /// Typed payload accompanying every [`HookEvent`].
@@ -210,27 +223,55 @@ impl HookPayload {
 /// separate field so handlers can filter cheaply
 /// (`if ctx.event != … { return … }`) without destructuring the enum.
 /// The two stay in sync via [`HookContext::new`].
-#[derive(Debug, Clone)]
 pub struct HookContext {
     pub event: HookEvent,
     pub payload: HookPayload,
+    /// Lazily-computed JSON projection of `payload`. Populated on
+    /// first call to [`HookContext::payload_json`] so multiple
+    /// handlers on the same dispatch share one serialization.
+    json_cache: OnceLock<Value>,
 }
 
 impl HookContext {
     pub fn new(payload: HookPayload) -> Self {
         let event = payload.event();
-        Self { event, payload }
+        Self {
+            event,
+            payload,
+            json_cache: OnceLock::new(),
+        }
     }
 
     /// JSON projection of [`HookContext::payload`].
     ///
     /// Used by handlers that need a `serde_json::Value` (e.g. skill
     /// hooks that pipe the payload through `SQUEEZY_HOOK_PAYLOAD` to
-    /// an external shell command). The projection is
-    /// `serde_json::to_value` over the typed enum, so the JSON shape
-    /// is stable per variant.
+    /// an external shell command). The projection is computed once per
+    /// dispatch and cached for subsequent calls, avoiding redundant
+    /// serialization when multiple handlers fire on the same event.
     pub fn payload_json(&self) -> Value {
-        serde_json::to_value(&self.payload).unwrap_or(Value::Null)
+        self.json_cache
+            .get_or_init(|| serde_json::to_value(&self.payload).unwrap_or(Value::Null))
+            .clone()
+    }
+}
+
+impl std::fmt::Debug for HookContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookContext")
+            .field("event", &self.event)
+            .field("payload", &self.payload)
+            .finish()
+    }
+}
+
+impl Clone for HookContext {
+    fn clone(&self) -> Self {
+        Self {
+            event: self.event,
+            payload: self.payload.clone(),
+            json_cache: OnceLock::new(),
+        }
     }
 }
 
@@ -282,14 +323,18 @@ pub trait HookHandler {
 
 /// Collection of handlers fanned out per dispatched event.
 ///
-/// The registry is intentionally simple: handlers are stored in
-/// insertion order and every handler sees every event. Filtering by
-/// [`HookEvent`] is the handler's responsibility — the trait method
-/// receives the event in `ctx.event`. This keeps the registry oblivious
-/// to per-handler subscription policy.
+/// Handlers registered with [`HookRegistry::register`] observe every
+/// event (the handler filters by `ctx.event`). Handlers registered
+/// with [`HookRegistry::register_for_event`] are indexed by event and
+/// only invoked for that specific event, giving O(matching handlers)
+/// dispatch instead of O(total handlers).
 #[derive(Default)]
 pub struct HookRegistry {
-    handlers: Vec<Box<dyn HookHandler + Send + Sync>>,
+    /// Handlers that observe all events. Added via [`HookRegistry::register`].
+    all_handlers: Vec<Box<dyn HookHandler + Send + Sync>>,
+    /// Handlers indexed by the specific event they subscribe to.
+    /// Added via [`HookRegistry::register_for_event`].
+    event_handlers: BTreeMap<HookEvent, Vec<Box<dyn HookHandler + Send + Sync>>>,
 }
 
 impl HookRegistry {
@@ -297,29 +342,42 @@ impl HookRegistry {
         Self::default()
     }
 
-    /// Register a new handler. Returns the registry by `&mut self` so
-    /// callers can chain registrations.
+    /// Register a handler that will be invoked for every event.
+    /// Returns `&mut self` for chaining.
     pub fn register(&mut self, handler: Box<dyn HookHandler + Send + Sync>) -> &mut Self {
-        self.handlers.push(handler);
+        self.all_handlers.push(handler);
         self
     }
 
-    /// Number of registered handlers. Primarily useful for tests.
+    /// Register a handler that will only be invoked when `event`
+    /// matches the dispatched payload. Prefer this over [`HookRegistry::register`]
+    /// when the handler is only relevant for a single event — it avoids
+    /// calling every handler on unrelated dispatches.
+    pub fn register_for_event(
+        &mut self,
+        event: HookEvent,
+        handler: Box<dyn HookHandler + Send + Sync>,
+    ) -> &mut Self {
+        self.event_handlers.entry(event).or_default().push(handler);
+        self
+    }
+
+    /// Total number of registered handlers across all buckets.
     pub fn len(&self) -> usize {
-        self.handlers.len()
+        self.all_handlers.len() + self.event_handlers.values().map(|v| v.len()).sum::<usize>()
     }
 
     /// Whether the registry has no handlers. Callers can skip building
     /// a [`HookContext`] entirely when this is true.
     pub fn is_empty(&self) -> bool {
-        self.handlers.is_empty()
+        self.all_handlers.is_empty() && self.event_handlers.is_empty()
     }
 
     /// Fan out the typed payload to every handler and collect their
     /// replies. The event discriminant is derived from `payload` so
     /// dispatch sites never need to pass both.
     pub fn dispatch(&self, payload: HookPayload) -> Vec<HookResult> {
-        if self.handlers.is_empty() {
+        if self.is_empty() {
             return Vec::new();
         }
         let ctx = HookContext::new(payload);
@@ -328,9 +386,15 @@ impl HookRegistry {
 
     /// Like [`HookRegistry::dispatch`] but accepts a pre-built context.
     pub fn dispatch_context(&self, ctx: &HookContext) -> Vec<HookResult> {
-        let mut results = Vec::with_capacity(self.handlers.len());
-        for handler in &self.handlers {
+        let event_count = self.event_handlers.get(&ctx.event).map_or(0, |v| v.len());
+        let mut results = Vec::with_capacity(self.all_handlers.len() + event_count);
+        for handler in &self.all_handlers {
             results.push(handler.handle(ctx));
+        }
+        if let Some(handlers) = self.event_handlers.get(&ctx.event) {
+            for handler in handlers {
+                results.push(handler.handle(ctx));
+            }
         }
         results
     }
@@ -340,7 +404,7 @@ impl HookRegistry {
     /// Use this for observation-only sites that only need handler side
     /// effects; decision points should continue using [`HookRegistry::dispatch`].
     pub fn dispatch_no_collect(&self, payload: HookPayload) {
-        if self.handlers.is_empty() {
+        if self.is_empty() {
             return;
         }
         let ctx = HookContext::new(payload);
@@ -350,14 +414,25 @@ impl HookRegistry {
     /// Like [`HookRegistry::dispatch_no_collect`] but accepts a pre-built
     /// context.
     pub fn dispatch_context_no_collect(&self, ctx: &HookContext) {
-        for handler in &self.handlers {
+        for handler in &self.all_handlers {
             let _ = handler.handle(ctx);
+        }
+        if let Some(handlers) = self.event_handlers.get(&ctx.event) {
+            for handler in handlers {
+                let _ = handler.handle(ctx);
+            }
         }
     }
 
-    fn first_denial_message(&self, ctx: &HookContext) -> Option<String> {
+    pub(crate) fn first_denial_message(&self, ctx: &HookContext) -> Option<String> {
         let mut first_denial = None;
-        for handler in &self.handlers {
+        let all_iter = self.all_handlers.iter().chain(
+            self.event_handlers
+                .get(&ctx.event)
+                .into_iter()
+                .flat_map(|v| v.iter()),
+        );
+        for handler in all_iter {
             let result = handler.handle(ctx);
             if !result.allow && first_denial.is_none() {
                 first_denial = Some(
@@ -373,8 +448,10 @@ impl HookRegistry {
 
 impl std::fmt::Debug for HookRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let event_count: usize = self.event_handlers.values().map(|v| v.len()).sum();
         f.debug_struct("HookRegistry")
-            .field("handlers", &self.handlers.len())
+            .field("all_handlers", &self.all_handlers.len())
+            .field("event_handlers", &event_count)
             .finish()
     }
 }

@@ -10,19 +10,19 @@ Skill hook scripts do not read stdout for mutations.
 
 The internal hook enum includes these lifecycle events:
 
-| Event | When it fires | Mutation capability |
-|-------|--------------|---------------------|
-| `PreTurn` | Before the model receives the user prompt | Append `extra_instructions` to the system prompt |
-| `UserPromptSubmit` | When the user submits a prompt | Rewrite or augment the prompt text |
-| `PreToolUse` | Before a tool call executes | Can deny the call (non-zero exit) |
-| `PostToolUse` | After a tool call succeeds | Observation only |
-| `PostToolUseFailure` | After a tool call fails | Observation only |
-| `PostTool` | After any tool call completes (success or failure) | Observation only |
+| Event | When it fires | Enforcement capability |
+|-------|--------------|------------------------|
+| `PreTurn` | Before the model receives the user prompt | Observation only (typed internal handlers can append `extra_instructions`) |
+| `UserPromptSubmit` | When the user submits a prompt | Observation only (typed internal handlers can rewrite the prompt) |
+| `PreToolUse` | Before a tool call executes | **Can deny the call** (non-zero exit) |
+| `PostToolUse` | After any tool call completes (success or failure) | Observation only |
+| `PostToolUseFailure` | After a tool call returns a non-success status | Observation only |
+| `PostTool` | After any tool call result is appended to the conversation | Observation only |
 | `PreCompact` | Before context compaction runs | Observation only |
 | `PostCompact` | After context compaction completes | Observation only |
 | `SubagentStart` | When a subagent is spawned | Observation only |
 | `SubagentStop` | When a subagent finishes | Observation only |
-| `PermissionRequest` | When a tool asks for permission | Can deny the request |
+| `PermissionRequest` | When a tool asks for permission | **Can deny the request** (non-zero exit) |
 | `PermissionDenied` | When a permission request is denied | Observation only |
 | `SessionStart` | When a session begins | Observation only |
 | `Stop` | When the session ends | Observation only |
@@ -30,21 +30,27 @@ The internal hook enum includes these lifecycle events:
 
 ## Mutation Capabilities
 
-Typed internal handlers can mutate two events:
+Two events support typed internal mutations. These mutations are applied by
+in-process handlers registered against the `AgentHookBus`, not by skill hook
+scripts — skill hook script stdout is always ignored.
 
-**`PreTurn`** — the hook script can return a JSON object with an
-`extra_instructions` key. Squeezy appends that string to the system prompt for
-the current turn. Use this to inject per-turn context, enforce policy, or add
-dynamic instructions.
+**`PreTurn`** — an internal handler can return `extra_instructions` in its
+`HookResult::mutate` value. Squeezy appends that string to the system prompt
+for the current turn. Skill hook scripts cannot trigger this mutation.
 
-**`UserPromptSubmit`** — the hook script can return a JSON object with a
-`prompt` key. Squeezy replaces the user's submitted text with the returned
-value. Use this for prompt enrichment, templating, or redaction before the
-model sees the input.
+**`UserPromptSubmit`** — an internal handler can return a replacement `prompt`
+in its `HookResult::mutate` value. Squeezy replaces the user's submitted text
+with the returned value. Skill hook scripts cannot trigger this mutation.
 
-Skill hook scripts cannot currently return those mutations. Their stdout is
-ignored; a zero exit status allows execution to continue, and a non-zero exit
-status returns a deny result at the dispatch site.
+### Skill hook scripts
+
+Skill hooks run as shell commands. Their stdout is ignored. The only mechanism
+available to skill hooks is exit status:
+
+- **Exit 0** — allow the event to proceed.
+- **Non-zero exit** — deny the action at enforcement-capable events
+  (`PreToolUse` and `PermissionRequest`); at observation-only events, a
+  non-zero exit is logged but does not block the action.
 
 ## Hook Scripts
 
@@ -79,10 +85,11 @@ hooks:
           command: scripts/audit-shell.sh
 ```
 
-The skill frontmatter parser currently accepts only these event keys:
-`PreTurn`, `PreToolUse`, `PostToolUse`, `PostTool`, `PreCompact`,
-`PostCompact`, `SubagentStart`, and `PermissionRequest` (or their snake_case
-aliases).
+The skill frontmatter parser accepts all event keys listed in the table above
+(PascalCase or their `snake_case` aliases): `PreTurn`, `PreToolUse`,
+`PostToolUse`, `PostToolUseFailure`, `PostTool`, `PreCompact`, `PostCompact`,
+`SubagentStart`, `SubagentStop`, `PermissionRequest`, `PermissionDenied`,
+`UserPromptSubmit`, `SessionStart`, `Stop`, and `Setup`.
 
 - `matcher` is a tool-name filter for payloads that include `tool_name`. Use
   `"*"` or omit it to match all payloads for the event.

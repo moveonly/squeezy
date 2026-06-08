@@ -3,7 +3,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -279,10 +283,18 @@ pub struct SkillHookMatcher {
 /// when the path is relative. `once: true` semantics live in the handler
 /// (self-skipped after the first *successful* run) so the registry stays
 /// agnostic; a failed first run is retried on the next dispatch.
+///
+/// `kind_valid` is `false` when the spec's `type:` field was set to an
+/// unsupported value. Such specs are dropped before handler registration
+/// so a frontmatter block with `type: webhook` + `command: ...` does
+/// not silently execute as a shell command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillHookSpec {
     pub command: String,
     pub once: bool,
+    /// `false` when an unsupported `type:` was declared; prevents
+    /// execution even if a `command:` line was also present.
+    pub(crate) kind_valid: bool,
 }
 
 impl LoadedSkill {
@@ -1462,6 +1474,7 @@ fn parse_hooks_block(rest: &[&str], out: &mut BTreeMap<HookEvent, Vec<SkillHookM
             matcher.hooks.push(SkillHookSpec {
                 command: String::new(),
                 once: false,
+                kind_valid: true,
             });
             if let Some(spec) = matcher.hooks.last_mut() {
                 apply_spec_kv(spec, item);
@@ -1491,12 +1504,16 @@ fn apply_spec_kv(spec: &mut SkillHookSpec, line: &str) {
     match key.trim() {
         "command" => spec.command = value.to_string(),
         "once" => spec.once = matches!(value, "true" | "yes" | "1"),
-        "type" if value != "command" => {
+        "type" if value == "command" => {
+            // Explicit `type: command` — already the default, no-op.
+        }
+        "type" => {
             warn!(
                 target: "squeezy_skills",
                 kind = %value,
-                "ignoring unsupported skill hook kind"
+                "ignoring unsupported skill hook kind; spec will be dropped"
             );
+            spec.kind_valid = false;
         }
         _ => {}
     }
@@ -1510,11 +1527,18 @@ fn parse_hook_event(name: &str) -> Option<HookEvent> {
         "PreTurn" | "pre_turn" => Some(HookEvent::PreTurn),
         "PreToolUse" | "pre_tool_use" => Some(HookEvent::PreToolUse),
         "PostToolUse" | "post_tool_use" => Some(HookEvent::PostToolUse),
+        "PostToolUseFailure" | "post_tool_use_failure" => Some(HookEvent::PostToolUseFailure),
         "PostTool" | "post_tool" => Some(HookEvent::PostTool),
         "PreCompact" | "pre_compact" => Some(HookEvent::PreCompact),
         "PostCompact" | "post_compact" => Some(HookEvent::PostCompact),
         "SubagentStart" | "subagent_start" => Some(HookEvent::SubagentStart),
+        "SubagentStop" | "subagent_stop" => Some(HookEvent::SubagentStop),
         "PermissionRequest" | "permission_request" => Some(HookEvent::PermissionRequest),
+        "PermissionDenied" | "permission_denied" => Some(HookEvent::PermissionDenied),
+        "UserPromptSubmit" | "user_prompt_submit" => Some(HookEvent::UserPromptSubmit),
+        "SessionStart" | "session_start" => Some(HookEvent::SessionStart),
+        "Stop" | "stop" => Some(HookEvent::Stop),
+        "Setup" | "setup" => Some(HookEvent::Setup),
         _ => None,
     }
 }
@@ -2005,6 +2029,11 @@ pub(crate) fn parse_skill_manifest(content: &str) -> std::result::Result<SkillMa
     toml::from_str::<SkillManifest>(content).map_err(|error| error.to_string())
 }
 
+/// Maximum wall-clock time a skill hook command may run before it is
+/// killed. Prevents a stalled hook from blocking the agent loop
+/// indefinitely.
+const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// [`HookHandler`] implementation that fires a skill's declared shell
 /// command when its event matches.
 ///
@@ -2023,11 +2052,12 @@ pub struct SkillHookHandler {
     matcher: Option<String>,
     spec: SkillHookSpec,
     base_dir: PathBuf,
-    /// Tracks whether a `once: true` hook has already succeeded in this
-    /// session. Set only after a successful exit so a failed first run is
-    /// retried. Held behind a `Mutex` so the trait method stays `&self`
-    /// while still allowing in-place mutation across dispatches.
-    fired: Mutex<bool>,
+    /// Tracks whether a `once: true` hook has already fired successfully.
+    /// Uses an `AtomicBool` with compare-exchange semantics so that
+    /// parallel dispatches (from concurrent tool calls) cannot both pass
+    /// the pre-run check before either marks success — eliminating the
+    /// TOCTOU race that a `Mutex`-with-early-release had.
+    fired: AtomicBool,
 }
 
 impl SkillHookHandler {
@@ -2044,7 +2074,7 @@ impl SkillHookHandler {
             matcher,
             spec,
             base_dir,
-            fired: Mutex::new(false),
+            fired: AtomicBool::new(false),
         }
     }
 }
@@ -2064,11 +2094,19 @@ impl HookHandler for SkillHookHandler {
                 return HookResult::allow();
             }
         }
-        if self.spec.once
-            && let Ok(fired) = self.fired.lock()
-            && *fired
-        {
-            return HookResult::allow();
+
+        // `once: true`: atomically claim the "will fire" slot before
+        // running the command, preventing parallel dispatches from both
+        // passing the pre-run check. Reset on failure so the next
+        // dispatch can retry.
+        if self.spec.once {
+            match self
+                .fired
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Err(_) => return HookResult::allow(), // already fired or claimed
+                Ok(_) => {}                           // claimed; will reset on failure
+            }
         }
 
         // Resolve the command path against the skill's base_dir when
@@ -2082,6 +2120,9 @@ impl HookHandler for SkillHookHandler {
                 skill = %self.skill_name,
                 "skipping skill hook with empty command"
             );
+            if self.spec.once {
+                self.fired.store(false, Ordering::Release);
+            }
             return HookResult::allow();
         }
         let payload = payload_json.to_string();
@@ -2092,31 +2133,35 @@ impl HookHandler for SkillHookHandler {
             .current_dir(&self.base_dir)
             .env("SQUEEZY_SKILL_DIR", &self.base_dir)
             .env("SQUEEZY_SKILL_NAME", &self.skill_name)
-            .env("SQUEEZY_HOOK_PAYLOAD", payload);
-        match command.status() {
-            Ok(status) if status.success() => {
-                // Only mark a `once: true` hook as fired once it has
-                // actually succeeded, so a failed first run can retry.
-                if self.spec.once
-                    && let Ok(mut fired) = self.fired.lock()
-                {
-                    *fired = true;
+            .env("SQUEEZY_HOOK_PAYLOAD", &payload);
+
+        let run_result = run_hook_with_timeout(&mut command, HOOK_TIMEOUT);
+
+        match run_result {
+            HookRunResult::Success => HookResult::allow(),
+            HookRunResult::Denied { code } => {
+                // Reset `once` so a failed first run can be retried.
+                if self.spec.once {
+                    self.fired.store(false, Ordering::Release);
                 }
-                HookResult::allow()
-            }
-            Ok(status) => {
                 warn!(
                     target: "squeezy_skills",
                     skill = %self.skill_name,
-                    code = ?status.code(),
+                    event = ?self.event,
+                    command = %trimmed,
+                    exit_code = ?code,
                     "skill hook exited non-zero"
                 );
                 HookResult::deny(format!(
-                    "skill `{}` hook denied the action",
-                    self.skill_name
+                    "skill `{}` hook denied the action \
+                     (event={:?}, command={:?}, exit_code={:?})",
+                    self.skill_name, self.event, trimmed, code,
                 ))
             }
-            Err(error) => {
+            HookRunResult::SpawnError(error) => {
+                if self.spec.once {
+                    self.fired.store(false, Ordering::Release);
+                }
                 warn!(
                     target: "squeezy_skills",
                     skill = %self.skill_name,
@@ -2125,6 +2170,62 @@ impl HookHandler for SkillHookHandler {
                 );
                 HookResult::allow()
             }
+            HookRunResult::Timeout => {
+                if self.spec.once {
+                    self.fired.store(false, Ordering::Release);
+                }
+                warn!(
+                    target: "squeezy_skills",
+                    skill = %self.skill_name,
+                    event = ?self.event,
+                    command = %trimmed,
+                    timeout_secs = HOOK_TIMEOUT.as_secs(),
+                    "skill hook timed out and was killed"
+                );
+                HookResult::allow()
+            }
+        }
+    }
+}
+
+/// Outcome of running a hook command.
+enum HookRunResult {
+    Success,
+    Denied { code: Option<i32> },
+    SpawnError(std::io::Error),
+    Timeout,
+}
+
+/// Spawn `command`, wait up to `timeout`, kill on expiry, and
+/// return a structured outcome. Uses a tight poll loop (100 ms
+/// sleep) to avoid blocking indefinitely — acceptable for hook
+/// commands which are expected to be short-lived scripts.
+fn run_hook_with_timeout(command: &mut Command, timeout: Duration) -> HookRunResult {
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => return HookRunResult::SpawnError(e),
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    HookRunResult::Success
+                } else {
+                    HookRunResult::Denied {
+                        code: status.code(),
+                    }
+                };
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap to avoid zombie
+                    return HookRunResult::Timeout;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return HookRunResult::SpawnError(e),
         }
     }
 }
@@ -2132,24 +2233,31 @@ impl HookHandler for SkillHookHandler {
 /// Register every hook declared in a [`LoadedSkill`]'s frontmatter
 /// against the given [`HookRegistry`].
 ///
-/// Returns the number of [`SkillHookHandler`]s installed so callers can
-/// log the activation count alongside the skill name. The registry takes
-/// ownership of each handler; deregistering individual skill hooks is
-/// not yet implemented because the registry stores erased boxed
-/// handlers — that surface is left to a follow-up when the agent loop
-/// learns to drop hooks on skill deactivation.
+/// Specs with `kind_valid = false` (unsupported `type:` in frontmatter)
+/// are silently dropped so they cannot execute as shell commands.
+///
+/// Handlers are registered via [`HookRegistry::register_for_event`] so
+/// the registry can dispatch in O(matching handlers) rather than
+/// O(total handlers). Returns the number of handlers installed so
+/// callers can log the activation count alongside the skill name.
 pub fn register_skill_hooks(skill: &LoadedSkill, registry: &mut HookRegistry) -> usize {
     let mut installed = 0;
     for (event, matchers) in &skill.hooks {
         for matcher in matchers {
             for spec in &matcher.hooks {
-                registry.register(Box::new(SkillHookHandler::new(
-                    skill.summary.name.clone(),
+                if !spec.kind_valid {
+                    continue;
+                }
+                registry.register_for_event(
                     *event,
-                    matcher.matcher.clone(),
-                    spec.clone(),
-                    skill.base_dir.clone(),
-                )));
+                    Box::new(SkillHookHandler::new(
+                        skill.summary.name.clone(),
+                        *event,
+                        matcher.matcher.clone(),
+                        spec.clone(),
+                        skill.base_dir.clone(),
+                    )),
+                );
                 installed += 1;
             }
         }
@@ -2158,9 +2266,31 @@ pub fn register_skill_hooks(skill: &LoadedSkill, registry: &mut HookRegistry) ->
         tracing::info!(
             target: "squeezy_skills",
             skill = %skill.summary.name,
+            source = %skill.base_dir.display(),
             installed,
             "registered skill frontmatter hooks"
         );
+        // Emit a per-handler snapshot at DEBUG level so session logs
+        // include the full hook registry for trusted local debugging.
+        for (event, matchers) in &skill.hooks {
+            for matcher_spec in matchers {
+                for spec in &matcher_spec.hooks {
+                    if !spec.kind_valid {
+                        continue;
+                    }
+                    tracing::debug!(
+                        target: "squeezy_skills",
+                        skill = %skill.summary.name,
+                        event = ?event,
+                        matcher = ?matcher_spec.matcher,
+                        command_path = %spec.command,
+                        once = spec.once,
+                        source = %skill.base_dir.display(),
+                        "hook handler registered"
+                    );
+                }
+            }
+        }
     }
     installed
 }
