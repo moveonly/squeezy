@@ -19,6 +19,12 @@ publish.workspace = true
 # events at a real `handle_key`. Release TUI binaries don't enable it,
 # so the test surface stays out of the shipped library.
 testing = []
+# Heavy terminal-emulator matrix (the `termsim` module). Implies
+# `testing` because the scenario driver reuses `TuiHarness`. Off by
+# default, so the release library and the default
+# `cargo test -p squeezy-tui` never compile vt100/alacritty/insta nor
+# the `termsim` tree. Only `--features term-matrix` pulls them in.
+term-matrix = ["testing", "dep:vt100", "dep:alacritty_terminal", "dep:insta", "dep:futures-util"]
 
 [dependencies]
 ansi-to-tui.workspace = true
@@ -67,6 +73,15 @@ tree-sitter-sequel.workspace = true
 tree-sitter-toml-updated.workspace = true
 tree-sitter-typescript.workspace = true
 tree-sitter-yaml.workspace = true
+
+# Optional, gated behind the `term-matrix` feature. See `[features]`.
+vt100 = { workspace = true, optional = true }
+alacritty_terminal = { workspace = true, optional = true }
+insta = { workspace = true, optional = true }
+# Needed by the `termsim` scenario driver's stub `LlmProvider` (an empty
+# stream). Also a dev-dependency for the crate's other tests; the optional
+# entry makes it available in the non-test lib build under `term-matrix`.
+futures-util = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures-util.workspace = true

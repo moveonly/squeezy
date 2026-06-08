@@ -180,3 +180,69 @@ async fn pump_until_idle_yields_on_pending_approval_then_respond_clears() {
     assert!(!harness.respond_approval());
     assert!(!harness.respond_deny());
 }
+
+/// Real-ANSI capture harness (§8 term-matrix). Proves `drive_scenario`
+/// builds a `CaptureLog` over the `Capture` sink, records one
+/// `FrameMark` per `Step::Frame` (in paint order, with the in-effect
+/// size), and that the captured byte stream is the real append-only
+/// ANSI — wrapped in the DEC 2026 synchronized-update markers, and
+/// self-slicing by the recorded offsets.
+#[cfg(feature = "term-matrix")]
+#[tokio::test]
+async fn drive_scenario_records_capture_log_frame_marks() {
+    use crate::termsim::Step;
+
+    let mut harness = build_harness();
+    let log = harness
+        .drive_scenario(&[
+            // First frame at the build size (80x24).
+            Step::Frame,
+            // Land a committed assistant turn, then shrink and paint.
+            Step::AssistantDelta("hello from the model".to_string()),
+            Step::Resize(100, 30),
+            Step::Frame,
+            // A tool-output line lands as history, paint a third frame.
+            Step::ToolOutput("ran: grep -n foo".to_string()),
+            Step::Frame,
+        ])
+        .await
+        .expect("drive_scenario produces a CaptureLog");
+
+    // One mark per `Step::Frame`, in paint order.
+    assert_eq!(log.frames.len(), 3, "one FrameMark per Frame step");
+
+    // The first frame painted at the build size; the next two after the
+    // resize to 100x30.
+    assert_eq!((log.frames[0].w, log.frames[0].h), (80, 24));
+    assert_eq!((log.frames[1].w, log.frames[1].h), (100, 30));
+    assert_eq!((log.frames[2].w, log.frames[2].h), (100, 30));
+
+    // Offsets are recorded AFTER each paint flushes, so they are
+    // strictly increasing (every frame emits at least the sync-update
+    // markers + a footer) and bounded by the full stream length.
+    assert!(
+        log.frames[0].byte_offset < log.frames[1].byte_offset,
+        "frame offsets must advance: {:?}",
+        log.frames,
+    );
+    assert!(
+        log.frames[1].byte_offset < log.frames[2].byte_offset,
+        "frame offsets must advance: {:?}",
+        log.frames,
+    );
+    assert!(
+        log.frames[2].byte_offset <= log.bytes.len(),
+        "last frame offset is within the captured stream",
+    );
+    assert!(!log.bytes.is_empty(), "the capture sink teed real bytes");
+
+    // The log is self-slicing per frame: frame 0 is bytes[0..mark0],
+    // and the second frame's slice carries real append-only output
+    // including the DEC 2026 synchronized-update BEGIN marker (`\x1b[?2026h`).
+    let frame1 = &log.bytes[log.frames[0].byte_offset..log.frames[1].byte_offset];
+    let begin_sync = b"\x1b[?2026h";
+    assert!(
+        frame1.windows(begin_sync.len()).any(|w| w == begin_sync),
+        "each painted frame opens a synchronized update",
+    );
+}

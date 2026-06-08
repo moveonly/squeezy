@@ -19,6 +19,15 @@ use squeezy_agent::{Agent, ToolApprovalDecision};
 use squeezy_core::{AppConfig, Result, Role, SessionMode, SqueezyError};
 use squeezy_llm::LlmProvider;
 
+// Heavy, term-matrix-only surface: the real-ANSI capture harness
+// (`drive_scenario`) pulls the `termsim` capture types and the
+// crate-private append-only paint helpers. Gated so the default
+// `testing` build never compiles it.
+#[cfg(feature = "term-matrix")]
+use std::io::Write as _;
+#[cfg(feature = "term-matrix")]
+use std::sync::Mutex;
+
 use squeezy_tools::{McpElicitationKind, McpElicitationRequest, McpElicitationResponse};
 use tokio::sync::oneshot;
 
@@ -502,6 +511,293 @@ impl TuiHarness {
             return Some("report");
         }
         None
+    }
+}
+
+/// Real-ANSI capture harness (§8 term-matrix). Gated behind
+/// `term-matrix` because it pulls the `termsim` capture types and the
+/// crate-private append-only paint helpers from `lib.rs`. The default
+/// `testing` build (and `cargo test -p squeezy-tui`) never compile any
+/// of this.
+#[cfg(feature = "term-matrix")]
+mod capture {
+    // `drive_scenario` / `capture_paint` are exercised only by the
+    // term-matrix `#[test]` (and, once it lands, the matrix runner), so
+    // the lib-crate build with `term-matrix` but without `cfg(test)`
+    // sees them as dead. This mirrors the tree-wide allowance the
+    // sibling `termsim` scaffold already carries until the runner wires
+    // them in.
+    #![allow(dead_code)]
+
+    use super::*;
+    use crate::size_source::FixedSize;
+    use crate::termsim::{CaptureLog, FrameMark, Step};
+    use crossterm::execute;
+    use crossterm::terminal::{Clear, ClearType, DisableLineWrap, EnableLineWrap};
+    use ratatui::backend::CrosstermBackend;
+
+    /// Inline viewport height the production guard pins itself to; the
+    /// capture terminal mirrors it so ratatui's inline construction
+    /// behaves identically. Kept in sync with `lib.rs`'s constant.
+    const INLINE_VIEWPORT_HEIGHT: u16 = crate::INLINE_VIEWPORT_HEIGHT;
+
+    /// Mutable paint bookkeeping the append-only renderer threads across
+    /// frames. Mirrors the subset of `TerminalGuard` state that
+    /// `paint_main` reads/writes: which history has flushed, the last
+    /// flushed turn-divider generation, and whether a footer is on
+    /// screen (so the next frame erases it). A standalone struct keeps
+    /// this off the public `TuiHarness` surface.
+    #[derive(Default)]
+    struct PaintState {
+        startup_flushed: bool,
+        transcript_flushed_len: usize,
+        turn_divider_flushed_generation: Option<u64>,
+        footer_painted: bool,
+    }
+
+    impl TuiHarness {
+        /// Drive a scripted [`Step`] sequence against the real
+        /// append-only paint path, capturing every emitted byte into a
+        /// [`CaptureLog`] and recording a [`FrameMark`] per `Step::Frame`.
+        ///
+        /// The harness builds a ratatui `Terminal` over a
+        /// `CrosstermBackend` whose writer is a `TerminalWriter::Capture`
+        /// sink, so the captured bytes are the exact ANSI the TUI would
+        /// emit to a real terminal — not a `TestBackend` cell diff. Steps
+        /// route through the existing `TuiApp` + `Agent` plumbing:
+        ///
+        /// * [`Step::Key`] → `handle_key` (pump idle before/after, like
+        ///   [`send_key`](TuiHarness::send_key)).
+        /// * [`Step::Paste`] → injected the way the paste handler receives it.
+        /// * [`Step::Resize`] → swaps the [`FixedSize`] source to `(w, h)`,
+        ///   sets `app.pending_resize`, and `terminal.resize`s the backing
+        ///   ratatui terminal, mirroring `Event::Resize`.
+        /// * [`Step::Tick`] / [`Step::SettleTurn`] → one / full
+        ///   `pump_until_idle` pass.
+        /// * [`Step::AssistantDelta`] → pushes assistant text the way a
+        ///   committed model turn lands, driving the streaming/commit surface.
+        /// * [`Step::ToolOutput`] → injects a tool-output transcript entry.
+        /// * [`Step::OpenOverlay`] / [`Step::CloseOverlay`] → toggles the
+        ///   fullscreen transcript overlay.
+        /// * [`Step::Frame`] → forces one append-only paint of the current
+        ///   state and records a `FrameMark{byte_offset, w, h}` at the
+        ///   current sink length.
+        ///
+        /// Returns the accumulated [`CaptureLog`]: `bytes` is the verbatim
+        /// stream read out of the `Capture` sink, `frames` is one mark per
+        /// painted frame in order. Frame *i*'s bytes are
+        /// `bytes[frames[i-1].byte_offset .. frames[i].byte_offset]`.
+        ///
+        /// `pub(crate)`: the parameter and return types are the
+        /// crate-private `termsim` capture shapes, and the only callers
+        /// are the in-crate matrix runner and tests — not the external
+        /// `squeezy-eval` driver, which uses the `pub` snapshot API above.
+        pub(crate) async fn drive_scenario(&mut self, steps: &[Step]) -> Result<CaptureLog> {
+            // In-memory sink shared with the crossterm backend; the
+            // capture writer tees every emitted byte here.
+            let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+            let writer = crate::terminal_writer::TerminalWriter::capture(sink.clone());
+            let backend = CrosstermBackend::new(writer);
+            // Default (`Fullscreen`) viewport: the append-only path writes
+            // raw bytes straight to the backend and never calls
+            // `draw`/`insert_before`, so the viewport choice does not
+            // affect the captured stream. Crucially, `Terminal::new`
+            // avoids the inline-viewport cursor-position query that
+            // `Viewport::Inline` performs at construction — that query
+            // fails on a headless `Capture` writer with no real TTY.
+            let mut terminal = Terminal::new(backend)
+                .map_err(|e| SqueezyError::Terminal(format!("capture terminal init: {e}")))?;
+
+            // Scripted terminal size: `Resize` steps mutate this, and the
+            // paint reads it instead of crossterm's global `size()`.
+            let mut size = FixedSize(self.width, self.height);
+            let mut paint = PaintState::default();
+            let mut log = CaptureLog::default();
+
+            for step in steps {
+                match step {
+                    Step::Key(key) => {
+                        let _ = self.send_key(*key).await?;
+                    }
+                    Step::Paste(text) => {
+                        // Route paste the same way the production handler
+                        // does: feed it at the composer, then pump.
+                        self.pump_until_idle().await?;
+                        let agent = self
+                            .agent
+                            .as_mut()
+                            .expect("agent dropped before harness; bug in TuiHarness");
+                        crate::handle_paste(&mut self.app, agent, text.clone()).await?;
+                        self.pump_until_idle().await?;
+                    }
+                    Step::Resize(w, h) => {
+                        size = FixedSize(*w, *h);
+                        self.width = *w;
+                        self.height = *h;
+                        self.app.pending_resize = true;
+                        // Mirror `Event::Resize`: the backing ratatui
+                        // terminal learns the new dimensions so any
+                        // inline bookkeeping (and a future `draw`) reflows.
+                        let _ = terminal.resize(ratatui::layout::Rect::new(0, 0, *w, *h));
+                    }
+                    Step::Tick => {
+                        self.pump_until_idle().await?;
+                    }
+                    Step::SettleTurn => {
+                        // Pump to completion so the turn settles and
+                        // history flushes — the settle boundary that gates
+                        // the history commit.
+                        self.pump_until_idle().await?;
+                    }
+                    Step::AssistantDelta(text) => {
+                        // Land assistant text as a committed turn the way
+                        // the model would, then pump so the streaming
+                        // surface settles into a flushable transcript entry.
+                        self.app
+                            .push_transcript_item(squeezy_core::TranscriptItem::assistant(
+                                text.clone(),
+                            ));
+                        self.pump_until_idle().await?;
+                    }
+                    Step::ToolOutput(text) => {
+                        // A completed tool call lands as a transcript log
+                        // line; the append-only path flushes it to history.
+                        self.app.push_log(text.clone());
+                        self.pump_until_idle().await?;
+                    }
+                    Step::OpenOverlay => {
+                        self.app.transcript_overlay =
+                            Some(crate::TranscriptOverlayState::default());
+                    }
+                    Step::CloseOverlay => {
+                        self.app.transcript_overlay = None;
+                    }
+                    Step::Mouse => {
+                        // Mouse routing is not wired yet (the scenario
+                        // model documents it as a future surface); a no-op
+                        // keeps the byte stream identical to a session that
+                        // received no mouse input.
+                    }
+                    Step::Frame => {
+                        self.pump_until_idle().await?;
+                        capture_paint(&mut terminal, &mut self.app, size, &mut paint)?;
+                        // Record the mark AFTER the paint flushed: the
+                        // sink length is this frame's end offset.
+                        let byte_offset = sink
+                            .lock()
+                            .map(|buf| buf.len())
+                            .unwrap_or_else(|poison| poison.into_inner().len());
+                        log.frames.push(FrameMark {
+                            byte_offset,
+                            w: size.0,
+                            h: size.1,
+                        });
+                    }
+                }
+            }
+
+            // Tee the full byte stream out of the sink into the log.
+            log.bytes = sink
+                .lock()
+                .map(|buf| buf.clone())
+                .unwrap_or_else(|poison| poison.into_inner().clone());
+            Ok(log)
+        }
+    }
+
+    /// One append-only frame, byte-for-byte the same compound op
+    /// `TerminalGuard::paint_main` emits, but driven by an injected
+    /// [`FixedSize`] instead of crossterm's global `terminal_size()` so a
+    /// scripted `Resize` actually changes what the paint reads. Reuses
+    /// the crate-private renderer helpers so the captured ANSI matches
+    /// production exactly.
+    fn capture_paint(
+        terminal: &mut Terminal<CrosstermBackend<crate::terminal_writer::TerminalWriter>>,
+        app: &mut TuiApp,
+        size: FixedSize,
+        paint: &mut PaintState,
+    ) -> Result<()> {
+        use crate::size_source::SizeSource as _;
+        let (w, h) = size
+            .size()
+            .map_err(|e| SqueezyError::Terminal(e.to_string()))?;
+        if w == 0 || h == 0 {
+            return Ok(());
+        }
+        // Match `paint_main`: render two columns narrower so a glyph the
+        // terminal draws wider than unicode-width can't overflow.
+        let content_w = w.saturating_sub(2).max(1);
+
+        // History flush bookkeeping (the `prepare_history` body, inlined
+        // so the paint state lives in `PaintState` rather than the guard).
+        let flush_to = crate::settling_flush_boundary(app);
+        let (history_lines, flushed_divider_generation) =
+            crate::inline_history_lines_for_flush_with_turn_divider(
+                app,
+                content_w,
+                !paint.startup_flushed,
+                paint.transcript_flushed_len,
+                flush_to,
+                paint.turn_divider_flushed_generation,
+            );
+        if let Some(generation) = flushed_divider_generation {
+            paint.turn_divider_flushed_generation = Some(generation);
+        }
+        paint.startup_flushed = true;
+        paint.transcript_flushed_len = flush_to;
+
+        let divider_gen = paint.turn_divider_flushed_generation;
+        let footer = crate::render_footer_to_buffer(
+            app,
+            content_w,
+            INLINE_VIEWPORT_HEIGHT.min(h),
+            divider_gen,
+        );
+        let footer_h = crate::capped_footer_height(crate::footer_content_height(&footer), h);
+        let history = (!history_lines.is_empty())
+            .then(|| crate::render_lines_to_owned_buffer(&history_lines, content_w));
+
+        let had_footer = paint.footer_painted;
+        let backend = terminal.backend_mut();
+        let body = (|| -> std::io::Result<()> {
+            // Capture path always wraps in the DEC 2026 synchronized
+            // update, matching a synchronized-capable production terminal.
+            backend.write_all(crate::BEGIN_SYNCHRONIZED_UPDATE.as_bytes())?;
+            if had_footer {
+                execute!(backend, Clear(ClearType::FromCursorDown))?;
+            }
+            if let Some(hist) = history.as_ref() {
+                for y in 0..hist.area.height {
+                    backend.write_all(b"\r")?;
+                    crate::emit_buffer_row_styled(backend, hist, y, content_w)?;
+                    backend.write_all(b"\r\n")?;
+                }
+            }
+            execute!(backend, DisableLineWrap)?;
+            for y in 0..footer_h {
+                backend.write_all(b"\r")?;
+                crate::emit_buffer_row_styled(backend, &footer, y, content_w)?;
+                execute!(backend, Clear(ClearType::UntilNewLine))?;
+                if y + 1 < footer_h {
+                    backend.write_all(b"\r\n")?;
+                }
+            }
+            execute!(backend, EnableLineWrap)?;
+            if footer_h > 1 {
+                execute!(backend, crossterm::cursor::MoveToPreviousLine(footer_h - 1))?;
+            } else {
+                execute!(backend, crossterm::cursor::MoveToColumn(0))?;
+            }
+            Ok(())
+        })();
+        let _ = execute!(backend, EnableLineWrap);
+        let _ = backend.write_all(crate::END_SYNCHRONIZED_UPDATE.as_bytes());
+        let flushed = backend.flush();
+
+        paint.footer_painted = true;
+        app.footer_origin = h.saturating_sub(footer_h);
+        body.and(flushed)
+            .map_err(|e| SqueezyError::Terminal(e.to_string()))
     }
 }
 

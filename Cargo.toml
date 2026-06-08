@@ -86,6 +86,12 @@ aws-sdk-bedrockruntime = { version = "1", default-features = false, features = [
     "rt-tokio",
 ] }
 aws-smithy-types = "1"
+# Terminal emulators + snapshot lib for the `term-matrix` feature in
+# squeezy-tui. All three are optional and only pulled in when that
+# feature is enabled; the default build never compiles them.
+vt100 = "0.16.2"
+alacritty_terminal = "0.26.0"
+insta = { version = "1.47.2", features = ["yaml"] }
 tree-sitter-bash = "0.25.1"
 tree-sitter-c = "0.24"
 tree-sitter-c-sharp = "0.23.5"

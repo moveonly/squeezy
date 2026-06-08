@@ -1,0 +1,17 @@
+---
+source: crates/squeezy-tui/src/termsim/matrix.rs
+expression: redacted
+---
+                                            ○ ☽ ◑ ●  Squeezy v0.1.0  ● ◐ ☾ ○
+
+   ☽ Here is a multi-line answer.
+     It spans several lines so the history commit and footer
+     reflow both have real content to move around. singleturndone
+
+
+☽──────────────────────────────────────────────────────────────────────────╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+
+ ┃
+
+termsim-stub:termsim-model · <workspace> · ru... Build mode (Shift+Tab to cycle)
+Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl+T full transcript · /help

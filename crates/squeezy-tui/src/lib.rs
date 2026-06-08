@@ -96,6 +96,8 @@ mod status_line_setup;
 mod streaming;
 mod streaming_patch;
 mod terminal_writer;
+#[cfg(feature = "term-matrix")]
+mod termsim;
 mod toast;
 mod transcript_surface;
 pub use render::markdown::render_markdown;

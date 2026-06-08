@@ -1,0 +1,19 @@
+{
+  "name": "xtermcheck",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Gated xterm.js (VS Code engine) replay oracle for the squeezy-tui termsim matrix. Replays an exported CaptureLog through @xterm/headless and fails if the ☽ divider stacks.",
+  "type": "commonjs",
+  "bin": {
+    "xtermcheck": "replay.js"
+  },
+  "scripts": {
+    "check": "node replay.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@xterm/headless": "^5.5.0"
+  }
+}
