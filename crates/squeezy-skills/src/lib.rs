@@ -2183,7 +2183,7 @@ impl HookHandler for SkillHookHandler {
             .env("SQUEEZY_SKILL_NAME", &self.skill_name)
             .env("SQUEEZY_HOOK_PAYLOAD", payload);
 
-        let mut child = match command.spawn() {
+        let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
                 warn!(
@@ -2285,10 +2285,10 @@ impl HookHandler for SkillHookHandler {
             Err(_timeout_expired) => {
                 // Attempt to kill via Arc in case the wait thread has not yet
                 // taken child ownership. On Windows this is the only kill path.
-                if let Ok(mut g) = child_arc.lock() {
-                    if let Some(c) = g.as_mut() {
-                        let _ = c.kill();
-                    }
+                if let Ok(mut g) = child_arc.lock()
+                    && let Some(c) = g.as_mut()
+                {
+                    let _ = c.kill();
                 }
                 // On Unix: also send SIGKILL to the entire process group so
                 // grandchildren spawned by the hook shell cannot outlive the
