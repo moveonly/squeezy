@@ -12,6 +12,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
+use std::sync::{Arc, Mutex};
 
 /// Environment variable whose value is a path to the debug tap log
 /// file. Empty or unset means "do not tap". The file is opened in
@@ -30,6 +31,21 @@ pub(crate) enum TerminalWriter {
     Tee {
         stdout: io::Stdout,
         tap: BufWriter<File>,
+    },
+    /// Capture mode. Every byte handed to [`Write::write`] is appended
+    /// to the shared `sink` buffer; the same bytes are reported as
+    /// written so callers see lossless, in-memory output with no real
+    /// terminal I/O. Used by tests and headless renderers that need to
+    /// assert on the exact ANSI stream the TUI would emit.
+    ///
+    /// Not yet wired into a production code path; constructed via
+    /// [`TerminalWriter::capture`] by tests/headless renderers. The
+    /// targeted `allow(dead_code)` keeps warning-clean builds green
+    /// without a module-wide allow that would hide dead code in the
+    /// already-wired `Plain`/`Tee` variants.
+    #[allow(dead_code)]
+    Capture {
+        sink: Arc<Mutex<Vec<u8>>>,
     },
 }
 
@@ -55,6 +71,17 @@ impl TerminalWriter {
         }
     }
 
+    /// Build a writer that captures every emitted byte into `sink`
+    /// instead of touching the terminal. This is the in-memory
+    /// counterpart to the file-backed [`Self::Tee`] tap: it lets tests
+    /// and headless renderers observe the exact byte stream without a
+    /// real stdout or a temp file. The caller retains a clone of the
+    /// `Arc` to read the accumulated bytes after writing.
+    #[allow(dead_code)] // Not yet wired into a production path; see `Capture` variant.
+    pub(crate) fn capture(sink: Arc<Mutex<Vec<u8>>>) -> Self {
+        Self::Capture { sink }
+    }
+
     fn open_tap(path: &OsStr) -> io::Result<BufWriter<File>> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(BufWriter::new(file))
@@ -70,6 +97,16 @@ impl Write for TerminalWriter {
                 let _ = tap.write_all(&buf[..written]);
                 Ok(written)
             }
+            TerminalWriter::Capture { sink } => {
+                // Accept the whole buffer: an in-memory sink never
+                // short-writes. A poisoned lock is treated as a benign
+                // no-op so capture failures can never disrupt a render,
+                // mirroring the fire-and-forget posture of the tap.
+                if let Ok(mut buffer) = sink.lock() {
+                    buffer.extend_from_slice(buf);
+                }
+                Ok(buf.len())
+            }
         }
     }
 
@@ -81,6 +118,9 @@ impl Write for TerminalWriter {
                 let _ = tap.flush();
                 result
             }
+            // The sink is written eagerly, so there is nothing to
+            // flush; bytes are already visible to the holder of `sink`.
+            TerminalWriter::Capture { .. } => Ok(()),
         }
     }
 }

@@ -87,7 +87,9 @@ mod prompt_queue;
 mod proposed_plan;
 mod render;
 mod resume_picker;
+mod scroll;
 mod settings_watcher;
+mod size_source;
 mod startup_model_picker;
 mod status;
 mod status_line_setup;
@@ -95,6 +97,7 @@ mod streaming;
 mod streaming_patch;
 mod terminal_writer;
 mod toast;
+mod transcript_surface;
 pub use render::markdown::render_markdown;
 pub use startup_model_picker::{
     StartupModelPickerModel, StartupModelPickerProvider, StartupModelPickerResult,

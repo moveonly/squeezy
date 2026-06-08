@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::execute;
@@ -180,4 +180,49 @@ fn tee_writer_appends_across_multiple_writers_using_same_path() {
     assert_eq!(recorded, "first-second");
 
     let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn capture_writer_records_every_byte_across_writes_and_flush() {
+    // The Capture variant is the in-memory counterpart to the file tap:
+    // bytes handed to the writer must land in the shared sink verbatim,
+    // including across multiple writes, an `execute!`-driven frame, and
+    // an explicit flush. No real terminal or temp file is involved, so
+    // this test is deterministic and races nothing.
+    let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut writer = TerminalWriter::capture(Arc::clone(&sink));
+    assert!(matches!(writer, TerminalWriter::Capture { .. }));
+
+    // Plain multi-write path: each call appends to the same sink.
+    writer.write_all(b"alpha-").unwrap();
+    writer.write_all(b"beta-").unwrap();
+
+    // Drive a frame through the same `execute!` write path the real
+    // `TerminalGuard` uses, so the capture is exercised against the
+    // exact byte shapes the TUI emits.
+    execute!(
+        writer,
+        Print("\x1b[2J"),
+        Print("gamma"),
+        Print("\x1b[31mred\x1b[0m"),
+    )
+    .expect("execute should not fail writing to a memory-backed sink");
+
+    writer.flush().expect("flush should not fail");
+
+    // A single `write` must report the entire buffer as consumed: an
+    // in-memory sink never short-writes.
+    let n = writer.write(b"!").expect("write should not fail");
+    assert_eq!(n, 1, "capture write must consume the whole buffer");
+
+    drop(writer);
+
+    let captured = sink.lock().unwrap();
+    let expected = b"alpha-beta-\x1b[2Jgamma\x1b[31mred\x1b[0m!";
+    assert_eq!(
+        captured.as_slice(),
+        expected,
+        "captured bytes must equal exactly what was written, got {:?}",
+        String::from_utf8_lossy(&captured)
+    );
 }
