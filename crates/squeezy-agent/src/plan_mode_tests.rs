@@ -5,8 +5,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use squeezy_core::SessionMode;
 
 use super::{
-    CURRENT_POINTER_FILE, PLAN_DIR, PLAN_MODE_INSTRUCTIONS, instructions_for_mode,
-    is_active_plan_path, latest_plan_path, strip_proposed_plan_blocks,
+    CURRENT_POINTER_FILE, PLAN_DIR, PLAN_MODE_INSTRUCTIONS, canonicalize_active_plan_path,
+    instructions_for_mode, is_active_plan_path_with_canon, latest_plan_path,
+    strip_proposed_plan_blocks,
 };
 
 const TEST_SESSION_ID: &str = "test-sess-abc";
@@ -276,7 +277,11 @@ fn is_active_plan_path_returns_true_for_same_file() {
     let plans_dir = session_plans_dir(&root, TEST_SESSION_ID);
     let plan = plans_dir.join("plan-a.md");
     fs::write(&plan, "body").expect("write");
-    assert!(is_active_plan_path(&plan, &plan), "same path should match");
+    assert!(
+        canonicalize_active_plan_path(&plan)
+            .map_or(false, |canon| is_active_plan_path_with_canon(&plan, &canon)),
+        "same path should match"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -289,7 +294,9 @@ fn is_active_plan_path_returns_false_for_different_file() {
     fs::write(&plan_a, "body").expect("write a");
     fs::write(&plan_b, "body").expect("write b");
     assert!(
-        !is_active_plan_path(&plan_a, &plan_b),
+        !canonicalize_active_plan_path(&plan_b).map_or(false, |canon| {
+            is_active_plan_path_with_canon(&plan_a, &canon)
+        }),
         "different files should not match"
     );
     let _ = fs::remove_dir_all(&root);
@@ -303,7 +310,10 @@ fn is_active_plan_path_returns_false_when_target_nonexistent() {
     fs::write(&plan, "body").expect("write");
     let ghost = plans_dir.join("ghost.md");
     assert!(
-        !is_active_plan_path(&ghost, &plan),
+        !canonicalize_active_plan_path(&plan)
+            .map_or(false, |canon| is_active_plan_path_with_canon(
+                &ghost, &canon
+            )),
         "nonexistent target should return false"
     );
     let _ = fs::remove_dir_all(&root);
@@ -322,7 +332,9 @@ fn is_active_plan_path_resolves_dotdot_traversal() {
         .join(TEST_SESSION_ID)
         .join("plan-a.md");
     assert!(
-        is_active_plan_path(&traversal, &plan),
+        canonicalize_active_plan_path(&plan).map_or(false, |canon| is_active_plan_path_with_canon(
+            &traversal, &canon
+        )),
         "dotdot-resolved path should match"
     );
     let _ = fs::remove_dir_all(&root);
@@ -339,7 +351,9 @@ fn is_active_plan_path_case_insensitive_on_windows() {
     let lower = plans_dir.join("plan-a.md");
     // Both spellings should canonicalize to the same path on NTFS.
     assert!(
-        is_active_plan_path(&lower, &plan),
+        canonicalize_active_plan_path(&plan).map_or(false, |canon| is_active_plan_path_with_canon(
+            &lower, &canon
+        )),
         "case-only difference should match on Windows"
     );
     let _ = fs::remove_dir_all(&root);

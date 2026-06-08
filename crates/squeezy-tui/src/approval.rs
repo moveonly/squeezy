@@ -167,20 +167,25 @@ fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) 
     if let Some(binary) = permission.metadata.get("binary") {
         lines.push(dim(format!("binary {binary}")));
     }
-    // Warn plainly when the sandbox cannot enforce filesystem/network isolation
-    // (the Windows Job-Object backend). Users on Windows do not see a sandbox
-    // restriction failure — the Job-Object backend is the intentional design —
-    // so surfacing this caveat at approval time gives them an explicit signal
-    // before the command runs.
-    if permission
-        .metadata
-        .get("filesystem")
-        .map(|v| v == "best_effort_unavailable" || v == "enforced_writes_only")
-        .unwrap_or(false)
-    {
-        lines.push(warn_line(
-            "Windows: no filesystem/network isolation; process tree will be killed on timeout/cancel".to_string(),
-        ));
+    // Warn about Windows sandbox posture when the metadata reveals the active
+    // tier. The two non-full-isolation cases get distinct messages:
+    // - "best_effort_unavailable": Job-Object backend (disabled tier) — no
+    //   filesystem or network isolation at all.
+    // - "enforced_writes_only": restricted-token tier — filesystem *writes*
+    //   are blocked by ACLs, but reads and network are not isolated.
+    match permission.metadata.get("filesystem").map(String::as_str) {
+        Some("best_effort_unavailable") => {
+            lines.push(warn_line(
+                "Windows: no filesystem/network isolation; process tree will be killed on timeout/cancel".to_string(),
+            ));
+        }
+        Some("enforced_writes_only") => {
+            lines.push(warn_line(
+                "Windows: filesystem write isolation enforced; reads and network are not isolated"
+                    .to_string(),
+            ));
+        }
+        _ => {}
     }
 }
 

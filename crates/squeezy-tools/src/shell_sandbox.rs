@@ -390,16 +390,36 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
     }
     #[cfg(target_os = "windows")]
     {
+        // Report the backend the runtime actually uses for a default
+        // (windows_sandbox_level = "disabled") install.  The elevated tier
+        // is provisioned on demand; the restricted-token tier is opt-in.
+        // Reporting "windows-restricted-token" here for a system that uses
+        // "windows-job-object" mismatches the plan metadata consumers see.
+        let elevated_ready = squeezy_win_sandbox::elevated_setup_is_complete(
+            &crate::win_sandbox_spec::win_state_dir(),
+        );
+        let (backend, detail) = if elevated_ready {
+            (
+                "windows-elevated",
+                "Windows elevated sandbox: restricted-token ACLs + WFP network-egress deny; \
+                 opt-out via windows_sandbox_level = \"restricted_token\" or \"disabled\"."
+                    .to_string(),
+            )
+        } else {
+            (
+                "windows-job-object",
+                "Windows shell sandbox: Job Objects provide process-tree cleanup only (default \
+                 disabled tier); filesystem and network isolation are unavailable — use approvals \
+                 and checkpoints carefully. The restricted-token tier enforces filesystem writes \
+                 without admin rights. The elevated tier adds network isolation; opt in via \
+                 `squeezy doctor --sandbox-setup` (one UAC prompt)."
+                    .to_string(),
+            )
+        };
         ShellSandboxDoctor {
-            backend: "windows-restricted-token",
+            backend,
             available: true,
-            detail: "Windows shell sandbox: Job Objects provide process-tree cleanup only at the \
-                     default (disabled) tier; filesystem and network isolation are unavailable — \
-                     use approvals and checkpoints carefully. The restricted-token tier enforces \
-                     filesystem writes without admin rights. The elevated tier adds sensitive-read \
-                     deny and WFP network-egress control; opt in via \
-                     `squeezy doctor --sandbox-setup` (one UAC prompt)."
-                .to_string(),
+            detail,
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]

@@ -1207,11 +1207,18 @@ fn normalize_path_token(token: &str, home: Option<&str>) -> String {
             continue;
         }
         for prefix in [cmd_var, ps_var] {
-            let prefix_slash = format!("{prefix}/");
-            if let Some(rest) = token.strip_prefix(&prefix_slash) {
-                return format!("{value}/{rest}");
+            // Both cmd.exe (`%USERPROFILE%`) and PowerShell (`$env:USERPROFILE`)
+            // treat env-var names case-insensitively, so match case-insensitively
+            // for both the bare form and the path form (e.g. `%userprofile%\...`).
+            let prefix_lower = prefix.to_ascii_lowercase();
+            let token_lower = token.to_ascii_lowercase();
+            let prefix_slash_lower = format!("{prefix_lower}/");
+            if let Some(rest) = token_lower.strip_prefix(&prefix_slash_lower) {
+                // Preserve original-case suffix from the real token.
+                let rest_start = token.len() - rest.len();
+                return format!("{value}/{}", &token[rest_start..]);
             }
-            if token.eq_ignore_ascii_case(prefix) {
+            if token_lower == prefix_lower {
                 return value.clone();
             }
         }

@@ -18,6 +18,11 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 
 static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
+/// Process-wide lock for tests that mutate environment variables. Rust's test
+/// harness runs tests concurrently; without serialization, `set_var`/`remove_var`
+/// calls in one test can corrupt `env::var` reads in another. Acquire this guard
+/// for the entire duration of any test that calls `env::set_var` or `env::remove_var`.
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn registry_with_shell_sandbox_off(root: &Path) -> ToolRegistry {
     registry_with_shell_sandbox_off_and_output_config(root, ToolOutputConfig::default())
@@ -13187,46 +13192,74 @@ fn sensitive_path_matcher_expands_windows_userprofile() {
     // Simulate a Windows-like environment with USERPROFILE set.
     // The default sensitive-path patterns include `.ssh/**` which covers
     // %USERPROFILE%\.ssh\id_rsa.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let patterns = squeezy_core::ShellSandboxConfig::default().sensitive_path_patterns;
+    let previous = env::var_os("USERPROFILE");
     unsafe {
         env::set_var("USERPROFILE", "C:/Users/testuser");
     }
+    let result_cmd =
+        shell_command_references_sensitive_path("type %USERPROFILE%/.ssh/id_rsa", &patterns);
+    let result_ps = shell_command_references_sensitive_path(
+        "Get-Content $env:USERPROFILE/.ssh/id_rsa",
+        &patterns,
+    );
+    unsafe {
+        match previous {
+            Some(v) => env::set_var("USERPROFILE", v),
+            None => env::remove_var("USERPROFILE"),
+        }
+    }
     assert!(
-        shell_command_references_sensitive_path("type %USERPROFILE%/.ssh/id_rsa", &patterns)
-            .is_some(),
+        result_cmd.is_some(),
         "%USERPROFILE% prefix should be expanded and .ssh/id_rsa detected"
     );
     assert!(
-        shell_command_references_sensitive_path(
-            "Get-Content $env:USERPROFILE/.ssh/id_rsa",
-            &patterns
-        )
-        .is_some(),
+        result_ps.is_some(),
         "$env:USERPROFILE prefix should be expanded and .ssh/id_rsa detected"
     );
-    unsafe {
-        env::remove_var("USERPROFILE");
-    }
 }
 
 #[test]
 fn sensitive_path_matcher_expands_windows_appdata() {
-    // APPDATA typically holds credentials for various CLI tools (gh, azure, etc.)
-    // that may appear in the user's sensitive-path config. We just verify the
-    // expansion itself works by checking a contrived pattern.
-    let custom_patterns = vec![".aws/credentials".to_string()];
+    // The sensitive pattern "Roaming/.aws/credentials" only matches after
+    // %APPDATA% is expanded to the configured value; the literal token
+    // "%APPDATA%/.aws/credentials" does not contain "Roaming" anywhere,
+    // so this test fails if the expansion code is absent or broken.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let custom_patterns = vec!["Roaming/.aws/credentials".to_string()];
+    let previous = env::var_os("APPDATA");
     unsafe {
         env::set_var("APPDATA", "C:/Users/testuser/AppData/Roaming");
     }
-    assert!(
-        shell_command_references_sensitive_path(
-            "type %APPDATA%/.aws/credentials",
-            &custom_patterns
-        )
-        .is_some(),
-        "%APPDATA% prefix should be expanded"
+    // Without expansion %APPDATA%/.aws/credentials does not match
+    // "Roaming/.aws/credentials".  With expansion it becomes
+    // "C:/Users/testuser/AppData/Roaming/.aws/credentials" which does.
+    let result_set = shell_command_references_sensitive_path(
+        "type %APPDATA%/.aws/credentials",
+        &custom_patterns,
     );
     unsafe {
         env::remove_var("APPDATA");
     }
+    // Verify the negative: without APPDATA set, the pattern cannot match.
+    let result_unset = shell_command_references_sensitive_path(
+        "type %APPDATA%/.aws/credentials",
+        &custom_patterns,
+    );
+    // Restore.
+    unsafe {
+        match previous {
+            Some(v) => env::set_var("APPDATA", v),
+            None => {} // already removed above
+        }
+    }
+    assert!(
+        result_set.is_some(),
+        "%APPDATA% prefix should be expanded before matching"
+    );
+    assert!(
+        result_unset.is_none(),
+        "unexpanded %APPDATA% must not match when env var is unset"
+    );
 }

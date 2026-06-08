@@ -6310,14 +6310,23 @@ impl TurnRuntime {
         if self.turn_id.get() == 1 {
             self.dispatch_setup();
             self.dispatch_session_start();
+            // Emit a session-level banner when the Windows sandbox is running
+            // at the job-object-only (disabled) tier. At the restricted-token
+            // or elevated tiers, filesystem isolation is partially or fully
+            // enforced, so the "no isolation" caveat does not apply.
             #[cfg(target_os = "windows")]
             {
-                let _ = self
-                    .tx
-                    .send(AgentEvent::WindowsSandboxActive {
-                        turn_id: self.turn_id,
-                    })
-                    .await;
+                use squeezy_core::WindowsSandboxLevel;
+                if self.config.permissions.shell_sandbox.windows_sandbox_level
+                    == WindowsSandboxLevel::Disabled
+                {
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::WindowsSandboxActive {
+                            turn_id: self.turn_id,
+                        })
+                        .await;
+                }
             }
         }
         let original_input = input.clone();
@@ -15270,16 +15279,18 @@ pub(crate) fn mode_permission_verdict(
     request: &PermissionRequest,
     active_plan_path: Option<&Path>,
 ) -> Option<PermissionVerdict> {
+    // Pre-canonicalize the active plan path once so it can be reused for
+    // both the permission gate (via is_active_plan_path_with_canon) and the
+    // denial-message display, avoiding a redundant fs::canonicalize syscall.
+    // On Windows this also normalises drive-letter case, UNC prefixes, and
+    // junction targets before either comparison or display.
+    let active_plan_canon = active_plan_path.and_then(plan_mode::canonicalize_active_plan_path);
     let plan_edit_allowed = matches!(
         (mode, request.capability),
         (SessionMode::Plan, PermissionCapability::Edit)
-    ) && active_plan_path
-        .is_some_and(|active| plan_mode::is_active_plan_path(Path::new(&request.target), active));
-    // Separately pre-canonicalize the active plan path for the denial-message
-    // display so both paths appear in their Windows-normalized form (resolved
-    // drive-letter case, UNC prefix, junction targets) rather than the raw
-    // form the caller passed in.
-    let active_plan_canon = active_plan_path.and_then(plan_mode::canonicalize_active_plan_path);
+    ) && active_plan_canon.as_deref().is_some_and(|active| {
+        plan_mode::is_active_plan_path_with_canon(Path::new(&request.target), active)
+    });
     if mode == SessionMode::Plan && request.tool_name == "shell" {
         if matches!(
             request.capability,
