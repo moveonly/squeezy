@@ -163,7 +163,7 @@ pub(crate) fn format_cost_command(snapshot: &SessionAccountingSnapshot) -> Strin
                     continue;
                 }
                 out.push_str(&format!(
-                    "  {} {} {} usd={} in={} out={} cache_r={} cache_w={}\n",
+                    "  {} {} {} usd={} in={} out={} cache_read={} cache_write={}\n",
                     style::accent("◉"),
                     styled_label,
                     style::muted(scope),
@@ -177,7 +177,7 @@ pub(crate) fn format_cost_command(snapshot: &SessionAccountingSnapshot) -> Strin
         }
         let totals = metrics.model_ledger.totals();
         out.push_str(&format!(
-            "  {} total usd={} in={} out={} cache_r={} cache_w={}\n",
+            "  {} total usd={} in={} out={} cache_read={} cache_write={}\n",
             style::accent("Σ"),
             format_cost_styled(&totals),
             style_optional_u64(totals.input_tokens),

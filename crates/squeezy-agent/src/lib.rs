@@ -1862,9 +1862,29 @@ impl Agent {
         // graph cache lives in `graph.redb` and is opened by the registry's
         // deferred graph task so a large semantic cache cannot block prompt
         // entry during session startup.
-        let store = SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref())
-            .ok()
-            .map(Arc::new);
+        let store = match SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref()) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(ref e) => {
+                // On Windows, redb uses exclusive file locks; a second
+                // Squeezy process (or a leftover handle) can prevent the
+                // store from opening. This degrades tool receipt
+                // persistence silently — warn so the user has a signal
+                // in logs and support reports, even though the agent
+                // continues to function without the store.
+                tracing::warn!(
+                    target: "squeezy::store",
+                    error = %e,
+                    path = %squeezy_store::state_path(
+                        std::path::Path::new(&config.workspace_root),
+                        config.cache.root.as_deref(),
+                    ).display(),
+                    "state.redb could not be opened; tool receipt persistence and \
+                     read-snapshot cache are unavailable for this session \
+                     (another Squeezy instance may hold the lock)",
+                );
+                None
+            }
+        };
         if let Some(store) = store.clone() {
             // Pruning expired compaction checkpoints is a best-effort GC
             // write transaction; nothing on the input path depends on it.
@@ -9196,6 +9216,12 @@ impl TurnRuntime {
         token_calibration: &squeezy_llm::TokenCalibration,
         mark_resume_available: bool,
     ) {
+        // Persist errors are captured while the lock is held and used to
+        // emit a session event *after* the lock drops so that
+        // `append_event`'s synchronous I/O does not extend the async-mutex
+        // window beyond what `write_resume_state` / `update_metadata` already
+        // require.
+        let mut persist_errors: Option<(Option<String>, Option<String>)> = None;
         let calibration_for_global = {
             let mut state = self.conversation_state.lock().await;
             merge_cost(&mut state.cost, cost);
@@ -9206,18 +9232,27 @@ impl TurnRuntime {
                 metrics.escalated_to_parent || !metrics.routed_to_cheap,
             );
             if let Some(session) = &self.session_log {
-                let _ = session.write_resume_state(&state.to_resume_state());
+                let resume_err = session
+                    .write_resume_state(&state.to_resume_state())
+                    .err()
+                    .map(|e| e.to_string());
                 let calibration_for_metadata = state.token_calibration.clone();
-                let _ = session.update_metadata(|metadata| {
-                    metadata.cost = state.cost.clone();
-                    metadata.metrics = state.metrics.clone();
-                    metadata.redactions = state.redactions;
-                    if mark_resume_available {
-                        metadata.resume_available = true;
-                    }
-                    metadata.mode = load_session_mode(&self.session_mode);
-                    metadata.token_calibration = calibration_for_metadata;
-                });
+                let metadata_err = session
+                    .update_metadata(|metadata| {
+                        metadata.cost = state.cost.clone();
+                        metadata.metrics = state.metrics.clone();
+                        metadata.redactions = state.redactions;
+                        if mark_resume_available {
+                            metadata.resume_available = true;
+                        }
+                        metadata.mode = load_session_mode(&self.session_mode);
+                        metadata.token_calibration = calibration_for_metadata;
+                    })
+                    .err()
+                    .map(|e| e.to_string());
+                if resume_err.is_some() || metadata_err.is_some() {
+                    persist_errors = Some((resume_err, metadata_err));
+                }
             }
             state.token_calibration.clone()
         };
@@ -9226,6 +9261,27 @@ impl TurnRuntime {
         // than the per-provider defaults. Failures are silent — the global
         // file is a warm-start cache, not a source of truth.
         let _ = SessionStore::open(&self.config).save_global_calibration(&calibration_for_global);
+        // Record a session event when persistence fails so that bug reports
+        // carry concrete evidence without needing a provider call. On Windows
+        // this surfaces file-lock failures (Defender/indexer holding the file)
+        // that would otherwise silently leave /cost as live-only. Placed
+        // outside the conversation_state lock so that append_event's I/O does
+        // not block while the async mutex is held.
+        if let (Some((resume_err, metadata_err)), Some(session)) =
+            (persist_errors, &self.session_log)
+        {
+            let _ = session.append_event(SessionEvent::from_typed(
+                SessionEventKind::Custom {
+                    kind: "accounting_persistence_error".to_string(),
+                    payload: serde_json::json!({
+                        "resume_state_error": resume_err,
+                        "metadata_error": metadata_err,
+                    }),
+                },
+                Some(self.turn_id.to_string()),
+                Some("accounting persistence failed".to_string()),
+            ));
+        }
     }
 
     /// Fold a best-effort partial cost into `total_cost` and the broker's

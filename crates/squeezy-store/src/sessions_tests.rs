@@ -3626,9 +3626,9 @@ fn write_json_is_atomic_no_stale_tmp_and_preserves_original() {
 
     // A pre-existing stale temp sibling (e.g. from a crashed prior write)
     // does not corrupt or block the next write: the good target survives
-    // and is replaced atomically. Use the new pid-counter format so the
-    // seeded path matches what a real crashed writer would have left.
-    let stale_tmp = root.join(format!(".metadata.json.{}-0.tmp", std::process::id()));
+    // and is replaced atomically. Use a high seq value to avoid colliding
+    // with the live WRITE_UNIQUE_COUNTER in this process.
+    let stale_tmp = root.join(format!(".metadata.json.{}.999999.tmp", std::process::id()));
     fs::write(&stale_tmp, b"{ this is not valid json").expect("seed stale tmp");
     write_json(&path, &json!({ "k": "third" })).expect("rewrite over stale tmp");
     let value: serde_json::Value =

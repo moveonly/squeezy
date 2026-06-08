@@ -23,10 +23,12 @@ use squeezy_core::{
 };
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
-/// Process-global counter used to generate unique temp-file suffixes.
-/// Using a counter instead of pid-only prevents two concurrent writers
-/// inside the same process from colliding on the same temp path.
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Monotonic counter that makes sibling temp file names unique within a
+/// process even when multiple session handles concurrently write the same
+/// target path. Combined with `std::process::id()` this eliminates temp-file
+/// collisions on Windows where `rename` fails when a temp is held open by
+/// another writer in the same process.
+static WRITE_UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
 /// Schema version stamped onto every `RolloutEvent` emitted by
 /// [`SessionStore::bundle_rollout_trace`]. The reducer is additive over
@@ -127,12 +129,25 @@ impl SessionStore {
     /// Atomically persist the cross-session `TokenCalibration`. Errors are
     /// returned to the caller but expected to be logged-and-ignored — a
     /// failed write only costs us the next session's warm-start.
+    ///
+    /// Skips the write when the serialized content is byte-for-byte identical
+    /// to the current file. This avoids unnecessary rename operations on
+    /// Windows (common when calibration ratios are stable across consecutive
+    /// turns) and reduces contention on the shared calibration file.
     pub fn save_global_calibration(
         &self,
         calibration: &squeezy_llm::TokenCalibration,
     ) -> Result<()> {
         fs::create_dir_all(&self.root)?;
-        write_json(&self.calibration_path(), calibration)
+        let path = self.calibration_path();
+        let new_bytes = serde_json::to_vec_pretty(calibration).map_err(json_error)?;
+        if let Ok(existing) = fs::read(&path)
+            && existing == new_bytes
+        {
+            return Ok(());
+        }
+        // Reuse the already-serialized bytes to avoid double serialization.
+        write_json_bytes(&path, &new_bytes)
     }
 
     /// Path to the user-global memory file. Returns `None` when `HOME` is
@@ -2881,15 +2896,21 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(value).map_err(json_error)?;
-    // Include a pid+counter suffix so concurrent writers within the same
-    // process (e.g. multiple async tasks writing resume_state.json via
-    // different tokio workers) never share a temp path.  A pid-only suffix
-    // was vulnerable to same-process collision on Windows where the second
-    // writer fails or clobbers the first temp file while its handle is open.
-    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    write_json_bytes(path, &bytes)
+}
+
+/// Write `bytes` to `path` atomically via a unique sibling temp file.
+/// Called by [`write_json`] (which serializes first) and by callers that
+/// have already serialized the value and want to avoid double-work.
+fn write_json_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    // Unique temp name: pid + monotonic counter so concurrent writers in
+    // the same process (multiple session handles writing metadata or
+    // calibration) never share a temp path. This is especially important
+    // on Windows where rename fails if another handle holds the temp file.
+    let seq = WRITE_UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = match path.file_name().and_then(|name| name.to_str()) {
-        Some(name) => path.with_file_name(format!(".{}.{}-{}.tmp", name, std::process::id(), seq)),
-        None => path.with_extension("tmp"),
+        Some(name) => path.with_file_name(format!(".{}.{}.{}.tmp", name, std::process::id(), seq)),
+        None => path.with_file_name(format!(".{}.{}.tmp", std::process::id(), seq)),
     };
     {
         let mut file = OpenOptions::new()
@@ -2897,7 +2918,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
             .truncate(true)
             .write(true)
             .open(&tmp)?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
     }
     if let Err(error) = rename_with_retry(&tmp, path) {
@@ -2905,6 +2926,51 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
         return Err(error.into());
     }
     Ok(())
+}
+
+/// `fs::rename` wrapper that retries on Windows sharing-violation errors
+/// (OS error 32 / `ERROR_SHARING_VIOLATION`). Antivirus scanners, indexers,
+/// and shell preview panes briefly lock files without delete-sharing, causing
+/// transient failures that a short bounded retry reliably clears.
+/// On non-Windows platforms this is a thin wrapper with zero overhead.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        // 4 retry attempts with backoff, then one final attempt — 5 total.
+        const RETRY_ATTEMPTS: u32 = 4;
+        let mut delay_ms = 10u64;
+        for _ in 0..RETRY_ATTEMPTS {
+            match fs::rename(from, to) {
+                Ok(()) => return Ok(()),
+                Err(ref e) if is_windows_sharing_violation(e) => {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    delay_ms = (delay_ms * 2).min(100);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        fs::rename(from, to)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)
+    }
+}
+
+/// Returns `true` when `e` is a transient Windows sharing/lock violation that
+/// is worth retrying. Covers `ERROR_SHARING_VIOLATION` (32) and
+/// `ERROR_LOCK_VIOLATION` (33), which are both raised by AV scanners and
+/// indexers that briefly hold files without delete-sharing.
+///
+/// `ERROR_ACCESS_DENIED` (5) / `PermissionDenied` is intentionally excluded:
+/// that error is permanent (ACL denial, read-only target) and will not clear
+/// on retry.
+///
+/// Defined unconditionally to avoid `#[cfg]` noise at call sites; on
+/// non-Windows it is never reached.
+#[allow(unused)]
+fn is_windows_sharing_violation(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(32) | Some(33)) // ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION
 }
 
 /// Heuristic guard for [`SessionStore::record_global_index`].
@@ -2992,19 +3058,16 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // Unique-per-process temp name prevents two concurrent Squeezy
-    // processes from clobbering each other's in-flight temp file.
-    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let index_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("index.jsonl");
-    let tmp = path.with_file_name(format!(
-        ".{}.{}-{}.tmp",
-        index_name,
-        std::process::id(),
-        seq
-    ));
+    // Unique temp name: pid + monotonic counter. A fixed `.jsonl.tmp`
+    // name caused races on Windows when multiple sessions finished
+    // concurrently — one writer could rename the other's partially
+    // prepared temp, losing session cost summaries from cross-project
+    // resume views.
+    let seq = WRITE_UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => path.with_file_name(format!(".{}.{}.{}.tmp", name, std::process::id(), seq)),
+        None => path.with_file_name(format!(".{}.{}.tmp", std::process::id(), seq)),
+    };
     {
         let mut file = OpenOptions::new()
             .create(true)
@@ -3487,39 +3550,6 @@ fn serialize_event_payload(event: &SessionEvent, max_event_bytes: usize) -> Resu
 
 fn json_error(error: serde_json::Error) -> SqueezyError {
     SqueezyError::Tool(format!("session store JSON error: {error}"))
-}
-
-/// Perform `fs::rename(from, to)`, retrying once with a short sleep on
-/// transient sharing-violation errors that are common on Windows when an
-/// antivirus scanner, Windows Search indexer, or another process briefly
-/// holds an exclusive handle on the target path.
-fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(first) if is_windows_sharing_violation(&first) => {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            match fs::rename(from, to) {
-                Ok(()) => Ok(()),
-                Err(_) => Err(first),
-            }
-        }
-        Err(error) => Err(error),
-    }
-}
-
-/// Returns `true` for Windows ERROR_SHARING_VIOLATION (os error 32) or
-/// ERROR_LOCK_VIOLATION (os error 33). These are transient: a brief sleep
-/// and retry is usually enough.  Always returns `false` on non-Windows.
-fn is_windows_sharing_violation(error: &std::io::Error) -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        matches!(error.raw_os_error(), Some(32) | Some(33))
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = error;
-        false
-    }
 }
 
 /// Translate a filesystem error that occurred while renaming or removing

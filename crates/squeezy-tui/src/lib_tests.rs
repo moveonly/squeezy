@@ -4497,8 +4497,8 @@ fn format_cost_command_renders_by_model_drill() {
     assert!(output.contains("anthropic:claude-haiku-4-5"), "{output}");
     assert!(output.contains("main usd="), "{output}");
     assert!(output.contains("subagent usd="), "{output}");
-    assert!(output.contains("cache_r=210000"), "{output}");
-    assert!(output.contains("cache_w=90000"), "{output}");
+    assert!(output.contains("cache_read=210000"), "{output}");
+    assert!(output.contains("cache_write=90000"), "{output}");
     // Σ total == cost.estimated_usd (910000) + subagent_provider (48000) == 958000
     // == sum of every ledger bucket. This invariant keeps the drill honest.
     assert!(output.contains("total usd=$0.958000"), "{output}");
