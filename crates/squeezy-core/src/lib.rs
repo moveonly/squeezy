@@ -4319,6 +4319,7 @@ impl ProviderSettings {
             request_metadata: None,
             deployment_name_map,
             route_style: string_value(table, "route_style", source, &field(path, "route_style"))?,
+            keep_alive: string_value(table, "keep_alive", source, &field(path, "keep_alive"))?,
             script: string_value(table, "script", source, &field(path, "script"))?,
             use_entra_id: bool_value(table, "use_entra_id", source, &field(path, "use_entra_id"))?,
             organization: string_value(
@@ -4379,6 +4380,7 @@ impl ProviderSettings {
         );
         replace_if_some(&mut self.headers, next.headers);
         replace_if_some(&mut self.route_style, next.route_style);
+        replace_if_some(&mut self.keep_alive, next.keep_alive);
         replace_if_some(&mut self.script, next.script);
         replace_if_some(&mut self.use_entra_id, next.use_entra_id);
         replace_if_some(&mut self.organization, next.organization);
