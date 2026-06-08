@@ -5956,11 +5956,23 @@ fn session_metrics_merge_turn_folds_model_ledger() {
 /// Guard that PROVIDER_OPTIONS in the config schema covers every provider
 /// name accepted by the runtime resolver.  This prevents the TUI provider
 /// dropdown and templates from lagging behind new provider support.
+///
+/// # Coverage
+/// - **OpenAI-compatible presets** (the majority): fully derived from
+///   `OpenAiCompatiblePreset::all()` so this half auto-updates when new
+///   presets are added to the enum.
+/// - **First-class providers** (openai, anthropic, google, azure_openai,
+///   bedrock, ollama, openai_codex, github_copilot): these are a small, stable
+///   set of `ProviderConfig` variants that have no equivalent `all()` accessor.
+///   The slice below is manually maintained.  There is currently no
+///   `ProviderConfig::all_slugs()` helper; if one is added in the future,
+///   replace the hard-coded slice with a dynamic call.
 #[test]
 fn provider_options_covers_all_accepted_providers() {
     use config_schema::PROVIDER_OPTIONS;
 
-    // First-class (non-compatible) providers accepted by the resolver.
+    // First-class (non-compatible) providers — manually maintained.
+    // These change rarely; update this list when adding a new ProviderConfig variant.
     let first_class = &[
         "openai",
         "anthropic",
@@ -5978,7 +5990,7 @@ fn provider_options_covers_all_accepted_providers() {
         );
     }
 
-    // Every OpenAI-compatible preset accepted by OpenAiCompatiblePreset::parse.
+    // OpenAI-compatible presets — derived dynamically from the enum.
     for preset in OpenAiCompatiblePreset::all() {
         let canonical = preset.as_str();
         assert!(

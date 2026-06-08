@@ -937,39 +937,29 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
         }
         Some(ConfigCommand::Inspect) => {
             let config = config_from_cli(cli)?;
-            let output = config.inspect_redacted();
-            // Warn when any config string value starts with '!' (shell-escape
-            // execution).  These execute at config-load time before sandboxing
-            // or permission policy and warrant explicit visibility.
-            let shell_escape_fields: Vec<String> = config
-                .config_warnings
-                .iter()
-                .filter(|w| w.field.starts_with('!'))
-                .map(|w| format!("  {}: {}", w.source, w.field))
-                .collect();
-            if !shell_escape_fields.is_empty() {
-                eprintln!(
-                    "warning: the following config values begin with '!' and will be executed \
-                     as shell commands at config-load time (before sandboxing):"
-                );
-                for line in &shell_escape_fields {
-                    eprintln!("{line}");
-                }
-            }
-            // Also scan the effective config output for '!' prefixed values
-            // so they are surfaced even if not captured as structured warnings.
-            for line in output.lines() {
-                if let Some(rest) = line.split_once('=') {
-                    let val = rest.1.trim().trim_matches('"');
-                    if val.starts_with('!') {
-                        eprintln!(
-                            "warning: shell-escape value detected in config: {}",
-                            line.trim()
-                        );
+            // Warn when any settings file contains shell-escape values (= "!command").
+            // These execute at config-load time before sandboxing or permission policy.
+            // We scan raw TOML rather than the resolved AppConfig because by the time
+            // the config is built, shell-escape values have already been executed and
+            // replaced with their output.
+            if let Ok(sources) = squeezy_core::load_separated_settings_sources() {
+                let tier_paths: [(&str, Option<&std::path::Path>); 3] = [
+                    ("user", sources.user.as_ref().map(|t| t.path.as_path())),
+                    ("repo", sources.project.as_ref().map(|t| t.path.as_path())),
+                    ("local", sources.repo.as_ref().map(|t| t.path.as_path())),
+                ];
+                for (label, path) in tier_paths {
+                    if let Some(p) = path {
+                        for escaped_line in scan_file_for_shell_escapes(p) {
+                            eprintln!(
+                                "warning: shell-escape value in {label} config ({}): {escaped_line}",
+                                p.display()
+                            );
+                        }
                     }
                 }
             }
-            print!("{output}");
+            print!("{}", config.inspect_redacted());
             Ok(())
         }
         Some(ConfigCommand::Init {
@@ -980,8 +970,20 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
             let (path, template) = if scope.user {
                 (default_settings_path(), user_settings_template())
             } else if scope.local {
+                // Mirror the logic in load_default_settings_sources: walk up to
+                // find squeezy.toml and use its parent as the canonical repo root.
+                // Using raw CWD would hash a different path than the runtime uses
+                // when the user is in a subdirectory of the repo.
                 let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                (per_repo_settings_path(&cwd), local_settings_template())
+                let repo_root = find_project_settings_path(&cwd)
+                    .as_deref()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or(cwd);
+                (
+                    per_repo_settings_path(&repo_root),
+                    local_settings_template(),
+                )
             } else {
                 let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 (project_init_target(cwd), project_settings_template())
@@ -1165,13 +1167,42 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
                     })
                 })
                 .collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&sections).unwrap_or_default()
-            );
+            let json = serde_json::to_string_pretty(&sections)
+                .map_err(|e| SqueezyError::Config(format!("schema serialization failed: {e}")))?;
+            println!("{json}");
             Ok(())
         }
     }
+}
+
+/// Reads `path` and returns each non-comment line that has a string value
+/// beginning with `!` (shell-escape syntax).  Returns an empty vec if the
+/// file cannot be read.
+fn scan_file_for_shell_escapes(path: &std::path::Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|line| {
+            let t = line.trim();
+            !t.starts_with('#') && t.contains('=')
+        })
+        .filter_map(|line| {
+            let eq_pos = line.find('=')?;
+            let val = line[eq_pos + 1..].trim();
+            // Strip one layer of surrounding quotes and check for !.
+            let inner = val
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| val.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(val);
+            if inner.starts_with('!') {
+                Some(line.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn field_kind_to_json(kind: &squeezy_core::config_schema::FieldKind) -> serde_json::Value {
