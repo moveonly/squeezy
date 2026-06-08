@@ -6885,9 +6885,15 @@ async fn shell_tty_attaches_stdout_to_terminal() {
         .await;
     assert_eq!(tty.status, ToolStatus::Success);
     // Windows does not yet wire up ConPTY for the shell tool, so `tty: true`
-    // is documented to degrade to pipe-backed stdio on that platform.
-    let expected_tty_output = if cfg!(windows) { "pipe" } else { "tty" };
-    assert_eq!(tty.content["stdout"], expected_tty_output);
+    // degrades to pipe-backed stdio. The output is prefixed with a notice
+    // so the model knows it is running in non-interactive pipe mode.
+    #[cfg(windows)]
+    assert_eq!(
+        tty.content["stdout"],
+        "[ConPTY unavailable; running non-interactive pipes]\npipe"
+    );
+    #[cfg(not(windows))]
+    assert_eq!(tty.content["stdout"], "tty");
 
     let _ = fs::remove_dir_all(root);
 }
