@@ -11230,18 +11230,35 @@ async fn run_subagent_rounds(
                     // accumulated in `refusal_text`; the `StopReason::Refusal`
                     // terminal here gates the early return.
                     if matches!(stop_reason, Some(StopReason::Refusal)) && tool_calls.is_empty() {
+                        // Fold the final round's cost before returning so the
+                        // parent's subagent metrics do not silently report zero
+                        // cost for this round.
+                        if cost.estimated_usd_micros.is_none() {
+                            cost.estimated_usd_micros =
+                                estimate_cost(parent.provider.name(), &effective_model, &cost);
+                        }
+                        broker.metrics.record_provider(&cost);
                         broker.metrics.redactions += assistant_stream.total_redactions();
-                        let detail = if refusal_text.is_empty() {
+                        // Some providers (e.g. Anthropic) emit refusal text as
+                        // ordinary `TextDelta` rather than `Refusal` deltas;
+                        // fall back to `assistant_message` when the dedicated
+                        // refusal buffer is empty so the summary is never blank.
+                        let refusal_prose = if refusal_text.is_empty() {
+                            &assistant_message
+                        } else {
+                            &refusal_text
+                        };
+                        let detail = if refusal_prose.is_empty() {
                             "subagent model refused the request".to_string()
                         } else {
                             format!(
                                 "subagent model refused: {}",
-                                compact_text(&refusal_text, 512)
+                                compact_text(refusal_prose, 512)
                             )
                         };
                         return SubagentExecution {
                             status: ToolStatus::Error,
-                            summary: compact_text(&refusal_text, 512),
+                            summary: compact_text(refusal_prose, 512),
                             status_label: "refusal",
                             error: Some(detail),
                             metrics: broker.metrics.clone(),
@@ -14976,6 +14993,12 @@ async fn permission_decision_for_request(
         // available on the permission path, so the *current* turn's live
         // status-line snapshot and cap checks don't see this spend until
         // the next turn re-seeds the broker from `state.cost`.
+        // Guard mirrors the AI-reviewer cost-fold: if all three counters are
+        // None (e.g. the provider returned an empty CostSnapshot AND
+        // estimate_cost returned None for an unknown/mock model), the fold
+        // is skipped. In production, `config.model` is always a known model
+        // and `estimate_cost` fills in `estimated_usd_micros` before we reach
+        // here, so the guard fires only in test environments with stub models.
         if (classifier.cost.estimated_usd_micros.is_some()
             || classifier.cost.input_tokens.is_some()
             || classifier.cost.output_tokens.is_some())
@@ -17580,9 +17603,16 @@ pub enum AgentEvent {
         source: CitationSource,
     },
     /// A hidden control-plane tool completed without consuming normal tool
-    /// budget. Emitted for `load_tool_schema` and `update_task_state` so
-    /// debuggers and eval replay can observe control-plane activity without
-    /// adding noisy user-facing tool cards.
+    /// budget. Intended to be emitted for `load_tool_schema` and
+    /// `update_task_state` so debuggers and eval replay can observe
+    /// control-plane activity without adding noisy user-facing tool cards.
+    ///
+    /// **Emission deferred**: creating a ~1 KiB `AgentEvent` temporary inside
+    /// the deeply-nested `execute_tool_calls` / `TurnRuntime::run` call stack
+    /// pushes borderline tests over the default thread-stack limit on macOS.
+    /// The infrastructure is ready (all match sites handle this variant via
+    /// `_ => {}` or `{ .. } => {}`); emission will be wired up once the
+    /// control-tool result path is moved off the hot-path stack.
     ControlToolTrace {
         turn_id: TurnId,
         /// Stable tool name token, e.g. `"load_tool_schema"` or

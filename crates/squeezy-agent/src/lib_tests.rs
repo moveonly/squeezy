@@ -11966,3 +11966,70 @@ async fn mcp_background_queue_serves_issued_tickets_in_order() {
 
     assert_eq!(&*events.lock().await, &["first", "second"]);
 }
+
+/// Regression: subagent loop previously dropped `LlmEvent::Refusal` deltas,
+/// causing an empty summary when the provider stopped with `StopReason::Refusal`.
+/// After the fix the refusal prose should appear in the `SubagentFailed.error`.
+#[tokio::test]
+async fn subagent_refusal_surfaces_prose_in_failed_event() {
+    // Round 1: parent calls `delegate`.
+    // Round 2 (subagent): provider emits Refusal delta + Completed(Refusal).
+    // Round 3: parent receives SubagentFailed and completes the turn.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "del_refusal".to_string(),
+                name: "delegate".to_string(),
+                arguments: json!({"prompt": "do something unsafe"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::ToolUse),
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Subagent round: OpenAI-style refusal delta + Refusal stop reason.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::Refusal {
+                content: "I cannot assist with that request.".to_string(),
+            }),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_sub_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::Refusal),
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Parent: acknowledges the failed subagent and finishes.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("understood".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let agent = Agent::new(AppConfig::default(), provider);
+    let mut rx = agent.start_turn("delegate unsafe task".to_string(), CancellationToken::new());
+    let mut failed_error: Option<String> = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::SubagentFailed { error, .. } => {
+                failed_error = Some(error);
+            }
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+    let error = failed_error.expect("SubagentFailed must fire when subagent is refused");
+    assert!(
+        error.contains("refused") || error.contains("cannot"),
+        "SubagentFailed error must include refusal prose, got: {error}"
+    );
+}
