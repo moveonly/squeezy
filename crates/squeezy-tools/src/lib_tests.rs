@@ -10240,6 +10240,44 @@ pub fn unrelated() {}
 }
 
 #[tokio::test]
+async fn decl_search_fuzzy_falls_back_when_seed_hits_do_not_rank() {
+    let root = temp_workspace("graph_fuzzy_seed_fallback");
+    write_rust_crate(
+        &root,
+        r#"
+pub struct GraphManager;
+pub struct Bogmanoise;
+pub fn unrelated() {}
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "fuzzy_seed_fallback".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "gmanagr"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let packets = result.content["packets"]
+        .as_array()
+        .expect("decl_search packets array");
+    let graph_manager = packets
+        .iter()
+        .find(|packet| packet["symbol"]["name"].as_str() == Some("GraphManager"))
+        .unwrap_or_else(|| {
+            panic!("full fuzzy fallback must recover `GraphManager`, got {packets:?}")
+        });
+    assert_eq!(graph_manager["symbol"]["rank"].as_str(), Some("fuzzy"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn decl_search_path_filter_accepts_fuzzy_path_token() {
     let root = temp_workspace("graph_fuzzy_path");
     write_rust_crate(&root, "pub fn entry() {}\n");

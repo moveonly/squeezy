@@ -977,12 +977,31 @@ pub(crate) fn graph_symbol_search(
     //
     // Prefilter: when the query has 3+ chars, use the first trigram as a
     // seed for `signature_search` to leverage the trigram index and avoid
-    // scanning every symbol with the full fuzzy algorithm. When the seed
-    // returns nothing the index has no useful candidates, so fall back to
-    // the full symbol map to preserve correctness.
+    // scanning every symbol with the full fuzzy algorithm. If the seed cannot
+    // produce a ranked match, fall back to the full symbol map to preserve the
+    // previous fuzzy recall.
     if symbols.is_empty()
         && let Some(query) = query
     {
+        let fuzzy_matches = |candidates: Vec<GraphSymbol>| {
+            candidates
+                .into_iter()
+                .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
+                .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
+                .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
+                .filter(|symbol| symbol_matches_path_filter(symbol, path))
+                .filter(|symbol| language_matches(graph, symbol, language))
+                .filter(|symbol| {
+                    let view = squeezy_rank::GraphSymbolView {
+                        name: symbol.name.as_str(),
+                        signature: symbol.signature.as_str(),
+                    };
+                    squeezy_rank::symbol_rank::rank_symbol(view, query).0
+                        != squeezy_rank::symbol_rank::RankTier::NoMatch
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut used_seed_hits = false;
         let candidates: Vec<GraphSymbol> = if query.len() >= 3 {
             let seed_end = query.char_indices().nth(3).map_or(query.len(), |(i, _)| i);
             let seed_hits = graph.signature_search(&SignatureQuery {
@@ -994,27 +1013,16 @@ pub(crate) fn graph_symbol_search(
             if seed_hits.is_empty() {
                 graph.symbols.values().cloned().collect()
             } else {
+                used_seed_hits = true;
                 seed_hits
             }
         } else {
             graph.symbols.values().cloned().collect()
         };
-        symbols = candidates
-            .into_iter()
-            .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
-            .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
-            .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
-            .filter(|symbol| symbol_matches_path_filter(symbol, path))
-            .filter(|symbol| language_matches(graph, symbol, language))
-            .filter(|symbol| {
-                let view = squeezy_rank::GraphSymbolView {
-                    name: symbol.name.as_str(),
-                    signature: symbol.signature.as_str(),
-                };
-                squeezy_rank::symbol_rank::rank_symbol(view, query).0
-                    != squeezy_rank::symbol_rank::RankTier::NoMatch
-            })
-            .collect::<Vec<_>>();
+        symbols = fuzzy_matches(candidates);
+        if symbols.is_empty() && used_seed_hits {
+            symbols = fuzzy_matches(graph.symbols.values().cloned().collect());
+        }
     }
 
     // Precompute per-symbol sort keys once to avoid re-tokenizing the query
