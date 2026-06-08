@@ -15460,10 +15460,24 @@ pub(crate) fn format_mcp_status_snapshot(snapshot: &McpStatusSnapshot) -> String
         parts.push(format!("{cached} cached"));
     }
     if stale > 0 {
-        parts.push(format!("{stale} stale"));
+        let names: Vec<&str> = snapshot
+            .per_server
+            .iter()
+            .filter_map(|(name, s)| {
+                matches!(s, McpServerStatus::Stale { .. }).then_some(name.as_str())
+            })
+            .collect();
+        parts.push(format!("{stale} stale ({})", names.join(",")));
     }
     if failed > 0 {
-        parts.push(format!("{failed} failed"));
+        let names: Vec<&str> = snapshot
+            .per_server
+            .iter()
+            .filter_map(|(name, s)| {
+                matches!(s, McpServerStatus::Failed { .. }).then_some(name.as_str())
+            })
+            .collect();
+        parts.push(format!("{failed} failed ({})", names.join(",")));
     }
     if cancelled > 0 {
         parts.push(format!("{cancelled} cancelled"));

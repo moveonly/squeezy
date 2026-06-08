@@ -42,7 +42,10 @@ use squeezy_store::{
 use squeezy_telemetry::{
     FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
 };
-use squeezy_tools::{McpElicitationResponse, ToolCall, ToolResult, ToolStatus};
+use squeezy_tools::{
+    McpClientRegistry, McpElicitationResponse, McpServerStatus, McpStaleOutcome, ToolCall,
+    ToolResult, ToolStatus,
+};
 use tokio_util::sync::CancellationToken;
 use toml_edit::{DocumentMut, Item, Table, Value as TomlValue};
 
@@ -253,6 +256,11 @@ enum McpCommand {
     List {
         #[arg(long)]
         json: bool,
+        /// Probe each enabled server with a live handshake and report
+        /// ready/stale/failed/cancelled status together with the advertised
+        /// tool count (same checks as `doctor --probe`).
+        #[arg(long)]
+        probe: bool,
     },
     #[command(about = "Add an MCP server to user or project settings")]
     Add(McpAddArgs),
@@ -561,7 +569,7 @@ async fn run() -> squeezy_core::Result<()> {
             return handle_sessions_command(command, &cli).await;
         }
         Some(Command::Feedback(args)) => return handle_feedback_command(args, &cli).await,
-        Some(Command::Mcp { command }) => return handle_mcp_command(command, &cli),
+        Some(Command::Mcp { command }) => return handle_mcp_command(command, &cli).await,
         Some(Command::Skills { command }) => return handle_skills_command(command, &cli),
         Some(Command::Ask(args)) => return handle_ask_command(args).await,
         Some(Command::Auth { command }) => return handle_auth_command(command).await,
@@ -960,16 +968,28 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
     }
 }
 
-fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<()> {
+async fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<()> {
     match command {
-        McpCommand::List { json } => {
+        McpCommand::List { json, probe } => {
             let config = config_from_cli(cli)?;
+            // Run a live handshake probe when requested.  The result gives
+            // us a per-server ready/stale/failed/cancelled signal and the
+            // live tool count — the same information `doctor --probe` reports
+            // but scoped to MCP servers only.
+            let live_status = if *probe {
+                let registry = McpClientRegistry::new(config.mcp_servers.clone());
+                let outcome = registry.refresh_tools(CancellationToken::new()).await;
+                registry.shutdown().await;
+                Some(outcome.status.per_server)
+            } else {
+                None
+            };
             if *json {
                 let servers = config
                     .mcp_servers
                     .iter()
                     .map(|(name, server)| {
-                        serde_json::json!({
+                        let mut entry = serde_json::json!({
                             "name": name,
                             "enabled": server.enabled,
                             "transport": server.transport.as_str(),
@@ -980,7 +1000,13 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
                             "env": server.env.keys().collect::<Vec<_>>(),
                             "permission_default": server.permissions.default.map(|value| value.as_str()),
                             "permission_rules": server.permissions.rules.len(),
-                        })
+                        });
+                        if let Some(status_map) = &live_status {
+                            if let Some(status) = status_map.get(name) {
+                                entry["probe"] = mcp_status_probe_json(status);
+                            }
+                        }
+                        entry
                     })
                     .collect::<Vec<_>>();
                 println!(
@@ -990,13 +1016,25 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
             } else if config.mcp_servers.is_empty() {
                 println!("No MCP servers configured.");
             } else {
-                let mut rows: Vec<[String; 4]> = Vec::with_capacity(config.mcp_servers.len() + 1);
-                rows.push([
-                    "NAME".to_string(),
-                    "STATE".to_string(),
-                    "TRANSPORT".to_string(),
-                    "ENDPOINT".to_string(),
-                ]);
+                let col_count = if live_status.is_some() { 5 } else { 4 };
+                let mut rows: Vec<Vec<String>> = Vec::with_capacity(config.mcp_servers.len() + 1);
+                let header: Vec<String> = if live_status.is_some() {
+                    vec![
+                        "NAME".to_string(),
+                        "STATE".to_string(),
+                        "TRANSPORT".to_string(),
+                        "ENDPOINT".to_string(),
+                        "PROBE".to_string(),
+                    ]
+                } else {
+                    vec![
+                        "NAME".to_string(),
+                        "STATE".to_string(),
+                        "TRANSPORT".to_string(),
+                        "ENDPOINT".to_string(),
+                    ]
+                };
+                rows.push(header);
                 for (name, server) in &config.mcp_servers {
                     let state = if server.enabled {
                         "enabled"
@@ -1008,27 +1046,43 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
                         .as_deref()
                         .or(server.url.as_deref())
                         .unwrap_or("-");
-                    rows.push([
+                    let mut row = vec![
                         name.clone(),
                         state.to_string(),
                         server.transport.as_str().to_string(),
                         endpoint.to_string(),
-                    ]);
+                    ];
+                    if let Some(status_map) = &live_status {
+                        let probe_str = status_map
+                            .get(name)
+                            .map(mcp_status_probe_str)
+                            .unwrap_or_else(|| "skipped".to_string());
+                        row.push(probe_str);
+                    }
+                    rows.push(row);
                 }
-                let widths = (0..4)
-                    .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+                let widths = (0..col_count)
+                    .map(|col| {
+                        rows.iter()
+                            .filter_map(|row| row.get(col))
+                            .map(|s| s.len())
+                            .max()
+                            .unwrap_or(0)
+                    })
                     .collect::<Vec<_>>();
-                for row in rows {
-                    println!(
-                        "{:<w0$}  {:<w1$}  {:<w2$}  {}",
-                        row[0],
-                        row[1],
-                        row[2],
-                        row[3],
-                        w0 = widths[0],
-                        w1 = widths[1],
-                        w2 = widths[2],
-                    );
+                for row in &rows {
+                    let mut line = String::new();
+                    for (i, cell) in row.iter().enumerate() {
+                        if i > 0 {
+                            line.push_str("  ");
+                        }
+                        if i + 1 < col_count {
+                            let _ = write!(line, "{:<width$}", cell, width = widths[i]);
+                        } else {
+                            line.push_str(cell);
+                        }
+                    }
+                    println!("{line}");
                 }
             }
             Ok(())
@@ -1116,6 +1170,59 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
                 Ok(())
             })
         }
+    }
+}
+
+fn mcp_status_probe_str(status: &McpServerStatus) -> String {
+    match status {
+        McpServerStatus::Ready { tools_count, .. } => format!("ready ({tools_count} tools)"),
+        McpServerStatus::Stale {
+            tools_count,
+            outcome,
+        } => {
+            let reason = match outcome {
+                McpStaleOutcome::Failed { .. } => "discovery failed",
+                McpStaleOutcome::Cancelled => "discovery cancelled",
+            };
+            format!("stale ({tools_count} cached; {reason})")
+        }
+        McpServerStatus::Failed { error } => format!("failed: {error}"),
+        McpServerStatus::Cancelled => "cancelled".to_string(),
+        McpServerStatus::Starting => "did not complete".to_string(),
+    }
+}
+
+fn mcp_status_probe_json(status: &McpServerStatus) -> serde_json::Value {
+    match status {
+        McpServerStatus::Ready {
+            tools_count,
+            cached,
+        } => serde_json::json!({
+            "status": "ready",
+            "tools_count": tools_count,
+            "cached": cached,
+        }),
+        McpServerStatus::Stale {
+            tools_count,
+            outcome,
+        } => {
+            let (outcome_str, error) = match outcome {
+                McpStaleOutcome::Failed { error } => ("failed", Some(error.as_str())),
+                McpStaleOutcome::Cancelled => ("cancelled", None),
+            };
+            serde_json::json!({
+                "status": "stale",
+                "tools_count": tools_count,
+                "outcome": outcome_str,
+                "error": error,
+            })
+        }
+        McpServerStatus::Failed { error } => serde_json::json!({
+            "status": "failed",
+            "error": error,
+        }),
+        McpServerStatus::Cancelled => serde_json::json!({"status": "cancelled"}),
+        McpServerStatus::Starting => serde_json::json!({"status": "starting"}),
     }
 }
 

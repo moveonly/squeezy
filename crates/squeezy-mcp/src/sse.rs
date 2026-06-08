@@ -30,9 +30,31 @@ use rmcp::{
 };
 use tracing::{debug, warn};
 
-/// Minimum interval between automatic reconnect attempts when the SSE stream
-/// ends without a recoverable cause.
-const SSE_RECONNECT_DELAY: Duration = Duration::from_millis(1000);
+/// Base reconnect interval for the first retry.
+const SSE_RECONNECT_BASE_MS: u64 = 250;
+/// Maximum reconnect back-off cap.
+const SSE_RECONNECT_MAX_MS: u64 = 30_000;
+/// Jitter fraction applied to the computed back-off (±25 %).
+const SSE_RECONNECT_JITTER_FRACTION: f64 = 0.25;
+
+/// Compute the next reconnect delay using bounded exponential back-off with
+/// jitter.  `attempt` is 0-based: the first reconnect uses the base interval,
+/// and the delay doubles each time up to `SSE_RECONNECT_MAX_MS`. A random
+/// jitter of up to ±`SSE_RECONNECT_JITTER_FRACTION` of the computed interval
+/// is applied so simultaneous clients spread their reconnect storms.
+fn sse_reconnect_delay(attempt: u32) -> Duration {
+    let base = SSE_RECONNECT_BASE_MS as f64;
+    let exponent = (attempt as f64).min(10.0);
+    let computed = base * 2_f64.powf(exponent);
+    let capped = computed.min(SSE_RECONNECT_MAX_MS as f64);
+    // Pseudorandom jitter derived from `attempt` — no dependency on `rand`.
+    // Uses a deterministic but irregular sequence so consecutive attempts
+    // don't all hit the same boundary.
+    let jitter_seed = (attempt.wrapping_mul(2654435761)) as f64 / u32::MAX as f64;
+    let jitter = (jitter_seed - 0.5) * 2.0 * SSE_RECONNECT_JITTER_FRACTION * capped;
+    let delay_ms = ((capped + jitter).round() as u64).clamp(1, SSE_RECONNECT_MAX_MS);
+    Duration::from_millis(delay_ms)
+}
 
 /// Errors raised by the SSE transport worker.
 #[derive(Debug, thiserror::Error)]
@@ -117,6 +139,11 @@ impl Worker for SseClientWorker {
             "established legacy MCP SSE session"
         );
 
+        // Counts consecutive stream-end events so the back-off can grow.
+        // Reset to 0 on the first successful message so a recovered server
+        // does not inherit the last failure's penalty.
+        let mut reconnect_attempt: u32 = 0;
+
         loop {
             tokio::select! {
                 _ = context.cancellation_token.cancelled() => {
@@ -139,6 +166,10 @@ impl Worker for SseClientWorker {
                                 );
                                 continue;
                             }
+                            // A successful message resets the back-off so a
+                            // healthy server that briefly drops never suffers
+                            // growing reconnect penalties.
+                            reconnect_attempt = 0;
                             let Some(payload) = data else {
                                 continue;
                             };
@@ -160,11 +191,21 @@ impl Worker for SseClientWorker {
                             }
                         }
                         None => {
-                            // Stream ended; reopen the GET after a short
-                            // back-off. Each new session re-advertises its
-                            // POST endpoint, so we replace the one we are
-                            // using rather than reusing the stale URL.
-                            tokio::time::sleep(SSE_RECONNECT_DELAY).await;
+                            // Stream ended; reopen the GET after a bounded
+                            // exponential back-off with jitter.  Each new
+                            // session re-advertises its POST endpoint, so we
+                            // replace the stored URL rather than reusing the
+                            // stale one.
+                            let delay = sse_reconnect_delay(reconnect_attempt);
+                            debug!(
+                                target: "squeezy::mcp::sse",
+                                sse_url = %self.sse_url,
+                                attempt = reconnect_attempt,
+                                delay_ms = delay.as_millis(),
+                                "SSE stream ended; reconnecting after back-off"
+                            );
+                            tokio::time::sleep(delay).await;
+                            reconnect_attempt = reconnect_attempt.saturating_add(1);
                             let response = match self.open_stream().await {
                                 Ok(response) => response,
                                 Err(error) => {
