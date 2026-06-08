@@ -255,7 +255,7 @@ enum McpCommand {
         json: bool,
     },
     #[command(about = "Add an MCP server to user or project settings")]
-    Add(McpAddArgs),
+    Add(Box<McpAddArgs>),
     #[command(about = "Enable a configured MCP server")]
     Enable(McpNameScope),
     #[command(about = "Disable a configured MCP server")]
@@ -271,7 +271,12 @@ struct McpAddArgs {
     scope: McpConfigScope,
     #[arg(long, help = "Transport: stdio, http, or sse")]
     transport: String,
-    #[arg(long, help = "Command for stdio MCP servers")]
+    #[arg(
+        long,
+        help = "Command for stdio MCP servers. \
+                On Windows use the full launcher name, e.g. \
+                `npx.cmd`, `cmd.exe`, or `powershell.exe`"
+    )]
     command: Option<String>,
     #[arg(long = "arg", help = "Command argument; repeat for multiple args")]
     args: Vec<String>,
@@ -281,6 +286,30 @@ struct McpAddArgs {
     timeout_ms: Option<u64>,
     #[arg(long = "env", help = "Environment entry in KEY=VALUE form")]
     env: Vec<String>,
+    #[arg(
+        long,
+        help = "Working directory for stdio MCP server processes. \
+                Useful on Windows when relative config paths, Node scripts, \
+                or Python virtualenvs must resolve from a specific project root"
+    )]
+    cwd: Option<String>,
+    #[arg(
+        long,
+        help = "Name of the environment variable holding the bearer token \
+                for http/sse transports (e.g. MY_API_KEY)"
+    )]
+    bearer_token_env_var: Option<String>,
+    #[arg(
+        long = "http-header",
+        help = "Static HTTP header in HEADER=VALUE form; repeat for multiple headers"
+    )]
+    http_headers: Vec<String>,
+    #[arg(
+        long = "env-http-header",
+        help = "HTTP header whose value is read from an env var in HEADER=ENV_VAR form; \
+                repeat for multiple headers"
+    )]
+    env_http_headers: Vec<String>,
     #[arg(long, help = "Per-server default permission: allow, ask, or deny")]
     permission_default: Option<String>,
 }
@@ -976,8 +1005,12 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
                             "command": server.command,
                             "args": server.args,
                             "url": server.url,
+                            "cwd": server.cwd,
                             "timeout_ms": server.timeout_ms,
                             "env": server.env.keys().collect::<Vec<_>>(),
+                            "bearer_token_env_var": server.bearer_token_env_var,
+                            "http_headers": server.http_headers.keys().collect::<Vec<_>>(),
+                            "env_http_headers": server.env_http_headers.keys().collect::<Vec<_>>(),
                             "permission_default": server.permissions.default.map(|value| value.as_str()),
                             "permission_rules": server.permissions.rules.len(),
                         })
@@ -990,12 +1023,13 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
             } else if config.mcp_servers.is_empty() {
                 println!("No MCP servers configured.");
             } else {
-                let mut rows: Vec<[String; 4]> = Vec::with_capacity(config.mcp_servers.len() + 1);
+                let mut rows: Vec<[String; 5]> = Vec::with_capacity(config.mcp_servers.len() + 1);
                 rows.push([
                     "NAME".to_string(),
                     "STATE".to_string(),
                     "TRANSPORT".to_string(),
                     "ENDPOINT".to_string(),
+                    "AUTH/ENV".to_string(),
                 ]);
                 for (name, server) in &config.mcp_servers {
                     let state = if server.enabled {
@@ -1003,31 +1037,88 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
                     } else {
                         "disabled"
                     };
-                    let endpoint = server
-                        .command
-                        .as_deref()
-                        .or(server.url.as_deref())
-                        .unwrap_or("-");
+                    // For stdio: show command basename + arg count.
+                    // For http/sse: show URL host+path (never the token value).
+                    let endpoint = match server.transport {
+                        squeezy_core::McpTransport::Stdio => {
+                            let cmd = server
+                                .command
+                                .as_deref()
+                                .map(|c| {
+                                    std::path::Path::new(c)
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or(c)
+                                        .to_string()
+                                })
+                                .unwrap_or_else(|| "-".to_string());
+                            if server.args.is_empty() {
+                                cmd
+                            } else {
+                                format!(
+                                    "{} ({} arg{})",
+                                    cmd,
+                                    server.args.len(),
+                                    if server.args.len() == 1 { "" } else { "s" }
+                                )
+                            }
+                        }
+                        squeezy_core::McpTransport::Http | squeezy_core::McpTransport::Sse => {
+                            // Strip scheme to keep the column compact while
+                            // retaining host, port, and path for identification.
+                            server
+                                .url
+                                .as_deref()
+                                .map(|u| {
+                                    // Strip leading scheme (http://, https://, etc.)
+                                    u.find("://")
+                                        .map(|pos| &u[pos + 3..])
+                                        .unwrap_or(u)
+                                        .to_string()
+                                })
+                                .unwrap_or_else(|| "-".to_string())
+                        }
+                    };
+                    // Auth/env column: bearer env var name and count of env keys.
+                    let mut auth_parts: Vec<String> = Vec::new();
+                    if let Some(env_var) = &server.bearer_token_env_var {
+                        auth_parts.push(format!("bearer=${env_var}"));
+                    }
+                    if !server.env.is_empty() {
+                        let keys: Vec<&str> = server.env.keys().map(String::as_str).collect();
+                        auth_parts.push(format!("env:[{}]", keys.join(",")));
+                    }
+                    if !server.env_http_headers.is_empty() {
+                        auth_parts.push(format!("{} env-header(s)", server.env_http_headers.len()));
+                    }
+                    let auth_col = if auth_parts.is_empty() {
+                        "-".to_string()
+                    } else {
+                        auth_parts.join(", ")
+                    };
                     rows.push([
                         name.clone(),
                         state.to_string(),
                         server.transport.as_str().to_string(),
-                        endpoint.to_string(),
+                        endpoint,
+                        auth_col,
                     ]);
                 }
-                let widths = (0..4)
+                let widths = (0..5)
                     .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
                     .collect::<Vec<_>>();
                 for row in rows {
                     println!(
-                        "{:<w0$}  {:<w1$}  {:<w2$}  {}",
+                        "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {}",
                         row[0],
                         row[1],
                         row[2],
                         row[3],
+                        row[4],
                         w0 = widths[0],
                         w1 = widths[1],
                         w2 = widths[2],
+                        w3 = widths[3],
                     );
                 }
             }
@@ -1056,6 +1147,27 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
                         return Err(SqueezyError::Config(
                             "http and sse MCP servers require --url".to_string(),
                         ));
+                    }
+                    McpTransport::Http | McpTransport::Sse => {
+                        // Warn when the URL contains bare `localhost`. On
+                        // Windows, IPv4/IPv6 loopback resolution can differ from
+                        // macOS/Linux depending on the system hosts file and
+                        // firewall configuration. Prefer explicit `127.0.0.1` or
+                        // `[::1]` for predictable behavior.
+                        if let Some(url) = args.url.as_deref()
+                            && let Some(host_part) = url.find("://").map(|p| &url[p + 3..])
+                        {
+                            let host_end = host_part.find('/').unwrap_or(host_part.len());
+                            let host = &host_part[..host_end];
+                            let bare_host = host.rfind(':').map(|p| &host[..p]).unwrap_or(host);
+                            if bare_host.eq_ignore_ascii_case("localhost") {
+                                eprintln!(
+                                    "warning: URL uses `localhost` which may resolve \
+                                     differently on Windows (IPv4 vs IPv6 loopback). \
+                                     Consider using `127.0.0.1` or `[::1]` explicitly."
+                                );
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1091,6 +1203,34 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
                         env.insert(key, TomlValue::from(value));
                     }
                     server.insert("env", Item::Value(TomlValue::InlineTable(env)));
+                }
+                if let Some(cwd) = &args.cwd {
+                    server.insert("cwd", Item::Value(TomlValue::from(cwd.as_str())));
+                }
+                if let Some(bearer_env_var) = &args.bearer_token_env_var {
+                    server.insert(
+                        "bearer_token_env_var",
+                        Item::Value(TomlValue::from(bearer_env_var.as_str())),
+                    );
+                }
+                if !args.http_headers.is_empty() {
+                    let mut headers = toml_edit::InlineTable::default();
+                    for entry in &args.http_headers {
+                        let (key, value) = parse_env_entry(entry)?;
+                        headers.insert(key, TomlValue::from(value));
+                    }
+                    server.insert("http_headers", Item::Value(TomlValue::InlineTable(headers)));
+                }
+                if !args.env_http_headers.is_empty() {
+                    let mut env_headers = toml_edit::InlineTable::default();
+                    for entry in &args.env_http_headers {
+                        let (key, value) = parse_env_entry(entry)?;
+                        env_headers.insert(key, TomlValue::from(value));
+                    }
+                    server.insert(
+                        "env_http_headers",
+                        Item::Value(TomlValue::InlineTable(env_headers)),
+                    );
                 }
                 if let Some(default) = &args.permission_default {
                     let default = parse_permission(default)?;
