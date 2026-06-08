@@ -15,7 +15,7 @@ use squeezy_llm::{
     GitHubCopilotDeviceCodeResponse, GitHubCopilotLoginHooks, GitHubCopilotLoginOutcome,
     OpenAiCodexLoginOutcome, PersistedTokens, codex_auth_file_path, exchange_authorization_code,
     generate_pkce, github_copilot_auth_file_path, github_copilot_read_tokens,
-    login_github_copilot_interactive, login_openai_codex_interactive, login_openai_codex_manual,
+    login_github_copilot_interactive, login_openai_codex_manual,
     login_openai_codex_with_auto_fallback, normalize_github_domain, parse_authorization_input,
 };
 use tokio_util::sync::CancellationToken;
