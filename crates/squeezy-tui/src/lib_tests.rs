@@ -4294,8 +4294,8 @@ fn format_reviewer_command_handles_empty_buffer() {
 #[test]
 fn format_cost_command_renders_active_buckets() {
     use squeezy_agent::{
-        AttachmentShape, ConversationShape, McpAccounting, SessionAccountingSnapshot,
-        SkillsAccounting, TranscriptShape,
+        AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
+        SessionAccountingSnapshot, SkillsAccounting, TranscriptShape,
     };
     use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
     use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
@@ -4358,6 +4358,7 @@ fn format_cost_command_renders_active_buckets() {
         full_history_request: estimate,
         skills: SkillsAccounting::default(),
         mcp: McpAccounting::default(),
+        budget_policy: BudgetPolicySnapshot::default(),
     };
 
     let raw = commands::format_cost_command(&snapshot);
@@ -4387,8 +4388,8 @@ fn format_cost_command_renders_active_buckets() {
 #[test]
 fn format_cost_command_renders_by_model_drill() {
     use squeezy_agent::{
-        AttachmentShape, ConversationShape, McpAccounting, SessionAccountingSnapshot,
-        SkillsAccounting, TranscriptShape,
+        AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
+        SessionAccountingSnapshot, SkillsAccounting, TranscriptShape,
     };
     use squeezy_core::{CostOrigin, CostSnapshot, ModelLedger, SessionMetrics, SessionMode};
     use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
@@ -4482,6 +4483,7 @@ fn format_cost_command_renders_by_model_drill() {
         full_history_request: estimate,
         skills: SkillsAccounting::default(),
         mcp: McpAccounting::default(),
+        budget_policy: BudgetPolicySnapshot::default(),
     };
 
     let output = strip_ansi_escape_sequences(&commands::format_cost_command(&snapshot));
@@ -4613,9 +4615,9 @@ fn context_recommendations_flag_largest_and_secondary_sources() {
 #[test]
 fn context_breaks_out_skills_and_mcp_sources() {
     use squeezy_agent::{
-        AttachmentShape, ConversationShape, McpAccounting, McpServerAccounting,
-        McpToolAccountingEntry, SessionAccountingSnapshot, SkillAccountingEntry, SkillsAccounting,
-        TranscriptShape,
+        AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
+        McpServerAccounting, McpToolAccountingEntry, SessionAccountingSnapshot,
+        SkillAccountingEntry, SkillsAccounting, TranscriptShape,
     };
     use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
     use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
@@ -4724,6 +4726,7 @@ fn context_breaks_out_skills_and_mcp_sources() {
         full_history_request: estimate,
         skills,
         mcp,
+        budget_policy: BudgetPolicySnapshot::default(),
     };
 
     let output = strip_ansi_escape_sequences(&commands::format_context_command(&snapshot));
@@ -8482,8 +8485,8 @@ fn accounting_block_dispatch_skips_unrelated_system_messages() {
 #[test]
 fn context_snapshot_stays_expanded_in_compact_transcript() {
     use squeezy_agent::{
-        AttachmentShape, ConversationShape, McpAccounting, SessionAccountingSnapshot,
-        SkillsAccounting, TranscriptShape,
+        AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
+        SessionAccountingSnapshot, SkillsAccounting, TranscriptShape,
     };
     use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
     use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
@@ -8526,6 +8529,7 @@ fn context_snapshot_stays_expanded_in_compact_transcript() {
         full_history_request: estimate,
         skills: SkillsAccounting::default(),
         mcp: McpAccounting::default(),
+        budget_policy: BudgetPolicySnapshot::default(),
     };
     let body = commands::format_context_command(&snapshot);
 
@@ -12510,7 +12514,7 @@ fn status_details_render_via_segments_match_legacy_format() {
 #[test]
 fn cost_segment_renders_cap_and_percent_when_configured() {
     // When `max_session_cost_usd_micros` is set, the cost segment must show
-    // the spend, the cap, and the integer percent so the user can see where
+    // the spend, the cap, and one-decimal percent so the user can see where
     // they stand without opening the /cost overlay.
     let mut config = test_config(SessionMode::Build);
     config.max_session_cost_usd_micros = Some(500_000); // $0.50 cap
@@ -12519,7 +12523,7 @@ fn cost_segment_renders_cap_and_percent_when_configured() {
 
     let details = format_status_details(&app);
     assert!(
-        details.contains("cost $0.125000 / $0.50 (25%)"),
+        details.contains("cost $0.125000 / $0.50 (25.0%)"),
         "unexpected status: {details}"
     );
 }

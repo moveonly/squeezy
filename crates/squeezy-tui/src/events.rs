@@ -371,6 +371,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::Completed {
                     message,
+                    cost,
                     metrics,
                     context_estimate,
                     session_cost,
@@ -396,6 +397,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // last known value rather than blanking.
                     if let Some(session_cost) = session_cost {
                         app.cost = session_cost;
+                    }
+                    // Emit a compact turn-level cost footer so users can
+                    // connect a completed turn to its marginal cost without
+                    // needing to open /cost.
+                    if cost.input_tokens.is_some() || cost.estimated_usd_micros.is_some() {
+                        let delta = format_turn_cost_delta(&cost);
+                        app.push_log(delta);
                     }
                     app.metrics = metrics;
                     app.status = "ready".to_string();
@@ -814,6 +822,32 @@ fn prune_tui_jobs(jobs: &mut BTreeMap<JobId, JobSnapshot>) {
         jobs.remove(&id);
         to_remove -= 1;
     }
+}
+
+/// Compact per-turn cost/token footer shown in the transcript log at turn
+/// completion. Connects a visible turn to its marginal provider cost without
+/// requiring the user to open `/cost`.
+fn format_turn_cost_delta(cost: &squeezy_core::CostSnapshot) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    if let Some(usd) = cost.estimated_usd_micros {
+        parts.push(format!("${:.6}", usd as f64 / 1_000_000.0));
+    }
+    if let (Some(inp), Some(out)) = (cost.input_tokens, cost.output_tokens) {
+        parts.push(format!("in {inp} out {out}"));
+    } else if let Some(inp) = cost.input_tokens {
+        parts.push(format!("in {inp}"));
+    }
+    if let Some(r) = cost.cached_input_tokens {
+        if r > 0 {
+            parts.push(format!("cached {r}"));
+        }
+    }
+    if let Some(w) = cost.cache_write_input_tokens {
+        if w > 0 {
+            parts.push(format!("cache_write {w}"));
+        }
+    }
+    format!("turn: {}", parts.join(" · "))
 }
 
 pub(crate) fn apply_job_notification(app: &mut TuiApp, notification: JobNotification) {
