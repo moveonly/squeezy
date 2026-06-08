@@ -32,14 +32,14 @@ impl SemanticGraph {
             })
     }
 
-    /// For C/C++ Direct calls, treat `#include "header.h"` as an
-    /// authoritative cross-TU import: when the called name resolves to a
-    /// unique Function/Method declared in a workspace file whose relative
-    /// path matches one of the caller file's includes (by trailing path
-    /// suffix on a `/` boundary, or by basename), bind to it. This is the
-    /// closest syntactic analogue to the Rust `use module::*;` shape that
-    /// is already handled — without it, every cross-file C call falls back
-    /// to `CandidateSet`.
+    /// Return `true` when a JS/TS `import` statement is a plausible source
+    /// for `symbol`. Uses [`JsTsResolver`] to expand the import's module
+    /// specifier into candidate file paths and compares them against the
+    /// module-path variants of the symbol's declaring file (e.g. `foo.ts`,
+    /// `foo/index.ts`, `foo.js`). A bare import of `'./foo'` in the caller
+    /// correctly matches any declaration in a recognised variant of that
+    /// module — without this check every cross-file JS/TS call that lacks a
+    /// matching named-binding falls back to a `CandidateSet`.
     pub(crate) fn js_ts_import_matches_symbol(
         &self,
         import: &ParsedImport,

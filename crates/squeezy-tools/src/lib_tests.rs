@@ -13183,12 +13183,11 @@ fn core_tool_prefix_stays_within_byte_baseline() {
     // the `transitive` boolean schema property) buys one-call retrieval of the
     // whole transitive subtype closure, replacing the N follow-up `decl_search`
     // calls a model would otherwise issue to walk a deep hierarchy by hand.
-    // 25_230 -> 26_000: deliberate bump for schema/impl drift fixes
-    // (`read_file.start_line`, `read_file.end_line`, `grep.max_bytes_per_file`)
-    // plus `follow_symlinks` on `grep` and `glob`. The latter supports
-    // symlink-heavy Linux monorepos while retaining workspace-containment
-    // checks and the conservative default `false`.
-    const PREFIX_BYTES_BASELINE: usize = 26_000;
+    // 25_230 -> 27_000: deliberate bump for schema/impl drift fixes,
+    // `follow_symlinks` on `grep` and `glob`, and first-class `impact` /
+    // `inheritance_hierarchy` specs. These additions expose implemented
+    // behavior that providers with strict schemas could not otherwise call.
+    const PREFIX_BYTES_BASELINE: usize = 27_000;
 
     // Every first-party spec advertised in the always-core path, paired
     // with the required params the model must still see to call it. Tools
@@ -13203,6 +13202,8 @@ fn core_tool_prefix_stays_within_byte_baseline() {
         (glob_spec(), &["pattern"]),
         (grep_spec(), &["pattern"]),
         (hierarchy_spec(), &[]),
+        (impact_spec(), &[]),
+        (inheritance_hierarchy_spec(), &[]),
         (notebook_edit_spec(), &["path", "expected_sha256"]),
         (plan_patch_spec(), &["objective"]),
         (read_file_spec(), &["path"]),

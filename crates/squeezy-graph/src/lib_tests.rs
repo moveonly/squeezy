@@ -8034,6 +8034,65 @@ internal class TraceJsonReader : JsonReader, IJsonLineInfo
 }
 
 #[test]
+fn graph_exposes_inheritance_api_for_ancestors_and_direct_subtypes() {
+    let mut parser = LanguageParser::new().unwrap();
+    let reader = csharp_record(
+        "src/JsonReader.cs",
+        r#"
+namespace App;
+
+public abstract class JsonReader
+{
+    public virtual bool Read() { return false; }
+}
+"#,
+    );
+    let trace = csharp_record(
+        "src/TraceJsonReader.cs",
+        r#"
+namespace App;
+
+internal class TraceJsonReader : JsonReader
+{
+    public override bool Read() { return true; }
+}
+"#,
+    );
+    let parsed = [reader, trace]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let reader_class = graph
+        .find_symbol_by_name("JsonReader")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("JsonReader class symbol");
+    let trace_class = graph
+        .find_symbol_by_name("TraceJsonReader")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("TraceJsonReader class symbol");
+
+    let ancestors = graph.inheritance_ancestors(&trace_class.id);
+    assert!(
+        ancestors.iter().any(|symbol| symbol.id == reader_class.id),
+        "TraceJsonReader should report JsonReader as an ancestor"
+    );
+    let direct_subtypes = graph.inheritance_direct_subtypes(&reader_class.id);
+    assert!(
+        direct_subtypes
+            .iter()
+            .any(|symbol| symbol.id == trace_class.id),
+        "JsonReader should report TraceJsonReader as a direct subtype"
+    );
+}
+
+#[test]
 fn graph_records_js_ts_class_heritage_as_base_and_iface_attributes() {
     // The JS/TS extractor records inheritance as queryable `base:`/`iface:`
     // attributes (not only type-reference edges), and the graph build carries
@@ -9090,4 +9149,58 @@ fn normalize_cargo_file_id_case_insensitive_fallback() {
             "case-insensitive absolute-prefix fallback must be Windows-only"
         );
     }
+}
+
+#[test]
+fn graph_compute_impact_uses_reverse_import_reachability() {
+    let mut parser = LanguageParser::new().unwrap();
+    let wanted = dart_record("lib/a/b/thing.dart", "class Thing {\n  void run() {}\n}\n");
+    let unrelated = dart_record("lib/c/d/thing.dart", "class Thing {\n  void run() {}\n}\n");
+    let importer = dart_record(
+        "lib/app.dart",
+        r#"import 'package:fixture/a/b/thing.dart';
+
+void main() {
+  Thing().run();
+}
+"#,
+    );
+    let parsed = [wanted, unrelated, importer]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let changed = HashSet::from([FileId::new("lib/a/b/thing.dart")]);
+    let propagating = changed.clone();
+    let removed = HashSet::new();
+    let impact = graph.compute_impact(&changed, &propagating, &removed);
+
+    assert!(
+        impact
+            .affected_files
+            .contains(&FileId::new("lib/a/b/thing.dart")),
+        "changed file should be included in its own impact set"
+    );
+    assert!(
+        impact.affected_files.contains(&FileId::new("lib/app.dart")),
+        "reverse importer should be included in impact set"
+    );
+    assert!(
+        !impact
+            .affected_files
+            .contains(&FileId::new("lib/c/d/thing.dart")),
+        "unrelated same-leaf file should not be included in impact set"
+    );
+    assert!(
+        impact
+            .affected_symbols
+            .iter()
+            .any(|symbol| symbol.file_id == FileId::new("lib/app.dart")),
+        "affected symbols should include symbols from reverse importers"
+    );
 }

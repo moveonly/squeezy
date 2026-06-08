@@ -491,6 +491,47 @@ pub(crate) fn hierarchy_spec() -> ToolSpec {
     }
 }
 
+pub(crate) fn inheritance_hierarchy_spec() -> ToolSpec {
+    ToolSpec {
+        name: "inheritance_hierarchy".to_string(),
+        description: "Return inheritance relationships for one class-like symbol. Default returns transitive supertypes through UsesTrait/Extends/Implements edges; set subtypes=true for first-generation direct inheritors. Use for inheritance questions, not containment.".to_string(),
+        capability: PermissionCapability::Read,
+        parallel_safe: true,
+        parameters: tool_schema(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "symbol_id": {"type": "string"},
+                "query": {"type": "string"},
+                "subtypes": {"type": "boolean"},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS}
+            }
+        })),
+        prepare_arguments: None,
+    }
+}
+
+pub(crate) fn impact_spec() -> ToolSpec {
+    ToolSpec {
+        name: "impact".to_string(),
+        description: "Return graph-computed impact for a changed symbol or file path: changed files, reverse-import affected files, affected symbols, tests, and evidence packets. Use before edits or reviews that need a bounded blast-radius view.".to_string(),
+        capability: PermissionCapability::Read,
+        parallel_safe: true,
+        parameters: tool_schema(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "symbol_id": {"type": "string"},
+                "query": {"type": "string"},
+                "path": {"type": "string"},
+                "extra_paths": {"type": "array", "items": {"type": "string"}},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS}
+            }
+        })),
+        prepare_arguments: None,
+    }
+}
+
 pub(crate) fn read_slice_spec() -> ToolSpec {
     ToolSpec {
         name: "read_slice".to_string(),

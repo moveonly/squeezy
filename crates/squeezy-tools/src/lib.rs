@@ -141,7 +141,8 @@ use shell_program::ShellProgram;
 use specs::{
     apply_patch_spec, checkpoint_list_spec, checkpoint_revert_spec, checkpoint_show_spec,
     checkpoint_undo_spec, decl_search_spec, definition_search_spec, diff_context_spec,
-    downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, list_skills_spec, load_skill_spec,
+    downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, impact_spec,
+    inheritance_hierarchy_spec, list_skills_spec, load_skill_spec,
     mcp_list_resource_templates_spec, mcp_list_resources_spec, mcp_read_resource_spec,
     mcp_tool_spec, notebook_edit_spec, notes_recall_spec, notes_remember_spec, observations_spec,
     plan_patch_spec, prepare_path_arguments, read_file_spec, read_slice_spec,
@@ -1969,6 +1970,8 @@ impl ToolRegistry {
             glob_spec(),
             grep_spec(),
             hierarchy_spec(),
+            impact_spec(),
+            inheritance_hierarchy_spec(),
             notebook_edit_spec(),
             plan_patch_spec(),
             read_file_spec(),

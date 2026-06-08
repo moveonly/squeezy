@@ -670,6 +670,14 @@ impl GraphStore {
                 table.remove(key.as_str()).map_err(store_error)?;
             }
         }
+        if let Some(blob) = &batch.import_graph {
+            let mut table = write
+                .open_table(RESOLVER_IMPORT_GRAPH)
+                .map_err(store_error)?;
+            table
+                .insert("resolver_import_graph", blob.as_slice())
+                .map_err(store_error)?;
+        }
         write.commit().map_err(store_error)
     }
 
@@ -764,6 +772,11 @@ pub struct GraphWriteBatch {
     removals: Vec<String>,
     resolver_upserts: Vec<(String, Vec<u8>)>,
     resolver_removals: Vec<String>,
+    /// Encoded replacement for the single-blob `RESOLVER_IMPORT_GRAPH` entry.
+    /// When `Some`, the batch writes this value in the same transaction as the
+    /// per-file resolver upserts/removals, so all resolver-cache state is
+    /// committed atomically.
+    import_graph: Option<Vec<u8>>,
 }
 
 impl GraphWriteBatch {
@@ -803,19 +816,30 @@ impl GraphWriteBatch {
         self.resolver_removals.push(file_id.0.clone());
     }
 
+    /// Encode and stage a replacement for the single-blob import-adjacency
+    /// graph. Committed in the same transaction as any resolver-entry
+    /// upserts/removals so all resolver-cache state lands atomically.
+    pub fn set_import_graph<T: Serialize>(&mut self, graph: &T) -> Result<()> {
+        self.import_graph = Some(encode(graph)?);
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.metadata.is_none()
             && self.upserts.is_empty()
             && self.removals.is_empty()
             && self.resolver_upserts.is_empty()
             && self.resolver_removals.is_empty()
+            && self.import_graph.is_none()
     }
 
     pub fn len(&self) -> usize {
-        self.upserts.len()
+        usize::from(self.metadata.is_some())
+            + self.upserts.len()
             + self.removals.len()
             + self.resolver_upserts.len()
             + self.resolver_removals.len()
+            + usize::from(self.import_graph.is_some())
     }
 }
 
