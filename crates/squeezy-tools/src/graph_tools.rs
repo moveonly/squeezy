@@ -1017,31 +1017,21 @@ pub(crate) fn graph_symbol_search(
             .collect::<Vec<_>>();
     }
 
-    symbols.sort_by(|left, right| {
-        query
-            .map(|query| symbol_rank(left, query).cmp(&symbol_rank(right, query)))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                // When a path filter is provided, use path rank to order
-                // symbols from better-matching paths before falling back to
-                // alphabetical path order. This makes partial-path queries
-                // like `graph/lib` prefer the most relevant file.
-                path.map(|p| {
-                    let lk = squeezy_rank::path_rank::path_rank(&left.file_id.0, p).sort_key();
-                    let rk = squeezy_rank::path_rank::path_rank(&right.file_id.0, p).sort_key();
-                    lk.cmp(&rk)
-                })
-                .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then(left.file_id.0.cmp(&right.file_id.0))
-            .then(left.span.start_byte.cmp(&right.span.start_byte))
-    });
+    // Precompute per-symbol sort keys once to avoid re-tokenizing the query
+    // inside the O(n log n) comparator. BM25 scores are computed here too
+    // so they can act as a within-tier tiebreaker without crossing tier
+    // boundaries.
+    //
+    // Sort key tuple: (tier, bm25_neg, lex_score, path_key)
+    //   tier      — lower value = better rank tier (usize)
+    //   bm25_neg  — negated fixed-point BM25 score (i64); symbols with
+    //               positive BM25 sort before zero-score ones within a tier;
+    //               zero when BM25 is not applicable
+    //   lex_score — fuzzy/token lexical score (i32); lower = better
+    //   path_key  — PathRank::sort_key() (i32, i32); lower = better
+    type SortKey = (usize, i64, i32, (i32, i32));
 
-    // BM25 rerank for multi-token queries: when the query has 2+ whitespace-
-    // separated tokens, reorder the primary-ranked result by BM25 score
-    // over signature + docs + attributes. This makes documented multi-word
-    // retrieval behaviour real rather than test-only.
-    if let Some(query) = query
+    let bm25_scores: Vec<f32> = if let Some(query) = query
         && query.split_whitespace().count() >= 2
         && symbols.len() > 1
     {
@@ -1059,14 +1049,46 @@ pub(crate) fn graph_symbol_search(
             })
             .collect();
         let reranked = squeezy_rank::bm25_rerank(&bm25_docs, query, symbols.len());
-        if !reranked.is_empty() {
-            let original = std::mem::take(&mut symbols);
-            symbols = reranked
-                .into_iter()
-                .map(|(idx, _)| original[idx].clone())
-                .collect();
+        let mut scores = vec![0.0f32; symbols.len()];
+        for (idx, score) in reranked {
+            scores[idx] = score;
         }
-    }
+        scores
+    } else {
+        vec![0.0; symbols.len()]
+    };
+
+    let sort_keys: Vec<SortKey> = symbols
+        .iter()
+        .zip(bm25_scores.iter())
+        .map(|(sym, &bm25)| {
+            let (tier, lex_score) = query
+                .map(|q| symbol_rank(sym, q))
+                .unwrap_or((usize::MAX, 0));
+            let path_key = path
+                .map(|p| squeezy_rank::path_rank::path_rank(&sym.file_id.0, p).sort_key())
+                .unwrap_or((i32::MAX, i32::MAX));
+            // Negate BM25 so higher score sorts first; 0.0 → 0 sorts after
+            // any positive-BM25 symbol.
+            let bm25_neg = -(bm25 * 1000.0).round() as i64;
+            (tier, bm25_neg, lex_score, path_key)
+        })
+        .collect();
+
+    let original = std::mem::take(&mut symbols);
+    let mut indices: Vec<usize> = (0..original.len()).collect();
+    indices.sort_by(|&i, &j| {
+        sort_keys[i]
+            .cmp(&sort_keys[j])
+            .then(original[i].file_id.0.cmp(&original[j].file_id.0))
+            .then(
+                original[i]
+                    .span
+                    .start_byte
+                    .cmp(&original[j].span.start_byte),
+            )
+    });
+    symbols = indices.into_iter().map(|i| original[i].clone()).collect();
 
     symbols
 }
@@ -1495,7 +1517,7 @@ fn graph_zero_hit_fallback(
             Value::Null,
             Value::Null,
             "no_path_scope",
-            "add a path filter to narrow results or search without path scope",
+            "try a different query or broader kind filter",
         ),
     };
     json!({
