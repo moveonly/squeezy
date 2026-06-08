@@ -1304,6 +1304,7 @@ async fn server_capabilities_surfaces_experimental_flags_from_initialize_respons
         service: Arc::new(service),
         _process: None,
         server_capabilities: Some(capabilities.clone()),
+        stderr_ring: None,
     });
     let registry = McpClientRegistry::new(BTreeMap::new());
     assert_eq!(
