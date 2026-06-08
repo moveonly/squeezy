@@ -2363,11 +2363,11 @@ impl GraphManager {
         // individually fingerprint-guarded inside `apply_warm_resolver_cache`,
         // but the global snapshot replacement is not, so skip the whole
         // warm-start on any re-parse.
-        if loaded.missed_records.is_empty() {
-            if let Some(store) = store.as_deref() {
-                let (entries, snap) = load_resolver_cache(store, &snapshot.files);
-                graph.apply_warm_resolver_cache(entries, snap);
-            }
+        if loaded.missed_records.is_empty()
+            && let Some(store) = store.as_deref()
+        {
+            let (entries, snap) = load_resolver_cache(store, &snapshot.files);
+            graph.apply_warm_resolver_cache(entries, snap);
         }
         let build_report = GraphBuildReport {
             duration_ms: started.elapsed().as_millis(),
