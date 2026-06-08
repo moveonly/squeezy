@@ -2236,7 +2236,15 @@ impl GraphManager {
             _watcher: None,
         };
         if let Some(store) = manager.store.as_deref() {
-            manager.persist_resolver_cache(store);
+            // Cold-build commits the partition/metadata batch above with
+            // error propagation; the resolver-cache rows go in a separate,
+            // best-effort batch so an encoding or write failure here cannot
+            // poison the freshly-built graph.
+            let mut batch = GraphWriteBatch::new();
+            manager.extend_resolver_cache_batch(&mut batch);
+            if !batch.is_empty() {
+                let _ = store.apply_graph_batch(&batch);
+            }
         }
         Ok(manager)
     }
@@ -2301,13 +2309,18 @@ impl GraphManager {
         Arc::clone(&self.pending_changed_paths)
     }
 
-    /// Best-effort write of the V2 resolver-cache rows. Per-file entries
+    /// Extend `batch` with the V2 resolver-cache rows. Per-file entries
     /// carry the workspace-side fingerprint that future warm-start reads
     /// will compare against. The single-blob import adjacency is mirrored
-    /// from [`SemanticGraph::importers_by_file`]. Failures are swallowed
-    /// so persistence errors cannot poison the in-memory graph.
-    fn persist_resolver_cache(&self, store: &GraphStore) {
-        let mut batch = GraphWriteBatch::new();
+    /// from [`SemanticGraph::importers_by_file`]. Encoding failures are
+    /// swallowed so persistence errors cannot poison the in-memory graph.
+    ///
+    /// Callers fold this into the same `GraphWriteBatch` they already
+    /// stage partition/metadata changes onto, so the resulting redb
+    /// commit covers metadata, partitions, and resolver cache in one
+    /// fsync. Deletion of stale rows for removed files is handled by
+    /// the caller via [`GraphWriteBatch::remove_resolver_entry`].
+    fn extend_resolver_cache_batch(&self, batch: &mut GraphWriteBatch) {
         for (file_id, file) in &self.graph.files {
             let Some(slot) = self.graph.resolver_slots.get(file_id) else {
                 continue;
@@ -2331,9 +2344,6 @@ impl GraphManager {
             }
         }
         let _ = batch.set_import_graph(&snapshot);
-        if !batch.is_empty() {
-            let _ = store.apply_graph_batch(&batch);
-        }
     }
 
     pub fn refresh_before_query(&mut self) -> Result<RefreshReport> {
@@ -2531,10 +2541,21 @@ impl GraphManager {
         for file_id in &removed_files {
             self.graph.remove_file_data(file_id);
             graph_batch.remove_partition(file_id);
+            // Drop the matching resolver-cache row so deleted files do
+            // not accumulate as dead weight in `RESOLVER_SNAPSHOT_PER_FILE`
+            // — the per-file partition removal above already covers
+            // `GRAPH_PARTITIONS`, but the resolver row would otherwise
+            // outlive its file and over-count
+            // `cache_diagnostics.resolver_entries`.
+            graph_batch.remove_resolver_entry(file_id);
         }
         for file_id in &unsupported_removed_files {
             self.graph.files.remove(file_id);
             graph_batch.remove_partition(file_id);
+            // Best-effort: unsupported files rarely carry resolver rows, but
+            // when they do (e.g. a file flipped from supported to unsupported
+            // on a previous run) the row would otherwise leak.
+            graph_batch.remove_resolver_entry(file_id);
         }
         for record in unsupported_changed_records {
             // A file that flipped from a supported language to unsupported
@@ -2580,17 +2601,18 @@ impl GraphManager {
             self.graph.rebuild_semantic_edges();
             self.graph.rebuild_indexes();
         }
-        if let Some(store) = self.store.as_deref()
-            && !graph_batch.is_empty()
-        {
-            let _ = store.apply_graph_batch(&graph_batch);
-        }
-        // Persist the resolver-cache rows for every file the rebuild
-        // touched. Best-effort: encoding or write failure must not poison
+        // Fold the resolver-cache rows (per-file entries + import-graph
+        // blob) into the same batch as the partition/metadata changes so a
+        // refresh that touches one or two files pays a single redb fsync
+        // instead of one for partitions and a second for the resolver
+        // cache. Best-effort: encoding or write failure must not poison
         // the in-memory graph update; the warm-start path will fall back
         // to a full rebuild when it cannot find an entry.
         if let Some(store) = self.store.as_deref() {
-            self.persist_resolver_cache(store);
+            self.extend_resolver_cache_batch(&mut graph_batch);
+            if !graph_batch.is_empty() {
+                let _ = store.apply_graph_batch(&graph_batch);
+            }
         }
 
         // Only declare the pending set fully drained when we actually parsed
@@ -2699,40 +2721,47 @@ fn load_resolver_cache(
         });
     }
 
-    // Pass 2: all entries matched — commit into the graph.
+    // Check the import-graph blob BEFORE inserting slots. If it is absent
+    // or unreadable, the caller's gate
+    // (`entries_missed == 0 && import_graph_loaded`) would force a
+    // `rebuild_resolver_slots()` that wipes anything we just inserted —
+    // paying slot-population cost for nothing. Bail early instead.
+    let Some(snapshot) = store.import_graph::<resolver_cache::ResolverSnapshot>()? else {
+        return Ok(ResolverCacheLoadReport {
+            entries_loaded: 0,
+            entries_missed: 0,
+            import_graph_loaded: false,
+        });
+    };
+
+    // Pass 2: all entries matched and import-graph available — commit into the graph.
     let entries_loaded = slots.len();
     for (id, slot) in slots {
         graph.resolver_slots.insert(id, slot);
     }
 
-    let import_graph_loaded =
-        if let Some(snapshot) = store.import_graph::<resolver_cache::ResolverSnapshot>()? {
-            let known = graph.files.keys().cloned().collect::<HashSet<_>>();
-            let mut importers_by_file = HashMap::new();
-            for (target, importers) in snapshot.importers_by_file {
-                let target = FileId::new(target);
-                if !known.contains(&target) {
-                    continue;
-                }
-                let importers = importers
-                    .into_iter()
-                    .map(FileId::new)
-                    .filter(|id| known.contains(id) && id != &target)
-                    .collect::<Vec<_>>();
-                if !importers.is_empty() {
-                    importers_by_file.insert(target, importers);
-                }
-            }
-            graph.importers_by_file = importers_by_file;
-            true
-        } else {
-            false
-        };
+    let known = graph.files.keys().cloned().collect::<HashSet<_>>();
+    let mut importers_by_file = HashMap::new();
+    for (target, importers) in snapshot.importers_by_file {
+        let target = FileId::new(target);
+        if !known.contains(&target) {
+            continue;
+        }
+        let importers = importers
+            .into_iter()
+            .map(FileId::new)
+            .filter(|id| known.contains(id) && id != &target)
+            .collect::<Vec<_>>();
+        if !importers.is_empty() {
+            importers_by_file.insert(target, importers);
+        }
+    }
+    graph.importers_by_file = importers_by_file;
 
     Ok(ResolverCacheLoadReport {
         entries_loaded,
         entries_missed: 0,
-        import_graph_loaded,
+        import_graph_loaded: true,
     })
 }
 

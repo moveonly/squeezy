@@ -20,7 +20,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use squeezy_core::{FileId, Result, SqueezyError};
 
@@ -1095,13 +1095,11 @@ fn table_entry_count(
         Ok(table) => table,
         Err(_) => return Ok(0),
     };
-    table
-        .iter()
-        .map_err(store_error)?
-        .try_fold(0usize, |count, entry| {
-            entry.map_err(store_error)?;
-            Ok(count + 1)
-        })
+    // redb 4.x exposes a constant-time `len()` on every readable table via
+    // [`ReadableTableMetadata`]. Falling back to iteration would do a full
+    // table scan for what cache diagnostics treat as a one-line summary —
+    // noticeable on graph caches with tens of thousands of partitions.
+    table.len().map(|len| len as usize).map_err(store_error)
 }
 
 fn table_has_key(

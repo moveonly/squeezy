@@ -93,6 +93,11 @@ struct GlobalIndexCache {
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     root: PathBuf,
+    /// Pre-computed `<root>/index.redb` path. Cached alongside `root` so
+    /// every `with_index_db` / `upsert_session_index` / index diagnostics
+    /// call does not re-allocate a `PathBuf` on the hot metadata-write
+    /// path.
+    index_path: PathBuf,
     retention_days: u64,
     retention_archive_days: u64,
     max_event_bytes: usize,
@@ -107,8 +112,10 @@ pub struct SessionStore {
 impl SessionStore {
     pub fn open(config: &AppConfig) -> Self {
         let root = session_root(config);
+        let index_path = root.join(SESSION_INDEX_FILE_NAME);
         Self {
             root,
+            index_path,
             retention_days: config.session_logs.log_retention_days,
             retention_archive_days: config.session_logs.log_retention_archive_days,
             max_event_bytes: config.session_logs.max_event_bytes,
@@ -124,11 +131,11 @@ impl SessionStore {
             .map_err(|_| SqueezyError::Tool("session index lock poisoned".into()))?;
         // If the underlying file was removed externally (e.g. cleanup or tests),
         // drop the cached handle so open_session_index recreates it on next access.
-        if guard.is_some() && !self.session_index_path().exists() {
+        if guard.is_some() && !self.index_path.exists() {
             *guard = None;
         }
         if guard.is_none() {
-            *guard = Some(open_session_index(&self.session_index_path())?);
+            *guard = Some(open_session_index(&self.index_path)?);
         }
         action(
             guard
@@ -142,9 +149,16 @@ impl SessionStore {
     }
 
     pub fn session_index_path(&self) -> PathBuf {
-        self.root.join(SESSION_INDEX_FILE_NAME)
+        self.index_path.clone()
     }
 
+    /// Best-effort snapshot of the session-metadata index. Surfaces in
+    /// `squeezy doctor`'s session-store sub-line so a user can see whether
+    /// the redb index is present, how many sessions it tracks, and which
+    /// schema version stamped it. Never errors — open/read failures are
+    /// returned in the `error` field rather than propagated, matching the
+    /// "JSON files are the source of truth, the index is an accelerator"
+    /// invariant.
     pub fn session_index_diagnostics(&self) -> SessionIndexDiagnostics {
         let path = self.session_index_path();
         if !path.exists() {
@@ -443,6 +457,10 @@ impl SessionStore {
             modified_unix_nanos,
         };
         let root_str = self.root.display().to_string();
+        // The outer `let _` keeps this whole path best-effort (the JSON file
+        // is the source of truth); commit failures are surfaced inside the
+        // closure rather than swallowed in place so tests and future
+        // diagnostics can observe them when the outer caller chooses to.
         let _ = self.with_index_db(|database| {
             let write = database.begin_write().map_err(crate::store_error)?;
             if let Ok(mut table) = write.open_table(SESSION_INDEX_METADATA)
@@ -455,13 +473,13 @@ impl SessionStore {
             {
                 let _ = meta.insert("root", encoded.as_slice());
             }
-            let _ = write.commit();
+            write.commit().map_err(crate::store_error)?;
             Ok(())
         });
     }
 
     fn remove_session_index_entry(&self, session_id: &str) {
-        if !self.session_index_path().exists() {
+        if !self.index_path.exists() {
             return;
         }
         let _ = self.with_index_db(|database| {
@@ -469,7 +487,7 @@ impl SessionStore {
             if let Ok(mut table) = write.open_table(SESSION_INDEX_METADATA) {
                 let _ = table.remove(session_id);
             }
-            let _ = write.commit();
+            write.commit().map_err(crate::store_error)?;
             Ok(())
         });
     }
@@ -683,7 +701,7 @@ impl SessionStore {
         &self,
         query: &SessionQuery,
     ) -> Result<Option<Vec<SessionMetadata>>> {
-        if !self.session_index_path().exists() {
+        if !self.index_path.exists() {
             return Ok(None);
         }
         let root_str = self.root.display().to_string();
@@ -782,14 +800,21 @@ impl SessionStore {
     }
 
     fn rebuild_session_index(&self, sessions: &[SessionMetadata]) {
+        // Skip sessions whose metadata.json mtime is unreadable for the same
+        // reason `upsert_session_index` does: storing `0` as the fingerprint
+        // would be immediately invalidated by `scan_session_metadata_fingerprints`
+        // (which itself returns `None` for unreadable-mtime entries), forcing a
+        // benign-but-wasteful infinite rebuild loop on every `list()` call until
+        // the OS surfaces a real mtime.
         let records: Vec<SessionIndexRecord> = sessions
             .iter()
-            .map(|metadata| {
+            .filter_map(|metadata| {
                 let path = self.metadata_path_for(metadata);
-                SessionIndexRecord {
+                let modified_unix_nanos = session_metadata_modified_unix_nanos(&path)?;
+                Some(SessionIndexRecord {
                     metadata: metadata.clone(),
-                    modified_unix_nanos: session_metadata_modified_unix_nanos(&path).unwrap_or(0),
-                }
+                    modified_unix_nanos,
+                })
             })
             .collect();
         let root_str = self.root.display().to_string();
@@ -818,7 +843,7 @@ impl SessionStore {
             {
                 let _ = meta.insert("root", encoded.as_slice());
             }
-            let _ = write.commit();
+            write.commit().map_err(crate::store_error)?;
             Ok(())
         });
     }
@@ -2116,6 +2141,7 @@ pub struct SessionIndexDiagnostics {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionIndexRecord {
     metadata: SessionMetadata,
     modified_unix_nanos: u128,
