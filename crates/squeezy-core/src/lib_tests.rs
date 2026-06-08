@@ -2565,6 +2565,10 @@ timeout_ms = 5000
 discovery_timeout_ms = 45000
 tool_call_timeout_ms = 120000
 env = { TOKEN = "secret" }
+cwd = "/workspace/docs"
+bearer_token_env_var = "DOCS_BEARER_TOKEN"
+http_headers = { "X-Static-Secret" = "header-secret" }
+env_http_headers = { "X-Env-Secret" = "DOCS_HEADER_TOKEN" }
 
 [mcp.servers.docs.permissions]
 default = "ask"
@@ -2631,6 +2635,22 @@ reason = "docs lookups are safe"
     assert_eq!(
         config.mcp_servers["docs"].tool_call_timeout_ms,
         Some(120_000)
+    );
+    assert_eq!(
+        config.mcp_servers["docs"].cwd.as_deref(),
+        Some("/workspace/docs")
+    );
+    assert_eq!(
+        config.mcp_servers["docs"].bearer_token_env_var.as_deref(),
+        Some("DOCS_BEARER_TOKEN")
+    );
+    assert_eq!(
+        config.mcp_servers["docs"].http_headers["X-Static-Secret"],
+        "header-secret"
+    );
+    assert_eq!(
+        config.mcp_servers["docs"].env_http_headers["X-Env-Secret"],
+        "DOCS_HEADER_TOKEN"
     );
     assert_eq!(
         config.mcp_servers["docs"].permissions.default,
@@ -2880,6 +2900,10 @@ custom_patterns = ["internal-[a-z0-9]+"]
 
 [mcp.servers.docs]
 env = { TOKEN = "secret-value" }
+cwd = "/workspace/docs"
+bearer_token_env_var = "DOCS_BEARER_TOKEN"
+http_headers = { Authorization = "Bearer static-secret" }
+env_http_headers = { "X-Docs-Token" = "DOCS_HEADER_TOKEN" }
 "#,
         "test",
     )
@@ -2888,9 +2912,15 @@ env = { TOKEN = "secret-value" }
     let inspect = config.inspect_redacted();
 
     assert!(inspect.contains("<redacted>"));
+    assert!(inspect.contains("cwd = \"/workspace/docs\""));
+    assert!(inspect.contains("bearer_token_env_var = \"DOCS_BEARER_TOKEN\""));
+    assert!(inspect.contains("env_http_headers = {"));
+    assert!(inspect.contains("X-Docs-Token"));
+    assert!(inspect.contains("DOCS_HEADER_TOKEN"));
     assert!(!inspect.contains("CUSTOM_EXA_KEY"));
     assert!(!inspect.contains("internal-[a-z0-9]+"));
     assert!(!inspect.contains("secret-value"));
+    assert!(!inspect.contains("static-secret"));
     SettingsFile::from_toml_str(&inspect, "inspect").expect("redacted inspect output parses");
 }
 
