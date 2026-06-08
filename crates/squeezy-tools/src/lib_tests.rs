@@ -11622,6 +11622,42 @@ fn shell_sandbox_plan_best_effort_when_userns_unavailable() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn shell_sandbox_plan_linux_direct_uses_configured_shell() {
+    let mut config = sandbox_config(
+        ShellSandboxMode::Required,
+        ShellSandboxNetworkPolicy::DenyByDefault,
+    );
+    config.linux_shell = Some("/custom/bash".to_string());
+
+    let plan = prepare_sandbox_plan_with_probes("printf ok", &config, true, true)
+        .expect("linux direct-syscalls plan");
+
+    assert_eq!(plan.backend, "linux-direct-syscalls");
+    assert_eq!(plan.program, "/custom/bash");
+    assert_eq!(plan.args, ["-lc", "printf ok"]);
+    assert_eq!(plan.metadata()["shell"], "/custom/bash");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn shell_sandbox_plan_linux_fallback_keeps_configured_shell_in_metadata() {
+    let mut config = sandbox_config(
+        ShellSandboxMode::BestEffort,
+        ShellSandboxNetworkPolicy::DenyByDefault,
+    );
+    config.linux_shell = Some("/custom/bash".to_string());
+
+    let plan = prepare_sandbox_plan_with_probes("printf ok", &config, true, false)
+        .expect("best effort falls back");
+
+    assert_eq!(plan.backend, "none");
+    assert_eq!(plan.program, "/custom/bash");
+    assert_eq!(plan.args, ["-lc", "printf ok"]);
+    assert_eq!(plan.metadata()["shell"], "/custom/bash");
+}
+
+#[test]
 fn shell_termination_reason_reports_missing_exit_status() {
     assert_eq!(
         shell_termination_reason(false, 120_000, None, None).as_deref(),

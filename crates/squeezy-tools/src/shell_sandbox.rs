@@ -220,6 +220,20 @@ impl ShellSandboxPlan {
     }
 
     pub(crate) fn metadata(&self) -> Value {
+        #[cfg(target_os = "linux")]
+        let shell = if self.backend == "linux-direct-syscalls"
+            || (self.backend == "none" && self.program.starts_with('/'))
+        {
+            Some(self.program.as_str())
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let shell = if self.backend == "linux-direct-syscalls" {
+            Some(self.program.as_str())
+        } else {
+            None
+        };
         let mut payload = json!({
             "backend": self.backend,
             "mode": self.mode,
@@ -229,13 +243,9 @@ impl ShellSandboxPlan {
             "read_roots": path_list_json(&self.configured_read_roots),
             "write_roots": path_list_json(&self.configured_write_roots),
             "fallback_reason": self.fallback_reason,
-            // Include the effective shell program for backends that use a
-            // configurable shell so the audit log records exactly what ran.
-            "shell": if self.backend == "linux-direct-syscalls" {
-                Some(self.program.as_str())
-            } else {
-                None
-            },
+            // Include the effective Linux shell even when best_effort has
+            // degraded to a direct spawn that still honors linux_shell.
+            "shell": shell,
         });
         if let Some(record) = self.best_effort_fallback
             && let Some(object) = payload.as_object_mut()
