@@ -99,13 +99,13 @@ fn sanitized_message(message: &str) -> String {
 fn terminal_supports_osc9() -> bool {
     // TERM_PROGRAM match — macOS/cross-platform emulators that report
     // themselves via this var and are known to honour OSC 9.
-    if let Ok(program) = env::var("TERM_PROGRAM") {
-        if matches!(
+    if env::var("TERM_PROGRAM").is_ok_and(|program| {
+        matches!(
             program.as_str(),
             "iTerm.app" | "Ghostty" | "WezTerm" | "kitty" | "WarpTerminal"
-        ) {
-            return true;
-        }
+        )
+    }) {
+        return true;
     }
     // Linux-specific environment signals present in capable emulators
     // even when running inside tmux (which overwrites $TERM_PROGRAM).

@@ -361,13 +361,13 @@ where
     // masking the outer terminal's $TERM, but tmux 3.3+ sets TERM_PROGRAM=tmux
     // and some outer terminals set COLORTERM. When inside tmux check for
     // COLORTERM=truecolor as a signal of a capable outer emulator.
-    if env_get("TMUX").is_some() {
-        if let Some(colorterm) = env_get("COLORTERM") {
-            let ct = colorterm.to_string_lossy().to_ascii_lowercase();
-            if ct == "truecolor" || ct == "24bit" {
-                return true;
-            }
-        }
+    if env_get("TMUX").is_some()
+        && env_get("COLORTERM").is_some_and(|ct| {
+            let ct = ct.to_string_lossy().to_ascii_lowercase();
+            ct == "truecolor" || ct == "24bit"
+        })
+    {
+        return true;
     }
     false
 }
