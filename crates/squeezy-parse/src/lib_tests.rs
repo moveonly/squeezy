@@ -1601,6 +1601,123 @@ fn parser_treats_non_utf8_rust_files_as_unsupported() {
 }
 
 #[test]
+fn parse_record_utf16_le_returns_encoding_hint() {
+    let mut parser = LanguageParser::new().unwrap();
+    let mut record = record("src/lib.rs", "");
+    // UTF-16LE BOM followed by null-padded ASCII: not valid UTF-8.
+    let bytes: &[u8] = b"\xFF\xFE\x66\x00\x6E\x00";
+    fs::write(&record.path, bytes).unwrap();
+    record.hash = ContentHash::new(stable_content_hash(bytes));
+    record.size_bytes = bytes.len() as u64;
+
+    let parsed = parser.parse_record(&record).unwrap();
+
+    assert!(parsed.unsupported.is_some());
+    let reason = &parsed.unsupported.unwrap().reason;
+    assert!(
+        reason.contains("UTF-16LE"),
+        "expected UTF-16LE encoding hint in reason, got: {reason:?}"
+    );
+}
+
+#[test]
+fn parse_record_utf16_be_returns_encoding_hint() {
+    let mut parser = LanguageParser::new().unwrap();
+    let mut record = record("src/lib.rs", "");
+    // UTF-16BE BOM followed by null-padded ASCII: not valid UTF-8.
+    let bytes: &[u8] = b"\xFE\xFF\x00\x66\x00\x6E";
+    fs::write(&record.path, bytes).unwrap();
+    record.hash = ContentHash::new(stable_content_hash(bytes));
+    record.size_bytes = bytes.len() as u64;
+
+    let parsed = parser.parse_record(&record).unwrap();
+
+    assert!(parsed.unsupported.is_some());
+    let reason = &parsed.unsupported.unwrap().reason;
+    assert!(
+        reason.contains("UTF-16BE"),
+        "expected UTF-16BE encoding hint in reason, got: {reason:?}"
+    );
+}
+
+#[test]
+fn parse_source_strips_utf8_bom_and_adds_diagnostic() {
+    const BOM: &str = "\u{FEFF}";
+    // Prepend BOM to a minimal valid Rust source.
+    let source_with_bom = format!("{BOM}fn hello() {{}}\n");
+    let mut parser = LanguageParser::new().unwrap();
+    // The file on disk mirrors what read_to_string would return for a BOM file.
+    let record = record("src/lib.rs", &source_with_bom);
+
+    let parsed = parser
+        .parse_source(&record, source_with_bom.clone())
+        .unwrap();
+
+    assert!(
+        parsed.unsupported.is_none(),
+        "BOM-prefixed source should still parse successfully"
+    );
+    assert!(
+        parsed.symbols.iter().any(|s| s.name == "hello"),
+        "symbols should be extracted from BOM-prefixed source"
+    );
+    assert!(
+        parsed.diagnostics.iter().any(|d| d.message.contains("BOM")),
+        "a BOM diagnostic should be present; diagnostics: {:?}",
+        parsed.diagnostics
+    );
+}
+
+#[test]
+fn parse_source_utf8_bom_cache_hit_retains_diagnostic() {
+    const BOM: &str = "\u{FEFF}";
+    let source_with_bom = format!("{BOM}fn hello() {{}}\n");
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", &source_with_bom);
+
+    // First parse populates the cache.
+    parser
+        .parse_source(&record, source_with_bom.clone())
+        .unwrap();
+    // Second parse hits the cache; BOM diagnostic should still appear.
+    let parsed = parser
+        .parse_source(&record, source_with_bom.clone())
+        .unwrap();
+
+    assert!(
+        parsed.diagnostics.iter().any(|d| d.message.contains("BOM")),
+        "BOM diagnostic should survive a cache hit; diagnostics: {:?}",
+        parsed.diagnostics
+    );
+}
+
+#[test]
+fn input_edit_crlf_multiline_points_match_reference() {
+    // \r is treated as a regular byte (column bump); only \n resets the row.
+    // This is consistent with tree-sitter's CRLF handling convention.
+    let old = "fn one() {\r\n    alpha();\r\n}\r\n";
+    let new = "fn one() {\r\n    beta();\r\n    gamma();\r\n}\r\n";
+
+    let edit = input_edit(old, new);
+
+    assert_eq!(
+        edit.start_position,
+        slow_point_for_byte(old, edit.start_byte),
+        "start_position should match reference for CRLF source"
+    );
+    assert_eq!(
+        edit.old_end_position,
+        slow_point_for_byte(old, edit.old_end_byte),
+        "old_end_position should match reference for CRLF source"
+    );
+    assert_eq!(
+        edit.new_end_position,
+        slow_point_for_byte(new, edit.new_end_byte),
+        "new_end_position should match reference for CRLF source"
+    );
+}
+
+#[test]
 fn parser_classifies_associated_functions_and_unsafe_impl_names() {
     let source = r#"
 pub struct Runner;

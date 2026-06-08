@@ -334,6 +334,46 @@ fn invalid_glob_in_policy_surfaces_as_config_error() {
 }
 
 #[test]
+fn classify_language_handles_uppercase_and_mixed_case_extensions() {
+    use squeezy_core::LanguageFamily;
+
+    // `classify_language` must fold ASCII-uppercase extensions to lowercase
+    // before dispatching to `LanguageKind::from_extension`.  This is the
+    // Windows code path: editors on Windows often save files with extensions
+    // like `.RS`, `.CS`, `.TSX`, etc.
+    for family in LanguageFamily::all() {
+        for &ext in family.file_extensions() {
+            // Fully uppercase variant, e.g. ".RS", ".CS".
+            let uppercase_path = PathBuf::from(format!("TESTFILE.{}", ext.to_ascii_uppercase()));
+            let kind = classify_language(&uppercase_path);
+            assert_eq!(
+                kind.family(),
+                Some(*family),
+                "uppercase extension .{} should classify as {:?}, got {:?}",
+                ext.to_ascii_uppercase(),
+                family,
+                kind
+            );
+
+            // Mixed-case variant capitalises just the first character,
+            // e.g. ".Rs", ".Cs".
+            if ext.len() > 1 {
+                let mixed = format!("{}{}", ext[..1].to_ascii_uppercase(), &ext[1..]);
+                let mixed_path = PathBuf::from(format!("TESTFILE.{mixed}"));
+                let kind = classify_language(&mixed_path);
+                assert_eq!(
+                    kind.family(),
+                    Some(*family),
+                    "mixed-case extension .{mixed} should classify as {:?}, got {:?}",
+                    family,
+                    kind
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn path_normalization_preserves_slash_compatibility() {
     assert_eq!(normalize_path("./src/lib.rs", false), "src/lib.rs");
     assert_eq!(normalize_path(".\\src\\lib.rs", false), "src/lib.rs");
