@@ -69,6 +69,33 @@ pub(crate) struct ShellRunOutcome {
     /// sidecar when the hard byte cap dropped bytes the in-memory capture
     /// could not keep. `None` when output stayed under the cap.
     pub(crate) raw_spillover: Option<ShellSpilloverInfo>,
+    /// Present when the child was killed via Unix signals (timeout or
+    /// cancellation). Records pgid targeted, whether each signal syscall
+    /// succeeded, whether the grace period expired, and whether a
+    /// direct-child fallback kill was also issued.
+    pub(crate) kill_meta: Option<ShellKillMeta>,
+}
+
+/// Termination mechanics recorded when a Unix shell child was killed by
+/// signal (on timeout or cancellation). Surfaces process-group signal
+/// outcomes so that Linux users can see whether pgid-based cleanup
+/// succeeded and whether detached descendants may have survived.
+pub(crate) struct ShellKillMeta {
+    /// Process group id targeted by the signal calls (`-pgid`).
+    pub(crate) pgid: u32,
+    /// Whether `kill(-pgid, SIGTERM)` returned without error.
+    pub(crate) sigterm_ok: bool,
+    /// Whether the grace period expired before the child exited
+    /// (i.e. SIGKILL escalation was required).
+    pub(crate) grace_expired: bool,
+    /// Whether `kill(-pgid, SIGKILL)` was sent.
+    pub(crate) sigkill_sent: bool,
+    /// Whether `kill(-pgid, SIGKILL)` returned without error.
+    pub(crate) sigkill_ok: bool,
+    /// Whether `child.kill()` was also called as a direct-child fallback
+    /// (always true when any signal path was taken, since the child.kill /
+    /// child.wait block runs unconditionally after the Unix signal block).
+    pub(crate) direct_child_fallback: bool,
 }
 
 struct ShellRunRequest<'a> {
@@ -398,6 +425,7 @@ impl ToolRegistry {
             stderr_bytes,
             stderr_truncated,
             raw_spillover,
+            kill_meta,
         } = run;
 
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
@@ -496,6 +524,36 @@ impl ToolRegistry {
                 &mut raw_content,
                 "sandbox",
                 json!({ "best_effort_fallback": fallback }),
+            );
+        }
+        // Inform the model and user when nested `squeezy ask` approvals are
+        // unavailable because the active sandbox policy forbids AF_UNIX
+        // sockets.  Without this field the child shell sees a missing
+        // `SQUEEZY_ASK_SOCKET` env var, which looks like a misconfiguration
+        // rather than an intentional sandbox policy.
+        if let Some(reason) = sandbox_plan.nested_ask_disabled_reason() {
+            insert_content_field(
+                &mut raw_content,
+                "nested_ask",
+                json!({ "available": false, "reason": reason }),
+            );
+        }
+        // When the child was killed via Unix signals, surface the kill
+        // mechanics so users can see whether pgid-based cleanup succeeded
+        // and whether detached descendants (setsid / daemonized) may survive.
+        if let Some(km) = kill_meta {
+            insert_content_field(
+                &mut raw_content,
+                "kill_meta",
+                json!({
+                    "pgid": km.pgid,
+                    "sigterm_ok": km.sigterm_ok,
+                    "grace_expired": km.grace_expired,
+                    "sigkill_sent": km.sigkill_sent,
+                    "sigkill_ok": km.sigkill_ok,
+                    "direct_child_fallback": km.direct_child_fallback,
+                    "caveat": "process-group signals cannot reach setsid/daemonized descendants; detached processes may survive until cgroup-backed cleanup is available",
+                }),
             );
         }
         if let Some(summary) = implicit_skill {
@@ -788,7 +846,7 @@ impl ToolRegistry {
 
         let status = tokio::select! {
             _ = cancel.cancelled() => {
-                terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                let _ = terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
                 #[cfg(windows)]
                 if let Some(job) = shell_job.as_ref() {
                     let _ = job.terminate(1);
@@ -802,10 +860,13 @@ impl ToolRegistry {
         };
 
         let timed_out = status.is_err();
+        #[allow(unused_mut)]
+        let mut kill_meta: Option<ShellKillMeta> = None;
         let exit_status = match status {
             Ok(Ok(status)) => Some(status),
             Err(_) => {
-                terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                kill_meta =
+                    terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
                 #[cfg(windows)]
                 if let Some(job) = shell_job.as_ref() {
                     let _ = job.terminate(1);
@@ -848,6 +909,7 @@ impl ToolRegistry {
             stderr_bytes,
             stderr_truncated,
             raw_spillover,
+            kill_meta,
         })
     }
 }
@@ -1485,19 +1547,38 @@ impl ShellChild {
     }
 }
 
-async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) {
+async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) -> Option<ShellKillMeta> {
     match child {
         ShellChild::Tokio(child) => {
             #[cfg(unix)]
             if let Some(pid) = child.id() {
-                kill_process_group(pid, libc::SIGTERM);
-                if time::timeout(Duration::from_millis(grace_ms), child.wait())
+                let sigterm_ok = kill_process_group(pid, libc::SIGTERM);
+                let grace_expired = time::timeout(Duration::from_millis(grace_ms), child.wait())
                     .await
-                    .is_ok()
-                {
-                    return;
+                    .is_err();
+                if !grace_expired {
+                    // Child exited within grace period; record what we did and
+                    // skip SIGKILL and the direct-child fallback.
+                    return Some(ShellKillMeta {
+                        pgid: pid,
+                        sigterm_ok,
+                        grace_expired: false,
+                        sigkill_sent: false,
+                        sigkill_ok: false,
+                        direct_child_fallback: false,
+                    });
                 }
-                kill_process_group(pid, libc::SIGKILL);
+                let sigkill_ok = kill_process_group(pid, libc::SIGKILL);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Some(ShellKillMeta {
+                    pgid: pid,
+                    sigterm_ok,
+                    grace_expired: true,
+                    sigkill_sent: true,
+                    sigkill_ok,
+                    direct_child_fallback: true,
+                });
             }
             #[cfg(not(unix))]
             let _ = grace_ms;
@@ -1511,13 +1592,18 @@ async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) {
             let _ = child.wait().await;
         }
     }
+    None
 }
 
+/// Send `signal` to the process group whose pgid equals `pid`.
+/// Returns `true` when the `kill(2)` syscall succeeded (return value ≥ 0).
+/// A `false` return means the pgid was not reachable — the process may have
+/// already exited, changed its process group via `setsid`, or the caller
+/// lacked permission. The caller should treat `false` as a best-effort
+/// signal attempt, not a hard error; `child.kill()` follows as a fallback.
 #[cfg(unix)]
-fn kill_process_group(pid: u32, signal: libc::c_int) {
-    unsafe {
-        let _ = libc::kill(-(pid as libc::pid_t), signal);
-    }
+fn kill_process_group(pid: u32, signal: libc::c_int) -> bool {
+    unsafe { libc::kill(-(pid as libc::pid_t), signal) >= 0 }
 }
 
 /// Compute the env-allowlist-filtered environment that a sandboxed shell child

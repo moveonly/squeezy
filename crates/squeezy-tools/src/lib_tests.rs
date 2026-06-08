@@ -11702,6 +11702,7 @@ fn shell_best_effort_falls_back_when_sandbox_dies_without_output() {
         stderr_bytes: Vec::new(),
         stderr_truncated: false,
         raw_spillover: None,
+        kill_meta: None,
     };
 
     let reason =
@@ -11854,6 +11855,7 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
         stderr_bytes: b"sandbox_apply: Operation not permitted".to_vec(),
         stderr_truncated: false,
         raw_spillover: None,
+        kill_meta: None,
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run)
@@ -12091,6 +12093,40 @@ fn linux_seccomp_plan_does_not_export_ask_socket() {
         assert!(
             plan.exports_ask_socket(),
             "backend {backend} should export the ask socket",
+        );
+    }
+}
+
+#[test]
+fn nested_ask_disabled_reason_is_set_for_suppressing_backends() {
+    // Backends that suppress AF_UNIX sockets must provide a human-readable
+    // reason so the model and user get a clear explanation rather than seeing
+    // a missing SQUEEZY_ASK_SOCKET as a mysterious misconfiguration.
+    for backend in [
+        "linux-direct-syscalls",
+        "windows-restricted-token",
+        "windows-elevated",
+    ] {
+        let plan = fake_sandbox_plan(backend, false);
+        let reason = plan
+            .nested_ask_disabled_reason()
+            .unwrap_or_else(|| panic!("backend {backend} must report a disabled reason"));
+        assert!(
+            reason.contains(backend),
+            "reason for {backend} must name the backend: {reason}"
+        );
+        assert!(
+            reason.contains("nested ask disabled"),
+            "reason for {backend} must describe the constraint: {reason}"
+        );
+    }
+
+    // Backends that allow ask must return None.
+    for backend in ["none", "external", "macos-sandbox-exec"] {
+        let plan = fake_sandbox_plan(backend, false);
+        assert!(
+            plan.nested_ask_disabled_reason().is_none(),
+            "backend {backend} must not report a disabled reason"
         );
     }
 }

@@ -283,6 +283,16 @@ impl ShellSandboxPlan {
             "linux-direct-syscalls" | "windows-restricted-token" | "windows-elevated"
         )
     }
+
+    /// When `exports_ask_socket` is false, returns a human-readable reason
+    /// explaining why nested `squeezy ask` approvals are unavailable under
+    /// this sandbox backend. Returns `None` when ask is available.
+    pub(crate) fn nested_ask_disabled_reason(&self) -> Option<String> {
+        if self.exports_ask_socket() {
+            return None;
+        }
+        Some(format!("nested ask disabled by {} sandbox", self.backend))
+    }
 }
 
 fn best_effort_fallback_json(record: BestEffortFallback) -> Value {
