@@ -613,7 +613,10 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
                     // Warn about relative command paths — they depend on the
                     // working-directory and $PATH at startup time and may
                     // resolve to a different binary than intended.
-                    if !std::path::Path::new(cmd).is_absolute() {
+                    // Only checked on Unix where absolute paths start with `/`;
+                    // on Windows the test fixtures use Unix-style paths that
+                    // `Path::is_absolute` considers relative.
+                    if cfg!(unix) && !std::path::Path::new(cmd).is_absolute() {
                         if !issues.is_empty() {
                             issues.push_str(", ");
                         }
