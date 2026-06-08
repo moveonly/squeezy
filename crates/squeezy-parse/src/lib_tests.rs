@@ -194,20 +194,14 @@ def test_runner():
             .iter()
             .any(|import| import.path == "Runner" && import.is_reexport)
     );
-    assert!(
-        parsed
-            .imports
-            .iter()
-            .any(|import| import.path == "Runner"
-                && import.alias.as_deref() == Some("RunnerAlias"))
-    );
-    assert!(
-        parsed
-            .imports
-            .iter()
-            .any(|import| import.path == "RunnerAlias"
-                && import.alias.as_deref() == Some("runner"))
-    );
+    assert!(parsed
+        .imports
+        .iter()
+        .any(|import| import.path == "Runner" && import.alias.as_deref() == Some("RunnerAlias")));
+    assert!(parsed
+        .imports
+        .iter()
+        .any(|import| import.path == "RunnerAlias" && import.alias.as_deref() == Some("runner")));
     assert!(
         parsed
             .calls
@@ -1604,7 +1598,6 @@ fn parser_treats_non_utf8_rust_files_as_unsupported() {
 fn parse_record_utf16_le_returns_encoding_hint() {
     let mut parser = LanguageParser::new().unwrap();
     let mut record = record("src/lib.rs", "");
-    // UTF-16LE BOM followed by null-padded ASCII: not valid UTF-8.
     let bytes: &[u8] = b"\xFF\xFE\x66\x00\x6E\x00";
     fs::write(&record.path, bytes).unwrap();
     record.hash = ContentHash::new(stable_content_hash(bytes));
@@ -1614,17 +1607,13 @@ fn parse_record_utf16_le_returns_encoding_hint() {
 
     assert!(parsed.unsupported.is_some());
     let reason = &parsed.unsupported.unwrap().reason;
-    assert!(
-        reason.contains("UTF-16LE"),
-        "expected UTF-16LE encoding hint in reason, got: {reason:?}"
-    );
+    assert!(reason.contains("UTF-16LE"), "got: {reason:?}");
 }
 
 #[test]
 fn parse_record_utf16_be_returns_encoding_hint() {
     let mut parser = LanguageParser::new().unwrap();
     let mut record = record("src/lib.rs", "");
-    // UTF-16BE BOM followed by null-padded ASCII: not valid UTF-8.
     let bytes: &[u8] = b"\xFE\xFF\x00\x66\x00\x6E";
     fs::write(&record.path, bytes).unwrap();
     record.hash = ContentHash::new(stable_content_hash(bytes));
@@ -1634,37 +1623,27 @@ fn parse_record_utf16_be_returns_encoding_hint() {
 
     assert!(parsed.unsupported.is_some());
     let reason = &parsed.unsupported.unwrap().reason;
-    assert!(
-        reason.contains("UTF-16BE"),
-        "expected UTF-16BE encoding hint in reason, got: {reason:?}"
-    );
+    assert!(reason.contains("UTF-16BE"), "got: {reason:?}");
 }
 
 #[test]
 fn parse_source_strips_utf8_bom_and_adds_diagnostic() {
     const BOM: &str = "\u{FEFF}";
-    // Prepend BOM to a minimal valid Rust source.
     let source_with_bom = format!("{BOM}fn hello() {{}}\n");
     let mut parser = LanguageParser::new().unwrap();
-    // The file on disk mirrors what read_to_string would return for a BOM file.
     let record = record("src/lib.rs", &source_with_bom);
 
     let parsed = parser
         .parse_source(&record, source_with_bom.clone())
         .unwrap();
 
+    assert!(parsed.unsupported.is_none());
+    assert!(parsed.symbols.iter().any(|s| s.name == "hello"));
     assert!(
-        parsed.unsupported.is_none(),
-        "BOM-prefixed source should still parse successfully"
-    );
-    assert!(
-        parsed.symbols.iter().any(|s| s.name == "hello"),
-        "symbols should be extracted from BOM-prefixed source"
-    );
-    assert!(
-        parsed.diagnostics.iter().any(|d| d.message.contains("BOM")),
-        "a BOM diagnostic should be present; diagnostics: {:?}",
-        parsed.diagnostics
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("bom:"))
     );
 }
 
@@ -1675,119 +1654,100 @@ fn parse_source_utf8_bom_cache_hit_retains_diagnostic() {
     let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", &source_with_bom);
 
-    // First parse populates the cache.
     parser
         .parse_source(&record, source_with_bom.clone())
         .unwrap();
-    // Second parse hits the cache; BOM diagnostic should still appear.
     let parsed = parser
         .parse_source(&record, source_with_bom.clone())
         .unwrap();
 
     assert!(
-        parsed.diagnostics.iter().any(|d| d.message.contains("BOM")),
-        "BOM diagnostic should survive a cache hit; diagnostics: {:?}",
-        parsed.diagnostics
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("bom:"))
     );
 }
 
 #[test]
 fn input_edit_crlf_multiline_points_match_reference() {
-    // \r is treated as a regular byte (column bump); only \n resets the row.
-    // This is consistent with tree-sitter's CRLF handling convention.
     let old = "fn one() {\r\n    alpha();\r\n}\r\n";
     let new = "fn one() {\r\n    beta();\r\n    gamma();\r\n}\r\n";
-
     let edit = input_edit(old, new);
 
     assert_eq!(
         edit.start_position,
-        slow_point_for_byte(old, edit.start_byte),
-        "start_position should match reference for CRLF source"
+        slow_point_for_byte(old, edit.start_byte)
     );
     assert_eq!(
         edit.old_end_position,
-        slow_point_for_byte(old, edit.old_end_byte),
-        "old_end_position should match reference for CRLF source"
+        slow_point_for_byte(old, edit.old_end_byte)
     );
     assert_eq!(
         edit.new_end_position,
-        slow_point_for_byte(new, edit.new_end_byte),
-        "new_end_position should match reference for CRLF source"
+        slow_point_for_byte(new, edit.new_end_byte)
     );
 }
 
 #[test]
-fn parse_source_crlf_produces_stable_symbols() {
-    // Verify that tree-sitter parses CRLF source correctly: the second symbol
-    // must start on row 1 (after the first `\r\n` line ending).
+fn parse_source_crlf_produces_stable_symbols_and_diagnostic() {
     let source = "pub fn foo() {}\r\npub fn bar() {}\r\n";
     let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
 
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
 
-    assert!(parsed.unsupported.is_none(), "CRLF source should parse");
+    assert!(parsed.unsupported.is_none());
+    assert!(parsed.symbols.iter().any(|s| s.name == "foo"));
+    let bar = parsed.symbols.iter().find(|s| s.name == "bar").unwrap();
+    assert_eq!(bar.span.start.line, 1);
     assert!(
-        parsed.symbols.iter().any(|s| s.name == "foo"),
-        "foo not found in CRLF source"
-    );
-    let bar = parsed
-        .symbols
-        .iter()
-        .find(|s| s.name == "bar")
-        .expect("bar not found in CRLF source");
-    assert_eq!(
-        bar.span.start.line, 1,
-        "bar should start on line 1 (row 1) after CRLF; got line {}",
-        bar.span.start.line
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("crlf:"))
     );
 }
 
 #[test]
-fn incremental_parse_crlf_produces_changed_ranges() {
-    // An incremental edit inside a CRLF file must produce non-empty changed
-    // ranges, confirming that the edit-point coordinates are valid for
-    // tree-sitter's incremental re-parser.
+fn incremental_parse_crlf_produces_changed_ranges_and_diagnostic() {
     let first = "pub fn foo() {}\r\npub fn bar() {}\r\n";
     let second = "pub fn foo() { let x = 1; }\r\npub fn bar() {}\r\n";
     let mut parser = LanguageParser::new().unwrap();
     let mut record = record("src/lib.rs", first);
 
     parser.parse_source(&record, first.to_string()).unwrap();
-
     record.hash = ContentHash::new(stable_content_hash(second.as_bytes()));
     let updated = parser.parse_source(&record, second.to_string()).unwrap();
 
+    assert!(!updated.changed_ranges.is_empty());
     assert!(
-        !updated.changed_ranges.is_empty(),
-        "CRLF incremental edit must produce changed ranges"
+        updated
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("crlf:"))
     );
 }
 
 #[test]
-fn parse_source_strips_utf8_bom_for_csharp() {
-    const BOM: &str = "\u{FEFF}";
-    let source_with_bom = format!("{BOM}class Main {{}}\n");
+fn parser_emits_crlf_and_bom_diagnostic_for_csharp_with_bom() {
+    let source = "\u{FEFF}class A {\r\n    public void M() {}\r\n}\r\n";
     let mut parser = LanguageParser::new().unwrap();
-    let record = csharp_record("src/Main.cs", &source_with_bom);
+    let record = csharp_record("src/Program.cs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
 
-    let parsed = parser
-        .parse_source(&record, source_with_bom.clone())
-        .unwrap();
-
+    assert!(parsed.unsupported.is_none());
     assert!(
-        parsed.unsupported.is_none(),
-        "C# BOM-prefixed source should parse; {:?}",
-        parsed.unsupported
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("bom:"))
     );
     assert!(
-        parsed.symbols.iter().any(|s| s.name == "Main"),
-        "Main class should be extracted from BOM-prefixed C# source"
-    );
-    assert!(
-        parsed.diagnostics.iter().any(|d| d.message.contains("BOM")),
-        "BOM diagnostic should be emitted for C# source"
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("crlf:"))
     );
 }
 
@@ -1802,14 +1762,12 @@ fn parse_source_strips_utf8_bom_for_typescript() {
         .parse_source(&record, source_with_bom.clone())
         .unwrap();
 
+    assert!(parsed.unsupported.is_none());
     assert!(
-        parsed.unsupported.is_none(),
-        "TypeScript BOM-prefixed source should parse; {:?}",
-        parsed.unsupported
-    );
-    assert!(
-        parsed.diagnostics.iter().any(|d| d.message.contains("BOM")),
-        "BOM diagnostic should be emitted for TypeScript source"
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("bom:"))
     );
 }
 
@@ -1824,32 +1782,21 @@ fn parse_source_strips_utf8_bom_for_python() {
         .parse_source(&record, source_with_bom.clone())
         .unwrap();
 
+    assert!(parsed.unsupported.is_none());
+    assert!(parsed.symbols.iter().any(|s| s.name == "hello"));
     assert!(
-        parsed.unsupported.is_none(),
-        "Python BOM-prefixed source should parse; {:?}",
-        parsed.unsupported
-    );
-    assert!(
-        parsed.symbols.iter().any(|s| s.name == "hello"),
-        "hello should be extracted from BOM-prefixed Python source"
-    );
-    assert!(
-        parsed.diagnostics.iter().any(|d| d.message.contains("BOM")),
-        "BOM diagnostic should be emitted for Python source"
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("bom:"))
     );
 }
 
 #[test]
 fn parallel_parse_utf16_le_returns_encoding_hint() {
-    // Exercises the parallel path (parse_record_with_cache) for UTF-16
-    // encoding detection.  The threshold is PARALLEL_PARSE_THRESHOLD = 8,
-    // so we create 8 records where one is a UTF-16LE file.
     let mut records: Vec<FileRecord> = (0..7)
         .map(|i| record(&format!("src/file{i}.rs"), "pub fn f() {}\n"))
         .collect();
-
-    // The UTF-16LE record is placed at a non-zero index so it ends up in the
-    // parallel scatter, not the serial fallback.
     let mut utf16_record = record("src/utf16.rs", "");
     let utf16_bytes: &[u8] = b"\xFF\xFE\x66\x00\x6E\x00";
     fs::write(&utf16_record.path, utf16_bytes).unwrap();
@@ -1866,10 +1813,26 @@ fn parallel_parse_utf16_le_returns_encoding_hint() {
         .unwrap();
     assert!(utf16_result.unsupported.is_some());
     let reason = &utf16_result.unsupported.as_ref().unwrap().reason;
-    assert!(
-        reason.contains("UTF-16LE"),
-        "parallel path should surface UTF-16LE hint; got: {reason:?}"
-    );
+    assert!(reason.contains("UTF-16LE"), "got: {reason:?}");
+}
+
+#[test]
+fn parse_summary_tracks_crlf_and_bom_counts() {
+    let crlf_source = "fn a() {}\r\nfn b() {}\r\n";
+    let bom_source = "\u{FEFF}fn c() {}\n";
+    let plain_source = "fn d() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let crlf_record = record("src/crlf.rs", crlf_source);
+    let bom_record = record("src/bom.rs", bom_source);
+    let plain_record = record("src/plain.rs", plain_source);
+
+    let (_, summary) = parser
+        .parse_records(&[crlf_record, bom_record, plain_record])
+        .unwrap();
+
+    assert_eq!(summary.crlf_files, 1);
+    assert_eq!(summary.bom_files, 1);
+    assert_eq!(summary.parsed_files, 3);
 }
 
 #[test]

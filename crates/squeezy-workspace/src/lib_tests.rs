@@ -703,6 +703,78 @@ fn crawler_prefers_c_header_sibling_over_cpp_project_majority() {
     );
 }
 
+/// On Linux the filesystem is case-sensitive, so `Foo.H` and `foo.h` are
+/// distinct files.  The sibling-refinement logic keys on the raw relative-path
+/// stem, so a header whose stem differs only in case from the sibling C source
+/// is not matched by the exact-sibling path and falls back to project majority.
+/// This test documents (and pins) that exact-case-only behavior so any future
+/// case-folded refinement is a deliberate, reviewed change.
+#[test]
+fn crawler_mixed_case_c_header_falls_back_to_project_majority() {
+    let root = temp_root("crawler_mixed_case_c_header_project_majority");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src").join("foo.c"),
+        "int foo(void) { return 0; }\n",
+    )
+    .unwrap();
+    // Mixed-case stem: header is "Foo.h", source sibling is "foo.c"
+    fs::write(root.join("src").join("Foo.h"), "int foo(void);\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    let header = snapshot
+        .files
+        .iter()
+        .find(|f| f.relative_path.ends_with("Foo.h"))
+        .unwrap();
+    // Exact-stem sibling not found → project majority wins → C (one .c file)
+    assert_eq!(
+        header.language,
+        LanguageKind::C,
+        "mixed-case header should fall back to project majority (C)"
+    );
+}
+
+/// Verify that uppercase extensions are normalised to the correct language
+/// across all parser families on a case-sensitive filesystem (Linux).
+#[cfg(unix)]
+#[test]
+fn classify_language_normalises_uppercase_extensions_on_linux() {
+    use std::path::Path;
+    let cases: &[(&str, LanguageKind)] = &[
+        ("MAIN.RS", LanguageKind::Rust),
+        ("lib.PY", LanguageKind::Python),
+        ("App.JAVA", LanguageKind::Java),
+        ("Program.CS", LanguageKind::CSharp),
+        ("main.GO", LanguageKind::Go),
+        ("runner.C", LanguageKind::C),
+        ("widget.CPP", LanguageKind::Cpp),
+        // .H goes through header-refinement; in isolation (no sibling .c or .cpp)
+        // it defaults to Cpp per project-majority (no C files → default Cpp).
+        ("api.H", LanguageKind::Cpp),
+        ("index.JS", LanguageKind::JavaScript),
+        ("view.TS", LanguageKind::TypeScript),
+        ("View.TSX", LanguageKind::Tsx),
+        ("item.JSX", LanguageKind::Jsx),
+        ("helper.RB", LanguageKind::Ruby),
+        ("page.PHP", LanguageKind::Php),
+        ("Greeter.KT", LanguageKind::Kotlin),
+        ("Model.SWIFT", LanguageKind::Swift),
+        ("Main.SCALA", LanguageKind::Scala),
+        ("widget.DART", LanguageKind::Dart),
+    ];
+    for (filename, expected) in cases {
+        let got = classify_language(Path::new(filename));
+        assert_eq!(
+            got, *expected,
+            "uppercase filename {filename:?}: expected {expected:?}, got {got:?}"
+        );
+    }
+}
+
 #[test]
 fn crawler_classifies_go_files() {
     let root = temp_root("crawler_classifies_go_files");
