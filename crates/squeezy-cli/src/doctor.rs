@@ -114,8 +114,13 @@ impl DoctorReport {
                     if let (Some(extra), Some(map)) = (c.extra.as_ref(), obj.as_object_mut())
                         && let Some(extra_map) = extra.as_object()
                     {
+                        // Skip keys already present in the base object so that
+                        // extra metadata can never silently overwrite "name",
+                        // "status", or "detail".
                         for (k, v) in extra_map {
-                            map.insert(k.clone(), v.clone());
+                            if !matches!(k.as_str(), "name" | "status" | "detail") {
+                                map.insert(k.clone(), v.clone());
+                            }
                         }
                     }
                     obj
@@ -636,9 +641,11 @@ fn provider_settings_state(name: &str, settings: &ProviderSettings) -> &'static 
 
 /// Summarize configured MCP servers without touching the network: count
 /// enabled/disabled servers and verify that each enabled entry has the field
-/// its transport needs (`command` for stdio, `url` for http/sse). Missing
-/// fields downgrade the row to `warn` — the server will fail to launch at
-/// session start but doctor stays runnable in CI without keys.
+/// its transport needs (`command` for stdio, `url` for http/sse). For stdio
+/// servers the first token of `command` is also resolved against `PATH` to
+/// catch common Linux packaging failures (binary absent from PATH, missing
+/// executable bit) before the user reaches `--probe`. Missing fields or an
+/// unresolvable command downgrade the row to `warn`.
 fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> Check {
     if servers.is_empty() {
         return Check {
@@ -659,17 +666,17 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
         enabled += 1;
         match server.transport {
             McpTransport::Stdio => {
-                if server
-                    .command
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or("")
-                    .is_empty()
-                {
+                let cmd = server.command.as_deref().map(str::trim).unwrap_or("");
+                if cmd.is_empty() {
                     if !issues.is_empty() {
                         issues.push_str(", ");
                     }
                     let _ = write!(issues, "{name}: stdio transport without command");
+                } else if let Some(issue) = mcp_stdio_command_issue(cmd) {
+                    if !issues.is_empty() {
+                        issues.push_str(", ");
+                    }
+                    let _ = write!(issues, "{name}: {issue}");
                 }
             }
             McpTransport::Http | McpTransport::Sse => {
@@ -706,6 +713,62 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
             status: Status::Warn,
             detail: format!("{summary}; {issues}"),
             extra: None,
+        }
+    }
+}
+
+/// Offline check for a stdio MCP server command: resolve the first token
+/// against `PATH` and verify the file exists and has the execute bit set.
+/// Returns `None` when the command looks reachable, or a short warning
+/// string when a common packaging failure is detected.
+fn mcp_stdio_command_issue(command: &str) -> Option<String> {
+    // Extract the binary name/path (first whitespace-delimited token).
+    let binary = command.split_whitespace().next()?;
+    let path = std::path::Path::new(binary);
+
+    // If the user specified an absolute or relative path, check it directly.
+    if path.is_absolute() || binary.contains(std::path::MAIN_SEPARATOR) {
+        return mcp_stdio_path_issue(path);
+    }
+
+    // Otherwise walk PATH looking for the binary.
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(binary);
+        if candidate.exists() {
+            return mcp_stdio_path_issue(&candidate);
+        }
+    }
+    Some(format!(
+        "stdio command '{binary}' not found on PATH; \
+         install the package or check PATH"
+    ))
+}
+
+/// Given a resolved path, check whether it has the execute bit set (Unix) or
+/// simply exists (Windows). Returns a warning string on problems, `None` on ok.
+fn mcp_stdio_path_issue(path: &std::path::Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match fs::metadata(path) {
+            Ok(meta) if meta.permissions().mode() & 0o111 != 0 => None,
+            Ok(_) => Some(format!(
+                "stdio command '{}' exists but is not executable (missing execute bit)",
+                path.display()
+            )),
+            Err(err) => Some(format!(
+                "stdio command '{}' cannot be stat'd: {err}",
+                path.display()
+            )),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if path.exists() {
+            None
+        } else {
+            Some(format!("stdio command '{}' does not exist", path.display()))
         }
     }
 }
@@ -865,6 +928,12 @@ fn sandbox_check() -> Check {
         }
         if let Some(landlock) = report.landlock {
             map.insert("landlock".to_string(), serde_json::Value::Bool(landlock));
+        }
+        if let Some(reason) = report.fallback_reason {
+            map.insert(
+                "fallback_reason".to_string(),
+                serde_json::Value::String(reason),
+            );
         }
         serde_json::Value::Object(map)
     };

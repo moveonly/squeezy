@@ -348,6 +348,11 @@ pub struct ShellSandboxDoctor {
     /// Linux only: whether Landlock filesystem enforcement is available.
     /// `None` on non-Linux platforms.
     pub landlock: Option<bool>,
+    /// When `available` is `false`, a short machine-readable string
+    /// explaining why the backend cannot enforce isolation right now. Mirrors
+    /// the prose in `detail` but under a stable key for scripts that should
+    /// not scrape the human-readable string.
+    pub fallback_reason: Option<String>,
 }
 
 /// Probe the active shell-sandbox backend for `doctor`.
@@ -355,6 +360,11 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
     #[cfg(target_os = "macos")]
     {
         let available = macos_sandbox_exec_supported();
+        let fallback_reason = if available {
+            None
+        } else {
+            Some("/usr/bin/sandbox-exec not found".to_string())
+        };
         ShellSandboxDoctor {
             backend: "macos-sandbox-exec",
             available,
@@ -367,12 +377,27 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             },
             userns: None,
             landlock: None,
+            fallback_reason,
         }
     }
     #[cfg(target_os = "linux")]
     {
         let userns = linux_unshare_supported();
         let landlock = linux_landlock_supported();
+        let fallback_reason: Option<String> = match (userns, landlock) {
+            (true, true) => None,
+            (true, false) => Some(
+                "Landlock filesystem enforcement unavailable (kernel 5.13+ required)".to_string(),
+            ),
+            (false, true) => Some(
+                "unprivileged user namespaces disabled \
+                 (kernel.unprivileged_userns_clone=0 or /proc/self/ns/user absent)"
+                    .to_string(),
+            ),
+            (false, false) => {
+                Some("neither unprivileged user namespaces nor Landlock available".to_string())
+            }
+        };
         let detail = match (userns, landlock) {
             (true, true) => {
                 "unshare(CLONE_NEWUSER|NEWNS|NEWNET) + Landlock + seccomp available".to_string()
@@ -398,6 +423,7 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             detail,
             userns: Some(userns),
             landlock: Some(landlock),
+            fallback_reason,
         }
     }
     #[cfg(target_os = "windows")]
@@ -409,6 +435,7 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
                 .to_string(),
             userns: None,
             landlock: None,
+            fallback_reason: None,
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -419,6 +446,7 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             detail: "no OS shell-sandbox backend is available for this platform".to_string(),
             userns: None,
             landlock: None,
+            fallback_reason: Some("unsupported platform".to_string()),
         }
     }
 }
