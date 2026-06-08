@@ -321,6 +321,46 @@ admin), `elevated` (sandbox-user isolation + WFP network egress control, after a
 one-time `squeezy doctor --sandbox-setup` UAC prompt), or `disabled` (Job Object
 process-tree cleanup only). See the Windows paragraph above.
 
+`linux_shell` (Linux only; ignored elsewhere) sets the shell binary used to
+run sandboxed commands. Must be an absolute path (e.g. `"/bin/bash"` or
+`"/usr/bin/fish"`). Defaults to `/bin/sh` (which on many Linux distributions
+is `dash` or `busybox`, not Bash). Projects requiring Bash syntax, Fish/Zsh
+aliases, or `$SHELL` semantics should set this explicitly. The effective shell
+path is recorded in the sandbox plan for audit.
+
+## Common Linux sandbox failures
+
+- **Docker default seccomp profile** — Docker applies a seccomp profile that
+  blocks `unshare`, so `CLONE_NEWUSER` fails with `EPERM`. Use
+  `--security-opt seccomp=unconfined` or `--privileged` for the container, or
+  set `mode = "best_effort"` / `mode = "off"` to run without OS isolation.
+- **Locked-down enterprise kernels** — Some distributions set
+  `/proc/sys/kernel/unprivileged_userns_clone = 0`. Check this value with
+  `cat /proc/sys/kernel/unprivileged_userns_clone`; a `0` means the sandbox
+  backend is unavailable. An admin can enable it with
+  `sysctl kernel.unprivileged_userns_clone=1`. Run `squeezy doctor` to see the
+  current verdict.
+- **WSL1** — WSL1 has no Linux kernel namespace support; `/proc/self/ns/user`
+  does not exist. The backend reports unavailable. WSL2 fully supports
+  namespaces. Use `mode = "best_effort"` to degrade gracefully on WSL1.
+- **Missing Landlock** — Kernels older than 5.13 do not support Landlock. The
+  sandbox still provides network isolation via `CLONE_NEWNET` when network is
+  denied, but filesystem restrictions are not enforced
+  (`filesystem = "best_effort_unavailable"`). Set `mode = "required"` to deny
+  commands when filesystem enforcement is unavailable.
+- **Container seccomp blocking pre_exec** — Some container runtimes apply a
+  seccomp policy that blocks `unshare` or `landlock_create_ruleset`. The
+  sandboxed child exits with code 1 and empty stderr; Squeezy detects this as
+  a sandbox failure and falls back in `best_effort` mode. Use
+  `squeezy doctor` to confirm which capabilities are available.
+- **Sandbox mode behavior summary:**
+  - `required` — command is denied pre-spawn when OS isolation is unavailable.
+  - `best_effort` — falls back to running without OS isolation when the backend
+    fails; env allowlist, timeout/output caps, and audit still apply.
+  - `external` — the caller is responsible for OS isolation; Squeezy runs the
+    command as-is with no namespace or Landlock setup.
+  - `off` — no OS isolation; permission policy and audit still apply.
+
 ## Limits
 
 The sandbox is intentionally local and deterministic. **It is not a substitute

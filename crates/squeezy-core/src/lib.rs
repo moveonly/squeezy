@@ -6819,6 +6819,9 @@ pub struct ShellSandboxSettings {
     pub replace_sensitive_path_patterns: Option<bool>,
     /// Windows-only: `disabled`, `restricted_token` (default), or `elevated`.
     pub windows_sandbox_level: Option<String>,
+    /// Linux-only: absolute path to the shell binary used for sandboxed commands
+    /// (e.g. `"/bin/bash"`). Defaults to `/bin/sh`. Ignored on other platforms.
+    pub linux_shell: Option<String>,
 }
 
 impl ShellSandboxSettings {
@@ -6837,6 +6840,7 @@ impl ShellSandboxSettings {
                 "sensitive_path_patterns",
                 "replace_sensitive_path_patterns",
                 "windows_sandbox_level",
+                "linux_shell",
             ],
             source,
             path,
@@ -6893,6 +6897,7 @@ impl ShellSandboxSettings {
                 source,
                 &field(path, "windows_sandbox_level"),
             )?,
+            linux_shell: string_value(table, "linux_shell", source, &field(path, "linux_shell"))?,
         })
     }
 
@@ -6917,6 +6922,7 @@ impl ShellSandboxSettings {
             next.replace_sensitive_path_patterns,
         );
         replace_if_some(&mut self.windows_sandbox_level, next.windows_sandbox_level);
+        replace_if_some(&mut self.linux_shell, next.linux_shell);
     }
 }
 
@@ -7024,6 +7030,9 @@ pub struct ShellSandboxConfig {
     /// Windows-only backend selection. Defaults to `RestrictedToken` so Windows
     /// shells get filesystem isolation with no configuration. Ignored elsewhere.
     pub windows_sandbox_level: WindowsSandboxLevel,
+    /// Linux-only: absolute path to the shell used for sandboxed commands.
+    /// `None` means use `/bin/sh`. Ignored on other platforms.
+    pub linux_shell: Option<String>,
 }
 
 impl Default for ShellSandboxConfig {
@@ -7039,6 +7048,7 @@ impl Default for ShellSandboxConfig {
             protected_metadata_names: default_protected_metadata_names(),
             sensitive_path_patterns: default_sensitive_path_patterns(),
             windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
+            linux_shell: None,
         }
     }
 }
@@ -7161,6 +7171,20 @@ impl ShellSandboxConfig {
                     "{source}: permissions.shell_sandbox.windows_sandbox_level invalid value {level:?}; expected disabled, restricted_token, or elevated"
                 ))
             })?;
+        }
+        if let Some(shell_path) = settings.linux_shell {
+            if shell_path.trim().is_empty() {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.linux_shell must not be empty"
+                )));
+            }
+            if !shell_path.starts_with('/') {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.linux_shell {shell_path:?} must be an \
+                     absolute path (e.g. \"/bin/bash\" or \"/usr/bin/fish\")"
+                )));
+            }
+            config.linux_shell = Some(shell_path);
         }
         reject_duplicate_shell_roots(source, &config.read_roots, &config.write_roots)?;
         Ok(config)
