@@ -189,6 +189,32 @@ fn language_allowlist_refines_c_headers_before_disabling_languages() {
 }
 
 #[test]
+fn language_allowlist_accepts_csharp_family_alias() {
+    let root = temp_root("language_allowlist_accepts_csharp_family_alias");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/Program.cs"), "class Program {}\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "fn rust() {}\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::try_new(CrawlOptions {
+        languages: vec!["c-sharp".to_string()],
+        ..CrawlOptions::default()
+    })
+    .unwrap()
+    .crawl(&root)
+    .unwrap();
+
+    let csharp = snapshot
+        .files
+        .iter()
+        .find(|file| file.relative_path == "src/Program.cs")
+        .expect("C# file indexed");
+    assert_eq!(csharp.language, LanguageKind::CSharp);
+    assert!(snapshot.unsupported.iter().any(|file| {
+        file.relative_path == "src/lib.rs" && file.reason == UnsupportedReason::LanguageDisabled
+    }));
+}
+
+#[test]
 fn invalid_language_allowlist_is_a_config_error() {
     let err = WorkspaceCrawler::try_new(CrawlOptions {
         languages: vec!["brainfuck".to_string()],

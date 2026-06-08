@@ -72,6 +72,29 @@ fn repo_profile_detects_mixed_language_repo_and_commands() {
 }
 
 #[test]
+fn repo_profile_reports_disabled_supported_languages() {
+    let root = temp_root("disabled_supported_languages");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+    fs::write(root.join("src/app.py"), "def ok():\n    pass\n").unwrap();
+
+    let graph = GraphConfig {
+        languages: vec!["rust".to_string()],
+        ..GraphConfig::default()
+    };
+    let profile = RepoProfile::detect(&root, &graph).unwrap();
+
+    assert!(
+        profile
+            .languages
+            .iter()
+            .any(|language| language.name == "Python" && language.files == 1),
+        "disabled supported languages should remain visible in repo diagnostics: {:?}",
+        profile.languages
+    );
+}
+
+#[test]
 fn missing_build_commands_are_reported_as_low_confidence_ambiguous_fallbacks() {
     let root = temp_root("ambiguous_missing_build_commands");
     fs::write(root.join("pyproject.toml"), "[project]\nname = \"demo\"\n").unwrap();

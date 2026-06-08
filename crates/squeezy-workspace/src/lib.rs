@@ -739,7 +739,7 @@ fn parse_language_selector(language: &str) -> Result<Vec<LanguageKind>> {
         "c" => &[LanguageKind::C],
         "cpp" | "cxx" => &[LanguageKind::Cpp],
         "cfamily" | "c-family" | "ccpp" => LanguageFamily::CFamily.kinds(),
-        "cs" | "csharp" => LanguageFamily::CSharp.kinds(),
+        "cs" | "csharp" | "c-sharp" => LanguageFamily::CSharp.kinds(),
         "dart" => LanguageFamily::Dart.kinds(),
         "go" => LanguageFamily::Go.kinds(),
         "java" => LanguageFamily::Java.kinds(),
