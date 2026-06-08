@@ -8618,6 +8618,7 @@ async fn drain_pending_swap_picks_up_mcp_servers_drift() {
             bearer_token_env_var: None,
             http_headers: BTreeMap::new(),
             env_http_headers: BTreeMap::new(),
+            cwd: None,
         },
     );
 
