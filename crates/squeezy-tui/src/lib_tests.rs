@@ -1800,7 +1800,6 @@ async fn cancelled_turn_auto_drains_next_queued_prompt() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send cancelled");
@@ -1922,7 +1921,6 @@ async fn cancelled_turn_clears_live_status_context() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send cancelled");
@@ -1959,7 +1957,6 @@ async fn failed_turn_clears_live_status_context() {
         turn_id: TurnId::new(1),
         error: squeezy_core::SqueezyError::Agent("boom".to_string()),
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send failed");
@@ -1990,7 +1987,6 @@ async fn status_line_cost_not_clobbered_by_no_broker_failure() {
         turn_id: TurnId::new(1),
         error: squeezy_core::SqueezyError::Agent("boom".to_string()),
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send failed");
@@ -10193,7 +10189,6 @@ async fn failed_edit_turn_error_status_mentions_undo() {
         turn_id: TurnId::new(1),
         error: SqueezyError::Permission("denied".to_string()),
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send failed");
@@ -10289,7 +10284,6 @@ async fn cancel_restores_prompt_into_composer() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send cancelled");
@@ -10321,7 +10315,6 @@ async fn cancel_does_not_clobber_draft_typed_during_interrupt() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         session_cost: None,
-        early_stop_reason: None,
     })
     .await
     .expect("send cancelled");
