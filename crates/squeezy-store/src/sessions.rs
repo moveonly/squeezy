@@ -3564,6 +3564,7 @@ fn random_nonce_hex() -> String {
 /// This is a best-effort operation — the session file content is already
 /// durable (synced before rename); a missed dir sync only costs durability
 /// of the directory entry, not the file content.
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn fsync_parent(path: &Path) {
     #[cfg(unix)]
     if let Some(parent) = path.parent()
