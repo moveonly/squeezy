@@ -6308,12 +6308,19 @@ pub(crate) fn shell_exit_signal(status: Option<&std::process::ExitStatus>) -> Op
 }
 
 pub(crate) fn checkpoints_disabled_result(call: &ToolCall) -> ToolResult {
+    // `message` mirrors the `error` body so TUI checkpoint cards can
+    // surface the disabled-checkpoints opt-in hint through the same
+    // `string_arg(content, "message")` lookup the list card already
+    // uses. Rollback / restore-file / check cards otherwise read
+    // `content["rollback"]`, which is absent here, and would render a
+    // useless `0 restored · 0 deleted` summary.
     make_result(
         call,
         ToolStatus::Stale,
         json!({
             "enabled": false,
             "error": CHECKPOINTS_DISABLED_MESSAGE,
+            "message": CHECKPOINTS_DISABLED_MESSAGE,
         }),
         ToolCostHint::default(),
         None,

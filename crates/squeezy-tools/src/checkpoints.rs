@@ -188,6 +188,28 @@ impl ToolRegistry {
         match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
             Ok(result) => {
                 self.invalidate_diff_cache();
+                // Mirror the `/undo` "nothing to undo" Success-with-message
+                // path here. `selected_rollback_records` now applies the
+                // consumed-rollback filter to `Group` and `Checkpoint`
+                // targets too, so a `/revert-turn <group_id>` immediately
+                // after `/undo` of the same group has nothing left to
+                // revert. Surface that as Success rather than Stale to
+                // keep the four checkpoint statuses parallel across the
+                // /undo and /revert surfaces.
+                let nothing_to_revert =
+                    result.skipped && !result.applied && result.conflicts.is_empty();
+                if nothing_to_revert {
+                    return make_result(
+                        call,
+                        ToolStatus::Success,
+                        json!({
+                            "rollback": result,
+                            "message": "nothing to revert",
+                        }),
+                        ToolCostHint::default(),
+                        None,
+                    );
+                }
                 make_result(
                     call,
                     if result.conflicts.is_empty() && !result.skipped && result.applied {

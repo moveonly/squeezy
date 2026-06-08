@@ -149,7 +149,7 @@ fn copy_is_hidden_from_slash_menu() {
 }
 
 #[test]
-fn checkpoint_commands_show_when_checkpointing_is_disabled_for_discovery() {
+fn slash_menu_surfaces_checkpoint_commands_when_disabled_for_discovery() {
     let names = slash_suggestions("/")
         .into_iter()
         .filter(|cmd| cmd.visible_with_checkpoints(false))

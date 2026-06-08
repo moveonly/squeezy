@@ -44,7 +44,7 @@ A tool call that does not change any tracked or large workspace files does not c
 
 ## Undo And Revert
 
-Use `checkpoint_undo` to roll back the latest unreverted checkpoint. After a successful undo, a repeated latest undo returns a skipped "nothing to undo" result instead of trying to roll back the same checkpoint again.
+Use `checkpoint_undo` to roll back the latest unreverted checkpoint. After a successful undo, a repeated latest undo returns a skipped "nothing to undo" result instead of trying to roll back the same checkpoint again. The same skipped result also fires from `checkpoint_revert` (with the message `nothing to revert`) when every checkpoint in the requested group or the requested checkpoint itself has already been rolled back.
 
 Use `checkpoint_revert` with exactly one of:
 
@@ -69,7 +69,7 @@ Rollback responses include:
 
 Rollback defaults to `atomic`.
 
-`atomic` preflights every protected file in the selected checkpoint set. If any conflict is found, no file is changed.
+`atomic` preflights every protected file in the selected checkpoint set. If any conflict is found, no file is changed. While applying, every touched path is backed up to memory and a per-file write failure rolls the workspace back to its pre-rollback bytes. The backups live only in memory, so a process crash between the partial apply and either completion or restore can leave the workspace half-applied.
 
 `best_effort` restores clean files and leaves conflicting files untouched. Conflicts are still reported and the tool returns a stale result so the caller can decide what to do next.
 

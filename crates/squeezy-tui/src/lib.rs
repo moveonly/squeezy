@@ -12028,23 +12028,31 @@ fn checkpoint_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
             .as_str()
             .map(|group_id| format!("/revert-turn {group_id}")),
         "checkpoint_check" => {
-            let integrity = &tool.result.content["integrity"];
-            if integrity["ok"].as_bool() == Some(true) {
-                Some("integrity ok".to_string())
+            if tool.result.content["enabled"].as_bool() == Some(false) {
+                string_arg(&tool.result.content, "message")
             } else {
-                let refs = integrity["missing_refs"]
-                    .as_array()
-                    .map(|items| items.len())
-                    .unwrap_or(0);
-                let objects = integrity["missing_objects"]
-                    .as_array()
-                    .map(|items| items.len())
-                    .unwrap_or(0);
-                Some(format!("{refs} missing refs · {objects} missing objects"))
+                let integrity = &tool.result.content["integrity"];
+                if integrity["ok"].as_bool() == Some(true) {
+                    Some("integrity ok".to_string())
+                } else {
+                    let refs = integrity["missing_refs"]
+                        .as_array()
+                        .map(|items| items.len())
+                        .unwrap_or(0);
+                    let objects = integrity["missing_objects"]
+                        .as_array()
+                        .map(|items| items.len())
+                        .unwrap_or(0);
+                    Some(format!("{refs} missing refs · {objects} missing objects"))
+                }
             }
         }
         "checkpoint_undo" | "checkpoint_revert" | "checkpoint_restore_file" => {
-            checkpoint_rollback_detail(&tool.result.content["rollback"])
+            if tool.result.content["enabled"].as_bool() == Some(false) {
+                string_arg(&tool.result.content, "message")
+            } else {
+                checkpoint_rollback_detail(&tool.result.content["rollback"])
+            }
         }
         _ => None,
     };

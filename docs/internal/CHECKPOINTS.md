@@ -29,7 +29,13 @@ A `CheckpointRecord` (`crates/squeezy-vcs/src/lib.rs`) carries:
 - `Checkpoint(id)` — one specific record.
 
 Both `Atomic` and `BestEffort` rollback modes accept any of the three
-targets; the sha256 gate is identical in all cases. `checkpoint_undo` targets
+targets; the sha256 gate is identical in all cases. `Atomic` writes a
+backup of every touched path to memory before applying so a per-file
+write failure rolls the workspace back to the pre-rollback bytes —
+atomic apart from a crash window between apply and restore. A process
+crash between the partial apply and either successful completion or
+backup restore can leave the workspace half-applied with no on-disk
+recovery state. `checkpoint_undo` targets
 `Latest`; `checkpoint_revert` requires exactly one of `group_id` or
 `checkpoint_id`. `checkpoint_restore_file` uses the same sha256 conflict gate
 but restores only one file and does not mark the whole checkpoint consumed for

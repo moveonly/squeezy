@@ -600,6 +600,10 @@ async fn windows_sandbox_plan_probe_failure(
     let mut argv = Vec::with_capacity(1 + plan.args.len());
     argv.push(plan.program.clone());
     argv.extend(plan.args.iter().cloned());
+    // The probe deliberately inherits the host environment so the
+    // backend has the same `PATH`, `SystemRoot`, and adjacent variables
+    // a real shell would see. A future tightening (minimal `PATH`, no
+    // `RUSTFLAGS`, etc.) would land here, not in the spec above.
     let env: HashMap<String, String> = std::env::vars().collect();
     let spawned = if plan.backend == "windows-elevated" {
         squeezy_win_sandbox::spawn_elevated(&spec, &argv, &workdir, &env, false)
