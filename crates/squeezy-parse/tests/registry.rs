@@ -1,7 +1,9 @@
 use std::collections::HashSet;
+use std::path::Path;
 
 use squeezy_core::{LanguageFamily, LanguageKind};
 use squeezy_parse::backend;
+use squeezy_workspace::classify_language;
 
 #[test]
 fn every_language_family_has_one_backend() {
@@ -69,5 +71,43 @@ fn every_family_file_extension_classifies_to_that_family() {
                 "no backend for {kind:?} (extension {extension:?})"
             );
         }
+    }
+}
+
+/// Pin uppercase-extension classification through the workspace layer so a
+/// regression in `classify_language`'s normalization path is caught before it
+/// silently excludes Linux repos with mixed-case filenames.
+#[test]
+fn classify_language_handles_uppercase_extensions_for_all_families() {
+    let cases: &[(&str, LanguageFamily)] = &[
+        ("MAIN.RS", LanguageFamily::Rust),
+        ("lib.PY", LanguageFamily::Python),
+        ("App.JAVA", LanguageFamily::Java),
+        ("Program.CS", LanguageFamily::CSharp),
+        ("main.GO", LanguageFamily::Go),
+        ("runner.C", LanguageFamily::CFamily),
+        ("widget.CPP", LanguageFamily::CFamily),
+        ("index.JS", LanguageFamily::JsTs),
+        ("view.TS", LanguageFamily::JsTs),
+        ("component.TSX", LanguageFamily::JsTs),
+        ("item.JSX", LanguageFamily::JsTs),
+        ("helper.RB", LanguageFamily::Ruby),
+        ("page.PHP", LanguageFamily::Php),
+        ("Greeter.KT", LanguageFamily::Kotlin),
+        ("Model.SWIFT", LanguageFamily::Swift),
+        ("Main.SCALA", LanguageFamily::Scala),
+        ("widget.DART", LanguageFamily::Dart),
+    ];
+    for (filename, expected_family) in cases {
+        let kind = classify_language(Path::new(filename));
+        assert_eq!(
+            kind.family(),
+            Some(*expected_family),
+            "uppercase filename {filename:?} classified as {kind:?}, expected {expected_family:?}"
+        );
+        assert!(
+            backend::backend_for_kind(kind).is_some(),
+            "no backend for {kind:?} (file {filename:?})"
+        );
     }
 }

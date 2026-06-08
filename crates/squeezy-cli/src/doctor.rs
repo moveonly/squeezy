@@ -9,6 +9,7 @@ use squeezy_core::{
 use squeezy_llm::{
     KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
 };
+use squeezy_parse::smoke_all_languages;
 use squeezy_store::{
     SessionStore, SqueezyStore, cache_diagnostics, ensure_repo_profile, prune_cache_backups,
 };
@@ -236,6 +237,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         checks.push(cache_check(config, args.prune_cache));
     }
 
+    checks.push(parser_health_check());
     checks.push(sandbox_check());
     checks.push(update_check(update::check_for_update().await));
 
@@ -773,6 +775,48 @@ fn update_check(status: UpdateStatus) -> Check {
         name: "update".to_string(),
         status: row_status,
         detail: status.doctor_detail(),
+    }
+}
+
+/// Smoke-initialize every registered tree-sitter grammar and report the
+/// results as a single `parser_health` doctor row.  Fails when any grammar
+/// cannot be loaded (e.g. a musl/static-link regression on Linux).
+///
+/// Reported fields:
+///   `target`   — compile-time target triple
+///   `backends` — number of registered language backends
+///   `ok`/`fail` — counts of grammars that parsed their fixture / failed
+fn parser_health_check() -> Check {
+    let target = env!("SQUEEZY_TARGET_TRIPLE");
+    let results = smoke_all_languages();
+    let total = results.len();
+    let failures: Vec<_> = results.iter().filter(|r| !r.ok).collect();
+    let fail_count = failures.len();
+    let ok_count = total - fail_count;
+    let backend_count = squeezy_core::LanguageFamily::all().len();
+
+    if fail_count == 0 {
+        Check {
+            name: "parser_health".to_string(),
+            status: Status::Ok,
+            detail: format!(
+                "target={target} backends={backend_count} grammars={ok_count}/{total} ok"
+            ),
+        }
+    } else {
+        let names: Vec<String> = failures
+            .iter()
+            .map(|r| format!("{:?}", r.language))
+            .collect();
+        Check {
+            name: "parser_health".to_string(),
+            status: Status::Fail,
+            detail: format!(
+                "target={target} backends={backend_count} grammars={ok_count}/{total} ok; \
+                 failed: {}",
+                names.join(", ")
+            ),
+        }
     }
 }
 

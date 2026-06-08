@@ -194,20 +194,14 @@ def test_runner():
             .iter()
             .any(|import| import.path == "Runner" && import.is_reexport)
     );
-    assert!(
-        parsed
-            .imports
-            .iter()
-            .any(|import| import.path == "Runner"
-                && import.alias.as_deref() == Some("RunnerAlias"))
-    );
-    assert!(
-        parsed
-            .imports
-            .iter()
-            .any(|import| import.path == "RunnerAlias"
-                && import.alias.as_deref() == Some("runner"))
-    );
+    assert!(parsed
+        .imports
+        .iter()
+        .any(|import| import.path == "Runner" && import.alias.as_deref() == Some("RunnerAlias")));
+    assert!(parsed
+        .imports
+        .iter()
+        .any(|import| import.path == "RunnerAlias" && import.alias.as_deref() == Some("runner")));
     assert!(
         parsed
             .calls
@@ -1598,6 +1592,108 @@ fn parser_treats_non_utf8_rust_files_as_unsupported() {
 
     assert!(parsed.unsupported.is_some());
     assert!(parsed.symbols.is_empty());
+}
+
+#[test]
+fn parser_emits_crlf_diagnostic_for_windows_line_endings() {
+    let source = "fn one() {}\r\nfn two() {}\r\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("crlf:")),
+        "expected a crlf diagnostic; got {:?}",
+        parsed.diagnostics
+    );
+}
+
+#[test]
+fn parser_emits_bom_diagnostic_for_utf8_bom() {
+    let source = "\u{FEFF}fn main() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("bom:")),
+        "expected a bom diagnostic; got {:?}",
+        parsed.diagnostics
+    );
+}
+
+#[test]
+fn parser_emits_crlf_diagnostic_for_csharp_with_bom() {
+    let source = "\u{FEFF}class A {\r\n    public void M() {}\r\n}\r\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let mut record = record("src/Program.cs", source);
+    record.language = squeezy_core::LanguageKind::CSharp;
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("bom:")),
+        "expected bom diagnostic"
+    );
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("crlf:")),
+        "expected crlf diagnostic"
+    );
+}
+
+#[test]
+fn parser_crlf_incremental_edit_preserves_changed_ranges() {
+    let first = "fn one() {}\r\nfn two() {}\r\n";
+    let second = "fn one() {}\r\nfn three() {}\r\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let mut record = record("src/lib.rs", first);
+
+    let _ = parser.parse_source(&record, first.to_string()).unwrap();
+    record.hash = ContentHash::new(stable_content_hash(second.as_bytes()));
+    let updated = parser.parse_source(&record, second.to_string()).unwrap();
+
+    assert!(!updated.changed_ranges.is_empty());
+    assert!(
+        updated
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("crlf:"))
+    );
+}
+
+#[test]
+fn parse_summary_tracks_crlf_and_bom_counts() {
+    use crate::LanguageParser;
+    let crlf_source = "fn a() {}\r\nfn b() {}\r\n";
+    let bom_source = "\u{FEFF}fn c() {}\n";
+    let plain_source = "fn d() {}\n";
+
+    let mut parser = LanguageParser::new().unwrap();
+    let crlf_record = record("src/crlf.rs", crlf_source);
+    let bom_record = record("src/bom.rs", bom_source);
+    let plain_record = record("src/plain.rs", plain_source);
+
+    let (_, summary) = parser
+        .parse_records(&[crlf_record, bom_record, plain_record])
+        .unwrap();
+
+    assert_eq!(summary.crlf_files, 1, "expected 1 crlf file");
+    assert_eq!(summary.bom_files, 1, "expected 1 bom file");
+    assert_eq!(summary.parsed_files, 3, "expected 3 parsed files");
 }
 
 #[test]

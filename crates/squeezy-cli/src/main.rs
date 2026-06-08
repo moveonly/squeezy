@@ -34,6 +34,7 @@ use auth::handle_auth_command;
 use config_browse::handle_browse_command;
 use doctor::DoctorArgs;
 use providers::{ProvidersCommand, handle_providers_command};
+use squeezy_parse::smoke_all_languages;
 use squeezy_store::{
     BugReportOptions, CleanupMode, RepoProfileLoad, SemanticSupport, SessionMetadata, SessionQuery,
     SessionStatus, SessionStore, default_bug_report_path, ensure_repo_profile,
@@ -43,6 +44,7 @@ use squeezy_telemetry::{
     FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
 };
 use squeezy_tools::{McpElicitationResponse, ToolCall, ToolResult, ToolStatus};
+use squeezy_workspace::WorkspaceCrawler;
 use tokio_util::sync::CancellationToken;
 use toml_edit::{DocumentMut, Item, Table, Value as TomlValue};
 
@@ -186,6 +188,11 @@ enum Command {
     Providers {
         #[command(subcommand)]
         command: ProvidersCommand,
+    },
+    #[command(about = "Parser diagnostics and smoke testing")]
+    Parse {
+        #[command(subcommand)]
+        command: ParseCommand,
     },
 }
 
@@ -365,6 +372,26 @@ enum RepoCommand {
     Refresh,
     #[command(about = "Print suggested project config settings for manual adoption")]
     Recommendations,
+    #[command(
+        about = "Report file counts, extension inventory, and C/C++ header classification \
+                 confidence for the workspace"
+    )]
+    Languages {
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ParseCommand {
+    #[command(
+        about = "Initialize every registered parser grammar and parse a built-in fixture per \
+                 language; exits non-zero if any grammar fails to load"
+    )]
+    Smoke {
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -585,6 +612,7 @@ async fn run() -> squeezy_core::Result<()> {
             return handle_refresh_models(args).await;
         }
         Some(Command::Providers { command }) => return handle_providers_command(command),
+        Some(Command::Parse { command }) => return handle_parse_command(command),
         None => {}
     }
 
@@ -1694,6 +1722,131 @@ fn handle_repo_command(command: &RepoCommand, cli: &Cli) -> squeezy_core::Result
         RepoCommand::Recommendations => {
             let loaded = ensure_repo_profile(&config.workspace_root, &config.graph)?;
             print!("{}", loaded.profile.recommendations_toml());
+            Ok(())
+        }
+        RepoCommand::Languages { json } => handle_repo_languages(&config.workspace_root, *json),
+    }
+}
+
+fn handle_repo_languages(root: &Path, json: bool) -> squeezy_core::Result<()> {
+    use squeezy_core::LanguageKind;
+
+    let snapshot = WorkspaceCrawler::new(squeezy_workspace::CrawlOptions::default())
+        .crawl(root)
+        .map_err(|e| SqueezyError::Tool(format!("workspace crawl failed: {e}")))?;
+
+    let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_extension: BTreeMap<String, usize> = BTreeMap::new();
+    let mut header_heuristic = 0usize;
+    let mut unsupported = 0usize;
+
+    for file in &snapshot.files {
+        let lang_name = file.language.display_name().to_string();
+        *by_language.entry(lang_name).or_default() += 1;
+
+        // Collect the raw (original-casing) extension for the inventory
+        let ext = std::path::Path::new(&file.relative_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_string();
+        if !ext.is_empty() {
+            *by_extension.entry(ext).or_default() += 1;
+        }
+
+        // A plain `.h` file that was classified to C or C++ came through the
+        // refine_c_family_header_languages heuristic.
+        if file.relative_path.ends_with(".h")
+            && matches!(file.language, LanguageKind::C | LanguageKind::Cpp)
+        {
+            header_heuristic += 1;
+        }
+    }
+    for uf in &snapshot.unsupported {
+        unsupported += 1;
+        if let Some(ext) = std::path::Path::new(&uf.relative_path)
+            .extension()
+            .and_then(|e| e.to_str())
+        {
+            *by_extension.entry(ext.to_string()).or_default() += 1;
+        }
+    }
+
+    if json {
+        let body = serde_json::json!({
+            "root": root.display().to_string(),
+            "total_files": snapshot.files.len(),
+            "unsupported_files": unsupported,
+            "header_heuristic_files": header_heuristic,
+            "by_language": by_language,
+            "by_extension": by_extension,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
+    } else {
+        println!("root: {}", root.display());
+        println!("total_files: {}", snapshot.files.len());
+        println!("unsupported_files: {unsupported}");
+        println!(
+            "header_heuristic_files: {header_heuristic} \
+             (classified via sibling/project-majority, not exact match)"
+        );
+        println!("by_language:");
+        for (lang, count) in &by_language {
+            println!("  {lang}: {count}");
+        }
+        println!("by_extension:");
+        for (ext, count) in &by_extension {
+            println!("  .{ext}: {count}");
+        }
+    }
+    Ok(())
+}
+
+fn handle_parse_command(command: &ParseCommand) -> squeezy_core::Result<()> {
+    match command {
+        ParseCommand::Smoke { json } => {
+            let results = smoke_all_languages();
+            let all_ok = results.iter().all(|r| r.ok);
+            if *json {
+                let body: Vec<_> = results
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "language": format!("{:?}", r.language),
+                            "ok": r.ok,
+                            "error": r.error,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "all_ok": all_ok,
+                        "results": body,
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                for r in &results {
+                    let status = if r.ok { "ok  " } else { "FAIL" };
+                    let suffix = r
+                        .error
+                        .as_deref()
+                        .map(|e| format!("  {e}"))
+                        .unwrap_or_default();
+                    println!("[{status}] {:?}{suffix}", r.language);
+                }
+                if all_ok {
+                    println!("all grammars ok");
+                } else {
+                    let fail_count = results.iter().filter(|r| !r.ok).count();
+                    eprintln!("{fail_count} grammar(s) failed");
+                    std::process::exit(1);
+                }
+            }
             Ok(())
         }
     }

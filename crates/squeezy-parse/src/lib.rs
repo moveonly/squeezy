@@ -8,8 +8,8 @@ mod languages;
 
 use serde::{Deserialize, Serialize};
 use squeezy_core::{
-    Confidence, ContentHash, EdgeKind, FileId, Freshness, LanguageKind, Provenance, Result,
-    SourcePoint, SourceSpan, SqueezyError, SymbolId, SymbolKind,
+    Confidence, ContentHash, EdgeKind, FileId, Freshness, LanguageFamily, LanguageKind, Provenance,
+    Result, SourcePoint, SourceSpan, SqueezyError, SymbolId, SymbolKind,
 };
 use squeezy_workspace::FileRecord;
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
@@ -23,6 +23,20 @@ pub(crate) use languages::{
 
 pub const CRATE_NAME: &str = "squeezy-parse";
 const PARALLEL_PARSE_THRESHOLD: usize = 8;
+
+/// Files whose byte length exceeds this limit cannot be represented with
+/// `u32` span coordinates and are returned as unsupported parse results.
+/// In practice the workspace file-size gate stops files far below this
+/// boundary; the check here is a safety belt for callers that bypass the
+/// workspace layer.
+const MAX_SOURCE_BYTES: usize = u32::MAX as usize;
+
+/// Environment variable that caps the parser worker thread count.
+/// When set to a positive integer `N`, `parse_records_parallel` uses at
+/// most `N` workers regardless of `available_parallelism()`.  Useful on
+/// large Linux workstations where concurrent builds / editors would
+/// otherwise be starved during a cold index.
+const PARSE_WORKERS_ENV: &str = "SQUEEZY_PARSE_WORKERS";
 
 pub fn crate_name() -> &'static str {
     CRATE_NAME
@@ -224,6 +238,13 @@ pub struct ParseSummary {
     pub unsupported_files: usize,
     pub changed_files: usize,
     pub changed_ranges: usize,
+    /// Files that contained at least one tree-sitter `ERROR` or `MISSING`
+    /// node, indicating partial or degraded parse results.
+    pub syntax_error_files: usize,
+    /// Files whose source contained CRLF (`\r\n`) line endings.
+    pub crlf_files: usize,
+    /// Files whose source started with a UTF-8 BOM (`\xEF\xBB\xBF`).
+    pub bom_files: usize,
 }
 
 #[derive(Debug)]
@@ -294,10 +315,18 @@ impl LanguageParser {
         &mut self,
         records: &[FileRecord],
     ) -> Result<(Vec<ParsedFile>, ParseSummary)> {
+        let env_cap = std::env::var(PARSE_WORKERS_ENV)
+            .ok()
+            .and_then(|val| val.parse::<usize>().ok())
+            .filter(|&n| n > 0);
         let worker_count = std::thread::available_parallelism()
             .map(|threads| threads.get())
             .unwrap_or(1)
             .min(records.len());
+        let worker_count = match env_cap {
+            Some(cap) => worker_count.min(cap),
+            None => worker_count,
+        };
         if worker_count <= 1 {
             return self.parse_records_serial(records);
         }
@@ -382,6 +411,18 @@ impl LanguageParser {
             ));
         }
 
+        if source.len() > MAX_SOURCE_BYTES {
+            self.cache.remove(&record.id);
+            return Ok(ParsedFile::unsupported(
+                record.clone(),
+                format!(
+                    "source too large for span representation ({} bytes) for {}",
+                    source.len(),
+                    record.relative_path
+                ),
+            ));
+        }
+
         if let Some(cached) = self.cache.get(&record.id)
             && cached.language == record.language
             && cached.hash == record.hash
@@ -430,6 +471,15 @@ impl LanguageParser {
 
         let mut parsed = extract_language(record.clone(), &source, &tree);
         parsed.changed_ranges = changed_ranges;
+        append_source_diagnostics(&source, &mut parsed.diagnostics);
+        if tree.root_node().has_error() {
+            parsed.diagnostics.push(ParseDiagnostic {
+                message: "syntax_error: tree-sitter parse produced ERROR or MISSING nodes"
+                    .to_string(),
+                span: None,
+                confidence: Confidence::Partial,
+            });
+        }
         self.cache.insert(
             record.id.clone(),
             CachedParsedFile {
@@ -539,6 +589,21 @@ fn parse_record_with_cache(parsers: &mut ParserPool, job: ParseJob) -> Result<Pa
         Err(err) => return Err(err.into()),
     };
 
+    if source.len() > MAX_SOURCE_BYTES {
+        return Ok(ParseOutput {
+            index,
+            parsed: ParsedFile::unsupported(
+                record.clone(),
+                format!(
+                    "source too large for span representation ({} bytes) for {}",
+                    source.len(),
+                    record.relative_path
+                ),
+            ),
+            cache: None,
+        });
+    }
+
     let old = old.filter(|cached| cached.language == record.language);
     let (tree, changed_ranges) = match old {
         Some(mut cached) => {
@@ -575,6 +640,14 @@ fn parse_record_with_cache(parsers: &mut ParserPool, job: ParseJob) -> Result<Pa
 
     let mut parsed = extract_language(record.clone(), &source, &tree);
     parsed.changed_ranges = changed_ranges;
+    append_source_diagnostics(&source, &mut parsed.diagnostics);
+    if tree.root_node().has_error() {
+        parsed.diagnostics.push(ParseDiagnostic {
+            message: "syntax_error: tree-sitter parse produced ERROR or MISSING nodes".to_string(),
+            span: None,
+            confidence: Confidence::Partial,
+        });
+    }
     Ok(ParseOutput {
         index,
         parsed,
@@ -596,6 +669,49 @@ fn update_parse_summary(summary: &mut ParseSummary, parsed_file: &ParsedFile) {
     if !parsed_file.changed_ranges.is_empty() {
         summary.changed_files += 1;
         summary.changed_ranges += parsed_file.changed_ranges.len();
+    }
+    if parsed_file
+        .diagnostics
+        .iter()
+        .any(|d| d.message.starts_with("crlf:"))
+    {
+        summary.crlf_files += 1;
+    }
+    if parsed_file
+        .diagnostics
+        .iter()
+        .any(|d| d.message.starts_with("bom:"))
+    {
+        summary.bom_files += 1;
+    }
+    if parsed_file
+        .diagnostics
+        .iter()
+        .any(|d| d.message.starts_with("syntax_error:"))
+    {
+        summary.syntax_error_files += 1;
+    }
+}
+
+/// Detect CRLF line endings and a leading UTF-8 BOM in `source` and
+/// append structured `ParseDiagnostic` entries with a stable prefix so
+/// callers can group by type without parsing free-text. Prefixes:
+///   `"crlf:"`          — file contains at least one `\r\n` sequence
+///   `"bom:"`           — file begins with the UTF-8 BOM (`\xEF\xBB\xBF`)
+fn append_source_diagnostics(source: &str, diagnostics: &mut Vec<ParseDiagnostic>) {
+    if source.starts_with('\u{FEFF}') {
+        diagnostics.push(ParseDiagnostic {
+            message: "bom: source begins with UTF-8 BOM".to_string(),
+            span: None,
+            confidence: Confidence::Full,
+        });
+    }
+    if source.contains("\r\n") {
+        diagnostics.push(ParseDiagnostic {
+            message: "crlf: source contains CRLF line endings".to_string(),
+            span: None,
+            confidence: Confidence::Full,
+        });
     }
 }
 
@@ -1079,15 +1195,15 @@ fn node_text<'source>(
 
 fn span_from_node(node: Node<'_>) -> SourceSpan {
     SourceSpan::new(
-        node.start_byte() as u32,
-        node.end_byte() as u32,
+        usize_to_u32_sat(node.start_byte()),
+        usize_to_u32_sat(node.end_byte()),
         SourcePoint::new(
-            node.start_position().row as u32,
-            node.start_position().column as u32,
+            usize_to_u32_sat(node.start_position().row),
+            usize_to_u32_sat(node.start_position().column),
         ),
         SourcePoint::new(
-            node.end_position().row as u32,
-            node.end_position().column as u32,
+            usize_to_u32_sat(node.end_position().row),
+            usize_to_u32_sat(node.end_position().column),
         ),
     )
 }
@@ -1100,44 +1216,58 @@ fn span_from_node(node: Node<'_>) -> SourceSpan {
 fn signature_span_from_nodes(node: Node<'_>, body: Option<Node<'_>>) -> Option<SourceSpan> {
     let body = body?;
     Some(SourceSpan::new(
-        node.start_byte() as u32,
-        body.start_byte() as u32,
+        usize_to_u32_sat(node.start_byte()),
+        usize_to_u32_sat(body.start_byte()),
         SourcePoint::new(
-            node.start_position().row as u32,
-            node.start_position().column as u32,
+            usize_to_u32_sat(node.start_position().row),
+            usize_to_u32_sat(node.start_position().column),
         ),
         SourcePoint::new(
-            body.start_position().row as u32,
-            body.start_position().column as u32,
+            usize_to_u32_sat(body.start_position().row),
+            usize_to_u32_sat(body.start_position().column),
         ),
     ))
 }
 
 fn span_from_range(range: tree_sitter::Range) -> SourceSpan {
     SourceSpan::new(
-        range.start_byte as u32,
-        range.end_byte as u32,
+        usize_to_u32_sat(range.start_byte),
+        usize_to_u32_sat(range.end_byte),
         SourcePoint::new(
-            range.start_point.row as u32,
-            range.start_point.column as u32,
+            usize_to_u32_sat(range.start_point.row),
+            usize_to_u32_sat(range.start_point.column),
         ),
-        SourcePoint::new(range.end_point.row as u32, range.end_point.column as u32),
+        SourcePoint::new(
+            usize_to_u32_sat(range.end_point.row),
+            usize_to_u32_sat(range.end_point.column),
+        ),
     )
 }
 
 fn span_from_edit(edit: &InputEdit) -> SourceSpan {
     SourceSpan::new(
-        edit.start_byte as u32,
-        edit.new_end_byte as u32,
+        usize_to_u32_sat(edit.start_byte),
+        usize_to_u32_sat(edit.new_end_byte),
         SourcePoint::new(
-            edit.start_position.row as u32,
-            edit.start_position.column as u32,
+            usize_to_u32_sat(edit.start_position.row),
+            usize_to_u32_sat(edit.start_position.column),
         ),
         SourcePoint::new(
-            edit.new_end_position.row as u32,
-            edit.new_end_position.column as u32,
+            usize_to_u32_sat(edit.new_end_position.row),
+            usize_to_u32_sat(edit.new_end_position.column),
         ),
     )
+}
+
+/// Saturating cast from `usize` to `u32`.
+///
+/// Files exceeding 4 GiB are rejected at the `MAX_SOURCE_BYTES` boundary
+/// before any span conversion, so `usize` values that arrive here fit in
+/// practice. The saturating fallback is a safety belt: it produces an
+/// obviously-clamped span coordinate instead of silently wrapping.
+#[inline]
+fn usize_to_u32_sat(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 fn input_edit(old: &str, new: &str) -> InputEdit {
@@ -1205,6 +1335,94 @@ pub fn edge_kind_for_call(call: ParsedCallKind) -> EdgeKind {
     match call {
         ParsedCallKind::Direct | ParsedCallKind::Method => EdgeKind::Calls,
         ParsedCallKind::Macro => EdgeKind::InvokesMacro,
+    }
+}
+
+/// Result of initializing one grammar during a parser smoke run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmokeResult {
+    pub language: LanguageKind,
+    pub ok: bool,
+    /// Error message when `ok` is false.
+    pub error: Option<String>,
+}
+
+/// Initialize every registered parser grammar and parse a minimal
+/// language-specific fixture.  Returns one `SmokeResult` per supported
+/// `LanguageKind`.  Failures indicate a missing or incompatible grammar
+/// crate (e.g. a musl/static-link regression).
+pub fn smoke_all_languages() -> Vec<SmokeResult> {
+    // Minimal valid source snippets for each language — just enough that
+    // tree-sitter can build a root node without returning `None`.
+    fn fixture(kind: LanguageKind) -> &'static str {
+        match kind {
+            LanguageKind::Rust => "fn main() {}\n",
+            LanguageKind::Python => "def f(): pass\n",
+            LanguageKind::Java => "class A {}\n",
+            LanguageKind::CSharp => "class A {}\n",
+            LanguageKind::Go => "package main\nfunc main() {}\n",
+            LanguageKind::C => "int f(void) { return 0; }\n",
+            LanguageKind::Cpp => "int f() { return 0; }\n",
+            LanguageKind::JavaScript => "function f() {}\n",
+            LanguageKind::Jsx => "function F() { return null; }\n",
+            LanguageKind::TypeScript => "function f(): void {}\n",
+            LanguageKind::Tsx => "function F(): JSX.Element { return null as any; }\n",
+            LanguageKind::Ruby => "def f; end\n",
+            LanguageKind::Php => "<?php function f() {}\n",
+            LanguageKind::Kotlin => "fun main() {}\n",
+            LanguageKind::Swift => "func f() {}\n",
+            LanguageKind::Scala => "object A\n",
+            LanguageKind::Dart => "void main() {}\n",
+            _ => "// smoke\n",
+        }
+    }
+
+    let mut results = Vec::new();
+    for family in squeezy_core::LanguageFamily::all() {
+        for &kind in family.kinds() {
+            let result = match parser_for_language_kind(kind) {
+                Err(err) => SmokeResult {
+                    language: kind,
+                    ok: false,
+                    error: Some(format!("grammar init failed: {err}")),
+                },
+                Ok(mut parser) => {
+                    let src = fixture(kind);
+                    match parser.parse(src, None) {
+                        None => SmokeResult {
+                            language: kind,
+                            ok: false,
+                            error: Some("parser returned None for fixture source".to_string()),
+                        },
+                        Some(_) => SmokeResult {
+                            language: kind,
+                            ok: true,
+                            error: None,
+                        },
+                    }
+                }
+            };
+            results.push(result);
+        }
+    }
+    results
+}
+
+/// Return the effective parse worker count that would be chosen for a
+/// parallel batch of `batch_size` files, respecting the
+/// `SQUEEZY_PARSE_WORKERS` environment variable cap.
+pub fn effective_worker_count(batch_size: usize) -> usize {
+    let env_cap = std::env::var(PARSE_WORKERS_ENV)
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    let count = std::thread::available_parallelism()
+        .map(|t| t.get())
+        .unwrap_or(1)
+        .min(batch_size);
+    match env_cap {
+        Some(cap) => count.min(cap),
+        None => count,
     }
 }
 
