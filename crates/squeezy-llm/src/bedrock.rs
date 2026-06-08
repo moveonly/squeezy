@@ -146,7 +146,10 @@ fn extract_url_host(url: &str) -> Option<String> {
     let after_userinfo = authority.split('@').next_back().unwrap_or(authority);
     let host = if after_userinfo.starts_with('[') {
         // IPv6 literal: "[::1]" or "[::1]:8080" — strip brackets.
-        let close = after_userinfo.find(']').unwrap_or(after_userinfo.len() - 1);
+        // If ']' is absent (malformed input like "[") use `len()` so the
+        // slice `[1..len]` is valid and yields an empty string, which the
+        // trailing `host.is_empty()` check turns into `None`.
+        let close = after_userinfo.find(']').unwrap_or(after_userinfo.len());
         &after_userinfo[1..close]
     } else {
         // Strip port if present and purely numeric.

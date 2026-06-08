@@ -250,7 +250,12 @@ pub fn read_tokens(path: &Path) -> Result<Option<PersistedGitHubCopilotTokens>> 
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => {}
+            Err(err) => {
+                return Err(SqueezyError::ProviderNotConfigured(format!(
+                    "could not check permissions of {}: {err}",
+                    path.display()
+                )));
+            }
         }
     }
     let bytes = match std::fs::read(path) {

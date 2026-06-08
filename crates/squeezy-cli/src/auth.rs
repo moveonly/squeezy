@@ -1343,7 +1343,13 @@ async fn run_anthropic_oauth_login(args: &AnthropicLoginArgs) -> squeezy_core::R
     writeln!(stdout, "  Authorize URL:")?;
     writeln!(stdout, "    {authorize_url}")?;
     if !args.no_browser {
-        if try_open_browser(&authorize_url) {
+        if is_headless_linux() {
+            writeln!(
+                stdout,
+                "  (headless Linux: no DISPLAY or WAYLAND_DISPLAY detected; \
+                 open the URL above in a browser on another machine)"
+            )?;
+        } else if try_open_browser(&authorize_url) {
             writeln!(stdout, "  Opened the authorize URL in your browser.")?;
         } else {
             writeln!(

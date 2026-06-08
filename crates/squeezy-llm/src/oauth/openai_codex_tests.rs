@@ -227,6 +227,32 @@ fn load_codex_token_rejects_group_readable_file() {
     );
 }
 
+// ─── wait_for_callback_code timeout ─────────────────────────────────────────
+
+#[tokio::test]
+async fn wait_for_callback_code_times_out_when_no_browser_connects() {
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let cancel = CancellationToken::new();
+    let err = wait_for_callback_code_with_timeout(
+        listener,
+        "irrelevant-state",
+        &cancel,
+        Duration::from_millis(50),
+    )
+    .await
+    .expect_err("should time out");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("timed out"),
+        "error should say 'timed out'; got: {msg}"
+    );
+}
+
 // ─── refresh + ApiKeySource interactions ───────────────────────────────────
 
 async fn read_http_request(stream: &mut TcpStream) -> String {

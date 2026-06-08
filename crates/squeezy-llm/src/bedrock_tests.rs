@@ -1926,6 +1926,18 @@ fn extract_url_host_strips_ipv6_brackets() {
 }
 
 #[test]
+fn extract_url_host_returns_none_for_malformed_ipv6_without_close_bracket() {
+    // A URL like "http://[/" has an authority "[" with no ']'.
+    // The old code would compute `unwrap_or(len - 1)` = 0 causing a panic
+    // on `&"["[1..0]`; now it returns None (empty host after stripping '[').
+    assert_eq!(
+        extract_url_host("http://[/path"),
+        None,
+        "malformed IPv6 URL must yield None, not panic"
+    );
+}
+
+#[test]
 fn extract_url_host_strips_userinfo() {
     assert_eq!(
         extract_url_host("https://user:pass@api.example.com/"),
