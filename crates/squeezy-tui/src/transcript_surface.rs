@@ -3,10 +3,12 @@
 //! This is the faithful foundation (plan Phase 3, "MOVE 2") that the main
 //! view, the Ctrl+T overlay, selection, search, and copy will all build on.
 //! It does NOT re-implement any layout — it REUSES the crate-root transcript
-//! pipeline (`crate::transcript_lines_for_overlay` →
-//! `crate::wrap_transcript_overlay_rows`) and decorates each wrapped visual
-//! line with stable identity (`RowId` / `EntryId`) and a plain-text
-//! `copy_text` projection.
+//! pipeline through [`crate::wrap_entries`], which runs the SAME per-entry
+//! formatting / coalescing / rail / divider loop as the overlay draw and wraps
+//! it with the SAME wrapper, additionally tagging each wrapped visual row with
+//! the `TranscriptEntry.id` it came from. The row model then decorates each row
+//! with stable identity (`RowId` / `EntryId`), a plain-text `copy_text`
+//! projection, and per-row style/click metadata.
 //!
 //! Why a separate module: the per-feature surfaces (selection rectangle,
 //! incremental search, yank-to-clipboard) all need the SAME row list with the
@@ -14,21 +16,36 @@
 //! those features parallelize against one model instead of each re-deriving
 //! rows from `Line`s. See the parallelization plan, Phase 3.
 //!
+//! Attribution is FAITHFUL: [`crate::wrap_entries`] threads per-line provenance
+//! through the combined pass, so every visual row carries the id of the entry
+//! that produced it and chrome rows (title banner, blank spacers, rail
+//! connectors, turn dividers, the live pending tail) carry no entry id. This
+//! replaces the earlier prefix-diffing stub that attributed every row to the
+//! first entry.
+//!
 //! Visibility note: this is a child module of the crate root, so it can read
-//! crate-root *private* items (`crate::transcript_lines_for_overlay`,
-//! `crate::wrap_transcript_overlay_rows`, `crate::TuiApp`,
-//! `crate::TranscriptEntry`, `crate::TranscriptEntryKind`,
+//! crate-root *private* items (`crate::wrap_entries`, `crate::AttributedRow`,
+//! `crate::TuiApp`, `crate::TranscriptEntry`, `crate::TranscriptEntryKind`,
 //! `crate::active_transcript_entries`). Nothing in lib.rs needs a visibility
 //! bump for this file to compile.
 //!
-//! TODO(parallelization-plan Phase 3): this whole module is the not-yet-wired
-//! foundation. The integration step adds `mod transcript_surface;` to lib.rs
-//! and routes the main view / Ctrl+T overlay / selection / search / copy
-//! through [`build_transcript_rows`]. Until a caller exists the module-level
-//! `allow(dead_code)` below keeps `-D warnings` builds green; remove it once
-//! the surfaces are wired.
+//! Wiring status (parallelization-plan Phase 3): `build_transcript_rows` is now
+//! the real, faithfully-attributed builder (it replaced the prefix-diffing
+//! stub) and is fully exercised by the row-model test surface in `lib_tests`.
+//! The production `render()` path still draws through
+//! [`crate::transcript_lines_for_overlay`]; routing it (and Ctrl+T, selection,
+//! search, copy) through this module is the Phase 4+ integration step. Until a
+//! NON-TEST caller exists the whole surface is dead in a plain `cargo build`, so
+//! the module-level `allow(dead_code)` below is what keeps `-D warnings` green;
+//! narrow it to per-item allows once the renderer consumes the row model.
 #![allow(dead_code)]
 
+use std::num::NonZeroUsize;
+use std::ops::Range;
+use std::sync::{Mutex, OnceLock};
+
+use lru::LruCache;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 /// Stable index of a single *visual* row (one wrapped line) within a freshly
@@ -128,185 +145,372 @@ impl RowKind {
     }
 }
 
-/// One visual row of the transcript: a single wrapped line plus the identity
-/// and plain-text projection the higher-level features need.
+/// A click target inside a row: a half-open `text_range` (in `copy_text`
+/// char offsets) and the action it triggers. Built empty today; the integration
+/// step populates it for entry headers (collapse/expand toggles) and any
+/// in-row affordances so the mouse handler can hit-test against the row model
+/// instead of re-deriving geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClickTarget {
+    /// Char-offset span within the row's `copy_text` the target covers.
+    pub(crate) text_range: Range<usize>,
+    /// What clicking the target does.
+    pub(crate) action: ClickAction,
+}
+
+/// The action a [`ClickTarget`] triggers when the row is clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClickAction {
+    /// Toggle the owning entry's collapsed/expanded state.
+    ToggleEntryCollapsed(EntryId),
+}
+
+/// One visual row of the transcript: a single wrapped line plus the identity,
+/// plain-text projection, style metadata, and interaction state the
+/// higher-level features need.
 ///
 /// `line` is the exact `ratatui` line the renderer draws, so a consumer can
 /// build rows once and both render them and operate on them (search hit
-/// highlighting, selection) without a second pass.
+/// highlighting, selection) without a second pass. `copy_text`, `text_range`,
+/// `style_spans`, and `search_match_ranges` all index by the SAME char offsets,
+/// so a search hit found in `copy_text` maps straight onto a re-style of the
+/// matching cells.
 #[derive(Debug, Clone)]
 pub(crate) struct TranscriptRow {
     /// Position of this row in the built list (see [`RowId`]).
     pub(crate) row_id: RowId,
     /// Logical entry this row belongs to (see [`EntryId`]).
     ///
-    /// TODO(parallelization-plan Phase 3): currently every row carries an
-    /// `EntryId`. Once the crate-root pipeline threads per-line provenance we
-    /// can attribute *blank separator* rows to no entry; until then they are
-    /// attributed to the nearest preceding entry (see [`build_transcript_rows`]).
-    pub(crate) entry_id: EntryId,
-    /// Coarse kind of the owning entry.
-    pub(crate) entry_kind: RowKind,
+    /// `None` for chrome rows owned by no single entry: the title banner and
+    /// its blank spacer, inter-node rail connectors, turn dividers, and the
+    /// live pending-assistant tail. This is FAITHFUL provenance threaded by
+    /// [`crate::wrap_entries`], not an approximation.
+    pub(crate) entry_id: Option<EntryId>,
+    /// Coarse kind of the owning entry, or `None` for chrome rows.
+    pub(crate) entry_kind: Option<RowKind>,
     /// 0-based index of this row *within its owning entry's* wrapped block —
     /// i.e. how many rows of the same `entry_id` preceded it. Lets a feature
-    /// address "the 3rd visual line of this answer".
+    /// address "the 3rd visual line of this answer". For chrome rows this is
+    /// the run-length position within the current chrome run.
     pub(crate) visual_line_index: usize,
     /// The styled line as drawn.
     pub(crate) line: Line<'static>,
     /// Plain-text projection of `line` (spans joined, styling dropped). The
     /// clipboard / search substrate works off this.
     pub(crate) copy_text: String,
+    /// Half-open char-offset span of this row within `copy_text`. Always
+    /// `0..copy_text.chars().count()` (one row == one line of text); carried
+    /// explicitly so selection/search can address sub-row ranges uniformly
+    /// with the same offset basis the other fields use.
+    pub(crate) text_range: Range<usize>,
+    /// Per-cell style runs derived from `line.spans`: `(char_range, style)`
+    /// over `copy_text` char offsets. Lets search highlighting re-style a hit
+    /// without re-walking the spans, and lets selection invert a sub-row range.
+    pub(crate) style_spans: Vec<(Range<usize>, Style)>,
+    /// Whether the owning entry is folded (collapsed preview) or expanded.
+    /// Chrome rows inherit the build's [`DetailPolicy`].
+    pub(crate) fold_state: FoldState,
+    /// Char-offset ranges (within `copy_text`) of incremental-search matches on
+    /// this row. Default empty.
+    ///
+    /// TODO(parallelization-plan Phase 7): populated by the incremental-search
+    /// step, which scans `copy_text` for the active query and records hit
+    /// ranges here so the renderer highlights them in place.
+    pub(crate) search_match_ranges: Vec<Range<usize>>,
+    /// Click targets inside this row (header toggles, affordances). Default
+    /// empty; populated by the integration step that wires the mouse handler.
+    pub(crate) click_targets: Vec<ClickTarget>,
+}
+
+/// Whether a row's owning entry renders folded or expanded. Mirrors the build's
+/// [`DetailPolicy`] one-to-one; carried per row so a future per-entry fold
+/// (where some entries expand while others stay folded) can vary it without a
+/// struct change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FoldState {
+    Collapsed,
+    Expanded,
+}
+
+impl From<DetailPolicy> for FoldState {
+    fn from(detail: DetailPolicy) -> Self {
+        match detail {
+            DetailPolicy::Collapsed => FoldState::Collapsed,
+            DetailPolicy::Expanded => FoldState::Expanded,
+        }
+    }
 }
 
 /// Build the shared row model for `app` at the given render `width`.
 ///
-/// REUSES the existing crate pipeline verbatim:
-///   1. `crate::transcript_lines_for_overlay(app, Some(width), expand_all)`
-///      produces the logical, per-entry line list (with all rail chrome, turn
-///      dividers, tool cards, etc. already applied).
-///   2. `crate::wrap_transcript_overlay_rows(&logical, width)` wraps those to
-///      `width` cells using the gutter-preserving wrap logic.
+/// REUSES the crate pipeline verbatim through [`crate::wrap_entries`], which
+/// runs the SAME per-entry formatting / coalescing / rail / divider loop as the
+/// overlay draw and wraps it with the SAME wrapper, additionally tagging every
+/// wrapped row with the `TranscriptEntry.id` it came from (or `None` for
+/// chrome). This function decorates each tagged row with stable identity, the
+/// plain-text / style projections, and interaction state.
 ///
-/// It then walks the *entries* in the same order to attribute each wrapped
-/// visual row back to an [`EntryId`] / [`RowKind`]. Attribution is done by
-/// re-deriving each entry's wrapped height through the same two functions, so
-/// the boundaries line up exactly with what the renderer drew without copying
-/// any wrap logic.
+/// Attribution is FAITHFUL: each row's `entry_id` is the id `wrap_entries`
+/// threaded through provenance, so a long answer's wrapped continuation rows
+/// share one id while chrome rows carry none. There is no prefix-diffing and no
+/// "attribute everything to the first entry" fallback.
 ///
-/// NOTE: this re-runs the per-entry render to compute boundaries. That is the
-/// faithful-but-unoptimised foundation; the integration step can swap in a
-/// provenance-carrying variant once the pipeline exposes per-line entry ids.
+/// Memoised: the built row list is cached under a composite of every input that
+/// affects it (see [`row_cache`]); an unchanged transcript redraws from cache
+/// without re-running `wrap_entries`.
 pub(crate) fn build_transcript_rows(
     app: &crate::TuiApp,
     width: u16,
     detail: DetailPolicy,
 ) -> Vec<TranscriptRow> {
     let width = width.max(1);
+    let key = row_cache_key(app, width, detail);
+    if let Some(cached) = row_cache_get(&key) {
+        return cached;
+    }
+    let rows = build_transcript_rows_uncached(app, width, detail);
+    row_cache_put(key, rows.clone());
+    rows
+}
+
+/// Build the row model without consulting the cache. Split out so the cache
+/// wrapper stays tiny and tests can exercise the build directly.
+fn build_transcript_rows_uncached(
+    app: &crate::TuiApp,
+    width: u16,
+    detail: DetailPolicy,
+) -> Vec<TranscriptRow> {
+    let width = width.max(1);
     let expand_all = detail.expand_all();
+    let fold_state = FoldState::from(detail);
 
-    // The full wrapped row list, exactly as the renderer would draw it.
-    let logical = crate::transcript_lines_for_overlay(app, Some(width), expand_all);
-    let wrapped = crate::wrap_transcript_overlay_rows(&logical, width);
+    // Faithfully attributed, width-wrapped rows — byte-identical lines to the
+    // overlay draw, each tagged with its owning entry id (or `None`).
+    let attributed = crate::wrap_entries(app, width, expand_all);
 
-    // Per-entry attribution. We re-render each entry on its own through the
-    // *same* two functions so the wrapped-height arithmetic matches the
-    // combined output. Leading rows the combined pass emits but no single
-    // entry does (title banner / blank spacer) are attributed to the first
-    // entry; trailing/in-between blanks fold into the preceding entry.
+    // Map entry ids to their `RowKind` once so attribution is O(1) per row.
     let entries = crate::active_transcript_entries(app);
-    let attribution = attribute_rows(entries, &wrapped, width, expand_all);
 
-    let mut rows = Vec::with_capacity(wrapped.len());
-    let mut per_entry_counter: Vec<(EntryId, usize)> = Vec::new();
-    for (i, line) in wrapped.into_iter().enumerate() {
-        let (entry_id, entry_kind) = attribution[i];
-        let visual_line_index = match per_entry_counter.last_mut() {
-            Some((id, n)) if *id == entry_id => {
+    let mut rows = Vec::with_capacity(attributed.len());
+    // Run-length counter over consecutive equal owners (entry id or chrome),
+    // giving each row its index within the current run.
+    let mut run: Option<(Option<u64>, usize)> = None;
+    for (i, attr) in attributed.into_iter().enumerate() {
+        let entry_id = attr.entry_id.map(EntryId);
+        let entry_kind = attr
+            .entry_id
+            .and_then(|id| entries.iter().find(|e| e.id == id))
+            .map(|e| RowKind::from_entry_kind(&e.kind));
+        let visual_line_index = match run.as_mut() {
+            Some((owner, n)) if *owner == attr.entry_id => {
                 *n += 1;
                 *n
             }
             _ => {
-                per_entry_counter.push((entry_id, 0));
+                run = Some((attr.entry_id, 0));
                 0
             }
         };
-        let copy_text = plain_text_of_line(&line);
+        let copy_text = plain_text_of_line(&attr.line);
+        let char_len = copy_text.chars().count();
+        let style_spans = style_spans_of_line(&attr.line);
         rows.push(TranscriptRow {
             row_id: RowId(i),
             entry_id,
             entry_kind,
             visual_line_index,
-            line,
+            line: attr.line,
             copy_text,
+            text_range: 0..char_len,
+            style_spans,
+            fold_state,
+            // TODO(parallelization-plan Phase 7): incremental search fills this.
+            search_match_ranges: Vec::new(),
+            click_targets: Vec::new(),
         });
     }
     rows
 }
 
-/// For each wrapped row index, the `(EntryId, RowKind)` it belongs to.
+/// The slice of `rows` visible in a `viewport_height`-tall viewport.
 ///
-/// We can't get provenance out of the combined pipeline today, so we
-/// reconstruct boundaries: render the *whole* prefix `entries[..=k]` and note
-/// how the wrapped row count grows as `k` advances. The growth between `k-1`
-/// and `k` is the set of rows owned by `entries[k]`. Any rows the combined
-/// output has beyond the last entry's prefix (or before the first entry
-/// contributes) are attributed to the nearest real entry so every row has an
-/// owner.
-///
-/// This is O(entries) passes over the pipeline — correct and faithful, but the
-/// integration step should replace it with per-line provenance (see the module
-/// docs). Marked accordingly.
-fn attribute_rows(
-    entries: &[crate::TranscriptEntry],
-    wrapped: &[Line<'static>],
-    width: u16,
-    expand_all: bool,
-) -> Vec<(EntryId, RowKind)> {
-    let total = wrapped.len();
-    if total == 0 {
-        return Vec::new();
+/// When `from_bottom` is `true` the viewport is anchored to the END of the
+/// transcript (the live-tail / "scrolled to bottom" case): the last
+/// `viewport_height` rows are returned. When `false` it is anchored to the
+/// TOP (the title-banner / "scrolled to top" case): the first `viewport_height`
+/// rows are returned. A `viewport_height` of 0 yields an empty slice, and a
+/// viewport taller than the row list yields the whole list. This is the single
+/// projection selection/search/render share so the visible window is computed
+/// the same way everywhere.
+pub(crate) fn visible_transcript_rows(
+    rows: &[TranscriptRow],
+    viewport_height: usize,
+    from_bottom: bool,
+) -> &[TranscriptRow] {
+    if viewport_height == 0 || rows.is_empty() {
+        return &[];
     }
-    if entries.is_empty() {
-        // No entries but non-empty output (e.g. a title-only banner). Attribute
-        // everything to a synthetic id so downstream indexing stays total.
-        return vec![(EntryId(0), RowKind::Message); total];
+    if viewport_height >= rows.len() {
+        return rows;
     }
+    if from_bottom {
+        &rows[rows.len() - viewport_height..]
+    } else {
+        &rows[..viewport_height]
+    }
+}
 
-    // Cumulative wrapped height of the first `k` entries, rendered as a group
-    // through the same pipeline the renderer uses. `cumulative[k]` is the
-    // number of wrapped rows produced by `entries[..k]`.
-    let mut cumulative = Vec::with_capacity(entries.len() + 1);
-    cumulative.push(0usize);
-    for k in 1..=entries.len() {
-        cumulative.push(wrapped_height_of_prefix(&entries[..k], width, expand_all));
-    }
-
-    let mut out: Vec<(EntryId, RowKind)> = Vec::with_capacity(total);
-    for k in 0..entries.len() {
-        let start = cumulative[k].min(total);
-        let end = cumulative[k + 1].min(total);
-        let id = EntryId(entries[k].id);
-        let kind = RowKind::from_entry_kind(&entries[k].kind);
-        for _ in start..end {
-            out.push((id, kind));
+/// Per-cell style runs of a line over `copy_text` char offsets:
+/// `(char_range, style)` for each span, in order. Re-uses the line's own spans
+/// (no re-styling), so `style_spans` and `copy_text` always agree on offsets.
+fn style_spans_of_line(line: &Line<'static>) -> Vec<(Range<usize>, Style)> {
+    let mut out = Vec::with_capacity(line.spans.len());
+    let mut offset = 0usize;
+    for span in &line.spans {
+        let len = span.content.chars().count();
+        if len > 0 {
+            out.push((offset..offset + len, span.style));
+            offset += len;
         }
     }
-    // Pad any shortfall (wrapped rows the per-entry prefixes didn't cover) with
-    // the LAST attributed entry, falling back to the FIRST entry only when
-    // nothing was attributed at all, so attribution covers every wrapped row.
-    if out.len() < total {
-        let last = *out.last().unwrap_or(&(
-            EntryId(entries[0].id),
-            RowKind::from_entry_kind(&entries[0].kind),
-        ));
-        while out.len() < total {
-            out.push(last);
-        }
-    }
-    out.truncate(total);
     out
 }
 
-/// Wrapped row count of an entry prefix, via the same two crate functions the
-/// renderer uses. Pure measurement — never copies wrap logic.
-fn wrapped_height_of_prefix(
-    _entries_prefix: &[crate::TranscriptEntry],
-    _width: u16,
-    _expand_all: bool,
-) -> usize {
-    // The crate-root pipeline takes the *whole* `app`, not an arbitrary entry
-    // slice, so we cannot re-run it on a prefix without an app. Boundary
-    // reconstruction therefore needs a pipeline entry point that accepts an
-    // entry slice + width; that does not exist yet.
-    //
-    // TODO(parallelization-plan Phase 3): add a crate-root helper
-    // `wrap_entries(entries: &[TranscriptEntry], width, expand_all)` (a thin
-    // wrapper over the existing per-entry formatters) and call it here. Until
-    // then `build_transcript_rows` attributes all rows to the first entry via
-    // the `out.len() < total` padding path, which keeps row indexing total and
-    // copy/plain-text correct; only the per-entry `entry_id` grouping is
-    // approximate.
-    0
+// ---------------------------------------------------------------------------
+// Revision-keyed row cache
+// ---------------------------------------------------------------------------
+//
+// `build_transcript_rows` runs on every redraw (resize, scroll, key, async
+// event), but `wrap_entries` + per-row decoration only change when an input to
+// the layout changes. This cache mirrors the per-entry render cache's
+// invalidation model (`render::cache`): a key that pins the structural inputs,
+// validity tags that capture the volatile ones, and an LRU bound.
+//
+// Granularity note: the design's ideal is a per-entry block cache, but
+// `wrap_entries` necessarily takes the whole app because coalescing, the rail
+// connector injection, and the turn divider all depend on cross-entry state, so
+// no single entry's rows can be produced in isolation today. The faithful unit
+// we *can* memoise is therefore the whole attributed row list, keyed on the
+// composite the `wrap_entries` design lists: the session, width, expand_all,
+// palette generation, selected entry, the three formatting toggles
+// (`tool_output_verbosity`, `show_reasoning_usage`, `coalesce_tool_runs`), the
+// transcript shortcut, the turn-divider snapshot, plus a fold over each visible
+// `(entry.id, entry.revision)` and the pending stream. Every one of these is an
+// input to `wrap_entries`; a change to any flips the key and rebuilds. Because
+// the per-entry render LRU is hit *inside* `wrap_entries`, a rebuild on a single
+// entry's revision bump only re-runs the cheap cross-entry assembly + wrap, not
+// the markdown/tree-sitter formatting.
+
+/// Bound on distinct cached row lists. One slot per (width, detail, toggle)
+/// combination of the live transcript; a handful of resizes / mode flips fit
+/// comfortably while the LRU stops an animating transcript from accumulating
+/// stale lists without bound.
+const ROW_CACHE_CAPACITY: usize = 32;
+
+/// Structural + validity composite for one cached row list. Derives `Hash`/`Eq`
+/// so the whole key participates in the LRU lookup — there are no separate
+/// "validity tags" because, unlike the per-entry cache, there is no stable
+/// sub-key to preserve a slot across an input change (the row list is rebuilt
+/// wholesale anyway).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct RowCacheKey {
+    render_cache_session: u64,
+    width: u16,
+    expand_all: bool,
+    palette_generation: u64,
+    selected_entry: Option<usize>,
+    tool_output_verbosity: u8,
+    show_reasoning_usage: bool,
+    coalesce_tool_runs: bool,
+    subagent_active: u64,
+    /// FNV/Default fold over every visible `(entry.id, entry.revision)`.
+    transcript_revision_hash: u64,
+    /// Fold over the live pending reasoning + assistant stream (no entry id /
+    /// revision exists for uncommitted text, so it is content-hashed).
+    pending_hash: u64,
+    /// Turn-divider animation snapshot, folded into a `u64` (it is `Hash`).
+    turn_divider_hash: u64,
+    /// `shortcut_hash` of the transcript shortcut so a keymap rebind busts the
+    /// cache, matching the per-entry render cache's behaviour.
+    shortcut_hash: u64,
+}
+
+fn row_cache() -> &'static Mutex<LruCache<RowCacheKey, std::sync::Arc<Vec<TranscriptRow>>>> {
+    static CACHE: OnceLock<Mutex<LruCache<RowCacheKey, std::sync::Arc<Vec<TranscriptRow>>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(ROW_CACHE_CAPACITY).expect("non-zero capacity"),
+        ))
+    })
+}
+
+/// Compute the cache composite for the current app/width/detail. Reuses the
+/// crate-private accessors the overlay render key uses, so the row cache
+/// invalidates on exactly the same events the overlay does.
+fn row_cache_key(app: &crate::TuiApp, width: u16, detail: DetailPolicy) -> RowCacheKey {
+    use std::hash::{Hash, Hasher};
+
+    let entries = crate::active_transcript_entries(app);
+    let mut transcript_hasher = std::collections::hash_map::DefaultHasher::new();
+    for entry in entries {
+        entry.id.hash(&mut transcript_hasher);
+        entry.revision.hash(&mut transcript_hasher);
+    }
+
+    let mut pending_hasher = std::collections::hash_map::DefaultHasher::new();
+    crate::active_pending_reasoning(app).hash(&mut pending_hasher);
+    if crate::active_subagent_record(app).is_none() && !app.pending_assistant.trim_is_empty() {
+        app.pending_assistant.text().hash(&mut pending_hasher);
+    }
+
+    let mut divider_hasher = std::collections::hash_map::DefaultHasher::new();
+    crate::overlay_turn_divider_snapshot(app).hash(&mut divider_hasher);
+
+    RowCacheKey {
+        render_cache_session: app.render_cache_session,
+        width,
+        expand_all: detail.expand_all(),
+        palette_generation: crate::render::palette::palette_generation(),
+        selected_entry: crate::active_selected_entry(app),
+        tool_output_verbosity: app.tool_output_verbosity as u8,
+        show_reasoning_usage: app.show_reasoning_usage,
+        coalesce_tool_runs: app.coalesce_tool_runs,
+        subagent_active: subagent_discriminator(app),
+        transcript_revision_hash: transcript_hasher.finish(),
+        pending_hash: pending_hasher.finish(),
+        turn_divider_hash: divider_hasher.finish(),
+        shortcut_hash: crate::shortcut_hash(
+            crate::key_hint(app, crate::keymap::Action::ToggleTranscriptOverlay).as_str(),
+        ),
+    }
+}
+
+/// Discriminate which conversation `wrap_entries` is rendering (main vs. a
+/// specific subagent), since the active source changes the entire row list.
+fn subagent_discriminator(app: &crate::TuiApp) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    app.subagent_pane.active.hash(&mut h);
+    h.finish()
+}
+
+fn row_cache_get(key: &RowCacheKey) -> Option<Vec<TranscriptRow>> {
+    let mut cache = row_cache().lock().ok()?;
+    cache.get(key).map(|rows| (**rows).clone())
+}
+
+fn row_cache_put(key: RowCacheKey, rows: Vec<TranscriptRow>) {
+    if let Ok(mut cache) = row_cache().lock() {
+        cache.put(key, std::sync::Arc::new(rows));
+    }
+}
+
+#[cfg(test)]
+fn row_cache_clear() {
+    if let Ok(mut cache) = row_cache().lock() {
+        cache.clear();
+    }
 }
 
 /// Plain text of a single line: its spans' contents concatenated, styling
@@ -317,7 +521,6 @@ pub(crate) fn plain_text_of_line(line: &Line<'static>) -> String {
 
 /// Plain text of a sequence of spans (same projection as
 /// [`plain_text_of_line`], exposed for callers that hold raw spans).
-#[allow(dead_code)] // TODO(parallelization-plan Phase 3): used by search span scanning.
 pub(crate) fn plain_text_of_spans(spans: &[Span<'static>]) -> String {
     spans.iter().map(|s| s.content.as_ref()).collect()
 }
@@ -333,7 +536,6 @@ pub(crate) fn plain_text_of_spans(spans: &[Span<'static>]) -> String {
 /// `crate::RAIL_GUTTER_CHARS` / `crate::rail_prefix_width` for the canonical
 /// gutter definition to reuse when wiring that up. Until then copy includes the
 /// gutter verbatim.
-#[allow(dead_code)] // TODO(parallelization-plan Phase 3): wired by the selection/yank step.
 pub(crate) fn copy_range(rows: &[TranscriptRow]) -> String {
     rows.iter()
         .map(|r| r.copy_text.as_str())
@@ -344,7 +546,6 @@ pub(crate) fn copy_range(rows: &[TranscriptRow]) -> String {
 /// Copy primitive addressed by [`RowId`] range (`start..=end`, inclusive),
 /// clamped to the available rows. Convenience over [`copy_range`] for
 /// selection code that tracks anchors as `RowId`s.
-#[allow(dead_code)] // TODO(parallelization-plan Phase 3): wired by the selection/yank step.
 pub(crate) fn copy_row_span(rows: &[TranscriptRow], start: RowId, end: RowId) -> String {
     let (lo, hi) = if start.0 <= end.0 {
         (start.0, end.0)

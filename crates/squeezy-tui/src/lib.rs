@@ -3260,7 +3260,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             if app.input.is_empty() {
-                set_active_transcript_scroll_from_bottom(app, u16::MAX);
+                set_active_transcript_scroll_from_bottom(app, u16::MAX as usize);
                 true
             } else {
                 false
@@ -3312,12 +3312,12 @@ fn dispatch_click_action(app: &mut TuiApp, action: ClickAction) {
     }
 }
 
-fn scroll_transcript_up(app: &mut TuiApp, lines: u16) {
+fn scroll_transcript_up(app: &mut TuiApp, lines: usize) {
     let scroll = active_transcript_scroll_from_bottom(app).saturating_add(lines);
     set_active_transcript_scroll_from_bottom(app, scroll);
 }
 
-fn scroll_transcript_down(app: &mut TuiApp, lines: u16) {
+fn scroll_transcript_down(app: &mut TuiApp, lines: usize) {
     let scroll = active_transcript_scroll_from_bottom(app).saturating_sub(lines);
     set_active_transcript_scroll_from_bottom(app, scroll);
 }
@@ -7139,7 +7139,11 @@ fn render_inline(
         .split(area);
     let mut index = 0;
     if live_height > 0 {
-        let scroll = transcript_scroll_offset(live_lines.len(), live_height, 0);
+        let scroll = scroll::to_u16_clamped(transcript_scroll_offset(
+            live_lines.len(),
+            live_height as usize,
+            0,
+        ));
         let paragraph = Paragraph::new(live_lines)
             .scroll((scroll, 0))
             .wrap(Wrap { trim: false });
@@ -7741,11 +7745,11 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_startup_card: bool) {
     let lines = transcript_lines_for_render(app, Some(area.width), include_startup_card);
-    let scroll = transcript_scroll_offset(
+    let scroll = scroll::to_u16_clamped(transcript_scroll_offset(
         lines.len(),
-        area.height,
+        area.height as usize,
         active_transcript_scroll_from_bottom(app),
-    );
+    ));
     let paragraph = Paragraph::new(lines)
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
@@ -8458,6 +8462,258 @@ fn transcript_lines_for_overlay(
     }
 }
 
+/// One wrapped visual row plus the transcript-entry id it was produced from.
+///
+/// `entry_id == None` marks chrome rows owned by no single entry: the title
+/// banner and the blank spacer beneath it, the inter-node rail `connector_line`
+/// rows that [`push_rail_work_block`] injects between consecutive work blocks,
+/// turn dividers, and the live pending-assistant tail. Continuation rows
+/// produced by wrapping inherit the `entry_id` of the logical line they came
+/// from, so a single long answer line and all its wrapped tails share one id.
+#[derive(Debug, Clone)]
+pub(crate) struct AttributedRow {
+    pub(crate) line: Line<'static>,
+    pub(crate) entry_id: Option<u64>,
+}
+
+/// Width-wrapped transcript rows, each tagged with its owning
+/// [`TranscriptEntry::id`].
+///
+/// This is [`transcript_lines_for_overlay`] instrumented to record provenance:
+/// it runs the SAME per-entry formatting / coalescing / rail / divider loop,
+/// remembering which `entry.id` produced each *logical* line, then wraps with
+/// the SAME [`wrap_transcript_overlay_line`] and carries the tag onto every
+/// wrapped continuation row. No wrap or format logic is duplicated — the
+/// emitted `line`s are byte-identical to
+/// `transcript_lines_for_overlay(app, Some(width), expand_all)`; only the
+/// parallel `entry_id` tag is new.
+///
+/// Per-entry formatting goes through [`cached_transcript_entry_lines`], so this
+/// shares the per-entry render LRU with the real overlay/inline draws and only
+/// the cheap cross-entry assembly (coalescing, rail, wrap) re-runs.
+pub(crate) fn wrap_entries(app: &TuiApp, width: u16, expand_all: bool) -> Vec<AttributedRow> {
+    let width = width.max(1);
+
+    // --- Phase 1: build the logical line list + a parallel provenance vector,
+    // running the IDENTICAL loop as `transcript_lines_for_overlay` (width-less,
+    // so wrapping happens once in phase 2). `provenance[i]` is the owner of
+    // `lines[i]`: `Some(entry.id)` for entry-owned rows, `None` for chrome.
+    let overlay_detail = if expand_all {
+        ToolDetailMode::Full
+    } else {
+        ToolDetailMode::Preview(app.tool_output_verbosity)
+    };
+    let shortcut = key_hint(app, keymap::Action::ToggleTranscriptOverlay);
+    let shortcut = shortcut.as_str();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut provenance: Vec<Option<u64>> = Vec::new();
+
+    // Tag every line appended since the last tag with `who`, computing the count
+    // from the actual `lines.len()` delta so connector injection and trailing
+    // blank-strip accounting are automatic. The leading rail `connector_line`
+    // that `push_rail_work_block` may prepend is chrome owned by no entry, so it
+    // is handled by `tag_work_block` (see the work-block sites below).
+    macro_rules! tag_rest {
+        ($who:expr) => {{
+            while provenance.len() < lines.len() {
+                provenance.push($who);
+            }
+            debug_assert_eq!(provenance.len(), lines.len());
+        }};
+    }
+
+    if let Some(title) = active_conversation_title(app) {
+        lines.push(title);
+        lines.push(Line::from(""));
+        tag_rest!(None);
+    }
+    let entries = active_transcript_entries(app);
+    let selected_entry = active_selected_entry(app);
+    let mut prev_work = false;
+    let subagent_view = active_subagent_record(app).is_some();
+    let turn_divider = overlay_turn_divider_snapshot(app);
+    let turn_divider_width = width;
+    let mut turn_divider_pushed = false;
+    for (index, entry) in entries.iter().enumerate() {
+        match reasoning_run_info(entries, index) {
+            Some(ReasoningRun::Suppressed) => continue,
+            Some(ReasoningRun::Lead { extras }) => {
+                if app.show_reasoning_usage
+                    && let TranscriptEntryKind::Reasoning(snapshot) = &entry.kind
+                {
+                    let mut block = reasoning_block_lines_with_extras(
+                        &snapshot.display_text,
+                        false,
+                        selected_entry == Some(index),
+                        extras,
+                        shortcut,
+                    );
+                    let base = lines.len();
+                    push_rail_work_block(
+                        &mut lines,
+                        &mut block,
+                        &mut prev_work,
+                        rail_chrome(&entry.kind, subagent_view),
+                    );
+                    tag_work_block(&mut provenance, &lines, base, entry.id);
+                }
+                maybe_push_overlay_turn_divider(
+                    &mut lines,
+                    turn_divider,
+                    &mut turn_divider_pushed,
+                    index + 1 + extras,
+                    turn_divider_width,
+                );
+                tag_rest!(None);
+                continue;
+            }
+            None => {}
+        }
+        match tool_run_info(entries, index, app.coalesce_tool_runs) {
+            Some(ToolRun::Suppressed) => continue,
+            Some(ToolRun::Lead { extras }) => {
+                let members = collect_tool_run_members(entries, index, extras);
+                let mut block = format_grouped_tool_result_entry(
+                    &members,
+                    !expand_all && entry.collapsed,
+                    selected_entry == Some(index),
+                    overlay_detail,
+                    Some(width),
+                    ToolCardSurface::Plain,
+                    shortcut,
+                );
+                let base = lines.len();
+                push_rail_work_block(
+                    &mut lines,
+                    &mut block,
+                    &mut prev_work,
+                    rail_chrome(&entry.kind, subagent_view),
+                );
+                tag_work_block(&mut provenance, &lines, base, entry.id);
+                maybe_push_overlay_turn_divider(
+                    &mut lines,
+                    turn_divider,
+                    &mut turn_divider_pushed,
+                    index + 1 + extras,
+                    turn_divider_width,
+                );
+                tag_rest!(None);
+                continue;
+            }
+            None => {}
+        }
+        let mut block = cached_transcript_entry_lines(
+            app.render_cache_session,
+            entry,
+            selected_entry == Some(index),
+            overlay_detail,
+            message_outcome(entries, index),
+            Some(width),
+            app.show_reasoning_usage,
+            expand_all,
+            shortcut,
+        );
+        if is_rail_work_node(&entry.kind) {
+            let base = lines.len();
+            push_rail_work_block(
+                &mut lines,
+                &mut block,
+                &mut prev_work,
+                rail_chrome(&entry.kind, subagent_view),
+            );
+            tag_work_block(&mut provenance, &lines, base, entry.id);
+        } else {
+            // Leaving the rail (the answer, a diff, …) after a work run: a `│`
+            // connector threads the gutter — chrome owned by no entry.
+            if prev_work {
+                lines.push(rail::connector_line(rail::dim()));
+                provenance.push(None);
+            }
+            lines.append(&mut block);
+            tag_rest!(Some(entry.id));
+            prev_work = false;
+        }
+        maybe_push_overlay_turn_divider(
+            &mut lines,
+            turn_divider,
+            &mut turn_divider_pushed,
+            index + 1,
+            turn_divider_width,
+        );
+        tag_rest!(None);
+    }
+    maybe_push_overlay_turn_divider(
+        &mut lines,
+        turn_divider,
+        &mut turn_divider_pushed,
+        entries.len(),
+        turn_divider_width,
+    );
+    tag_rest!(None);
+    let pending = active_pending_assistant_lines(app);
+    if !pending.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.extend(pending);
+    }
+    tag_rest!(None);
+    debug_assert_eq!(provenance.len(), lines.len());
+
+    // --- Phase 2: wrap with the SAME wrapper, carrying each logical line's tag
+    // onto every wrapped row it produces. All wrap math is reused untouched.
+    let width = usize::from(width);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut row_tags: Vec<Option<u64>> = Vec::new();
+    for (line, who) in lines.into_iter().zip(provenance) {
+        let before = rows.len();
+        wrap_transcript_overlay_line(&line, width, &mut rows);
+        for _ in before..rows.len() {
+            row_tags.push(who);
+        }
+    }
+    debug_assert_eq!(rows.len(), row_tags.len());
+    rows.into_iter()
+        .zip(row_tags)
+        .map(|(line, entry_id)| AttributedRow { line, entry_id })
+        .collect()
+}
+
+/// Tag every logical line `push_rail_work_block` appended in `lines[base..]`
+/// with `who`, except a leading `connector_line` (chrome injected before the
+/// block when it follows another rail node), which is attributed to `None`.
+/// The block-empty case appends nothing, so this tags nothing — matching the
+/// suppressed-member behaviour.
+fn tag_work_block(
+    provenance: &mut Vec<Option<u64>>,
+    lines: &[Line<'static>],
+    base: usize,
+    who: u64,
+) {
+    let mut i = base;
+    // A prepended connector is exactly one rail-gutter row at `base` produced
+    // by `rail::connector_line` (indent + `│`). Attribute it to no entry.
+    if i < lines.len() && line_is_rail_connector(&lines[i]) {
+        provenance.push(None);
+        i += 1;
+    }
+    while i < lines.len() {
+        provenance.push(Some(who));
+        i += 1;
+    }
+    debug_assert_eq!(provenance.len(), lines.len());
+}
+
+/// Whether a logical line is a standalone rail connector row (the output of
+/// [`rail::connector_line`]: the indent followed by a single `│` and nothing
+/// else). Used to attribute the connector `push_rail_work_block` prepends to no
+/// entry without re-deriving the gutter logic.
+fn line_is_rail_connector(line: &Line<'_>) -> bool {
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let trimmed = text.trim_start_matches(' ');
+    trimmed == "│"
+}
+
 fn maybe_push_overlay_turn_divider(
     lines: &mut Vec<Line<'static>>,
     snapshot: Option<TurnDividerSnapshot>,
@@ -8687,13 +8943,13 @@ fn active_transcript_entries(app: &TuiApp) -> &[TranscriptEntry] {
         .unwrap_or(app.transcript.as_slice())
 }
 
-fn active_transcript_scroll_from_bottom(app: &TuiApp) -> u16 {
+fn active_transcript_scroll_from_bottom(app: &TuiApp) -> usize {
     active_subagent_record(app)
         .map(|record| record.scroll_from_bottom)
         .unwrap_or(app.transcript_scroll_from_bottom)
 }
 
-fn set_active_transcript_scroll_from_bottom(app: &mut TuiApp, scroll: u16) {
+fn set_active_transcript_scroll_from_bottom(app: &mut TuiApp, scroll: usize) {
     if let Some(record) = active_subagent_record_mut(app) {
         record.scroll_from_bottom = scroll;
     } else {
@@ -9242,10 +9498,9 @@ fn render_plan_mode_indicator(frame: &mut Frame<'_>, area: Rect, _app: &TuiApp) 
     frame.render_widget(paragraph, area);
 }
 
-fn transcript_scroll_offset(line_count: usize, area_height: u16, from_bottom: u16) -> u16 {
-    let visible_lines = area_height as usize;
-    let max_scroll = line_count.saturating_sub(visible_lines);
-    max_scroll.saturating_sub(from_bottom as usize) as u16
+fn transcript_scroll_offset(line_count: usize, area_height: usize, from_bottom: usize) -> usize {
+    let max_scroll = line_count.saturating_sub(area_height);
+    max_scroll.saturating_sub(from_bottom)
 }
 
 fn transcript_visual_line_count(app: &TuiApp, width: u16, include_startup_card: bool) -> u16 {
@@ -15940,7 +16195,7 @@ struct SubagentRecord {
     prompt: String,
     lifecycle: SubagentLifecycle,
     latest: String,
-    scroll_from_bottom: u16,
+    scroll_from_bottom: usize,
     metrics: Option<TurnMetrics>,
     transcript: Vec<TranscriptEntry>,
 }
@@ -16082,7 +16337,7 @@ pub(crate) struct TuiApp {
     /// clobber each other's entries through the colliding `entry_id = 0`
     /// they both restart from.
     pub(crate) render_cache_session: u64,
-    pub(crate) transcript_scroll_from_bottom: u16,
+    pub(crate) transcript_scroll_from_bottom: usize,
     pub(crate) pending_assistant: streaming::StreamingController,
     /// Streaming buffer for reasoning/thinking deltas emitted during the
     /// current turn. Rendered as a grey transient block above the

@@ -19,11 +19,13 @@
 //! row counts. Conversion to `u16` (for ratatui geometry) is funneled through
 //! the single [`to_u16_clamped`] helper.
 //!
-//! TODO(parallelization-plan Phase 4 / MOVE 5): this module is compiled but not
-//! yet wired into the renderer (the `u16` scroll field is migrated in a later
-//! move). The module-level `allow(dead_code)` below keeps warning-clean builds
-//! green until a caller exists; remove it when the scroll field is widened.
-#![allow(dead_code)]
+//! Wiring status (parallelization-plan Phase 4 / MOVE 5): now that the
+//! transcript scroll field is widened to `usize`, [`to_u16_clamped`] is used in
+//! production at the ratatui boundary, so the module no longer needs a blanket
+//! `allow(dead_code)`. The logical [`ScrollState`] and [`scrollbar_geometry`]
+//! are still test-only until the renderer drives the main view through them; the
+//! few remaining not-yet-wired items carry a targeted `#[allow(dead_code)]` at
+//! their definition so everything else participates in dead-code analysis.
 
 /// Saturating conversion from `usize` to `u16`.
 ///
@@ -45,6 +47,9 @@ pub(crate) fn to_u16_clamped(value: usize) -> u16 {
 /// `follow_tail` records intent: while following, the view should stay pinned to
 /// the bottom as new content arrives (mirroring how the renderer keeps
 /// `from_bottom` at 0). Scrolling up unpins; pinning to bottom re-pins.
+///
+/// Not-yet-wired (Phase 4 integration); test-only today.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScrollState {
     /// Lines scrolled up from the tail. `0` == pinned to the last line.
@@ -63,6 +68,9 @@ impl Default for ScrollState {
     }
 }
 
+// Not-yet-wired (Phase 4 integration): the logical scroll API is test-only
+// until the renderer drives the main view through it.
+#[allow(dead_code)]
 impl ScrollState {
     /// Construct a state pinned to the bottom (following the tail).
     #[must_use]
@@ -163,6 +171,9 @@ impl ScrollState {
 /// `scroll = max_scroll - from_bottom` and the thumb travels from top (scroll 0)
 /// to bottom (scroll == max_scroll). Here `from_bottom == 0` (the tail) places
 /// the thumb at the bottom of its travel.
+///
+/// Not-yet-wired (Phase 4 integration); test-only today.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScrollbarGeometry {
     /// Offset of the thumb's top edge from the top of the track, in rows.
@@ -177,6 +188,9 @@ pub(crate) struct ScrollbarGeometry {
 /// proportional `track * track / content`, clamped to `[1, track]`, and the
 /// thumb top is `scroll * travel / max_scroll` where `scroll` is the resolved
 /// top-line offset (`max_scroll - from_bottom`).
+///
+/// Not-yet-wired (Phase 4 integration); test-only today.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn scrollbar_geometry(
     total_rows: usize,

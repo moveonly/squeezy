@@ -7750,7 +7750,7 @@ fn startup_card_scrolls_with_transcript_history() {
     let at_bottom = render_to_string(&app, 120, 20);
     assert!(!at_bottom.contains("Squeezy v"), "{at_bottom}");
 
-    app.transcript_scroll_from_bottom = u16::MAX;
+    app.transcript_scroll_from_bottom = usize::MAX;
     let at_top = render_to_string(&app, 120, 20);
     assert!(at_top.contains("Squeezy v"), "{at_top}");
 }
@@ -10052,14 +10052,14 @@ async fn transcript_navigation_keys_update_scroll_state() {
     )
     .await
     .expect("handle key");
-    assert_eq!(app.transcript_scroll_from_bottom, u16::MAX);
+    assert_eq!(app.transcript_scroll_from_bottom, u16::MAX as usize);
 }
 
 #[test]
 fn transcript_scroll_offset_defaults_to_bottom() {
     assert_eq!(transcript_scroll_offset(20, 10, 0), 10);
     assert_eq!(transcript_scroll_offset(20, 10, 8), 2);
-    assert_eq!(transcript_scroll_offset(20, 10, u16::MAX), 0);
+    assert_eq!(transcript_scroll_offset(20, 10, usize::MAX), 0);
 }
 
 #[test]
@@ -15982,4 +15982,453 @@ fn context_window_anchors_to_resolved_effective_window() {
         Box::new(NoopClipboard),
     );
     assert_eq!(flat_app.context_window_tokens, 109_600);
+}
+
+// --- Unified transcript row model (`wrap_entries` + `transcript_surface`) ---
+
+/// `wrap_entries` must emit lines byte-identical to the overlay draw it
+/// instruments — only the parallel `entry_id` tag is new.
+#[test]
+fn wrap_entries_lines_match_overlay_rows() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("explain the architecture"));
+    app.push_transcript_item(TranscriptItem::assistant(
+        "Here is a fairly long answer that should wrap across multiple visual \
+         rows at a narrow width so the continuation-row tagging is exercised too.",
+    ));
+    app.push_note("mcp status 0/1 ready".to_string());
+
+    for &width in &[24u16, 40, 100] {
+        let expanded = transcript_lines_for_overlay(&app, Some(width), true);
+        let attributed = wrap_entries(&app, width, true);
+        let attributed_lines: Vec<String> = attributed
+            .iter()
+            .map(|row| rendered_line_text(&row.line))
+            .collect();
+        let expected_lines: Vec<String> = expanded.iter().map(rendered_line_text).collect();
+        assert_eq!(
+            attributed_lines, expected_lines,
+            "wrap_entries must be byte-identical to the overlay rows at width {width}",
+        );
+    }
+}
+
+/// Attribution is faithful: message rows carry their entry id, continuation
+/// rows of a wrapped line inherit it, chrome rows (blank spacers, connectors,
+/// dividers) carry no id, and `visual_line_index` counts within a run.
+#[test]
+fn build_transcript_rows_attributes_each_row_to_its_entry() {
+    use crate::transcript_surface::{DetailPolicy, EntryId, build_transcript_rows};
+
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("short question"));
+    app.push_transcript_item(TranscriptItem::assistant(
+        "A deliberately long answer engineered to wrap into several rows at a \
+         narrow render width so continuation rows share their parent's entry id.",
+    ));
+    // A completed turn appends a turn-divider row — chrome owned by no entry.
+    complete_turn_for_test(&mut app, TurnVisualState::Succeeded, Duration::from_secs(3));
+
+    let entries = active_transcript_entries(&app);
+    let assistant_id = EntryId(entries.last().unwrap().id);
+
+    let rows = build_transcript_rows(&app, 28, DetailPolicy::Expanded);
+    assert!(!rows.is_empty());
+
+    // Every row's RowId is its position; chrome rows carry no entry id/kind.
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.row_id.0, i);
+        assert_eq!(row.entry_id.is_none(), row.entry_kind.is_none());
+        // text_range / style_spans agree with copy_text on offsets.
+        assert_eq!(row.text_range, 0..row.copy_text.chars().count());
+        let styled_len: usize = row.style_spans.iter().map(|(r, _)| r.len()).sum();
+        assert_eq!(styled_len, row.copy_text.chars().count());
+    }
+
+    // The wrapped assistant answer must produce at least two rows sharing the
+    // assistant entry id, with strictly increasing visual_line_index.
+    let answer_rows: Vec<&_> = rows
+        .iter()
+        .filter(|r| r.entry_id == Some(assistant_id))
+        .collect();
+    assert!(
+        answer_rows.len() >= 2,
+        "the long answer should wrap into multiple attributed rows"
+    );
+    for (k, row) in answer_rows.iter().enumerate() {
+        assert_eq!(
+            row.visual_line_index, k,
+            "visual_line_index must count consecutive rows within the entry"
+        );
+    }
+
+    // At least one chrome row (the blank spacer between user and answer) is
+    // attributed to no entry — the bug the old stub could not express.
+    assert!(
+        rows.iter().any(|r| r.entry_id.is_none()),
+        "chrome rows must be attributed to no entry"
+    );
+}
+
+/// The row cache returns results identical to an uncached build, and the public
+/// entry point is stable across repeated calls (cache hit path).
+#[test]
+fn build_transcript_rows_cache_matches_uncached_and_is_stable() {
+    use crate::transcript_surface::{DetailPolicy, build_transcript_rows};
+
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("question"));
+    app.push_transcript_item(TranscriptItem::assistant("an answer that wraps a bit here"));
+
+    let first = build_transcript_rows(&app, 32, DetailPolicy::Expanded);
+    let second = build_transcript_rows(&app, 32, DetailPolicy::Expanded);
+    let first_text: Vec<&str> = first.iter().map(|r| r.copy_text.as_str()).collect();
+    let second_text: Vec<&str> = second.iter().map(|r| r.copy_text.as_str()).collect();
+    assert_eq!(
+        first_text, second_text,
+        "cache hit must match the first build"
+    );
+
+    // A new entry (revision/structure change) flips the key and rebuilds.
+    app.push_transcript_item(TranscriptItem::assistant("a second answer appears"));
+    let third = build_transcript_rows(&app, 32, DetailPolicy::Expanded);
+    assert!(
+        third.len() > first.len(),
+        "adding an entry must produce more rows, not a stale cache hit"
+    );
+}
+
+/// `visible_transcript_rows` slices the viewport from the requested anchor.
+#[test]
+fn visible_transcript_rows_slices_from_anchor() {
+    use crate::transcript_surface::{DetailPolicy, build_transcript_rows, visible_transcript_rows};
+
+    let mut app = test_app(SessionMode::Build);
+    for i in 0..6 {
+        app.push_transcript_item(TranscriptItem::user(format!("prompt {i}")));
+        app.push_transcript_item(TranscriptItem::assistant(format!("answer {i}")));
+    }
+    let rows = build_transcript_rows(&app, 100, DetailPolicy::Expanded);
+    assert!(rows.len() > 4);
+
+    // 0 height / empty viewport.
+    assert!(visible_transcript_rows(&rows, 0, true).is_empty());
+    assert!(visible_transcript_rows(&[], 5, true).is_empty());
+
+    // Taller than the list returns everything.
+    assert_eq!(
+        visible_transcript_rows(&rows, rows.len() + 10, true).len(),
+        rows.len()
+    );
+
+    // Bottom anchor returns the last `h` rows; top anchor the first `h`.
+    let bottom = visible_transcript_rows(&rows, 3, true);
+    assert_eq!(bottom.len(), 3);
+    assert_eq!(bottom[2].row_id.0, rows.len() - 1);
+    let top = visible_transcript_rows(&rows, 3, false);
+    assert_eq!(top.len(), 3);
+    assert_eq!(top[0].row_id.0, 0);
+}
+
+/// REGRESSION GUARD for the former "attribute every row to entries[0]" bug.
+///
+/// Builds the row model from a MULTI-ENTRY synthetic transcript (several user +
+/// assistant turns, each long enough to wrap into multiple visual rows) and
+/// asserts the per-entry attribution is CORRECT:
+///   * every entry-owned row carries the id of the entry it was rendered from
+///     (NOT entries[0]);
+///   * the distinct entry ids appear in transcript order;
+///   * each entry's wrapped rows form a single contiguous, in-order run with a
+///     `visual_line_index` that counts 0,1,2,… within that run;
+///   * each multi-line answer actually produced more than one row sharing its id
+///     (so the test genuinely exercises continuation-row attribution).
+#[test]
+fn build_transcript_rows_groups_multi_entry_in_order() {
+    use crate::transcript_surface::{DetailPolicy, EntryId, build_transcript_rows};
+
+    let mut app = test_app(SessionMode::Build);
+
+    // Several distinct turns. Each assistant answer is long enough to wrap into
+    // multiple visual rows at the narrow width used below, so continuation-row
+    // attribution is exercised for EVERY entry, not just the last.
+    let answers = [
+        "First answer that is intentionally long enough to wrap across several \
+         visual rows so its continuation lines must inherit this entry's id.",
+        "Second answer, also engineered to be wide enough that the wrapper splits \
+         it into multiple rows attributed to the second assistant entry alone.",
+        "Third and final answer, again padded out so the narrow render width \
+         forces it to span more than one attributed visual row.",
+    ];
+    for (i, answer) in answers.iter().enumerate() {
+        app.push_transcript_item(TranscriptItem::user(format!("question number {i}")));
+        app.push_transcript_item(TranscriptItem::assistant((*answer).to_string()));
+    }
+
+    // The set of real entry ids, in transcript order. These are the only ids any
+    // entry-owned row may carry.
+    let entries = active_transcript_entries(&app);
+    assert!(
+        entries.len() >= 6,
+        "expected at least 3 user + 3 assistant entries, got {}",
+        entries.len()
+    );
+    let entry_ids_in_order: Vec<EntryId> = entries.iter().map(|e| EntryId(e.id)).collect();
+    let first_entry_id = entry_ids_in_order[0];
+
+    let rows = build_transcript_rows(&app, 30, DetailPolicy::Expanded);
+    assert!(!rows.is_empty());
+
+    // (1) Every entry-owned row carries a REAL entry id (the old bug attributed
+    // continuation/other-entry rows to entries[0]; here we assert the full set
+    // of attributed ids matches the transcript and is NOT collapsed onto one).
+    let valid_ids: std::collections::HashSet<EntryId> =
+        entry_ids_in_order.iter().copied().collect();
+    let mut distinct_attributed: Vec<EntryId> = Vec::new();
+    for row in &rows {
+        if let Some(id) = row.entry_id {
+            assert!(
+                valid_ids.contains(&id),
+                "row {} attributed to unknown entry {:?}",
+                row.row_id.0,
+                id
+            );
+            if !distinct_attributed.contains(&id) {
+                distinct_attributed.push(id);
+            }
+        }
+    }
+
+    // If attribution were the old "everything -> entries[0]" stub, every owned
+    // row would carry `first_entry_id` and `distinct_attributed` would have a
+    // single element. Assert the opposite: multiple distinct entries are owners.
+    assert!(
+        distinct_attributed.len() >= entry_ids_in_order.len().min(4),
+        "expected several distinct entry owners, got {distinct_attributed:?}"
+    );
+    assert!(
+        distinct_attributed.iter().any(|&id| id != first_entry_id),
+        "rows must be attributed to entries beyond entries[0] (regression guard)"
+    );
+
+    // (2) The distinct owners appear in transcript order: filter the canonical
+    // order down to the ones that actually produced rows and require equality.
+    let expected_order: Vec<EntryId> = entry_ids_in_order
+        .iter()
+        .copied()
+        .filter(|id| distinct_attributed.contains(id))
+        .collect();
+    assert_eq!(
+        distinct_attributed, expected_order,
+        "attributed entry ids must appear in transcript order"
+    );
+
+    // (3) Each entry's rows form ONE contiguous run (no entry's rows are split
+    // by another entry's rows) and `visual_line_index` counts 0,1,2,… within it.
+    // Walk the rows, and every time the owner changes to an id we've seen before,
+    // that's an interleaving bug.
+    let mut seen_owners: std::collections::HashSet<EntryId> = std::collections::HashSet::new();
+    let mut prev_owner: Option<EntryId> = None;
+    let mut run_index = 0usize;
+    for row in &rows {
+        let Some(id) = row.entry_id else {
+            // Chrome row: ends the current entry run.
+            prev_owner = None;
+            continue;
+        };
+        if prev_owner == Some(id) {
+            run_index += 1;
+        } else {
+            assert!(
+                !seen_owners.contains(&id),
+                "entry {id:?} rows are not contiguous (interleaved by another entry)"
+            );
+            seen_owners.insert(id);
+            run_index = 0;
+            prev_owner = Some(id);
+        }
+        assert_eq!(
+            row.visual_line_index, run_index,
+            "visual_line_index must count within the entry's contiguous run"
+        );
+    }
+
+    // (4) Each assistant answer wrapped into >= 2 rows sharing its id, proving
+    // continuation rows really were attributed (not just the lead line).
+    let assistant_ids: Vec<EntryId> = entries
+        .iter()
+        .filter(|e| matches!(&e.kind, TranscriptEntryKind::Message(m) if m.role == Role::Assistant))
+        .map(|e| EntryId(e.id))
+        .collect();
+    assert!(!assistant_ids.is_empty(), "no assistant entries found");
+    for id in assistant_ids {
+        let count = rows.iter().filter(|r| r.entry_id == Some(id)).count();
+        assert!(
+            count >= 2,
+            "assistant entry {id:?} should wrap into >= 2 attributed rows, got {count}"
+        );
+    }
+}
+
+/// Scroll math must handle transcripts taller than the historical `u16` ceiling
+/// (65_535 rows) with no overflow and correct clamping. Exercises the
+/// `usize`-backed [`crate::scroll::ScrollState`] and `scrollbar_geometry`, which
+/// are what the widened renderer consumes.
+#[test]
+fn scroll_math_handles_more_than_65k_rows_without_overflow() {
+    use crate::scroll::{ScrollState, scrollbar_geometry, to_u16_clamped};
+
+    // Strictly greater than u16::MAX rows of content in a small viewport.
+    let line_count = 70_000usize;
+    let viewport = 40usize;
+    let max_scroll = line_count - viewport; // 69_960, well past u16::MAX.
+    assert!(max_scroll > u16::MAX as usize);
+
+    // Pinned to tail: offset is the full max_scroll, no truncation in usize.
+    let pinned = ScrollState::pinned();
+    assert_eq!(pinned.offset(line_count, viewport), max_scroll);
+    assert!(pinned.offset(line_count, viewport) > u16::MAX as usize);
+
+    // Scrolling up past u16::MAX stays exact; offset subtracts correctly.
+    let mut s = ScrollState::pinned();
+    s.scroll_by(68_000, line_count, viewport);
+    assert_eq!(s.from_bottom(), 68_000);
+    assert!(s.from_bottom() > u16::MAX as usize);
+    assert_eq!(s.offset(line_count, viewport), max_scroll - 68_000);
+
+    // Scrolling up far beyond the top clamps to max_scroll (no overflow), and the
+    // offset clamps to 0 (the very top).
+    let mut top = ScrollState::pinned();
+    top.scroll_by(isize::MAX, line_count, viewport);
+    assert_eq!(top.from_bottom(), max_scroll);
+    assert_eq!(top.offset(line_count, viewport), 0);
+
+    // clamp() after a shrink caps from_bottom to the new max_scroll.
+    let mut unpinned = ScrollState::pinned();
+    unpinned.scroll_by(60_000, line_count, viewport);
+    let smaller_count = 50_000usize; // new max_scroll = 49_960.
+    let changed = unpinned.clamp(smaller_count, viewport);
+    assert!(changed);
+    assert_eq!(unpinned.from_bottom(), smaller_count - viewport);
+
+    // Scrollbar geometry over >65k rows: no overflow, thumb is valid and clamps.
+    let geo = scrollbar_geometry(line_count, viewport, 0).expect("scrollbar present");
+    assert!(geo.thumb_len >= 1 && geo.thumb_len <= viewport);
+    assert!(geo.thumb_offset <= viewport);
+    // Tail places the thumb at the bottom of its travel.
+    assert_eq!(geo.thumb_offset, viewport - geo.thumb_len);
+    // A from_bottom far beyond max_scroll produces the same geometry as the top.
+    let beyond = scrollbar_geometry(line_count, viewport, usize::MAX).unwrap();
+    let at_top = scrollbar_geometry(line_count, viewport, max_scroll).unwrap();
+    assert_eq!(beyond, at_top);
+
+    // Narrowing the offset to u16 for ratatui saturates rather than wrapping.
+    assert_eq!(
+        to_u16_clamped(pinned.offset(line_count, viewport)),
+        u16::MAX
+    );
+}
+
+/// Property test (deterministic, no RNG / clock): under many (width, height)
+/// resizes the scroll state stays VALID and clamps correctly. For every size
+/// derived from loop indices we assert the core invariants the renderer relies
+/// on:
+///   * `offset` is always in `[0, max_scroll]`;
+///   * the visible window `[offset, offset + viewport)` never runs past the
+///     content length;
+///   * `clamp` leaves `from_bottom` within `[0, max_scroll]` and is idempotent;
+///   * a following state stays pinned (offset == max_scroll) across resizes.
+#[test]
+fn scroll_state_stays_valid_across_deterministic_resizes() {
+    use crate::scroll::ScrollState;
+
+    // Deterministic size generator from a loop index: no RNG, no clock. Spreads
+    // widths/heights/content across small, mid, and >65k ranges, and includes
+    // degenerate 0 / 1 sizes.
+    fn dims_for(i: usize) -> (usize, usize, usize) {
+        // Heights cycle through 0,1, small, and large viewports.
+        let heights = [0usize, 1, 5, 24, 80, 1000];
+        let height = heights[i % heights.len()];
+        // Content lengths span empty -> well past u16::MAX, derived from i.
+        let content_choices = [
+            0usize,
+            1,
+            (i * 7) % 200,
+            5_000 + i * 13,
+            65_000 + i * 101,
+            120_000 + i * 9_973,
+        ];
+        let content = content_choices[(i / heights.len()) % content_choices.len()];
+        // Width is unused by the pure scroll model but the resize loop varies it
+        // to mirror real (width, height) resizes; fold it into the initial
+        // scroll target so different widths drive different starting positions.
+        let width = 1 + (i % 200);
+        (width, height, content)
+    }
+
+    // Carry one state across all resizes (the real app keeps scroll across
+    // resizes), plus a second state that always follows the tail.
+    let mut roaming = ScrollState::pinned();
+    // Unpin it so it doesn't trivially stay at 0.
+    roaming.scroll_by(37, 1_000, 24);
+    let mut following = ScrollState::pinned();
+
+    for i in 0..2_000usize {
+        let (width, height, content) = dims_for(i);
+
+        // Drive an arbitrary-but-deterministic scroll before clamping, mixing in
+        // the width so the starting position varies per resize.
+        let delta = ((i as isize * 31 + width as isize) % 4_000) - 2_000;
+        roaming.scroll_by(delta, content, height);
+
+        // Re-clamp for the new size, exactly as a resize handler would.
+        roaming.clamp(content, height);
+        following.clamp(content, height);
+
+        let max_scroll = content.saturating_sub(height);
+
+        // (a) from_bottom never exceeds max_scroll after clamp.
+        assert!(
+            roaming.from_bottom() <= max_scroll,
+            "i={i}: from_bottom {} > max_scroll {max_scroll} (w={width},h={height},c={content})",
+            roaming.from_bottom()
+        );
+
+        // (b) offset stays within [0, max_scroll], and the visible window never
+        // runs past the content.
+        let offset = roaming.offset(content, height);
+        assert!(
+            offset <= max_scroll,
+            "i={i}: offset {offset} > max_scroll {max_scroll}"
+        );
+        assert!(
+            offset + height <= content || height >= content,
+            "i={i}: visible window [{offset}, {}) overruns content {content}",
+            offset + height
+        );
+
+        // (c) clamp is idempotent: a second clamp at the same size is a no-op.
+        let before = roaming.from_bottom();
+        let changed_again = roaming.clamp(content, height);
+        assert!(
+            !changed_again && roaming.from_bottom() == before,
+            "i={i}: clamp not idempotent at (h={height},c={content})"
+        );
+
+        // (d) the following state remains pinned: it tracks the tail, so its
+        // offset is always the full max_scroll for the current size.
+        assert_eq!(
+            following.from_bottom(),
+            0,
+            "i={i}: follower drifted off tail"
+        );
+        assert!(
+            following.is_following(),
+            "i={i}: follower stopped following"
+        );
+        assert_eq!(
+            following.offset(content, height),
+            max_scroll,
+            "i={i}: follower offset must equal max_scroll"
+        );
+    }
 }
