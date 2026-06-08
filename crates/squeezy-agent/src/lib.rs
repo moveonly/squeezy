@@ -12848,42 +12848,38 @@ async fn execute_tool_calls(
             );
         }
         if call.name == TASK_STATE_TOOL_NAME {
-            let result = handle_task_state_call(&context, call).await;
-            // Emit a compact trace event so debuggers and eval replay can
-            // observe task-state mutations without a full tool card.
-            // Use try_send to avoid adding a suspend point to this large
-            // async function's state machine; trace events may be silently
-            // dropped if the channel is full (acceptable for debug signals).
-            let _ = context.tx.try_send(AgentEvent::ControlToolTrace {
-                turn_id: context.turn_id,
-                tool_name: TASK_STATE_TOOL_NAME.to_string(),
-                label: "task state updated".to_string(),
-            });
-            results[index] = Some(result);
+            // Emit the trace event in a scoped block before the await so that
+            // no intermediate String or ToolResult spans the suspend point —
+            // keeping the async state machine footprint of execute_tool_calls
+            // at its original size.
+            {
+                let _ = context.tx.try_send(AgentEvent::ControlToolTrace {
+                    turn_id: context.turn_id,
+                    tool_name: TASK_STATE_TOOL_NAME.to_string(),
+                    label: "task state updated".to_string(),
+                });
+            }
+            results[index] = Some(handle_task_state_call(&context, call).await);
             recorded[index] = true;
             continue;
         }
         if call.name == LOAD_TOOL_SCHEMA_TOOL_NAME {
-            let result = handle_load_tool_schema_call(&context, call).await;
-            // Build a compact label showing which tool schema was loaded (or
-            // why it was refused), so debugging lazy-schema turns is easier.
-            // Use try_send for the same state-machine-size reason as above.
-            let schema_name = call
-                .arguments
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("?");
-            let label = if result.status == ToolStatus::Success {
-                format!("schema attached: {schema_name}")
-            } else {
-                format!("schema load failed: {schema_name}")
-            };
-            let _ = context.tx.try_send(AgentEvent::ControlToolTrace {
-                turn_id: context.turn_id,
-                tool_name: LOAD_TOOL_SCHEMA_TOOL_NAME.to_string(),
-                label,
-            });
-            results[index] = Some(result);
+            // Same: emit trace in a scoped block before the await.
+            {
+                let label = format!(
+                    "load_tool_schema: {}",
+                    call.arguments
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                );
+                let _ = context.tx.try_send(AgentEvent::ControlToolTrace {
+                    turn_id: context.turn_id,
+                    tool_name: LOAD_TOOL_SCHEMA_TOOL_NAME.to_string(),
+                    label,
+                });
+            }
+            results[index] = Some(handle_load_tool_schema_call(&context, call).await);
             recorded[index] = true;
             continue;
         }
@@ -13465,71 +13461,6 @@ async fn apply_delegate_completions(
     }
 }
 
-/// Partition a parallel-safe batch into calls to dispatch and calls that are
-/// exact duplicates of an earlier call in the same batch. Extracted as a
-/// synchronous helper so the large local state (BTreeMap, Vec, HashMap) does
-/// not inflate the async state machine of [`flush_parallel_batch`].
-///
-/// Returns `(dispatch_calls, duplicates)` where:
-/// - `dispatch_calls` is the deduplicated list to hand off to the provider.
-/// - `duplicates` is `Vec<(results_index, canonical_results_index, call,
-///   tool_sequence)>` — calls whose result can be synthesised from the
-///   canonical call after dispatch, without re-running I/O.
-fn partition_parallel_batch(
-    calls: &[(usize, ToolCall, u64)],
-) -> (
-    Vec<(usize, ToolCall, u64)>,
-    Vec<(usize, usize, ToolCall, u64)>,
-) {
-    let mut canonical_key_to_results_index: BTreeMap<(String, String), usize> = BTreeMap::new();
-    let mut dispatch: Vec<(usize, ToolCall, u64)> = Vec::with_capacity(calls.len());
-    let mut duplicates: Vec<(usize, usize, ToolCall, u64)> = Vec::new();
-    for (index, call, tool_sequence) in calls {
-        if let Some(args_sha) = tool_call_args_sha256(call) {
-            let key = (call.name.clone(), args_sha);
-            match canonical_key_to_results_index.entry(key) {
-                std::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(*index);
-                    dispatch.push((*index, call.clone(), *tool_sequence));
-                }
-                std::collections::btree_map::Entry::Occupied(slot) => {
-                    duplicates.push((*index, *slot.get(), call.clone(), *tool_sequence));
-                }
-            }
-        } else {
-            dispatch.push((*index, call.clone(), *tool_sequence));
-        }
-    }
-    (dispatch, duplicates)
-}
-
-/// Build a synthetic result for a duplicate parallel-safe call by cloning the
-/// canonical result and stamping the `duplicate_of` marker. Extracted as a
-/// synchronous helper to keep `flush_parallel_batch`'s async state machine
-/// small.
-fn make_duplicate_result(canonical: Option<&ToolResult>, duplicate_call: &ToolCall) -> ToolResult {
-    if let Some(r) = canonical {
-        let mut r = r.clone();
-        let canonical_call_id = r.call_id.clone();
-        r.call_id = duplicate_call.call_id.clone();
-        if let Some(obj) = r.content.as_object_mut() {
-            obj.insert("duplicate_of".to_string(), json!(canonical_call_id));
-            obj.entry("hint").or_insert_with(|| {
-                json!(
-                    "This call is identical to an earlier call in the same response. \
-                     Do not issue duplicate tool calls; reuse the earlier output."
-                )
-            });
-        }
-        r
-    } else {
-        budget_denied_result(
-            duplicate_call,
-            "duplicate of budget-denied read".to_string(),
-        )
-    }
-}
-
 async fn flush_parallel_batch(
     context: &ToolExecutionContext<'_>,
     broker: &mut CostBroker,
@@ -13590,46 +13521,13 @@ async fn flush_parallel_batch(
         return;
     }
 
-    // Deduplicate exact parallel-safe calls before dispatch so identical
-    // grep / read_file / graph calls within the same assistant response do
-    // not pay twice for the same I/O. The synchronous partition step is
-    // factored out to keep this async function's state machine compact.
-    let (dispatch_calls, duplicates) = partition_parallel_batch(&calls);
-    let order: Vec<(usize, ToolCall, u64)> = dispatch_calls.clone();
-    let completions = dispatch_parallel_reads(context, dispatch_calls).await;
-
-    // Snapshot canonical results keyed by their results-slice index so
-    // duplicates can clone the output without re-running I/O.
-    let canonical_snap: std::collections::HashMap<usize, ToolResult> = completions
-        .iter()
-        .map(|(idx, r)| (*idx, r.clone()))
-        .collect();
-
-    // Fold canonical completions through the incremental budget enforcement.
+    // Run the reads *concurrently* (independent reads must not serialize
+    // behind one another — that one-at-a-time `.await` per read dominated
+    // turn latency), then fold them back with incremental per-turn budget
+    // enforcement. See [`fold_parallel_read_completions`].
+    let order: Vec<(usize, ToolCall, u64)> = calls.clone();
+    let completions = dispatch_parallel_reads(context, calls).await;
     fold_parallel_read_completions(context, broker, results, order, completions).await;
-
-    // Synthesise and record results for duplicate calls.
-    for (index, canonical_idx, call, tool_sequence) in duplicates {
-        let result = make_duplicate_result(canonical_snap.get(&canonical_idx), &call);
-        emit_tool_telemetry(
-            context.config,
-            &context.telemetry,
-            context.turn_id,
-            tool_sequence,
-            &call,
-            &result,
-            Duration::ZERO,
-        );
-        record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
-        let _ = context
-            .tx
-            .send(AgentEvent::ToolCallCompleted {
-                turn_id: context.turn_id,
-                result: result.clone(),
-            })
-            .await;
-        results[index] = Some(result);
-    }
 }
 
 /// Fold concurrently dispatched parallel-read completions back into the
