@@ -14720,13 +14720,12 @@ async fn permission_decision_for_request(
     // mode policy before the user is asked. A non-zero exit from a
     // skill hook returns `allow=false` which is now enforced here,
     // consistent with PreToolUse denial semantics.
-    if let Some(registry) = context.hooks.as_ref() {
-        if let Some(deny_reason) =
+    if let Some(registry) = context.hooks.as_ref()
+        && let Some(deny_reason) =
             dispatch_permission_request(registry, context.turn_id, call, &request)
-        {
-            dispatch_permission_denied(registry, context.turn_id, call, &request, &deny_reason);
-            return ApprovalDecision::Denied(deny_reason);
-        }
+    {
+        dispatch_permission_denied(registry, context.turn_id, call, &request, &deny_reason);
+        return ApprovalDecision::Denied(deny_reason);
     }
     let active_mode = load_session_mode(&context.session_mode);
     let session_id_for_plan_mode = context.session_id_for_plan_mode();
