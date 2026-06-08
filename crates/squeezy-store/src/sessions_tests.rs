@@ -1152,6 +1152,66 @@ fn token_calibration_round_trips_through_metadata_and_global_file() {
 }
 
 #[test]
+fn load_global_calibration_with_source_hint_absent_file_returns_none_hint() {
+    let root = temp_root("calibration-source-absent");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let (cal, hint) = store.load_global_calibration_with_source_hint();
+    assert!(
+        cal.providers.is_empty(),
+        "absent file must return default calibration"
+    );
+    assert_eq!(hint, None, "absent file must return hint=None");
+}
+
+#[test]
+fn load_global_calibration_with_source_hint_valid_file_returns_some_true() {
+    let root = temp_root("calibration-source-valid");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let mut calibration = squeezy_llm::TokenCalibration::default();
+    calibration.record_sample("openai", 4500, 1000);
+    store
+        .save_global_calibration(&calibration)
+        .expect("save calibration");
+    let (cal, hint) = store.load_global_calibration_with_source_hint();
+    assert_eq!(
+        cal, calibration,
+        "valid file must return the saved calibration"
+    );
+    assert_eq!(hint, Some(true), "valid file must return hint=Some(true)");
+}
+
+#[test]
+fn load_global_calibration_with_source_hint_corrupt_file_returns_some_false() {
+    let root = temp_root("calibration-source-corrupt");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    // Write invalid JSON to the calibration path.
+    let cal_path = root.join("calibration.json");
+    fs::write(&cal_path, b"not valid json {{{").expect("write corrupt calibration");
+    let (cal, hint) = store.load_global_calibration_with_source_hint();
+    assert!(
+        cal.providers.is_empty(),
+        "corrupt file must fall back to default calibration"
+    );
+    assert_eq!(
+        hint,
+        Some(false),
+        "corrupt file must return hint=Some(false)"
+    );
+}
+
+#[test]
 fn session_metadata_v0_file_reads_as_v1() {
     // Pre-versioning `metadata.json` files are missing the
     // `schema_version` field. The reader migration framework must treat
@@ -3777,8 +3837,15 @@ fn rewrite_global_index_uses_pid_temp_name_not_fixed_suffix() {
             SessionStore::append_global_index_entry(&entry);
         }
         // Call list_global_index which triggers rewrite_global_index.
-        let _ = SessionStore::list_global_index();
-        // The fixed-suffix temp file must NOT exist after a successful
+        let entries = SessionStore::list_global_index();
+        // Positive assertion: compaction must have deduped the 10 000 identical
+        // appends down to 1 entry, confirming rewrite_global_index actually ran.
+        assert_eq!(
+            entries.len(),
+            1,
+            "compaction must deduplicate 10_000 appends of the same session to 1 entry"
+        );
+        // Negative assertion: the fixed-suffix temp file must NOT exist after
         // compaction — if it does, the old broken code path is still in use.
         assert!(
             !forbidden_tmp.exists(),

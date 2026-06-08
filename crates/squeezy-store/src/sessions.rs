@@ -132,15 +132,19 @@ impl SessionStore {
 
     fn load_global_calibration_inner(&self) -> (squeezy_llm::TokenCalibration, Option<bool>) {
         let path = self.calibration_path();
-        if !path.exists() {
-            return (squeezy_llm::TokenCalibration::default(), None);
-        }
-        match read_json(&path) {
+        // Read directly without a separate `exists()` check to avoid TOCTOU: on
+        // NFS / shared homes the file can be deleted between the two syscalls.
+        // Pattern-match on the error kind so "not found" is silent but other
+        // failures (permission denied, I/O error, parse error) emit a diagnostic.
+        match read_json::<squeezy_llm::TokenCalibration>(&path) {
             Ok(calibration) => (calibration, Some(true)),
-            Err(_) => {
+            Err(SqueezyError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                (squeezy_llm::TokenCalibration::default(), None)
+            }
+            Err(e) => {
                 eprintln!(
-                    "squeezy: warning: {:?} is malformed; falling back to default token calibration",
-                    path
+                    "squeezy: warning: {:?}: {}; falling back to default token calibration",
+                    path, e
                 );
                 (squeezy_llm::TokenCalibration::default(), Some(false))
             }

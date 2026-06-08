@@ -461,6 +461,11 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     if let Some(session_cost) = session_cost {
                         app.cost = session_cost;
                     }
+                    // A non-zero micro_usd means the active model has known pricing;
+                    // clear the persistent unpriced-cap marker.
+                    if micro_usd > 0 {
+                        app.cap_unenforceable = false;
+                    }
                 }
                 AgentEvent::ToolProgress {
                     tool_name,
@@ -555,10 +560,10 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // than a System transcript item, which rendered the off-rail
                     // `• Noted ↪ routed …` line that severed the gutter.
                     app.push_note(format!("routed `{from}` → `{to}` ({reason})"));
-                    // A model switch may land us on a model with known pricing;
-                    // clear the unpriced-cap flag so it doesn't persist
-                    // stale after the route.
-                    app.cap_unenforceable = false;
+                    // Do not clear cap_unenforceable here: the new model may also
+                    // be unpriced, and the broker's latch won't re-fire within this
+                    // same turn. The flag is cleared only when we observe an actual
+                    // priced round (CostUpdate with micro_usd > 0).
                 }
             }
         }

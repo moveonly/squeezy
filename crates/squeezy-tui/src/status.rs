@@ -615,7 +615,7 @@ pub(crate) fn format_cost_segment(
         _ => format!("cost {}", format_cost(cost)),
     };
     if cap_unenforceable {
-        out.push_str(" ⚠unpriced");
+        out.push_str(" ⚠ unpriced");
     }
     out
 }
