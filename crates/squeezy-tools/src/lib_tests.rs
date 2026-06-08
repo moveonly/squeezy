@@ -299,6 +299,8 @@ fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     assert_eq!(destructive.target, "rm:*");
     assert_eq!(destructive.metadata["cwd"], ".");
     assert_eq!(destructive.metadata["destructive"], "true");
+    assert_eq!(destructive.metadata["sandbox_backend"], "none");
+    assert_eq!(destructive.metadata["sandbox_filesystem"], "not_enforced");
 
     let compiler = registry.permission_request(&ToolCall {
         call_id: "test".to_string(),
@@ -319,6 +321,40 @@ fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     assert_eq!(refresh.capability, PermissionCapability::Compiler);
     assert_eq!(refresh.target, "cargo facts+check:*");
     assert_eq!(refresh.metadata["diagnostics"], "true");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg(windows)]
+fn shell_permission_metadata_matches_windows_disabled_sandbox_level() {
+    let root = temp_workspace("permission_windows_disabled_sandbox");
+    let registry = registry_with_runtime_config(
+        &root,
+        ToolRuntimeConfig {
+            shell_sandbox: squeezy_core::ShellSandboxConfig {
+                mode: squeezy_core::ShellSandboxMode::BestEffort,
+                windows_sandbox_level: squeezy_core::WindowsSandboxLevel::Disabled,
+                ..squeezy_core::ShellSandboxConfig::default()
+            },
+            ..ToolRuntimeConfig::default()
+        },
+    );
+
+    let request = registry.permission_request(&ToolCall {
+        call_id: "echo".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "echo hi",
+            "description": "smoke"
+        }),
+    });
+
+    assert_eq!(request.metadata["sandbox_backend"], "windows-job-object");
+    assert_eq!(
+        request.metadata["sandbox_filesystem"],
+        "best_effort_unavailable"
+    );
 
     let _ = fs::remove_dir_all(root);
 }

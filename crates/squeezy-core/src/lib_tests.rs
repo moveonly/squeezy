@@ -6014,3 +6014,22 @@ fn default_sensitive_paths_include_xdg_and_cloud_creds() {
         );
     }
 }
+
+#[test]
+fn user_settings_template_lists_hardened_sensitive_path_defaults() {
+    let template = user_settings_template();
+
+    for expected in [
+        ".password-store/**",
+        ".config/sops/**",
+        ".config/1Password/**",
+        ".azure/**",
+        ".config/gcloud/**",
+        ".config/kube/**",
+    ] {
+        assert!(
+            template.contains(expected),
+            "user settings template should mention default sensitive path {expected:?}"
+        );
+    }
+}

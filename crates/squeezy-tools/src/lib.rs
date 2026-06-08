@@ -2447,8 +2447,33 @@ impl ToolRegistry {
                     }
                 };
                 #[cfg(target_os = "windows")]
-                let (sandbox_backend, sandbox_filesystem) =
-                    ("windows-restricted-token", "enforced_writes_only");
+                let (sandbox_backend, sandbox_filesystem) = {
+                    if matches!(
+                        self.shell_sandbox.mode,
+                        ShellSandboxMode::Off | ShellSandboxMode::External
+                    ) {
+                        ("none", "not_enforced")
+                    } else {
+                        match self.shell_sandbox.windows_sandbox_level {
+                            squeezy_core::WindowsSandboxLevel::Disabled => {
+                                ("windows-job-object", "best_effort_unavailable")
+                            }
+                            squeezy_core::WindowsSandboxLevel::RestrictedToken => {
+                                ("windows-restricted-token", "enforced_writes_only")
+                            }
+                            squeezy_core::WindowsSandboxLevel::Elevated
+                                if squeezy_win_sandbox::elevated_setup_is_complete(
+                                    &win_sandbox_spec::win_state_dir(),
+                                ) =>
+                            {
+                                ("windows-elevated", "enforced")
+                            }
+                            squeezy_core::WindowsSandboxLevel::Elevated => {
+                                ("windows-restricted-token", "enforced_writes_only")
+                            }
+                        }
+                    }
+                };
                 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
                 let (sandbox_backend, sandbox_filesystem) = ("none", "not_enforced");
                 metadata.insert("sandbox_backend".to_string(), sandbox_backend.to_string());
