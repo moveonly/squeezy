@@ -176,15 +176,19 @@ fn replace_file_windows(from: &Path, to: &Path) -> io::Result<()> {
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
-    // MoveFileExW does not honour the long-path registry setting; use the \\?\
-    // prefix for absolute paths so paths longer than MAX_PATH succeed.
+    // MoveFileExW does not honour the long-path registry setting.  For paths
+    // longer than MAX_PATH, use the \\?\ extended-length prefix.  That prefix
+    // requires (a) an absolute path and (b) only backslash separators — forward
+    // slashes are not accepted.  Normalise any forward slashes before prefixing.
     fn wide(path: &Path) -> Vec<u16> {
-        let extended: OsString =
-            if path.is_absolute() && !path.as_os_str().to_string_lossy().starts_with(r"\\") {
-                OsString::from(format!(r"\\?\{}", path.display()))
-            } else {
-                path.as_os_str().to_owned()
-            };
+        let as_str = path.as_os_str().to_string_lossy();
+        // Normalise forward slashes → backslashes required by \\?\ paths.
+        let normalised = as_str.replace('/', "\\");
+        let extended: OsString = if path.is_absolute() && !normalised.starts_with(r"\\") {
+            OsString::from(format!(r"\\?\{normalised}"))
+        } else {
+            OsString::from(normalised.as_ref())
+        };
         extended.encode_wide().chain(iter::once(0)).collect()
     }
 
