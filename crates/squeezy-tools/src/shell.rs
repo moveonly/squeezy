@@ -589,7 +589,7 @@ impl ToolRegistry {
             &args,
             &workdir,
             &analysis,
-            sandbox_metadata,
+            sandbox_metadata.clone(),
             timeout_ms,
             output_cap,
             if timed_out {

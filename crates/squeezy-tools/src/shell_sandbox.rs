@@ -210,6 +210,7 @@ impl ShellSandboxPlan {
                 backend,
                 fallback_count: record.fallback_count,
                 first_in_session: record.first_in_session,
+                fallback_reason: fallback_reason.clone(),
             }),
         }
     }
@@ -244,12 +245,12 @@ impl ShellSandboxPlan {
             "write_roots": path_list_json(&self.configured_write_roots),
             "fallback_reason": self.fallback_reason,
         });
-        if let Some(record) = self.best_effort_fallback
+        if let Some(record) = &self.best_effort_fallback
             && let Some(object) = payload.as_object_mut()
         {
             object.insert(
                 "best_effort_fallback".to_string(),
-                best_effort_fallback_json(record),
+                best_effort_fallback_json(record.clone()),
             );
         }
         payload
