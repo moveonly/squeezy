@@ -2195,7 +2195,12 @@ impl HookHandler for SkillHookHandler {
             }
         };
 
+        // Capture PID before moving child into the wait thread. Only used on
+        // Unix to send SIGKILL to the process group on timeout; on other
+        // platforms the variable is elided entirely to avoid a dead-code warning.
+        #[cfg(unix)]
         let child_pid = child.id();
+
         let timeout =
             Duration::from_secs(self.spec.timeout_secs.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS));
         let (tx, rx) = mpsc::channel();
