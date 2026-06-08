@@ -4865,9 +4865,11 @@ fn handle_help_command(app: &mut TuiApp, agent: &mut Agent, rest: &str) {
         format!("/help {}", rest.trim())
     };
     // Attempt to answer locally from the bundled skills knowledge base before
-    // sending the turn to the model. This avoids a network round-trip for the
-    // large majority of help requests.
-    let help = SqueezyHelp::new("");
+    // sending the turn to the model. Pass the redacted config inspect so the
+    // local answer can include relevant config sections, matching the quality
+    // of the agent-level `resolve_help_turn` path.
+    let config_inspect = agent.config_snapshot().inspect_redacted();
+    let help = SqueezyHelp::new(config_inspect);
     if let Some(answer) = help.answer_for_input(&prompt) {
         if answer.status == HelpStatus::Answered {
             app.push_transcript_item(TranscriptItem::system(answer.render_markdown()));

@@ -182,8 +182,9 @@ fn checkpoint_commands_show_when_checkpointing_is_enabled() {
 fn capability_badges_match_capability_as_str() {
     let cmd = find_command("/diff");
     assert_eq!(cmd.capability_badges(), vec!["git", "read"]);
+    // `/help` is local-first: no network badge.
     let cmd = find_command("/help");
-    assert_eq!(cmd.capability_badges(), vec!["net"]);
+    assert_eq!(cmd.capability_badges(), Vec::<&str>::new());
     let cmd = find_command("/undo");
     assert_eq!(cmd.capability_badges(), vec!["edit", "destructive"]);
 }
