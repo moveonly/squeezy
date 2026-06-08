@@ -1055,11 +1055,17 @@ impl McpClientRegistry {
             resource_declarations: self.resource_declarations.clone(),
         };
         let entry = match server.transport {
-            McpTransport::Stdio => start_stdio_service(server_name, server, handler).await?,
+            McpTransport::Stdio => {
+                start_stdio_service(server_name, server, handler, self.stderr_excerpts.clone())
+                    .await?
+            }
             McpTransport::Http => start_http_service(server_name, server, handler).await?,
             McpTransport::Sse => start_sse_service(server_name, server, handler).await?,
         };
         let arc = Arc::new(entry);
+        if let Ok(mut excerpts) = self.stderr_excerpts.lock() {
+            excerpts.remove(server_name);
+        }
         let mut sessions = self.sessions.lock().await;
         sessions.insert(server_name.to_string(), arc.clone());
         Ok(arc.service.clone())
@@ -1072,13 +1078,15 @@ impl McpClientRegistry {
         };
         // Preserve the last stderr lines so they survive session teardown and
         // remain available to `stderr_tail` for diagnostics (e.g. doctor --probe).
-        if let Some(entry) = removed
-            && let Some(ring) = &entry.stderr_ring
-            && let (Ok(r), Ok(mut excerpts)) = (ring.lock(), self.stderr_excerpts.lock())
-        {
-            let lines: Vec<String> = r.iter().cloned().collect();
-            if !lines.is_empty() {
-                excerpts.insert(server_name.to_string(), lines);
+        if let Some(entry) = removed {
+            if let Some(ring) = &entry.stderr_ring {
+                preserve_stderr_excerpt(
+                    &self.stderr_excerpts,
+                    server_name,
+                    stderr_ring_snapshot(ring),
+                );
+            } else if let Ok(mut excerpts) = self.stderr_excerpts.lock() {
+                excerpts.remove(server_name);
             }
         }
         if let Ok(mut cache) = self.resource_declarations.lock() {
@@ -1961,6 +1969,7 @@ async fn start_stdio_service(
     server_name: &str,
     server: &McpServerConfig,
     handler: SqueezyMcpClientHandler,
+    stderr_excerpts: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
 ) -> McpResult<SessionEntry> {
     let command = server
         .command
@@ -1988,10 +1997,10 @@ async fn start_stdio_service(
     let stderr_ring: Arc<Mutex<std::collections::VecDeque<String>>> = Arc::new(Mutex::new(
         std::collections::VecDeque::with_capacity(STDERR_RING_CAPACITY),
     ));
-    if let Some(stderr) = stderr {
+    let stderr_reader = if let Some(stderr) = stderr {
         let server_name = server_name.to_string();
         let ring = stderr_ring.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             loop {
                 match lines.next_line().await {
@@ -2036,15 +2045,27 @@ async fn start_stdio_service(
                     }
                 }
             }
-        });
-    }
-    let service = handler
-        .serve(transport)
-        .await
-        .map_err(|err| McpError::Transport {
-            server: server_name.to_string(),
-            message: err.to_string(),
-        })?;
+        }))
+    } else {
+        None
+    };
+    let service = match handler.serve(transport).await {
+        Ok(service) => service,
+        Err(err) => {
+            if let Some(reader) = stderr_reader {
+                let _ = tokio::time::timeout(Duration::from_millis(50), reader).await;
+            }
+            preserve_stderr_excerpt(
+                &stderr_excerpts,
+                server_name,
+                stderr_ring_snapshot(&stderr_ring),
+            );
+            return Err(McpError::Transport {
+                server: server_name.to_string(),
+                message: err.to_string(),
+            });
+        }
+    };
     let server_capabilities = service.peer_info().map(|info| info.capabilities.clone());
     Ok(SessionEntry {
         service: Arc::new(service),
@@ -2052,6 +2073,26 @@ async fn start_stdio_service(
         server_capabilities,
         stderr_ring: Some(stderr_ring),
     })
+}
+
+fn stderr_ring_snapshot(ring: &Arc<Mutex<std::collections::VecDeque<String>>>) -> Vec<String> {
+    ring.lock()
+        .map(|ring| ring.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn preserve_stderr_excerpt(
+    excerpts: &Arc<Mutex<BTreeMap<String, Vec<String>>>>,
+    server_name: &str,
+    lines: Vec<String>,
+) {
+    if let Ok(mut excerpts) = excerpts.lock() {
+        if lines.is_empty() {
+            excerpts.remove(server_name);
+        } else {
+            excerpts.insert(server_name.to_string(), lines);
+        }
+    }
 }
 
 async fn start_http_service(

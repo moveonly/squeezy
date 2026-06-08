@@ -48,8 +48,69 @@ fn fixture_tool(server: &str, raw: &str) -> ExternalMcpTool {
     }
 }
 
+#[cfg(unix)]
+fn fixture_client_handler(server_name: &str) -> SqueezyMcpClientHandler {
+    SqueezyMcpClientHandler {
+        server_name: server_name.to_string(),
+        elicitation_handler: Arc::new(Mutex::new(None)),
+        elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
+        elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(256))),
+        pause_state: ElicitationPauseState::default(),
+        resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
+        resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
+    }
+}
+
 fn rmcp_tool(name: &'static str) -> RmcpTool {
     RmcpTool::new(name, format!("{name} description"), JsonObject::new())
+}
+
+#[test]
+fn preserve_stderr_excerpt_replaces_and_clears_stale_lines() {
+    let excerpts = Arc::new(Mutex::new(BTreeMap::new()));
+
+    preserve_stderr_excerpt(&excerpts, "docs", vec!["first".to_string()]);
+    assert_eq!(
+        excerpts.lock().expect("excerpt lock").get("docs").cloned(),
+        Some(vec!["first".to_string()])
+    );
+
+    preserve_stderr_excerpt(&excerpts, "docs", Vec::new());
+    assert!(
+        !excerpts.lock().expect("excerpt lock").contains_key("docs"),
+        "empty snapshots must clear stale stderr excerpts"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_stdio_start_preserves_stderr_excerpt() {
+    let mut server = fixture_server(true, Some("/bin/sh"));
+    server.args = vec![
+        "-c".to_string(),
+        "printf 'boot failure\\n' >&2; exit 1".to_string(),
+    ];
+    let excerpts = Arc::new(Mutex::new(BTreeMap::new()));
+
+    let result = start_stdio_service(
+        "docs",
+        &server,
+        fixture_client_handler("docs"),
+        excerpts.clone(),
+    )
+    .await;
+
+    assert!(matches!(result, Err(McpError::Transport { .. })));
+    let lines = excerpts
+        .lock()
+        .expect("excerpt lock")
+        .get("docs")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        lines.iter().any(|line| line.contains("boot failure")),
+        "startup stderr must survive failed handshakes: {lines:?}"
+    );
 }
 
 #[test]
