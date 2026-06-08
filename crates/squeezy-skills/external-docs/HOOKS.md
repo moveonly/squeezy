@@ -98,10 +98,11 @@ The skill frontmatter parser accepts all event keys listed in the table above
 
 ## Configuration
 
-Hooks are disabled by default. When `[skills].hooks_enabled = true` and a skill
-with `hooks:` is activated, its hook handlers are registered against the
-session's `HookRegistry`. Hook commands run through `sh -c` with the privileges
-of the Squeezy process, so only enable this for trusted skill catalogs.
+Hooks are disabled by default. When `[skills].hooks_enabled = true`, all
+non-disabled discovered skills that declare `hooks:` frontmatter have their
+handlers registered against the session's `HookRegistry` at agent startup.
+Hook commands run through `sh -c` with the privileges of the Squeezy process,
+so only enable this for trusted skill catalogs.
 
 The `[skills]` section controls skill discovery:
 

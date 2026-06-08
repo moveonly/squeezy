@@ -764,8 +764,9 @@ fn skills_check(config: &AppConfig) -> Check {
                     .hooks
                     .values()
                     .flat_map(|matchers| matchers.iter())
-                    .map(|m| m.hooks.len())
-                    .sum();
+                    .flat_map(|m| m.hooks.iter())
+                    .filter(|s| s.kind_valid)
+                    .count();
                 if count > 0 {
                     total_specs += count;
                     hook_skills.push(summary.name.clone());

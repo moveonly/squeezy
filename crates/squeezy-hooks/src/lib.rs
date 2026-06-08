@@ -279,9 +279,11 @@ impl Clone for HookContext {
 ///
 /// `allow=false` advises the caller that the in-flight action should be
 /// blocked; `mutate=Some(v)` carries a handler-proposed replacement for
-/// the payload (e.g. a transformed turn instructions block). Today the
-/// agent records these but does not yet apply mutations — that is left
-/// to a follow-up commit.
+/// the payload (e.g. a transformed turn instructions block or a rewritten
+/// user prompt). Mutations from in-process handlers registered on the
+/// typed [`AgentHookBus`] surface are applied at [`HookEvent::PreTurn`]
+/// and [`HookEvent::UserPromptSubmit`] dispatch sites. Skill hook scripts
+/// cannot return mutations because their stdout is ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookResult {
     pub allow: bool,

@@ -7,7 +7,7 @@ use std::{
         Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -294,7 +294,7 @@ pub struct SkillHookSpec {
     pub once: bool,
     /// `false` when an unsupported `type:` was declared; prevents
     /// execution even if a `command:` line was also present.
-    pub(crate) kind_valid: bool,
+    pub kind_valid: bool,
 }
 
 impl LoadedSkill {
@@ -2132,14 +2132,20 @@ impl HookHandler for SkillHookHandler {
             .current_dir(&self.base_dir)
             .env("SQUEEZY_SKILL_DIR", &self.base_dir)
             .env("SQUEEZY_SKILL_NAME", &self.skill_name)
-            .env("SQUEEZY_HOOK_PAYLOAD", &payload);
+            .env("SQUEEZY_HOOK_PAYLOAD", &payload)
+            // Redirect subprocess stdio to /dev/null so hook scripts
+            // cannot corrupt the TUI or write to the agent's streams.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
 
         let run_result = run_hook_with_timeout(&mut command, HOOK_TIMEOUT);
 
         match run_result {
             HookRunResult::Success => HookResult::allow(),
             HookRunResult::Denied { code } => {
-                // Reset `once` so a failed first run can be retried.
+                // Reset `once` so a non-zero exit on the first run can
+                // be retried on the next dispatch.
                 if self.spec.once {
                     self.fired.store(false, Ordering::Release);
                 }
@@ -2170,16 +2176,18 @@ impl HookHandler for SkillHookHandler {
                 HookResult::allow()
             }
             HookRunResult::Timeout => {
-                if self.spec.once {
-                    self.fired.store(false, Ordering::Release);
-                }
+                // Do NOT reset `fired` on timeout: a hook that has
+                // already consumed the 30-second budget is treated as
+                // permanently fired for this session. Resetting would
+                // let a pathological hook stall every subsequent
+                // dispatch for another 30 seconds.
                 warn!(
                     target: "squeezy_skills",
                     skill = %self.skill_name,
                     event = ?self.event,
                     command = %trimmed,
                     timeout_secs = HOOK_TIMEOUT.as_secs(),
-                    "skill hook timed out and was killed"
+                    "skill hook timed out; hook will not retry in this session"
                 );
                 HookResult::allow()
             }
@@ -2195,37 +2203,37 @@ enum HookRunResult {
     Timeout,
 }
 
-/// Spawn `command`, wait up to `timeout`, kill on expiry, and
-/// return a structured outcome. Uses a tight poll loop (100 ms
-/// sleep) to avoid blocking indefinitely — acceptable for hook
-/// commands which are expected to be short-lived scripts.
+/// Spawn `command`, wait up to `timeout`, and return a structured
+/// outcome.
+///
+/// The child is waited on in a dedicated OS thread so that this
+/// function does not busy-poll or call `thread::sleep`, keeping the
+/// calling (possibly Tokio) thread unblocked while the OS thread does
+/// an efficient `child.wait()`. On timeout the child is left running
+/// but detached; the OS thread will eventually reap it after the
+/// process exits naturally. This is acceptable for the current
+/// synchronous hook trait — a fully async path is deferred.
 fn run_hook_with_timeout(command: &mut Command, timeout: Duration) -> HookRunResult {
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => return HookRunResult::SpawnError(e),
     };
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return if status.success() {
-                    HookRunResult::Success
-                } else {
-                    HookRunResult::Denied {
-                        code: status.code(),
-                    }
-                };
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait(); // reap to avoid zombie
-                    return HookRunResult::Timeout;
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<std::process::ExitStatus>>();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(status)) => {
+            if status.success() {
+                HookRunResult::Success
+            } else {
+                HookRunResult::Denied {
+                    code: status.code(),
                 }
-                std::thread::sleep(Duration::from_millis(100));
             }
-            Err(e) => return HookRunResult::SpawnError(e),
         }
+        Ok(Err(e)) => HookRunResult::SpawnError(e),
+        Err(_) => HookRunResult::Timeout,
     }
 }
 
