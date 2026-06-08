@@ -943,8 +943,8 @@ fn read_source_file(path: &std::path::Path) -> std::result::Result<String, Sourc
 /// relative to the BOM-stripped content.
 fn strip_utf8_bom(source: String) -> (String, bool) {
     const BOM: &str = "\u{FEFF}";
-    if source.starts_with(BOM) {
-        (source[BOM.len()..].to_string(), true)
+    if let Some(stripped) = source.strip_prefix(BOM) {
+        (stripped.to_string(), true)
     } else {
         (source, false)
     }
