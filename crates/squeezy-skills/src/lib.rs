@@ -2099,14 +2099,13 @@ impl HookHandler for SkillHookHandler {
         // running the command, preventing parallel dispatches from both
         // passing the pre-run check. Reset on failure so the next
         // dispatch can retry.
-        if self.spec.once {
-            match self
+        if self.spec.once
+            && self
                 .fired
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Err(_) => return HookResult::allow(), // already fired or claimed
-                Ok(_) => {}                           // claimed; will reset on failure
-            }
+                .is_err()
+        {
+            return HookResult::allow(); // already fired or claimed by a concurrent dispatch
         }
 
         // Resolve the command path against the skill's base_dir when
