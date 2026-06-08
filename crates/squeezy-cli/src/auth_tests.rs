@@ -490,6 +490,7 @@ fn auth_set_resolves_deepinfra_to_canonical_section_name() {
 /// The function itself has no side effects, but reading env vars while
 /// another thread is modifying them is undefined behaviour in Rust's
 /// stdlib API.
+#[cfg(target_os = "linux")]
 static HEADLESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(target_os = "linux")]
