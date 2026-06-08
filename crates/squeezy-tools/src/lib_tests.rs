@@ -9207,6 +9207,8 @@ fn tool_specs_are_sorted_by_name() {
             "glob",
             "grep",
             "hierarchy",
+            "impact",
+            "inheritance_hierarchy",
             "list_skills",
             "load_skill",
             "notebook_edit",
@@ -10622,20 +10624,33 @@ async fn decl_search_zero_hit_path_unknown_emits_case_near_match() {
     assert_eq!(result.status, ToolStatus::Success);
     let fallback = &result.content["fallback"];
     assert_eq!(fallback["status"].as_str(), Some("no_graph_evidence"));
-    assert_eq!(fallback["reason"].as_str(), Some("path_unknown"));
-    // The path field must echo the unresolved query path, not null and not
-    // the actual file path (which was not found by exact/suffix match).
-    assert_eq!(
-        fallback["path"].as_str(),
-        Some("src/Lib.rs"),
-        "path field must echo the unresolved query path; fallback={fallback}"
-    );
-    // The fallback must include the case-insensitive near-match hint.
-    assert_eq!(
-        fallback["case_near_match"].as_str(),
-        Some("src/lib.rs"),
-        "expected case_near_match to point to src/lib.rs; fallback={fallback}"
-    );
+    if cfg!(windows) {
+        assert_eq!(
+            fallback["reason"].as_str(),
+            Some("supported_language_no_match")
+        );
+        assert_eq!(
+            fallback["path"].as_str(),
+            Some("src/lib.rs"),
+            "Windows resolves case-insensitive paths to the indexed spelling; fallback={fallback}"
+        );
+        assert!(fallback.get("case_near_match").is_none());
+    } else {
+        assert_eq!(fallback["reason"].as_str(), Some("path_unknown"));
+        // The path field must echo the unresolved query path, not null and not
+        // the actual file path (which was not found by exact/suffix match).
+        assert_eq!(
+            fallback["path"].as_str(),
+            Some("src/Lib.rs"),
+            "path field must echo the unresolved query path; fallback={fallback}"
+        );
+        // The fallback must include the case-insensitive near-match hint.
+        assert_eq!(
+            fallback["case_near_match"].as_str(),
+            Some("src/lib.rs"),
+            "expected case_near_match to point to src/lib.rs; fallback={fallback}"
+        );
+    }
     assert!(
         fallback.get("suggested_tools").is_none(),
         "suggested_tools must be trimmed from the wire payload"
