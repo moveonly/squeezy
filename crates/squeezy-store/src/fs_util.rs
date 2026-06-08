@@ -187,7 +187,7 @@ fn replace_file_windows(from: &Path, to: &Path) -> io::Result<()> {
         let extended: OsString = if path.is_absolute() && !normalised.starts_with(r"\\") {
             OsString::from(format!(r"\\?\{normalised}"))
         } else {
-            OsString::from(normalised.as_ref())
+            OsString::from(normalised)
         };
         extended.encode_wide().chain(iter::once(0)).collect()
     }
