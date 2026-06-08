@@ -229,6 +229,13 @@ impl ShellSandboxPlan {
             "read_roots": path_list_json(&self.configured_read_roots),
             "write_roots": path_list_json(&self.configured_write_roots),
             "fallback_reason": self.fallback_reason,
+            // Include the effective shell program for backends that use a
+            // configurable shell so the audit log records exactly what ran.
+            "shell": if self.backend == "linux-direct-syscalls" {
+                Some(self.program.as_str())
+            } else {
+                None
+            },
         });
         if let Some(record) = self.best_effort_fallback
             && let Some(object) = payload.as_object_mut()
@@ -769,7 +776,11 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
             } else {
                 "best_effort_unavailable"
             };
-            let shell_program = config.linux_shell.as_deref().unwrap_or("sh").to_string();
+            let shell_program = config
+                .linux_shell
+                .as_deref()
+                .unwrap_or("/bin/sh")
+                .to_string();
             return Ok(ShellSandboxPlan {
                 program: shell_program,
                 args: vec!["-lc".to_string(), command.to_string()],
@@ -894,12 +905,17 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
             }
         }
 
-        Ok(ShellSandboxPlan::direct_with_fallback(
-            command,
-            config.mode,
-            config,
-            fallback_reason,
-        ))
+        let mut plan =
+            ShellSandboxPlan::direct_with_fallback(command, config.mode, config, fallback_reason);
+        // On Linux, respect the configured shell in the degraded path so that
+        // a project relying on Bash syntax or Fish/Zsh aliases does not
+        // silently switch to /bin/sh when the sandbox falls back.
+        #[cfg(target_os = "linux")]
+        if let Some(linux_shell) = &config.linux_shell {
+            plan.program = linux_shell.clone();
+            plan.args = vec!["-lc".to_string(), command.to_string()];
+        }
+        Ok(plan)
     }
 }
 
@@ -1477,12 +1493,17 @@ fn linux_landlock_restrict(read_roots: &[PathBuf], write_roots: &[PathBuf]) -> s
     }
     let restrict_result =
         unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset_fd, 0u32) };
-    let close_result = unsafe { libc::close(ruleset_fd) };
-    if restrict_result < 0 {
-        return Err(std::io::Error::last_os_error());
+    // Save errno immediately before any other syscall can clobber it.
+    let restrict_err = if restrict_result < 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    unsafe {
+        libc::close(ruleset_fd);
     }
-    if close_result != 0 {
-        return Err(std::io::Error::last_os_error());
+    if let Some(err) = restrict_err {
+        return Err(err);
     }
     Ok(())
 }

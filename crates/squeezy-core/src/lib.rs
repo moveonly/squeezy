@@ -7184,6 +7184,17 @@ impl ShellSandboxConfig {
                      absolute path (e.g. \"/bin/bash\" or \"/usr/bin/fish\")"
                 )));
             }
+            // On Linux, validate that the shell binary exists at config load
+            // time so a misconfigured path produces a clear error at startup
+            // rather than a cryptic spawn failure when the first shell command
+            // runs. On other platforms this config is ignored, so skip the
+            // check to avoid spurious failures in cross-platform test configs.
+            #[cfg(target_os = "linux")]
+            if !std::path::Path::new(&shell_path).exists() {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.linux_shell {shell_path:?} does not exist"
+                )));
+            }
             config.linux_shell = Some(shell_path);
         }
         reject_duplicate_shell_roots(source, &config.read_roots, &config.write_roots)?;
