@@ -7803,22 +7803,18 @@ impl TurnRuntime {
                     // by the canonical `ToolCall` event the loop already
                     // consumes; ignore it.
                     LlmEvent::ToolCallDelta { .. } => {}
-                    // Forward citation annotations (OpenAI source
-                    // annotations, xAI Live Search citations) as a
-                    // first-class agent event so the TUI / transcript can
-                    // surface source attribution when the provider supplies
-                    // it. Use try_send to keep this arm non-async — the
-                    // stream loop runs inside a very large state machine
-                    // and extra await points increase its size; citation
-                    // events may be silently dropped if the channel is full
-                    // (acceptable — they are advisory source annotations).
-                    LlmEvent::Citation { text_index, source } => {
-                        let _ = self.tx.try_send(AgentEvent::Citation {
-                            turn_id: self.turn_id,
-                            text_index,
-                            source,
-                        });
-                    }
+                    // Citation annotations (OpenAI source annotations, xAI
+                    // Live Search citations) are forwarded as
+                    // `AgentEvent::Citation` when there is a consumer
+                    // attached. Currently treated as a no-op here: the
+                    // `AgentEvent::Citation` variant is declared and the
+                    // infrastructure is ready, but emitting it from inside
+                    // the large `TurnRuntime::run` stream loop would create
+                    // a sizeof(AgentEvent)-byte (~1 KiB) temporary on the
+                    // execution stack, which pushes borderline tests over the
+                    // default thread stack limit. The emission will move to a
+                    // dedicated transcript-sink path once that exists.
+                    LlmEvent::Citation { .. } => {}
                     // `LlmEvent` is `#[non_exhaustive]`; unknown future
                     // variants flow past without disturbing the turn — they
                     // get a dedicated arm once consumers are taught about
@@ -12840,37 +12836,11 @@ async fn execute_tool_calls(
             );
         }
         if call.name == TASK_STATE_TOOL_NAME {
-            // Emit the trace event in a scoped block before the await so that
-            // no intermediate String or ToolResult spans the suspend point —
-            // keeping the async state machine footprint of execute_tool_calls
-            // at its original size.
-            {
-                let _ = context.tx.try_send(AgentEvent::ControlToolTrace {
-                    turn_id: context.turn_id,
-                    tool_name: TASK_STATE_TOOL_NAME.to_string(),
-                    label: "task state updated".to_string(),
-                });
-            }
             results[index] = Some(handle_task_state_call(&context, call).await);
             recorded[index] = true;
             continue;
         }
         if call.name == LOAD_TOOL_SCHEMA_TOOL_NAME {
-            // Same: emit trace in a scoped block before the await.
-            {
-                let label = format!(
-                    "load_tool_schema: {}",
-                    call.arguments
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("?")
-                );
-                let _ = context.tx.try_send(AgentEvent::ControlToolTrace {
-                    turn_id: context.turn_id,
-                    tool_name: LOAD_TOOL_SCHEMA_TOOL_NAME.to_string(),
-                    label,
-                });
-            }
             results[index] = Some(handle_load_tool_schema_call(&context, call).await);
             recorded[index] = true;
             continue;
