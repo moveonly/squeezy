@@ -1935,7 +1935,7 @@ pub struct SkillValidationResult {
 /// scan for a given `(workspace_root, config)` pair, in the same order
 /// `discover` uses. This includes:
 ///
-/// - User-level roots (`compat_user_dir`, `user_dir`).
+/// - User-level roots (`compat_user_dir`, `user_dir`, optional XDG user dir).
 /// - `extra_roots` from config.
 /// - The current workspace's project roots (`.agents/skills`,
 ///   `.squeezy/skills`).
@@ -1948,6 +1948,9 @@ pub fn skill_scan_dirs(workspace_root: &Path, config: &squeezy_core::SkillsConfi
     let mut dirs = Vec::new();
     dirs.push(config.compat_user_dir.clone());
     dirs.push(config.user_dir.clone());
+    if let Some(xdg_dir) = &config.xdg_user_dir {
+        dirs.push(xdg_dir.clone());
+    }
     dirs.extend(config.extra_roots.iter().cloned());
     dirs.push(workspace_root.join(COMPAT_PROJECT_SKILLS_DIR));
     dirs.push(workspace_root.join(PROJECT_SKILLS_DIR));

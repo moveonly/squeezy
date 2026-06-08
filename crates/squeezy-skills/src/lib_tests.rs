@@ -2103,6 +2103,40 @@ fn skill_scan_dirs_includes_ancestor_project_roots() {
 }
 
 #[test]
+fn validate_skill_dirs_includes_xdg_user_dir() {
+    let root = temp_workspace("skills_validate_xdg_malformed");
+    let xdg_root = root.join("xdg").join("squeezy").join("skills");
+    let bad_dir = xdg_root.join("bad-xdg");
+    fs::create_dir_all(&bad_dir).expect("mkdir bad-xdg");
+    fs::write(bad_dir.join("SKILL.md"), "not frontmatter at all").expect("write bad skill");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        xdg_user_dir: Some(xdg_root),
+        ..Default::default()
+    };
+
+    let results = super::validate_skill_dirs(&root, &config);
+    let bad = results
+        .iter()
+        .find(|r| {
+            r.path
+                .to_str()
+                .map(|s| s.contains("bad-xdg"))
+                .unwrap_or(false)
+        })
+        .expect("bad-xdg result must be present");
+    assert!(
+        bad.outcome.is_err(),
+        "malformed XDG skill must produce an error: {:?}",
+        bad.outcome
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn validate_skill_dirs_includes_ancestor_malformed_skill() {
     // Same monorepo layout, but with a malformed SKILL.md in the ancestor root.
     let root = temp_workspace("skills_validate_ancestor_malformed");

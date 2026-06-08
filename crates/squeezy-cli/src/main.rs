@@ -17,7 +17,7 @@ use squeezy_core::{
     AppConfig, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpTransport,
     ModelProfile, OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode, ReasoningEffort,
     SessionMode, SettingsFile, SqueezyError, default_settings_path, find_project_settings_path,
-    per_repo_settings_path, project_settings_template, skills_home_missing, user_settings_template,
+    per_repo_settings_path, project_settings_template, user_settings_template,
 };
 use squeezy_llm::{
     LlmProvider, ModelInfo, PROVIDERS, UnavailableProvider, capabilities_for,
@@ -1298,16 +1298,16 @@ fn handle_skills_command(command: &SkillsCommand, cli: &Cli) -> squeezy_core::Re
 }
 
 fn skills_install(cli: &Cli, force: bool) -> squeezy_core::Result<()> {
-    if skills_home_missing() {
-        eprintln!(
-            "warning: HOME is not set; bundled skills will be installed under a \
-             relative path ({}) which is relative to the current working directory. \
-             Set HOME or SQUEEZY_SKILLS_USER_DIR to an absolute path to avoid this.",
-            squeezy_core::DEFAULT_SQUEEZY_SKILLS_DIR,
-        );
-    }
     let config = config_from_cli(cli)?;
     let target = &config.skills.user_dir;
+    if target.is_relative() {
+        eprintln!(
+            "warning: bundled skills will be installed under a relative path ({}) \
+             which is relative to the current working directory. Set HOME or \
+             SQUEEZY_SKILLS_USER_DIR to an absolute path to avoid this.",
+            target.display(),
+        );
+    }
     if force {
         for source in skills_bundled_dir_names() {
             let dir = target.join(source);
@@ -1404,6 +1404,27 @@ fn skills_paths(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
         path: config.workspace_root.join(".squeezy/skills"),
         source: "workspace root",
     });
+    let mut seen_paths = entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<BTreeSet<_>>();
+    for path in squeezy_skills::skill_scan_dirs(&config.workspace_root, &config.skills) {
+        if !seen_paths.insert(path.clone()) {
+            continue;
+        }
+        let tier = if path.ends_with(".agents/skills") {
+            "ancestor (.agents/skills)"
+        } else if path.ends_with(".squeezy/skills") {
+            "ancestor (.squeezy/skills)"
+        } else {
+            "scan"
+        };
+        entries.push(PathEntry {
+            tier,
+            path,
+            source: "discovery scan",
+        });
+    }
 
     if json {
         println!(
@@ -1413,8 +1434,8 @@ fn skills_paths(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
         return Ok(());
     }
 
-    if skills_home_missing() {
-        eprintln!("warning: HOME is not set; user skill roots are cwd-relative paths.");
+    if entries.iter().any(|entry| entry.path.is_relative()) {
+        eprintln!("warning: one or more skill roots are cwd-relative paths.");
     }
 
     let width = entries.iter().map(|e| e.tier.len()).max().unwrap_or(4);
