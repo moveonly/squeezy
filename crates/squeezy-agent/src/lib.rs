@@ -1392,11 +1392,10 @@ pub struct Agent {
     /// settle in the same order the user requested them.
     mcp_background_queue: Arc<McpBackgroundQueue>,
     /// Root cancellation token for agent-lifetime background tasks. Cancelling
-    /// this token bounds MCP reload/toggle/restart tasks so they cannot hold
-    /// tool-registry or store handles across `Agent::shutdown`. Especially
-    /// important on Windows where the redb exclusive lock prevents store
-    /// reopening while any handle is alive.
-    shutdown_token: CancellationToken,
+    /// the current token bounds MCP reload/toggle/restart tasks so they cannot
+    /// hold tool-registry or store handles across `Agent::shutdown`. The token
+    /// is renewed after shutdown because the `Agent` remains reusable.
+    shutdown_token: Arc<StdMutex<CancellationToken>>,
     /// Cross-turn state for the per-turn model router. Tracks the
     /// escalation-sticky window and any pending `/cheap` / `/parent` /
     /// `/router` user override. Shared with each `TurnRuntime` via
@@ -2068,7 +2067,7 @@ impl Agent {
             event_broadcast,
             background_tasks: Arc::new(StdMutex::new(tokio::task::JoinSet::new())),
             mcp_background_queue: Arc::new(McpBackgroundQueue::default()),
-            shutdown_token: CancellationToken::new(),
+            shutdown_token: Arc::new(StdMutex::new(CancellationToken::new())),
             routing_state: Arc::new(StdMutex::new(turn_router::RoutingPersistentState::default())),
             last_request_overhead_tokens: Arc::new(AtomicU64::new(0)),
             configured_model_context_window,
@@ -2192,7 +2191,7 @@ impl Agent {
         }
         let tools = self.tools.clone();
         let servers = next.mcp_servers.clone();
-        let cancel = self.shutdown_token.child_token();
+        let cancel = self.mcp_shutdown_child_token();
         let task = async move {
             let _ = tools.replace_mcp_servers(servers, cancel).await;
         };
@@ -2498,7 +2497,7 @@ impl Agent {
             server.enabled = enabled;
         }
         let tools = self.tools.clone();
-        let cancel = self.shutdown_token.child_token();
+        let cancel = self.mcp_shutdown_child_token();
         let task = async move {
             let _ = tools
                 .set_mcp_server_enabled(&server_name, enabled, cancel)
@@ -2514,7 +2513,7 @@ impl Agent {
         server_name: &str,
     ) -> squeezy_tools::McpResult<squeezy_tools::McpRefreshOutcome> {
         self.tools
-            .restart_mcp_server(server_name, self.shutdown_token.child_token())
+            .restart_mcp_server(server_name, self.mcp_shutdown_child_token())
             .await
     }
 
@@ -2523,7 +2522,7 @@ impl Agent {
     /// that snapshot while this task runs.
     pub fn restart_mcp_server_in_background(&self, server_name: String) {
         let tools = self.tools.clone();
-        let cancel = self.shutdown_token.child_token();
+        let cancel = self.mcp_shutdown_child_token();
         let task = async move {
             let _ = tools.restart_mcp_server(&server_name, cancel).await;
         };
@@ -2540,7 +2539,7 @@ impl Agent {
     ) -> squeezy_tools::McpRefreshOutcome {
         self.config.mcp_servers = servers.clone();
         self.tools
-            .replace_mcp_servers(servers, self.shutdown_token.child_token())
+            .replace_mcp_servers(servers, self.mcp_shutdown_child_token())
             .await
     }
 
@@ -2553,7 +2552,7 @@ impl Agent {
     ) {
         self.config.mcp_servers = servers.clone();
         let tools = self.tools.clone();
-        let cancel = self.shutdown_token.child_token();
+        let cancel = self.mcp_shutdown_child_token();
         let task = async move {
             let _ = tools.replace_mcp_servers(servers, cancel).await;
         };
@@ -2588,6 +2587,13 @@ impl Agent {
         }
     }
 
+    fn mcp_shutdown_child_token(&self) -> CancellationToken {
+        match self.shutdown_token.lock() {
+            Ok(token) => token.child_token(),
+            Err(poison) => poison.into_inner().child_token(),
+        }
+    }
+
     /// Snapshot of the registry's live server map. Mirrors
     /// `AppConfig.mcp_servers` but reads from the registry directly so
     /// callers see post-`replace_mcp_servers` state.
@@ -2615,12 +2621,19 @@ impl Agent {
         // restart) to stop. This bounds their lifetime so callers can safely
         // drop the agent and reopen any held file handles (e.g. redb on
         // Windows, which uses an exclusive lock).
-        self.shutdown_token.cancel();
+        match self.shutdown_token.lock() {
+            Ok(token) => token.cancel(),
+            Err(poison) => poison.into_inner().cancel(),
+        }
         let mut tasks = match self.background_tasks.lock() {
             Ok(mut guard) => std::mem::take(&mut *guard),
             Err(poison) => std::mem::take(&mut *poison.into_inner()),
         };
         while tasks.join_next().await.is_some() {}
+        match self.shutdown_token.lock() {
+            Ok(mut token) => *token = CancellationToken::new(),
+            Err(poison) => *poison.into_inner() = CancellationToken::new(),
+        }
     }
 
     pub fn subscribe_jobs(&self) -> broadcast::Receiver<JobEvent> {

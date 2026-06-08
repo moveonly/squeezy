@@ -11967,3 +11967,20 @@ async fn mcp_background_queue_serves_issued_tickets_in_order() {
 
     assert_eq!(&*events.lock().await, &["first", "second"]);
 }
+
+#[tokio::test]
+async fn agent_shutdown_renews_mcp_shutdown_token() {
+    let agent = Agent::new_ephemeral(AppConfig::default(), Arc::new(MockProvider::new(vec![])));
+    let old_child = agent.mcp_shutdown_child_token();
+
+    agent.shutdown().await;
+
+    assert!(
+        old_child.is_cancelled(),
+        "shutdown must cancel already-issued MCP background tokens"
+    );
+    assert!(
+        !agent.mcp_shutdown_child_token().is_cancelled(),
+        "Agent remains reusable after shutdown, so new MCP work must receive a live token"
+    );
+}
