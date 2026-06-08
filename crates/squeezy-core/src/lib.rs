@@ -8814,6 +8814,16 @@ impl SkillsBudgetMode {
 pub struct SkillsConfig {
     pub user_dir: PathBuf,
     pub compat_user_dir: PathBuf,
+    /// Optional XDG-aware user skills directory.  On Linux this is
+    /// `$XDG_DATA_HOME/squeezy/skills` (or `$HOME/.local/share/squeezy/skills`
+    /// when `XDG_DATA_HOME` is unset but `HOME` is present).  When set it is
+    /// scanned alongside `user_dir` so users who follow XDG conventions are
+    /// covered without losing the legacy `~/.squeezy/skills` path.
+    ///
+    /// `None` on platforms or configurations where XDG is not applicable (e.g.
+    /// macOS with default settings, or any host where `HOME` is absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xdg_user_dir: Option<PathBuf>,
     /// Additional filesystem roots walked during skill discovery. Their
     /// skills live at [`SkillSource::ExtraRoot`] precedence, above the
     /// personal `user_dir` and below project-local skills, so a workspace
@@ -8902,6 +8912,7 @@ impl SkillsConfig {
                     .or(settings.compat_user_dir)
                     .unwrap_or_else(default_agent_compat_skills_dir),
             ),
+            xdg_user_dir: default_xdg_skills_dir(),
             extra_roots: settings
                 .extra_roots
                 .into_iter()
@@ -8956,6 +8967,7 @@ impl Default for SkillsConfig {
         Self {
             user_dir: default_squeezy_skills_dir(),
             compat_user_dir: default_agent_compat_skills_dir(),
+            xdg_user_dir: default_xdg_skills_dir(),
             extra_roots: Vec::new(),
             active_budget_chars: DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS,
             active_body_cap_chars: DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS,
@@ -9787,6 +9799,68 @@ pub fn default_agent_compat_skills_dir() -> PathBuf {
         .map(PathBuf::from)
         .map(|home| home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
+}
+
+/// Returns `true` when `HOME` is absent **and** a skills/prompts default would
+/// resolve to a bare relative path.  Callers (doctor, `skills install`) should
+/// surface a warning in this case because relative defaults are process-cwd
+/// relative and almost certainly wrong in a service/container context.
+pub fn skills_home_missing() -> bool {
+    env::var_os("HOME").is_none()
+}
+
+/// XDG-aware user skills directory.  Returns `Some` only when both `HOME` is
+/// present *and* the resolved XDG path differs from the legacy `user_dir`.
+///
+/// Resolution order:
+///   1. `$XDG_DATA_HOME/squeezy/skills` when `XDG_DATA_HOME` is set.
+///   2. `$HOME/.local/share/squeezy/skills` when `HOME` is set.
+///   3. `None` otherwise (no HOME → the caller will already warn).
+///
+/// When the resolved path equals `default_squeezy_skills_dir()` (i.e. the
+/// user has `XDG_DATA_HOME` pointed at `~/.squeezy`) there is no point
+/// scanning it twice, so `None` is returned in that case too.
+pub fn default_xdg_skills_dir() -> Option<PathBuf> {
+    let xdg = if let Some(xdg_data) = env::var_os("XDG_DATA_HOME") {
+        PathBuf::from(xdg_data).join("squeezy").join("skills")
+    } else {
+        let home = PathBuf::from(env::var_os("HOME")?);
+        home.join(".local")
+            .join("share")
+            .join("squeezy")
+            .join("skills")
+    };
+    // Avoid scanning the same directory twice when XDG_DATA_HOME happens to
+    // point at the same place as the legacy ~/.squeezy/skills default.
+    if xdg == default_squeezy_skills_dir() {
+        return None;
+    }
+    Some(xdg)
+}
+
+/// XDG-aware user prompts directory.  Returns `Some` only when `HOME` is
+/// present and the resolved XDG path differs from the legacy prompts path.
+///
+/// Resolution order:
+///   1. `$XDG_CONFIG_HOME/squeezy/prompts` when `XDG_CONFIG_HOME` is set.
+///   2. `$HOME/.config/squeezy/prompts` when `HOME` is set.
+///   3. `None` otherwise.
+pub fn default_xdg_prompts_dir() -> Option<PathBuf> {
+    let xdg = if let Some(xdg_cfg) = env::var_os("XDG_CONFIG_HOME") {
+        PathBuf::from(xdg_cfg).join("squeezy").join("prompts")
+    } else {
+        let home = PathBuf::from(env::var_os("HOME")?);
+        home.join(".config").join("squeezy").join("prompts")
+    };
+    // Avoid duplicates: if XDG resolved to the same path as the legacy
+    // ~/.squeezy/prompts, return None so we don't scan it twice.
+    let legacy = PathBuf::from(env::var_os("HOME").unwrap_or_default())
+        .join(".squeezy")
+        .join("prompts");
+    if xdg == legacy {
+        return None;
+    }
+    Some(xdg)
 }
 
 fn expand_home_path(path: PathBuf) -> PathBuf {

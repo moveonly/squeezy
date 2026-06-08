@@ -17,7 +17,7 @@ use squeezy_core::{
     AppConfig, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpTransport,
     ModelProfile, OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode, ReasoningEffort,
     SessionMode, SettingsFile, SqueezyError, default_settings_path, find_project_settings_path,
-    per_repo_settings_path, project_settings_template, user_settings_template,
+    per_repo_settings_path, project_settings_template, skills_home_missing, user_settings_template,
 };
 use squeezy_llm::{
     LlmProvider, ModelInfo, PROVIDERS, UnavailableProvider, capabilities_for,
@@ -325,6 +325,13 @@ enum SkillsCommand {
     Install {
         #[arg(long, help = "Overwrite an existing target directory")]
         force: bool,
+    },
+    #[command(
+        about = "Print the resolved skill discovery roots (compat-user, user, XDG, extra, project)"
+    )]
+    Paths {
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
     },
 }
 
@@ -1146,10 +1153,19 @@ fn handle_skills_command(command: &SkillsCommand, cli: &Cli) -> squeezy_core::Re
         SkillsCommand::Disable(args) => skills_set_enabled(cli, args, false),
         SkillsCommand::Validate { json } => skills_validate(cli, *json),
         SkillsCommand::Install { force } => skills_install(cli, *force),
+        SkillsCommand::Paths { json } => skills_paths(cli, *json),
     }
 }
 
 fn skills_install(cli: &Cli, force: bool) -> squeezy_core::Result<()> {
+    if skills_home_missing() {
+        eprintln!(
+            "warning: HOME is not set; bundled skills will be installed under a \
+             relative path ({}) which is relative to the current working directory. \
+             Set HOME or SQUEEZY_SKILLS_USER_DIR to an absolute path to avoid this.",
+            squeezy_core::DEFAULT_SQUEEZY_SKILLS_DIR,
+        );
+    }
     let config = config_from_cli(cli)?;
     let target = &config.skills.user_dir;
     if force {
@@ -1194,6 +1210,83 @@ fn skills_bundled_dir_names() -> &'static [&'static str] {
         "skill-creator",
         "trace-symbol",
     ]
+}
+
+/// Print every directory that will be scanned for skills, in discovery order,
+/// together with the configuration tier that produced each path.  Useful for
+/// diagnosing unexpected skill-discovery behaviour on Linux where multiple
+/// paths (XDG, legacy, extra roots, project, ancestors) may coexist.
+fn skills_paths(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
+    let config = config_from_cli(cli)?;
+    let s = &config.skills;
+
+    // Build an ordered list of (tier, path) entries.
+    #[derive(serde::Serialize)]
+    struct PathEntry {
+        tier: &'static str,
+        path: std::path::PathBuf,
+        source: &'static str,
+    }
+
+    let mut entries: Vec<PathEntry> = Vec::new();
+
+    entries.push(PathEntry {
+        tier: "compat_user",
+        path: s.compat_user_dir.clone(),
+        source: "settings/SQUEEZY_SKILLS_COMPAT_USER_DIR/default",
+    });
+    entries.push(PathEntry {
+        tier: "user",
+        path: s.user_dir.clone(),
+        source: "settings/SQUEEZY_SKILLS_USER_DIR/default ($HOME/.squeezy/skills)",
+    });
+    if let Some(xdg) = &s.xdg_user_dir {
+        entries.push(PathEntry {
+            tier: "xdg_user",
+            path: xdg.clone(),
+            source: "XDG_DATA_HOME/squeezy/skills or $HOME/.local/share/squeezy/skills",
+        });
+    }
+    for (_i, extra) in s.extra_roots.iter().enumerate() {
+        entries.push(PathEntry {
+            tier: "extra_root",
+            path: extra.clone(),
+            source: "settings extra_roots",
+        });
+    }
+    entries.push(PathEntry {
+        tier: "project (.agents/skills)",
+        path: config.workspace_root.join(".agents/skills"),
+        source: "workspace root (compat)",
+    });
+    entries.push(PathEntry {
+        tier: "project (.squeezy/skills)",
+        path: config.workspace_root.join(".squeezy/skills"),
+        source: "workspace root",
+    });
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&entries).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    if skills_home_missing() {
+        eprintln!("warning: HOME is not set; user skill roots are cwd-relative paths.");
+    }
+
+    let width = entries.iter().map(|e| e.tier.len()).max().unwrap_or(4);
+    for entry in &entries {
+        println!(
+            "  {:<width$}  {}",
+            entry.tier,
+            entry.path.display(),
+            width = width,
+        );
+    }
+    Ok(())
 }
 
 fn skills_list(cli: &Cli, json: bool) -> squeezy_core::Result<()> {

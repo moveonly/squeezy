@@ -1,6 +1,7 @@
 use super::*;
 use squeezy_core::{McpPermissionConfig, McpServerConfig, McpTransport, ProviderSettings};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 // env::set_var/remove_var is process-global; serialize these tests so a parallel
@@ -418,4 +419,39 @@ fn state_store_check_fails_when_path_unwritable() {
     config.cache.root = Some(PathBuf::from("/dev/null/nope"));
     let check = state_store_check(&config);
     assert_eq!(check.status, Status::Fail, "detail: {}", check.detail);
+}
+
+#[test]
+fn skills_roots_check_shows_resolved_paths() {
+    let root = skills_doctor_workspace("skills_roots_paths");
+    let config = skills_doctor_config(&root);
+    let check = skills_roots_check(&config);
+    // With HOME set (normal test environment) this should be Ok.
+    // The detail must mention the user and compat_user paths.
+    assert!(
+        check.detail.contains("user=") || check.status == Status::Warn,
+        "expected resolved paths in detail: {check:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn skills_roots_check_warns_when_home_missing() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let root = skills_doctor_workspace("skills_roots_no_home");
+    let config = skills_doctor_config(&root);
+    // Temporarily unset HOME to simulate a container/service environment.
+    let saved = std::env::var_os("HOME");
+    unsafe {
+        env::remove_var("HOME");
+    }
+    let check = skills_roots_check(&config);
+    if let Some(h) = saved {
+        unsafe {
+            env::set_var("HOME", h);
+        }
+    }
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(check.detail.to_lowercase().contains("home"), "{check:?}");
+    let _ = std::fs::remove_dir_all(root);
 }

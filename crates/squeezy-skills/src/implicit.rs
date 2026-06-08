@@ -9,7 +9,11 @@ const RUNNERS: &[&str] = &[
     "python", "python3", "bash", "zsh", "sh", "node", "deno", "ruby", "perl", "pwsh",
 ];
 const SCRIPT_EXTENSIONS: &[&str] = &[".py", ".sh", ".js", ".ts", ".rb", ".pl", ".ps1"];
-const READERS: &[&str] = &["cat", "sed", "head", "tail", "less", "more", "bat", "awk"];
+const READERS: &[&str] = &[
+    "cat", "sed", "head", "tail", "less", "more", "bat", "awk",
+    // Common Linux search/read tools that may read or locate skill docs.
+    "rg", "fd", "find",
+];
 
 pub(crate) fn detect_for_command(
     command: &str,
@@ -93,12 +97,111 @@ fn doc_token_may_match_indexed_path(token: &str, by_doc_path: &BTreeMap<PathBuf,
 
 fn script_run_token(tokens: &[String]) -> Option<&str> {
     let runner_token = tokens.first()?;
-    let runner = command_basename(runner_token).to_ascii_lowercase();
-    let runner = runner.strip_suffix(".exe").unwrap_or(&runner);
-    if !RUNNERS.contains(&runner) {
+    let runner_base = command_basename(runner_token).to_ascii_lowercase();
+    let runner_base = runner_base.strip_suffix(".exe").unwrap_or(&runner_base);
+
+    // Direct executable path: `./scripts/task.sh`, `/abs/path/script.py`, etc.
+    // The token itself is the script — no runner prefix needed.
+    if is_path_like(runner_token) {
+        if SCRIPT_EXTENSIONS
+            .iter()
+            .any(|ext| runner_token.to_ascii_lowercase().ends_with(ext))
+        {
+            return Some(runner_token);
+        }
+        // Path-like but no recognized extension; cannot be a script run.
         return None;
     }
-    for token in tokens.iter().skip(1) {
+
+    // `env [options/assignments] <runner> <script>` — skip `env` and any
+    // VAR=value assignments or flags before the real runner.
+    if runner_base == "env" {
+        let rest = skip_env_prefix(tokens.iter().skip(1).map(String::as_str))?;
+        return script_run_token_from_runner_and_rest(rest);
+    }
+
+    if !RUNNERS.contains(&runner_base) {
+        return None;
+    }
+    script_run_token_from_rest(tokens.iter().skip(1))
+}
+
+/// Given a slice that starts right after the `env` token, skip option flags
+/// (`-i`, `-u NAME`, etc.) and `NAME=VALUE` assignments, then return the
+/// remaining tokens starting from the real runner command.
+fn skip_env_prefix<'a>(mut iter: impl Iterator<Item = &'a str>) -> Option<Vec<&'a str>> {
+    let mut remaining = Vec::new();
+    // Collect all tokens so we can index them.
+    for tok in iter.by_ref() {
+        remaining.push(tok);
+    }
+    let mut i = 0;
+    while i < remaining.len() {
+        let tok = remaining[i];
+        // `-` or `--` ends option parsing for env(1).
+        if tok == "-" || tok == "--" {
+            i += 1;
+            break;
+        }
+        if tok.starts_with('-') {
+            // Options that consume the next argument: -u, -C, -S (simplified).
+            if matches!(tok, "-u" | "-C" | "-S") {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // NAME=VALUE assignment — skip.
+        if tok.contains('=') && !tok.starts_with('=') {
+            let name_part = &tok[..tok.find('=').unwrap_or(0)];
+            if name_part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                i += 1;
+                continue;
+            }
+        }
+        // First non-option, non-assignment token is the runner.
+        break;
+    }
+    if i >= remaining.len() {
+        return None;
+    }
+    Some(remaining[i..].to_vec())
+}
+
+/// Recognises runner + optional flags + script from a `[runner, rest…]` slice
+/// where `rest` has already had the `env` prefix stripped.
+fn script_run_token_from_runner_and_rest<'a>(tokens: Vec<&'a str>) -> Option<&'a str> {
+    let runner = tokens.first()?;
+    let runner_base = command_basename(runner).to_ascii_lowercase();
+    let runner_base = runner_base.strip_suffix(".exe").unwrap_or(&runner_base);
+    if !RUNNERS.contains(&runner_base) {
+        return None;
+    }
+    // Re-use the rest logic on the slice after the runner.
+    for tok in tokens.iter().skip(1) {
+        if *tok == "--" || tok.starts_with('-') {
+            continue;
+        }
+        if SCRIPT_EXTENSIONS
+            .iter()
+            .any(|ext| tok.to_ascii_lowercase().ends_with(ext))
+        {
+            return Some(tok);
+        }
+        return None;
+    }
+    None
+}
+
+fn script_run_token_from_rest<'a, I>(mut iter: I) -> Option<&'a str>
+where
+    I: Iterator<Item = &'a String>,
+{
+    for token in iter.by_ref() {
         if token == "--" || token.starts_with('-') {
             continue;
         }
@@ -111,6 +214,19 @@ fn script_run_token(tokens: &[String]) -> Option<&str> {
         return None;
     }
     None
+}
+
+/// Returns `true` when a token looks like a filesystem path rather than a bare
+/// command name: starts with `./`, `../`, or `/`, or is an absolute Windows
+/// path (letter + `:\`).
+fn is_path_like(token: &str) -> bool {
+    token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with('/')
+        || (token.len() >= 3
+            && token.as_bytes()[0].is_ascii_alphabetic()
+            && token.as_bytes()[1] == b':'
+            && (token.as_bytes()[2] == b'\\' || token.as_bytes()[2] == b'/'))
 }
 
 fn command_reads_file(tokens: &[String]) -> bool {

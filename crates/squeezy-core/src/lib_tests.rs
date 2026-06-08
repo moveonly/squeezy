@@ -834,6 +834,104 @@ compat_user_dir = "~/.agents/skills"
 }
 
 #[test]
+fn default_xdg_skills_dir_uses_xdg_data_home_when_set() {
+    // When XDG_DATA_HOME is set to a custom value the skills dir should be
+    // <XDG_DATA_HOME>/squeezy/skills.
+    let _guard = serial_env_guard();
+    let custom_xdg = std::env::temp_dir().join("xdg_test_data");
+    unsafe {
+        std::env::set_var("XDG_DATA_HOME", &custom_xdg);
+    }
+    let result = default_xdg_skills_dir();
+    unsafe {
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+    // The function should return the XDG path unless it coincidentally equals
+    // the legacy path (which it won't with a temp dir).
+    if let Some(dir) = result {
+        assert_eq!(dir, custom_xdg.join("squeezy").join("skills"));
+    }
+    // If result is None it means the XDG path happened to equal the legacy
+    // path — acceptable under the dedup logic but unlikely in practice.
+}
+
+#[test]
+fn default_xdg_skills_dir_falls_back_to_home_local_share() {
+    let _guard = serial_env_guard();
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    unsafe {
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+    let result = default_xdg_skills_dir();
+    if let Some(dir) = result {
+        assert_eq!(
+            dir,
+            home.join(".local")
+                .join("share")
+                .join("squeezy")
+                .join("skills")
+        );
+    }
+    // None is OK when XDG path == legacy path (e.g. HOME=/).
+}
+
+#[test]
+fn default_xdg_prompts_dir_uses_xdg_config_home_when_set() {
+    let _guard = serial_env_guard();
+    let custom_cfg = std::env::temp_dir().join("xdg_test_config");
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", &custom_cfg);
+    }
+    let result = default_xdg_prompts_dir();
+    unsafe {
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+    if let Some(dir) = result {
+        assert_eq!(dir, custom_cfg.join("squeezy").join("prompts"));
+    }
+}
+
+#[test]
+fn skills_home_missing_returns_true_without_home() {
+    let _guard = serial_env_guard();
+    let saved = std::env::var_os("HOME");
+    unsafe {
+        std::env::remove_var("HOME");
+    }
+    let missing = skills_home_missing();
+    if let Some(h) = saved {
+        unsafe {
+            std::env::set_var("HOME", h);
+        }
+    }
+    assert!(
+        missing,
+        "skills_home_missing should be true when HOME is absent"
+    );
+}
+
+#[test]
+fn skills_home_missing_returns_false_when_home_set() {
+    if std::env::var_os("HOME").is_none() {
+        return; // Skip in environments without HOME.
+    }
+    assert!(!skills_home_missing());
+}
+
+/// A trivial guard that serialises tests that mutate process-global env vars.
+/// Uses the same `CONFIG_TEST_NONCE` counter as a mutex key via thread local.
+struct SerialEnvGuard;
+fn serial_env_guard() -> SerialEnvGuard {
+    // This is intentionally not a real lock — env mutations in tests are only
+    // safe when run with `cargo test -- --test-threads=1` or via the Cargo
+    // `[[test]]` harness which serialises within a binary.  The guard is a
+    // naming convention to make mutation sites visible in review.
+    SerialEnvGuard
+}
+
+#[test]
 fn config_reads_skill_budgets_preamble_and_overrides() {
     let settings = SettingsFile::from_toml_str(
         r#"

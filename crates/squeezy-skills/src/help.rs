@@ -50,7 +50,11 @@ pub enum HelpCitation {
 impl HelpCitation {
     fn render(&self) -> String {
         match self {
-            Self::DocsPath(path) => format!("See: {path}"),
+            // These are logical bundled-doc IDs compiled into the binary at
+            // build time, not paths on the installed filesystem.  Label them
+            // explicitly so Linux users do not chase the absent `docs/external`
+            // tree that only exists inside the source checkout.
+            Self::DocsPath(path) => format!("Bundled doc (logical ID): {path}"),
             Self::ConfigInspectSection(section) => {
                 format!("From config: [{section}]")
             }

@@ -4,7 +4,7 @@ use clap::Args;
 use serde_json::json;
 use squeezy_core::{
     AppConfig, McpServerConfig, McpTransport, ProviderConfig, ProviderSettings, Result,
-    SettingsFile, default_settings_path,
+    SettingsFile, default_settings_path, skills_home_missing,
 };
 use squeezy_llm::{
     KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
@@ -231,6 +231,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
             checks.extend(probe_mcp_servers(&config.mcp_servers).await);
         }
         checks.push(skills_check(config));
+        checks.push(skills_roots_check(config));
         checks.push(session_store_check(config));
         checks.push(state_store_check(config));
         checks.push(cache_check(config, args.prune_cache));
@@ -756,6 +757,42 @@ fn skills_check(config: &AppConfig) -> Check {
         name: "skills".to_string(),
         status: Status::Ok,
         detail,
+    }
+}
+
+/// Report resolved skill discovery roots with their configuration sources so
+/// Linux users can understand which directories will be scanned.  Warns when
+/// `HOME` is absent and defaults fall back to process-cwd-relative paths.
+fn skills_roots_check(config: &AppConfig) -> Check {
+    if skills_home_missing() {
+        return Check {
+            name: "skills_roots".to_string(),
+            status: Status::Warn,
+            detail: "HOME is unset; skill roots default to relative paths (cwd-relative). \
+                     Set HOME or use SQUEEZY_SKILLS_USER_DIR / SQUEEZY_SKILLS_COMPAT_USER_DIR \
+                     to point to absolute directories."
+                .to_string(),
+        };
+    }
+
+    let s = &config.skills;
+    let mut parts: Vec<String> = Vec::new();
+
+    parts.push(format!("compat_user={}", s.compat_user_dir.display()));
+    parts.push(format!("user={}", s.user_dir.display()));
+
+    if let Some(xdg) = &s.xdg_user_dir {
+        parts.push(format!("xdg_user={}", xdg.display()));
+    }
+
+    for (i, extra) in s.extra_roots.iter().enumerate() {
+        parts.push(format!("extra[{i}]={}", extra.display()));
+    }
+
+    Check {
+        name: "skills_roots".to_string(),
+        status: Status::Ok,
+        detail: parts.join(" | "),
     }
 }
 

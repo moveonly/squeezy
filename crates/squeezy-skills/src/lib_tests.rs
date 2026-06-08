@@ -2593,3 +2593,95 @@ fn skill_hook_once_retries_after_failed_first_run() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+// ── XDG skill root discovery ──────────────────────────────────────────────────
+
+/// Skills placed in the XDG data directory are discovered alongside the legacy
+/// user directory.
+#[test]
+fn xdg_user_dir_skills_are_discovered() {
+    let root = lib_tests_tempdir("xdg_skill_discover");
+    let xdg_skills = root.join("xdg_data").join("squeezy").join("skills");
+    let xdg_skill_dir = xdg_skills.join("xdg-nav");
+    fs::create_dir_all(&xdg_skill_dir).expect("create xdg skill dir");
+    fs::write(
+        xdg_skill_dir.join("SKILL.md"),
+        "---\nname: xdg-nav\ndescription: \"XDG skill\"\ntriggers: [\"xdg nav\"]\n---\n# xdg-nav\n",
+    )
+    .expect("write xdg skill");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user-noop"),
+        compat_user_dir: root.join("compat-noop"),
+        xdg_user_dir: Some(xdg_skills),
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+    assert!(
+        catalog.skills.contains_key("xdg-nav"),
+        "xdg-nav skill should be discovered via xdg_user_dir"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// When `xdg_user_dir` is `None`, discovery does not panic and works normally.
+#[test]
+fn discover_works_without_xdg_user_dir() {
+    let root = lib_tests_tempdir("xdg_none_discover");
+    let config = SkillsConfig {
+        user_dir: root.join("user-noop"),
+        compat_user_dir: root.join("compat-noop"),
+        xdg_user_dir: None,
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+    assert!(catalog.summaries().is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Legacy user_dir skills take precedence over same-name XDG skills.
+#[test]
+fn legacy_user_dir_shadows_xdg_same_name_skill() {
+    let root = lib_tests_tempdir("xdg_shadow_test");
+
+    let user_skill = root.join("user").join("my-skill");
+    fs::create_dir_all(&user_skill).expect("create user skill");
+    fs::write(
+        user_skill.join("SKILL.md"),
+        "---\nname: my-skill\ndescription: \"from user\"\ntriggers: [\"my skill\"]\n---\n# user\n",
+    )
+    .expect("write user skill");
+
+    let xdg_skills = root.join("xdg").join("squeezy").join("skills");
+    let xdg_skill = xdg_skills.join("my-skill");
+    fs::create_dir_all(&xdg_skill).expect("create xdg skill");
+    fs::write(
+        xdg_skill.join("SKILL.md"),
+        "---\nname: my-skill\ndescription: \"from xdg\"\ntriggers: [\"my skill\"]\n---\n# xdg\n",
+    )
+    .expect("write xdg skill");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat-noop"),
+        xdg_user_dir: Some(xdg_skills),
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+    let skill = catalog.skills.get("my-skill").expect("skill present");
+    assert_eq!(
+        skill.summary.description, "from user",
+        "legacy user_dir should shadow xdg for same-name skill"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+fn lib_tests_tempdir(name: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("squeezy-{name}-{}-{nonce}", std::process::id()));
+    fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}

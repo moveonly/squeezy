@@ -63,3 +63,121 @@ fn doc_prefilter_keeps_skill_doc_tokens_when_canonical_target_differs() {
         &by_doc_path
     ));
 }
+
+// ── env-prefix detection ──────────────────────────────────────────────────────
+
+#[test]
+fn env_prefix_activates_runner_plus_script() {
+    let tokens = vec![
+        "env".to_string(),
+        "python3".to_string(),
+        "scripts/fetch.py".to_string(),
+    ];
+    assert_eq!(script_run_token(&tokens), Some("scripts/fetch.py"));
+}
+
+#[test]
+fn env_with_var_assignment_activates_runner() {
+    let tokens = vec![
+        "env".to_string(),
+        "PYTHONPATH=/lib".to_string(),
+        "python3".to_string(),
+        "scripts/run.py".to_string(),
+    ];
+    assert_eq!(script_run_token(&tokens), Some("scripts/run.py"));
+}
+
+#[test]
+fn env_with_flag_and_runner() {
+    // `env -i python3 script.py` — `-i` is a bare flag
+    let tokens = vec![
+        "env".to_string(),
+        "-i".to_string(),
+        "python3".to_string(),
+        "script.py".to_string(),
+    ];
+    assert_eq!(script_run_token(&tokens), Some("script.py"));
+}
+
+#[test]
+fn env_with_unknown_runner_returns_none() {
+    let tokens = vec![
+        "env".to_string(),
+        "notarunner".to_string(),
+        "script.py".to_string(),
+    ];
+    assert_eq!(script_run_token(&tokens), None);
+}
+
+#[test]
+fn env_empty_after_prefix_returns_none() {
+    let tokens = vec!["env".to_string()];
+    assert_eq!(script_run_token(&tokens), None);
+}
+
+// ── direct executable path detection ─────────────────────────────────────────
+
+#[test]
+fn direct_dotslash_script_is_detected() {
+    let tokens = vec!["./scripts/task.sh".to_string()];
+    assert_eq!(script_run_token(&tokens), Some("./scripts/task.sh"));
+}
+
+#[test]
+fn direct_absolute_script_is_detected() {
+    let tokens = vec!["/usr/local/lib/skill/run.py".to_string()];
+    assert_eq!(
+        script_run_token(&tokens),
+        Some("/usr/local/lib/skill/run.py")
+    );
+}
+
+#[test]
+fn direct_dotdot_script_is_detected() {
+    let tokens = vec!["../shared/scripts/run.sh".to_string()];
+    assert_eq!(script_run_token(&tokens), Some("../shared/scripts/run.sh"));
+}
+
+#[test]
+fn direct_path_without_script_extension_returns_none() {
+    // A `./binary` with no recognized extension is not a script run.
+    let tokens = vec!["./mybinary".to_string(), "arg".to_string()];
+    assert_eq!(script_run_token(&tokens), None);
+}
+
+// ── rg / fd / find as skill-doc readers ──────────────────────────────────────
+
+#[test]
+fn rg_is_recognized_as_file_reader() {
+    let tokens: Vec<String> = vec!["rg".to_string(), "SKILL.md".to_string()];
+    assert!(command_reads_file(&tokens));
+}
+
+#[test]
+fn fd_is_recognized_as_file_reader() {
+    let tokens: Vec<String> = vec!["fd".to_string(), "SKILL.md".to_string()];
+    assert!(command_reads_file(&tokens));
+}
+
+#[test]
+fn find_is_recognized_as_file_reader() {
+    let tokens: Vec<String> = vec![
+        "find".to_string(),
+        ".".to_string(),
+        "-name".to_string(),
+        "SKILL.md".to_string(),
+    ];
+    assert!(command_reads_file(&tokens));
+}
+
+// ── is_path_like helper ───────────────────────────────────────────────────────
+
+#[test]
+fn is_path_like_classifies_correctly() {
+    assert!(is_path_like("./foo.sh"));
+    assert!(is_path_like("../foo.sh"));
+    assert!(is_path_like("/abs/path/foo.py"));
+    assert!(!is_path_like("python3"));
+    assert!(!is_path_like("env"));
+    assert!(!is_path_like("script.py"));
+}
