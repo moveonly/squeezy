@@ -12104,18 +12104,29 @@ fn nested_ask_disabled_reason_is_set_for_suppressing_backends() {
     // Backends that suppress AF_UNIX sockets must provide a human-readable
     // reason so the model and user get a clear explanation rather than seeing
     // a missing SQUEEZY_ASK_SOCKET as a mysterious misconfiguration.
-    for backend in [
-        "linux-direct-syscalls",
-        "windows-restricted-token",
-        "windows-elevated",
-    ] {
+    // Each backend gets a differentiated message explaining the actual
+    // mechanism (seccomp deny vs. missing Win32 transport).
+    let linux_plan = fake_sandbox_plan("linux-direct-syscalls", false);
+    let linux_reason = linux_plan
+        .nested_ask_disabled_reason()
+        .expect("linux-direct-syscalls must report a disabled reason");
+    assert!(
+        linux_reason.contains("seccomp"),
+        "linux reason must mention seccomp filter: {linux_reason}"
+    );
+    assert!(
+        linux_reason.contains("nested ask disabled"),
+        "linux reason must describe the constraint: {linux_reason}"
+    );
+
+    for backend in ["windows-restricted-token", "windows-elevated"] {
         let plan = fake_sandbox_plan(backend, false);
         let reason = plan
             .nested_ask_disabled_reason()
             .unwrap_or_else(|| panic!("backend {backend} must report a disabled reason"));
         assert!(
-            reason.contains(backend),
-            "reason for {backend} must name the backend: {reason}"
+            reason.contains("Win32"),
+            "windows reason for {backend} must mention Win32: {reason}"
         );
         assert!(
             reason.contains("nested ask disabled"),
