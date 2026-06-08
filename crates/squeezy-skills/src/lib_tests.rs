@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Barrier, Mutex},
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -2548,7 +2548,7 @@ fn skill_hook_once_claims_concurrent_dispatches_atomically() {
     let registry = Arc::new(registry);
 
     const THREADS: usize = 8;
-    let barrier = Arc::new(Barrier::new(THREADS));
+    let barrier = Arc::new(std::sync::Barrier::new(THREADS));
     let mut handles = Vec::new();
     for index in 0..THREADS {
         let registry = Arc::clone(&registry);
