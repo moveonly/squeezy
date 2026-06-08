@@ -2355,6 +2355,41 @@ impl AppConfig {
                     .join(", ");
                 output.push_str(&format!("env = {{ {entries} }}\n"));
             }
+            if let Some(cwd) = &server.cwd {
+                output.push_str(&format!("cwd = {}\n", toml_string(cwd)));
+            }
+            if let Some(env_var) = &server.bearer_token_env_var {
+                output.push_str(&format!(
+                    "bearer_token_env_var = {}\n",
+                    toml_string(env_var)
+                ));
+            }
+            if !server.http_headers.is_empty() {
+                let entries = server
+                    .http_headers
+                    .keys()
+                    .map(|key| {
+                        format!(
+                            "{} = {}",
+                            toml_bare_or_quoted_key(key),
+                            toml_string("<redacted>")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                output.push_str(&format!("http_headers = {{ {entries} }}\n"));
+            }
+            if !server.env_http_headers.is_empty() {
+                let entries = server
+                    .env_http_headers
+                    .iter()
+                    .map(|(key, value)| {
+                        format!("{} = {}", toml_bare_or_quoted_key(key), toml_string(value))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                output.push_str(&format!("env_http_headers = {{ {entries} }}\n"));
+            }
             if let Some(default) = server.permissions.default {
                 output.push('\n');
                 output.push_str(&format!(
@@ -11083,6 +11118,12 @@ pub struct McpServerConfig {
     /// start. Map key is the header name, value is the env var name. On
     /// conflict with `http_headers`, the env-sourced value wins.
     pub env_http_headers: BTreeMap<String, String>,
+    /// Working directory for stdio MCP server processes. When set, the child
+    /// process is started in this directory so relative config paths, Node
+    /// package scripts, and Python virtualenv paths resolve predictably.
+    /// Particularly useful on Windows where MCP servers often need a specific
+    /// project root to locate their config files or dependencies.
+    pub cwd: Option<String>,
 }
 
 impl McpServerConfig {
@@ -11110,6 +11151,7 @@ impl McpServerConfig {
                 "bearer_token_env_var",
                 "http_headers",
                 "env_http_headers",
+                "cwd",
             ],
             source,
             path,
@@ -11176,6 +11218,7 @@ impl McpServerConfig {
             )?,
             http_headers,
             env_http_headers,
+            cwd: string_value(table, "cwd", source, &field(path, "cwd"))?,
         })
     }
 
@@ -11205,6 +11248,7 @@ impl McpServerConfig {
         if !next.env_http_headers.is_empty() {
             self.env_http_headers.extend(next.env_http_headers);
         }
+        replace_if_some(&mut self.cwd, next.cwd);
     }
 }
 
