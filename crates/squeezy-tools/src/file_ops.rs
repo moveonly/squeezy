@@ -560,7 +560,7 @@ impl ToolRegistry {
             // traversal escaping through symlinks that point outside the root.
             if follow_symlinks && entry.path_is_symlink() {
                 match path.canonicalize() {
-                    Ok(canonical) if !canonical.starts_with(&self.root) => {
+                    Ok(canonical) if !canonical.starts_with(self.root.as_path()) => {
                         symlink_skipped_count += 1;
                         continue;
                     }
@@ -768,7 +768,7 @@ impl ToolRegistry {
             // When following symlinks, enforce workspace containment.
             if follow_symlinks && entry.path_is_symlink() {
                 match path.canonicalize() {
-                    Ok(canonical) if !canonical.starts_with(&self.root) => {
+                    Ok(canonical) if !canonical.starts_with(self.root.as_path()) => {
                         symlink_skipped_count += 1;
                         continue;
                     }
