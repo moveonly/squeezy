@@ -1040,6 +1040,15 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         related: &["providers", "config"],
     },
     SlashCommandHelp {
+        name: "/parent",
+        what: "Force the next turn to use the parent (headline) model, bypassing cheap-model routing for one turn.",
+        syntax: "/parent",
+        examples: &["/parent  — run the next turn with the parent model regardless of routing"],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["providers", "config"],
+    },
+    SlashCommandHelp {
         name: "/reviewer",
         what: "Show recent AI reviewer auto-decisions for tool approvals.",
         syntax: "/reviewer",

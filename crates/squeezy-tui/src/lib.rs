@@ -4226,9 +4226,21 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         DispatchCommand::Diff => handle_slash_diff(app),
         DispatchCommand::Cheap => {
             agent.request_routing_force_cheap();
-            app.push_transcript_item(TranscriptItem::system(
-                "next turn forced to the cheap model (one-shot)".to_string(),
-            ));
+            let parent_model = agent.config_snapshot().model;
+            let note = match agent.cheap_model() {
+                Some(ref cheap) if cheap == &parent_model => {
+                    "\nNote: the cheap model resolves to the same model as the parent; \
+                     this turn will use the parent model."
+                }
+                None => {
+                    "\nNote: no distinct cheap model is configured for this provider; \
+                     this turn will fall back to the parent model."
+                }
+                Some(_) => "",
+            };
+            app.push_transcript_item(TranscriptItem::system(format!(
+                "next turn forced to the cheap model (one-shot){note}"
+            )));
             app.status = "routing: forced cheap next turn".to_string();
         }
         DispatchCommand::Parent => {
@@ -5329,10 +5341,13 @@ fn handle_slash_router(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
         }
     };
     agent.set_routing_session_disabled(disabled);
-    app.status = format!(
-        "routing → {}",
-        if disabled { "disabled" } else { "enabled" }
-    );
+    let label = if disabled { "disabled" } else { "enabled" };
+    app.status = format!("routing → {label} (session only)");
+    app.push_transcript_item(TranscriptItem::system(format!(
+        "Cheap-model routing {label} for this session.\n\
+         This is a session-only toggle and does not change `[routing].enabled` in your config.\n\
+         To persist the change, run `/config` and edit the Routing section.",
+    )));
 }
 
 /// `/tool-verbosity [compact|normal|verbose]`. Bare prints + usage hint;

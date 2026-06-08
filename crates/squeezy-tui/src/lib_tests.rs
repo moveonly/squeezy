@@ -5089,6 +5089,31 @@ fn slash_help_table_entries_exist_in_registry() {
     }
 }
 
+/// Bidirectional drift test for the high-value routing and mode command set.
+///
+/// These commands are part of the core routing/mode control surface and are
+/// especially likely to confuse users if they lack help entries.  The original
+/// drift test only checks the reverse direction (help entries must exist in the
+/// registry); this test checks that every routing/mode command has a curated
+/// help entry so `/help /parent`, `/help /cheap`, etc. resolve locally instead
+/// of falling through to unsupported/generic help.
+#[test]
+fn routing_and_mode_commands_have_help_entries() {
+    use squeezy_skills::slash_command_help_names;
+
+    const ROUTING_MODE_COMMANDS: &[&str] = &["/plan", "/build", "/cheap", "/parent", "/router"];
+
+    let help_names: std::collections::HashSet<&str> = slash_command_help_names().collect();
+
+    for cmd in ROUTING_MODE_COMMANDS {
+        assert!(
+            help_names.contains(cmd),
+            "routing/mode command {cmd:?} has no entry in SLASH_COMMAND_HELP_TABLE; \
+             add a help entry so `/help {cmd}` resolves locally"
+        );
+    }
+}
+
 #[tokio::test]
 async fn slash_help_lists_topics() {
     let mut agent = test_agent(SessionMode::Build);
