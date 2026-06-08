@@ -745,13 +745,17 @@ fn mcp_stdio_command_issue(command: &str) -> Option<String> {
     ))
 }
 
-/// Given a resolved path, check whether it has the execute bit set (Unix) or
-/// simply exists (Windows). Returns a warning string on problems, `None` on ok.
+/// Given a resolved path, check whether it names an executable file (Unix) or
+/// an existing file (Windows). Returns a warning string on problems, `None` on ok.
 fn mcp_stdio_path_issue(path: &std::path::Path) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         match fs::metadata(path) {
+            Ok(meta) if !meta.is_file() => Some(format!(
+                "stdio command '{}' exists but is not a file",
+                path.display()
+            )),
             Ok(meta) if meta.permissions().mode() & 0o111 != 0 => None,
             Ok(_) => Some(format!(
                 "stdio command '{}' exists but is not executable (missing execute bit)",
@@ -765,7 +769,7 @@ fn mcp_stdio_path_issue(path: &std::path::Path) -> Option<String> {
     }
     #[cfg(not(unix))]
     {
-        if path.exists() {
+        if path.is_file() {
             None
         } else {
             Some(format!("stdio command '{}' does not exist", path.display()))

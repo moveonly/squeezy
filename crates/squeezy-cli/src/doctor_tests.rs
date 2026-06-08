@@ -321,6 +321,32 @@ fn mcp_check_warns_when_stdio_command_not_executable() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn mcp_check_warns_when_stdio_command_is_directory() {
+    let dir = std::env::temp_dir().join(format!(
+        "squeezy-mcp-check-directory-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&dir).expect("create dir");
+    let mut servers = BTreeMap::new();
+    let mut server = mcp_fixture(true, McpTransport::Stdio);
+    server.command = Some(dir.to_string_lossy().into_owned());
+    servers.insert("directory".to_string(), server);
+    let check = mcp_check(&servers);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("not a file"),
+        "detail: {}",
+        check.detail
+    );
+}
+
 #[test]
 fn providers_check_reports_no_sections() {
     let settings = SettingsFile::default();
