@@ -146,7 +146,8 @@ impl SessionStore {
         {
             return Ok(());
         }
-        write_json(&path, calibration)
+        // Reuse the already-serialized bytes to avoid double serialization.
+        write_json_bytes(&path, &new_bytes)
     }
 
     /// Path to the user-global memory file. Returns `None` when `HOME` is
@@ -2842,6 +2843,13 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(value).map_err(json_error)?;
+    write_json_bytes(path, &bytes)
+}
+
+/// Write `bytes` to `path` atomically via a unique sibling temp file.
+/// Called by [`write_json`] (which serializes first) and by callers that
+/// have already serialized the value and want to avoid double-work.
+fn write_json_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     // Unique temp name: pid + monotonic counter so concurrent writers in
     // the same process (multiple session handles writing metadata or
     // calibration) never share a temp path. This is especially important
@@ -2849,7 +2857,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let seq = WRITE_UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = match path.file_name().and_then(|name| name.to_str()) {
         Some(name) => path.with_file_name(format!(".{}.{}.{}.tmp", name, std::process::id(), seq)),
-        None => path.with_extension("tmp"),
+        None => path.with_file_name(format!(".{}.{}.tmp", std::process::id(), seq)),
     };
     {
         let mut file = OpenOptions::new()
@@ -2857,7 +2865,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
             .truncate(true)
             .write(true)
             .open(&tmp)?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
     }
     if let Err(error) = rename_with_retry(&tmp, path) {
@@ -2875,12 +2883,13 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        const MAX_ATTEMPTS: u32 = 5;
+        // 4 retry attempts with backoff, then one final attempt — 5 total.
+        const RETRY_ATTEMPTS: u32 = 4;
         let mut delay_ms = 10u64;
-        for attempt in 0..MAX_ATTEMPTS {
+        for _ in 0..RETRY_ATTEMPTS {
             match fs::rename(from, to) {
                 Ok(()) => return Ok(()),
-                Err(ref e) if attempt + 1 < MAX_ATTEMPTS && is_windows_sharing_violation(e) => {
+                Err(ref e) if is_windows_sharing_violation(e) => {
                     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                     delay_ms = (delay_ms * 2).min(100);
                 }
@@ -2895,13 +2904,20 @@ fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Returns `true` when `e` is a Windows sharing violation (OS error 32).
+/// Returns `true` when `e` is a transient Windows sharing/lock violation that
+/// is worth retrying. Covers `ERROR_SHARING_VIOLATION` (32) and
+/// `ERROR_LOCK_VIOLATION` (33), which are both raised by AV scanners and
+/// indexers that briefly hold files without delete-sharing.
+///
+/// `ERROR_ACCESS_DENIED` (5) / `PermissionDenied` is intentionally excluded:
+/// that error is permanent (ACL denial, read-only target) and will not clear
+/// on retry.
+///
 /// Defined unconditionally to avoid `#[cfg]` noise at call sites; on
 /// non-Windows it is never reached.
 #[allow(unused)]
 fn is_windows_sharing_violation(e: &std::io::Error) -> bool {
-    e.raw_os_error() == Some(32) // ERROR_SHARING_VIOLATION
-        || e.kind() == std::io::ErrorKind::PermissionDenied
+    matches!(e.raw_os_error(), Some(32) | Some(33)) // ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION
 }
 
 /// Heuristic guard for [`SessionStore::record_global_index`].
@@ -2992,7 +3008,7 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
     let seq = WRITE_UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = match path.file_name().and_then(|name| name.to_str()) {
         Some(name) => path.with_file_name(format!(".{}.{}.{}.tmp", name, std::process::id(), seq)),
-        None => path.with_extension("tmp"),
+        None => path.with_file_name(format!(".{}.{}.tmp", std::process::id(), seq)),
     };
     {
         let mut file = OpenOptions::new()

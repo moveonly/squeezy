@@ -9085,6 +9085,12 @@ impl TurnRuntime {
         token_calibration: &squeezy_llm::TokenCalibration,
         mark_resume_available: bool,
     ) {
+        // Persist errors are captured while the lock is held and used to
+        // emit a session event *after* the lock drops so that
+        // `append_event`'s synchronous I/O does not extend the async-mutex
+        // window beyond what `write_resume_state` / `update_metadata` already
+        // require.
+        let mut persist_errors: Option<(Option<String>, Option<String>)> = None;
         let calibration_for_global = {
             let mut state = self.conversation_state.lock().await;
             merge_cost(&mut state.cost, cost);
@@ -9113,23 +9119,8 @@ impl TurnRuntime {
                     })
                     .err()
                     .map(|e| e.to_string());
-                // Record a session event when persistence fails so that
-                // bug reports carry concrete evidence without needing a
-                // provider call. On Windows this surfaces file-lock
-                // failures (Defender/indexer holding the file) that would
-                // otherwise silently leave /cost as live-only.
                 if resume_err.is_some() || metadata_err.is_some() {
-                    let _ = session.append_event(SessionEvent::from_typed(
-                        SessionEventKind::Custom {
-                            kind: "accounting_persistence_error".to_string(),
-                            payload: serde_json::json!({
-                                "resume_state_error": resume_err,
-                                "metadata_error": metadata_err,
-                            }),
-                        },
-                        Some(self.turn_id.to_string()),
-                        Some("accounting persistence failed".to_string()),
-                    ));
+                    persist_errors = Some((resume_err, metadata_err));
                 }
             }
             state.token_calibration.clone()
@@ -9139,6 +9130,27 @@ impl TurnRuntime {
         // than the per-provider defaults. Failures are silent — the global
         // file is a warm-start cache, not a source of truth.
         let _ = SessionStore::open(&self.config).save_global_calibration(&calibration_for_global);
+        // Record a session event when persistence fails so that bug reports
+        // carry concrete evidence without needing a provider call. On Windows
+        // this surfaces file-lock failures (Defender/indexer holding the file)
+        // that would otherwise silently leave /cost as live-only. Placed
+        // outside the conversation_state lock so that append_event's I/O does
+        // not block while the async mutex is held.
+        if let (Some((resume_err, metadata_err)), Some(session)) =
+            (persist_errors, &self.session_log)
+        {
+            let _ = session.append_event(SessionEvent::from_typed(
+                SessionEventKind::Custom {
+                    kind: "accounting_persistence_error".to_string(),
+                    payload: serde_json::json!({
+                        "resume_state_error": resume_err,
+                        "metadata_error": metadata_err,
+                    }),
+                },
+                Some(self.turn_id.to_string()),
+                Some("accounting persistence failed".to_string()),
+            ));
+        }
     }
 
     /// Fold a best-effort partial cost into `total_cost` and the broker's
