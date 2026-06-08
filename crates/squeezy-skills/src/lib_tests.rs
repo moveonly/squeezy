@@ -2336,10 +2336,14 @@ fn register_skill_hooks_installs_one_handler_per_spec() {
                     SkillHookSpec {
                         command: "true".to_string(),
                         once: false,
+                        timeout_secs: None,
+                        fail_open: true,
                     },
                     SkillHookSpec {
                         command: "true".to_string(),
                         once: true,
+                        timeout_secs: None,
+                        fail_open: true,
                     },
                 ],
             }],
@@ -2422,6 +2426,8 @@ fn skill_hook_fires_on_matching_event_and_skips_others() {
     let spec = SkillHookSpec {
         command: script.display().to_string(),
         once: false,
+        timeout_secs: None,
+        fail_open: true,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),
@@ -2482,6 +2488,8 @@ fn skill_hook_once_self_removes_after_first_run() {
     let spec = SkillHookSpec {
         command: script.display().to_string(),
         once: true,
+        timeout_secs: None,
+        fail_open: true,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),
@@ -2502,6 +2510,67 @@ fn skill_hook_once_self_removes_after_first_run() {
     }
     let count = fs::read_to_string(&counter).expect("read counter");
     assert_eq!(count.trim(), "1", "once: true must fire exactly once");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_hook_once_claims_concurrent_dispatches_atomically() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_workspace("skill_hook_once_concurrent");
+    let counter = root.join("count");
+    let script = root.join("hook.sh");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\nsleep 1\nprintf x >> {}\n", counter.display()),
+    )
+    .expect("write hook script");
+    let mut perms = fs::metadata(&script).expect("script meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script, perms).expect("chmod hook");
+
+    let spec = SkillHookSpec {
+        command: script.display().to_string(),
+        once: true,
+        timeout_secs: None,
+        fail_open: true,
+    };
+    let handler = SkillHookHandler::new(
+        "validator".to_string(),
+        HookEvent::PreToolUse,
+        None,
+        spec,
+        root.clone(),
+    );
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(handler));
+    let registry = Arc::new(registry);
+
+    const THREADS: usize = 8;
+    let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+    let mut handles = Vec::new();
+    for index in 0..THREADS {
+        let registry = Arc::clone(&registry);
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            let _ = registry.dispatch(squeezy_hooks::HookPayload::PreToolUse {
+                turn_id: "1".into(),
+                tool_name: "Bash".into(),
+                call_id: format!("c{index}"),
+            });
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("dispatch thread should finish");
+    }
+
+    let count = fs::read_to_string(&counter).unwrap_or_default().len();
+    assert_eq!(
+        count, 1,
+        "once: true must allow only one concurrent dispatch to execute"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2533,6 +2602,8 @@ fn skill_hook_once_retries_after_failed_first_run() {
     let spec = SkillHookSpec {
         command: script.display().to_string(),
         once: true,
+        timeout_secs: None,
+        fail_open: true,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),

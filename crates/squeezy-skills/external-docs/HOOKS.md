@@ -93,8 +93,13 @@ aliases).
 
 Hooks are disabled by default. When `[skills].hooks_enabled = true` and a skill
 with `hooks:` is activated, its hook handlers are registered against the
-session's `HookRegistry`. Hook commands run through `sh -c` with the privileges
-of the Squeezy process, so only enable this for trusted skill catalogs.
+session's `HookRegistry`. Hook commands run through `/bin/sh -c` (absolute path
+on POSIX; `sh` on Windows) with the privileges of the Squeezy process, so only
+enable this for trusted skill catalogs.
+
+> **Warning**: setting `hooks_enabled = true` is a high-trust operation.
+> `squeezy doctor` will flag this configuration as a warning so it is visible
+> in CI smoke runs. Use it only with skill catalogs you fully control.
 
 The `[skills]` section controls skill discovery:
 
@@ -105,6 +110,28 @@ user_dir = "~/.squeezy/skills"
 hooks_enabled = true
 ```
 
+### Per-hook options
+
+In addition to `command` and `once`, each hook spec accepts:
+
+- `timeout` — maximum seconds to wait before killing the hook process and
+  returning a deny result. Defaults to 30 seconds. A timed-out hook returns
+  deny so it does not silently pass while blocking the turn.
+- `fail_open` — when `false` (fail-closed), a spawn error (e.g. `/bin/sh` not
+  found, file-descriptor exhaustion) returns a deny result instead of silently
+  allowing execution. Defaults to `true` for backward compatibility.
+
+```yaml
+hooks:
+  PreToolUse:
+    - matcher: shell
+      hooks:
+        - type: command
+          command: scripts/audit-shell.sh
+          timeout: 10
+          fail_open: false
+```
+
 ## Environment Variables In Hook Scripts
 
 Scripts receive the following environment:
@@ -113,11 +140,127 @@ Scripts receive the following environment:
 - `SQUEEZY_SKILL_DIR` — absolute path to the skill's base directory.
 - `SQUEEZY_SKILL_NAME` — the skill's registered name.
 
+## Exit Codes and Diagnostics
+
+Hook scripts communicate intent through exit status:
+
+| Exit code | Meaning | Squeezy message |
+|-----------|---------|-----------------|
+| `0` | Allow; hook succeeded | (no message) |
+| `1`–`125` | Deny the action | `skill '<name>' hook denied the action` |
+| `126` | Command not executable | `skill '<name>' hook: command not executable (exit 126)` |
+| `127` | Interpreter or command not found | `skill '<name>' hook: interpreter or command not found (exit 127)` |
+
+Exit codes 126 and 127 appear when the hook script path is correct but either
+the executable bit is not set (`chmod +x`) or the shebang interpreter is not
+found. Run `squeezy doctor` to detect these issues before starting a session.
+
+## Shell Behavior on Linux
+
+Squeezy invokes hook commands as `/bin/sh -c "<command>"` on POSIX platforms.
+`/bin/sh` varies by distribution:
+
+- **Debian / Ubuntu** — `dash` (POSIX shell, strict mode)
+- **Fedora / RHEL** — `bash` in POSIX mode
+- **Alpine** — `ash` / `busybox sh`
+
+Write hooks in portable POSIX sh unless you explicitly need Bash features. If
+a hook requires Bash, use an explicit shebang in the script file:
+
+```sh
+#!/usr/bin/env bash
+```
+
+Inline shell snippets (containing `|`, `&&`, `;`, `>`, etc.) are allowed but
+depend on the distro's `/bin/sh` semantics. `squeezy doctor --hooks` notes
+inline snippets so you can verify they are portable.
+
+## Timeout and Process Cleanup
+
+Each hook runs with a timeout (default: 30 seconds, configurable per hook with
+`timeout: <secs>`). On timeout, Squeezy sends `SIGKILL` to the hook's process
+group so any grandchild processes spawned by the hook script are also
+terminated. The hook returns a deny result on timeout.
+
+## Linux Examples
+
+### Block sudo calls
+
+```yaml
+hooks:
+  PreToolUse:
+    - matcher: shell
+      hooks:
+        - type: command
+          command: scripts/no-sudo.sh
+          fail_open: false
+```
+
+```sh
+#!/bin/sh
+# scripts/no-sudo.sh
+# Deny any shell command that invokes sudo.
+payload="$SQUEEZY_HOOK_PAYLOAD"
+cmd=$(printf '%s' "$payload" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('arguments',{}).get('command',''))" 2>/dev/null || true)
+case "$cmd" in
+  *sudo*) exit 1 ;;
+esac
+exit 0
+```
+
+### Audit all tool calls
+
+```yaml
+hooks:
+  PreToolUse:
+    - matcher: "*"
+      hooks:
+        - type: command
+          command: scripts/audit.sh
+```
+
+```sh
+#!/bin/sh
+# scripts/audit.sh
+printf '%s\t%s\n' "$(date -Iseconds)" "$SQUEEZY_HOOK_PAYLOAD" >> "$SQUEEZY_SKILL_DIR/audit.log"
+exit 0
+```
+
+### Block systemctl writes
+
+```yaml
+hooks:
+  PreToolUse:
+    - matcher: shell
+      hooks:
+        - type: command
+          command: scripts/no-systemctl-write.sh
+          fail_open: false
+```
+
+```sh
+#!/bin/sh
+# scripts/no-systemctl-write.sh
+# Deny systemctl start/stop/enable/disable/mask.
+payload="$SQUEEZY_HOOK_PAYLOAD"
+cmd=$(printf '%s' "$payload" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('arguments',{}).get('command',''))" 2>/dev/null || true)
+case "$cmd" in
+  *systemctl\ start*|*systemctl\ stop*|*systemctl\ enable*|*systemctl\ disable*|*systemctl\ mask*)
+    exit 1 ;;
+esac
+exit 0
+```
+
 ## Use Cases
 
 - **Audit logging**: write tool calls or session events to a local log file.
 - **Policy enforcement**: deny shell commands that match a blocklist on
   `PreToolUse`.
 - **Observability**: emit structured telemetry events to an internal system.
+- **Package-manager guardrails**: block `apt install`, `pip install --user`, or
+  `npm install -g` on `PreToolUse` to enforce workspace-local dependency
+  management.
+- **Workspace-bound shell auditing**: log every shell command with its
+  arguments to a structured audit trail for compliance workflows.
 
 See [SKILLS.md](SKILLS.md) for the full skill authoring guide.

@@ -230,7 +230,12 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         if args.probe && config.mcp_servers.values().any(|server| server.enabled) {
             checks.extend(probe_mcp_servers(&config.mcp_servers).await);
         }
-        checks.push(skills_check(config));
+        let skill_catalog =
+            squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
+        checks.push(skills_check(config, &skill_catalog));
+        if let Some(hooks) = hooks_check(config, &skill_catalog) {
+            checks.push(hooks);
+        }
         checks.push(session_store_check(config));
         checks.push(state_store_check(config));
         checks.push(cache_check(config, args.prune_cache));
@@ -854,8 +859,7 @@ fn mcp_stale_outcome_detail(outcome: &McpStaleOutcome) -> String {
 /// same-precedence name collision flips trigger activation into
 /// ambiguous mode. Pure stat work so the row stays fast and matches
 /// the rest of `doctor`'s offline-CI contract.
-fn skills_check(config: &AppConfig) -> Check {
-    let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
+fn skills_check(config: &AppConfig, catalog: &squeezy_skills::SkillCatalog) -> Check {
     let summaries = catalog.summaries();
     if summaries.is_empty() {
         return Check {
@@ -883,13 +887,73 @@ fn skills_check(config: &AppConfig) -> Check {
         };
     }
     if config.skills.hooks_enabled {
-        detail.push_str("; hooks_enabled");
+        // Hooks run as sh -c with Squeezy's full process privileges, so
+        // warn in doctor whenever this high-trust mode is active so
+        // operators notice it in CI smoke runs.
+        detail.push_str("; hooks_enabled=true (hooks run with Squeezy process privileges)");
+        return Check {
+            name: "skills".to_string(),
+            status: Status::Warn,
+            detail,
+        };
     }
     Check {
         name: "skills".to_string(),
         status: Status::Ok,
         detail,
     }
+}
+
+/// Validate hook declarations for every non-disabled skill when
+/// `[skills].hooks_enabled = true`. Reports missing scripts, missing
+/// executable bits, missing shebang lines, and inline shell snippets.
+/// Returns `None` when hooks are disabled so the check row is omitted
+/// entirely rather than cluttering the output.
+fn hooks_check(config: &AppConfig, catalog: &squeezy_skills::SkillCatalog) -> Option<Check> {
+    if !config.skills.hooks_enabled {
+        return None;
+    }
+    let issues = squeezy_skills::catalog_hook_issues(catalog);
+
+    // Count declared handlers for the detail line.
+    let total_handlers: usize = catalog
+        .summaries()
+        .iter()
+        .filter(|s| !s.disabled)
+        .filter_map(|s| catalog.load(&s.name).ok())
+        .map(|loaded| {
+            loaded
+                .hooks
+                .values()
+                .map(|matchers| matchers.iter().map(|m| m.hooks.len()).sum::<usize>())
+                .sum::<usize>()
+        })
+        .sum();
+    // Note: catalog.load() results are cached, so the loads above and those
+    // inside catalog_hook_issues() hit the skill-catalog cache.
+
+    let errors = issues.iter().filter(|i| i.is_error).count();
+    let notes = issues.iter().filter(|i| !i.is_error).count();
+    let mut detail = format!("handlers={total_handlers}");
+    if errors > 0 || notes > 0 {
+        detail.push_str(&format!("; errors={errors} notes={notes}"));
+        for issue in &issues {
+            let kind = if issue.is_error { "error" } else { "note" };
+            detail.push_str(&format!("; {kind}:{} {}", issue.skill, issue.message));
+        }
+    }
+    let status = if errors > 0 {
+        Status::Fail
+    } else if notes > 0 {
+        Status::Warn
+    } else {
+        Status::Ok
+    };
+    Some(Check {
+        name: "hooks".to_string(),
+        status,
+        detail,
+    })
 }
 
 /// Pull the result of `update::check_for_update()` into a doctor row. Newer

@@ -26,13 +26,29 @@ The current skill hook surface is intentionally smaller than the internal enum.
 `SubagentStop`, and `UserPromptSubmit` may be dispatched by the hook registry
 or typed hook bus, but they are not accepted in skill frontmatter today.
 
-Skill hook commands run through `sh -c` from the skill directory with
-`SQUEEZY_HOOK_PAYLOAD`, `SQUEEZY_SKILL_DIR`, and `SQUEEZY_SKILL_NAME` set.
-`matcher` filters tool-scoped payloads by exact `tool_name`; an omitted matcher
-means every payload for that event. `once: true` suppresses later executions
-only after a successful exit, so a failed first run can retry. Stdout is not
-parsed for mutations. A successful exit allows the event; a non-zero exit
-returns a deny result where the dispatch site enforces one.
+Skill hook commands run through `/bin/sh -c` (absolute path on POSIX, `sh` on
+Windows) from the skill directory with `SQUEEZY_HOOK_PAYLOAD`,
+`SQUEEZY_SKILL_DIR`, and `SQUEEZY_SKILL_NAME` set. The child process is placed
+in its own process group (`process_group(0)` on Unix) so a timeout signal
+reaches all grandchildren. A per-hook `timeout` (default 30 s) is enforced via
+a background thread; on expiry the process group receives `SIGKILL` and the
+hook returns deny. Payloads larger than 32 KB are truncated before the env var
+is set to stay within Linux `execve` environment limits. Spawn errors are
+fail-open by default; set `fail_open = false` in the frontmatter spec for
+enforcement hooks that must not silently pass when the interpreter is missing.
+
+`matcher` filters tool-scoped payloads by direct comparison against the typed
+`HookPayload` field (no JSON allocation on mismatch) before JSON is projected.
+`once: true` suppresses later executions only after a successful exit, so a
+failed first run can retry. Stdout is not parsed for mutations. A successful
+exit allows the event; a non-zero exit returns a deny result where the dispatch
+site enforces one. Exit codes 126 and 127 surface targeted messages:
+"command not executable" and "interpreter or command not found" respectively.
+
+`squeezy doctor` warns when `hooks_enabled = true` (high-privilege mode) and
+runs a static hook-validation pass (`catalog_hook_issues`) that checks for
+missing script files, non-executable scripts, and missing shebang lines without
+spawning any processes.
 
 ## Prompt enrichment
 

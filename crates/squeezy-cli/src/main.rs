@@ -332,21 +332,6 @@ struct McpAddArgs {
         help = "Block a specific tool name; repeat for multiple"
     )]
     disabled_tools: Vec<String>,
-    #[arg(
-        long,
-        help = "Name of the environment variable holding the bearer token (http/sse only)"
-    )]
-    bearer_token_env_var: Option<String>,
-    #[arg(
-        long = "http-header",
-        help = "Static HTTP header in NAME=VALUE form (http/sse only); repeat for multiple"
-    )]
-    http_headers: Vec<String>,
-    #[arg(
-        long = "env-http-header",
-        help = "Env-sourced HTTP header in HEADER_NAME=ENV_VAR form (http/sse only); repeat for multiple"
-    )]
-    env_http_headers: Vec<String>,
 }
 
 #[derive(Debug, Args)]
