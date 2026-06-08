@@ -4134,20 +4134,21 @@ fn slash_menu_surfaces_capability_badges_for_world_touching_commands() {
 #[test]
 fn slash_suggestion_line_contents_match_command_capabilities() {
     // Build the menu lines directly and assert the badge follows the
-    // declared capabilities — covers both presence (`/help` → `net`) and
-    // absence (`/cost` → no badge).
+    // declared capabilities — covers both presence (`/compact` → `net`) and
+    // absence (`/cost` → no badge). `/help` is local-first so it no longer
+    // carries a network badge.
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/help".to_string());
+    set_input(&mut app, "/compact".to_string());
     let lines = slash_suggestion_lines(&app, 120);
     let serialised = lines
         .iter()
         .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
         .collect::<Vec<String>>();
-    let help_line = serialised
+    let compact_line = serialised
         .iter()
-        .find(|line| line.contains("/help"))
-        .expect("rendered /help line");
-    assert!(help_line.contains("[net]"), "{help_line}");
+        .find(|line| line.contains("/compact"))
+        .expect("rendered /compact line");
+    assert!(compact_line.contains("[net]"), "{compact_line}");
 
     set_input(&mut app, "/cost".to_string());
     let lines = slash_suggestion_lines(&app, 120);
@@ -5096,12 +5097,8 @@ async fn slash_help_lists_topics() {
 
     assert!(handle_slash_command(&mut app, &mut agent, "/help").await);
 
-    wait_for_turn_completion(&mut app).await;
+    // Local help answers are rendered immediately without starting a model turn.
     let content = last_message_content(&app).expect("help transcript");
-    assert!(
-        transcript_message_contents(&app).contains(&"/help"),
-        "user prompt should remain in the transcript"
-    );
     assert!(content.contains("Available `/help` topics"), "{content}");
     assert!(content.contains("`providers`"), "{content}");
 }
@@ -5113,12 +5110,8 @@ async fn slash_help_config_renders_citations_and_config() {
 
     assert!(handle_slash_command(&mut app, &mut agent, "/help providers").await);
 
-    wait_for_turn_completion(&mut app).await;
+    // Local help answers are rendered immediately without starting a model turn.
     let content = last_message_content(&app).expect("help transcript");
-    assert!(
-        transcript_message_contents(&app).contains(&"/help providers"),
-        "user prompt should remain in the transcript"
-    );
     assert!(content.contains("docs/external/PROVIDERS.md"), "{content}");
     assert!(content.contains("[model]"), "{content}");
     assert!(!content.contains("--api-key"), "{content}");
@@ -5138,14 +5131,13 @@ async fn inline_slash_help_dispatches_from_prompt_body() {
     .await
     .expect("handle key");
 
-    wait_for_turn_completion(&mut app).await;
+    // Local help answers are rendered immediately; input is cleared.
     assert!(app.input.is_empty());
-    assert!(
-        transcript_message_contents(&app).contains(&"/help providers"),
-        "inline /help should dispatch the command from its inline position"
-    );
     let content = last_message_content(&app).expect("help transcript");
-    assert!(content.contains("docs/external/PROVIDERS.md"), "{content}");
+    assert!(
+        content.contains("docs/external/PROVIDERS.md"),
+        "inline /help should dispatch from its position and render local answer: {content}"
+    );
 }
 
 #[tokio::test]

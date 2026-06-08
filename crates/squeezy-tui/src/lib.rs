@@ -50,7 +50,7 @@ use squeezy_core::{
     context_attachment_storage_text, detect_context_attachment_kind, detect_image_mime,
 };
 use squeezy_llm::{LlmInputItem, LlmProvider};
-use squeezy_skills::PromptTemplateCatalog;
+use squeezy_skills::{HelpStatus, PromptTemplateCatalog, SqueezyHelp};
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
 use squeezy_telemetry::{
     ConfigApplyTier, ConfigChangeKind, ConfigChangeReport, ConfigScopeKind, PreparedFeedback,
@@ -2548,9 +2548,13 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 app.status_line_setup = None;
                 app.status = "/statusline cancelled".to_string();
             }
-            status_line_setup::KeyOutcome::Save { items, use_colors } => {
+            status_line_setup::KeyOutcome::Save {
+                items,
+                use_colors,
+                scope,
+            } => {
                 app.status_line_setup = None;
-                save_status_line(app, agent, items, use_colors);
+                save_status_line(app, agent, items, use_colors, scope);
             }
         }
         return Ok(false);
@@ -3451,18 +3455,30 @@ fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: String) {
 }
 
 /// Persist the picker's selection to `[tui].status_line` /
-/// `[tui].status_line_use_colors` in the user-scope settings file and
-/// apply it in-memory immediately.
+/// `[tui].status_line_use_colors` in the chosen scope (user or project
+/// settings file) and apply it in-memory immediately.
 fn save_status_line(
     app: &mut TuiApp,
     agent: &mut Agent,
     items: Vec<status::StatusLineItem>,
     use_colors: bool,
+    scope: status_line_setup::SaveScope,
 ) {
     use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
 
-    let target_path = app.user_settings_path();
-    let scope_target = SettingsScope::user(&target_path);
+    let (target_path, scope_target) = match scope {
+        status_line_setup::SaveScope::User => {
+            let p = app.user_settings_path();
+            let s = SettingsScope::user(&p);
+            (p, s)
+        }
+        status_line_setup::SaveScope::Project => {
+            let p = squeezy_core::find_project_settings_path(&app.workspace_root)
+                .unwrap_or_else(|| app.workspace_root.join(squeezy_core::PROJECT_SETTINGS_FILE));
+            let s = SettingsScope::project(&p);
+            (p, s)
+        }
+    };
     let slug_list: Vec<String> = items.iter().map(|i| i.slug().to_string()).collect();
     let edits = [
         SettingsEdit {
@@ -4848,6 +4864,18 @@ fn handle_help_command(app: &mut TuiApp, agent: &mut Agent, rest: &str) {
     } else {
         format!("/help {}", rest.trim())
     };
+    // Attempt to answer locally from the bundled skills knowledge base before
+    // sending the turn to the model. This avoids a network round-trip for the
+    // large majority of help requests.
+    let help = SqueezyHelp::new("");
+    if let Some(answer) = help.answer_for_input(&prompt) {
+        if answer.status == HelpStatus::Answered {
+            app.push_transcript_item(TranscriptItem::system(answer.render_markdown()));
+            app.status = format!("help: {}", answer.topic);
+            return;
+        }
+    }
+    // Topic not covered locally — fall back to a model turn.
     start_user_turn(app, agent, prompt);
 }
 

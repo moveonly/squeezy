@@ -122,13 +122,13 @@ pub(crate) fn match_slash_command_prefix(text: &str) -> Option<usize> {
 }
 
 pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
-    // `/help` is forwarded to the model as a normal user turn, so it counts
-    // as a network-exercising command.
-    slash_caps(
+    // `/help` answers locally from bundled docs; falls back to the model only
+    // for topics without local coverage.
+    slash_args(
         "/help",
-        "show local Squeezy help topics",
+        "show local Squeezy help topics (falls back to model for unknown topics)",
         true,
-        &[PermissionCapability::Network],
+        "[topic|/slash-command]",
     ),
     slash_args_caps(
         "/config",
