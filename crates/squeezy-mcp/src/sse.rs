@@ -30,9 +30,10 @@ use rmcp::{
 };
 use tracing::{debug, warn};
 
-/// Minimum interval between automatic reconnect attempts when the SSE stream
-/// ends without a recoverable cause.
-const SSE_RECONNECT_DELAY: Duration = Duration::from_millis(1000);
+/// Base reconnect delay for the first SSE stream reconnect attempt.
+const SSE_RECONNECT_BASE_MS: u64 = 250;
+/// Maximum reconnect delay cap (after exponential growth with jitter).
+const SSE_RECONNECT_MAX_MS: u64 = 30_000;
 
 /// Errors raised by the SSE transport worker.
 #[derive(Debug, thiserror::Error)]
@@ -117,6 +118,12 @@ impl Worker for SseClientWorker {
             "established legacy MCP SSE session"
         );
 
+        // Consecutive reconnect counter; reset to 0 after a successful message
+        // delivery so the backoff window only grows during an unbroken failure
+        // streak (e.g. a crashing local daemon), not across normal session
+        // lifetime.
+        let mut reconnect_attempts: u32 = 0;
+
         loop {
             tokio::select! {
                 _ = context.cancellation_token.cancelled() => {
@@ -147,6 +154,10 @@ impl Worker for SseClientWorker {
                             }
                             match serde_json::from_str::<ServerJsonRpcMessage>(&payload) {
                                 Ok(message) => {
+                                    // Successful delivery — reset the backoff
+                                    // counter so intermittent disconnects don't
+                                    // accumulate into a long wait.
+                                    reconnect_attempts = 0;
                                     context.send_to_handler(message).await?;
                                 }
                                 Err(err) => {
@@ -160,11 +171,19 @@ impl Worker for SseClientWorker {
                             }
                         }
                         None => {
-                            // Stream ended; reopen the GET after a short
-                            // back-off. Each new session re-advertises its
-                            // POST endpoint, so we replace the one we are
+                            // Stream ended; reopen the GET after an exponential
+                            // backoff with jitter. Each new session re-advertises
+                            // its POST endpoint, so we replace the one we are
                             // using rather than reusing the stale URL.
-                            tokio::time::sleep(SSE_RECONNECT_DELAY).await;
+                            let delay_ms = sse_reconnect_delay_ms(reconnect_attempts);
+                            reconnect_attempts = reconnect_attempts.saturating_add(1);
+                            debug!(
+                                target: "squeezy::mcp::sse",
+                                attempt = reconnect_attempts,
+                                delay_ms,
+                                "SSE stream ended; reconnecting after backoff"
+                            );
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                             let response = match self.open_stream().await {
                                 Ok(response) => response,
                                 Err(error) => {
@@ -190,6 +209,33 @@ impl Worker for SseClientWorker {
             }
         }
     }
+}
+
+/// Compute the reconnect backoff delay in milliseconds for the given attempt
+/// number (0-indexed). Uses full-jitter exponential backoff:
+///
+/// ```text
+/// delay = rand(0 .. min(SSE_RECONNECT_MAX_MS, SSE_RECONNECT_BASE_MS * 2^attempt))
+/// ```
+///
+/// Full jitter spreads concurrent clients across the reconnect window and
+/// prevents the thundering-herd that a fixed or additive backoff produces
+/// when a local daemon crashes and many reconnects pile up simultaneously.
+fn sse_reconnect_delay_ms(attempt: u32) -> u64 {
+    let shift = attempt.min(10); // cap the shift to avoid overflow
+    let cap = SSE_RECONNECT_BASE_MS
+        .saturating_mul(1u64 << shift)
+        .min(SSE_RECONNECT_MAX_MS);
+    // Cheap deterministic jitter from the current time's sub-millisecond bits.
+    let jitter_source = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(12345);
+    // Map nanos to [0, cap)
+    (jitter_source as u64)
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1)
+        % cap.max(1)
 }
 
 impl SseClientWorker {

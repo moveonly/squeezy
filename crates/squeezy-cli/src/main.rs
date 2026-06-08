@@ -279,10 +279,45 @@ struct McpAddArgs {
     url: Option<String>,
     #[arg(long, help = "Timeout in milliseconds")]
     timeout_ms: Option<u64>,
+    #[arg(
+        long,
+        help = "Discovery-phase timeout in milliseconds (overrides --timeout-ms)"
+    )]
+    discovery_timeout_ms: Option<u64>,
+    #[arg(
+        long,
+        help = "Tool-call timeout in milliseconds (overrides --timeout-ms)"
+    )]
+    tool_call_timeout_ms: Option<u64>,
     #[arg(long = "env", help = "Environment entry in KEY=VALUE form")]
     env: Vec<String>,
     #[arg(long, help = "Per-server default permission: allow, ask, or deny")]
     permission_default: Option<String>,
+    #[arg(
+        long = "enabled-tool",
+        help = "Allow-list a specific tool name; repeat for multiple (all tools enabled when unset)"
+    )]
+    enabled_tools: Vec<String>,
+    #[arg(
+        long = "disabled-tool",
+        help = "Block a specific tool name; repeat for multiple"
+    )]
+    disabled_tools: Vec<String>,
+    #[arg(
+        long,
+        help = "Name of the environment variable holding the bearer token (http/sse only)"
+    )]
+    bearer_token_env_var: Option<String>,
+    #[arg(
+        long = "http-header",
+        help = "Static HTTP header in NAME=VALUE form (http/sse only); repeat for multiple"
+    )]
+    http_headers: Vec<String>,
+    #[arg(
+        long = "env-http-header",
+        help = "Env-sourced HTTP header in HEADER_NAME=ENV_VAR form (http/sse only); repeat for multiple"
+    )]
+    env_http_headers: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1084,6 +1119,18 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
                         Item::Value(TomlValue::from(timeout_ms as i64)),
                     );
                 }
+                if let Some(ms) = args.discovery_timeout_ms {
+                    server.insert(
+                        "discovery_timeout_ms",
+                        Item::Value(TomlValue::from(ms as i64)),
+                    );
+                }
+                if let Some(ms) = args.tool_call_timeout_ms {
+                    server.insert(
+                        "tool_call_timeout_ms",
+                        Item::Value(TomlValue::from(ms as i64)),
+                    );
+                }
                 if !args.env.is_empty() {
                     let mut env = toml_edit::InlineTable::default();
                     for entry in &args.env {
@@ -1097,6 +1144,45 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
                     let mut permissions = Table::new();
                     permissions.insert("default", Item::Value(TomlValue::from(default.as_str())));
                     server.insert("permissions", Item::Table(permissions));
+                }
+                if !args.enabled_tools.is_empty() {
+                    let mut array = toml_edit::Array::default();
+                    for tool in &args.enabled_tools {
+                        array.push(tool.as_str());
+                    }
+                    server.insert("enabled_tools", Item::Value(TomlValue::Array(array)));
+                }
+                if !args.disabled_tools.is_empty() {
+                    let mut array = toml_edit::Array::default();
+                    for tool in &args.disabled_tools {
+                        array.push(tool.as_str());
+                    }
+                    server.insert("disabled_tools", Item::Value(TomlValue::Array(array)));
+                }
+                if let Some(var) = &args.bearer_token_env_var {
+                    server.insert(
+                        "bearer_token_env_var",
+                        Item::Value(TomlValue::from(var.as_str())),
+                    );
+                }
+                if !args.http_headers.is_empty() {
+                    let mut table = toml_edit::InlineTable::default();
+                    for entry in &args.http_headers {
+                        let (name, value) = parse_env_entry(entry)?;
+                        table.insert(name, TomlValue::from(value));
+                    }
+                    server.insert("http_headers", Item::Value(TomlValue::InlineTable(table)));
+                }
+                if !args.env_http_headers.is_empty() {
+                    let mut table = toml_edit::InlineTable::default();
+                    for entry in &args.env_http_headers {
+                        let (name, value) = parse_env_entry(entry)?;
+                        table.insert(name, TomlValue::from(value));
+                    }
+                    server.insert(
+                        "env_http_headers",
+                        Item::Value(TomlValue::InlineTable(table)),
+                    );
                 }
                 servers.insert(&args.name, Item::Table(server));
                 Ok(())

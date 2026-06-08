@@ -68,6 +68,12 @@ const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
 const HASH_SUFFIX_BYTES: usize = 12;
 const RESOURCE_READ_CACHE_TTL: Duration = Duration::from_secs(300);
 const RESOURCE_DECLARATION_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Maximum number of stderr lines kept per stdio MCP session.
+const STDERR_RING_CAPACITY: usize = 20;
+/// Maximum bytes per stderr line before truncation. Lines from an untrusted
+/// child process are capped before logging or surfacing to avoid log injection
+/// and unbounded memory growth from long unterminated writes.
+const STDERR_LINE_MAX_BYTES: usize = 256;
 /// Cap on retained resource-read cache entries. The registry lives for the
 /// whole session, so without a bound a server (or agent loop) that reads many
 /// distinct URIs would accumulate their full bodies indefinitely. Mirrors the
@@ -301,6 +307,12 @@ pub struct McpClientRegistry {
     servers: Arc<std::sync::RwLock<Arc<BTreeMap<String, McpServerConfig>>>>,
     cache: Arc<Mutex<BTreeMap<String, ExternalMcpTool>>>,
     sessions: Arc<TokioMutex<BTreeMap<String, Arc<SessionEntry>>>>,
+    /// Per-server async mutex that serializes concurrent `session_for` calls
+    /// for the same server name. Prevents duplicate stdio child processes when
+    /// multiple callers race to bring up the same server for the first time.
+    /// The inner `Arc<TokioMutex<()>>` is held for the entire startup duration;
+    /// subsequent callers find the session already populated after the gate.
+    startup_gates: Arc<Mutex<BTreeMap<String, Arc<TokioMutex<()>>>>>,
     store: Option<Arc<SqueezyStore>>,
     status_tx: watch::Sender<McpStatusSnapshot>,
     elicitation_handler: Arc<Mutex<Option<McpElicitationHandler>>>,
@@ -336,6 +348,7 @@ impl McpClientRegistry {
             servers: Arc::new(std::sync::RwLock::new(Arc::new(servers))),
             cache: Arc::new(Mutex::new(BTreeMap::new())),
             sessions: Arc::new(TokioMutex::new(BTreeMap::new())),
+            startup_gates: Arc::new(Mutex::new(BTreeMap::new())),
             store,
             status_tx,
             elicitation_handler: Arc::new(Mutex::new(None)),
@@ -853,19 +866,27 @@ impl McpClientRegistry {
                 })
             },
         )
-        .await?;
-        let result = strip_untrusted_meta(result);
-        if let Ok(mut cache) = self.resource_reads.lock() {
-            insert_resource_read(
-                &mut cache,
-                key,
-                CachedResourceRead {
-                    value: result.clone(),
-                    fetched_at: Instant::now(),
-                },
-            );
+        .await;
+        match result {
+            Err(error) => {
+                self.invalidate_session(server_name).await;
+                Err(error)
+            }
+            Ok(result) => {
+                let result = strip_untrusted_meta(result);
+                if let Ok(mut cache) = self.resource_reads.lock() {
+                    insert_resource_read(
+                        &mut cache,
+                        key,
+                        CachedResourceRead {
+                            value: result.clone(),
+                            fetched_at: Instant::now(),
+                        },
+                    );
+                }
+                Ok(result)
+            }
         }
-        Ok(result)
     }
 
     async fn discover_one(
@@ -979,6 +1000,29 @@ impl McpClientRegistry {
         server_name: &str,
         server: &McpServerConfig,
     ) -> McpResult<Arc<McpService>> {
+        // Fast path: session already exists.
+        {
+            let sessions = self.sessions.lock().await;
+            if let Some(entry) = sessions.get(server_name) {
+                return Ok(entry.service.clone());
+            }
+        }
+
+        // Serialise concurrent first-use for the same server name so that at
+        // most one stdio child process is ever started per server. The gate is
+        // a per-server async mutex stored in a sync map; we only hold the sync
+        // lock long enough to clone the Arc.
+        let gate = {
+            let mut gates = self.startup_gates.lock().unwrap_or_else(|p| p.into_inner());
+            gates
+                .entry(server_name.to_string())
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone()
+        };
+        let _gate_guard = gate.lock().await;
+
+        // Re-check after acquiring the gate: a concurrent caller may have
+        // already started the session while we were waiting.
         {
             let sessions = self.sessions.lock().await;
             if let Some(entry) = sessions.get(server_name) {
@@ -1002,9 +1046,6 @@ impl McpClientRegistry {
         };
         let arc = Arc::new(entry);
         let mut sessions = self.sessions.lock().await;
-        if let Some(existing) = sessions.get(server_name) {
-            return Ok(existing.service.clone());
-        }
         sessions.insert(server_name.to_string(), arc.clone());
         Ok(arc.service.clone())
     }
@@ -1023,6 +1064,22 @@ impl McpClientRegistry {
         if let Ok(mut cache) = self.resource_declarations.lock() {
             cache.clear();
         }
+    }
+
+    /// Return a snapshot of the recent stderr lines for the named stdio MCP
+    /// server. Returns an empty vec if the server has no active session, is not
+    /// a stdio transport, or no lines have been captured yet.
+    pub async fn stderr_tail(&self, server_name: &str) -> Vec<String> {
+        let sessions = self.sessions.lock().await;
+        let Some(entry) = sessions.get(server_name) else {
+            return Vec::new();
+        };
+        let Some(ring) = &entry.stderr_ring else {
+            return Vec::new();
+        };
+        ring.lock()
+            .map(|r| r.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Server-advertised capabilities captured during `initialize`, or `None`
@@ -1422,6 +1479,10 @@ struct SessionEntry {
     /// returns. `None` only if the peer never delivered an `initialize` result,
     /// which would have failed the bring-up before this `SessionEntry` exists.
     server_capabilities: Option<ServerCapabilities>,
+    /// Ring buffer of recent stderr lines from the stdio child process.
+    /// Bounded to `STDERR_RING_CAPACITY` lines; each line is truncated to
+    /// `STDERR_LINE_MAX_BYTES` bytes. `None` for non-stdio transports.
+    stderr_ring: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
 }
 
 #[derive(Debug)]
@@ -1864,18 +1925,39 @@ async fn start_stdio_service(
             message: err.to_string(),
         })?;
     let process_handle = transport.id().map(StdioProcessHandle::new);
+    let stderr_ring: Arc<Mutex<std::collections::VecDeque<String>>> = Arc::new(Mutex::new(
+        std::collections::VecDeque::with_capacity(STDERR_RING_CAPACITY),
+    ));
     if let Some(stderr) = stderr {
         let server_name = server_name.to_string();
+        let ring = stderr_ring.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             loop {
                 match lines.next_line().await {
-                    Ok(Some(line)) => tracing::info!(
-                        target: "squeezy::mcp",
-                        server = %server_name,
-                        stderr = %line,
-                        "MCP server stderr"
-                    ),
+                    Ok(Some(raw_line)) => {
+                        // Truncate untrusted child output before logging or
+                        // storing to avoid log injection and memory growth.
+                        let line = if raw_line.len() > STDERR_LINE_MAX_BYTES {
+                            let mut s = raw_line[..STDERR_LINE_MAX_BYTES].to_string();
+                            s.push_str(" [truncated]");
+                            s
+                        } else {
+                            raw_line
+                        };
+                        tracing::info!(
+                            target: "squeezy::mcp",
+                            server = %server_name,
+                            stderr = %line,
+                            "MCP server stderr"
+                        );
+                        if let Ok(mut ring) = ring.lock() {
+                            if ring.len() >= STDERR_RING_CAPACITY {
+                                ring.pop_front();
+                            }
+                            ring.push_back(line);
+                        }
+                    }
                     Ok(None) => break,
                     Err(error) => {
                         tracing::warn!(
@@ -1902,6 +1984,7 @@ async fn start_stdio_service(
         service: Arc::new(service),
         _process: process_handle,
         server_capabilities,
+        stderr_ring: Some(stderr_ring),
     })
 }
 
@@ -1934,6 +2017,7 @@ async fn start_http_service(
         service: Arc::new(service),
         _process: None,
         server_capabilities,
+        stderr_ring: None,
     })
 }
 
@@ -1975,6 +2059,7 @@ async fn start_sse_service(
         service: Arc::new(service),
         _process: None,
         server_capabilities,
+        stderr_ring: None,
     })
 }
 

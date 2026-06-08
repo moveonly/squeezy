@@ -603,17 +603,47 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
         enabled += 1;
         match server.transport {
             McpTransport::Stdio => {
-                if server
-                    .command
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or("")
-                    .is_empty()
-                {
+                let cmd = server.command.as_deref().map(str::trim).unwrap_or("");
+                if cmd.is_empty() {
                     if !issues.is_empty() {
                         issues.push_str(", ");
                     }
                     let _ = write!(issues, "{name}: stdio transport without command");
+                } else {
+                    // Warn about relative command paths — they depend on the
+                    // working-directory and $PATH at startup time and may
+                    // resolve to a different binary than intended.
+                    if !std::path::Path::new(cmd).is_absolute() {
+                        if !issues.is_empty() {
+                            issues.push_str(", ");
+                        }
+                        let _ = write!(
+                            issues,
+                            "{name}: stdio command is a relative path ({cmd:?}); \
+                             use an absolute path for reproducible resolution"
+                        );
+                    }
+                    // Warn about env overrides that can redirect dynamic
+                    // linker or interpreter search paths — common vectors for
+                    // unintentional binary substitution on Linux.
+                    const RISKY_ENV_VARS: &[&str] = &[
+                        "PATH",
+                        "LD_PRELOAD",
+                        "LD_LIBRARY_PATH",
+                        "PYTHONPATH",
+                        "NODE_OPTIONS",
+                    ];
+                    for var in RISKY_ENV_VARS {
+                        if server.env.contains_key(*var) {
+                            if !issues.is_empty() {
+                                issues.push_str(", ");
+                            }
+                            let _ = write!(
+                                issues,
+                                "{name}: env overrides {var} for stdio MCP server (security risk)"
+                            );
+                        }
+                    }
                 }
             }
             McpTransport::Http | McpTransport::Sse => {
@@ -662,22 +692,52 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
 /// cancelled/incomplete handshake → warn. Disabled servers are skipped. The
 /// registry is shut down afterward so any stdio child processes spawned for the
 /// handshake are terminated.
+///
+/// For stdio servers that fail or produce no tools, the last few stderr lines
+/// captured during startup are appended to the detail to help diagnose the
+/// failure without having to re-run the server manually.
 async fn probe_mcp_servers(
     servers: &std::collections::BTreeMap<String, McpServerConfig>,
 ) -> Vec<Check> {
     let registry = McpClientRegistry::new(servers.clone());
     let outcome = registry.refresh_tools(CancellationToken::new()).await;
+
+    // Collect stderr tails before shutdown so the ring buffer is still live.
+    let mut stderr_tails: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (name, server) in servers {
+        if server.enabled && matches!(server.transport, McpTransport::Stdio) {
+            let tail = registry.stderr_tail(name).await;
+            if !tail.is_empty() {
+                stderr_tails.insert(name.clone(), tail);
+            }
+        }
+    }
+
     registry.shutdown().await;
     outcome
         .status
         .per_server
         .iter()
         .map(|(name, server_status)| {
-            let (status, detail) = match server_status {
-                McpServerStatus::Ready { tools_count, .. } => (
-                    Status::Ok,
-                    format!("handshake ok; {tools_count} tools advertised"),
-                ),
+            let (status, mut detail) = match server_status {
+                McpServerStatus::Ready { tools_count, .. } => {
+                    let server = servers.get(name);
+                    let extra = if let Some(s) = server {
+                        stdio_probe_detail(name, s)
+                    } else {
+                        String::new()
+                    };
+                    let base = format!("handshake ok; {tools_count} tools advertised");
+                    (
+                        Status::Ok,
+                        if extra.is_empty() {
+                            base
+                        } else {
+                            format!("{base}; {extra}")
+                        },
+                    )
+                }
                 McpServerStatus::Stale {
                     tools_count,
                     outcome,
@@ -699,6 +759,15 @@ async fn probe_mcp_servers(
                     (Status::Warn, "handshake did not complete".to_string())
                 }
             };
+            // Append captured stderr for failed/warn stdio servers to give
+            // actionable startup diagnostics without requiring a manual re-run.
+            if !matches!(status, Status::Ok) {
+                if let Some(lines) = stderr_tails.get(name) {
+                    let excerpt: String =
+                        lines.iter().map(|l| format!("\n  stderr: {l}")).collect();
+                    detail.push_str(&excerpt);
+                }
+            }
             Check {
                 name: format!("probe:mcp:{name}"),
                 status,
@@ -706,6 +775,43 @@ async fn probe_mcp_servers(
             }
         })
         .collect()
+}
+
+/// Return a compact detail string describing the stdio MCP server configuration
+/// for successful probe rows (resolved command path, env key count, platform).
+fn stdio_probe_detail(name: &str, server: &McpServerConfig) -> String {
+    let _ = name;
+    let Some(cmd) = server.command.as_deref() else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    // Resolved binary path via PATH walk (best-effort; empty on failure).
+    if std::path::Path::new(cmd).is_absolute() {
+        parts.push(format!("cmd={cmd}"));
+    } else if let Some(resolved) = which_in_path(cmd) {
+        parts.push(format!("cmd={resolved}"));
+    } else {
+        parts.push(format!("cmd={cmd} (not found in PATH)"));
+    }
+    if !server.env.is_empty() {
+        parts.push(format!("env_keys={}", server.env.len()));
+    }
+    #[cfg(unix)]
+    parts.push("process_group=new".to_string());
+    parts.join(" ")
+}
+
+/// Walk `$PATH` to find the first executable named `name`. Returns the absolute
+/// path as a `String`, or `None` if no match is found.
+fn which_in_path(name: &str) -> Option<String> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return candidate.into_os_string().into_string().ok();
+        }
+    }
+    None
 }
 
 fn mcp_stale_outcome_detail(outcome: &McpStaleOutcome) -> String {
