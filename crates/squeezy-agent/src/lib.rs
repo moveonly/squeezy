@@ -7189,17 +7189,15 @@ impl TurnRuntime {
             // round is *still* over. This converts the existing reactive
             // overflow handling into a proactive one for the round we're about
             // to pay for.
-            // Include fixed request overhead (instructions + tool schemas) in
-            // both round-input gate checks so the pre-flight estimate matches
-            // what will actually be sent. `estimate_context` only walks
-            // conversation items; the overhead from the most-recent assembled
-            // request closes the gap.
-            let round_overhead = self.last_request_overhead_tokens.load(Ordering::Relaxed);
+            // Note: the round-input gate counts conversation items only
+            // (not fixed overhead). The overhead (instructions + tool schemas)
+            // is constant per round and cannot be reduced by compaction, so
+            // including it would gate legitimate rounds when overhead is large.
+            // The session-cap projection includes overhead for accurate cost
+            // estimation (see cap_status check above).
             if let Some(initial_gate) = round_input_gate_status(
                 self.config.max_round_input_tokens,
-                estimate_context(&conversation)
-                    .estimated_tokens
-                    .saturating_add(round_overhead),
+                estimate_context(&conversation).estimated_tokens,
                 self.provider.name(),
                 &current_model,
                 CostBroker::projected_output_tokens(
@@ -7270,9 +7268,7 @@ impl TurnRuntime {
                 // paying for the oversized round.
                 if let Some(status) = round_input_gate_status(
                     self.config.max_round_input_tokens,
-                    estimate_context(&conversation)
-                        .estimated_tokens
-                        .saturating_add(round_overhead),
+                    estimate_context(&conversation).estimated_tokens,
                     self.provider.name(),
                     &current_model,
                     CostBroker::projected_output_tokens(
