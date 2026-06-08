@@ -230,8 +230,10 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         if args.probe && config.mcp_servers.values().any(|server| server.enabled) {
             checks.extend(probe_mcp_servers(&config.mcp_servers).await);
         }
-        checks.push(skills_check(config));
-        if let Some(hooks) = hooks_check(config) {
+        let skill_catalog =
+            squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
+        checks.push(skills_check(config, &skill_catalog));
+        if let Some(hooks) = hooks_check(config, &skill_catalog) {
             checks.push(hooks);
         }
         checks.push(session_store_check(config));
@@ -724,8 +726,7 @@ fn mcp_stale_outcome_detail(outcome: &McpStaleOutcome) -> String {
 /// same-precedence name collision flips trigger activation into
 /// ambiguous mode. Pure stat work so the row stays fast and matches
 /// the rest of `doctor`'s offline-CI contract.
-fn skills_check(config: &AppConfig) -> Check {
-    let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
+fn skills_check(config: &AppConfig, catalog: &squeezy_skills::SkillCatalog) -> Check {
     let summaries = catalog.summaries();
     if summaries.is_empty() {
         return Check {
@@ -775,12 +776,11 @@ fn skills_check(config: &AppConfig) -> Check {
 /// executable bits, missing shebang lines, and inline shell snippets.
 /// Returns `None` when hooks are disabled so the check row is omitted
 /// entirely rather than cluttering the output.
-fn hooks_check(config: &AppConfig) -> Option<Check> {
+fn hooks_check(config: &AppConfig, catalog: &squeezy_skills::SkillCatalog) -> Option<Check> {
     if !config.skills.hooks_enabled {
         return None;
     }
-    let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
-    let issues = squeezy_skills::catalog_hook_issues(&catalog);
+    let issues = squeezy_skills::catalog_hook_issues(catalog);
 
     // Count declared handlers for the detail line.
     let total_handlers: usize = catalog
@@ -796,6 +796,8 @@ fn hooks_check(config: &AppConfig) -> Option<Check> {
                 .sum::<usize>()
         })
         .sum();
+    // Note: catalog.load() results are cached, so the loads above and those
+    // inside catalog_hook_issues() hit the skill-catalog cache.
 
     let errors = issues.iter().filter(|i| i.is_error).count();
     let notes = issues.iter().filter(|i| !i.is_error).count();

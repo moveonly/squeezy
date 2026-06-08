@@ -197,8 +197,9 @@ fn skills_doctor_config(root: &std::path::Path) -> AppConfig {
 fn skills_check_with_no_skills_is_ok() {
     let root = skills_doctor_workspace("skills_empty");
     let config = skills_doctor_config(&root);
+    let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
 
-    let check = skills_check(&config);
+    let check = skills_check(&config, &catalog);
     assert_eq!(check.status, Status::Ok);
     assert!(check.detail.contains("no skills discovered"), "{check:?}");
 
@@ -217,8 +218,9 @@ fn skills_check_reports_enabled_count() {
     .expect("write skill");
 
     let config = skills_doctor_config(&root);
+    let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
 
-    let check = skills_check(&config);
+    let check = skills_check(&config, &catalog);
     assert_eq!(check.status, Status::Ok);
     assert!(
         check.detail.contains("enabled=1") && check.detail.contains("disabled=0"),
@@ -247,8 +249,9 @@ fn skills_check_warns_on_ambiguous_same_precedence_names() {
     .expect("write second dup");
 
     let config = skills_doctor_config(&root);
+    let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
 
-    let check = skills_check(&config);
+    let check = skills_check(&config, &catalog);
     assert_eq!(check.status, Status::Warn);
     assert!(check.detail.contains("ambiguous"), "{check:?}");
     assert!(check.detail.contains("dup"), "{check:?}");

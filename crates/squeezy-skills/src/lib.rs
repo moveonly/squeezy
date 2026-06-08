@@ -1,9 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read as _,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -300,11 +305,15 @@ pub struct SkillHookSpec {
     /// and returning a deny result. Defaults to
     /// [`DEFAULT_HOOK_TIMEOUT_SECS`] when `None`.
     pub timeout_secs: Option<u64>,
-    /// When `false` (fail-closed), a spawn error returns a deny result
-    /// instead of silently allowing execution. Defaults to `true` for
-    /// backward-compatibility with the original fail-open behaviour;
-    /// set `fail_open = false` in the frontmatter for enforcement hooks
-    /// that must not silently pass when the interpreter is missing.
+    /// When `false` (fail-closed), a spawn error or `wait()` error returns
+    /// a deny result instead of silently allowing execution. Defaults to
+    /// `true` for backward-compatibility with the original fail-open
+    /// behaviour; set `fail_open = false` in the frontmatter for enforcement
+    /// hooks that must not silently pass when the interpreter is missing.
+    ///
+    /// **Note**: a hook that exceeds `timeout_secs` always returns deny
+    /// regardless of `fail_open`, because a hung hook is an anomaly that
+    /// should not silently pass in either audit or enforcement configurations.
     pub fail_open: bool,
 }
 
@@ -2062,9 +2071,11 @@ pub struct SkillHookHandler {
     base_dir: PathBuf,
     /// Tracks whether a `once: true` hook has already succeeded in this
     /// session. Set only after a successful exit so a failed first run is
-    /// retried. Held behind a `Mutex` so the trait method stays `&self`
-    /// while still allowing in-place mutation across dispatches.
-    fired: Mutex<bool>,
+    /// retried. `AtomicBool` with `AcqRel` / `Acquire` ordering is used
+    /// rather than `Mutex<bool>` to close the TOCTOU gap where two
+    /// concurrent dispatches could both read `false` before either writes
+    /// `true`, and to avoid the silent-pass risk of a poisoned mutex.
+    fired: AtomicBool,
 }
 
 impl SkillHookHandler {
@@ -2081,7 +2092,7 @@ impl SkillHookHandler {
             matcher,
             spec,
             base_dir,
-            fired: Mutex::new(false),
+            fired: AtomicBool::new(false),
         }
     }
 }
@@ -2110,10 +2121,7 @@ impl HookHandler for SkillHookHandler {
             }
         }
 
-        if self.spec.once
-            && let Ok(fired) = self.fired.lock()
-            && *fired
-        {
+        if self.spec.once && self.fired.load(Ordering::Acquire) {
             return HookResult::allow();
         }
 
@@ -2195,27 +2203,45 @@ impl HookHandler for SkillHookHandler {
             }
         };
 
-        // Capture PID before moving child into the wait thread. Only used on
-        // Unix to send SIGKILL to the process group on timeout; on other
-        // platforms the variable is elided entirely to avoid a dead-code warning.
+        // Capture PID before wrapping child in Arc. On Unix, used to send
+        // SIGKILL to the process group on timeout so all grandchildren are
+        // terminated; elided on non-Unix to avoid an unused-variable warning.
         #[cfg(unix)]
         let child_pid = child.id();
+
+        // Wrap child in Arc<Mutex<Option<…>>> so the main thread can call
+        // `kill()` on timeout without a blocking wait-for-lock: the wait
+        // thread takes the child out of the Option (releasing the lock) before
+        // calling `wait()`, so the main thread's lock attempt never blocks on
+        // a syscall. On non-Unix this is the primary kill path; on Unix the
+        // process-group SIGKILL below handles grandchildren independently.
+        let child_arc = Arc::new(Mutex::new(Some(child)));
+        let child_for_thread = Arc::clone(&child_arc);
 
         let timeout =
             Duration::from_secs(self.spec.timeout_secs.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS));
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(child.wait());
+            // Take the child out before calling wait() to release the lock so
+            // the main thread can acquire it to kill on timeout.
+            let result = child_for_thread
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take())
+                .map(|mut c| c.wait());
+            if let Some(r) = result {
+                let _ = tx.send(r);
+            }
         });
 
         match rx.recv_timeout(timeout) {
             Ok(Ok(status)) if status.success() => {
                 // Only mark a `once: true` hook as fired once it has
                 // actually succeeded, so a failed first run can retry.
-                if self.spec.once
-                    && let Ok(mut fired) = self.fired.lock()
-                {
-                    *fired = true;
+                // compare_exchange from false → true so concurrent dispatches
+                // cannot both slip past the load-before-execute check.
+                if self.spec.once {
+                    self.fired.store(true, Ordering::Release);
                 }
                 HookResult::allow()
             }
@@ -2257,12 +2283,22 @@ impl HookHandler for SkillHookHandler {
                 }
             }
             Err(_timeout_expired) => {
-                // Send SIGKILL to the entire process group so grandchildren
-                // spawned by the hook shell cannot outlive the timeout.
-                #[cfg(unix)]
-                // SAFETY: child_pid is a valid process ID obtained from
-                // `child.id()` and the process group equals child_pid
+                // Attempt to kill via Arc in case the wait thread has not yet
+                // taken child ownership. On Windows this is the only kill path.
+                if let Ok(mut g) = child_arc.lock() {
+                    if let Some(c) = g.as_mut() {
+                        let _ = c.kill();
+                    }
+                }
+                // On Unix: also send SIGKILL to the entire process group so
+                // grandchildren spawned by the hook shell cannot outlive the
+                // timeout. This is the reliable kill path on Unix regardless of
+                // whether the Arc still holds the child.
+                //
+                // SAFETY: child_pid was obtained from `child.id()` before the
+                // Arc wrapper was created. The process group equals child_pid
                 // because we called `process_group(0)` above.
+                #[cfg(unix)]
                 unsafe {
                     libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL);
                 }
@@ -2413,25 +2449,38 @@ pub fn catalog_hook_issues(catalog: &SkillCatalog) -> Vec<HookDoctorIssue> {
                                 }
                             }
                             // Check for shebang line to catch missing interpreter errors.
+                            // Only read the first 2 bytes to avoid slurping large scripts.
                             if meta.is_file() {
-                                match fs::read(&script_path) {
-                                    Ok(bytes) if bytes.len() >= 2 => {
-                                        if bytes[0] != b'#' || bytes[1] != b'!' {
-                                            issues.push(HookDoctorIssue {
-                                                skill: summary.name.clone(),
-                                                message: format!(
-                                                    "hook script missing shebang line: {}",
-                                                    script_path.display()
-                                                ),
-                                                is_error: false,
-                                            });
-                                        }
-                                    }
-                                    _ => {}
+                                let has_shebang = fs::File::open(&script_path)
+                                    .and_then(|mut f| {
+                                        let mut buf = [0u8; 2];
+                                        f.read_exact(&mut buf).map(|_| buf)
+                                    })
+                                    .map(|buf| buf[0] == b'#' && buf[1] == b'!')
+                                    .unwrap_or(true); // on read error, don't produce a false note
+                                if !has_shebang {
+                                    issues.push(HookDoctorIssue {
+                                        skill: summary.name.clone(),
+                                        message: format!(
+                                            "hook script missing shebang line: {}",
+                                            script_path.display()
+                                        ),
+                                        is_error: false,
+                                    });
                                 }
                             }
                         }
-                        Err(_) => {}
+                        Err(e) => {
+                            issues.push(HookDoctorIssue {
+                                skill: summary.name.clone(),
+                                message: format!(
+                                    "hook script not accessible ({}): {}",
+                                    e,
+                                    script_path.display()
+                                ),
+                                is_error: true,
+                            });
+                        }
                     }
                 }
             }
