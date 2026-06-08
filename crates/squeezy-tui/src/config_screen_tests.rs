@@ -128,6 +128,7 @@ fn mcp_section_absorbs_keys_that_would_otherwise_panic_current_field() {
             bearer_token_env_var: None,
             http_headers: std::collections::BTreeMap::new(),
             env_http_headers: std::collections::BTreeMap::new(),
+            cwd: None,
         },
     );
     state.field_index = 0;
