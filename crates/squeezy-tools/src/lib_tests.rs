@@ -12875,8 +12875,9 @@ fn core_tool_prefix_stays_within_byte_baseline() {
 /// silently rejects valid model calls.
 #[test]
 fn first_party_args_schemas_cover_all_accepted_fields() {
+    type SpecDriftCase = (fn() -> ToolSpec, &'static [&'static str]);
     // (spec_fn, fields accepted by the Args struct that the schema must declare)
-    let cases: &[(fn() -> ToolSpec, &[&str])] = &[
+    let cases: &[SpecDriftCase] = &[
         (
             read_file_spec,
             &[
