@@ -144,9 +144,6 @@ impl Worker for SseClientWorker {
                 frame = frames.next() => {
                     match frame {
                         Some(SseEvent { event, data, .. }) => {
-                            // A live message arrived; the server is healthy.
-                            reconnect_attempts = 0;
-                            reconnect_delay = SSE_RECONNECT_DELAY_INITIAL;
                             if !is_message_event(event.as_deref()) {
                                 debug!(
                                     target: "squeezy::mcp::sse",
@@ -163,6 +160,9 @@ impl Worker for SseClientWorker {
                             }
                             match serde_json::from_str::<ServerJsonRpcMessage>(&payload) {
                                 Ok(message) => {
+                                    // A live message arrived; the server is healthy.
+                                    reconnect_attempts = 0;
+                                    reconnect_delay = SSE_RECONNECT_DELAY_INITIAL;
                                     context.send_to_handler(message).await?;
                                 }
                                 Err(err) => {
@@ -209,9 +209,6 @@ impl Worker for SseClientWorker {
                             match read_endpoint(&self.sse_url, &mut frames).await {
                                 Ok(new_endpoint) => {
                                     endpoint_url = new_endpoint;
-                                    // Successfully reconnected; reset the counter.
-                                    reconnect_attempts = 0;
-                                    reconnect_delay = SSE_RECONNECT_DELAY_INITIAL;
                                 }
                                 Err(error) => {
                                     return Err(WorkerQuitReason::fatal(
