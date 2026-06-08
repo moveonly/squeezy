@@ -214,7 +214,7 @@ pub fn save_codex_token(path: &Path, token: &OpenAiCodexTokenSet) -> Result<()> 
             ))
         })?;
     }
-    std::fs::rename(&tmp, path).map_err(|err| {
+    replace_codex_token_file(&tmp, path).map_err(|err| {
         SqueezyError::Config(format!(
             "could not rename {} to codex auth file {}: {err}",
             tmp.display(),
@@ -235,6 +235,27 @@ pub fn save_codex_token(path: &Path, token: &OpenAiCodexTokenSet) -> Result<()> 
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn replace_codex_token_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    match std::fs::rename(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists || path.exists() => {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(remove_err) => return Err(remove_err),
+            }
+            std::fs::rename(tmp, path)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_codex_token_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)
 }
 
 // ─── PKCE + base64url helpers ──────────────────────────────────────────────
@@ -701,12 +722,12 @@ where
 ///   [`INTERACTIVE_LOGIN_TIMEOUT`] elapses before the callback arrives.
 ///
 /// Callbacks:
-/// * `on_open_url(url)` — called right after the URL is built; typical
-///   callers print it and optionally launch a browser.
+/// * `on_open_url(url)` — called after the callback listener is bound;
+///   typical callers print it and optionally launch a browser.
 /// * `on_fallback(reason)` — called when the fallback is triggered;
 ///   `reason` is a short human-readable string ("port bind failed" or
-///   "callback timed out"). The caller should print the URL again (it
-///   is still valid) and prompt for the pasted redirect URL or code.
+///   "callback timed out"). The caller should print the URL and prompt
+///   for the pasted redirect URL or code.
 /// * `read_manual_input()` — reads the pasted redirect URL or bare code
 ///   from stdin (or any other source the caller controls).
 pub async fn login_openai_codex_with_auto_fallback<F, G, R>(
@@ -725,10 +746,6 @@ where
     let state = generate_state()?;
     let authorize_url = build_authorize_url(&pair.challenge, &state, originator);
 
-    on_open_url(&authorize_url)?;
-
-    // Try to bind the callback port. On failure, fall through immediately
-    // to the paste path using the same PKCE/URL already shown to the user.
     let code = match tokio::net::TcpListener::bind((
         OPENAI_CODEX_CALLBACK_HOST,
         OPENAI_CODEX_CALLBACK_PORT,
@@ -741,6 +758,9 @@ where
             extract_code_from_paste(&raw, &state)?
         }
         Ok(listener) => {
+            // Own the localhost callback port before opening the browser so a
+            // competing process cannot receive the authorization code first.
+            on_open_url(&authorize_url)?;
             match tokio::time::timeout(
                 INTERACTIVE_LOGIN_TIMEOUT,
                 wait_for_callback_code(listener, &state),

@@ -358,20 +358,20 @@ pub async fn handle_auth_command(command: &AuthCommand) -> squeezy_core::Result<
         AuthCommand::Remove(args) => handle_auth_remove(args),
         AuthCommand::Status(args) => handle_auth_status(args),
         AuthCommand::Anthropic { command } => handle_anthropic_oauth(command).await,
-        AuthCommand::OpenAiCodex { command } => handle_openai_codex_command(command),
+        AuthCommand::OpenAiCodex { command } => handle_openai_codex_command(command).await,
         AuthCommand::GitHubCopilot { command } => handle_github_copilot_command(command),
     }
 }
 
-fn handle_openai_codex_command(command: &OpenAiCodexCommand) -> squeezy_core::Result<()> {
+async fn handle_openai_codex_command(command: &OpenAiCodexCommand) -> squeezy_core::Result<()> {
     match command {
-        OpenAiCodexCommand::Login(args) => handle_openai_codex_login(args),
+        OpenAiCodexCommand::Login(args) => handle_openai_codex_login(args).await,
         OpenAiCodexCommand::Logout => handle_openai_codex_logout(),
         OpenAiCodexCommand::Status => handle_openai_codex_status(),
     }
 }
 
-fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Result<()> {
+async fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Result<()> {
     let auth_path = codex_auth_file_path().ok_or_else(|| {
         SqueezyError::Config(
             "could not determine ~/.squeezy auth directory; \
@@ -385,14 +385,6 @@ fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Resul
         .unwrap_or_else(|| "squeezy".to_string());
     let no_browser = args.no_browser;
     let manual = args.manual;
-
-    // Construct a runtime explicitly so this stays runnable from the
-    // non-async `handle_auth_command` entry point without changing
-    // the trait signature.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| SqueezyError::Config(format!("tokio runtime build failed: {err}")))?;
 
     let auth_path_for_login = auth_path.clone();
 
@@ -414,31 +406,29 @@ fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Resul
         // --manual: skip the localhost listener entirely and accept a
         // pasted redirect URL or bare code. Useful on Windows when the
         // firewall or browser isolation blocks 127.0.0.1:1455.
-        runtime.block_on(async move {
-            login_openai_codex_manual(
-                &originator,
-                &auth_path_for_login,
-                |url| {
-                    eprintln!("Open this URL in your browser to sign in to ChatGPT Plus/Pro:");
-                    eprintln!();
-                    eprintln!("    {url}");
-                    eprintln!();
-                    eprintln!("After approving the consent screen, paste the full redirect URL");
-                    eprintln!("  (http://localhost:1455/auth/callback?code=…&state=…) or the");
-                    eprintln!("  bare authorization code here:");
-                    if !no_browser {
-                        if !try_open_browser(url) {
-                            eprintln!("Could not launch browser. Copy the URL above.");
-                        }
-                    } else {
-                        eprintln!("(--no-browser: not launching a browser)");
+        login_openai_codex_manual(
+            &originator,
+            &auth_path_for_login,
+            |url| {
+                eprintln!("Open this URL in your browser to sign in to ChatGPT Plus/Pro:");
+                eprintln!();
+                eprintln!("    {url}");
+                eprintln!();
+                eprintln!("After approving the consent screen, paste the full redirect URL");
+                eprintln!("  (http://localhost:1455/auth/callback?code=…&state=…) or the");
+                eprintln!("  bare authorization code here:");
+                if !no_browser {
+                    if !try_open_browser(url) {
+                        eprintln!("Could not launch browser. Copy the URL above.");
                     }
-                    Ok(())
-                },
-                read_paste_input,
-            )
-            .await
-        })?
+                } else {
+                    eprintln!("(--no-browser: not launching a browser)");
+                }
+                Ok(())
+            },
+            read_paste_input,
+        )
+        .await?
     } else {
         // Interactive path with automatic in-session fallback:
         // - Show the URL and try to open a browser.
@@ -446,54 +436,52 @@ fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Resul
         // - On port bind failure or timeout, fall back to the paste flow
         //   in the same invocation, reusing the same URL so the user
         //   does not need to start over.
-        runtime.block_on(async move {
-            login_openai_codex_with_auto_fallback(
-                &originator,
-                &auth_path_for_login,
-                |url| {
-                    eprintln!("Open this URL in your browser to sign in to ChatGPT Plus/Pro:");
-                    eprintln!();
-                    eprintln!("    {url}");
-                    eprintln!();
+        login_openai_codex_with_auto_fallback(
+            &originator,
+            &auth_path_for_login,
+            |url| {
+                eprintln!("Open this URL in your browser to sign in to ChatGPT Plus/Pro:");
+                eprintln!();
+                eprintln!("    {url}");
+                eprintln!();
+                eprintln!(
+                    "Squeezy is listening for the OAuth callback on \
+                     http://localhost:1455/auth/callback"
+                );
+                #[cfg(target_os = "windows")]
+                eprintln!(
+                    "(Windows: if your browser or firewall blocks localhost callbacks, \
+                     squeezy will automatically fall back to the paste flow)"
+                );
+                if no_browser {
+                    eprintln!("(--no-browser: not launching a browser; waiting for callback…)");
+                    return Ok(());
+                }
+                if !try_open_browser(url) {
+                    eprintln!("Could not launch browser. Open the URL above manually.");
                     eprintln!(
-                        "Squeezy is listening for the OAuth callback on \
-                         http://localhost:1455/auth/callback"
+                        "Waiting for the callback on port 1455, or it will fall back \
+                         to the paste flow after {} seconds.",
+                        squeezy_llm::OPENAI_CODEX_INTERACTIVE_LOGIN_TIMEOUT_SECS
                     );
-                    #[cfg(target_os = "windows")]
-                    eprintln!(
-                        "(Windows: if your browser or firewall blocks localhost callbacks, \
-                         squeezy will automatically fall back to the paste flow)"
-                    );
-                    if no_browser {
-                        eprintln!("(--no-browser: not launching a browser; waiting for callback…)");
-                        return Ok(());
-                    }
-                    if !try_open_browser(url) {
-                        eprintln!("Could not launch browser. Open the URL above manually.");
-                        eprintln!(
-                            "Waiting for the callback on port 1455, or it will fall back \
-                             to the paste flow after {} seconds.",
-                            squeezy_llm::OPENAI_CODEX_INTERACTIVE_LOGIN_TIMEOUT_SECS
-                        );
-                    } else {
-                        eprintln!("Browser launched. Waiting for callback…");
-                    }
-                    Ok(())
-                },
-                |url, reason| {
-                    eprintln!();
-                    eprintln!(
-                        "Falling back to paste flow ({reason}). \
-                         The authorize URL above is still valid."
-                    );
-                    eprintln!("    {url}");
-                    eprintln!();
-                    eprintln!("After approving, paste the full redirect URL or bare code here:");
-                },
-                read_paste_input,
-            )
-            .await
-        })?
+                } else {
+                    eprintln!("Browser launched. Waiting for callback…");
+                }
+                Ok(())
+            },
+            |url, reason| {
+                eprintln!();
+                eprintln!(
+                    "Falling back to paste flow ({reason}). \
+                     Open this authorize URL in your browser if it is not already open:"
+                );
+                eprintln!("    {url}");
+                eprintln!();
+                eprintln!("After approving, paste the full redirect URL or bare code here:");
+            },
+            read_paste_input,
+        )
+        .await?
     };
 
     let expires_in = expires_in_human(outcome.expires_at_unix_ms);
