@@ -442,22 +442,27 @@ fn skills_roots_check_shows_resolved_paths() {
 }
 
 #[test]
-fn skills_roots_check_warns_when_home_missing() {
-    let _lock = ENV_LOCK.lock().unwrap();
-    let root = skills_doctor_workspace("skills_roots_no_home");
-    let config = skills_doctor_config(&root);
-    // Temporarily unset HOME to simulate a container/service environment.
-    let saved = std::env::var_os("HOME");
-    unsafe {
-        env::remove_var("HOME");
-    }
+fn skills_roots_check_warns_when_roots_are_relative() {
+    // Simulate the condition that arises when HOME is unset and skill roots
+    // default to relative paths: construct a config with relative user_dir /
+    // compat_user_dir and verify the check emits a warning.
+    let root = skills_doctor_workspace("skills_roots_relative_warn");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        skills: squeezy_core::SkillsConfig {
+            // Relative paths — as would result from HOME being absent at
+            // config-load time.
+            user_dir: std::path::PathBuf::from(".squeezy/skills"),
+            compat_user_dir: std::path::PathBuf::from(".agents/skills"),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let check = skills_roots_check(&config);
-    if let Some(h) = saved {
-        unsafe {
-            env::set_var("HOME", h);
-        }
-    }
     assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
-    assert!(check.detail.to_lowercase().contains("home"), "{check:?}");
+    assert!(
+        check.detail.contains("relative"),
+        "expected 'relative' in detail: {check:?}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
