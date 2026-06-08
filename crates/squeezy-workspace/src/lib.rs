@@ -789,6 +789,7 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
     let mut negative_signals = Vec::new();
     let context = IndexingDecisionContext::from_env();
     let workspace_signals = scan_workspace_signals(root);
+    let has_case_mismatches = workspace_signals.has_case_mismatches();
 
     if context.is_home_dir(root) {
         negative_signals.push("workspace root is the user's home directory".to_string());
@@ -833,7 +834,7 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
         format!("indexing allowed: {}", positive_signals.join(", "))
     } else if blocked_by_root {
         format!("indexing skipped: {}", negative_signals.join(", "))
-    } else if workspace_signals.has_case_mismatches {
+    } else if has_case_mismatches {
         // Case-mismatch branch before README: a near-miss marker is a more
         // actionable diagnostic than a README-only message.
         format!(
@@ -928,12 +929,17 @@ struct WorkspaceSignalScan {
     has_readme: bool,
     project_markers: Vec<String>,
     project_marker_case_mismatches: Vec<String>,
+    shallow_source_markers: Vec<String>,
+    code_directory_markers: Vec<String>,
+}
+
+impl WorkspaceSignalScan {
     /// True when `project_marker_case_mismatches` is non-empty. Checked
     /// structurally in `decide_indexing` rather than by substring-matching
     /// the human-readable message strings.
-    has_case_mismatches: bool,
-    shallow_source_markers: Vec<String>,
-    code_directory_markers: Vec<String>,
+    fn has_case_mismatches(&self) -> bool {
+        !self.project_marker_case_mismatches.is_empty()
+    }
 }
 
 fn scan_workspace_signals(root: &Path) -> WorkspaceSignalScan {
@@ -948,8 +954,7 @@ fn scan_workspace_signals(root: &Path) -> WorkspaceSignalScan {
     let has_readme = root_entries.iter().any(is_readme_entry);
     let project_markers = project_markers_from_root(root, Some((&root_entry_names, &root_entries)));
     let project_marker_case_mismatches =
-        project_marker_case_mismatches(&root_entry_names, &root_entries);
-    let has_case_mismatches = !project_marker_case_mismatches.is_empty();
+        project_marker_case_mismatches(root, &root_entry_names, &root_entries, &project_markers);
 
     let mut source_scan = SourceMarkerScan::default();
     collect_source_markers_from_entries(&root_entries, 0, None, &mut source_scan);
@@ -961,7 +966,6 @@ fn scan_workspace_signals(root: &Path) -> WorkspaceSignalScan {
         has_readme,
         project_markers,
         project_marker_case_mismatches,
-        has_case_mismatches,
         shallow_source_markers: source_scan.signals,
         code_directory_markers,
     }
@@ -1023,8 +1027,10 @@ fn project_marker_exists(
 }
 
 fn project_marker_case_mismatches(
+    root: &Path,
     root_entry_names: &BTreeSet<OsString>,
     entries: &[fs::DirEntry],
+    resolved_markers: &[String],
 ) -> Vec<String> {
     // Build a case-folded lookup table once so each marker check is O(1)
     // rather than scanning all directory entries linearly.
@@ -1038,6 +1044,14 @@ fn project_marker_case_mismatches(
         if marker.contains('/') || root_entry_names.contains(std::ffi::OsStr::new(marker)) {
             continue;
         }
+        // On case-insensitive filesystems (default macOS APFS, default
+        // Windows NTFS) `project_marker_exists` accepts a mis-cased file as
+        // the marker, so the marker already shows up in `resolved_markers`.
+        // Suppress the near-miss diagnostic in that case to avoid a
+        // confusing negative signal alongside the positive one.
+        if project_marker_exists(root, marker, Some(root_entry_names)) {
+            continue;
+        }
         if let Some(actual_os) = lower_to_actual.get(&marker.to_ascii_lowercase())
             && let Some(actual) = actual_os.to_str()
         {
@@ -1046,6 +1060,27 @@ fn project_marker_case_mismatches(
             ));
         }
     }
+
+    // A sibling entry that already produced a real `.csproj/.sln/.slnx`
+    // marker means the case-insensitive filesystem accepted some other
+    // file at the expected extension; do not emit a mis-cased extension
+    // diagnostic alongside the positive marker.
+    let already_resolved_dotnet_extensions: BTreeSet<&'static str> = ["csproj", "sln", "slnx"]
+        .into_iter()
+        .filter(|ext| {
+            entries.iter().any(|entry| {
+                let file_name = entry.file_name();
+                let Some(name) = file_name.to_str() else {
+                    return false;
+                };
+                let Some(actual_ext) = Path::new(name).extension().and_then(|e| e.to_str()) else {
+                    return false;
+                };
+                let resolved = format!("project marker {name}");
+                actual_ext == *ext && resolved_markers.iter().any(|m| m == &resolved)
+            })
+        })
+        .collect();
     for entry in entries {
         let file_name = entry.file_name();
         let Some(name) = file_name.to_str() else {
@@ -1061,7 +1096,9 @@ fn project_marker_case_mismatches(
             "slnx" => "slnx",
             _ => continue,
         };
-        if extension != expected_extension {
+        if extension != expected_extension
+            && !already_resolved_dotnet_extensions.contains(expected_extension)
+        {
             mismatches.push(format!(
                 "project marker case differs from expected .{expected_extension} extension: found {name}"
             ));

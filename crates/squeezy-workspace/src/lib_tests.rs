@@ -973,27 +973,52 @@ fn mis_cased_project_marker_is_reported_as_case_sensitive_near_miss() {
         .crawl(&root)
         .unwrap();
 
-    assert!(
-        snapshot
-            .indexing_decision
-            .negative_signals
-            .iter()
-            .any(|signal| {
-                signal.contains("project marker case differs")
-                    && signal.contains("Cargo.toml")
-                    && signal.contains("cargo.toml")
-            }),
-        "{:?}",
-        snapshot.indexing_decision.negative_signals
-    );
+    // The behavior splits cleanly on filesystem case sensitivity. On a
+    // case-insensitive volume (default macOS APFS, default Windows NTFS)
+    // `cargo.toml` already satisfies the `Cargo.toml` marker via
+    // `Path::exists`, so the diagnostic must NOT also fire as a misleading
+    // negative signal alongside the positive one. On a case-sensitive
+    // volume (typical Linux ext4) the marker does not resolve, and the
+    // diagnostic is the actionable near-miss signal the model needs.
     if snapshot.indexing_decision.should_index {
         assert!(
             snapshot
                 .indexing_decision
                 .positive_signals
                 .contains(&"project marker Cargo.toml".to_string()),
-            "case-insensitive filesystems may still accept the marker: {:?}",
+            "case-insensitive filesystem must accept the marker: {:?}",
             snapshot.indexing_decision.positive_signals
+        );
+        assert!(
+            !snapshot
+                .indexing_decision
+                .negative_signals
+                .iter()
+                .any(|signal| signal.contains("project marker case differs")),
+            "case-insensitive filesystem must not emit a misleading near-miss alongside the resolved marker: {:?}",
+            snapshot.indexing_decision.negative_signals
+        );
+    } else {
+        assert!(
+            snapshot
+                .indexing_decision
+                .negative_signals
+                .iter()
+                .any(|signal| {
+                    signal.contains("project marker case differs")
+                        && signal.contains("Cargo.toml")
+                        && signal.contains("cargo.toml")
+                }),
+            "case-sensitive filesystem must emit the near-miss diagnostic: {:?}",
+            snapshot.indexing_decision.negative_signals
+        );
+        assert!(
+            snapshot
+                .indexing_decision
+                .reason
+                .starts_with("indexing skipped: no exact project marker or shallow source file"),
+            "case-sensitive filesystem must pin the case-mismatch decision reason: {:?}",
+            snapshot.indexing_decision.reason,
         );
     }
 }
