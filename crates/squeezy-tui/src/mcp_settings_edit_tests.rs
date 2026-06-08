@@ -153,6 +153,7 @@ fn mcp_server_table_preserves_http_identity() {
         bearer_token_env_var: Some("DOCS_BEARER".to_string()),
         http_headers: headers,
         env_http_headers: BTreeMap::new(),
+        cwd: None,
     };
 
     let table = mcp_server_table(&server);
@@ -235,6 +236,7 @@ fn mcp_server_table_preserves_permissions_block() {
         bearer_token_env_var: None,
         http_headers: BTreeMap::new(),
         env_http_headers: BTreeMap::new(),
+        cwd: None,
     };
 
     let table = mcp_server_table(&server);
@@ -359,6 +361,7 @@ fn fixture_stdio_server(name: &str) -> squeezy_core::McpServerConfig {
         bearer_token_env_var: None,
         http_headers: BTreeMap::new(),
         env_http_headers: BTreeMap::new(),
+        cwd: None,
     }
 }
 
