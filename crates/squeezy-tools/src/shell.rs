@@ -492,21 +492,18 @@ impl ToolRegistry {
                 [..sandbox_plan.args.len().saturating_sub(1)]
                 .iter()
                 .enumerate()
-                .filter_map(|(i, arg)| {
-                    // Suppress the sandbox-exec profile text that follows `-p`.
+                .map(|(i, arg)| {
+                    // When the previous arg was `-p`, this arg is the sandbox-exec
+                    // profile text which can be many KB; replace it with a placeholder.
                     let prev = if i > 0 {
                         sandbox_plan.args.get(i - 1).map(|s| s.as_str())
                     } else {
                         None
                     };
                     if prev == Some("-p") {
-                        // Replace the large profile blob with a short placeholder.
-                        Some("<sandbox-profile>".to_string())
-                    } else if arg == "-p" || arg.as_str() == "<sandbox-profile>" {
-                        // Keep the `-p` flag itself.
-                        Some(arg.clone())
+                        "<sandbox-profile>".to_string()
                     } else {
-                        Some(arg.clone())
+                        arg.clone()
                     }
                 })
                 .collect();
