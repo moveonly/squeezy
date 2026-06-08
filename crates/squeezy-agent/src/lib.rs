@@ -13466,6 +13466,71 @@ async fn apply_delegate_completions(
     }
 }
 
+/// Partition a parallel-safe batch into calls to dispatch and calls that are
+/// exact duplicates of an earlier call in the same batch. Extracted as a
+/// synchronous helper so the large local state (BTreeMap, Vec, HashMap) does
+/// not inflate the async state machine of [`flush_parallel_batch`].
+///
+/// Returns `(dispatch_calls, duplicates)` where:
+/// - `dispatch_calls` is the deduplicated list to hand off to the provider.
+/// - `duplicates` is `Vec<(results_index, canonical_results_index, call,
+///   tool_sequence)>` — calls whose result can be synthesised from the
+///   canonical call after dispatch, without re-running I/O.
+fn partition_parallel_batch(
+    calls: &[(usize, ToolCall, u64)],
+) -> (
+    Vec<(usize, ToolCall, u64)>,
+    Vec<(usize, usize, ToolCall, u64)>,
+) {
+    let mut canonical_key_to_results_index: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut dispatch: Vec<(usize, ToolCall, u64)> = Vec::with_capacity(calls.len());
+    let mut duplicates: Vec<(usize, usize, ToolCall, u64)> = Vec::new();
+    for (index, call, tool_sequence) in calls {
+        if let Some(args_sha) = tool_call_args_sha256(call) {
+            let key = (call.name.clone(), args_sha);
+            match canonical_key_to_results_index.entry(key) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(*index);
+                    dispatch.push((*index, call.clone(), *tool_sequence));
+                }
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    duplicates.push((*index, *slot.get(), call.clone(), *tool_sequence));
+                }
+            }
+        } else {
+            dispatch.push((*index, call.clone(), *tool_sequence));
+        }
+    }
+    (dispatch, duplicates)
+}
+
+/// Build a synthetic result for a duplicate parallel-safe call by cloning the
+/// canonical result and stamping the `duplicate_of` marker. Extracted as a
+/// synchronous helper to keep `flush_parallel_batch`'s async state machine
+/// small.
+fn make_duplicate_result(canonical: Option<&ToolResult>, duplicate_call: &ToolCall) -> ToolResult {
+    if let Some(r) = canonical {
+        let mut r = r.clone();
+        let canonical_call_id = r.call_id.clone();
+        r.call_id = duplicate_call.call_id.clone();
+        if let Some(obj) = r.content.as_object_mut() {
+            obj.insert("duplicate_of".to_string(), json!(canonical_call_id));
+            obj.entry("hint").or_insert_with(|| {
+                json!(
+                    "This call is identical to an earlier call in the same response. \
+                     Do not issue duplicate tool calls; reuse the earlier output."
+                )
+            });
+        }
+        r
+    } else {
+        budget_denied_result(
+            duplicate_call,
+            "duplicate of budget-denied read".to_string(),
+        )
+    }
+}
+
 async fn flush_parallel_batch(
     context: &ToolExecutionContext<'_>,
     broker: &mut CostBroker,
@@ -13528,85 +13593,31 @@ async fn flush_parallel_batch(
 
     // Deduplicate exact parallel-safe calls before dispatch so identical
     // grep / read_file / graph calls within the same assistant response do
-    // not pay twice for the same I/O. The first occurrence of each
-    // `(tool_name, args_sha256)` key is dispatched; later occurrences
-    // receive a synthetic result that references the canonical call_id and
-    // carries the same content, avoiding both the round-trip and the byte
-    // accounting for the duplicate read.
-    //
-    // `canonical_key_to_results_index` maps a unique `(tool_name, args_sha)` key
-    // to the results-slice index of the first (canonical) occurrence. After
-    // dispatch, that index can be used to look up the canonical ToolResult.
-    let mut canonical_key_to_results_index: BTreeMap<(String, String), usize> = BTreeMap::new();
-    // For each position in `calls`, stores the canonical results-slice index
-    // when the call is a duplicate, or `None` when it is canonical itself.
-    let mut dupe_canonical_results_index: Vec<Option<usize>> = vec![None; calls.len()];
-    let mut dispatch_calls: Vec<(usize, ToolCall, u64)> = Vec::with_capacity(calls.len());
-
-    for (pos, (index, call, tool_sequence)) in calls.iter().enumerate() {
-        if let Some(args_sha) = tool_call_args_sha256(call) {
-            let key = (call.name.clone(), args_sha);
-            match canonical_key_to_results_index.entry(key) {
-                std::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(*index);
-                    dispatch_calls.push((*index, call.clone(), *tool_sequence));
-                }
-                std::collections::btree_map::Entry::Occupied(slot) => {
-                    dupe_canonical_results_index[pos] = Some(*slot.get());
-                }
-            }
-        } else {
-            dispatch_calls.push((*index, call.clone(), *tool_sequence));
-        }
-    }
-
+    // not pay twice for the same I/O. The synchronous partition step is
+    // factored out to keep this async function's state machine compact.
+    let (dispatch_calls, duplicates) = partition_parallel_batch(&calls);
     let order: Vec<(usize, ToolCall, u64)> = dispatch_calls.clone();
     let completions = dispatch_parallel_reads(context, dispatch_calls).await;
 
-    // Build a snapshot of canonical results (keyed by results-slice index)
-    // *before* fold_parallel_read_completions consumes them, so duplicates can
-    // clone the canonical output.
-    let canonical_results_by_idx: std::collections::HashMap<usize, ToolResult> = completions
+    // Snapshot canonical results keyed by their results-slice index so
+    // duplicates can clone the output without re-running I/O.
+    let canonical_snap: std::collections::HashMap<usize, ToolResult> = completions
         .iter()
         .map(|(idx, r)| (*idx, r.clone()))
         .collect();
 
-    // Fold canonical completions through the budget enforcement path.
+    // Fold canonical completions through the incremental budget enforcement.
     fold_parallel_read_completions(context, broker, results, order, completions).await;
 
-    // Synthesise results for duplicate calls by cloning the canonical
-    // result, stamping `duplicate_of`, and recording without re-running I/O.
-    for (pos, (index, call, tool_sequence)) in calls.iter().enumerate() {
-        let Some(canonical_idx) = dupe_canonical_results_index[pos] else {
-            continue;
-        };
-        // Derive the duplicate's result from the canonical, then overwrite
-        // `call_id` so the model's function-call-output routing works correctly.
-        let result = if let Some(r) = canonical_results_by_idx.get(&canonical_idx) {
-            let mut r = r.clone();
-            let canonical_call_id = r.call_id.clone();
-            r.call_id = call.call_id.clone();
-            if let Some(obj) = r.content.as_object_mut() {
-                obj.insert("duplicate_of".to_string(), json!(canonical_call_id));
-                obj.entry("hint").or_insert_with(|| {
-                    json!(
-                        "This call is identical to an earlier call in the same response. \
-                         Do not issue duplicate tool calls; reuse the earlier output."
-                    )
-                });
-            }
-            r
-        } else {
-            // Canonical was budget-denied or cancelled; treat the duplicate
-            // as denied so the model-visible semantics stay consistent.
-            budget_denied_result(call, "duplicate of budget-denied read".to_string())
-        };
+    // Synthesise and record results for duplicate calls.
+    for (index, canonical_idx, call, tool_sequence) in duplicates {
+        let result = make_duplicate_result(canonical_snap.get(&canonical_idx), &call);
         emit_tool_telemetry(
             context.config,
             &context.telemetry,
             context.turn_id,
-            *tool_sequence,
-            call,
+            tool_sequence,
+            &call,
             &result,
             Duration::ZERO,
         );
@@ -13618,7 +13629,7 @@ async fn flush_parallel_batch(
                 result: result.clone(),
             })
             .await;
-        results[*index] = Some(result);
+        results[index] = Some(result);
     }
 }
 
