@@ -590,9 +590,9 @@ fn path_matches_filter(path: &str, filter: &str) -> bool {
         // Case-insensitive prefix match on Windows.
         #[cfg(target_os = "windows")]
         {
-            let path_lower = path.to_ascii_lowercase();
             let filter_lower = filter.to_ascii_lowercase();
-            if path_lower == filter_lower
+            let path_lower = path.to_ascii_lowercase();
+            if path.eq_ignore_ascii_case(filter)
                 || (path_lower.starts_with(filter_lower.as_str())
                     && path_lower.as_bytes().get(filter_lower.len()) == Some(&b'/'))
             {
@@ -1642,7 +1642,7 @@ fn path_matches_exact_or_suffix(path: &str, filter: &str) -> bool {
     }
     // Case-insensitive comparison on Windows where the filesystem ignores case.
     #[cfg(target_os = "windows")]
-    if path.to_ascii_lowercase() == filter.to_ascii_lowercase() {
+    if path.eq_ignore_ascii_case(filter) {
         return true;
     }
     if path
