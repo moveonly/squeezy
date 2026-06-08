@@ -1393,10 +1393,14 @@ fn graph_zero_hit_fallback(
     }
     let (path_value, language_value, reason, windows_hint) = match path {
         Some(path) => {
+            // Use the same directory-aware, Windows-normalised predicate as
+            // the symbol search so that directory-shaped filters like
+            // `src/main` correctly surface files under that tree (and return
+            // `supported_language_no_match` rather than `path_unknown`).
             let file = graph
                 .files
                 .values()
-                .find(|file| path_matches_exact_or_suffix(&file.relative_path, path));
+                .find(|file| path_matches_filter(&file.relative_path, path));
             match file {
                 Some(file) => {
                     let reason = match file.language {
@@ -2381,7 +2385,10 @@ fn read_slice_target(
             graph
                 .files
                 .values()
-                .find(|file| path_matches_exact_or_suffix(&file.relative_path, &path))
+                // Use the directory-aware, Windows-normalised predicate so
+                // that directory-shaped paths and backslash-escaped inputs
+                // resolve consistently with the symbol-search predicates.
+                .find(|file| path_matches_filter(&file.relative_path, &path))
         })
         .map(|file| graph_status_for_language(file.language))
         .unwrap_or("not_indexed");
@@ -4385,6 +4392,38 @@ mod path_filter_tests {
         assert!(path_matches_filter(
             "src/CMakeLists.txt",
             "src\\CMakeLists.txt",
+        ));
+    }
+
+    #[test]
+    fn degenerate_separator_only_filter_matches_all_paths() {
+        // A filter consisting only of separators (e.g., a model mistake)
+        // normalises to an empty string after trimming and acts as an
+        // unconditional match — the same behaviour as an absent filter.
+        // Pinned here so any future refactor cannot silently change it.
+        assert!(path_matches_filter("any/path/file.rs", "\\"));
+        assert!(path_matches_filter("any/path/file.rs", "/"));
+    }
+}
+
+#[cfg(test)]
+mod exact_or_suffix_tests {
+    use super::path_matches_exact_or_suffix;
+
+    #[test]
+    fn exact_or_suffix_handles_windows_separator() {
+        // Windows backslash suffix: `src\lib.rs` must suffix-match the
+        // slash-normalised graph path `crates/src/lib.rs`.
+        assert!(path_matches_exact_or_suffix(
+            "crates/src/lib.rs",
+            "src\\lib.rs"
+        ));
+        // Exact match after normalisation.
+        assert!(path_matches_exact_or_suffix("src/lib.rs", "src\\lib.rs"));
+        // Must not match an unrelated file that shares a longer basename.
+        assert!(!path_matches_exact_or_suffix(
+            "crates/mylib.rs",
+            "src\\lib.rs"
         ));
     }
 }

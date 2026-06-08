@@ -58,15 +58,16 @@ fn fuzzy_score_handles_multichar_lowercase_expansion() {
     // points: U+0069 (i) + U+0307 (combining dot above).  The scorer must
     // match both expanded chars against consecutive needle positions rather
     // than silently dropping the second expansion char.
+    //
+    // Expected score: İ occupies bytes 0–1 (2 bytes); s=2, t=3, a=4, n=5,
+    // b=6, u=7, l=8.  All 9 needle chars matched contiguously starting at
+    // byte 0.  Score = last_match(8) − first_match(0) − prefix_bonus(100)
+    // − contiguous_bonus(25) = 8 − 100 − 25 = −117.
     let score = fuzzy_score("\u{0130}stanbul", "i\u{0307}stanbul");
-    assert!(
-        score.is_some(),
-        "multi-char lowercase expansion must produce a match"
-    );
-    // The expanded match starts at byte 0, so the prefix bonus applies.
-    assert!(
-        score.unwrap() < 0,
-        "prefix match score should be negative (bonus applied)"
+    assert_eq!(
+        score,
+        Some(-117),
+        "multi-char lowercase expansion: distance=8, prefix−100, contiguous−25"
     );
 }
 
