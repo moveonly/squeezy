@@ -3746,3 +3746,44 @@ fn global_index_cache_invalidates_when_append_changes_file() {
         );
     });
 }
+
+#[test]
+fn rewrite_global_index_uses_pid_temp_name_not_fixed_suffix() {
+    // Guard: the temp file used by rewrite_global_index must include the
+    // process id so concurrent compactors cannot clobber each other's
+    // in-flight file (the earlier `jsonl.tmp` fixed-name bug).
+    let home = temp_root("rewrite-global-index-pid-temp");
+    with_home(&home, || {
+        let Some(path) = SessionStore::global_index_path() else {
+            panic!("HOME not set");
+        };
+        let forbidden_tmp = path.with_extension("jsonl.tmp");
+        // Write a dummy entry so the index is non-empty and compaction fires.
+        let entry = GlobalSessionIndexEntry {
+            session_id: "session-x".to_string(),
+            cwd: "/tmp/x".to_string(),
+            workspace_root: "/tmp/x".to_string(),
+            repo_root: None,
+            title: None,
+            display_name: None,
+            started_at_ms: 1,
+            last_event_at_ms: 1,
+            turn_count: 1,
+            resume_available: false,
+        };
+        // Append enough duplicates to trigger compaction (exceeds the byte
+        // threshold after enough repeated rows).
+        for _ in 0..10_000 {
+            SessionStore::append_global_index_entry(&entry);
+        }
+        // Call list_global_index which triggers rewrite_global_index.
+        let _ = SessionStore::list_global_index();
+        // The fixed-suffix temp file must NOT exist after a successful
+        // compaction — if it does, the old broken code path is still in use.
+        assert!(
+            !forbidden_tmp.exists(),
+            "rewrite_global_index must not leave a fixed-suffix .jsonl.tmp temp file; \
+             it should use a pid-scoped name to prevent cross-process clobbering"
+        );
+    });
+}

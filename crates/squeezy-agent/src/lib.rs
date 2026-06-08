@@ -205,7 +205,7 @@ async fn next_llm_stream_event(
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct ConversationState {
     previous_response_id: Option<String>,
     conversation: Vec<LlmInputItem>,
@@ -216,6 +216,7 @@ struct ConversationState {
     metrics: SessionMetrics,
     redactions: u64,
     token_calibration: squeezy_llm::TokenCalibration,
+    calibration_source: CalibrationSource,
     /// Mirror of the per-turn router's sticky-window counter, kept
     /// in sync with `Agent::routing_state.sticky.remaining_turns` so
     /// that every existing `to_resume_state()` call site persists the
@@ -231,6 +232,27 @@ struct ConversationState {
     /// over-optimistic catalog/override). In-memory only — a best-effort safety
     /// signal, not persisted across resume.
     observed_context_ceilings: HashMap<(String, String), u64>,
+}
+
+impl Default for ConversationState {
+    fn default() -> Self {
+        Self {
+            previous_response_id: None,
+            conversation: Vec::new(),
+            transcript: Vec::new(),
+            context_attachments: Vec::new(),
+            context_compaction: ContextCompactionState::default(),
+            cost: CostSnapshot::default(),
+            metrics: SessionMetrics::default(),
+            redactions: 0,
+            token_calibration: squeezy_llm::TokenCalibration::default(),
+            calibration_source: CalibrationSource::HardCodedDefault,
+            routing_sticky_remaining_turns: 0,
+            routing_session_disabled: false,
+            routing_prior_turn_was_hard: false,
+            observed_context_ceilings: HashMap::new(),
+        }
+    }
 }
 
 impl ConversationState {
@@ -249,6 +271,7 @@ impl ConversationState {
             metrics: metadata.metrics.clone(),
             redactions: metadata.redactions,
             token_calibration: metadata.token_calibration.clone(),
+            calibration_source: CalibrationSource::ResumedSession,
             routing_sticky_remaining_turns: state.routing_sticky_remaining_turns,
             routing_session_disabled: state.routing_session_disabled,
             routing_prior_turn_was_hard: state.routing_prior_turn_was_hard,
@@ -691,6 +714,32 @@ pub struct AttachmentShape {
     pub redactions: u64,
 }
 
+/// Where the active `TokenCalibration` came from at session start. Shown by
+/// `/cost` so users in CI / containers understand whether token estimates are
+/// warm (from prior sessions) or cold (first run / shared home / corrupt file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationSource {
+    /// calibration.json was absent; estimates use hard-coded provider defaults.
+    HardCodedDefault,
+    /// calibration.json was present but malformed; fell back to defaults.
+    CorruptFallback,
+    /// Loaded from the global calibration.json warm-start file.
+    GlobalFile,
+    /// Loaded from resumed session metadata (most accurate warm-start).
+    ResumedSession,
+}
+
+impl CalibrationSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HardCodedDefault => "hard-coded default (no calibration file)",
+            Self::CorruptFallback => "hard-coded default (calibration file was malformed)",
+            Self::GlobalFile => "global calibration.json",
+            Self::ResumedSession => "resumed session metadata",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionAccountingSnapshot {
     pub session_id: Option<String>,
@@ -709,6 +758,8 @@ pub struct SessionAccountingSnapshot {
     pub full_history_request: RequestTokenEstimate,
     pub skills: SkillsAccounting,
     pub mcp: McpAccounting,
+    /// Where the token calibration was loaded from at session start.
+    pub calibration_source: CalibrationSource,
 }
 
 impl SessionAccountingSnapshot {
@@ -1577,8 +1628,16 @@ impl Agent {
         // the first round's estimator isn't stuck on per-provider defaults.
         // Missing or malformed files fall back to `TokenCalibration::default()`,
         // which is what `ConversationState::default()` would carry anyway.
+        let store = SessionStore::open(&config);
+        let (token_calibration, source_hint) = store.load_global_calibration_with_source_hint();
+        let calibration_source = match source_hint {
+            None => CalibrationSource::HardCodedDefault,
+            Some(true) => CalibrationSource::GlobalFile,
+            Some(false) => CalibrationSource::CorruptFallback,
+        };
         let conversation_state = ConversationState {
-            token_calibration: SessionStore::open(&config).load_global_calibration(),
+            token_calibration,
+            calibration_source,
             ..ConversationState::default()
         };
         Self::build(
@@ -2820,6 +2879,7 @@ impl Agent {
             ),
             skills: self.skills_accounting(),
             mcp: self.mcp_accounting(&loaded_tool_schemas),
+            calibration_source: state.calibration_source,
         }
     }
 
@@ -3277,9 +3337,11 @@ impl Agent {
         {
             let mut state = self.conversation_state.lock().await;
             let token_calibration = state.token_calibration.clone();
+            let calibration_source = state.calibration_source;
             let routing_session_disabled = state.routing_session_disabled();
             *state = ConversationState {
                 token_calibration,
+                calibration_source,
                 routing_session_disabled,
                 ..ConversationState::default()
             };

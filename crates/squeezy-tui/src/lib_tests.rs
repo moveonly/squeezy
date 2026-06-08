@@ -4358,6 +4358,7 @@ fn format_cost_command_renders_active_buckets() {
         full_history_request: estimate,
         skills: SkillsAccounting::default(),
         mcp: McpAccounting::default(),
+        calibration_source: squeezy_agent::CalibrationSource::GlobalFile,
     };
 
     let raw = commands::format_cost_command(&snapshot);
@@ -4482,6 +4483,7 @@ fn format_cost_command_renders_by_model_drill() {
         full_history_request: estimate,
         skills: SkillsAccounting::default(),
         mcp: McpAccounting::default(),
+        calibration_source: squeezy_agent::CalibrationSource::GlobalFile,
     };
 
     let output = strip_ansi_escape_sequences(&commands::format_cost_command(&snapshot));
@@ -4724,6 +4726,7 @@ fn context_breaks_out_skills_and_mcp_sources() {
         full_history_request: estimate,
         skills,
         mcp,
+        calibration_source: squeezy_agent::CalibrationSource::HardCodedDefault,
     };
 
     let output = strip_ansi_escape_sequences(&commands::format_context_command(&snapshot));
@@ -8526,6 +8529,7 @@ fn context_snapshot_stays_expanded_in_compact_transcript() {
         full_history_request: estimate,
         skills: SkillsAccounting::default(),
         mcp: McpAccounting::default(),
+        calibration_source: squeezy_agent::CalibrationSource::HardCodedDefault,
     };
     let body = commands::format_context_command(&snapshot);
 

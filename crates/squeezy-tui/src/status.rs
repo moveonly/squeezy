@@ -34,6 +34,20 @@ pub(crate) const DEFAULT_STATUS_LINE_ITEMS: &[StatusLineItem] = &[
     StatusLineItem::Cost,
 ];
 
+/// Narrow status-line preset for SSH / tmux / narrow Linux terminals.
+/// Keeps spend, budget, and context visible while eliding directory,
+/// language, and branch metadata — items that are only useful in a wide
+/// terminal where the user can already read their shell prompt.
+///
+/// Activated by setting `[tui] status_line = ["narrow-linux"]` in TOML.
+pub(crate) const NARROW_LINUX_STATUS_LINE_ITEMS: &[StatusLineItem] = &[
+    StatusLineItem::ProviderAndModel,
+    StatusLineItem::Cost,
+    StatusLineItem::ContextRemaining,
+    StatusLineItem::Tools,
+    StatusLineItem::Budget,
+];
+
 /// One configurable status-bar item.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) enum StatusLineItem {
@@ -448,7 +462,11 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
             .map(|tokens| format!("cache_write {tokens}")),
         StatusLineItem::Tools => Some(format!("tools {}", app.metrics.tool_calls)),
         StatusLineItem::BytesRead => Some(format!("read {}", format_bytes(app.metrics.bytes_read))),
-        StatusLineItem::Cost => Some(format_cost_segment(&app.cost, app.cost_cap_usd_micros)),
+        StatusLineItem::Cost => Some(format_cost_segment(
+            &app.cost,
+            app.cost_cap_usd_micros,
+            app.cap_unenforceable,
+        )),
         StatusLineItem::CostCap => app
             .cost_cap_usd_micros
             .filter(|cap| *cap > 0)
@@ -572,19 +590,21 @@ pub(crate) fn render_status_details(app: &TuiApp) -> String {
 }
 
 /// Render the `cost ...` segment with optional cap and percent.
+///
+/// When `cap_unenforceable` is `true` (the active model has no pricing and
+/// a session cap is configured) an `unpriced` suffix is appended so the
+/// status line shows a persistent reminder without requiring the user to
+/// scroll back to the one-shot transcript notice.
 pub(crate) fn format_cost_segment(
     cost: &squeezy_core::CostSnapshot,
     cap_usd_micros: Option<u64>,
+    cap_unenforceable: bool,
 ) -> String {
     use crate::commands::format_cost;
-    match cap_usd_micros {
+    let mut out = match cap_usd_micros {
         Some(cap) if cap > 0 => {
             let spent = cost.estimated_usd_micros.unwrap_or(0);
-            let percent = if cap == 0 {
-                0
-            } else {
-                ((spent as u128 * 100) / cap as u128).min(255) as u8
-            };
+            let percent = ((spent as u128 * 100) / cap as u128).min(255) as u8;
             format!(
                 "cost {} / ${:.2} ({}%)",
                 format_cost(cost),
@@ -593,7 +613,11 @@ pub(crate) fn format_cost_segment(
             )
         }
         _ => format!("cost {}", format_cost(cost)),
+    };
+    if cap_unenforceable {
+        out.push_str(" ⚠unpriced");
     }
+    out
 }
 
 pub(crate) mod segments {
@@ -622,7 +646,11 @@ pub(crate) mod segments {
     }
 
     pub(crate) fn cost(app: &TuiApp) -> Option<String> {
-        Some(format_cost_segment(&app.cost, app.cost_cap_usd_micros))
+        Some(format_cost_segment(
+            &app.cost,
+            app.cost_cap_usd_micros,
+            app.cap_unenforceable,
+        ))
     }
 
     pub(crate) fn tokens(app: &TuiApp) -> Option<String> {

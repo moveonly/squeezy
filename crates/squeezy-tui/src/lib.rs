@@ -15233,8 +15233,15 @@ fn configured_status_line_items(app: &TuiApp) -> Option<Vec<status::StatusLineIt
 
 /// Parse the TOML-side `[tui].status_line` list into typed items, dropping
 /// unknown identifiers. Returns `None` when the TOML key was unset.
+///
+/// The single-element list `["narrow-linux"]` is a named preset that expands
+/// to [`status::NARROW_LINUX_STATUS_LINE_ITEMS`], optimised for SSH / tmux /
+/// narrow terminal environments where spend and budget must stay visible.
 fn parse_status_line_items(raw: Option<&[String]>) -> Option<Vec<status::StatusLineItem>> {
     let raw = raw?;
+    if raw.len() == 1 && raw[0] == "narrow-linux" {
+        return Some(status::NARROW_LINUX_STATUS_LINE_ITEMS.to_vec());
+    }
     Some(
         raw.iter()
             .filter_map(|s| s.parse::<status::StatusLineItem>().ok())
@@ -16169,6 +16176,11 @@ pub(crate) struct TuiApp {
     /// means the status bar renders the legacy `cost $X` segment
     /// unchanged.
     pub(crate) cost_cap_usd_micros: Option<u64>,
+    /// Set when the active (provider, model) has no pricing data and a session
+    /// cap is configured, so the cap cannot be enforced. Surfaces a persistent
+    /// `unpriced` marker in the cost status-line segment for the duration of
+    /// the session or until a model switch (TurnRouted) resets it.
+    pub(crate) cap_unenforceable: bool,
     pub(crate) metrics: squeezy_core::TurnMetrics,
     pub(crate) turn_rx: Option<mpsc::Receiver<AgentEvent>>,
     pub(crate) job_rx: Option<broadcast::Receiver<JobEvent>>,
@@ -16570,6 +16582,7 @@ impl TuiApp {
             recent_edit_failures: HashMap::new(),
             cost: squeezy_core::CostSnapshot::default(),
             cost_cap_usd_micros: config.max_session_cost_usd_micros.filter(|cap| *cap > 0),
+            cap_unenforceable: false,
             metrics: squeezy_core::TurnMetrics::default(),
             turn_rx: None,
             job_rx: None,

@@ -109,15 +109,42 @@ impl SessionStore {
         self.root.join("calibration.json")
     }
 
-    /// Load the cross-session `TokenCalibration` if present. Missing or
-    /// malformed files yield `TokenCalibration::default()` rather than an
-    /// error: the calibration is a best-effort cache, not a source of truth.
+    /// Load the cross-session `TokenCalibration` if present. Missing files
+    /// yield `TokenCalibration::default()` silently. Malformed files also
+    /// fall back to the default, but emit a one-time diagnostic to stderr so
+    /// the user knows the warm-start cache is cold (e.g. in CI or on shared
+    /// homes where corruption is more likely to go unnoticed).
     pub fn load_global_calibration(&self) -> squeezy_llm::TokenCalibration {
+        self.load_global_calibration_inner().0
+    }
+
+    /// Like [`Self::load_global_calibration`] but also returns a hint about
+    /// where the calibration came from:
+    /// - `(cal, None)` — file was absent; `cal` is the hard-coded default.
+    /// - `(cal, Some(true))` — file existed and was parsed successfully.
+    /// - `(cal, Some(false))` — file existed but was malformed; `cal` is the
+    ///   default and a warning was emitted to stderr.
+    pub fn load_global_calibration_with_source_hint(
+        &self,
+    ) -> (squeezy_llm::TokenCalibration, Option<bool>) {
+        self.load_global_calibration_inner()
+    }
+
+    fn load_global_calibration_inner(&self) -> (squeezy_llm::TokenCalibration, Option<bool>) {
         let path = self.calibration_path();
         if !path.exists() {
-            return squeezy_llm::TokenCalibration::default();
+            return (squeezy_llm::TokenCalibration::default(), None);
         }
-        read_json(&path).unwrap_or_default()
+        match read_json(&path) {
+            Ok(calibration) => (calibration, Some(true)),
+            Err(_) => {
+                eprintln!(
+                    "squeezy: warning: {:?} is malformed; falling back to default token calibration",
+                    path
+                );
+                (squeezy_llm::TokenCalibration::default(), Some(false))
+            }
+        }
     }
 
     /// Atomically persist the cross-session `TokenCalibration`. Errors are
@@ -2926,7 +2953,12 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("jsonl.tmp");
+    // Per-pid temp name to prevent concurrent compactors from clobbering
+    // each other's in-flight temp file, matching the safer `write_json` pattern.
+    let tmp = match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => path.with_file_name(format!(".{}.{}.tmp", name, std::process::id())),
+        None => path.with_extension("tmp"),
+    };
     {
         let mut file = OpenOptions::new()
             .create(true)
@@ -2943,7 +2975,11 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
         }
         file.sync_all()?;
     }
-    fs::rename(&tmp, path)
+    if let Err(error) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
