@@ -215,7 +215,7 @@ impl SessionStore {
     }
 
     /// Path to the cross-project session index. When `XDG_STATE_HOME` is set
-    /// (Linux XDG Base Directory Specification) it resolves to
+    /// to an absolute path (Linux XDG Base Directory Specification) it resolves to
     /// `$XDG_STATE_HOME/squeezy/sessions/index.jsonl`; otherwise it uses the
     /// legacy `$HOME/.squeezy/sessions/index.jsonl` path so that existing
     /// macOS, Windows, and Linux state at that location is undisturbed.
@@ -226,7 +226,8 @@ impl SessionStore {
     ///
     /// Per-project session roots live under each workspace, so a global index
     /// is the only way the resume picker can show sessions started from sibling
-    /// repos. Returns `None` when `HOME` is unset.
+    /// repos. Returns `None` when neither an absolute `XDG_STATE_HOME` nor
+    /// `HOME` is set.
     pub fn global_index_path() -> Option<PathBuf> {
         xdg_global_index_path()
     }
@@ -3465,17 +3466,15 @@ fn json_error(error: serde_json::Error) -> SqueezyError {
 }
 
 /// Resolve the XDG-aware path for the global session index. When
-/// `XDG_STATE_HOME` is set it takes precedence (Linux XDG Base Dir Spec);
-/// otherwise falls back to `$HOME/.squeezy/sessions/index.jsonl` to preserve
-/// existing macOS/Windows state.
+/// `XDG_STATE_HOME` is set to an absolute path it takes precedence (Linux XDG
+/// Base Dir Spec); otherwise falls back to `$HOME/.squeezy/sessions/index.jsonl`
+/// to preserve existing macOS/Windows state.
 fn xdg_global_index_path() -> Option<PathBuf> {
     if let Some(xdg) = env::var_os("XDG_STATE_HOME") {
-        return Some(
-            PathBuf::from(xdg)
-                .join("squeezy")
-                .join("sessions")
-                .join("index.jsonl"),
-        );
+        let path = PathBuf::from(xdg);
+        if path.is_absolute() {
+            return Some(path.join("squeezy").join("sessions").join("index.jsonl"));
+        }
     }
     let home = env::var_os("HOME")?;
     Some(

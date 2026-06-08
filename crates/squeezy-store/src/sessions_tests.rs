@@ -2750,11 +2750,20 @@ fn hash_payload(payload: &serde_json::Value) -> String {
 static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn with_home<R>(home: &Path, body: impl FnOnce() -> R) -> R {
+    with_home_and_xdg(home, None, body)
+}
+
+fn with_home_and_xdg<R>(home: &Path, xdg_state_home: Option<&Path>, body: impl FnOnce() -> R) -> R {
     let _guard = HOME_LOCK.lock().expect("HOME lock");
     let previous = std::env::var_os("HOME");
-    // SAFETY: the lock above serialises HOME mutations across the suite.
+    let previous_xdg = std::env::var_os("XDG_STATE_HOME");
+    // SAFETY: the lock above serialises HOME/XDG_STATE_HOME mutations across the suite.
     unsafe {
         std::env::set_var("HOME", home);
+        match xdg_state_home {
+            Some(path) => std::env::set_var("XDG_STATE_HOME", path),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
     }
     let result = body();
     unsafe {
@@ -2762,8 +2771,27 @@ fn with_home<R>(home: &Path, body: impl FnOnce() -> R) -> R {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
+        match previous_xdg {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
     }
     result
+}
+
+fn global_index_entry_for_test(id: &str, started_at_ms: u64) -> GlobalSessionIndexEntry {
+    GlobalSessionIndexEntry {
+        session_id: id.to_string(),
+        cwd: format!("/Users/dev/projects/{id}"),
+        workspace_root: format!("/Users/dev/projects/{id}"),
+        repo_root: None,
+        title: Some(id.to_string()),
+        display_name: None,
+        started_at_ms,
+        last_event_at_ms: started_at_ms,
+        turn_count: 1,
+        resume_available: true,
+    }
 }
 
 #[test]
@@ -3744,5 +3772,62 @@ fn global_index_cache_invalidates_when_append_changes_file() {
             second_pos < first_pos,
             "local entries should preserve newest-first order after cache invalidation: {listed:?}"
         );
+    });
+}
+
+#[test]
+fn global_index_prefers_absolute_xdg_and_merges_legacy_home_index() {
+    let home = temp_root("global-index-xdg-home");
+    let xdg = temp_root("global-index-xdg-state");
+    with_home_and_xdg(&home, Some(&xdg), || {
+        let active = SessionStore::global_index_path().expect("XDG path");
+        assert_eq!(
+            active,
+            xdg.join("squeezy").join("sessions").join("index.jsonl")
+        );
+
+        let legacy_path = SessionStore::legacy_global_index_path().expect("legacy path");
+        fs::create_dir_all(legacy_path.parent().expect("legacy parent")).expect("mkdir legacy");
+        let legacy = global_index_entry_for_test("legacy-session", 1);
+        fs::write(
+            &legacy_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&legacy).expect("serialize legacy")
+            ),
+        )
+        .expect("write legacy index");
+
+        let xdg_entry = global_index_entry_for_test("xdg-session", 2);
+        SessionStore::append_global_index_entry(&xdg_entry);
+
+        let listed = SessionStore::list_global_index();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["xdg-session", "legacy-session"],
+            "XDG and legacy entries should both be visible newest-first"
+        );
+        assert!(active.exists(), "new appends should land in the XDG index");
+    });
+}
+
+#[test]
+fn global_index_ignores_relative_xdg_state_home() {
+    let home = temp_root("global-index-relative-xdg");
+    let relative_xdg = PathBuf::from("relative-state");
+    with_home_and_xdg(&home, Some(&relative_xdg), || {
+        let active = SessionStore::global_index_path().expect("fallback path");
+        let legacy = SessionStore::legacy_global_index_path().expect("legacy path");
+        assert_eq!(
+            active, legacy,
+            "relative XDG_STATE_HOME values are invalid and must not redirect state"
+        );
+
+        let entry = global_index_entry_for_test("home-session", 1);
+        SessionStore::append_global_index_entry(&entry);
+        assert!(legacy.exists(), "append should use HOME fallback");
     });
 }

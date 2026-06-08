@@ -397,29 +397,51 @@ fn key_source_label(source: KeySource, env_name: &str) -> String {
 
 /// Report resolved session-related paths and whether XDG variables are honored.
 /// Shows the workspace session root, global index path, static memory path, and
-/// warns when `HOME` is unset or the active index directory is read-only.
+/// warns when `HOME` is unset, XDG is invalid, or the active index directory is
+/// read-only.
 fn session_paths_checks(config: &AppConfig) -> Vec<Check> {
     let mut checks = Vec::new();
     let store = SessionStore::open(config);
     let session_root = store.root().display().to_string();
 
-    // Warn when HOME is unset (global index and memory file will be unavailable).
-    let home_available = match env::var_os("HOME") {
-        None => {
-            checks.push(Check {
-                name: "session_home".to_string(),
-                status: Status::Warn,
-                detail: "HOME is not set; global session index and memory file are unavailable"
-                    .to_string(),
-            });
-            false
-        }
-        Some(_) => true,
-    };
-
-    let xdg_honored = env::var_os("XDG_STATE_HOME").is_some();
     let index_path = SessionStore::global_index_path();
     let memory_path = SessionStore::memory_path();
+    let xdg_state_home = env::var_os("XDG_STATE_HOME");
+    let xdg_honored = xdg_state_home
+        .as_ref()
+        .is_some_and(|xdg| PathBuf::from(xdg).is_absolute());
+    let xdg_invalid = xdg_state_home.as_ref().is_some_and(|xdg| {
+        let path = PathBuf::from(xdg);
+        !path.is_absolute()
+    });
+
+    // Warn when HOME is unset; an absolute XDG_STATE_HOME can still carry the
+    // global index, but the memory file remains HOME-based.
+    if env::var_os("HOME").is_none() {
+        let detail = if index_path.is_some() {
+            "HOME is not set; memory file is unavailable; global index uses XDG_STATE_HOME"
+                .to_string()
+        } else {
+            "HOME is not set; global session index and memory file are unavailable".to_string()
+        };
+        checks.push(Check {
+            name: "session_home".to_string(),
+            status: Status::Warn,
+            detail,
+        });
+    }
+
+    if xdg_invalid {
+        let raw = xdg_state_home
+            .as_ref()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        checks.push(Check {
+            name: "session_xdg_state_home".to_string(),
+            status: Status::Warn,
+            detail: format!("XDG_STATE_HOME={raw} is not absolute; falling back to HOME"),
+        });
+    }
 
     // Check that the directory that will hold the global index is writable. This
     // uses the resolved index path (XDG or legacy) rather than HOME so the check
@@ -481,7 +503,7 @@ fn session_paths_checks(config: &AppConfig) -> Vec<Check> {
         });
     }
 
-    let stale_running = if home_available && !index_dir_readonly {
+    let stale_running = if !index_dir_readonly {
         let stale_count = count_stale_running_sessions(&store);
         if stale_count > 0 {
             Some(stale_count)

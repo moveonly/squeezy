@@ -1,6 +1,7 @@
 use super::*;
 use squeezy_core::{McpPermissionConfig, McpServerConfig, McpTransport, ProviderSettings};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 // env::set_var/remove_var is process-global; serialize these tests so a parallel
@@ -18,6 +19,38 @@ fn isolate_credentials_file() {
         );
         env::remove_var("SQUEEZY_CREDENTIALS_JSON");
     }
+}
+
+fn with_session_env<R>(
+    home: Option<&Path>,
+    xdg_state_home: Option<&Path>,
+    body: impl FnOnce() -> R,
+) -> R {
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    let previous_home = env::var_os("HOME");
+    let previous_xdg = env::var_os("XDG_STATE_HOME");
+    unsafe {
+        match home {
+            Some(path) => env::set_var("HOME", path),
+            None => env::remove_var("HOME"),
+        }
+        match xdg_state_home {
+            Some(path) => env::set_var("XDG_STATE_HOME", path),
+            None => env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+    let result = body();
+    unsafe {
+        match previous_home {
+            Some(value) => env::set_var("HOME", value),
+            None => env::remove_var("HOME"),
+        }
+        match previous_xdg {
+            Some(value) => env::set_var("XDG_STATE_HOME", value),
+            None => env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+    result
 }
 
 #[test]
@@ -86,6 +119,78 @@ fn probe_writable_round_trips_in_tempdir() {
     // probe file should have been cleaned up
     assert!(!dir.join(".squeezy-doctor-probe").exists());
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_paths_check_reports_absolute_xdg_without_home() {
+    let root = skills_doctor_workspace("session_paths_xdg_no_home");
+    let xdg = root.join("xdg-state");
+    std::fs::create_dir_all(&xdg).expect("mkdir xdg");
+    with_session_env(None, Some(&xdg), || {
+        let config = AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        };
+        let checks = session_paths_checks(&config);
+        let home = checks
+            .iter()
+            .find(|check| check.name == "session_home")
+            .expect("HOME warning");
+        assert_eq!(home.status, Status::Warn);
+        assert!(
+            home.detail.contains("global index uses XDG_STATE_HOME"),
+            "{home:?}"
+        );
+        let paths = checks
+            .iter()
+            .find(|check| check.name == "session_paths")
+            .expect("session paths row");
+        assert!(
+            paths.detail.contains("XDG_STATE_HOME honored")
+                && paths.detail.contains("memory=unavailable"),
+            "{paths:?}"
+        );
+    });
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn session_paths_check_warns_on_relative_xdg_state_home() {
+    let root = skills_doctor_workspace("session_paths_relative_xdg");
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).expect("mkdir home");
+    let relative_xdg = Path::new("relative-state");
+    with_session_env(Some(&home), Some(relative_xdg), || {
+        let config = AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        };
+        let checks = session_paths_checks(&config);
+        let xdg = checks
+            .iter()
+            .find(|check| check.name == "session_xdg_state_home")
+            .expect("XDG warning");
+        assert_eq!(xdg.status, Status::Warn);
+        assert!(xdg.detail.contains("not absolute"), "{xdg:?}");
+        let paths = checks
+            .iter()
+            .find(|check| check.name == "session_paths")
+            .expect("session paths row");
+        assert!(
+            paths.detail.contains(
+                &home
+                    .join(".squeezy/sessions/index.jsonl")
+                    .display()
+                    .to_string()
+            ),
+            "{paths:?}"
+        );
+        assert!(
+            !paths.detail.contains("XDG_STATE_HOME honored"),
+            "relative XDG_STATE_HOME must not be reported as honored: {paths:?}"
+        );
+    });
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn mcp_fixture(enabled: bool, transport: McpTransport) -> McpServerConfig {
