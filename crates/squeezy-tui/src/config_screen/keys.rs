@@ -1698,6 +1698,7 @@ fn handle_mcp_add_form_key(
                 bearer_token_env_var: None,
                 http_headers: std::collections::BTreeMap::new(),
                 env_http_headers: std::collections::BTreeMap::new(),
+                cwd: None,
             };
             let persist = !form.session_only;
             state
