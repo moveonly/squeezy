@@ -261,8 +261,10 @@ fn detect_for_command_activates_skill_on_fd_skill_doc() {
     let mut skills = BTreeMap::new();
     skills.insert("nav".to_string(), entry);
 
+    // Use the form where the full skill doc path appears as an argument token.
+    // `fd -tf .squeezy/skills/nav/SKILL.md` — checking a specific file.
     let result = detect_for_command(
-        "fd SKILL.md .squeezy/skills/nav",
+        "fd -tf .squeezy/skills/nav/SKILL.md",
         &workdir,
         &BTreeMap::new(),
         &by_doc_path,
@@ -270,6 +272,6 @@ fn detect_for_command_activates_skill_on_fd_skill_doc() {
     );
     assert!(
         result.is_some(),
-        "fd reading a skill dir should activate the skill"
+        "fd with explicit SKILL.md path should activate the skill"
     );
 }
