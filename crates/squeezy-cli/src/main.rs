@@ -1212,23 +1212,23 @@ fn skills_show(cli: &Cli, name: &str, preview: bool) -> squeezy_core::Result<()>
     }
     // Show any ambiguous trigger phrases declared by THIS skill.
     let ambiguous_triggers = catalog.ambiguous_triggers();
-    if !ambiguous_triggers.is_empty() {
-        if let Ok(content) = fs::read_to_string(&summary.location) {
-            let skill_triggers = squeezy_skills::parse_skill_triggers(&content);
-            let ambiguous_for_skill: Vec<&String> = ambiguous_triggers
+    if !ambiguous_triggers.is_empty()
+        && let Ok(content) = fs::read_to_string(&summary.location)
+    {
+        let skill_triggers = squeezy_skills::parse_skill_triggers(&content);
+        let ambiguous_for_skill: Vec<&String> = ambiguous_triggers
+            .iter()
+            .filter(|t| skill_triggers.iter().any(|s| s == t.as_str()))
+            .collect();
+        if !ambiguous_for_skill.is_empty() {
+            let listed = ambiguous_for_skill
                 .iter()
-                .filter(|t| skill_triggers.iter().any(|s| s == t.as_str()))
-                .collect();
-            if !ambiguous_for_skill.is_empty() {
-                let listed = ambiguous_for_skill
-                    .iter()
-                    .map(|t| format!("`{t}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                println!(
-                    "ambiguous triggers: {listed} (declared by multiple skills; auto-activation skipped — use `/skill {name}` or `load_skill` to select explicitly)"
-                );
-            }
+                .map(|t| format!("`{t}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "ambiguous triggers: {listed} (declared by multiple skills; auto-activation skipped — use `/skill {name}` or `load_skill` to select explicitly)"
+            );
         }
     }
     if preview {
