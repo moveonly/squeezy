@@ -3,8 +3,8 @@ use std::{env, fmt::Write as _, fs, path::PathBuf, time::Duration};
 use clap::Args;
 use serde_json::json;
 use squeezy_core::{
-    AppConfig, McpServerConfig, McpTransport, ProviderConfig, ProviderSettings, Result,
-    SettingsFile, default_settings_path,
+    AppConfig, McpServerConfig, McpTransport, OllamaConfig, ProviderConfig, ProviderSettings,
+    Result, SettingsFile, default_settings_path,
 };
 use squeezy_llm::{
     KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
@@ -281,13 +281,7 @@ fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Statu
                 format!("region={} (uses AWS credential chain)", c.region),
             ),
         ),
-        ProviderConfig::Ollama(c) => (
-            "ollama",
-            (
-                Status::Ok,
-                format!("base_url={} (no API key required)", c.base_url),
-            ),
-        ),
+        ProviderConfig::Ollama(c) => ("ollama", ollama_credential_check(c)),
         ProviderConfig::OpenAiCodex(_) => ("openai_codex", openai_codex_auth_check()),
         ProviderConfig::GitHubCopilot(_) => ("github_copilot", github_copilot_auth_check()),
         ProviderConfig::OpenAiCompatible(c) => (
@@ -376,6 +370,42 @@ fn credential_check(inline: Option<&str>, env_name: &str) -> (Status, String) {
                  ~/.squeezy/settings.toml, or run `squeezy auth set <provider>`"
             ),
         ),
+    }
+}
+
+/// Credential check for the Ollama provider. Ollama operates without auth by
+/// default, so no token is not a failure. When `api_key_env` is set (or an
+/// inline key is configured) we use the normal resolution chain so users
+/// running Ollama Cloud or a protected reverse proxy get the same clear
+/// feedback as any key-bearing provider.
+fn ollama_credential_check(c: &OllamaConfig) -> (Status, String) {
+    let has_inline = c.api_key.as_deref().is_some_and(|v| !v.trim().is_empty());
+    let has_env = !c.api_key_env.is_empty();
+    if has_inline || has_env {
+        // Try to resolve through the normal chain; fall back to the local-only
+        // message rather than emitting a Warn when the env var is simply unset.
+        match resolve_api_key_with_inline(c.api_key.as_deref(), &c.api_key_env) {
+            Ok(resolved) => (
+                Status::Ok,
+                format!(
+                    "base_url={}, bearer token resolved via {}",
+                    c.base_url,
+                    key_source_label(resolved.source, &c.api_key_env)
+                ),
+            ),
+            Err(_) => (
+                Status::Ok,
+                format!(
+                    "base_url={} (no bearer token set; local auth-free deployment assumed)",
+                    c.base_url
+                ),
+            ),
+        }
+    } else {
+        (
+            Status::Ok,
+            format!("base_url={} (no API key required)", c.base_url),
+        )
     }
 }
 

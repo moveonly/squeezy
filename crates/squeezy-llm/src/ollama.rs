@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
     compatible::OpenAiCompatibleProvider,
-    credentials::static_api_key_source,
+    credentials::{resolve_api_key_with_inline, static_api_key_source},
     retry::{RetryPolicy, idle_timeout, send_with_retry},
     transport::shared_client,
 };
@@ -39,8 +39,7 @@ pub(crate) const DEFAULT_NUM_CTX: u64 = 32_768;
 // falling back to the canonical `OLLAMA_HOST` env var. The URL helpers below
 // (`api_endpoint_url`, `ollama_host_root`) absorb any base shape so users who
 // set `OLLAMA_HOST=http://host:11434` still reach the right endpoint; the
-// core-side constant and env-fallback fixes ship in Phase 4FH alongside the
-// `OllamaConfig` field additions.
+// core-side constant and env-fallback fixes are tracked in a follow-up commit.
 #[derive(Debug, Clone)]
 pub struct OllamaProvider {
     client: reqwest::Client,
@@ -74,26 +73,30 @@ impl OllamaProvider {
                 config.transport,
             )),
         };
+        // Resolve api_key: inline TOML field wins, then fall back to the
+        // configured env var (default: OLLAMA_API_KEY). A missing or
+        // empty env var produces `None` so plain no-auth local deployments
+        // continue working without a bearer-token header.
+        let api_key = config.api_key.clone().or_else(|| {
+            resolve_api_key_with_inline(None, &config.api_key_env)
+                .ok()
+                .map(|resolved| resolved.value)
+                .filter(|v| !v.trim().is_empty())
+        });
         Self {
             client: shared_client(&config.transport),
             base_url,
             transport: config.transport,
             compat,
-            // TODO(audit H-16): plumb `OllamaConfig.keep_alive` once Phase 4FH
-            // adds the field to squeezy-core. Read path is wired through
-            // `with_keep_alive` and `request_body` today.
-            keep_alive: None,
-            // TODO(audit Low/OAuth): plumb `OllamaConfig.api_key` once Phase
-            // 4FH adds the field to squeezy-core. Read path is wired through
-            // `with_api_key` and the native request layer today.
-            api_key: None,
+            keep_alive: config.keep_alive.clone(),
+            api_key,
         }
     }
 
     /// Override the optional `keep_alive` value used on every native chat
-    /// request. Returns `self` for chaining; intended for use sites that
-    /// construct the provider directly (e.g. tests, future config-bridge
-    /// glue) ahead of the Phase 4FH config field landing.
+    /// request. Returns `self` for chaining; primarily for tests and
+    /// programmatic construction. Config-level wiring uses
+    /// `OllamaConfig.keep_alive` / `OLLAMA_KEEP_ALIVE`.
     pub fn with_keep_alive(mut self, keep_alive: impl Into<String>) -> Self {
         self.keep_alive = Some(keep_alive.into());
         self
@@ -101,7 +104,8 @@ impl OllamaProvider {
 
     /// Override the optional bearer token used on every native request
     /// (e.g. Ollama Cloud, reverse-proxy-protected self-host). Returns
-    /// `self` for chaining; same provisional plumb as `with_keep_alive`.
+    /// `self` for chaining; primarily for tests and programmatic construction.
+    /// Config-level wiring uses `OllamaConfig.api_key` / `OLLAMA_API_KEY`.
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = Some(api_key.into());
         self

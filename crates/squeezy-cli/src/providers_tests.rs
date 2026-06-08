@@ -85,3 +85,62 @@ fn env_set_treats_blank_strings_as_unset() {
     assert!(!env_set(&lookup, "MISSING"));
     assert!(!env_set(&lookup, ""));
 }
+
+#[test]
+fn ollama_is_always_configured_regardless_of_api_key() {
+    // Ollama requires no auth by default; it must not appear unconfigured
+    // just because OLLAMA_API_KEY is absent.
+    let entries_no_key = registry_entries(&|_| None);
+    let ollama_no_key = entries_no_key
+        .iter()
+        .find(|e| e.name == "ollama")
+        .expect("ollama entry");
+    assert!(
+        ollama_no_key.configured,
+        "ollama must be configured even without OLLAMA_API_KEY"
+    );
+
+    let mut with_key = HashMap::new();
+    with_key.insert("OLLAMA_API_KEY", "ollama-cloud-token");
+    let entries_with_key = registry_entries(&lookup_from(with_key));
+    let ollama_with_key = entries_with_key
+        .iter()
+        .find(|e| e.name == "ollama")
+        .expect("ollama entry");
+    assert!(
+        ollama_with_key.configured,
+        "ollama still configured with key"
+    );
+}
+
+#[test]
+fn bedrock_configured_when_any_aws_cred_var_set() {
+    let no_creds = registry_entries(&|_| None);
+    let bedrock_no_creds = no_creds
+        .iter()
+        .find(|e| e.name == "bedrock")
+        .expect("bedrock entry");
+    assert!(
+        !bedrock_no_creds.configured,
+        "bedrock should not be configured when no AWS credential env vars are set"
+    );
+
+    // Each of these AWS credential signals should mark Bedrock as configured.
+    for var in &[
+        "AWS_ACCESS_KEY_ID",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_ROLE_ARN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_BEARER_TOKEN_BEDROCK",
+    ] {
+        let mut map = HashMap::new();
+        map.insert(*var, "some-value");
+        let entries = registry_entries(&lookup_from(map));
+        let bedrock = entries.iter().find(|e| e.name == "bedrock").unwrap();
+        assert!(
+            bedrock.configured,
+            "bedrock must be configured when {var} is set"
+        );
+    }
+}

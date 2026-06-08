@@ -382,12 +382,22 @@ impl ProviderContribution for GoogleContribution {
 /// `route_style` is accepted as a lowercase string (`"native"`,
 /// `"openai_compatible"`, …) and parsed via [`OllamaRoute::parse`] so the
 /// user-facing TOML matches the existing settings.toml dialect.
+///
+/// `api_key_env` / `api_key` / `keep_alive` map 1:1 to `OllamaConfig` and
+/// let users configure Ollama Cloud / reverse-proxy auth and the idle model
+/// retention window through the same contribution surface.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OllamaContributionConfig {
     #[serde(default = "default_ollama_base_url")]
     pub base_url: String,
     #[serde(default)]
     pub route_style: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub keep_alive: Option<String>,
     #[serde(default)]
     pub transport: ProviderTransportConfig,
 }
@@ -422,6 +432,11 @@ impl ProviderContribution for OllamaContribution {
         let core = OllamaConfig {
             base_url: config.base_url,
             route_style,
+            api_key_env: config
+                .api_key_env
+                .unwrap_or_else(|| "OLLAMA_API_KEY".to_string()),
+            api_key: config.api_key,
+            keep_alive: config.keep_alive,
             transport: config.transport,
         };
         Ok(Box::new(OllamaProvider::from_config(&core)))

@@ -46,6 +46,7 @@ async fn ollama_local_streaming_smoke() -> Result<()> {
         base_url: base_url.clone(),
         route_style: Default::default(),
         transport: ProviderTransportConfig::default(),
+        ..Default::default()
     });
     let model = env::var(MODEL_ENV).unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string());
     let request = LlmRequest {

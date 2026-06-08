@@ -2424,6 +2424,7 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
                 base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
                 route_style: Default::default(),
                 transport,
+                ..Default::default()
             }),
             DEFAULT_OLLAMA_MODEL,
         ),
