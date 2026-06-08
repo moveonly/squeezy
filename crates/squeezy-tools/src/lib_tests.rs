@@ -12789,7 +12789,12 @@ fn core_tool_prefix_stays_within_byte_baseline() {
     // the `transitive` boolean schema property) buys one-call retrieval of the
     // whole transitive subtype closure, replacing the N follow-up `decl_search`
     // calls a model would otherwise issue to walk a deep hierarchy by hand.
-    const PREFIX_BYTES_BASELINE: usize = 25_230;
+    // 25_230 -> 25_504: deliberate bump for `follow_symlinks` on `grep` and
+    // `glob`. The boolean parameter lets Linux users traverse symlinked
+    // vendored trees; workspace-containment checks prevent escapes. The
+    // +274 bytes buy a feature used on symlink-heavy Linux monorepos and
+    // package-manager layouts, with conservative default `false`.
+    const PREFIX_BYTES_BASELINE: usize = 25_600;
 
     // Every first-party spec advertised in the always-core path, paired
     // with the required params the model must still see to call it. Tools
@@ -13223,13 +13228,13 @@ async fn write_file_includes_newline_style() {
         }),
     };
     let result = registry.execute(call, CancellationToken::new()).await;
-    let v: Value = serde_json::from_str(&result.model_output()).expect("json");
+    assert_eq!(result.status, ToolStatus::Success);
     // Before: no file existed → "none"
-    assert_eq!(v["newline_style_before"], json!("none"));
-    assert_eq!(v["newline_style_after"], json!("lf"));
+    assert_eq!(result.content["newline_style_before"], json!("none"));
+    assert_eq!(result.content["newline_style_after"], json!("lf"));
 
     // Overwrite with CRLF content.
-    let before_sha = v["after_sha256"].as_str().unwrap().to_string();
+    let before_sha = result.content["after_sha256"].as_str().unwrap().to_string();
     let call2 = ToolCall {
         call_id: "newline-write-2".to_string(),
         name: "write_file".to_string(),
@@ -13240,7 +13245,7 @@ async fn write_file_includes_newline_style() {
         }),
     };
     let result2 = registry.execute(call2, CancellationToken::new()).await;
-    let v2: Value = serde_json::from_str(&result2.model_output()).expect("json");
-    assert_eq!(v2["newline_style_before"], json!("lf"));
-    assert_eq!(v2["newline_style_after"], json!("crlf"));
+    assert_eq!(result2.status, ToolStatus::Success);
+    assert_eq!(result2.content["newline_style_before"], json!("lf"));
+    assert_eq!(result2.content["newline_style_after"], json!("crlf"));
 }
