@@ -664,7 +664,7 @@ Each item uses the same shape:
   tmux/SSH/ConPTY hints and optional probes. Add built-in profiles and manual pins/overrides.
 - **Verify:** Fixture env-map tests, nested VS Code/tmux/SSH, no renderer path changes, `/terminal`
   snapshots, tmux/ConPTY smoke where available.
-- **Deps/Risks:** Detection is probabilistic. Downgrades must be visible and overrideable.
+- **Deps/Risks:** Detection is probabilistic. Downgrades must be visible and overridable.
 - **Platform notes:** Built-in profiles should explicitly cover macOS Terminal/iTerm2, Linux desktop
   terminals, Linux console, tmux/screen, SSH remoting, VS Code/xterm.js, Windows Terminal, legacy
   conhost, and ConPTY. Keep OS detection separate from terminal capability detection.
