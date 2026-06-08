@@ -8874,6 +8874,35 @@ fn detect_case_collisions_finds_pair() {
     );
 }
 
+// ── Windows path identity tests ──────────────────────────────────────────────
+
+#[test]
+fn graph_files_by_normalized_id_enables_case_insensitive_lookup() {
+    let source = "pub fn a() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let rec = record("src/Lib.rs", source);
+    let parsed = parser.parse_source(&rec, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    // Exact lookup works.
+    assert!(graph.files.contains_key(&FileId::new("src/Lib.rs")));
+    // Case-insensitive lookup via normalized index finds the record.
+    assert!(
+        graph.find_file_case_insensitive("src/lib.rs").is_some(),
+        "find_file_case_insensitive must resolve lowercase query to src/Lib.rs"
+    );
+    // Backslash normalization is applied before the lookup.
+    assert!(
+        graph.find_file_case_insensitive("src\\Lib.rs").is_some(),
+        "find_file_case_insensitive must accept backslash path separators"
+    );
+    // A query with no match returns None.
+    assert!(
+        graph.find_file_case_insensitive("src/missing.rs").is_none(),
+        "find_file_case_insensitive must return None for absent paths"
+    );
+}
+
 #[test]
 fn detect_case_collisions_finds_all_pairs_for_three_way_collision() {
     // Three files that all fold to "src/lib.rs": must yield C(3,2) = 3 pairs.
@@ -8887,6 +8916,56 @@ fn detect_case_collisions_finds_all_pairs_for_three_way_collision() {
         collisions.len(),
         3,
         "three-way collision must yield 3 pairs, got: {collisions:?}"
+    );
+}
+
+#[test]
+fn graph_case_insensitive_hint_returns_canonical_spelling() {
+    let source = "fn x() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let rec = record("src/MyModule.rs", source);
+    let parsed = parser.parse_source(&rec, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    assert_eq!(
+        graph.case_insensitive_match_hint("src/mymodule.rs"),
+        Some("src/MyModule.rs")
+    );
+    assert_eq!(
+        graph.case_insensitive_match_hint("SRC/MYMODULE.RS"),
+        Some("src/MyModule.rs")
+    );
+    assert_eq!(
+        graph.case_insensitive_match_hint("src/MyModule.rs"),
+        Some("src/MyModule.rs")
+    );
+    assert!(graph.case_insensitive_match_hint("src/other.rs").is_none());
+}
+
+#[test]
+fn graph_case_collision_detected_in_rebuild_indexes() {
+    let source_a = "pub fn a() {}\n";
+    let source_b = "pub fn b() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let rec_a = record("src/lib.rs", source_a);
+    let mut rec_b = record("src/lib.rs", source_b);
+    rec_b.id = FileId::new("src/Lib.rs");
+    rec_b.relative_path = "src/Lib.rs".to_string();
+
+    let parsed_a = parser.parse_source(&rec_a, source_a.to_string()).unwrap();
+    let parsed_b = parser.parse_source(&rec_b, source_b.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed_a, parsed_b]);
+
+    assert_eq!(
+        graph.case_collisions.len(),
+        1,
+        "expected exactly one case collision for src/lib.rs vs src/Lib.rs"
+    );
+    let (a, b) = &graph.case_collisions[0];
+    let pair = [a.as_str(), b.as_str()];
+    assert!(
+        pair.contains(&"src/lib.rs") && pair.contains(&"src/Lib.rs"),
+        "collision must name both spellings, got {a:?} and {b:?}"
     );
 }
 
@@ -8969,4 +9048,46 @@ fn normalize_cargo_file_id_fallback_via_symlink() {
     // Cleanup
     let _ = fs::remove_dir_all(&real_root);
     let _ = fs::remove_file(&sym_root);
+}
+
+#[test]
+fn normalize_cargo_file_id_case_insensitive_fallback() {
+    // Build a root path from the temp directory and construct a path that
+    // differs from the root prefix only in casing (simulating a Windows
+    // drive-letter or directory-case mismatch). The *relative* portion retains
+    // its original casing so we can assert it is preserved in the output.
+    let root = temp_root("cargo-norm-case");
+    let root_norm = root.to_string_lossy().replace('\\', "/");
+
+    // Exact-case path with a mixed-case relative portion.
+    let exact_path = format!("{root_norm}/src/MyModule.cs");
+    assert_eq!(
+        normalize_cargo_file_id(&root, None, &exact_path),
+        Some("src/MyModule.cs".to_string()),
+        "exact case must return the relative path with its original casing"
+    );
+
+    // Construct a path where the root prefix differs in casing but the
+    // relative portion stays at original casing. This simulates the Windows
+    // scenario where the diagnostic reports `C:\work\src\MyModule.cs` while
+    // the workspace root is `c:\work`.
+    let upper_root = root_norm.to_ascii_uppercase();
+    if upper_root != root_norm {
+        let case_mismatch_path = format!("{upper_root}/src/MyModule.cs");
+        assert_eq!(
+            super::case_insensitive_relative_path(&root, std::path::Path::new(&case_mismatch_path)),
+            Some(std::path::PathBuf::from("src/MyModule.cs")),
+            "case-insensitive helper must preserve the relative path's original casing"
+        );
+        let expected = if cfg!(windows) {
+            Some("src/MyModule.cs".to_string())
+        } else {
+            None
+        };
+        assert_eq!(
+            normalize_cargo_file_id(&root, None, &case_mismatch_path),
+            expected,
+            "case-insensitive absolute-prefix fallback must be Windows-only"
+        );
+    }
 }
