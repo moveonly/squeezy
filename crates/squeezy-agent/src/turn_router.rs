@@ -149,6 +149,53 @@ const HEURISTIC_VERBS: &[&str] = &[
     "tag",
 ];
 
+/// Keywords that indicate the prompt touches Linux sandbox/container/kernel
+/// territory where cheap-model errors are expensive to recover from.
+/// When `routing.linux_sandbox_sensitive_parent` is enabled (the default),
+/// any prompt containing one of these terms bypasses cheap routing and goes
+/// to the parent model. An explicit `/cheap` override still wins.
+const LINUX_SANDBOX_SENSITIVE_TERMS: &[&str] = &[
+    "unshare",
+    "landlock",
+    "seccomp",
+    "sudo",
+    "systemd",
+    "docker",
+    "podman",
+    "/proc",
+    "/sys",
+    "apt-get",
+    "apt ",
+    "yum ",
+    "dnf ",
+    "pacman",
+    "zypper",
+    " apk ",
+    "network namespace",
+    "netns",
+    "kernel policy",
+    "cgroup",
+    "nsenter",
+    "chroot",
+    "pivot_root",
+    "overlayfs",
+    "containerd",
+    "rootless",
+    "user namespace",
+    "userns",
+];
+
+/// Returns `true` when `user_input` (case-insensitive) contains any
+/// Linux sandbox-sensitive keyword. Used by `classify_turn` to prevent
+/// the heuristic or judge from routing host-sensitive Linux work to
+/// the cheap model tier.
+pub(crate) fn is_linux_sandbox_sensitive(user_input: &str) -> bool {
+    let lower = user_input.to_ascii_lowercase();
+    LINUX_SANDBOX_SENSITIVE_TERMS
+        .iter()
+        .any(|term| lower.contains(term))
+}
+
 const AMBIGUITY_MARKERS: &[&str] = &[
     "maybe",
     "figure out",
@@ -437,6 +484,9 @@ pub(crate) struct ClassifyTurnInputs<'a> {
     pub session_mode: SessionMode,
     pub overrides: RoutingOverride,
     pub sticky: bool,
+    /// Mirror of `config.routing.linux_sandbox_sensitive_parent`. Passed
+    /// explicitly so callers can override without touching the config.
+    pub linux_sandbox_sensitive_parent: bool,
 }
 
 /// Result of classifying a single turn. Carries the routing decision
@@ -522,6 +572,13 @@ pub(crate) async fn classify_turn(
 
     if inputs.overrides.force_cheap {
         return ClassifyResult::cheap(CheapReason::UserExplicit, cheap);
+    }
+
+    // Linux sandbox/container/kernel prompts go to the parent by default so the
+    // cheap tier never mishandles host-sensitive work. An explicit `/cheap`
+    // override (consumed above) still wins.
+    if inputs.linux_sandbox_sensitive_parent && is_linux_sandbox_sensitive(inputs.user_input) {
+        return ClassifyResult::parent();
     }
 
     // Short follow-ups inherit the prior turn's route instead of paying for a

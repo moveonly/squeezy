@@ -189,12 +189,24 @@ impl SubagentCatalog {
 }
 
 /// Default user agents directory, derived from `$HOME` on Unix-like
-/// systems. Returns `None` when `HOME` is unset (Windows callers should
-/// pass an explicit `user_dir` until cross-platform support lands).
+/// systems. Returns `None` when `HOME` is unset and emits a
+/// user-visible warning — Linux services, sudo shells, CI jobs, and
+/// containers frequently run with HOME unset or rewritten, silently
+/// skipping user subagent discovery. Windows callers should pass an
+/// explicit `user_dir` until cross-platform support lands.
 fn default_user_subagents_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(USER_SUBAGENTS_DIR))
+    match std::env::var_os("HOME") {
+        Some(home) => Some(PathBuf::from(home).join(USER_SUBAGENTS_DIR)),
+        None => {
+            warn!(
+                target: "squeezy_agent::subagent_catalog",
+                "HOME is not set; user subagents from ~/.squeezy/agents will not be loaded. \
+                 Pass an explicit user_dir to SubagentCatalog::discover, or set HOME, to \
+                 suppress this warning."
+            );
+            None
+        }
+    }
 }
 
 fn load_dir(dir: &Path, source: SubagentSource, out: &mut Vec<SubagentDefinition>) {
