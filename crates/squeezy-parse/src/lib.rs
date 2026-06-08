@@ -8,8 +8,8 @@ mod languages;
 
 use serde::{Deserialize, Serialize};
 use squeezy_core::{
-    Confidence, ContentHash, EdgeKind, FileId, Freshness, LanguageFamily, LanguageKind, Provenance,
-    Result, SourcePoint, SourceSpan, SqueezyError, SymbolId, SymbolKind,
+    Confidence, ContentHash, EdgeKind, FileId, Freshness, LanguageKind, Provenance, Result,
+    SourcePoint, SourceSpan, SqueezyError, SymbolId, SymbolKind,
 };
 use squeezy_workspace::FileRecord;
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
@@ -703,14 +703,14 @@ fn append_source_diagnostics(source: &str, diagnostics: &mut Vec<ParseDiagnostic
         diagnostics.push(ParseDiagnostic {
             message: "bom: source begins with UTF-8 BOM".to_string(),
             span: None,
-            confidence: Confidence::Full,
+            confidence: Confidence::ExactSyntax,
         });
     }
     if source.contains("\r\n") {
         diagnostics.push(ParseDiagnostic {
             message: "crlf: source contains CRLF line endings".to_string(),
             span: None,
-            confidence: Confidence::Full,
+            confidence: Confidence::ExactSyntax,
         });
     }
 }
@@ -1378,7 +1378,7 @@ pub fn smoke_all_languages() -> Vec<SmokeResult> {
     }
 
     let mut results = Vec::new();
-    for family in squeezy_core::LanguageFamily::all() {
+    for family in squeezy_core::LanguageFamily::ALL.iter() {
         for &kind in family.kinds() {
             let result = match parser_for_language_kind(kind) {
                 Err(err) => SmokeResult {
