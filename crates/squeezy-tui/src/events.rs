@@ -837,15 +837,15 @@ fn format_turn_cost_delta(cost: &squeezy_core::CostSnapshot) -> String {
     } else if let Some(inp) = cost.input_tokens {
         parts.push(format!("in {inp}"));
     }
-    if let Some(r) = cost.cached_input_tokens {
-        if r > 0 {
-            parts.push(format!("cached {r}"));
-        }
+    if let Some(r) = cost.cached_input_tokens
+        && r > 0
+    {
+        parts.push(format!("cached {r}"));
     }
-    if let Some(w) = cost.cache_write_input_tokens {
-        if w > 0 {
-            parts.push(format!("cache_write {w}"));
-        }
+    if let Some(w) = cost.cache_write_input_tokens
+        && w > 0
+    {
+        parts.push(format!("cache_write {w}"));
     }
     format!("turn: {}", parts.join(" · "))
 }
