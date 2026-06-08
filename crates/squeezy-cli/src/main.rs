@@ -1210,28 +1210,13 @@ fn skills_show(cli: &Cli, name: &str, preview: bool) -> squeezy_core::Result<()>
             println!("prompt_hint:  {hint}");
         }
     }
-    // Show ambiguous triggers for this skill.
-    let ambiguous_triggers = catalog.ambiguous_triggers();
-    if !ambiguous_triggers.is_empty() {
-        let skill_triggers: Vec<_> = ambiguous_triggers
-            .iter()
-            .filter(|t| {
-                // Re-discover by loading; if it fails, skip quietly.
-                catalog
-                    .load(&summary.name)
-                    .ok()
-                    .map(|s| s.summary.name == summary.name)
-                    .unwrap_or(false)
-            })
-            .collect();
-        if !skill_triggers.is_empty() {
-            let listed = skill_triggers
-                .iter()
-                .map(|t| format!("`{t}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!("ambiguous triggers: {listed}");
-        }
+    // Note if there are catalog-wide ambiguous triggers (shared by multiple skills).
+    // run `squeezy skills validate` for per-skill details.
+    if !catalog.ambiguous_triggers().is_empty() {
+        println!(
+            "note: catalog has {} ambiguous trigger phrase(s); run `squeezy skills validate` for details",
+            catalog.ambiguous_triggers().len()
+        );
     }
     if preview {
         match catalog.load(name) {
@@ -1425,21 +1410,20 @@ fn skills_validate(cli: &Cli, json: bool) -> squeezy_core::Result<()> {
         // and missing hook scripts when the file parses successfully.
         if result.outcome.is_ok()
             && let Some(_name) = &result.name
+            && let Ok(content) = fs::read_to_string(&result.path)
         {
-            if let Ok(content) = fs::read_to_string(&result.path) {
-                let skill_dir = result.path.parent().unwrap_or(std::path::Path::new("."));
-                let lint_issues = squeezy_skills::lint_skill_extended(
-                    &content,
-                    skill_dir,
-                    ambiguous_trigger_set,
-                    SKILL_BODY_WARN_BYTES,
-                );
-                for (severity, message) in lint_issues {
-                    if severity == "warning" {
-                        warnings.push(message);
-                    } else {
-                        errors.push(message);
-                    }
+            let skill_dir = result.path.parent().unwrap_or(std::path::Path::new("."));
+            let lint_issues = squeezy_skills::lint_skill_extended(
+                &content,
+                skill_dir,
+                ambiguous_trigger_set,
+                SKILL_BODY_WARN_BYTES,
+            );
+            for (severity, message) in lint_issues {
+                if severity == "warning" {
+                    warnings.push(message);
+                } else {
+                    errors.push(message);
                 }
             }
         }
