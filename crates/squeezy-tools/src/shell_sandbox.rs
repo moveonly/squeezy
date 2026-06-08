@@ -905,16 +905,20 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
             }
         }
 
-        let mut plan =
+        let plan =
             ShellSandboxPlan::direct_with_fallback(command, config.mode, config, fallback_reason);
         // On Linux, respect the configured shell in the degraded path so that
         // a project relying on Bash syntax or Fish/Zsh aliases does not
         // silently switch to /bin/sh when the sandbox falls back.
         #[cfg(target_os = "linux")]
-        if let Some(linux_shell) = &config.linux_shell {
-            plan.program = linux_shell.clone();
-            plan.args = vec!["-lc".to_string(), command.to_string()];
-        }
+        let plan = {
+            let mut plan = plan;
+            if let Some(linux_shell) = &config.linux_shell {
+                plan.program = linux_shell.clone();
+                plan.args = vec!["-lc".to_string(), command.to_string()];
+            }
+            plan
+        };
         Ok(plan)
     }
 }
