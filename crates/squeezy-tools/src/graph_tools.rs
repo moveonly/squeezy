@@ -1041,29 +1041,30 @@ pub(crate) fn graph_symbol_search(
     // separated tokens, reorder the primary-ranked result by BM25 score
     // over signature + docs + attributes. This makes documented multi-word
     // retrieval behaviour real rather than test-only.
-    if let Some(query) = query {
-        if query.split_whitespace().count() >= 2 && symbols.len() > 1 {
-            let doc_bufs: Vec<(String, String)> = symbols
-                .iter()
-                .map(|sym| (sym.docs.join(" "), sym.attributes.join(" ")))
+    if let Some(query) = query
+        && query.split_whitespace().count() >= 2
+        && symbols.len() > 1
+    {
+        let doc_bufs: Vec<(String, String)> = symbols
+            .iter()
+            .map(|sym| (sym.docs.join(" "), sym.attributes.join(" ")))
+            .collect();
+        let bm25_docs: Vec<squeezy_rank::BM25Doc<'_>> = symbols
+            .iter()
+            .zip(doc_bufs.iter())
+            .map(|(sym, (docs, attrs))| squeezy_rank::BM25Doc {
+                signature: sym.signature.as_str(),
+                docs: docs.as_str(),
+                attributes: attrs.as_str(),
+            })
+            .collect();
+        let reranked = squeezy_rank::bm25_rerank(&bm25_docs, query, symbols.len());
+        if !reranked.is_empty() {
+            let original = std::mem::take(&mut symbols);
+            symbols = reranked
+                .into_iter()
+                .map(|(idx, _)| original[idx].clone())
                 .collect();
-            let bm25_docs: Vec<squeezy_rank::BM25Doc<'_>> = symbols
-                .iter()
-                .zip(doc_bufs.iter())
-                .map(|(sym, (docs, attrs))| squeezy_rank::BM25Doc {
-                    signature: sym.signature.as_str(),
-                    docs: docs.as_str(),
-                    attributes: attrs.as_str(),
-                })
-                .collect();
-            let reranked = squeezy_rank::bm25_rerank(&bm25_docs, query, symbols.len());
-            if !reranked.is_empty() {
-                let original = std::mem::take(&mut symbols);
-                symbols = reranked
-                    .into_iter()
-                    .map(|(idx, _)| original[idx].clone())
-                    .collect();
-            }
         }
     }
 
