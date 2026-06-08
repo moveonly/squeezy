@@ -36,10 +36,10 @@ fn display_path(path: &std::path::Path) -> String {
         .or_else(dirs::home_dir);
     if let Some(home) = home_candidate {
         let home_str = home.display().to_string();
-        if !home_str.is_empty() {
-            if let Some(rest) = full.strip_prefix(&home_str) {
-                return format!("~{rest}");
-            }
+        if !home_str.is_empty()
+            && let Some(rest) = full.strip_prefix(&home_str)
+        {
+            return format!("~{rest}");
         }
     }
     full
