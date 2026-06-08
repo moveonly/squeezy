@@ -114,7 +114,7 @@ fn osc9_auto_resolves_to_concrete_backend_in_test_env() {
     );
 }
 
-fn make_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + '_ {
+fn make_env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
     |key: &str| {
         pairs
             .iter()
