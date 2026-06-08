@@ -807,13 +807,13 @@ fn graph_stats_json(graph: &squeezy_graph::SemanticGraph) -> Value {
     // Surface case-collision count only when non-zero so the common-case
     // response pays no byte cost. Non-zero means a Windows checkout produced
     // two differently-cased spellings for the same logical file.
-    if stats.case_collision_count > 0 {
-        if let Some(map) = obj.as_object_mut() {
-            map.insert(
-                "case_collision_count".to_string(),
-                json!(stats.case_collision_count),
-            );
-        }
+    if stats.case_collision_count > 0
+        && let Some(map) = obj.as_object_mut()
+    {
+        map.insert(
+            "case_collision_count".to_string(),
+            json!(stats.case_collision_count),
+        );
     }
     obj
 }
