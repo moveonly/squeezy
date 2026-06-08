@@ -2217,9 +2217,13 @@ impl HookHandler for SkillHookHandler {
         // environment-block ceiling), via env var for small ones. Never set
         // both so that the large JSON is never placed in the env block.
         if let Some(ref path) = payload_file_path {
-            command.env("SQUEEZY_HOOK_PAYLOAD_FILE", path);
+            command
+                .env("SQUEEZY_HOOK_PAYLOAD_FILE", path)
+                .env_remove("SQUEEZY_HOOK_PAYLOAD");
         } else {
-            command.env("SQUEEZY_HOOK_PAYLOAD", &payload);
+            command
+                .env("SQUEEZY_HOOK_PAYLOAD", &payload)
+                .env_remove("SQUEEZY_HOOK_PAYLOAD_FILE");
         }
 
         let cleanup = |path: Option<&Path>| {

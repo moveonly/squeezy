@@ -13,6 +13,51 @@ use tracing_subscriber::fmt::MakeWriter;
 use super::*;
 
 static LOG_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(unix)]
+static HOOK_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(unix)]
+struct ScopedHookPayloadEnv {
+    payload: Option<std::ffi::OsString>,
+    payload_file: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl ScopedHookPayloadEnv {
+    fn with_stale_values() -> Self {
+        let payload = std::env::var_os("SQUEEZY_HOOK_PAYLOAD");
+        let payload_file = std::env::var_os("SQUEEZY_HOOK_PAYLOAD_FILE");
+        unsafe {
+            std::env::set_var("SQUEEZY_HOOK_PAYLOAD", "stale-inline-payload");
+            std::env::set_var("SQUEEZY_HOOK_PAYLOAD_FILE", "stale-payload-file");
+        }
+        Self {
+            payload,
+            payload_file,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ScopedHookPayloadEnv {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.payload {
+                Some(value) => std::env::set_var("SQUEEZY_HOOK_PAYLOAD", value),
+                None => std::env::remove_var("SQUEEZY_HOOK_PAYLOAD"),
+            }
+            match &self.payload_file {
+                Some(value) => std::env::set_var("SQUEEZY_HOOK_PAYLOAD_FILE", value),
+                None => std::env::remove_var("SQUEEZY_HOOK_PAYLOAD_FILE"),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sh_quote_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
 
 #[test]
 fn bundled_skills_load_with_valid_metadata() {
@@ -2314,6 +2359,53 @@ fn parses_hooks_block_drops_unknown_event_without_failing_load() {
 }
 
 #[test]
+fn parses_hooks_block_accepts_all_hook_event_names_and_aliases() {
+    let cases = [
+        ("PreTurn", HookEvent::PreTurn),
+        ("pre_turn", HookEvent::PreTurn),
+        ("PreToolUse", HookEvent::PreToolUse),
+        ("pre_tool_use", HookEvent::PreToolUse),
+        ("PostToolUse", HookEvent::PostToolUse),
+        ("post_tool_use", HookEvent::PostToolUse),
+        ("PostToolUseFailure", HookEvent::PostToolUseFailure),
+        ("post_tool_use_failure", HookEvent::PostToolUseFailure),
+        ("PostTool", HookEvent::PostTool),
+        ("post_tool", HookEvent::PostTool),
+        ("PreCompact", HookEvent::PreCompact),
+        ("pre_compact", HookEvent::PreCompact),
+        ("PostCompact", HookEvent::PostCompact),
+        ("post_compact", HookEvent::PostCompact),
+        ("SubagentStart", HookEvent::SubagentStart),
+        ("subagent_start", HookEvent::SubagentStart),
+        ("SubagentStop", HookEvent::SubagentStop),
+        ("subagent_stop", HookEvent::SubagentStop),
+        ("PermissionRequest", HookEvent::PermissionRequest),
+        ("permission_request", HookEvent::PermissionRequest),
+        ("PermissionDenied", HookEvent::PermissionDenied),
+        ("permission_denied", HookEvent::PermissionDenied),
+        ("UserPromptSubmit", HookEvent::UserPromptSubmit),
+        ("user_prompt_submit", HookEvent::UserPromptSubmit),
+        ("SessionStart", HookEvent::SessionStart),
+        ("session_start", HookEvent::SessionStart),
+        ("Stop", HookEvent::Stop),
+        ("stop", HookEvent::Stop),
+        ("Setup", HookEvent::Setup),
+        ("setup", HookEvent::Setup),
+    ];
+
+    for (key, event) in cases {
+        let content = format!(
+            "---\nname: validator\ndescription: \"d\"\nhooks:\n  {key}:\n    - matcher: \"*\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# body\n"
+        );
+        let (metadata, _body) = parse_skill_file(&content).expect("parse");
+        assert!(
+            metadata.hooks.contains_key(&event),
+            "{key} should parse as {event:?}"
+        );
+    }
+}
+
+#[test]
 fn register_skill_hooks_installs_one_handler_per_spec() {
     let skill = LoadedSkill {
         summary: SkillSummary {
@@ -2589,6 +2681,105 @@ fn skill_hook_once_retries_after_failed_first_run() {
         fs::read_to_string(&counter).expect("read counter").trim(),
         "2",
         "after a successful run the hook self-skips"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_hook_inline_payload_removes_stale_payload_file_env() {
+    let _guard = HOOK_ENV_LOCK.lock().expect("hook env lock");
+    let _env = ScopedHookPayloadEnv::with_stale_values();
+    let root = temp_workspace("skill_hook_inline_payload_env");
+    let capture = root.join("payload.json");
+    let command = format!(
+        "test -z \"${{SQUEEZY_HOOK_PAYLOAD_FILE+x}}\" && printf '%s' \"$SQUEEZY_HOOK_PAYLOAD\" > {}",
+        sh_quote_path(&capture)
+    );
+
+    let handler = SkillHookHandler::new(
+        "validator".to_string(),
+        HookEvent::UserPromptSubmit,
+        None,
+        SkillHookSpec {
+            command,
+            once: false,
+        },
+        root.clone(),
+    );
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(handler));
+
+    let results = registry.dispatch(squeezy_hooks::HookPayload::UserPromptSubmit {
+        prompt: "hello".into(),
+        turn_id: "1".into(),
+    });
+
+    assert!(results.iter().all(|result| result.allow), "{results:?}");
+    let captured = fs::read_to_string(&capture).expect("read captured payload");
+    assert!(captured.contains("\"prompt\":\"hello\""), "{captured}");
+    assert!(
+        !captured.contains("stale-payload-file"),
+        "stale parent env leaked into hook payload: {captured}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_hook_large_payload_uses_file_and_removes_stale_inline_env() {
+    let _guard = HOOK_ENV_LOCK.lock().expect("hook env lock");
+    let _env = ScopedHookPayloadEnv::with_stale_values();
+    let root = temp_workspace("skill_hook_large_payload_file");
+    let payload_file_path_capture = root.join("payload-file-path");
+    let copied_payload = root.join("payload-copy.json");
+    let command = format!(
+        "test -z \"${{SQUEEZY_HOOK_PAYLOAD+x}}\" \
+         && test -n \"$SQUEEZY_HOOK_PAYLOAD_FILE\" \
+         && test -f \"$SQUEEZY_HOOK_PAYLOAD_FILE\" \
+         && printf '%s' \"$SQUEEZY_HOOK_PAYLOAD_FILE\" > {} \
+         && cp \"$SQUEEZY_HOOK_PAYLOAD_FILE\" {}",
+        sh_quote_path(&payload_file_path_capture),
+        sh_quote_path(&copied_payload)
+    );
+
+    let handler = SkillHookHandler::new(
+        "validator".to_string(),
+        HookEvent::UserPromptSubmit,
+        None,
+        SkillHookSpec {
+            command,
+            once: false,
+        },
+        root.clone(),
+    );
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(handler));
+
+    let prompt = "x".repeat(PAYLOAD_INLINE_THRESHOLD + 128);
+    let results = registry.dispatch(squeezy_hooks::HookPayload::UserPromptSubmit {
+        prompt,
+        turn_id: "1".into(),
+    });
+
+    assert!(results.iter().all(|result| result.allow), "{results:?}");
+    let temp_payload_path =
+        fs::read_to_string(&payload_file_path_capture).expect("read payload file path");
+    assert!(
+        !Path::new(temp_payload_path.trim()).exists(),
+        "temporary hook payload file should be removed after dispatch"
+    );
+    let copied = fs::read_to_string(&copied_payload).expect("read copied payload");
+    assert!(copied.len() > PAYLOAD_INLINE_THRESHOLD, "{copied}");
+    assert!(
+        copied.contains("\"event\":\"user_prompt_submit\""),
+        "{copied}"
+    );
+    assert!(
+        !copied.contains("stale-inline-payload"),
+        "stale parent env leaked into hook payload: {copied}"
     );
 
     let _ = fs::remove_dir_all(root);
