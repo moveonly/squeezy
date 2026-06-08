@@ -10,7 +10,7 @@ use clap::Args;
 use serde_json::json;
 use squeezy_core::{
     AppConfig, McpServerConfig, McpTransport, ProviderConfig, ProviderSettings, Result,
-    SettingsFile, default_settings_path, skills_home_missing,
+    SettingsFile, default_settings_path,
 };
 use squeezy_llm::{
     KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
@@ -776,7 +776,7 @@ fn skills_roots_check(config: &AppConfig) -> Check {
     let mut parts: Vec<String> = Vec::new();
     let mut any_relative = false;
 
-    let mut push_root = |label: &str, path: &Path, parts: &mut Vec<String>, rel: &mut bool| {
+    let push_root = |label: &str, path: &Path, parts: &mut Vec<String>, rel: &mut bool| {
         if path.is_relative() {
             *rel = true;
             parts.push(format!("{label}={} (relative!)", path.display()));
