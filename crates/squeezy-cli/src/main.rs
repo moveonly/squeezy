@@ -60,7 +60,12 @@ enum PromptFormat {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "squeezy", version, about = "Cost-aware coding agent TUI")]
+#[command(
+    name = "squeezy",
+    version,
+    about = "Cost-aware coding agent TUI",
+    disable_help_subcommand = true
+)]
 struct Cli {
     /// Provider id. `SQUEEZY_PROVIDER` is also honored, but goes through the
     /// env source layer so it is tagged correctly by `config inspect`.

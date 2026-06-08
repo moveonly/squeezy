@@ -4134,8 +4134,8 @@ fn slash_menu_surfaces_capability_badges_for_world_touching_commands() {
 #[test]
 fn slash_suggestion_line_contents_match_command_capabilities() {
     // Build the menu lines directly and assert the badge follows the
-    // declared capabilities — covers both presence (`/help` → `net`) and
-    // absence (`/cost` → no badge).
+    // declared capabilities — covers both absence (`/help` → no badge after
+    // removing Network cap) and absence (`/cost` → no badge).
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/help".to_string());
     let lines = slash_suggestion_lines(&app, 120);
@@ -4147,7 +4147,11 @@ fn slash_suggestion_line_contents_match_command_capabilities() {
         .iter()
         .find(|line| line.contains("/help"))
         .expect("rendered /help line");
-    assert!(help_line.contains("[net]"), "{help_line}");
+    // `/help` no longer has a `[net]` badge — curated topics are local.
+    assert!(
+        !help_line.contains('['),
+        "/help should not render a capability badge: {help_line}"
+    );
 
     set_input(&mut app, "/cost".to_string());
     let lines = slash_suggestion_lines(&app, 120);

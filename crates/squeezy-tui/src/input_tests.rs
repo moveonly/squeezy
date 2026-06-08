@@ -48,10 +48,8 @@ fn find_command(name: &str) -> &'static SlashCommand {
 fn slash_commands_declare_expected_capabilities() {
     // Anchors the audited capability mapping so future edits to the catalog
     // stay deliberate rather than accidentally silent.
-    assert_eq!(
-        find_command("/help").capabilities,
-        &[PermissionCapability::Network]
-    );
+    // `/help` is answered locally for curated topics; no capability badge.
+    assert_eq!(find_command("/help").capabilities, &[]);
     assert_eq!(
         find_command("/compact").capabilities,
         &[PermissionCapability::Network]
@@ -185,7 +183,12 @@ fn capability_badges_match_capability_as_str() {
     let cmd = find_command("/diff");
     assert_eq!(cmd.capability_badges(), vec!["git", "read"]);
     let cmd = find_command("/help");
-    assert_eq!(cmd.capability_badges(), vec!["net"]);
+    // `/help` has no capability badges (curated topics are local).
+    assert!(
+        cmd.capability_badges().is_empty(),
+        "expected /help to have no capability badges, got {:?}",
+        cmd.capability_badges()
+    );
     let cmd = find_command("/undo");
     assert_eq!(cmd.capability_badges(), vec!["edit", "destructive"]);
 }

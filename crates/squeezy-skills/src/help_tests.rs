@@ -495,7 +495,9 @@ fn relevant_docs_for_input_scopes_corpus() {
     );
 
     // Completely unknown topic (no lexical evidence) falls back to full corpus.
-    let unknown_docs = relevant_docs_for_input("/help quantum billing rules");
+    // Use terms that are guaranteed not to appear in any bundled doc so the
+    // zero-score fallback path is exercised.
+    let unknown_docs = relevant_docs_for_input("/help xylophone kazoo fluorescent");
     assert_eq!(
         unknown_docs.len(),
         bundled_docs().len(),
