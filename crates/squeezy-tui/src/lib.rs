@@ -36,8 +36,8 @@ use serde::Deserialize;
 #[cfg(test)]
 use squeezy_agent::RequestUserInputChoice;
 use squeezy_agent::{
-    Agent, AgentEvent, DispatchCommand, DispatchCommandParseError, JobEvent, JobId,
-    JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS, PendingConfigSwap,
+    Agent, AgentEvent, CompactSubcommand, DispatchCommand, DispatchCommandParseError, JobEvent,
+    JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS, PendingConfigSwap,
     RequestUserInputRequest, RequestUserInputResponse, SessionAccountingSnapshot, SubagentId,
     ToolApprovalDecision, ToolApprovalRequest,
 };
@@ -1065,11 +1065,9 @@ fn maybe_pick_resume_session(
     .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
     match choice {
         resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
-        // `branch_tip` is captured by the picker but not yet wired through
-        // the resume flow — the agent restarts at the most recent event in
-        // the session log. Branch-aware resume is a follow-up; the
-        // schema/picker landing first lets future producers populate
-        // `parent_event_sequence` without churn here.
+        // The picker only emits linear entries (branch-tip rows are collapsed
+        // until branch-aware resume is implemented), so `branch_tip` is always
+        // `None` here. The field is preserved in the enum for future use.
         resume_picker::ResumeChoice::Resume {
             session_id,
             branch_tip: _,
@@ -1742,7 +1740,13 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             };
             app.status = format!("resumed session {session_id}");
         }
-        Err(error) => app.status = format!("resume failed: {error}"),
+        Err(error) => {
+            set_status_with_notice(
+                app,
+                format!("resume failed: {error}"),
+                format!("Resume failed: {error}\nCheck that the session exists and is resumable."),
+            );
+        }
     }
 }
 
@@ -3702,13 +3706,10 @@ fn telemetry_tui_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         DispatchCommand::Config { section } => {
             slash_option_shape(section.as_ref(), SlashArgShape::FixedSubcommand)
         }
-        DispatchCommand::Compact { undo } => {
-            if *undo {
-                SlashArgShape::FixedSubcommand
-            } else {
-                SlashArgShape::None
-            }
-        }
+        DispatchCommand::Compact { subcommand } => match subcommand {
+            CompactSubcommand::Undo | CompactSubcommand::History => SlashArgShape::FixedSubcommand,
+            CompactSubcommand::Run => SlashArgShape::None,
+        },
         DispatchCommand::Plans { args }
         | DispatchCommand::Feedback { args }
         | DispatchCommand::Report { args } => {
@@ -4096,8 +4097,47 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 );
             }
         },
-        DispatchCommand::Compact { undo } => {
-            if undo {
+        DispatchCommand::Compact { subcommand } => {
+            if matches!(subcommand, CompactSubcommand::History) {
+                app.context_compaction = agent.context_compaction_snapshot().await;
+                let compaction = &app.context_compaction;
+                if compaction.history.is_empty() {
+                    set_status_with_notice(
+                        app,
+                        "no compaction history",
+                        "No compaction events recorded for this session yet.",
+                    );
+                } else {
+                    app.status = format!(
+                        "compaction history: {} generation(s)",
+                        compaction.history.len()
+                    );
+                    let lines: Vec<String> = compaction
+                        .history
+                        .iter()
+                        .map(|record| {
+                            let undo_mark = if record.replacement_id.is_some() {
+                                " [undoable]"
+                            } else {
+                                ""
+                            };
+                            format!(
+                                "gen={} trigger={} {before}→{after} tok dropped={dropped}{undo_mark}",
+                                record.generation,
+                                record.trigger.as_str(),
+                                before = record.before.estimated_tokens,
+                                after = record.after.estimated_tokens,
+                                dropped = record.dropped_items,
+                            )
+                        })
+                        .collect();
+                    app.push_transcript_item(TranscriptItem::system(format!(
+                        "Compaction history ({} generation(s)):\n{}",
+                        compaction.history.len(),
+                        lines.join("\n"),
+                    )));
+                }
+            } else if matches!(subcommand, CompactSubcommand::Undo) {
                 match agent.compact_context_undo().await {
                     Ok(Some(record)) => {
                         app.context_compaction = agent.context_compaction_snapshot().await;
@@ -4137,9 +4177,13 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                             report.record.before.estimated_tokens,
                             report.record.after.estimated_tokens
                         ));
+                        let undo_hint = if report.record.replacement_id.is_some() {
+                            " Run `/compact undo` to restore."
+                        } else {
+                            ""
+                        };
                         app.push_transcript_item(TranscriptItem::system(format!(
-                            "/compact discarded {dropped} item(s); context {before}→{after} tokens. \
-                             Run `/compact undo` to restore.",
+                            "/compact discarded {dropped} item(s); context {before}→{after} tokens.{undo_hint}",
                             dropped = report.record.dropped_items,
                             before = report.record.before.estimated_tokens,
                             after = report.record.after.estimated_tokens,

@@ -225,6 +225,10 @@ impl PickerEntry {
         }
     }
 
+    /// Construct a picker row pinned to a specific branch tip. Not yet called
+    /// by `expand_entries` because branch-aware resume is not yet implemented;
+    /// retained here so the schema is ready when that feature lands.
+    #[allow(dead_code)]
     fn branched(summary: SessionSummary, branch_tip: EventBranchTip) -> Self {
         Self {
             summary,
@@ -490,25 +494,15 @@ pub(crate) fn has_scoped_candidates(all: &[SessionSummary], cwd: &Path) -> bool 
     all.iter().any(|summary| paths_same(&summary.cwd, &cwd_str))
 }
 
-/// Flatten each summary into selectable rows: linear sessions emit a
-/// single `PickerEntry`, branched sessions emit one entry per branch tip
-/// so the user can pick either path. Sessions reach this function in
-/// newest-first order (set by `filter_inner`), and we preserve that
-/// order across branch expansion: tips inside one session stay grouped,
-/// with the newest tip first (already enforced by `detect_branches`).
+/// Flatten each summary into selectable rows. All sessions — including those
+/// with multiple branch tips — emit a single `PickerEntry` so the picker only
+/// shows resumable rows. Branch-aware resume (replaying up to a chosen
+/// `parent_event_sequence`) is not yet implemented; showing multiple per-tip
+/// rows and ignoring the selected tip would silently resume the wrong state,
+/// so branched sessions collapse to a single linear entry until that feature
+/// lands.
 fn expand_entries(summaries: Vec<SessionSummary>) -> Vec<PickerEntry> {
-    let mut entries = Vec::with_capacity(summaries.len());
-    for summary in summaries {
-        if summary.branches.len() < 2 {
-            entries.push(PickerEntry::linear(summary));
-            continue;
-        }
-        let tips = summary.branches.clone();
-        for tip in tips {
-            entries.push(PickerEntry::branched(summary.clone(), tip));
-        }
-    }
-    entries
+    summaries.into_iter().map(PickerEntry::linear).collect()
 }
 
 /// Pull recent resumable sessions across every cwd. The picker filters
@@ -842,9 +836,10 @@ fn render_candidate_row(
     } else {
         Style::default().fg(crate::render::theme::quiet())
     };
-    // Branched rows replace the default session label with the branch's
-    // first user message (if any) so the user can disambiguate two paths
-    // that came out of the same fork point.
+    // `expand_entries` currently produces only linear entries, so
+    // `branch_tip` is always `None` here. The branch rendering path is
+    // preserved so it activates automatically when branch-aware resume
+    // populates `branch_tip` in the future.
     let (label, branch_marker) = match entry.branch_tip.as_ref() {
         Some(tip) => {
             let branch_label = tip

@@ -85,7 +85,8 @@ pub mod subagent_catalog;
 mod turn_router;
 
 pub use dispatch::{
-    DispatchCommand, DispatchCommandKind, DispatchCommandParseError, DispatchOutcome,
+    CompactSubcommand, DispatchCommand, DispatchCommandKind, DispatchCommandParseError,
+    DispatchOutcome,
 };
 
 use cancel::{CancelErr, OrCancelExt};
@@ -3682,27 +3683,27 @@ impl Agent {
     /// existing helper while RPC/eval drivers see a structured value.
     pub async fn dispatch_command(&self, cmd: DispatchCommand) -> DispatchOutcome {
         match cmd {
-            DispatchCommand::Compact { undo } => {
-                if undo {
-                    match self.compact_context_undo().await {
-                        Ok(Some(_)) => DispatchOutcome::CompactedUndo { restored: true },
-                        Ok(None) => DispatchOutcome::CompactedUndo { restored: false },
-                        Err(err) => DispatchOutcome::Error {
-                            command: "/compact".into(),
-                            message: format!("{err}"),
-                        },
-                    }
-                } else {
-                    match self.compact_context_manual().await {
-                        Ok(Some(_)) => DispatchOutcome::Compacted { skipped: false },
-                        Ok(None) => DispatchOutcome::Compacted { skipped: true },
-                        Err(err) => DispatchOutcome::Error {
-                            command: "/compact".into(),
-                            message: format!("{err}"),
-                        },
-                    }
-                }
-            }
+            DispatchCommand::Compact { subcommand } => match subcommand {
+                CompactSubcommand::History => DispatchOutcome::TuiOnly {
+                    command: "/compact history".into(),
+                },
+                CompactSubcommand::Undo => match self.compact_context_undo().await {
+                    Ok(Some(_)) => DispatchOutcome::CompactedUndo { restored: true },
+                    Ok(None) => DispatchOutcome::CompactedUndo { restored: false },
+                    Err(err) => DispatchOutcome::Error {
+                        command: "/compact".into(),
+                        message: format!("{err}"),
+                    },
+                },
+                CompactSubcommand::Run => match self.compact_context_manual().await {
+                    Ok(Some(_)) => DispatchOutcome::Compacted { skipped: false },
+                    Ok(None) => DispatchOutcome::Compacted { skipped: true },
+                    Err(err) => DispatchOutcome::Error {
+                        command: "/compact".into(),
+                        message: format!("{err}"),
+                    },
+                },
+            },
             DispatchCommand::Plan { prompt } => {
                 let changed = self.set_session_mode(SessionMode::Plan, "dispatch_command");
                 DispatchOutcome::ModeChanged {
@@ -4071,6 +4072,22 @@ impl Agent {
         let Some(checkpoint) = store.get_compaction_checkpoint(&replacement_id)? else {
             return Ok(None);
         };
+        // Guard against restoring a checkpoint from a different session when
+        // two sessions share the same store and happen to generate the same
+        // `ckpt-{generation}-{millis}` id. Legacy checkpoints written before
+        // the session_id field was populated have an empty string; skip the
+        // check in that case so they remain restorable.
+        if let Some(session) = &self.session_log {
+            let checkpoint_sid = checkpoint.session_id.as_str();
+            if !checkpoint_sid.is_empty() && checkpoint_sid != session.session_id() {
+                return Err(SqueezyError::Agent(format!(
+                    "compaction checkpoint {} belongs to session {}, not the current session {}",
+                    replacement_id,
+                    checkpoint_sid,
+                    session.session_id(),
+                )));
+            }
+        }
         // The synthetic summary head occupies index 0 of `conversation`.
         // Drop it and prepend the restored items so the conversation now
         // matches the pre-compaction shape (plus any items added after
@@ -11320,6 +11337,7 @@ async fn run_subagent_rounds(
                             &mut context_compaction,
                             &[],
                             None,
+                            None,
                             config,
                             ContextCompactionTrigger::Auto,
                             true,
@@ -11373,6 +11391,7 @@ async fn run_subagent_rounds(
                                 conversation,
                                 &mut context_compaction,
                                 &[],
+                                None,
                                 None,
                                 config,
                                 ContextCompactionTrigger::Auto,
@@ -14689,13 +14708,10 @@ fn telemetry_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
                 SlashArgShape::None
             }
         }
-        DispatchCommand::Compact { undo } => {
-            if *undo {
-                SlashArgShape::FixedSubcommand
-            } else {
-                SlashArgShape::None
-            }
-        }
+        DispatchCommand::Compact { subcommand } => match subcommand {
+            CompactSubcommand::Undo | CompactSubcommand::History => SlashArgShape::FixedSubcommand,
+            CompactSubcommand::Run => SlashArgShape::None,
+        },
         DispatchCommand::Plans { args }
         | DispatchCommand::Feedback { args }
         | DispatchCommand::Report { args } => {

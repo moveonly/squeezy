@@ -1032,9 +1032,13 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
     },
     SlashCommandHelp {
         name: "/compact",
-        what: "Force context compaction now — removes stale history while keeping recent turns, pins, and attachments.",
-        syntax: "/compact",
-        examples: &["/compact  — trigger compaction immediately"],
+        what: "Force context compaction now — removes stale history while keeping recent turns, pins, and attachments. Use '/compact undo' to restore the last compaction checkpoint. Use '/compact history' to view the per-session compaction timeline.",
+        syntax: "/compact [undo|history]",
+        examples: &[
+            "/compact  — trigger compaction immediately",
+            "/compact undo  — restore the last compaction checkpoint",
+            "/compact history  — show compaction timeline for this session",
+        ],
         available_during_turn: false,
         capability_note: None,
         related: &["cost", "sessions"],

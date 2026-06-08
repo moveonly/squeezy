@@ -184,7 +184,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     // `/compact` triggers a summarisation turn against the model.
     SlashCommand {
         name: "/compact",
-        description: "compact conversation context now (use '/compact undo' to restore)",
+        description: "compact context now (undo to restore; history to view timeline)",
         available_during_task: false,
         parameter_hint: None,
         capabilities: &[PermissionCapability::Network],

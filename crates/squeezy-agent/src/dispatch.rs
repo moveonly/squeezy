@@ -35,6 +35,20 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use squeezy_vcs::{DiffSnapshot as VcsDiffSnapshot, RollbackResult as VcsRollbackResult};
 
+/// Subcommand for `/compact`. Exactly one of these variants is active at a
+/// time, eliminating the invalid two-bool state (`undo: true, history: true`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompactSubcommand {
+    /// Trigger a new compaction pass (default).
+    #[default]
+    Run,
+    /// Restore the most recent compaction checkpoint.
+    Undo,
+    /// Display the per-session compaction timeline.
+    History,
+}
+
 /// Typed slash command parsed from a slash-prefixed input string. Each
 /// variant matches exactly one entry in `SLASH_COMMANDS` (with `/jobs`,
 /// `/job`, `/job-cancel` kept as documented aliases of `/tasks`,
@@ -77,7 +91,7 @@ pub enum DispatchCommand {
     },
     Attachments,
     Compact {
-        undo: bool,
+        subcommand: CompactSubcommand,
     },
     /// `/clear` — drop the live conversation and start a clean slate.
     /// The outgoing session stays resumable on disk; the next turn
@@ -275,10 +289,14 @@ impl DispatchCommand {
             }
             "/attachments" => Self::Attachments,
             "/compact" => {
-                let mut tokens = rest.split_whitespace();
-                let undo =
-                    matches!(tokens.next(), Some(token) if token.eq_ignore_ascii_case("undo"));
-                Self::Compact { undo }
+                let subcommand = match rest.split_whitespace().next() {
+                    Some(token) if token.eq_ignore_ascii_case("undo") => CompactSubcommand::Undo,
+                    Some(token) if token.eq_ignore_ascii_case("history") => {
+                        CompactSubcommand::History
+                    }
+                    _ => CompactSubcommand::Run,
+                };
+                Self::Compact { subcommand }
             }
             "/clear" => Self::Clear,
             "/diff" => Self::Diff,

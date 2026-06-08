@@ -132,10 +132,15 @@ commented examples so that built-in defaults can evolve over time:
 
 [context]
 # compaction_enabled = true
-# compaction_estimated_tokens = 60000
 # compaction_min_items = 16
 # compaction_recent_items = 10
 # compaction_max_summary_bytes = 12000
+# model_context_window = 200000          # override auto-detected window size
+# effective_context_window_percent = 95  # usable fraction of the window
+# max_context_tokens = 60000             # hard economy cap (optional)
+# trim_at_percent = 70                   # micro-compaction fires at this % of window
+# micro_compaction_enabled = true
+# micro_compaction_keep_recent = 4
 
 [subagents]
 # enabled = true
@@ -265,10 +270,15 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 
 [context]
 # compaction_enabled = true
-# compaction_estimated_tokens = 60000
 # compaction_min_items = 16
 # compaction_recent_items = 10
 # compaction_max_summary_bytes = 12000
+# model_context_window = 200000          # override auto-detected window size
+# effective_context_window_percent = 95  # usable fraction of the window
+# max_context_tokens = 60000             # hard economy cap (optional)
+# trim_at_percent = 70                   # micro-compaction fires at this % of window
+# micro_compaction_enabled = true
+# micro_compaction_keep_recent = 4
 
 # [redaction]
 # Add project-specific Rust regex patterns for secrets Squeezy should redact
@@ -335,12 +345,14 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   model-visible prompt tokens locally and, when enabled, replaces stale raw
   conversation/tool output with a compact summary while preserving recent
   turns, pinned context, active attachments, and seen-output receipts. The TUI
-  also supports `/compact`, `/pin`, `/pins`, and `/unpin`. The
-  `compaction_estimated_tokens` threshold is a local heuristic — Squeezy
-  counts byte length of redacted prompt items and divides by 4 to estimate
-  tokens, so pick a value that maps to your provider's real prompt budget
-  (e.g. set it well below the provider's context window since the heuristic
-  is a lower bound).
+  also supports `/compact`, `/pin`, `/pins`, and `/unpin`. Compaction thresholds
+  are derived from the model's effective context window: `model_context_window`
+  overrides auto-detection, `effective_context_window_percent` sets the usable
+  fraction (default 95%), `max_context_tokens` applies an optional hard economy
+  cap, `trim_at_percent` controls when the cheap micro-compaction trim fires,
+  and `micro_compaction_enabled` / `micro_compaction_keep_recent` tune the trim
+  tier. The legacy `compaction_estimated_tokens` field still accepted for
+  backwards compatibility but is superseded by the window-relative thresholds.
 - `[subagents]`: isolated research-agent controls. `delegate` uses the main
   model for broad natural-language research; `explore` uses
   `explore_model` when set, otherwise the provider's cheap default model, and
