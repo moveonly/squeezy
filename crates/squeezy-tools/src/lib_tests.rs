@@ -11435,11 +11435,13 @@ fn prepare_sandbox_plan_with_probes(
     linux_available: bool,
 ) -> std::result::Result<ShellSandboxPlan, String> {
     let analysis = analyze_shell_command(command);
+    let health = ShellSandboxHealth::default();
     prepare_shell_sandbox_plan_with_probe(
         command,
         &analysis,
         Path::new("/tmp"),
         config,
+        &health,
         macos_available,
         linux_available,
         true,

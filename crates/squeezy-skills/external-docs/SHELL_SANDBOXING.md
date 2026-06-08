@@ -58,8 +58,10 @@ The current implementation:
   on path segments so `cat .environment` is not falsely flagged as `.env`.
 - Emits redacted JSONL audit records to `.squeezy/audit/shell.jsonl` under a
   process-wide mutex with rotation at 8 MiB and up to four archived files.
-- Adds `policy`, `sandbox`, `sandbox_network`, and `env` metadata to shell
-  tool results.
+- Adds `sandbox.best_effort_fallback` metadata to shell tool results when the
+  sandbox backend degrades to the direct path; full sandbox metadata
+  (`policy`, `sandbox`, `sandbox_network`, `env`) is audit-only for normal
+  runs and is not included in model-facing tool results.
 
 On **macOS**, Squeezy launches shell commands through `/usr/bin/sandbox-exec`
 with a `(deny default)` SBPL profile. The profile then re-allows the minimum
@@ -320,6 +322,21 @@ backend: `restricted_token` (default — per-spawn filesystem-write isolation, n
 admin), `elevated` (sandbox-user isolation + WFP network egress control, after a
 one-time `squeezy doctor --sandbox-setup` UAC prompt), or `disabled` (Job Object
 process-tree cleanup only). See the Windows paragraph above.
+
+`macos_socket_domain_allowlist` (macOS only; ignored elsewhere) is a list of
+absolute path prefixes for AF_UNIX sockets that the sandbox child may open when
+`network = "deny_by_default"`. The Seatbelt `(deny default)` rule otherwise
+blocks all AF_UNIX sockets when network is denied. The default is an empty list
+(full AF_UNIX denial). Add entries like `/private/tmp/mytool-` for build tools
+or local daemons that need Unix socket access from within the sandbox. Entries
+are merged additively across config layers. Entries must start with `/`.
+
+**Linux note**: `squeezy ask` (in-shell approval escalation via
+`SQUEEZY_ASK_SOCKET`) is unavailable under the `linux-direct-syscalls` backend
+because the seccomp filter denies `socket(AF_UNIX, …)`. Squeezy does not export
+`SQUEEZY_ASK_SOCKET` in that environment. Workflows that require in-shell
+approval escalation must run with `mode = "off"` or `mode = "external"`, or on
+macOS/Windows where AF_UNIX is not blocked by the sandbox filter.
 
 ## Limits
 

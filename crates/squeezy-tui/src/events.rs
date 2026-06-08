@@ -428,15 +428,22 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 AgentEvent::ShellSandboxBestEffortFallback {
                     backend,
                     fallback_count,
+                    fallback_reason,
                     ..
                 } => {
                     // Fires at most once per session — the agent's
                     // `maybe_emit_shell_sandbox_fallback_warning` gates on
                     // the tool-layer one-shot latch. Land a durable warning
                     // in the transcript so users notice mid-turn AND keep a
-                    // record.
+                    // record. Include the fallback reason when available so
+                    // users can tell whether the degradation was a probe
+                    // timeout, spawn/pre-exec blocked, or a cached failure.
+                    let reason_suffix = fallback_reason
+                        .as_deref()
+                        .map(|r| format!(": {r}"))
+                        .unwrap_or_default();
                     let notice = format!(
-                        "shell sandbox degraded: backend `{backend}` unavailable; subsequent shell calls run without OS isolation under mode=best_effort (fallback #{fallback_count})"
+                        "shell sandbox degraded: backend `{backend}` unavailable{reason_suffix}; subsequent shell calls run without OS isolation under mode=best_effort (fallback #{fallback_count})"
                     );
                     app.push_warn(notice);
                 }

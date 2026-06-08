@@ -1757,8 +1757,13 @@ impl ToolRegistry {
                 Ok(ShellSandboxPlan::external(command, &self.shell_sandbox))
             }
             ShellSandboxMode::BestEffort | ShellSandboxMode::Required => {
-                let plan =
-                    prepare_shell_sandbox_plan(command, analysis, &self.root, &self.shell_sandbox)?;
+                let plan = prepare_shell_sandbox_plan(
+                    command,
+                    analysis,
+                    &self.root,
+                    &self.shell_sandbox,
+                    &self.shell_sandbox_health,
+                )?;
                 apply_shell_sandbox_backend_health(
                     command,
                     &self.shell_sandbox,
@@ -6759,14 +6764,16 @@ fn patch_match_contexts(content: &str, search: &str, max_matches: usize) -> Vec<
 ///
 /// `backend` is the OS sandbox backend that was attempted (e.g.
 /// `macos-sandbox-exec`); `fallback_count` is the cumulative number of
-/// fallbacks across the registry's lifetime (so per session); and
+/// fallbacks across the registry's lifetime (so per session);
 /// `first_in_session` is the one-shot latch indicating whether this is the
-/// first time the registry has seen a fallback.
+/// first time the registry has seen a fallback; and `fallback_reason` is the
+/// human-readable degradation cause surfaced in the TUI warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellBestEffortFallback {
     pub backend: String,
     pub fallback_count: u64,
     pub first_in_session: bool,
+    pub fallback_reason: Option<String>,
 }
 
 /// Extract the best_effort fallback descriptor from a shell `ToolResult`,
@@ -6783,10 +6790,15 @@ pub fn shell_best_effort_fallback_from_result(
     let backend = payload.get("backend")?.as_str()?.to_string();
     let fallback_count = payload.get("fallback_count")?.as_u64()?;
     let first_in_session = payload.get("first_in_session")?.as_bool()?;
+    let fallback_reason = payload
+        .get("fallback_reason")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
     Some(ShellBestEffortFallback {
         backend,
         fallback_count,
         first_in_session,
+        fallback_reason,
     })
 }
 

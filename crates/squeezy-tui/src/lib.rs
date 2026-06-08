@@ -15825,7 +15825,17 @@ impl PermissionStatus {
     }
 
     fn compact(&self) -> String {
-        format!("perm={}", self.mode)
+        // Extract just the mode portion of the sandbox string (e.g.
+        // "best_effort" from "best_effort/net=deny_by_default").  When the
+        // sandbox is in a risky state (off or best_effort) we append it to
+        // the compact permission badge so users see the degradation without
+        // having to add a separate `sandbox` status-line item.
+        let sb_mode = self.sandbox.split('/').next().unwrap_or(&self.sandbox);
+        if matches!(sb_mode, "best_effort" | "off") {
+            format!("perm={} sb={sb_mode}", self.mode)
+        } else {
+            format!("perm={}", self.mode)
+        }
     }
 }
 

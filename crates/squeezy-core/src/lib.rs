@@ -6819,6 +6819,9 @@ pub struct ShellSandboxSettings {
     pub replace_sensitive_path_patterns: Option<bool>,
     /// Windows-only: `disabled`, `restricted_token` (default), or `elevated`.
     pub windows_sandbox_level: Option<String>,
+    /// macOS-only: AF_UNIX socket subpath allowlist used when network is
+    /// denied. Merged additively across config sources (same as `read_roots`).
+    pub macos_socket_domain_allowlist: Option<Vec<String>>,
 }
 
 impl ShellSandboxSettings {
@@ -6837,6 +6840,7 @@ impl ShellSandboxSettings {
                 "sensitive_path_patterns",
                 "replace_sensitive_path_patterns",
                 "windows_sandbox_level",
+                "macos_socket_domain_allowlist",
             ],
             source,
             path,
@@ -6893,6 +6897,12 @@ impl ShellSandboxSettings {
                 source,
                 &field(path, "windows_sandbox_level"),
             )?,
+            macos_socket_domain_allowlist: string_array_value(
+                table,
+                "macos_socket_domain_allowlist",
+                source,
+                &field(path, "macos_socket_domain_allowlist"),
+            )?,
         })
     }
 
@@ -6917,6 +6927,10 @@ impl ShellSandboxSettings {
             next.replace_sensitive_path_patterns,
         );
         replace_if_some(&mut self.windows_sandbox_level, next.windows_sandbox_level);
+        merge_string_lists(
+            &mut self.macos_socket_domain_allowlist,
+            next.macos_socket_domain_allowlist,
+        );
     }
 }
 
@@ -7024,6 +7038,16 @@ pub struct ShellSandboxConfig {
     /// Windows-only backend selection. Defaults to `RestrictedToken` so Windows
     /// shells get filesystem isolation with no configuration. Ignored elsewhere.
     pub windows_sandbox_level: WindowsSandboxLevel,
+    /// macOS-only: AF_UNIX socket subpath allowlist applied when the network
+    /// posture is `deny_by_default`. Each entry is a path prefix; any socket
+    /// whose path starts with that prefix is allowed. An empty list (the
+    /// default) means AF_UNIX is fully denied when network is denied — the
+    /// Seatbelt `(deny default)` rule blocks it. Add entries like
+    /// `/private/tmp/squeezy-` for local build-tool sockets that need to
+    /// reach the sandbox child (e.g. a custom approval daemon). Ignored
+    /// when `network = allow_when_approved` or on non-macOS platforms.
+    #[serde(default)]
+    pub macos_socket_domain_allowlist: Vec<String>,
 }
 
 impl Default for ShellSandboxConfig {
@@ -7039,6 +7063,7 @@ impl Default for ShellSandboxConfig {
             protected_metadata_names: default_protected_metadata_names(),
             sensitive_path_patterns: default_sensitive_path_patterns(),
             windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
+            macos_socket_domain_allowlist: Vec::new(),
         }
     }
 }
@@ -7161,6 +7186,18 @@ impl ShellSandboxConfig {
                     "{source}: permissions.shell_sandbox.windows_sandbox_level invalid value {level:?}; expected disabled, restricted_token, or elevated"
                 ))
             })?;
+        }
+        if let Some(allowlist) = settings.macos_socket_domain_allowlist {
+            // Validate: each entry must be an absolute path or start with /
+            // (on macOS, Unix sockets always live in the filesystem).
+            for entry in &allowlist {
+                if !entry.starts_with('/') {
+                    return Err(SqueezyError::Config(format!(
+                        "{source}: permissions.shell_sandbox.macos_socket_domain_allowlist entry {entry:?} must be an absolute path starting with /"
+                    )));
+                }
+            }
+            config.macos_socket_domain_allowlist = allowlist;
         }
         reject_duplicate_shell_roots(source, &config.read_roots, &config.write_roots)?;
         Ok(config)

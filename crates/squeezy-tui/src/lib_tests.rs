@@ -12848,6 +12848,7 @@ async fn shell_sandbox_best_effort_fallback_warns_user_once_per_session() {
         turn_id: TurnId::new(3),
         backend: "macos-sandbox-exec".to_string(),
         fallback_count: 1,
+        fallback_reason: None,
     })
     .await
     .expect("send fallback warning");

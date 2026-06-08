@@ -2530,6 +2530,7 @@ impl Driver {
                     turn_id,
                     backend,
                     fallback_count,
+                    ..
                 } => {
                     let turn_str = format!("{turn_id:?}");
                     self.capture.record(

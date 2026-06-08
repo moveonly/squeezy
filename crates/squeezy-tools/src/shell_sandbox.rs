@@ -46,6 +46,17 @@ pub(crate) struct ShellSandboxHealth {
     /// per session, even when several shell calls in a row land on the
     /// same degraded backend. The telemetry counter above keeps ticking.
     best_effort_warning_emitted: AtomicBool,
+    /// macOS SBPL profile cache: computed once per session per `allow_network`
+    /// value (deny=0, allow=1). The profile string is deterministic for a
+    /// fixed (root, config) pair, so we pay the build cost at most twice.
+    #[cfg(target_os = "macos")]
+    pub(crate) sbpl_profile_cache: [OnceLock<String>; 2],
+    /// Allowlisted environment map cache. `apply_shell_environment_policy`
+    /// scans all env vars and filters by the allowlist on every shell call;
+    /// since the agent process environment and the allowlist are both stable
+    /// per session, we compute this once and clone it per call instead.
+    pub(crate) preserved_env_cache:
+        OnceLock<std::collections::BTreeMap<String, std::ffi::OsString>>,
 }
 
 /// Outcome of `ShellSandboxHealth::record_best_effort_fallback`. The agent
@@ -145,12 +156,15 @@ pub(crate) struct ShellSandboxPlan {
 /// Side-table that accompanies a best_effort fallback plan. The agent
 /// reads these fields to (a) tick the `approval.best_effort.fallback`
 /// telemetry counter and (b) decide whether to publish the once-per-session
-/// TUI banner.
-#[derive(Debug, Clone, Copy)]
+/// TUI banner. `fallback_reason` is surfaced in the TUI warning so users
+/// see whether the degradation came from a probe timeout, a spawn/pre-exec
+/// error, a signal-killed probe child, or a cached-unavailable backend.
+#[derive(Debug, Clone)]
 pub(crate) struct BestEffortFallback {
     pub(crate) backend: &'static str,
     pub(crate) fallback_count: u64,
     pub(crate) first_in_session: bool,
+    pub(crate) fallback_reason: Option<String>,
 }
 
 impl ShellSandboxPlan {
@@ -244,11 +258,14 @@ impl ShellSandboxPlan {
     /// Build the audit metadata row at the fallback EMISSION site, where
     /// the plan still references the failing backend (so `backend`,
     /// `filesystem`, etc. describe the attempt that was abandoned) but
-    /// the caller already has the counter snapshot in hand.
+    /// the caller already has the counter snapshot in hand. `reason` is the
+    /// human-readable degradation reason forwarded into `fallback_reason` so
+    /// the TUI warning can explain the root cause to the user.
     pub(crate) fn metadata_with_best_effort_fallback(
         &self,
         degraded_backend: &'static str,
         record: &ShellSandboxFallbackRecord,
+        reason: Option<&str>,
     ) -> Value {
         let mut payload = self.metadata();
         if let Some(object) = payload.as_object_mut() {
@@ -258,6 +275,7 @@ impl ShellSandboxPlan {
                     backend: degraded_backend,
                     fallback_count: record.fallback_count,
                     first_in_session: record.first_in_session,
+                    fallback_reason: reason.map(str::to_owned),
                 }),
             );
         }
@@ -290,6 +308,7 @@ fn best_effort_fallback_json(record: BestEffortFallback) -> Value {
         "backend": record.backend,
         "fallback_count": record.fallback_count,
         "first_in_session": record.first_in_session,
+        "fallback_reason": record.fallback_reason,
     })
 }
 
@@ -412,12 +431,14 @@ pub(crate) fn prepare_shell_sandbox_plan(
     analysis: &ShellPermissionAnalysis,
     root: &Path,
     config: &ShellSandboxConfig,
+    health: &ShellSandboxHealth,
 ) -> std::result::Result<ShellSandboxPlan, String> {
     prepare_shell_sandbox_plan_with_probe(
         command,
         analysis,
         root,
         config,
+        health,
         macos_sandbox_exec_supported(),
         linux_unshare_supported(),
         linux_landlock_supported(),
@@ -636,6 +657,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
     analysis: &ShellPermissionAnalysis,
     root: &Path,
     config: &ShellSandboxConfig,
+    health: &ShellSandboxHealth,
     macos_sandbox_exec_available: bool,
     linux_unshare_available: bool,
     linux_landlock_available: bool,
@@ -644,7 +666,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
     // below; reference the others so the non-matching targets (and the Windows
     // CI `clippy -D warnings` gate) don't flag them as unused.
     #[cfg(not(target_os = "macos"))]
-    let _ = macos_sandbox_exec_available;
+    let _ = (macos_sandbox_exec_available, health);
     #[cfg(not(target_os = "linux"))]
     let _ = (linux_unshare_available, linux_landlock_available);
 
@@ -684,11 +706,18 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
     #[cfg(target_os = "macos")]
     {
         if macos_sandbox_exec_available {
+            let allow_network = network != "denied";
+            let profile = {
+                let cache_idx = usize::from(allow_network);
+                health.sbpl_profile_cache[cache_idx]
+                    .get_or_init(|| macos_shell_sandbox_profile(root, config, allow_network))
+                    .clone()
+            };
             return Ok(ShellSandboxPlan {
                 program: "/usr/bin/sandbox-exec".to_string(),
                 args: vec![
                     "-p".to_string(),
-                    macos_shell_sandbox_profile(root, config, network != "denied"),
+                    profile,
                     "sh".to_string(),
                     "-lc".to_string(),
                     command.to_string(),
@@ -945,7 +974,8 @@ pub(crate) fn macos_shell_sandbox_profile(
         // WindowServer, etc. via `nc -U`. Each allowed entry is matched
         // as a path subpath so prefixes like `/private/tmp/agent.sock`
         // cover sockets created beneath them.
-        for entry in MACOS_AF_UNIX_ALLOWLIST {
+        // Use the per-config allowlist (promoted from the old empty constant).
+        for entry in &config.macos_socket_domain_allowlist {
             let escaped = sandbox_profile_string(entry);
             profile.push_str(&format!(
                 "(allow network* (local unix-socket (subpath {escaped})))\n"
@@ -958,14 +988,8 @@ pub(crate) fn macos_shell_sandbox_profile(
     profile
 }
 
-/// Subpath-qualified AF_UNIX socket allowlist used when the network
-/// posture is denied. An empty list means AF_UNIX is denied entirely
-/// when network is denied; the default Seatbelt `(deny default)` rule
-/// supplies the actual deny. A future ticket can promote this to a
-/// `ShellSandboxConfig::socket_domain_allowlist` field; the constant
-/// keeps the policy site visible in one place.
-#[cfg(target_os = "macos")]
-const MACOS_AF_UNIX_ALLOWLIST: &[&str] = &[];
+// MACOS_AF_UNIX_ALLOWLIST has been promoted to `ShellSandboxConfig::macos_socket_domain_allowlist`
+// with conservative defaults (empty) and per-workspace config support.
 
 /// Read-only roots every shell needs to look at: system libraries, the
 /// dynamic linker, certificate stores, the toolchain prefix, and the user's
