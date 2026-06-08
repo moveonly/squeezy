@@ -566,14 +566,6 @@ fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> boo
 /// `cargo` output, or MSBuild output without learning the internal convention.
 ///
 /// Returns the input unchanged (zero allocation) when it contains no `\`.
-fn normalize_filter(filter: &str) -> std::borrow::Cow<'_, str> {
-    if filter.contains('\\') {
-        std::borrow::Cow::Owned(filter.replace('\\', "/"))
-    } else {
-        std::borrow::Cow::Borrowed(filter)
-    }
-}
-
 /// Match `path` against a model-supplied `filter`.
 ///
 /// Filters that look like a directory path (contain `/` or `\`) match by
