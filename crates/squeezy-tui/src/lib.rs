@@ -4235,11 +4235,11 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             let note = match agent.cheap_model() {
                 Some(ref cheap) if cheap == &parent_model => {
                     "\nNote: the cheap model resolves to the same model as the parent; \
-                     this turn will use the parent model."
+                     the next turn will use the parent model."
                 }
                 None => {
                     "\nNote: no distinct cheap model is configured for this provider; \
-                     this turn will fall back to the parent model."
+                     the next turn will fall back to the parent model."
                 }
                 Some(_) => "",
             };

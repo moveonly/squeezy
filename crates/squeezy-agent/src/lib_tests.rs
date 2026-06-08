@@ -4892,6 +4892,35 @@ fn agent_session_mode_can_be_set_and_toggled() {
 }
 
 #[test]
+fn mode_state_snapshot_reports_live_mode_and_routing_overrides() {
+    let agent = Agent::new(
+        AppConfig {
+            session_mode: SessionMode::Plan,
+            ..Default::default()
+        },
+        Arc::new(MockProvider::new(Vec::new())),
+    );
+
+    assert_eq!(agent.mode_state_snapshot().session_mode, SessionMode::Plan);
+
+    assert!(agent.set_session_mode(SessionMode::Build, "test"));
+    agent.request_routing_force_cheap();
+    agent.set_routing_session_disabled(true);
+
+    let snapshot = agent.mode_state_snapshot();
+    assert_eq!(snapshot.session_mode, SessionMode::Build);
+    assert!(snapshot.routing_session_disabled);
+    assert!(snapshot.pending_force_cheap);
+    assert!(!snapshot.pending_force_parent);
+    assert_eq!(snapshot.sticky_turns_remaining, 0);
+
+    agent.request_routing_force_parent();
+    let snapshot = agent.mode_state_snapshot();
+    assert!(!snapshot.pending_force_cheap);
+    assert!(snapshot.pending_force_parent);
+}
+
+#[test]
 fn agent_session_mode_transition_logs_structured_fields() {
     let writer = SharedLogWriter::default();
     let subscriber = tracing_subscriber::fmt()

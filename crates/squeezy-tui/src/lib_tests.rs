@@ -2105,6 +2105,33 @@ async fn slash_command_queues_mid_turn() {
 }
 
 #[tokio::test]
+async fn slash_cheap_fallback_notice_says_next_turn() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    apply_dispatch_command(&mut app, &mut agent, DispatchCommand::Cheap).await;
+
+    assert_eq!(app.status, "routing: forced cheap next turn");
+    assert!(
+        agent.mode_state_snapshot().pending_force_cheap,
+        "/cheap should arm the one-shot override"
+    );
+    let notice = last_message_content(&app).expect("/cheap notice");
+    assert!(
+        notice.contains("next turn forced to the cheap model (one-shot)"),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("the next turn will fall back to the parent model"),
+        "{notice}"
+    );
+    assert!(
+        !notice.contains("this turn will"),
+        "fallback notice must not imply the current turn changes: {notice}"
+    );
+}
+
+#[tokio::test]
 async fn queued_slash_clear_executes_after_running_turn_finishes() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);

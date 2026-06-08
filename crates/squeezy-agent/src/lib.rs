@@ -2160,8 +2160,8 @@ impl Agent {
     /// This is the single authoritative source the TUI status line and tests
     /// should read: current session mode, whether auto-routing is
     /// session-disabled, pending one-shot overrides, and the sticky-escalation
-    /// window. All fields are read from the same `routing_state` lock so the
-    /// snapshot is internally consistent.
+    /// window. Routing fields are read from the same `routing_state` lock so
+    /// that portion of the snapshot is internally consistent.
     pub fn mode_state_snapshot(&self) -> ModeStateSnapshot {
         let routing = self.routing_state.lock().expect("routing state lock");
         let session_mode = self.session_mode();
