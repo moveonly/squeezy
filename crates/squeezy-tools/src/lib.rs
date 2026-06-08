@@ -2407,6 +2407,40 @@ impl ToolRegistry {
                     "sandbox_network".to_string(),
                     self.shell_sandbox.network.as_str().to_string(),
                 );
+                // Surface the active OS sandbox backend name at approval time so
+                // the TUI can show posture without waiting until after spawn. On
+                // linux-direct-syscalls the seccomp filter blocks AF_UNIX, so
+                // `squeezy ask` is also unavailable inside the shell child.
+                let sandbox_backend = {
+                    #[cfg(target_os = "linux")]
+                    {
+                        "linux-direct-syscalls"
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        "macos-sandbox-exec"
+                    }
+                    #[cfg(target_os = "windows")]
+                    {
+                        "windows-restricted-token"
+                    }
+                    #[cfg(not(any(
+                        target_os = "linux",
+                        target_os = "macos",
+                        target_os = "windows"
+                    )))]
+                    {
+                        "none"
+                    }
+                };
+                metadata.insert("sandbox_backend".to_string(), sandbox_backend.to_string());
+                #[cfg(target_os = "linux")]
+                if self.shell_sandbox.mode != ShellSandboxMode::Off {
+                    metadata.insert(
+                        "ask_socket_unavailable".to_string(),
+                        "squeezy ask is unavailable inside this shell child because the seccomp profile blocks AF_UNIX socket(2)".to_string(),
+                    );
+                }
                 metadata.insert(
                     "sandbox_read_roots".to_string(),
                     path_list_metadata(&self.shell_sandbox.read_roots),

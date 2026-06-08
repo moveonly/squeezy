@@ -541,3 +541,74 @@ fn edit_preview_without_diff_keeps_legacy_layout() {
         "stray remove gutter in legacy layout: {out}"
     );
 }
+
+#[test]
+fn shell_preview_shows_sandbox_posture_when_backend_known() {
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo build",
+        &[
+            ("command", "cargo build"),
+            ("sandbox", "required"),
+            ("sandbox_network", "deny_by_default"),
+            ("sandbox_backend", "linux-direct-syscalls"),
+        ],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("linux-direct-syscalls"),
+        "sandbox backend should appear in preview: {out}"
+    );
+    assert!(
+        out.contains("required"),
+        "sandbox mode should appear in preview: {out}"
+    );
+    assert!(
+        out.contains("deny_by_default"),
+        "sandbox network policy should appear in preview: {out}"
+    );
+}
+
+#[test]
+fn shell_preview_shows_ask_socket_unavailable_hint_for_linux() {
+    let hint = "squeezy ask is unavailable inside this shell child because the seccomp profile blocks AF_UNIX socket(2)";
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "make test",
+        &[
+            ("command", "make test"),
+            ("sandbox_backend", "linux-direct-syscalls"),
+            ("ask_socket_unavailable", hint),
+        ],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("AF_UNIX"),
+        "ask socket hint should appear in preview: {out}"
+    );
+    assert!(
+        out.contains("seccomp"),
+        "ask socket hint should mention seccomp: {out}"
+    );
+}
+
+#[test]
+fn shell_preview_omits_sandbox_row_when_backend_is_none() {
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "ls",
+        &[
+            ("command", "ls"),
+            ("sandbox", "off"),
+            ("sandbox_backend", "none"),
+        ],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        !out.contains("sandbox none"),
+        "backend=none must not emit a sandbox posture row: {out}"
+    );
+}

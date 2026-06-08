@@ -342,6 +342,20 @@ pub struct ShellSandboxDoctor {
     pub available: bool,
     /// Human-readable explanation for the doctor row.
     pub detail: String,
+    /// Linux-specific: whether unprivileged user namespaces are available
+    /// (required for `unshare(CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWNET)`).
+    /// Always `None` on non-Linux platforms.
+    pub linux_user_namespaces: Option<bool>,
+    /// Linux-specific: Landlock ABI version exposed by the kernel,
+    /// or `0` when Landlock is absent. Always `None` on non-Linux platforms.
+    pub linux_landlock_abi: Option<i32>,
+    /// Linux-specific: whether the seccomp BPF filter compiles successfully on
+    /// this architecture. Always `None` on non-Linux platforms.
+    pub linux_seccomp_available: Option<bool>,
+    /// Linux-specific: whether `squeezy ask` is unavailable inside the sandboxed
+    /// shell child because the seccomp profile denies AF_UNIX `socket(2)`.
+    /// Always `None` on non-Linux platforms.
+    pub linux_ask_socket_blocked: Option<bool>,
 }
 
 /// Probe the active shell-sandbox backend for `doctor`.
@@ -359,12 +373,18 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
                 "/usr/bin/sandbox-exec not found; required mode denies, best_effort degrades"
                     .to_string()
             },
+            linux_user_namespaces: None,
+            linux_landlock_abi: None,
+            linux_seccomp_available: None,
+            linux_ask_socket_blocked: None,
         }
     }
     #[cfg(target_os = "linux")]
     {
         let userns = linux_unshare_supported();
         let landlock = linux_landlock_supported();
+        let landlock_abi = linux_landlock_abi_version();
+        let seccomp_ok = linux_seccomp::build_shell_filter().is_ok();
         let detail = match (userns, landlock) {
             (true, true) => {
                 "unshare(CLONE_NEWUSER|NEWNS|NEWNET) + Landlock + seccomp available".to_string()
@@ -386,6 +406,12 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             backend: "linux-direct-syscalls",
             available: userns && landlock,
             detail,
+            linux_user_namespaces: Some(userns),
+            linux_landlock_abi: Some(landlock_abi),
+            linux_seccomp_available: Some(seccomp_ok),
+            // The seccomp filter always denies AF_UNIX socket(2) so squeezy ask
+            // is always unavailable inside a sandboxed linux child.
+            linux_ask_socket_blocked: Some(true),
         }
     }
     #[cfg(target_os = "windows")]
@@ -395,6 +421,10 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             available: true,
             detail: "restricted-token tier enforces filesystem writes with no admin; the elevated tier (sensitive-read deny + WFP network egress control) is opt-in via `squeezy doctor --sandbox-setup` (one UAC prompt)"
                 .to_string(),
+            linux_user_namespaces: None,
+            linux_landlock_abi: None,
+            linux_seccomp_available: None,
+            linux_ask_socket_blocked: None,
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -403,6 +433,10 @@ pub fn shell_sandbox_doctor() -> ShellSandboxDoctor {
             backend: "none",
             available: false,
             detail: "no OS shell-sandbox backend is available for this platform".to_string(),
+            linux_user_namespaces: None,
+            linux_landlock_abi: None,
+            linux_seccomp_available: None,
+            linux_ask_socket_blocked: None,
         }
     }
 }
@@ -723,16 +757,18 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
         if !linux_unshare_available {
             if required {
                 return Err(format!(
-                    "required shell sandbox unavailable: linux unshare(CLONE_NEWUSER|CLONE_NEWNS{}) failed",
+                    "required shell sandbox unavailable: linux unshare(CLONE_NEWUSER|CLONE_NEWNS{}) not permitted on this host",
                     if network == "denied" {
-                        " |CLONE_NEWNET"
+                        "|CLONE_NEWNET"
                     } else {
                         ""
                     }
                 ));
             }
-            fallback_reason =
-                Some("required shell sandbox unavailable: linux unshare failed".to_string());
+            fallback_reason = Some(
+                "linux unshare unavailable; running without OS sandbox because mode is best_effort"
+                    .to_string(),
+            );
         } else {
             let filesystem = if linux_landlock_available {
                 "enforced"

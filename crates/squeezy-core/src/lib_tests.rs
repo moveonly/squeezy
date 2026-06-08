@@ -5950,3 +5950,37 @@ fn session_metrics_merge_turn_folds_model_ledger() {
         .expect("gpt-5.5 bucket");
     assert_eq!(bucket.main.estimated_usd_micros, Some(84));
 }
+
+// ── sensitive-path defaults ────────────────────────────────────────────────
+
+/// Validate that the default sensitive-path patterns cover the XDG and cloud
+/// CLI credential locations added in the Linux-hardening pass, in addition to
+/// the pre-existing baseline patterns.
+#[test]
+fn default_sensitive_paths_include_xdg_and_cloud_creds() {
+    let config = ShellSandboxConfig::default();
+    let patterns = &config.sensitive_path_patterns;
+
+    // Pre-existing baseline patterns.
+    for expected in [".ssh/**", ".aws/**", ".kube/**", ".gnupg/**"] {
+        assert!(
+            patterns.iter().any(|p| p == expected),
+            "default patterns should contain {expected:?}; got: {patterns:?}"
+        );
+    }
+
+    // Linux-hardening additions: XDG and cloud CLI secrets.
+    for expected in [
+        ".password-store/**",
+        ".config/sops/**",
+        ".config/1Password/**",
+        ".azure/**",
+        ".config/gcloud/**",
+        ".config/kube/**",
+    ] {
+        assert!(
+            patterns.iter().any(|p| p == expected),
+            "default patterns should contain {expected:?}; got: {patterns:?}"
+        );
+    }
+}

@@ -11621,6 +11621,72 @@ fn shell_sandbox_plan_best_effort_when_userns_unavailable() {
     );
 }
 
+/// Regression: best_effort fallback reason must describe the actual mode, not
+/// mislead users into thinking the sandbox was "required". Previously the
+/// message read "required shell sandbox unavailable: linux unshare failed"
+/// even when mode = best_effort.
+#[test]
+#[cfg(target_os = "linux")]
+fn shell_sandbox_best_effort_fallback_reason_does_not_say_required() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::BestEffort,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        true,
+        false,
+    )
+    .expect("best effort falls back gracefully");
+
+    let reason = plan
+        .fallback_reason
+        .expect("best_effort fallback must carry a reason");
+    assert!(
+        !reason.contains("required"),
+        "best_effort fallback reason must not say 'required'; got: {reason:?}"
+    );
+    assert!(
+        reason.contains("best_effort"),
+        "best_effort fallback reason should mention the mode; got: {reason:?}"
+    );
+}
+
+/// Regression: required mode must fail closed even when the static preflight
+/// probe says unshare is available but the actual unshare/Landlock step
+/// would fail at runtime. The plan planner must produce `Err` so the
+/// permission gate surfaces a user-visible denial before any spawn occurs.
+#[test]
+#[cfg(target_os = "linux")]
+fn shell_sandbox_required_mode_fails_closed_on_preflight_false_positive() {
+    // Simulate a host where the sysctl / ns file say "yes" (probes = true,
+    // true) but we invert to probes = false to represent the state where
+    // unshare is blocked by a container security policy. Required mode must
+    // still produce a clean Err rather than a plan that would fail inside
+    // the child.
+    let err = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::Required,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        // linux_unshare_available = false → simulate host that blocks unshare
+        // even though sysctl may say yes.
+        false,
+        false,
+    )
+    .expect_err("required mode must fail closed before spawn");
+
+    assert!(
+        err.contains("required shell sandbox unavailable"),
+        "required-mode denial must be user-visible; got: {err:?}"
+    );
+    assert!(
+        !err.contains("best_effort"),
+        "required-mode error must not mention best_effort; got: {err:?}"
+    );
+}
+
 #[test]
 fn shell_termination_reason_reports_missing_exit_status() {
     assert_eq!(

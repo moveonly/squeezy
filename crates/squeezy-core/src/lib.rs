@@ -7417,6 +7417,14 @@ fn default_sensitive_path_patterns() -> Vec<String> {
         ".npmrc",
         ".pypirc",
         ".env*",
+        // XDG and cloud CLI credential locations not covered above.
+        // Added as part of the Linux-hardening pass.
+        ".password-store/**",
+        ".config/sops/**",
+        ".config/1Password/**",
+        ".azure/**",
+        ".config/gcloud/**",
+        ".config/kube/**",
     ]
     .into_iter()
     .map(str::to_string)

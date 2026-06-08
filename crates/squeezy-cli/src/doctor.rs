@@ -783,6 +783,32 @@ fn update_check(status: UpdateStatus) -> Check {
 /// and the Windows restricted-token / elevated tiers.
 fn sandbox_check() -> Check {
     let report = squeezy_tools::shell_sandbox_doctor();
+    let mut detail = format!("backend {}: {}", report.backend, report.detail);
+    // Surface Linux-specific sandbox health fields for diagnostics.
+    if let Some(userns) = report.linux_user_namespaces {
+        detail.push_str(if userns {
+            "; user-namespaces: available"
+        } else {
+            "; user-namespaces: unavailable"
+        });
+    }
+    if let Some(abi) = report.linux_landlock_abi {
+        if abi > 0 {
+            detail.push_str(&format!("; landlock-abi: {abi}"));
+        } else {
+            detail.push_str("; landlock-abi: unavailable");
+        }
+    }
+    if let Some(seccomp) = report.linux_seccomp_available {
+        detail.push_str(if seccomp {
+            "; seccomp: available"
+        } else {
+            "; seccomp: unavailable"
+        });
+    }
+    if report.linux_ask_socket_blocked == Some(true) {
+        detail.push_str("; squeezy-ask-in-child: blocked (AF_UNIX denied by seccomp)");
+    }
     Check {
         name: "sandbox".to_string(),
         status: if report.available {
@@ -790,7 +816,7 @@ fn sandbox_check() -> Check {
         } else {
             Status::Warn
         },
-        detail: format!("backend {}: {}", report.backend, report.detail),
+        detail,
     }
 }
 

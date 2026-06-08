@@ -167,6 +167,30 @@ fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) 
     if let Some(binary) = permission.metadata.get("binary") {
         lines.push(dim(format!("binary {binary}")));
     }
+    // Show sandbox posture so the user can see isolation level at approval time.
+    let backend = permission
+        .metadata
+        .get("sandbox_backend")
+        .map(String::as_str);
+    let mode = permission.metadata.get("sandbox").map(String::as_str);
+    let network = permission
+        .metadata
+        .get("sandbox_network")
+        .map(String::as_str);
+    match (backend, mode, network) {
+        (Some(b), Some(m), Some(n)) if b != "none" => {
+            lines.push(dim(format!("sandbox {b}  mode {m}  network-policy {n}")));
+        }
+        (Some(b), Some(m), None) if b != "none" => {
+            lines.push(dim(format!("sandbox {b}  mode {m}")));
+        }
+        _ => {}
+    }
+    // On linux-direct-syscalls the seccomp filter blocks AF_UNIX, so
+    // `squeezy ask` cannot be used from inside this sandboxed shell child.
+    if let Some(hint) = permission.metadata.get("ask_socket_unavailable") {
+        lines.push(dim(format!("note: {hint}")));
+    }
 }
 
 fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
