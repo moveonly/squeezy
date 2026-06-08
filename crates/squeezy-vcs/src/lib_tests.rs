@@ -760,6 +760,124 @@ fn checkpoint_rollback_preserves_hardlinked_regular_files() {
     let _ = fs::remove_dir_all(root);
 }
 
+// Covers review N2: `rollback_paths` must surface every hardlink peer so
+// the tool-layer sandbox preflight sees every workspace path the
+// rollback can mutate.
+#[cfg(unix)]
+#[test]
+fn rollback_paths_includes_hardlink_peers() {
+    let root = temp_repo("checkpoint_hardlink_rollback_paths");
+    let alpha = root.join("alpha.txt");
+    let beta = root.join("beta.txt");
+    fs::write(&alpha, "before\n").expect("write alpha");
+    fs::hard_link(&alpha, &beta).expect("hardlink beta");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(&alpha, "after\n").expect("agent write alpha");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    assert!(
+        record
+            .files
+            .iter()
+            .any(|file| file.before_hardlink_paths.is_some()),
+        "checkpoint should record the hardlink group"
+    );
+
+    let paths = store
+        .rollback_paths(RollbackTarget::Latest)
+        .expect("rollback paths");
+    assert!(
+        paths.iter().any(|path| path == "alpha.txt"),
+        "alpha.txt should be in rollback paths: {:?}",
+        paths
+    );
+    assert!(
+        paths.iter().any(|path| path == "beta.txt"),
+        "hardlink peer beta.txt should also be surfaced for the sandbox preflight: {:?}",
+        paths
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+// Covers review N1: a best-effort rollback whose hardlink group has a
+// conflicted peer must not let the per-group restore loop overwrite that
+// peer's user-modified content.
+#[cfg(unix)]
+#[test]
+fn checkpoint_best_effort_hardlink_group_respects_per_peer_conflict() {
+    let root = temp_repo("checkpoint_hardlink_best_effort_conflict");
+    let alpha = root.join("alpha.txt");
+    let beta = root.join("beta.txt");
+    fs::write(&alpha, "before\n").expect("write alpha");
+    fs::hard_link(&alpha, &beta).expect("hardlink beta");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(&alpha, "after\n").expect("agent write alpha");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    assert!(
+        record
+            .files
+            .iter()
+            .any(|file| file.before_hardlink_paths.is_some()),
+        "checkpoint should record the hardlink group: {:?}",
+        record
+    );
+
+    fs::remove_file(&alpha).expect("user unlink alpha");
+    fs::write(&alpha, "user-a\n").expect("user rewrite alpha");
+    assert_eq!(fs::read_to_string(&alpha).unwrap(), "user-a\n");
+    assert_eq!(fs::read_to_string(&beta).unwrap(), "after\n");
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::BestEffort)
+        .expect("rollback hardlink best-effort");
+
+    assert!(
+        rollback.applied,
+        "best-effort rollback should still report applied"
+    );
+    assert!(
+        rollback
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == "alpha.txt"),
+        "alpha should be flagged as a conflict: {:?}",
+        rollback.conflicts
+    );
+    assert_eq!(
+        fs::read_to_string(&alpha).unwrap(),
+        "user-a\n",
+        "conflicted peer alpha must not be overwritten"
+    );
+    assert!(
+        !rollback
+            .file_actions
+            .iter()
+            .any(|action| action.path == "alpha.txt"),
+        "no rollback action should target alpha: {:?}",
+        rollback.file_actions
+    );
+    assert!(
+        !rollback
+            .file_actions
+            .iter()
+            .any(|action| action.action == RollbackFileActionKind::RestoreHardlink),
+        "the hardlink group must be skipped when any peer is conflicted: {:?}",
+        rollback.file_actions
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 #[test]
 fn checkpoint_rollback_restores_chmod_only_change() {

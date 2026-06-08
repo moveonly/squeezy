@@ -77,12 +77,23 @@ target without following it. Deletes unlink the workspace entry itself and
 refuse to remove directories. Hardlinked regular files are restored to the
 before snapshot and then relinked so the recorded link group shares one inode;
 unchanged peers are preflighted before relinking so rollback does not overwrite
-user edits made after the checkpoint. The rollback receipt includes a per-file
-`file_actions` list with `restore_regular`, `restore_symlink`,
-`restore_hardlink`, or `delete`, the mode/file type when relevant, and a
-`verified_after_rollback` boolean. Restores fail if post-rollback verification
-does not match the expected content hash, file type, Git mode, or hardlink
-identity.
+user edits made after the checkpoint. The relink itself is crash-atomic: a
+sibling tempfile is hard-linked from the source inode and renamed over the
+peer, so an interrupt between the unlink and link cannot leave the peer
+absent. The rollback receipt includes a per-file `file_actions` list with
+`restore_regular`, `restore_symlink`, `restore_hardlink`, or `delete`, the
+mode/file type when relevant, and a `verified_after_rollback` boolean.
+Restores fail if post-rollback verification does not match the expected
+content hash, file type, Git mode, or hardlink identity.
+
+Rollback fidelity is limited to the Git tree model: the 9-bit Unix mode is
+reapplied, but extended attributes (`security.capability`, SELinux contexts,
+POSIX ACLs, user xattrs) are *not* preserved across a checkpoint cycle.
+Restoring a `setcap`'d binary, an SELinux-labeled config, or a file with a
+custom xattr will produce content-identical bytes but a stripped security
+envelope. Workspaces relying on those attributes should treat checkpoint
+rollback as a content-only restore and reapply labels/capabilities through
+the same tooling that set them.
 
 Checkpoint coverage is explicit. Files that exceed the checkpoint size limit
 are reported in `skipped_files` and add a coverage warning; rollback will not

@@ -25,6 +25,14 @@ pub const CRATE_NAME: &str = "squeezy-vcs";
 const DEFAULT_MAX_PATCH_BYTES: usize = 1_000_000;
 const DEFAULT_CHECKPOINT_RETENTION_DAYS: u64 = 7;
 const DEFAULT_MAX_CHECKPOINT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Upper bound on how many sibling-tempfile / sibling-symlink / sibling-
+/// hardlink candidates the rollback path will try before giving up. Each
+/// `create_sibling_*` helper draws a fresh `(pid, counter)` candidate per
+/// attempt; in practice the first attempt almost always succeeds because
+/// the counter is process-wide and monotonic. The cap is here to bound
+/// the loop in the pathological case where another process is racing the
+/// rollback (e.g. running `cleanup` while we restore) and to surface a
+/// clean `Tool` error instead of spinning indefinitely.
 const MAX_RESTORE_TEMPFILE_ATTEMPTS: usize = 128;
 const SHADOW_LOCK_FILENAME: &str = "shadow.lock";
 const SHADOW_STALE_DIR_RETENTION_DAYS: u64 = 14;
@@ -1158,7 +1166,15 @@ impl CheckpointStore {
             self.rollback_record(record, &mut result)?;
         }
         self.track_tree()?;
-        result.applied = !result.file_actions.is_empty();
+        // `applied` reports whether the rollback finished as planned. A
+        // pass that emitted at least one per-file action clearly applied,
+        // but a *no-op* pass (no conflicts, every file already at the
+        // expected state) is also a success and should stay `applied`
+        // rather than tricking the tool layer into reporting `Stale`
+        // (see review N9). When conflicts gated all of the work,
+        // `file_actions` is empty and we keep `applied = false` so the
+        // tool layer can map it to `Stale`.
+        result.applied = !result.file_actions.is_empty() || result.conflicts.is_empty();
         self.append_journal(json!({
             "kind": "rollback",
             "created_at_ms": now_ms(),
@@ -1174,6 +1190,16 @@ impl CheckpointStore {
                 paths.insert(file.path.clone());
                 if let Some(from_path) = file.from_path {
                     paths.insert(from_path);
+                }
+                // Hardlink peers are mutated by `restore_hardlink_group`
+                // (unlinked + relinked), so the tool-layer sandbox preflight
+                // must see them too. Without this the policy gate could
+                // approve a rollback whose only writable-root violation
+                // lives on a peer outside `record.files` (see review N2).
+                if let Some(group) = file.before_hardlink_paths {
+                    for peer in group {
+                        paths.insert(peer);
+                    }
                 }
             }
         }
@@ -1507,6 +1533,17 @@ impl CheckpointStore {
         record: &CheckpointRecord,
         result: &mut RollbackResult,
     ) -> Result<()> {
+        // Collect every workspace path that any conflict in this record's
+        // preflight already protected. The per-group loop below must skip
+        // those paths so a non-conflicted peer never overwrites a peer the
+        // gate told us to leave alone (see review N1).
+        let conflicted_paths: BTreeSet<&str> = result
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict.checkpoint_id == record.id)
+            .map(|conflict| conflict.path.as_str())
+            .collect();
+
         let mut groups = BTreeSet::<Vec<String>>::new();
         for file in &record.files {
             if rollback_file_has_conflict(result, record, file) {
@@ -1520,6 +1557,15 @@ impl CheckpointStore {
         }
 
         for group in groups {
+            // If any peer in this group was preflighted as conflicted, skip
+            // the whole group rather than restoring some peers and relinking
+            // the rest to the freshly overwritten content.
+            if group
+                .iter()
+                .any(|peer| conflicted_paths.contains(peer.as_str()))
+            {
+                continue;
+            }
             for rel in &group {
                 let Some(entry) = self.tree_entry(&record.before_tree, rel)? else {
                     continue;
@@ -1545,11 +1591,10 @@ impl CheckpointStore {
                 }
             }
 
+            // `restore_hardlink_group` returns only after verifying that
+            // every relinked peer shares the source's inode, so we can
+            // record the verified result without a second walk.
             let relinked = restore_hardlink_group(&self.root, &group)?;
-            // `restore_hardlink_group` already verified the group internally;
-            // capture the result once here rather than re-running O(N)
-            // `symlink_metadata` calls per re-linked member.
-            let verified = verify_hardlink_group(&self.root, &group)?;
             for rel in relinked {
                 let Some(entry) = self.tree_entry(&record.before_tree, &rel)? else {
                     continue;
@@ -1562,7 +1607,7 @@ impl CheckpointStore {
                     action: RollbackFileActionKind::RestoreHardlink,
                     mode: Some(mode),
                     file_type: Some(file_type),
-                    verified_after_rollback: verified,
+                    verified_after_rollback: true,
                 });
             }
         }
@@ -1576,67 +1621,58 @@ impl CheckpointStore {
         path: &str,
         current_state: &WorkspaceEntryState,
     ) -> Result<Option<RollbackConflict>> {
+        // Collect every failed predicate so a multi-cause divergence (e.g.
+        // both type and mode changed) shows up in a single conflict reason
+        // instead of silently collapsing to whichever check ran first
+        // (see review N10).
+        let mut reasons: Vec<String> = Vec::new();
         if let Some(expected_type) = file.after_file_type
             && current_state.file_type != Some(expected_type)
         {
-            let reason = if current_state.file_type.is_none() {
-                format!(
+            if current_state.file_type.is_none() {
+                reasons.push(format!(
                     "file was deleted after checkpoint; expected {:?}; leaving it deleted",
                     expected_type
-                )
+                ));
             } else {
-                format!(
+                reasons.push(format!(
                     "file type changed after checkpoint; expected {:?}, got {:?}; leaving current content untouched",
                     expected_type, current_state.file_type
-                )
-            };
-            return Ok(Some(RollbackConflict {
-                checkpoint_id: record.id.clone(),
-                path: path.to_string(),
-                expected_sha256: file.after_sha256.clone(),
-                current_sha256: current_state.sha256.clone(),
-                reason,
-            }));
+                ));
+            }
         }
         if let Some(expected_mode) = file.after_mode.as_deref()
             && current_state.mode.as_deref() != Some(expected_mode)
         {
-            return Ok(Some(RollbackConflict {
-                checkpoint_id: record.id.clone(),
-                path: path.to_string(),
-                expected_sha256: file.after_sha256.clone(),
-                current_sha256: current_state.sha256.clone(),
-                reason: format!(
-                    "file mode changed after checkpoint; expected {expected_mode}, got {}; leaving current content untouched",
-                    current_state.mode.as_deref().unwrap_or("absent")
-                ),
-            }));
+            reasons.push(format!(
+                "file mode changed after checkpoint; expected {expected_mode}, got {}; leaving current content untouched",
+                current_state.mode.as_deref().unwrap_or("absent")
+            ));
         }
         if current_state.sha256 != file.after_sha256 {
-            return Ok(Some(RollbackConflict {
-                checkpoint_id: record.id.clone(),
-                path: path.to_string(),
-                expected_sha256: file.after_sha256.clone(),
-                current_sha256: current_state.sha256.clone(),
-                reason: "file changed after checkpoint; leaving current content untouched"
-                    .to_string(),
-            }));
+            reasons.push(
+                "file changed after checkpoint; leaving current content untouched".to_string(),
+            );
         }
         let before_lookup = file.from_path.as_deref().unwrap_or(file.path.as_str());
         if let Some(entry) = self.tree_entry(&record.before_tree, before_lookup)?
             && (entry.object_type != "blob"
                 || self.blob_bytes(&record.before_tree, before_lookup).is_err())
         {
-            return Ok(Some(RollbackConflict {
-                checkpoint_id: record.id.clone(),
-                path: path.to_string(),
-                expected_sha256: file.after_sha256.clone(),
-                current_sha256: current_state.sha256.clone(),
-                reason: "checkpoint object is missing; leaving current content untouched"
-                    .to_string(),
-            }));
+            reasons.push(
+                "checkpoint object is missing; leaving current content untouched".to_string(),
+            );
         }
-        Ok(None)
+        if reasons.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(RollbackConflict {
+            checkpoint_id: record.id.clone(),
+            path: path.to_string(),
+            expected_sha256: file.after_sha256.clone(),
+            current_sha256: current_state.sha256.clone(),
+            reason: reasons.join("; "),
+        }))
     }
 
     fn restore_tree_path(
@@ -2027,7 +2063,12 @@ impl WorkspaceEntryState {
     }
 
     fn is_absent(&self) -> bool {
-        self.sha256.is_none() && self.file_type.is_none() && self.mode.is_none()
+        // `workspace_entry_state` only ever returns `None` for `file_type`
+        // when the path itself was missing, so the `file_type.is_none()`
+        // check captures the absent state without re-asserting `sha256`
+        // and `mode` (which are correlated with `file_type` by
+        // construction).
+        self.file_type.is_none()
     }
 }
 
@@ -2121,6 +2162,12 @@ fn workspace_entry_state(path: &Path) -> Result<WorkspaceEntryState> {
             mode: Some(workspace_regular_file_git_mode(&metadata)),
         });
     }
+    // For non-regular, non-symlink workspace entries (sockets, fifos,
+    // block/char devices) we hash a fixed sentinel string keyed by the
+    // path. The conflict gate only needs a *stable* sha that compares
+    // equal to itself across rollback attempts on the same path; the
+    // exact bytes are immaterial. Using the path keeps two unrelated
+    // device files from colliding into the same hash.
     Ok(WorkspaceEntryState {
         sha256: Some(sha256_hex(
             format!("unsupported-file-type:{}", rel_display(path)).as_bytes(),
@@ -2194,18 +2241,23 @@ fn symlink_target_display(bytes: &[u8]) -> String {
 /// walking and stat-checking each component before descent.
 fn safe_workspace_path(root: &Path, rel: &str) -> Result<PathBuf> {
     let path = Path::new(rel);
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-        || rel == ".squeezy"
-        || rel.starts_with(".squeezy/")
-    {
+    let reason = if path.is_absolute() {
+        Some("absolute path")
+    } else if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        Some("path escapes workspace via parent or root component")
+    } else if rel == ".squeezy" || rel.starts_with(".squeezy/") {
+        Some("path targets the .squeezy protected metadata tree")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
         return Err(SqueezyError::Tool(format!(
-            "checkpoint path is not safe to roll back: {rel}"
+            "checkpoint path is not safe to roll back ({reason}): {rel}"
         )));
     }
     Ok(root.join(path))
@@ -2226,7 +2278,11 @@ fn restore_regular_file_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> 
         fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
     }
     #[cfg(not(unix))]
-    let _ = mode;
+    {
+        // No POSIX mode bits to apply on non-Unix; consume the parameter
+        // so `cargo clippy` does not flag it as dead.
+        mode.map(drop);
+    }
     if let Err(err) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(err.into());
@@ -2290,10 +2346,11 @@ fn restore_hardlink_group(root: &Path, group: &[String]) -> Result<Vec<String>> 
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        if path_exists_no_follow(&target) {
-            remove_workspace_file(&target)?;
-        }
-        fs::hard_link(&source, &target)?;
+        // Crash-atomic relink: hard-link `source` to a sibling tempfile
+        // first, then `rename` over `target`. A power loss between the
+        // two steps leaves `target` either in its pre-rollback state or
+        // pointing at the source inode — never absent (see review N3).
+        atomic_relink(&source, &target)?;
         sync_parent_dir(&target);
         relinked.push(rel.clone());
     }
@@ -2304,6 +2361,37 @@ fn restore_hardlink_group(root: &Path, group: &[String]) -> Result<Vec<String>> 
         )));
     }
     Ok(relinked)
+}
+
+#[cfg(unix)]
+fn atomic_relink(source: &Path, target: &Path) -> Result<()> {
+    let tmp = create_sibling_hardlink(source, target)?;
+    if let Err(err) = fs::rename(&tmp, target) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_sibling_hardlink(source: &Path, target: &Path) -> Result<PathBuf> {
+    let mut saw_collision = false;
+    for _ in 0..MAX_RESTORE_TEMPFILE_ATTEMPTS {
+        let tmp = next_sibling_tempfile(target);
+        match fs::hard_link(source, &tmp) {
+            Ok(()) => return Ok(tmp),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                saw_collision = true;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let message = if saw_collision {
+        "exhausted checkpoint restore hardlink tempfile candidates"
+    } else {
+        "no checkpoint restore hardlink tempfile candidates available"
+    };
+    Err(SqueezyError::Tool(message.to_string()))
 }
 
 #[cfg(not(unix))]
