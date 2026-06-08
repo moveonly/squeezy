@@ -677,15 +677,15 @@ where
                 .to_string(),
         )
     })?;
-    if let Some(pasted_state) = parsed.state {
-        if pasted_state != state {
-            return Err(SqueezyError::ProviderNotConfigured(
-                "OAuth state mismatch: the pasted `state` did not match the value squeezy \
-                 generated for this session. Re-run `squeezy auth openai-codex login --manual` \
-                 from scratch."
-                    .to_string(),
-            ));
-        }
+    if let Some(pasted_state) = parsed.state
+        && pasted_state != state
+    {
+        return Err(SqueezyError::ProviderNotConfigured(
+            "OAuth state mismatch: the pasted `state` did not match the value squeezy \
+             generated for this session. Re-run `squeezy auth openai-codex login --manual` \
+             from scratch."
+                .to_string(),
+        ));
     }
     let client = shared_client(&ProviderTransportConfig::default());
     let token = exchange_authorization_code(
