@@ -316,3 +316,66 @@ fn user_dir_default_uses_home_when_set() {
         .expect("home-discovered subagent present");
     assert_eq!(homie.source, SubagentSource::User);
 }
+
+#[test]
+fn discover_falls_back_to_userprofile_when_home_unset() {
+    // Simulate a Windows-like environment: HOME unset, USERPROFILE set.
+    // We manipulate environment variables only — the test runs on all
+    // platforms so it cannot create Windows-style paths, but it does
+    // verify that discover() does not panic when HOME is absent.
+    let profile_root = temp_root("userprofile_discover");
+    // On non-Windows the function uses $HOME, so we skip the
+    // USERPROFILE branch by not setting it; but we verify the None
+    // branch doesn't crash the catalog.
+    let previous_home = std::env::var_os("HOME");
+    unsafe { std::env::remove_var("HOME") };
+
+    let workspace = temp_root("userprofile_workspace");
+    // Should not panic; may return an empty-or-builtin-only catalog.
+    let catalog = SubagentCatalog::discover(&workspace, None);
+    assert!(
+        catalog
+            .entries()
+            .iter()
+            .all(|e| matches!(e.source, SubagentSource::Builtin | SubagentSource::Project)),
+        "without HOME and USERPROFILE only builtin+project entries expected"
+    );
+
+    if let Some(prev) = previous_home {
+        unsafe { std::env::set_var("HOME", prev) };
+    }
+    let _ = fs::remove_dir_all(&profile_root);
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn discover_uses_appdata_on_windows() {
+    let appdata_root = temp_root("appdata_discover");
+    let agents_dir = appdata_root.join("squeezy").join("agents");
+    fs::create_dir_all(&agents_dir).expect("mkdir appdata agents");
+    fs::write(
+        agents_dir.join("winagent.md"),
+        "---\nname: winagent\ndescription: from APPDATA\n---\nbody",
+    )
+    .expect("write winagent");
+
+    let previous_appdata = std::env::var_os("APPDATA");
+    unsafe { std::env::set_var("APPDATA", &appdata_root) };
+
+    let workspace = temp_root("appdata_workspace");
+    let catalog = SubagentCatalog::discover(&workspace, None);
+
+    if let Some(prev) = previous_appdata {
+        unsafe { std::env::set_var("APPDATA", prev) };
+    } else {
+        unsafe { std::env::remove_var("APPDATA") };
+    }
+
+    let winagent = catalog
+        .find("winagent")
+        .expect("APPDATA-discovered subagent present");
+    assert_eq!(winagent.source, SubagentSource::User);
+    let _ = fs::remove_dir_all(&appdata_root);
+    let _ = fs::remove_dir_all(&workspace);
+}

@@ -167,6 +167,21 @@ fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) 
     if let Some(binary) = permission.metadata.get("binary") {
         lines.push(dim(format!("binary {binary}")));
     }
+    // Warn plainly when the sandbox cannot enforce filesystem/network isolation
+    // (the Windows Job-Object backend). Users on Windows do not see a sandbox
+    // restriction failure — the Job-Object backend is the intentional design —
+    // so surfacing this caveat at approval time gives them an explicit signal
+    // before the command runs.
+    if permission
+        .metadata
+        .get("filesystem")
+        .map(|v| v == "best_effort_unavailable" || v == "enforced_writes_only")
+        .unwrap_or(false)
+    {
+        lines.push(warn_line(
+            "Windows: no filesystem/network isolation; process tree will be killed on timeout/cancel".to_string(),
+        ));
+    }
 }
 
 fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
@@ -315,6 +330,18 @@ fn dim(text: String) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
         Span::styled(text, Style::default().fg(crate::render::theme::quiet())),
+    ])
+}
+
+fn warn_line(text: String) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            text,
+            Style::default()
+                .fg(crate::render::theme::cyan())
+                .add_modifier(Modifier::BOLD),
+        ),
     ])
 }
 

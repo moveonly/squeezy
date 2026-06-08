@@ -50,3 +50,46 @@ fn ignores_benign_commands() {
     assert!(!is_destructive_windows_segment("echo hello"));
     assert!(!is_destructive_windows_segment("cargo build"));
 }
+
+#[test]
+fn flags_powershell_remove_item_short_alias() {
+    assert!(is_destructive_windows_segment("ri -Recurse -Force C:\\tmp"));
+    assert!(is_destructive_windows_segment(
+        "ri -force -recurse C:\\data"
+    ));
+}
+
+#[test]
+fn flags_remove_local_user() {
+    assert!(is_destructive_windows_segment("Remove-LocalUser -Name foo"));
+}
+
+#[test]
+fn flags_unregister_scheduled_task() {
+    assert!(is_destructive_windows_segment(
+        "Unregister-ScheduledTask -TaskName backup -Confirm:$false"
+    ));
+}
+
+#[test]
+fn flags_takeown_recursive() {
+    assert!(is_destructive_windows_segment("takeown /f C:\\dir /r"));
+}
+
+#[test]
+fn flags_net_user_delete() {
+    assert!(is_destructive_windows_segment("net user bob /delete"));
+}
+
+#[test]
+fn does_not_flag_safe_takeown() {
+    // /r is required for our match; single-file takeown is less dangerous
+    assert!(!is_destructive_windows_segment("takeown /f somefile.txt"));
+}
+
+#[test]
+fn does_not_flag_safe_net_user_add() {
+    assert!(!is_destructive_windows_segment(
+        "net user bob Password1 /add"
+    ));
+}

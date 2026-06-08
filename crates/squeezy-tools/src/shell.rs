@@ -1160,9 +1160,14 @@ pub(crate) fn shell_segment_writes_filesystem(segment: &str) -> bool {
 /// Normalises a path-like token for sensitive-path matching:
 ///   - replaces backslashes with `/`,
 ///   - expands a leading `~/` or `~` against `$HOME`,
-///   - expands a leading `$HOME` or `${HOME}` against `$HOME`.
+///   - expands a leading `$HOME` or `${HOME}` against `$HOME`,
+///   - expands Windows `%VAR%` and PowerShell `$env:VAR` forms for
+///     `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, and `HOME`.
 fn normalize_path_token(token: &str, home: Option<&str>) -> String {
+    // Normalise path separators first so all comparisons use `/`.
     let token = token.replace('\\', "/");
+
+    // Expand Unix-style $HOME / ${HOME} / ~/
     if let Some(home) = home {
         if let Some(rest) = token.strip_prefix("$HOME/") {
             return format!("{home}/{rest}");
@@ -1183,6 +1188,35 @@ fn normalize_path_token(token: &str, home: Option<&str>) -> String {
             return home.to_string();
         }
     }
+
+    // Expand Windows cmd-style `%VAR%` and PowerShell `$env:VAR` prefixes.
+    // We only expand the three most security-sensitive Windows path roots so
+    // the pattern list stays specific. The result is normalised to `/`
+    // separators so the subsequent token_contains_sensitive_base check works
+    // identically on all platforms.
+    for (cmd_var, ps_var, env_key) in [
+        ("%USERPROFILE%", "$env:USERPROFILE", "USERPROFILE"),
+        ("%APPDATA%", "$env:APPDATA", "APPDATA"),
+        ("%LOCALAPPDATA%", "$env:LOCALAPPDATA", "LOCALAPPDATA"),
+        ("%HOME%", "$env:HOME", "HOME"),
+    ] {
+        let value = env::var_os(env_key)
+            .map(|v| v.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if value.is_empty() {
+            continue;
+        }
+        for prefix in [cmd_var, ps_var] {
+            let prefix_slash = format!("{prefix}/");
+            if let Some(rest) = token.strip_prefix(&prefix_slash) {
+                return format!("{value}/{rest}");
+            }
+            if token.eq_ignore_ascii_case(prefix) {
+                return value.clone();
+            }
+        }
+    }
+
     token
 }
 

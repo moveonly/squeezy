@@ -6310,6 +6310,15 @@ impl TurnRuntime {
         if self.turn_id.get() == 1 {
             self.dispatch_setup();
             self.dispatch_session_start();
+            #[cfg(target_os = "windows")]
+            {
+                let _ = self
+                    .tx
+                    .send(AgentEvent::WindowsSandboxActive {
+                        turn_id: self.turn_id,
+                    })
+                    .await;
+            }
         }
         let original_input = input.clone();
         let display_tracks_input = self.display_input == original_input;
@@ -15261,11 +15270,19 @@ pub(crate) fn mode_permission_verdict(
     request: &PermissionRequest,
     active_plan_path: Option<&Path>,
 ) -> Option<PermissionVerdict> {
+    // Pre-canonicalize the active plan path once here so
+    // `is_active_plan_path_with_canon` below only needs to canonicalize
+    // the (potentially different) target side. On Windows, canonicalization
+    // resolves drive-letter case, UNC prefixes, and junction paths, so
+    // doing it once per request rather than per capability check is both
+    // a correctness aid and a perf win.
+    let active_plan_canon = active_plan_path.and_then(plan_mode::canonicalize_active_plan_path);
     let plan_edit_allowed = matches!(
         (mode, request.capability),
         (SessionMode::Plan, PermissionCapability::Edit)
-    ) && active_plan_path
-        .is_some_and(|active| plan_mode::is_active_plan_path(Path::new(&request.target), active));
+    ) && active_plan_canon.as_deref().is_some_and(|active| {
+        plan_mode::is_active_plan_path_with_canon(Path::new(&request.target), active)
+    });
     if mode == SessionMode::Plan && request.tool_name == "shell" {
         if matches!(
             request.capability,
@@ -15319,12 +15336,25 @@ pub(crate) fn mode_permission_verdict(
         return None;
     }
     let reason = if mode == SessionMode::Plan && request.capability == PermissionCapability::Edit {
-        match active_plan_path {
-            Some(active) => format!(
-                "Plan mode: only the active plan file is editable ({}); requested target was {}",
-                active.display(),
-                request.target,
-            ),
+        // Prefer the pre-canonicalized path for display so the message
+        // shows the resolved (drive-letter-normalized, UNC-resolved,
+        // junction-followed) form that the permission gate actually compared.
+        match active_plan_canon.as_deref().or(active_plan_path) {
+            Some(active) => {
+                // Normalise both paths to forward-slashes so the message is
+                // readable on Windows (where Display would otherwise print
+                // backslashes) and to help users spot drive-letter or UNC
+                // differences. The guard itself uses canonicalize/PathBuf
+                // equality; this is display-only.
+                let active_display = active.display().to_string().replace('\\', "/");
+                let target_display = request.target.replace('\\', "/");
+                format!(
+                    "Plan mode: only the active plan file is editable \
+                     (active: {active_display}; requested: {target_display}). \
+                     If paths differ only in drive-letter case, UNC prefix, or \
+                     junction resolution, accept the plan-handoff prompt to reload the session.",
+                )
+            }
             None => format!(
                 "{} mode refuses {} (no active plan file to edit)",
                 mode.as_str(),
@@ -17553,6 +17583,17 @@ pub enum AgentEvent {
         turn_id: TurnId,
         backend: String,
         fallback_count: u64,
+    },
+    /// Emitted exactly once, on the first turn of a Windows session, to
+    /// surface the steady-state sandbox posture. Unlike
+    /// `ShellSandboxBestEffortFallback` (which fires when a previously
+    /// capable backend silently downgrades), this variant fires because
+    /// Windows Job-Object cleanup is the *intentional* Windows design, not a
+    /// runtime fallback. The TUI renders a durable session-level notice so
+    /// users running Build-mode shell work on Windows see the isolation
+    /// caveat without having to execute a shell command first.
+    WindowsSandboxActive {
+        turn_id: TurnId,
     },
     /// Per-turn progress callout emitted every few tool calls so a user
     /// watching a live transcript can see cost accumulating before the

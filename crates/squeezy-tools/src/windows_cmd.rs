@@ -17,14 +17,30 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     // raw text. Each needle is a contiguous substring that does not appear
     // inside benign commands.
     for needle in [
+        // Recursive/forced item removal.
         "remove-item -recurse -force",
         "remove-item -r -force",
         "remove-item -force -recurse",
         "remove-item -force -r",
+        // Abbreviation "ri" is a built-in alias for Remove-Item.
+        "ri -recurse -force",
+        "ri -force -recurse",
+        "ri -r -force",
+        "ri -force -r",
+        // Policy / user / storage management.
         "set-executionpolicy",
         "new-localuser",
+        "remove-localuser",
         "clear-recyclebin",
         "format-volume",
+        // Credential and secret stores.
+        "remove-storedcredential",
+        "clear-content",
+        // Network / firewall rule removal.
+        "remove-netfirewallrule",
+        // Service and scheduled-task removal.
+        "remove-service",
+        "unregister-scheduledtask",
     ] {
         if lower.contains(needle) {
             return true;
@@ -47,6 +63,23 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         }
         "reg" => return flag_matches("delete"),
         "cipher" => return flag_matches("/w"),
+        // TAKEOWN and ICACLS can be used to seize ownership of files and
+        // rewrite ACLs wholesale — destructive when applied recursively.
+        "takeown" => return flag_matches("/r"),
+        "icacls" => return flag_matches("/reset") || flag_matches("/grant:r"),
+        // ATTRIB with /S recursively changes file attributes (e.g. stripping
+        // read-only flags before a subsequent delete).
+        "attrib" => return flag_matches("/s") && (flag_matches("-r") || flag_matches("+h")),
+        // NET USER with /DELETE removes a local account.
+        "net" => {
+            if tokens
+                .get(1)
+                .map(|t| t.eq_ignore_ascii_case("user"))
+                .unwrap_or(false)
+            {
+                return flag_matches("/delete");
+            }
+        }
         _ => {}
     }
 

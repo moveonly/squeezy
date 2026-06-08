@@ -188,13 +188,36 @@ impl SubagentCatalog {
     }
 }
 
-/// Default user agents directory, derived from `$HOME` on Unix-like
-/// systems. Returns `None` when `HOME` is unset (Windows callers should
-/// pass an explicit `user_dir` until cross-platform support lands).
+/// Default user agents directory.
+///
+/// On Windows, prefers `%APPDATA%\squeezy\agents` (the conventional
+/// Windows per-user application-data location) and falls back to
+/// `%USERPROFILE%\.squeezy\agents` if `APPDATA` is unset.  On Unix-like
+/// systems, uses `$HOME/.squeezy/agents`.  Returns `None` only when no
+/// suitable base directory can be determined from the process environment.
 fn default_user_subagents_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(USER_SUBAGENTS_DIR))
+    #[cfg(target_os = "windows")]
+    {
+        // Prefer the Windows-conventional APPDATA location.
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return Some(PathBuf::from(appdata).join("squeezy").join("agents"));
+        }
+        // Fall back to USERPROFILE\.squeezy\agents, mirroring the Unix
+        // HOME layout under the user's profile directory.
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            return Some(PathBuf::from(profile).join(".squeezy").join("agents"));
+        }
+        // Last resort: honour HOME if someone sets it explicitly on Windows.
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(USER_SUBAGENTS_DIR))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(USER_SUBAGENTS_DIR))
+    }
 }
 
 fn load_dir(dir: &Path, source: SubagentSource, out: &mut Vec<SubagentDefinition>) {

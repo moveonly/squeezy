@@ -440,6 +440,20 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     );
                     app.push_warn(notice);
                 }
+                AgentEvent::WindowsSandboxActive { .. } => {
+                    // Fires exactly once, at the start of the first turn on
+                    // Windows. The Windows Job-Object backend provides
+                    // process-tree cleanup only; it is not a runtime
+                    // fallback — it is the intentional Windows design.
+                    // Surface a durable session-level banner so users see
+                    // the isolation caveat before running any shell command.
+                    app.push_warn(
+                        "Windows shell sandbox: Job Objects provide process-tree cleanup only. \
+                         Filesystem and network isolation are unavailable. \
+                         Review and approve shell commands carefully."
+                            .to_string(),
+                    );
+                }
                 AgentEvent::CostUpdate {
                     tool_count,
                     input_tokens,

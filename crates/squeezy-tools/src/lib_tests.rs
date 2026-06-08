@@ -13181,3 +13181,53 @@ fn detect_inheritance_grep_extraction() {
     assert_eq!(colon.base_names, vec!["Bar"]);
     assert_eq!(colon.decl_kw, "struct");
 }
+
+#[test]
+fn sensitive_path_matcher_expands_windows_userprofile() {
+    // Simulate a Windows-like environment with USERPROFILE set.
+    // The default sensitive-path patterns include `.ssh/**` which covers
+    // %USERPROFILE%\.ssh\id_rsa.
+    let patterns = squeezy_core::ShellSandboxConfig::default().sensitive_path_patterns;
+    unsafe {
+        env::set_var("USERPROFILE", "C:/Users/testuser");
+    }
+    assert!(
+        shell_command_references_sensitive_path("type %USERPROFILE%/.ssh/id_rsa", &patterns)
+            .is_some(),
+        "%USERPROFILE% prefix should be expanded and .ssh/id_rsa detected"
+    );
+    assert!(
+        shell_command_references_sensitive_path(
+            "Get-Content $env:USERPROFILE/.ssh/id_rsa",
+            &patterns
+        )
+        .is_some(),
+        "$env:USERPROFILE prefix should be expanded and .ssh/id_rsa detected"
+    );
+    unsafe {
+        env::remove_var("USERPROFILE");
+    }
+}
+
+#[test]
+fn sensitive_path_matcher_expands_windows_appdata() {
+    let patterns = squeezy_core::ShellSandboxConfig::default().sensitive_path_patterns;
+    // APPDATA typically holds credentials for various CLI tools (gh, azure, etc.)
+    // that may appear in the user's sensitive-path config. We just verify the
+    // expansion itself works by checking a contrived pattern.
+    let custom_patterns = vec![".aws/credentials".to_string()];
+    unsafe {
+        env::set_var("APPDATA", "C:/Users/testuser/AppData/Roaming");
+    }
+    assert!(
+        shell_command_references_sensitive_path(
+            "type %APPDATA%/.aws/credentials",
+            &custom_patterns
+        )
+        .is_some(),
+        "%APPDATA% prefix should be expanded"
+    );
+    unsafe {
+        env::remove_var("APPDATA");
+    }
+}
