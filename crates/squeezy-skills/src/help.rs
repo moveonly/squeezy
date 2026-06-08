@@ -1729,10 +1729,10 @@ pub fn relevant_docs_for_input(input: &str) -> Vec<BundledDoc> {
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     // Anchors first.
     for anchor in &[ANCHOR_README, ANCHOR_APPROACH] {
-        if let Some(&doc) = BUNDLED_DOCS.iter().find(|d| d.path == *anchor) {
-            if seen.insert(doc.path) {
-                result.push(doc);
-            }
+        if let Some(&doc) = BUNDLED_DOCS.iter().find(|d| d.path == *anchor)
+            && seen.insert(doc.path)
+        {
+            result.push(doc);
         }
     }
     // Top-K by score (stop at zero-score docs — they have no evidence).
