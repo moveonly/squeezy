@@ -4602,13 +4602,13 @@ impl ToolRegistry {
         });
         // Surface line-ending metadata so the model can detect when an edit
         // silently converts CRLF line endings to LF (common on Windows).
-        if let Some(le_b) = le_before {
-            if let Some(obj) = content.as_object_mut() {
-                obj.insert("line_endings_before".into(), json!(le_b));
-                obj.insert("line_endings_after".into(), json!(le_after));
-                if le_b != le_after && le_b != "none" && le_after != "none" {
-                    obj.insert("line_endings_changed".into(), json!(true));
-                }
+        if let Some(le_b) = le_before
+            && let Some(obj) = content.as_object_mut()
+        {
+            obj.insert("line_endings_before".into(), json!(le_b));
+            obj.insert("line_endings_after".into(), json!(le_after));
+            if le_b != le_after && le_b != "none" && le_after != "none" {
+                obj.insert("line_endings_changed".into(), json!(true));
             }
         }
         self.append_checkpoint_to_content(

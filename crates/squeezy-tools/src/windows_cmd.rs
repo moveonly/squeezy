@@ -46,7 +46,7 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
 
     // ── cmd.exe destructive commands ─────────────────────────────────────
     // Tokenise to avoid matching substrings inside paths.
-    let flag_matches = |flag: &str| tokens.iter().any(|t| *t == flag);
+    let flag_matches = |flag: &str| tokens.contains(&flag);
 
     match first {
         "del" | "erase" => return flag_matches("/s") || flag_matches("/q") && flag_matches("/f"),
