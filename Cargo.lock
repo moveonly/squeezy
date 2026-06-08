@@ -3164,6 +3164,7 @@ version = "0.1.0"
 name = "squeezy-skills"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "squeezy-core",
