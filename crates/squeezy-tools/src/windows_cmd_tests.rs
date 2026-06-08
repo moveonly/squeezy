@@ -11,6 +11,47 @@ fn flags_powershell_recursive_force_remove() {
 }
 
 #[test]
+fn flags_remove_item_literalpath_recurse() {
+    // Parameter-interleaved form: -LiteralPath before -Recurse -Force.
+    assert!(is_destructive_windows_segment(
+        "Remove-Item -LiteralPath C:\\x -Recurse -Force"
+    ));
+    assert!(is_destructive_windows_segment(
+        "remove-item -literalpath C:\\x -r"
+    ));
+}
+
+#[test]
+fn flags_remove_item_confirm_false() {
+    // -Confirm:$false suppresses safety prompt; treated as destructive.
+    assert!(is_destructive_windows_segment(
+        "Remove-Item -Recurse -Confirm:$false C:\\logs"
+    ));
+    assert!(is_destructive_windows_segment(
+        "Remove-Item C:\\file -Confirm:$false"
+    ));
+}
+
+#[test]
+fn flags_ri_alias() {
+    // `ri` is the built-in PowerShell alias for Remove-Item.
+    assert!(is_destructive_windows_segment("ri -r C:\\tmp"));
+    assert!(is_destructive_windows_segment("ri -Recurse C:\\data"));
+    assert!(is_destructive_windows_segment(
+        "ri C:\\file -Confirm:$false"
+    ));
+}
+
+#[test]
+fn flags_remove_item_short_recurse_alias() {
+    // -r is the short alias for -Recurse in PowerShell.
+    assert!(is_destructive_windows_segment("Remove-Item -r C:\\foo"));
+    assert!(is_destructive_windows_segment(
+        "remove-item -force -r C:\\bar"
+    ));
+}
+
+#[test]
 fn flags_set_executionpolicy() {
     assert!(is_destructive_windows_segment(
         "Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process"
@@ -49,4 +90,10 @@ fn ignores_benign_commands() {
     assert!(!is_destructive_windows_segment("Get-ChildItem -Recurse"));
     assert!(!is_destructive_windows_segment("echo hello"));
     assert!(!is_destructive_windows_segment("cargo build"));
+    // `ri` without recursive/confirm-suppress flags is not flagged.
+    assert!(!is_destructive_windows_segment("ri C:\\foo\\bar.txt"));
+    // Remove-Item without -Recurse/-r or -Confirm:$false is not flagged.
+    assert!(!is_destructive_windows_segment(
+        "Remove-Item C:\\logs\\app.log"
+    ));
 }

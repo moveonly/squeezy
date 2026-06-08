@@ -69,6 +69,13 @@ pub(crate) struct ShellRunOutcome {
     /// sidecar when the hard byte cap dropped bytes the in-memory capture
     /// could not keep. `None` when output stayed under the cap.
     pub(crate) raw_spillover: Option<ShellSpilloverInfo>,
+    /// Whether a real PTY master was allocated for this run. `false` when
+    /// `tty=true` was requested but the platform does not support ConPTY
+    /// (Windows non-sandbox path) — the shell ran with pipe-backed stdio.
+    pub(crate) tty_allocated: bool,
+    /// Non-empty on Windows when Job Object creation or process assignment
+    /// failed; process-tree cleanup on timeout/cancel may be incomplete.
+    pub(crate) job_object_error: Option<String>,
 }
 
 struct ShellRunRequest<'a> {
@@ -398,6 +405,8 @@ impl ToolRegistry {
             stderr_bytes,
             stderr_truncated,
             raw_spillover,
+            tty_allocated,
+            job_object_error,
         } = run;
 
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
@@ -496,6 +505,25 @@ impl ToolRegistry {
                 &mut raw_content,
                 "sandbox",
                 json!({ "best_effort_fallback": fallback }),
+            );
+        }
+        // When tty=true was requested but the platform could not allocate a
+        // real PTY, surface the fallback so the caller knows interactive
+        // commands may misbehave.
+        if args.tty && !tty_allocated {
+            insert_content_field(&mut raw_content, "tty_allocated", json!(false));
+            insert_content_field(&mut raw_content, "tty_backend", json!("pipe_fallback"));
+        }
+        // Windows Job Object degraded status: process-tree cleanup on
+        // timeout/cancel may be incomplete when Job Object setup failed.
+        if let Some(ref jo_err) = job_object_error {
+            insert_content_field(
+                &mut raw_content,
+                "windows_job_object",
+                json!({
+                    "status": "degraded",
+                    "reason": jo_err,
+                }),
             );
         }
         if let Some(summary) = implicit_skill {
@@ -724,6 +752,11 @@ impl ToolRegistry {
             };
         }
 
+        // Track whether a real PTY was allocated for `tty=true` requests.
+        // On non-Unix (Windows), ConPTY is not wired up and pty_master is always
+        // None; callers can inspect this via ShellRunOutcome::tty_allocated.
+        let tty_allocated = pty_master.is_some();
+
         // Windows analog to Unix process groups: a Job Object created with
         // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills every descendant when either
         // `terminate(...)` is called or the handle drops at function exit.
@@ -736,19 +769,23 @@ impl ToolRegistry {
         // here for the non-sandboxed tokio path (e.g. windows_sandbox_level =
         // "disabled"); assigning one to a sandbox child would be redundant.
         #[cfg(windows)]
-        let shell_job: Option<ShellJob> = if win_sandbox_backend {
-            None
-        } else {
-            match ShellJob::new() {
-                Ok(job) => {
-                    if let Some(pid) = child.id() {
-                        let _ = job.assign_process(pid);
+        let (shell_job, job_object_error): (Option<ShellJob>, Option<String>) =
+            if win_sandbox_backend {
+                (None, None)
+            } else {
+                match ShellJob::new() {
+                    Ok(job) => {
+                        let assign_err = child
+                            .id()
+                            .and_then(|pid| job.assign_process(pid).err())
+                            .map(|e| format!("Job Object assign_process failed: {e}"));
+                        (Some(job), assign_err)
                     }
-                    Some(job)
+                    Err(e) => (None, Some(format!("Job Object creation failed: {e}"))),
                 }
-                Err(_) => None,
-            }
-        };
+            };
+        #[cfg(not(windows))]
+        let job_object_error: Option<String> = None;
 
         let stdout_capture = ShellStreamCapture::default();
         let stderr_capture = ShellStreamCapture::default();
@@ -848,6 +885,8 @@ impl ToolRegistry {
             stderr_bytes,
             stderr_truncated,
             raw_spillover,
+            tty_allocated,
+            job_object_error,
         })
     }
 }

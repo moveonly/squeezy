@@ -4591,6 +4591,8 @@ impl ToolRegistry {
             ..ToolCostHint::default()
         };
 
+        let le_after = detect_line_endings(args.content.as_bytes());
+        let le_before = before.as_deref().map(detect_line_endings);
         let mut content = json!({
             "path": rel.to_string_lossy(),
             "before_sha256": before_sha256,
@@ -4598,6 +4600,17 @@ impl ToolRegistry {
             "bytes_written": args.content.len(),
             "noop": false,
         });
+        // Surface line-ending metadata so the model can detect when an edit
+        // silently converts CRLF line endings to LF (common on Windows).
+        if let Some(le_b) = le_before {
+            if let Some(obj) = content.as_object_mut() {
+                obj.insert("line_endings_before".into(), json!(le_b));
+                obj.insert("line_endings_after".into(), json!(le_after));
+                if le_b != le_after && le_b != "none" && le_after != "none" {
+                    obj.insert("line_endings_changed".into(), json!(true));
+                }
+            }
+        }
         self.append_checkpoint_to_content(
             &mut content,
             checkpoint_before.as_ref(),
@@ -6331,11 +6344,14 @@ pub(crate) fn tool_error(call: &ToolCall, err: impl ToString) -> ToolResult {
 }
 
 pub(crate) fn build_required_glob(pattern: &str) -> std::result::Result<GlobSet, String> {
+    // Normalise Windows-style backslashes to forward slashes so that patterns
+    // like `src\**\*.rs` are treated as path-aware globs on all platforms.
+    let pattern = pattern.replace('\\', "/");
     let mut builder = GlobSetBuilder::new();
     if pattern.contains('/') {
-        builder.add(Glob::new(pattern).map_err(|err| err.to_string())?);
+        builder.add(Glob::new(&pattern).map_err(|err| err.to_string())?);
     } else {
-        builder.add(Glob::new(pattern).map_err(|err| err.to_string())?);
+        builder.add(Glob::new(&pattern).map_err(|err| err.to_string())?);
         builder.add(Glob::new(&format!("**/{pattern}")).map_err(|err| err.to_string())?);
     }
     builder.build().map_err(|err| err.to_string())
@@ -6351,11 +6367,15 @@ pub(crate) fn build_include_set(
         return Ok(None);
     }
     let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
+    for raw in patterns {
+        // Normalise backslashes once per pattern so include/exclude filters
+        // from Windows callers align with the slash-normalised paths that
+        // glob/grep return.
+        let pattern = raw.replace('\\', "/");
         if pattern.contains('/') {
-            builder.add(Glob::new(pattern).map_err(|err| err.to_string())?);
+            builder.add(Glob::new(&pattern).map_err(|err| err.to_string())?);
         } else {
-            builder.add(Glob::new(pattern).map_err(|err| err.to_string())?);
+            builder.add(Glob::new(&pattern).map_err(|err| err.to_string())?);
             builder.add(Glob::new(&format!("**/{pattern}")).map_err(|err| err.to_string())?);
         }
     }
@@ -6788,6 +6808,23 @@ pub fn shell_best_effort_fallback_from_result(
         fallback_count,
         first_in_session,
     })
+}
+
+/// Classify the dominant line ending present in `bytes`.
+///
+/// Returns `"crlf"`, `"lf"`, `"mixed"`, or `"none"` (no newlines).  Used to
+/// surface line-ending changes in `write_file` and `apply_patch` results so
+/// callers can detect when an edit silently converts a CRLF file to LF.
+pub(crate) fn detect_line_endings(bytes: &[u8]) -> &'static str {
+    let crlf = bytes.windows(2).filter(|w| *w == b"\r\n").count();
+    let total_lf = bytes.iter().filter(|&&b| b == b'\n').count();
+    let bare_lf = total_lf.saturating_sub(crlf);
+    match (crlf > 0, bare_lf > 0) {
+        (true, true) => "mixed",
+        (true, false) => "crlf",
+        (false, true) => "lf",
+        (false, false) => "none",
+    }
 }
 
 pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {

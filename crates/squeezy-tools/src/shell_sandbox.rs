@@ -640,6 +640,11 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
     linux_unshare_available: bool,
     linux_landlock_available: bool,
 ) -> std::result::Result<ShellSandboxPlan, String> {
+    // Fail fast if SQUEEZY_SHELL names a shell that cannot be resolved on
+    // this host (e.g. `gitbash` when Git Bash is absent on Windows).  This
+    // produces a clear tool error instead of a confusing spawn failure later.
+    ShellProgram::validate_override()?;
+
     // Each probe result is consumed only by its own platform's backend branch
     // below; reference the others so the non-matching targets (and the Windows
     // CI `clippy -D warnings` gate) don't flag them as unused.

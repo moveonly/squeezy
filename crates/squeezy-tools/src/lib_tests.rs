@@ -11702,6 +11702,8 @@ fn shell_best_effort_falls_back_when_sandbox_dies_without_output() {
         stderr_bytes: Vec::new(),
         stderr_truncated: false,
         raw_spillover: None,
+        tty_allocated: false,
+        job_object_error: None,
     };
 
     let reason =
@@ -11854,6 +11856,8 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
         stderr_bytes: b"sandbox_apply: Operation not permitted".to_vec(),
         stderr_truncated: false,
         raw_spillover: None,
+        tty_allocated: false,
+        job_object_error: None,
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run)
