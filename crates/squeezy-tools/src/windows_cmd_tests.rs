@@ -139,6 +139,16 @@ fn ignores_del_without_s_q_f() {
 }
 
 #[test]
+fn ignores_remove_item_path_without_recursive_force() {
+    assert!(!is_destructive_windows_segment(
+        "Remove-Item -Path C:\\tmp\\foo.txt"
+    ));
+    assert!(!is_destructive_windows_segment(
+        "Remove-Item -LiteralPath C:\\tmp\\foo.txt -Force"
+    ));
+}
+
+#[test]
 fn flags_unregister_scheduledtask() {
     assert!(is_destructive_windows_segment(
         "Unregister-ScheduledTask -TaskName Foo -Confirm:$false"

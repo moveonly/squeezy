@@ -13,6 +13,11 @@
 pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     let lower = segment.to_ascii_lowercase();
 
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    let flag_matches = |flag: &str| tokens.iter().any(|t| t.eq_ignore_ascii_case(flag));
+    let has_recursive_force =
+        (flag_matches("-recurse") || flag_matches("-r")) && flag_matches("-force");
+
     // PowerShell cmdlets / aliases where the dangerous shape is unambiguous
     // in the raw text. Each needle is a contiguous substring that does not
     // appear inside benign commands.
@@ -21,17 +26,6 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     // combined with recurse/force so that `ri` alone (tab completion, etc.)
     // is not a false positive.
     for needle in [
-        // Remove-Item / ri — standard and LiteralPath forms
-        "remove-item -recurse -force",
-        "remove-item -r -force",
-        "remove-item -force -recurse",
-        "remove-item -force -r",
-        "remove-item -literalpath",
-        "remove-item -path",
-        "ri -recurse -force",
-        "ri -r -force",
-        "ri -force -recurse",
-        "ri -force -r",
         // Execution policy change
         "set-executionpolicy",
         // User / identity mutation
@@ -57,12 +51,17 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
             return true;
         }
     }
+    if has_recursive_force
+        && tokens.iter().any(|token| {
+            token.eq_ignore_ascii_case("remove-item") || token.eq_ignore_ascii_case("ri")
+        })
+    {
+        return true;
+    }
 
     // cmd.exe destructive commands. Tokenise to avoid matching substrings
     // inside paths.
-    let tokens: Vec<&str> = segment.split_whitespace().collect();
     let first = tokens.first().copied().unwrap_or("").to_ascii_lowercase();
-    let flag_matches = |flag: &str| tokens.iter().any(|t| t.eq_ignore_ascii_case(flag));
 
     match first.as_str() {
         // `del /S` alone (recursive) or `del /Q /F` (quiet + force-delete
