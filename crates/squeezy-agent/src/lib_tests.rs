@@ -12031,18 +12031,16 @@ fn redact_permission_request_strips_secret_from_metadata_target_and_summary() {
 
     assert!(
         !redacted.target.contains(SYNTHETIC_SECRET),
-        "secret must be redacted from target; got: {:?}",
-        redacted.target
+        "secret must be redacted from target"
     );
     assert!(
         !redacted.summary.contains(SYNTHETIC_SECRET),
-        "secret must be redacted from summary; got: {:?}",
-        redacted.summary
+        "secret must be redacted from summary"
     );
     for (key, value) in &redacted.metadata {
         assert!(
             !value.contains(SYNTHETIC_SECRET),
-            "secret must be redacted from metadata[{key}]; got: {value:?}"
+            "secret must be redacted from metadata[{key}]"
         );
     }
 }
