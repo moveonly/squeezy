@@ -15188,8 +15188,8 @@ fn synchronized_output_auto_stays_off_for_unknown_terminals() {
         "dumb terminal must not auto-enable BSU"
     );
 
-    // tmux without COLORTERM should not enable passthrough.
-    let tmux_no_colorterm = |key: &str| -> Option<std::ffi::OsString> {
+    // tmux without other capability signals should not enable passthrough.
+    let tmux_only = |key: &str| -> Option<std::ffi::OsString> {
         match key {
             "TMUX" => Some(std::ffi::OsString::from("/tmp/tmux-1000/default,1234,0")),
             "TERM" => Some(std::ffi::OsString::from("tmux-256color")),
@@ -15197,37 +15197,8 @@ fn synchronized_output_auto_stays_off_for_unknown_terminals() {
         }
     };
     assert!(
-        !super::detect_synchronized_output_support_from_env(tmux_no_colorterm),
-        "tmux without COLORTERM=truecolor must not auto-enable BSU"
-    );
-}
-
-#[test]
-fn synchronized_output_tmux_truecolor_passthrough_enables_sync() {
-    // tmux + COLORTERM=truecolor: detect as capable outer terminal.
-    let tmux_truecolor = |key: &str| -> Option<std::ffi::OsString> {
-        match key {
-            "TMUX" => Some(std::ffi::OsString::from("/tmp/tmux-1000/default,1234,0")),
-            "TERM" => Some(std::ffi::OsString::from("tmux-256color")),
-            "COLORTERM" => Some(std::ffi::OsString::from("truecolor")),
-            _ => None,
-        }
-    };
-    assert!(
-        super::detect_synchronized_output_support_from_env(tmux_truecolor),
-        "tmux + COLORTERM=truecolor should enable BSU (outer terminal is capable)"
-    );
-
-    let tmux_24bit = |key: &str| -> Option<std::ffi::OsString> {
-        match key {
-            "TMUX" => Some(std::ffi::OsString::from("/tmp/tmux-1000/default,1234,0")),
-            "COLORTERM" => Some(std::ffi::OsString::from("24bit")),
-            _ => None,
-        }
-    };
-    assert!(
-        super::detect_synchronized_output_support_from_env(tmux_24bit),
-        "tmux + COLORTERM=24bit should enable BSU"
+        !super::detect_synchronized_output_support_from_env(tmux_only),
+        "tmux alone (without capability signals from the outer terminal) must not auto-enable BSU"
     );
 }
 

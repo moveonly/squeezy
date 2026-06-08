@@ -5670,13 +5670,26 @@ fn local_tool_completion_message(result: Option<&ToolResult>) -> String {
         ToolStatus::Cancelled => format!("`{command}` was cancelled."),
         _ => {
             let detail = tool_failure_detail(result);
-            let shell_hint = effective_shell_hint();
-            let base = if !stderr.is_empty() {
-                format!("`{command}` failed: {detail}\n\n{stderr}")
+            let exit_code = result
+                .content
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .unwrap_or(-1);
+            // Surface the effective-shell hint only when the failure looks
+            // like it may be shell-syntax related: stderr was non-empty
+            // (shell printed a message) or the exit code suggests the shell
+            // itself failed (127 = command not found, 126 = not executable,
+            // 2 = common syntax error exit in bash/sh).
+            let shell_hint = if !stderr.is_empty() || matches!(exit_code, 2 | 126 | 127) {
+                format!("\n{}", effective_shell_hint())
             } else {
-                format!("`{command}` failed: {detail}")
+                String::new()
             };
-            format!("{base}\n{shell_hint}")
+            if !stderr.is_empty() {
+                format!("`{command}` failed: {detail}\n\n{stderr}{shell_hint}")
+            } else {
+                format!("`{command}` failed: {detail}{shell_hint}")
+            }
         }
     }
 }

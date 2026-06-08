@@ -355,20 +355,6 @@ where
             return true;
         }
     }
-    // Tmux passthrough profile: when running inside tmux with a capable outer
-    // terminal, DEC mode 2026 can be passed through via tmux's DCS passthrough
-    // (`allow-passthrough on`). Tmux overwrites $TERM to `tmux-256color`,
-    // masking the outer terminal's $TERM, but tmux 3.3+ sets TERM_PROGRAM=tmux
-    // and some outer terminals set COLORTERM. When inside tmux check for
-    // COLORTERM=truecolor as a signal of a capable outer emulator.
-    if env_get("TMUX").is_some()
-        && env_get("COLORTERM").is_some_and(|ct| {
-            let ct = ct.to_string_lossy().to_ascii_lowercase();
-            ct == "truecolor" || ct == "24bit"
-        })
-    {
-        return true;
-    }
     false
 }
 
@@ -4304,7 +4290,8 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             app.push_transcript_item(TranscriptItem::system(body));
         }
         DispatchCommand::Terminal => {
-            let body = build_terminal_diagnostic(app);
+            let sync_policy = agent.config().tui.synchronized_output;
+            let body = build_terminal_diagnostic(app, sync_policy);
             app.status = "terminal diagnostics".to_string();
             app.push_transcript_item(TranscriptItem::system(body));
         }
@@ -5273,7 +5260,7 @@ fn last_assistant_clipboard_text(app: &TuiApp) -> Option<String> {
 /// Build a compact terminal diagnostic string for the `/terminal` command.
 /// Reports the key capabilities and environment settings that affect TUI
 /// behaviour, especially on Linux where terminal variety is high.
-fn build_terminal_diagnostic(app: &TuiApp) -> String {
+fn build_terminal_diagnostic(app: &TuiApp, sync_policy: TuiSynchronizedOutput) -> String {
     let mut rows: Vec<(&'static str, String)> = Vec::new();
 
     // TTY status
@@ -5306,16 +5293,17 @@ fn build_terminal_diagnostic(app: &TuiApp) -> String {
     };
     rows.push(("multiplexer", mux));
 
-    // Synchronized output — report the Auto heuristic result and note if a
-    // passthrough session is detected (tmux + truecolor outer terminal).
-    let sync_detected = detect_synchronized_output_support_from_env(|k| env::var_os(k));
-    rows.push((
-        "synchronized output",
-        format!(
-            "Auto ({})",
-            if sync_detected { "enabled" } else { "disabled" }
-        ),
-    ));
+    // Synchronized output — report the configured policy and, for Auto, the
+    // heuristic result so the user can see what was actually decided.
+    let sync_out = match sync_policy {
+        TuiSynchronizedOutput::Always => "Always".to_string(),
+        TuiSynchronizedOutput::Never => "Never".to_string(),
+        TuiSynchronizedOutput::Auto => {
+            let detected = detect_synchronized_output_support_from_env(|k| env::var_os(k));
+            format!("Auto → {}", if detected { "enabled" } else { "disabled" })
+        }
+    };
+    rows.push(("synchronized output", sync_out));
 
     // Mouse capture
     let mouse = if env::var_os("SQUEEZY_MOUSE_CAPTURE")
@@ -5338,12 +5326,13 @@ fn build_terminal_diagnostic(app: &TuiApp) -> String {
     ));
 
     // Notifications — use the resolved backend from the live notifier.
+    // resolved() only returns None, Some(Bel), or Some(Osc9); Auto and Off
+    // are consumed internally before returning.
     let notif = match app.desktop_notifier.resolved() {
         None => "off".to_string(),
         Some(squeezy_core::NotificationMethod::Bel) => "BEL".to_string(),
         Some(squeezy_core::NotificationMethod::Osc9) => "OSC9".to_string(),
-        Some(squeezy_core::NotificationMethod::Auto) => "auto".to_string(),
-        Some(squeezy_core::NotificationMethod::Off) => "off".to_string(),
+        Some(other) => format!("{other:?}"),
     };
     rows.push(("notifications", notif));
 

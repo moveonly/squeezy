@@ -97,11 +97,21 @@ fn sanitized_message(message: &str) -> String {
 }
 
 fn terminal_supports_osc9() -> bool {
+    detect_osc9_support_from_env(|key: &str| env::var_os(key))
+}
+
+/// Pure capability heuristic for OSC 9 support based on environment-variable
+/// signals. Factored out for testability — production calls `env::var_os` in;
+/// tests pass a closure backed by a fixture map.
+pub(crate) fn detect_osc9_support_from_env<F>(env_get: F) -> bool
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
     // TERM_PROGRAM match — macOS/cross-platform emulators that report
     // themselves via this var and are known to honour OSC 9.
-    if env::var("TERM_PROGRAM").is_ok_and(|program| {
+    if env_get("TERM_PROGRAM").is_some_and(|prog| {
         matches!(
-            program.as_str(),
+            prog.to_string_lossy().as_ref(),
             "iTerm.app" | "Ghostty" | "WezTerm" | "kitty" | "WarpTerminal"
         )
     }) {
@@ -109,17 +119,21 @@ fn terminal_supports_osc9() -> bool {
     }
     // Linux-specific environment signals present in capable emulators
     // even when running inside tmux (which overwrites $TERM_PROGRAM).
-    if env::var_os("KITTY_WINDOW_ID").is_some()
-        || env::var_os("WEZTERM_PANE").is_some()
-        || env::var_os("WEZTERM_EXECUTABLE").is_some()
-        || env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
+    if env_get("KITTY_WINDOW_ID").is_some()
+        || env_get("WEZTERM_PANE").is_some()
+        || env_get("WEZTERM_EXECUTABLE").is_some()
+        || env_get("GHOSTTY_RESOURCES_DIR").is_some()
     {
         return true;
     }
     // TERM values that identify OSC-9-capable emulators on Linux.
-    if let Ok(term) = env::var("TERM") {
-        let term = term.to_ascii_lowercase();
-        if term.contains("kitty") || term.contains("ghostty") || term.contains("wezterm") {
+    if let Some(term) = env_get("TERM") {
+        let term = term.to_string_lossy().to_ascii_lowercase();
+        if term.contains("kitty")
+            || term.contains("ghostty")
+            || term.contains("wezterm")
+            || term.contains("foot")
+        {
             return true;
         }
     }

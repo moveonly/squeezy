@@ -1,3 +1,5 @@
+use std::ffi::OsString;
+
 use super::*;
 
 // ---- DesktopNotifier byte-sequence acceptance ----------------------------
@@ -99,14 +101,9 @@ fn notification_method_parses_canonical_strings() {
 }
 
 #[test]
-fn osc9_auto_detects_linux_terminal_signals() {
-    // The OSC9 auto-detection is tested indirectly: we can't mutate real
-    // process env inside a unit test without races, so we verify the
-    // expanded terminal_supports_osc9 logic via the Auto resolved() path.
+fn osc9_auto_resolves_to_concrete_backend_in_test_env() {
     // In the default test environment $TERM_PROGRAM and Linux signals are
-    // absent so Auto should fall back to Bel (not Osc9). The assertion
-    // confirms the function runs without panic; actual Linux terminal
-    // detection is validated in integration environments.
+    // absent so Auto should fall back to Bel (not Osc9).
     let notifier = DesktopNotifier::new(NotificationMethod::Auto);
     let resolved = notifier
         .resolved()
@@ -115,4 +112,64 @@ fn osc9_auto_detects_linux_terminal_signals() {
         matches!(resolved, NotificationMethod::Bel | NotificationMethod::Osc9),
         "Auto must resolve to Bel or Osc9, got {resolved:?}"
     );
+}
+
+fn make_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + '_ {
+    |key: &str| {
+        pairs
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| OsString::from(*v))
+    }
+}
+
+#[test]
+fn osc9_detects_term_program_signals() {
+    for program in &["iTerm.app", "Ghostty", "WezTerm", "kitty", "WarpTerminal"] {
+        let env = make_env(&[("TERM_PROGRAM", program)]);
+        assert!(
+            detect_osc9_support_from_env(env),
+            "TERM_PROGRAM={program} should enable OSC9"
+        );
+    }
+}
+
+#[test]
+fn osc9_detects_linux_env_var_signals() {
+    let signals: &[&str] = &[
+        "KITTY_WINDOW_ID",
+        "WEZTERM_PANE",
+        "WEZTERM_EXECUTABLE",
+        "GHOSTTY_RESOURCES_DIR",
+    ];
+    for signal in signals {
+        let env = make_env(&[(signal, "1")]);
+        assert!(
+            detect_osc9_support_from_env(env),
+            "{signal} should enable OSC9"
+        );
+    }
+}
+
+#[test]
+fn osc9_detects_linux_term_values() {
+    for term in &["xterm-kitty", "ghostty", "wezterm", "foot"] {
+        let env = make_env(&[("TERM", term)]);
+        assert!(
+            detect_osc9_support_from_env(env),
+            "TERM={term} should enable OSC9"
+        );
+    }
+}
+
+#[test]
+fn osc9_off_for_unknown_terminals() {
+    let empty = |_: &str| -> Option<OsString> { None };
+    assert!(!detect_osc9_support_from_env(empty));
+
+    let dumb = make_env(&[("TERM", "dumb")]);
+    assert!(!detect_osc9_support_from_env(dumb));
+
+    let screen = make_env(&[("TERM", "screen-256color")]);
+    assert!(!detect_osc9_support_from_env(screen));
 }
