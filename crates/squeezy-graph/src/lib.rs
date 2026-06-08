@@ -1539,7 +1539,7 @@ impl SemanticGraph {
 
         // Build a lowercase path → FileId index for O(1) case-insensitive
         // lookups and detect case collisions that indicate Windows casing drift.
-        for (file_id, _record) in &self.files {
+        for file_id in self.files.keys() {
             let normalized = file_id.0.to_ascii_lowercase();
             if let Some(existing) = self.files_by_normalized_id.get(&normalized) {
                 if existing != file_id {
@@ -3108,7 +3108,7 @@ fn normalize_cargo_file_id(root: &Path, path: &str) -> Option<String> {
         // diagnostic path and workspace root differ only by drive-letter casing
         // (e.g. `C:\...` vs `c:\...`) or verbatim-prefix spelling. Fall back
         // to comparing lowercased string representations in that case.
-        if let Some(rel) = path.strip_prefix(root).ok() {
+        if let Ok(rel) = path.strip_prefix(root) {
             rel.to_path_buf()
         } else {
             let path_lower = path.to_string_lossy().to_ascii_lowercase();
