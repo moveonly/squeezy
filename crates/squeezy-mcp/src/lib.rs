@@ -1848,6 +1848,17 @@ impl StdioProcessHandle {
         if self.terminated.swap(true, Ordering::SeqCst) {
             return;
         }
+        // On Windows, primary cleanup is the Job Object (win_job field):
+        // dropping it closes the handle, firing KILL_ON_JOB_CLOSE and killing
+        // the entire process tree. Only fall back to direct PID termination
+        // when Job Object assignment failed at spawn time (win_job == None).
+        // The field drop happens after this method returns (Rust struct drop
+        // order: body runs first, then fields in declaration order).
+        #[cfg(windows)]
+        if self.win_job.is_none() {
+            terminate_process_group(self.pid);
+        }
+        #[cfg(not(windows))]
         terminate_process_group(self.pid);
     }
 }
@@ -1895,6 +1906,14 @@ async fn start_stdio_service(
     #[cfg(windows)]
     let process_handle = {
         let pid = transport.id();
+        // NOTE: There is an inherent race window between process spawn and
+        // `AssignProcessToJobObject`. Grandchildren spawned by the child before
+        // assignment completes (e.g. `cmd.exe` immediately launching `node`)
+        // will not be members of the job and will survive cleanup. The proper
+        // fix (CREATE_SUSPENDED + assign + ResumeThread) is not accessible
+        // through `tokio::process::Command`, so this best-effort coverage is
+        // the best we can do without a custom spawn helper. The window is
+        // typically a few microseconds in practice.
         let job = pid.and_then(|pid| match win_job::McpJob::new_and_assign(pid) {
             Ok(job) => Some(job),
             Err(err) => {
@@ -2745,6 +2764,7 @@ fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {
         "command": &server.command,
         "args": &server.args,
         "url": &server.url,
+        "cwd": &server.cwd,
         "timeout_ms": server.timeout_ms,
         "discovery_timeout_ms": server.discovery_timeout_ms,
         "tool_call_timeout_ms": server.tool_call_timeout_ms,
