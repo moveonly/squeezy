@@ -214,12 +214,15 @@ impl SessionStore {
         Some(truncated)
     }
 
-    /// Path to the cross-project session index. On Linux (and any platform
-    /// that honours the XDG Base Directory Specification), this resolves to
-    /// `$XDG_STATE_HOME/squeezy/sessions/index.jsonl`; when `XDG_STATE_HOME`
-    /// is not set it falls back to `$HOME/.local/state/squeezy/sessions/index.jsonl`.
-    /// For non-XDG platforms the legacy `$HOME/.squeezy/sessions/index.jsonl`
-    /// path is used so that existing macOS and Windows state is undisturbed.
+    /// Path to the cross-project session index. When `XDG_STATE_HOME` is set
+    /// (Linux XDG Base Directory Specification) it resolves to
+    /// `$XDG_STATE_HOME/squeezy/sessions/index.jsonl`; otherwise it uses the
+    /// legacy `$HOME/.squeezy/sessions/index.jsonl` path so that existing
+    /// macOS, Windows, and Linux state at that location is undisturbed.
+    ///
+    /// Linux users who want the canonical XDG placement can set `XDG_STATE_HOME`
+    /// (typically `$HOME/.local/state`); `list_global_index` will then merge
+    /// entries from the legacy path as a one-time migration source.
     ///
     /// Per-project session roots live under each workspace, so a global index
     /// is the only way the resume picker can show sessions started from sibling
@@ -232,7 +235,7 @@ impl SessionStore {
     /// Used as a migration source when the active path has moved to an XDG
     /// location; callers read from this path too so old entries remain visible
     /// after the first XDG-aware launch.
-    fn legacy_global_index_path() -> Option<PathBuf> {
+    pub fn legacy_global_index_path() -> Option<PathBuf> {
         let home = env::var_os("HOME")?;
         Some(
             PathBuf::from(home)
@@ -350,12 +353,18 @@ impl SessionStore {
                 .write(true)
                 .open(&lock_path)
                 .ok();
-            if let Some(ref lf) = lock_file {
-                let _ = lf.try_lock_exclusive();
-            }
-            let _ = rewrite_global_index(&path, &ordered);
-            if let Some(ref lf) = lock_file {
-                let _ = lf.unlock();
+            // Only rewrite when we actually hold the lock. try_lock_exclusive
+            // returns Err when another process already owns it; in that case
+            // we skip the rewrite — the other process will compact the file,
+            // and the in-memory entries we already built are still valid.
+            let locked = lock_file
+                .as_ref()
+                .map_or(true, |lf| lf.try_lock_exclusive().is_ok());
+            if locked {
+                let _ = rewrite_global_index(&path, &ordered);
+                if let Some(ref lf) = lock_file {
+                    let _ = lf.unlock();
+                }
             }
         }
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
@@ -3526,20 +3535,17 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.{pid}.{tid}.{nonce}.tmp"))
 }
 
-/// Current thread id as a `u64`. Uses the OS thread handle address as a
-/// stable discriminator inside a process.
+/// Per-process thread counter used as a discriminator inside unique temp
+/// file names. Each thread gets a stable monotonically-increasing id on
+/// first access via `thread_local!`, which is cheap and does not rely on
+/// any unstable `ThreadId` Debug representation.
+static THREAD_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 fn thread_id_u64() -> u64 {
-    // thread::current().id() doesn't give a numeric value on stable Rust,
-    // but its Debug representation embeds the number. We extract it to get
-    // a cheap discriminator without unsafe code.
-    let id = thread::current().id();
-    let debug = format!("{id:?}");
-    // ThreadId(N) → extract N
-    debug
-        .trim_start_matches("ThreadId(")
-        .trim_end_matches(')')
-        .parse::<u64>()
-        .unwrap_or(0)
+    thread_local! {
+        static TID: u64 = THREAD_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    }
+    TID.with(|id| *id)
 }
 
 /// Generate 4 random bytes and encode them as an 8-character hex string.
