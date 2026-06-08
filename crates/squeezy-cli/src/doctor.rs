@@ -857,8 +857,9 @@ fn mcp_stale_outcome_detail(outcome: &McpStaleOutcome) -> String {
 /// long-running work: walks the configured roots, counts total /
 /// enabled / disabled skills, and downgrades to `warn` when a
 /// same-precedence name collision flips trigger activation into
-/// ambiguous mode. Pure stat work so the row stays fast and matches
-/// the rest of `doctor`'s offline-CI contract.
+/// ambiguous mode. When `hooks_enabled`, also reports hook handler
+/// counts and which skills declare hooks. Pure stat work so the row
+/// stays fast and matches the rest of `doctor`'s offline-CI contract.
 fn skills_check(config: &AppConfig, catalog: &squeezy_skills::SkillCatalog) -> Check {
     let summaries = catalog.summaries();
     if summaries.is_empty() {
@@ -887,10 +888,36 @@ fn skills_check(config: &AppConfig, catalog: &squeezy_skills::SkillCatalog) -> C
         };
     }
     if config.skills.hooks_enabled {
+        // Summarise which enabled skills declare hooks and how many
+        // handler specs they contain, so users can confirm what will
+        // fire without inspecting individual SKILL.md files.
+        let mut total_specs = 0usize;
+        let mut hook_skills: Vec<String> = Vec::new();
+        for summary in summaries.iter().filter(|s| !s.disabled) {
+            if let Ok(loaded) = catalog.load(&summary.name)
+                && !loaded.hooks.is_empty()
+            {
+                let count: usize = loaded
+                    .hooks
+                    .values()
+                    .flat_map(|matchers| matchers.iter())
+                    .flat_map(|m| m.hooks.iter())
+                    .filter(|s| s.kind_valid)
+                    .count();
+                if count > 0 {
+                    total_specs += count;
+                    hook_skills.push(summary.name.clone());
+                }
+            }
+        }
+        detail.push_str(&format!("; hooks_enabled handlers={total_specs}"));
+        if !hook_skills.is_empty() {
+            detail.push_str(&format!(" ({})", hook_skills.join(", ")));
+        }
         // Hooks run as sh -c with Squeezy's full process privileges, so
         // warn in doctor whenever this high-trust mode is active so
         // operators notice it in CI smoke runs.
-        detail.push_str("; hooks_enabled=true (hooks run with Squeezy process privileges)");
+        detail.push_str(" (hooks run with Squeezy process privileges)");
         return Check {
             name: "skills".to_string(),
             status: Status::Warn,

@@ -297,6 +297,11 @@ pub struct SkillHookMatcher {
 /// when the path is relative. `once: true` semantics live in the handler
 /// (self-skipped after the first *successful* run) so the registry stays
 /// agnostic; a failed first run is retried on the next dispatch.
+///
+/// `kind_valid` is `false` when the spec's `type:` field was set to an
+/// unsupported value. Such specs are dropped before handler registration
+/// so a frontmatter block with `type: webhook` + `command: ...` does
+/// not silently execute as a shell command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillHookSpec {
     pub command: String,
@@ -315,6 +320,9 @@ pub struct SkillHookSpec {
     /// regardless of `fail_open`, because a hung hook is an anomaly that
     /// should not silently pass in either audit or enforcement configurations.
     pub fail_open: bool,
+    /// `false` when an unsupported `type:` was declared; prevents
+    /// execution even if a `command:` line was also present.
+    pub kind_valid: bool,
 }
 
 impl LoadedSkill {
@@ -1461,26 +1469,42 @@ fn parse_hooks_block(rest: &[&str], out: &mut BTreeMap<HookEvent, Vec<SkillHookM
             continue;
         }
 
-        // A `- matcher: ...` clause opens a new matcher under the
-        // current event. The matcher indent is locked on first sight
-        // so later `command:`/`once:` lines can be told apart from a
-        // sibling matcher reliably.
+        // A matcher item opens a new hook group under the current
+        // event. `- matcher: ...` installs a tool-name filter;
+        // `- hooks:` is the documented shorthand for an omitted matcher
+        // and therefore matches every payload for the event. The
+        // matcher indent is locked on first sight so later
+        // `command:`/`once:` lines can be told apart from a sibling
+        // matcher reliably.
         if let Some(item) = trimmed.strip_prefix("- ")
             && let Some((key, value)) = item.split_once(':')
-            && key.trim() == "matcher"
+            && matcher_indent.is_none_or(|m| indent <= m)
         {
-            matcher_indent = Some(indent);
-            let raw_match = unquote(value.trim()).to_string();
-            let matcher = if raw_match.is_empty() || raw_match == "*" {
-                None
-            } else {
-                Some(raw_match)
-            };
-            current_matchers.push(SkillHookMatcher {
-                matcher,
-                hooks: Vec::new(),
-            });
-            continue;
+            match key.trim() {
+                "matcher" => {
+                    matcher_indent = Some(indent);
+                    let raw_match = unquote(value.trim()).to_string();
+                    let matcher = if raw_match.is_empty() || raw_match == "*" {
+                        None
+                    } else {
+                        Some(raw_match)
+                    };
+                    current_matchers.push(SkillHookMatcher {
+                        matcher,
+                        hooks: Vec::new(),
+                    });
+                    continue;
+                }
+                "hooks" if value.trim().is_empty() => {
+                    matcher_indent = Some(indent);
+                    current_matchers.push(SkillHookMatcher {
+                        matcher: None,
+                        hooks: Vec::new(),
+                    });
+                    continue;
+                }
+                _ => {}
+            }
         }
 
         // A `- type: command` (or any `- key: value`) at indent
@@ -1496,6 +1520,7 @@ fn parse_hooks_block(rest: &[&str], out: &mut BTreeMap<HookEvent, Vec<SkillHookM
                 once: false,
                 timeout_secs: None,
                 fail_open: true,
+                kind_valid: true,
             });
             if let Some(spec) = matcher.hooks.last_mut() {
                 apply_spec_kv(spec, item);
@@ -1537,12 +1562,16 @@ fn apply_spec_kv(spec: &mut SkillHookSpec, line: &str) {
             }
         }
         "fail_open" => spec.fail_open = matches!(value, "true" | "yes" | "1"),
-        "type" if value != "command" => {
+        "type" if value == "command" => {
+            // Explicit `type: command` — already the default, no-op.
+        }
+        "type" => {
             warn!(
                 target: "squeezy_skills",
                 kind = %value,
-                "ignoring unsupported skill hook kind"
+                "ignoring unsupported skill hook kind; spec will be dropped"
             );
+            spec.kind_valid = false;
         }
         _ => {}
     }
@@ -1556,11 +1585,18 @@ fn parse_hook_event(name: &str) -> Option<HookEvent> {
         "PreTurn" | "pre_turn" => Some(HookEvent::PreTurn),
         "PreToolUse" | "pre_tool_use" => Some(HookEvent::PreToolUse),
         "PostToolUse" | "post_tool_use" => Some(HookEvent::PostToolUse),
+        "PostToolUseFailure" | "post_tool_use_failure" => Some(HookEvent::PostToolUseFailure),
         "PostTool" | "post_tool" => Some(HookEvent::PostTool),
         "PreCompact" | "pre_compact" => Some(HookEvent::PreCompact),
         "PostCompact" | "post_compact" => Some(HookEvent::PostCompact),
         "SubagentStart" | "subagent_start" => Some(HookEvent::SubagentStart),
+        "SubagentStop" | "subagent_stop" => Some(HookEvent::SubagentStop),
         "PermissionRequest" | "permission_request" => Some(HookEvent::PermissionRequest),
+        "PermissionDenied" | "permission_denied" => Some(HookEvent::PermissionDenied),
+        "UserPromptSubmit" | "user_prompt_submit" => Some(HookEvent::UserPromptSubmit),
+        "SessionStart" | "session_start" => Some(HookEvent::SessionStart),
+        "Stop" | "stop" => Some(HookEvent::Stop),
+        "Setup" | "setup" => Some(HookEvent::Setup),
         _ => None,
     }
 }
@@ -2128,6 +2164,9 @@ impl HookHandler for SkillHookHandler {
                 skill = %self.skill_name,
                 "skipping skill hook with empty command"
             );
+            if self.spec.once {
+                self.fired.store(false, Ordering::Release);
+            }
             return HookResult::allow();
         }
 
@@ -2190,7 +2229,12 @@ impl HookHandler for SkillHookHandler {
             .current_dir(&self.base_dir)
             .env("SQUEEZY_SKILL_DIR", &self.base_dir)
             .env("SQUEEZY_SKILL_NAME", &self.skill_name)
-            .env("SQUEEZY_HOOK_PAYLOAD", payload);
+            .env("SQUEEZY_HOOK_PAYLOAD", payload)
+            // Redirect subprocess stdio to /dev/null so hook scripts
+            // cannot corrupt the TUI or write to the agent's streams.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
 
         let child = match command.spawn() {
             Ok(child) => child,
@@ -2337,24 +2381,31 @@ impl HookHandler for SkillHookHandler {
 /// Register every hook declared in a [`LoadedSkill`]'s frontmatter
 /// against the given [`HookRegistry`].
 ///
-/// Returns the number of [`SkillHookHandler`]s installed so callers can
-/// log the activation count alongside the skill name. The registry takes
-/// ownership of each handler; deregistering individual skill hooks is
-/// not yet implemented because the registry stores erased boxed
-/// handlers — that surface is left to a follow-up when the agent loop
-/// learns to drop hooks on skill deactivation.
+/// Specs with `kind_valid = false` (unsupported `type:` in frontmatter)
+/// are silently dropped so they cannot execute as shell commands.
+///
+/// Handlers are registered via [`HookRegistry::register_for_event`] so
+/// the registry can dispatch in O(matching handlers) rather than
+/// O(total handlers). Returns the number of handlers installed so
+/// callers can log the activation count alongside the skill name.
 pub fn register_skill_hooks(skill: &LoadedSkill, registry: &mut HookRegistry) -> usize {
     let mut installed = 0;
     for (event, matchers) in &skill.hooks {
         for matcher in matchers {
             for spec in &matcher.hooks {
-                registry.register(Box::new(SkillHookHandler::new(
-                    skill.summary.name.clone(),
+                if !spec.kind_valid {
+                    continue;
+                }
+                registry.register_for_event(
                     *event,
-                    matcher.matcher.clone(),
-                    spec.clone(),
-                    skill.base_dir.clone(),
-                )));
+                    Box::new(SkillHookHandler::new(
+                        skill.summary.name.clone(),
+                        *event,
+                        matcher.matcher.clone(),
+                        spec.clone(),
+                        skill.base_dir.clone(),
+                    )),
+                );
                 installed += 1;
             }
         }
@@ -2363,9 +2414,31 @@ pub fn register_skill_hooks(skill: &LoadedSkill, registry: &mut HookRegistry) ->
         tracing::info!(
             target: "squeezy_skills",
             skill = %skill.summary.name,
+            source = %skill.base_dir.display(),
             installed,
             "registered skill frontmatter hooks"
         );
+        // Emit a per-handler snapshot at DEBUG level so session logs
+        // include the full hook registry for trusted local debugging.
+        for (event, matchers) in &skill.hooks {
+            for matcher_spec in matchers {
+                for spec in &matcher_spec.hooks {
+                    if !spec.kind_valid {
+                        continue;
+                    }
+                    tracing::debug!(
+                        target: "squeezy_skills",
+                        skill = %skill.summary.name,
+                        event = ?event,
+                        matcher = ?matcher_spec.matcher,
+                        command_path = %spec.command,
+                        once = spec.once,
+                        source = %skill.base_dir.display(),
+                        "hook handler registered"
+                    );
+                }
+            }
+        }
     }
     installed
 }

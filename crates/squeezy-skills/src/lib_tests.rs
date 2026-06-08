@@ -2304,6 +2304,27 @@ fn parses_hooks_block_with_matchers_and_specs() {
 }
 
 #[test]
+fn parses_hooks_block_with_omitted_matcher_as_match_all() {
+    let (metadata, _body) = parse_skill_file(
+        "---\nname: validator\ndescription: \"validates all tools\"\nhooks:\n  PreToolUse:\n    - hooks:\n        - type: command\n          command: \"scripts/all-tools.sh\"\n          once: true\n---\n# body\n",
+    )
+    .expect("parse");
+
+    let hooks = metadata
+        .hooks
+        .get(&HookEvent::PreToolUse)
+        .expect("PreToolUse parsed");
+    assert_eq!(hooks.len(), 1);
+    assert!(
+        hooks[0].matcher.is_none(),
+        "omitted matcher should match every payload for the event"
+    );
+    assert_eq!(hooks[0].hooks.len(), 1);
+    assert_eq!(hooks[0].hooks[0].command, "scripts/all-tools.sh");
+    assert!(hooks[0].hooks[0].once);
+}
+
+#[test]
 fn parses_hooks_block_drops_unknown_event_without_failing_load() {
     let (metadata, _body) = parse_skill_file(
         "---\nname: validator\ndescription: \"d\"\nhooks:\n  NoSuchEvent:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"scripts/x.sh\"\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"scripts/y.sh\"\n---\n# body\n",
@@ -2338,12 +2359,14 @@ fn register_skill_hooks_installs_one_handler_per_spec() {
                         once: false,
                         timeout_secs: None,
                         fail_open: true,
+                        kind_valid: true,
                     },
                     SkillHookSpec {
                         command: "true".to_string(),
                         once: true,
                         timeout_secs: None,
                         fail_open: true,
+                        kind_valid: true,
                     },
                 ],
             }],
@@ -2428,6 +2451,7 @@ fn skill_hook_fires_on_matching_event_and_skips_others() {
         once: false,
         timeout_secs: None,
         fail_open: true,
+        kind_valid: true,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),
@@ -2490,6 +2514,7 @@ fn skill_hook_once_self_removes_after_first_run() {
         once: true,
         timeout_secs: None,
         fail_open: true,
+        kind_valid: true,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),
@@ -2535,6 +2560,7 @@ fn skill_hook_once_claims_concurrent_dispatches_atomically() {
         once: true,
         timeout_secs: None,
         fail_open: true,
+        kind_valid: true,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),
@@ -2604,6 +2630,7 @@ fn skill_hook_once_retries_after_failed_first_run() {
         once: true,
         timeout_secs: None,
         fail_open: true,
+        kind_valid: true,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),
