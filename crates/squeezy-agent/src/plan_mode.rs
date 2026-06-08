@@ -111,13 +111,10 @@ pub(crate) fn plan_edit_allowed_in_workspace(
 /// [`is_active_plan_path_with_canon`] to avoid re-canonicalising the
 /// active side on every call.
 pub(crate) fn is_active_plan_path(target: &Path, active: &Path) -> bool {
-    let Ok(target_canon) = std::fs::canonicalize(target) else {
-        return false;
-    };
-    let Ok(active_canon) = std::fs::canonicalize(active) else {
-        return false;
-    };
-    target_canon == active_canon
+    match canonicalize_active_plan_path(active) {
+        Some(active_canon) => is_active_plan_path_with_canon(target, &active_canon),
+        None => false,
+    }
 }
 
 /// Pre-canonicalize the active plan path so the result can be stored and

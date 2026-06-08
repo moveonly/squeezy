@@ -13211,7 +13211,6 @@ fn sensitive_path_matcher_expands_windows_userprofile() {
 
 #[test]
 fn sensitive_path_matcher_expands_windows_appdata() {
-    let patterns = squeezy_core::ShellSandboxConfig::default().sensitive_path_patterns;
     // APPDATA typically holds credentials for various CLI tools (gh, azure, etc.)
     // that may appear in the user's sensitive-path config. We just verify the
     // expansion itself works by checking a contrived pattern.

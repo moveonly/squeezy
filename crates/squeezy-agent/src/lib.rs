@@ -15270,19 +15270,16 @@ pub(crate) fn mode_permission_verdict(
     request: &PermissionRequest,
     active_plan_path: Option<&Path>,
 ) -> Option<PermissionVerdict> {
-    // Pre-canonicalize the active plan path once here so
-    // `is_active_plan_path_with_canon` below only needs to canonicalize
-    // the (potentially different) target side. On Windows, canonicalization
-    // resolves drive-letter case, UNC prefixes, and junction paths, so
-    // doing it once per request rather than per capability check is both
-    // a correctness aid and a perf win.
-    let active_plan_canon = active_plan_path.and_then(plan_mode::canonicalize_active_plan_path);
     let plan_edit_allowed = matches!(
         (mode, request.capability),
         (SessionMode::Plan, PermissionCapability::Edit)
-    ) && active_plan_canon.as_deref().is_some_and(|active| {
-        plan_mode::is_active_plan_path_with_canon(Path::new(&request.target), active)
-    });
+    ) && active_plan_path
+        .is_some_and(|active| plan_mode::is_active_plan_path(Path::new(&request.target), active));
+    // Separately pre-canonicalize the active plan path for the denial-message
+    // display so both paths appear in their Windows-normalized form (resolved
+    // drive-letter case, UNC prefix, junction targets) rather than the raw
+    // form the caller passed in.
+    let active_plan_canon = active_plan_path.and_then(plan_mode::canonicalize_active_plan_path);
     if mode == SessionMode::Plan && request.tool_name == "shell" {
         if matches!(
             request.capability,
