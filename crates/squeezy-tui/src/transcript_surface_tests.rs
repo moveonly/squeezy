@@ -14,13 +14,21 @@ fn styled_line(text: &str) -> Line<'static> {
 
 fn row(id: usize, text: &str) -> TranscriptRow {
     let line = styled_line(text);
+    let copy_text = plain_text_of_line(&line);
+    let char_len = copy_text.chars().count();
+    let style_spans = style_spans_of_line(&line);
     TranscriptRow {
         row_id: RowId(id),
-        entry_id: EntryId(id as u64),
-        entry_kind: RowKind::Message,
+        entry_id: Some(EntryId(id as u64)),
+        entry_kind: Some(RowKind::Message),
         visual_line_index: 0,
-        line: line.clone(),
-        copy_text: plain_text_of_line(&line),
+        line,
+        copy_text,
+        text_range: 0..char_len,
+        style_spans,
+        fold_state: FoldState::Expanded,
+        search_match_ranges: Vec::new(),
+        click_targets: Vec::new(),
     }
 }
 
