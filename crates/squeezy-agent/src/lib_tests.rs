@@ -1827,80 +1827,82 @@ async fn parallel_tool_calls_config_flows_into_dispatched_request() {
     }
 }
 
-#[tokio::test]
-async fn tool_loop_executes_fallback_tool_and_returns_observation() {
-    let root = temp_workspace("agent_tool_loop");
-    fs::write(root.join("sample.rs"), "fn needle() {}\n").expect("write sample");
-    let provider = Arc::new(MockProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "call_1".to_string(),
-                name: "grep".to_string(),
-                arguments: json!({"pattern": "needle", "include": ["*.rs"]}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_1".to_string()),
-                cost: CostSnapshot {
-                    input_tokens: Some(10),
-                    output_tokens: Some(1),
-                    reasoning_output_tokens: Some(2),
-                    cached_input_tokens: None,
-                    cache_write_input_tokens: None,
-                    estimated_usd_micros: None,
-                },
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("found it".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_2".to_string()),
-                cost: CostSnapshot {
-                    input_tokens: Some(4),
-                    output_tokens: Some(2),
-                    reasoning_output_tokens: Some(3),
-                    cached_input_tokens: None,
-                    cache_write_input_tokens: None,
-                    estimated_usd_micros: None,
-                },
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let config = AppConfig {
-        workspace_root: root.clone(),
-        ..Default::default()
-    };
-    let agent = Agent::new(config, provider.clone());
+#[test]
+fn tool_loop_executes_fallback_tool_and_returns_observation() {
+    run_high_stack_async_test(async {
+        let root = temp_workspace("agent_tool_loop");
+        fs::write(root.join("sample.rs"), "fn needle() {}\n").expect("write sample");
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "call_1".to_string(),
+                    name: "grep".to_string(),
+                    arguments: json!({"pattern": "needle", "include": ["*.rs"]}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_1".to_string()),
+                    cost: CostSnapshot {
+                        input_tokens: Some(10),
+                        output_tokens: Some(1),
+                        reasoning_output_tokens: Some(2),
+                        cached_input_tokens: None,
+                        cache_write_input_tokens: None,
+                        estimated_usd_micros: None,
+                    },
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("found it".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_2".to_string()),
+                    cost: CostSnapshot {
+                        input_tokens: Some(4),
+                        output_tokens: Some(2),
+                        reasoning_output_tokens: Some(3),
+                        cached_input_tokens: None,
+                        cache_write_input_tokens: None,
+                        estimated_usd_micros: None,
+                    },
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let config = AppConfig {
+            workspace_root: root.clone(),
+            ..Default::default()
+        };
+        let agent = Agent::new(config, provider.clone());
 
-    let mut rx = agent.start_turn("find needle".to_string(), CancellationToken::new());
-    let mut tool_result = None;
-    let mut completed = None;
-    while let Some(event) = rx.recv().await {
-        match event {
-            AgentEvent::ToolCallCompleted { result, .. } => tool_result = Some(result),
-            AgentEvent::Completed { message, cost, .. } => {
-                completed = Some((message.content, cost));
+        let mut rx = agent.start_turn("find needle".to_string(), CancellationToken::new());
+        let mut tool_result = None;
+        let mut completed = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::ToolCallCompleted { result, .. } => tool_result = Some(result),
+                AgentEvent::Completed { message, cost, .. } => {
+                    completed = Some((message.content, cost));
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
 
-    let tool_result = tool_result.expect("tool result");
-    assert_eq!(tool_result.status, ToolStatus::Success);
-    assert_eq!(tool_result.content["matches"][0]["path"], "sample.rs");
-    let (message, cost) = completed.expect("completed");
-    assert_eq!(message, "found it");
-    assert_eq!(cost.input_tokens, Some(14));
-    assert_eq!(cost.reasoning_output_tokens, Some(5));
-    assert_eq!(provider.requests().len(), 2);
-    assert!(!provider.requests()[0].tools.is_empty());
+        let tool_result = tool_result.expect("tool result");
+        assert_eq!(tool_result.status, ToolStatus::Success);
+        assert_eq!(tool_result.content["matches"][0]["path"], "sample.rs");
+        let (message, cost) = completed.expect("completed");
+        assert_eq!(message, "found it");
+        assert_eq!(cost.input_tokens, Some(14));
+        assert_eq!(cost.reasoning_output_tokens, Some(5));
+        assert_eq!(provider.requests().len(), 2);
+        assert!(!provider.requests()[0].tools.is_empty());
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[test]
