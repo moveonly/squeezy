@@ -4601,6 +4601,11 @@ impl ToolRegistry {
         // mtime bump and the journal entry that would otherwise be recorded
         // for a no-op edit.
         let after_sha256 = sha256_hex(args.content.as_bytes());
+        let newline_before = before
+            .as_ref()
+            .map(|b| detect_newline_style(b))
+            .unwrap_or("none");
+        let newline_after = detect_newline_style(args.content.as_bytes());
         if before_sha256.as_deref() == Some(after_sha256.as_str()) {
             let cost = ToolCostHint {
                 bytes_read: before.as_ref().map_or(0, |bytes| bytes.len() as u64),
@@ -4612,6 +4617,8 @@ impl ToolRegistry {
                 "after_sha256": after_sha256,
                 "bytes_written": 0,
                 "noop": true,
+                "newline_style_before": newline_before,
+                "newline_style_after": newline_after,
             });
             return make_result(call, ToolStatus::Success, content, cost, Some(after_sha256));
         }
@@ -4640,6 +4647,8 @@ impl ToolRegistry {
             "after_sha256": after_sha256,
             "bytes_written": args.content.len(),
             "noop": false,
+            "newline_style_before": newline_before,
+            "newline_style_after": newline_after,
         });
         // Surface line-ending metadata so the model can detect when an edit
         // silently converts CRLF line endings to LF (common on Windows).
@@ -6887,6 +6896,28 @@ pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
 }
 
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// Detect the dominant newline style of a byte slice.
+///
+/// Returns `"crlf"` when the first newline found is `\r\n`, `"lf"` when
+/// the first newline is a bare `\n`, or `"none"` when the content contains
+/// no newline characters at all.  Inspects only the first 8 KB + 1 byte so
+/// the check is O(1) for large files.  The extra byte ensures a CRLF pair
+/// straddling the 8 192-byte boundary is not missed.
+pub(crate) fn detect_newline_style(bytes: &[u8]) -> &'static str {
+    // +1 so a \r\n pair where \r lands at byte 8191 and \n at byte 8192 is
+    // still detected correctly.
+    let probe = &bytes[..bytes.len().min(8193)];
+    for (i, &b) in probe.iter().enumerate() {
+        if b == b'\n' {
+            if i > 0 && probe[i - 1] == b'\r' {
+                return "crlf";
+            }
+            return "lf";
+        }
+    }
+    "none"
+}
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

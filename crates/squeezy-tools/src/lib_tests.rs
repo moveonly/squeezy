@@ -1001,6 +1001,163 @@ fn detect_line_endings_classifies_common_shapes() {
     assert_eq!(detect_line_endings(b"one two"), "none");
 }
 
+/// Verify that `follow_symlinks=true` with a symlink pointing outside the
+/// workspace does NOT return the out-of-workspace file in glob results.
+/// Also verifies that in-workspace files are still returned.
+#[cfg(unix)]
+#[tokio::test]
+async fn glob_follow_symlinks_respects_workspace_containment() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_workspace("glob_symlink_containment");
+    // A real in-workspace file.
+    fs::write(root.join("inside.rs"), "// inside\n").expect("write inside");
+
+    // Create a file outside the workspace.
+    let outside_dir = temp_workspace("glob_symlink_outside");
+    fs::write(outside_dir.join("secret.rs"), "// secret\n").expect("write secret");
+
+    // Symlink inside the workspace pointing to the outside directory.
+    symlink(&outside_dir, root.join("link_to_outside")).expect("create symlink");
+
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "glob-symlink-1".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "**/*.rs", "follow_symlinks": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let paths = result.content["paths"]
+        .as_array()
+        .expect("paths array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect::<Vec<_>>();
+
+    // in-workspace file must appear
+    assert!(
+        paths.contains(&"inside.rs".to_string()),
+        "inside.rs must be in results; got: {paths:?}"
+    );
+    // out-of-workspace file via symlink must NOT appear
+    assert!(
+        !paths.iter().any(|p| p.contains("secret")),
+        "secret.rs from outside workspace must not appear; got: {paths:?}"
+    );
+    // symlink_skipped_count must be non-zero (the outside dir was rejected)
+    let skipped = result.content["metadata"]["symlink_skipped_count"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        skipped > 0,
+        "symlink_skipped_count must be > 0 when out-of-workspace symlinks were rejected"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn glob_default_skips_symlink_file_that_escapes_workspace() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_workspace("glob_symlink_file_escape");
+    fs::write(root.join("inside.rs"), "// inside\n").expect("write inside");
+    let outside_dir = temp_workspace("glob_symlink_file_outside");
+    fs::write(outside_dir.join("secret.rs"), "// secret\n").expect("write secret");
+    symlink(outside_dir.join("secret.rs"), root.join("leaked.rs")).expect("create symlink");
+
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "glob-symlink-file-escape".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "*.rs"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["paths"], json!(["inside.rs"]));
+    assert_eq!(
+        result.content["metadata"]["symlink_skipped_count"],
+        json!(1)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn grep_default_skips_symlink_file_that_escapes_workspace() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_workspace("grep_symlink_file_escape");
+    fs::write(root.join("inside.rs"), "needle inside\n").expect("write inside");
+    let outside_dir = temp_workspace("grep_symlink_file_outside");
+    fs::write(outside_dir.join("secret.rs"), "needle secret\n").expect("write secret");
+    symlink(outside_dir.join("secret.rs"), root.join("leaked.rs")).expect("create symlink");
+
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "grep-symlink-file-escape".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(match_paths(&result), vec!["inside.rs"]);
+    assert_eq!(
+        result.content["metadata"]["symlink_skipped_count"],
+        json!(1)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside_dir);
+}
+
+/// Verify that `follow_symlinks=false` (default) reports `symlinks_not_followed: true`.
+#[tokio::test]
+async fn glob_default_reports_symlinks_not_followed() {
+    let root = temp_workspace("glob_symlink_meta");
+    fs::write(root.join("file.rs"), "// file\n").expect("write file");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "glob-meta-1".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "*.rs"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(
+        result.content["metadata"]["symlinks_not_followed"],
+        json!(true)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn grep_and_glob_apply_squeezy_indexing_policy_by_default() {
     let root = temp_workspace("tool_indexing_policy");
@@ -12892,12 +13049,12 @@ fn core_tool_prefix_stays_within_byte_baseline() {
     // the `transitive` boolean schema property) buys one-call retrieval of the
     // whole transitive subtype closure, replacing the N follow-up `decl_search`
     // calls a model would otherwise issue to walk a deep hierarchy by hand.
-    // 25_230 -> 25_700: deliberate bump for bug fixes — advertising previously
-    // implemented-only fields `read_file.start_line`, `read_file.end_line`, and
-    // `grep.max_bytes_per_file` in their respective schemas (schema/impl drift).
-    // The additions are purely corrective: providers that enforce the advertised
-    // schema were rejecting calls the handler was designed to accept.
-    const PREFIX_BYTES_BASELINE: usize = 25_700;
+    // 25_230 -> 26_000: deliberate bump for schema/impl drift fixes
+    // (`read_file.start_line`, `read_file.end_line`, `grep.max_bytes_per_file`)
+    // plus `follow_symlinks` on `grep` and `glob`. The latter supports
+    // symlink-heavy Linux monorepos while retaining workspace-containment
+    // checks and the conservative default `false`.
+    const PREFIX_BYTES_BASELINE: usize = 26_000;
 
     // Every first-party spec advertised in the always-core path, paired
     // with the required params the model must still see to call it. Tools
@@ -13359,4 +13516,76 @@ fn detect_inheritance_grep_extraction() {
     let colon = detect_inheritance_grep("struct Foo : Bar").expect("colon qualifies");
     assert_eq!(colon.base_names, vec!["Bar"]);
     assert_eq!(colon.decl_kw, "struct");
+}
+
+#[test]
+fn detect_newline_style_lf() {
+    assert_eq!(detect_newline_style(b"hello\nworld\n"), "lf");
+}
+
+#[test]
+fn detect_newline_style_crlf() {
+    assert_eq!(detect_newline_style(b"hello\r\nworld\r\n"), "crlf");
+}
+
+#[test]
+fn detect_newline_style_none() {
+    assert_eq!(detect_newline_style(b"no newlines here"), "none");
+}
+
+#[test]
+fn detect_newline_style_empty() {
+    assert_eq!(detect_newline_style(b""), "none");
+}
+
+#[test]
+fn detect_newline_style_lf_before_crlf() {
+    // A bare \n before any \r\n → reported as lf.
+    assert_eq!(detect_newline_style(b"a\nb\r\nc"), "lf");
+}
+
+#[test]
+fn detect_newline_style_crlf_straddles_probe_boundary() {
+    // \r at byte 8191 and \n at byte 8192: must detect crlf, not "none".
+    let mut buf = vec![b'x'; 8191];
+    buf.push(b'\r');
+    buf.push(b'\n');
+    assert_eq!(detect_newline_style(&buf), "crlf");
+}
+
+#[tokio::test]
+async fn write_file_includes_newline_style() {
+    let root = temp_workspace("write_file_newline_style");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    // Write a new file with LF content.
+    let call = ToolCall {
+        call_id: "newline-write-1".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": "newline_test.txt",
+            "content": "line1\nline2\n",
+        }),
+    };
+    let result = registry.execute(call, CancellationToken::new()).await;
+    assert_eq!(result.status, ToolStatus::Success);
+    // Before: no file existed → "none"
+    assert_eq!(result.content["newline_style_before"], json!("none"));
+    assert_eq!(result.content["newline_style_after"], json!("lf"));
+
+    // Overwrite with CRLF content.
+    let before_sha = result.content["after_sha256"].as_str().unwrap().to_string();
+    let call2 = ToolCall {
+        call_id: "newline-write-2".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": "newline_test.txt",
+            "content": "line1\r\nline2\r\n",
+            "expected_sha256": before_sha,
+        }),
+    };
+    let result2 = registry.execute(call2, CancellationToken::new()).await;
+    assert_eq!(result2.status, ToolStatus::Success);
+    assert_eq!(result2.content["newline_style_before"], json!("lf"));
+    assert_eq!(result2.content["newline_style_after"], json!("crlf"));
 }

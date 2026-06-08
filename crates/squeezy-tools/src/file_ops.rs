@@ -61,6 +61,10 @@ pub(crate) struct GlobArgs {
     diff_only: Option<bool>,
     max_paths: Option<usize>,
     offset: Option<usize>,
+    /// When true, follow symlinks during traversal. Default false (conservative).
+    /// Workspace containment is checked for each resolved target: symlinks that
+    /// escape the workspace root are silently skipped with a warning in metadata.
+    follow_symlinks: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +88,10 @@ pub(crate) struct GrepArgs {
     /// `MAX_GREP_CONTEXT` defensively in case a non-spec caller sends a
     /// larger value.
     context: Option<u32>,
+    /// When true, follow symlinks during traversal. Default false (conservative).
+    /// Workspace containment is checked for each resolved target: symlinks that
+    /// escape the workspace root are silently skipped with a warning in metadata.
+    follow_symlinks: Option<bool>,
 }
 
 /// Hard cap on grep `context` to keep per-match windows bounded even if
@@ -500,10 +508,19 @@ impl ToolRegistry {
         };
         let max_paths = args.max_paths.unwrap_or(DEFAULT_MAX_MATCHES).min(1_000);
         let offset = args.offset.unwrap_or(0);
+        let follow_symlinks = args.follow_symlinks.unwrap_or(false);
+
+        // Canonicalize the workspace root once so `starts_with` comparisons
+        // work correctly even when `self.root` contains symlink components
+        // (e.g. macOS `/tmp` → `/private/tmp`).
+        let canonical_root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.to_path_buf());
 
         let mut builder = WalkBuilder::new(&start);
         builder
-            .follow_links(false)
+            .follow_links(follow_symlinks)
             .hidden(false)
             .ignore(!include_ignored)
             .git_ignore(!include_ignored)
@@ -515,7 +532,10 @@ impl ToolRegistry {
         let mut paths = Vec::new();
         let mut skipped_paths = 0usize;
         let mut skipped_secret_files = 0u64;
+        let mut dirs_visited = 0u64;
+        let mut symlink_skipped_count = 0u64;
         let mut cost = ToolCostHint::default();
+        let traverse_start = std::time::Instant::now();
 
         for entry in builder.build() {
             if cancel.is_cancelled() {
@@ -531,8 +551,49 @@ impl ToolRegistry {
                 Err(_) => continue,
             };
             let path = entry.path();
+            // Check for symlinks before is_dir/is_file since those calls follow
+            // symlinks and would misclassify symlink→dir entries.
+            if entry.path_is_symlink() {
+                match path.canonicalize() {
+                    Ok(canonical) if !canonical.starts_with(&canonical_root) => {
+                        symlink_skipped_count += 1;
+                        continue;
+                    }
+                    Err(_) => {
+                        symlink_skipped_count += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                if !follow_symlinks {
+                    // Symlink to a dir was yielded but not expanded (follow_links=false);
+                    // count it as skipped rather than as a visited directory.
+                    if !path.is_file() {
+                        symlink_skipped_count += 1;
+                    }
+                    // Symlinks to files with follow_links=false fall through to normal
+                    // processing below only after the containment check above.
+                }
+            }
+            if path.is_dir() {
+                dirs_visited += 1;
+                continue;
+            }
             if !path.is_file() || contains_skipped_dir(path) {
                 continue;
+            }
+            // Additional containment check for non-symlink files when following links:
+            // files reached by descending into directory symlinks have
+            // path_is_symlink()==false but their canonical path may be outside the root.
+            if follow_symlinks && !entry.path_is_symlink() {
+                match path.canonicalize() {
+                    Ok(canonical) if !canonical.starts_with(&canonical_root) => {
+                        symlink_skipped_count += 1;
+                        continue;
+                    }
+                    Err(_) => continue,
+                    _ => {}
+                }
             }
             let rel = self.relative(path);
             if !include_ignored && self.policy_exclusion_for_file(path, &rel, None).is_some() {
@@ -558,6 +619,8 @@ impl ToolRegistry {
             cost.matches_returned += 1;
         }
 
+        let elapsed_ms = traverse_start.elapsed().as_millis() as u64;
+
         make_result(
             call,
             ToolStatus::Success,
@@ -570,6 +633,10 @@ impl ToolRegistry {
                     "diff_only": diff_only,
                     "offset": offset,
                     "skipped_secret_files": skipped_secret_files,
+                    "symlinks_not_followed": !follow_symlinks,
+                    "symlink_skipped_count": symlink_skipped_count,
+                    "dirs_visited": dirs_visited,
+                    "elapsed_ms": elapsed_ms,
                 },
             }),
             cost,
@@ -638,6 +705,7 @@ impl ToolRegistry {
             .unwrap_or(DEFAULT_OUTPUT_BYTE_CAP)
             .min(128_000);
         let context = args.context.unwrap_or(0).min(MAX_GREP_CONTEXT) as usize;
+        let follow_symlinks = args.follow_symlinks.unwrap_or(false);
 
         // Cross-tool "already-resident" dedup: when the grep target is a
         // single file the model already read in full this session (a
@@ -671,9 +739,17 @@ impl ToolRegistry {
             return result;
         }
 
+        // Canonicalize the workspace root once for containment checks so
+        // `starts_with` works even when `self.root` has symlink components
+        // (e.g. macOS `/tmp` → `/private/tmp`).
+        let canonical_root_grep = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.to_path_buf());
+
         let mut builder = WalkBuilder::new(&start);
         builder
-            .follow_links(false)
+            .follow_links(follow_symlinks)
             .hidden(false)
             .ignore(!include_ignored)
             .git_ignore(!include_ignored)
@@ -690,6 +766,9 @@ impl ToolRegistry {
         let mut skipped_secret_files = 0u64;
         let mut scanned_files = 0usize;
         let mut stop_search = false;
+        let mut dirs_visited = 0u64;
+        let mut symlink_skipped_count = 0u64;
+        let traverse_start = std::time::Instant::now();
 
         for entry in builder.build() {
             if cancel.is_cancelled() {
@@ -708,8 +787,41 @@ impl ToolRegistry {
                 Err(_) => continue,
             };
             let path = entry.path();
+            // Check for symlinks before is_dir/is_file since those follow symlinks.
+            if entry.path_is_symlink() {
+                match path.canonicalize() {
+                    Ok(canonical) if !canonical.starts_with(&canonical_root_grep) => {
+                        symlink_skipped_count += 1;
+                        continue;
+                    }
+                    Err(_) => {
+                        symlink_skipped_count += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                if !follow_symlinks && !path.is_file() {
+                    symlink_skipped_count += 1;
+                }
+            }
+            if path.is_dir() {
+                dirs_visited += 1;
+                continue;
+            }
             if !path.is_file() || contains_skipped_dir(path) {
                 continue;
+            }
+            // For non-symlink files reached via followed directory symlinks,
+            // enforce containment too (they have path_is_symlink()==false).
+            if follow_symlinks && !entry.path_is_symlink() {
+                match path.canonicalize() {
+                    Ok(canonical) if !canonical.starts_with(&canonical_root_grep) => {
+                        symlink_skipped_count += 1;
+                        continue;
+                    }
+                    Err(_) => continue,
+                    _ => {}
+                }
             }
             let rel = self.relative(path);
             if !include_ignored && self.policy_exclusion_for_file(path, &rel, None).is_some() {
@@ -917,6 +1029,8 @@ impl ToolRegistry {
             }
         }
 
+        let elapsed_ms = traverse_start.elapsed().as_millis() as u64;
+
         let mut metadata = BTreeMap::new();
         metadata.insert("pattern".to_string(), json!(args.pattern));
         metadata.insert(
@@ -938,6 +1052,13 @@ impl ToolRegistry {
             "skipped_secret_files".to_string(),
             json!(skipped_secret_files),
         );
+        metadata.insert("symlinks_not_followed".to_string(), json!(!follow_symlinks));
+        metadata.insert(
+            "symlink_skipped_count".to_string(),
+            json!(symlink_skipped_count),
+        );
+        metadata.insert("dirs_visited".to_string(), json!(dirs_visited));
+        metadata.insert("elapsed_ms".to_string(), json!(elapsed_ms));
         if !include_ignored {
             metadata.insert(
                 "hint".to_string(),
@@ -1357,6 +1478,13 @@ impl ToolRegistry {
         metadata.insert("resident_read".to_string(), json!(true));
         metadata.insert("same_as_call_id".to_string(), json!(snap.call_id));
         metadata.insert("same_as_tool_name".to_string(), json!(snap.tool_name));
+        // Always include the traversal-metrics fields added by the disk-grep
+        // path so callers see a consistent metadata shape regardless of which
+        // code path executed.
+        metadata.insert("symlinks_not_followed".to_string(), json!(true));
+        metadata.insert("symlink_skipped_count".to_string(), json!(0u64));
+        metadata.insert("dirs_visited".to_string(), json!(0u64));
+        metadata.insert("elapsed_ms".to_string(), json!(0u64));
 
         let content = json!({
             "matches": matches,

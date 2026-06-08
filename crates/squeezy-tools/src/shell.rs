@@ -633,9 +633,43 @@ impl ToolRegistry {
         );
         self.invalidate_diff_cache();
 
+        // The `command_wrapper` shows the actual process spawned (e.g.
+        // `sh -lc` on Linux/macOS) so POSIX-shell vs Bash behavior is explicit.
+        // For the macOS `sandbox-exec` backend the `-p <profile>` argument
+        // contains a multi-KB policy string; we summarize it as `<sandbox-profile>`
+        // so the field stays concise and readable.
+        let command_wrapper = {
+            // Collect args up to (but not including) the user command literal,
+            // which is always the last element on Unix shell plans.
+            let display_args: Vec<String> = sandbox_plan.args
+                [..sandbox_plan.args.len().saturating_sub(1)]
+                .iter()
+                .enumerate()
+                .map(|(i, arg)| {
+                    // When the previous arg was `-p`, this arg is the sandbox-exec
+                    // profile text which can be many KB; replace it with a placeholder.
+                    let prev = if i > 0 {
+                        sandbox_plan.args.get(i - 1).map(|s| s.as_str())
+                    } else {
+                        None
+                    };
+                    if prev == Some("-p") {
+                        "<sandbox-profile>".to_string()
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect();
+            if display_args.is_empty() {
+                sandbox_plan.program.clone()
+            } else {
+                format!("{} {}", sandbox_plan.program, display_args.join(" "))
+            }
+        };
         let mut raw_content = json!({
             "command": args.command,
             "workdir": self.relative(&workdir).to_string_lossy(),
+            "command_wrapper": command_wrapper,
             "exit_code": exit_code,
             "signal": exit_signal,
             "termination": termination,
@@ -644,12 +678,29 @@ impl ToolRegistry {
             "error": error,
             "truncated": truncated,
         });
-        if let Some(fallback) = sandbox_metadata.get("best_effort_fallback").cloned() {
-            insert_content_field(
-                &mut raw_content,
-                "sandbox",
-                json!({ "best_effort_fallback": fallback }),
+        // Always surface sandbox status fields so the model can detect
+        // Linux-specific constraints (ask socket suppressed, Landlock active)
+        // without parsing the backend string.
+        {
+            let mut sandbox_info = serde_json::Map::new();
+            sandbox_info.insert("backend".to_string(), sandbox_metadata["backend"].clone());
+            sandbox_info.insert("network".to_string(), sandbox_metadata["network"].clone());
+            sandbox_info.insert(
+                "filesystem".to_string(),
+                sandbox_metadata["filesystem"].clone(),
             );
+            sandbox_info.insert(
+                "ask_socket_suppressed".to_string(),
+                sandbox_metadata["ask_socket_suppressed"].clone(),
+            );
+            sandbox_info.insert(
+                "landlock_active".to_string(),
+                sandbox_metadata["landlock_active"].clone(),
+            );
+            if let Some(fallback) = sandbox_metadata.get("best_effort_fallback").cloned() {
+                sandbox_info.insert("best_effort_fallback".to_string(), fallback);
+            }
+            insert_content_field(&mut raw_content, "sandbox", Value::Object(sandbox_info));
         }
         // Expose Windows Job Object process-tree cleanup status so the audit
         // and the model can distinguish genuine cleanup from a degraded state.
