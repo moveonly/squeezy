@@ -404,6 +404,21 @@ impl ToolRegistry {
         let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
         let redacted_stdout = self.redactor.redact(&stdout);
         let redacted_stderr = self.redactor.redact(&stderr);
+        let stdout_redactions = redacted_stdout.redactions;
+        let stderr_redactions = redacted_stderr.redactions;
+        // On Windows, TTY requests degrade to non-TTY pipes because ConPTY is
+        // not yet wired up. Prepend a brief notice so the model and user are
+        // aware that interactive prompts may not work as expected (Bug 7).
+        #[cfg(not(unix))]
+        let stdout = if args.tty {
+            let mut prefixed =
+                String::from("[ConPTY unavailable; running non-interactive pipes]\n");
+            prefixed.push_str(&redacted_stdout.text);
+            prefixed
+        } else {
+            redacted_stdout.text
+        };
+        #[cfg(unix)]
         let stdout = redacted_stdout.text;
         let stderr = redacted_stderr.text;
         let truncated = stdout_truncated || stderr_truncated || timed_out;
@@ -420,7 +435,7 @@ impl ToolRegistry {
         };
         let cost = ToolCostHint {
             output_bytes: (stdout.len() + stderr.len()) as u64,
-            redactions: redacted_stdout.redactions + redacted_stderr.redactions,
+            redactions: stdout_redactions + stderr_redactions,
             truncated,
             ..ToolCostHint::default()
         };
@@ -665,9 +680,11 @@ impl ToolRegistry {
                 }
                 #[cfg(not(unix))]
                 {
-                    // Windows non-sandbox path: ConPTY is not yet wired up;
-                    // degrade to non-TTY pipes. The shell still runs with the
-                    // requested backend, just without a controlling terminal.
+                    // Windows: ConPTY is not yet wired up; degrade to
+                    // non-TTY pipes. The shell still runs with the requested
+                    // backend, just without a controlling terminal. A note
+                    // will be prepended to stdout so the model and user know
+                    // that interactive prompts may behave differently.
                     command
                         .stdin(Stdio::null())
                         .stdout(Stdio::piped())

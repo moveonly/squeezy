@@ -10,6 +10,12 @@ pub(crate) struct ShellProgram {
     pub args: Vec<String>,
 }
 
+/// Cached Windows shell binary path resolved once per process. Stores just
+/// the resolved program path (not the command-specific args) because args
+/// always include the user command which differs per call.
+#[cfg(windows)]
+static WINDOWS_SHELL_BINARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 impl ShellProgram {
     /// Resolve the shell program + arguments to run `command`.
     ///
@@ -22,7 +28,8 @@ impl ShellProgram {
     /// - Windows: `pwsh.exe` → `powershell.exe` → `cmd.exe`, in that order,
     ///   resolved via `which::which`. The shell call follows each shell's
     ///   convention (`-NoLogo -NoProfile -Command` for PowerShell variants,
-    ///   `/D /S /C` for cmd).
+    ///   `/D /S /C` for cmd). The resolved binary is cached per session so
+    ///   PATH probing runs only once.
     pub(crate) fn for_command(command: &str) -> Self {
         if let Ok(custom) = std::env::var("SQUEEZY_SHELL") {
             return Self::resolve_override(&custom, command);
@@ -33,7 +40,7 @@ impl ShellProgram {
         }
         #[cfg(windows)]
         {
-            Self::windows_default(command)
+            Self::windows_default_cached(command)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -85,38 +92,50 @@ impl ShellProgram {
         }
     }
 
+    /// Cached version of `windows_default`: resolves the binary path once via
+    /// PATH probing and reuses it for subsequent calls in the same session.
     #[cfg(windows)]
-    fn windows_default(command: &str) -> Self {
+    fn windows_default_cached(command: &str) -> Self {
+        let binary = WINDOWS_SHELL_BINARY.get_or_init(|| Self::resolve_windows_shell_binary());
+        Self::windows_shell_with_binary(binary, command)
+    }
+
+    /// Probe PATH for the best available Windows shell binary.
+    #[cfg(windows)]
+    fn resolve_windows_shell_binary() -> String {
         if let Ok(pwsh) = which::which("pwsh") {
-            return Self {
-                program: pwsh.to_string_lossy().into_owned(),
-                args: vec![
-                    "-NoLogo".to_string(),
-                    "-NoProfile".to_string(),
-                    "-Command".to_string(),
-                    command.to_string(),
-                ],
-            };
+            return pwsh.to_string_lossy().into_owned();
         }
         if let Ok(powershell) = which::which("powershell") {
-            return Self {
-                program: powershell.to_string_lossy().into_owned(),
+            return powershell.to_string_lossy().into_owned();
+        }
+        "cmd.exe".to_string()
+    }
+
+    /// Build a `ShellProgram` for the given cached binary path and command.
+    #[cfg(windows)]
+    fn windows_shell_with_binary(binary: &str, command: &str) -> Self {
+        let lower = binary.to_ascii_lowercase();
+        if lower.ends_with("pwsh.exe") || lower.ends_with("powershell.exe") {
+            Self {
+                program: binary.to_string(),
                 args: vec![
                     "-NoLogo".to_string(),
                     "-NoProfile".to_string(),
                     "-Command".to_string(),
                     command.to_string(),
                 ],
-            };
-        }
-        Self {
-            program: "cmd.exe".to_string(),
-            args: vec![
-                "/D".to_string(),
-                "/S".to_string(),
-                "/C".to_string(),
-                command.to_string(),
-            ],
+            }
+        } else {
+            Self {
+                program: binary.to_string(),
+                args: vec![
+                    "/D".to_string(),
+                    "/S".to_string(),
+                    "/C".to_string(),
+                    command.to_string(),
+                ],
+            }
         }
     }
 

@@ -167,6 +167,23 @@ fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) 
     if let Some(binary) = permission.metadata.get("binary") {
         lines.push(dim(format!("binary {binary}")));
     }
+    // Show sandbox posture. On Windows without FS isolation, highlight that
+    // the user's approval is the primary enforcement boundary (Bug 5 / UI/UX).
+    if permission
+        .metadata
+        .get("windows_no_fs_sandbox")
+        .is_some_and(|v| v == "true")
+    {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "Windows: no filesystem/network sandbox — approval is the enforcement boundary",
+                Style::default()
+                    .fg(crate::render::theme::red())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
 }
 
 fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {

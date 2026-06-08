@@ -7406,6 +7406,7 @@ fn default_shell_env_allowlist() -> Vec<String> {
 
 fn default_sensitive_path_patterns() -> Vec<String> {
     [
+        // Unix / cross-platform credential and key stores.
         ".ssh/**",
         ".aws/**",
         ".config/gh/**",
@@ -7417,6 +7418,16 @@ fn default_sensitive_path_patterns() -> Vec<String> {
         ".npmrc",
         ".pypirc",
         ".env*",
+        // Windows-specific credential and token stores. On Windows these live
+        // under %USERPROFILE% and are matched relative to the home directory
+        // via the sensitive-path scanner's home-relative normalization. On
+        // non-Windows hosts they do not occur in practice, so the extra
+        // patterns are a no-op.
+        ".azure/**",
+        "AppData/Roaming/gcloud/**",
+        "AppData/Roaming/Microsoft/UserSecrets/**",
+        "AppData/Local/Microsoft/Windows/PowerShell/**",
+        ".nuget/credentials",
     ]
     .into_iter()
     .map(str::to_string)

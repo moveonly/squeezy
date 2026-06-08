@@ -2415,6 +2415,24 @@ impl ToolRegistry {
                     "sandbox_write_roots".to_string(),
                     path_list_metadata(&self.shell_sandbox.write_roots),
                 );
+                // On Windows the sandbox backend never provides filesystem or
+                // network isolation at the OS level (unless the elevated tier
+                // is provisioned). Signal this to the approval UI so users
+                // understand that their approval is the primary enforcement
+                // boundary. The flag is compile-time so there is no runtime
+                // cost on other platforms.
+                #[cfg(target_os = "windows")]
+                {
+                    use squeezy_core::WindowsSandboxLevel;
+                    let windows_fs_isolated = matches!(
+                        self.shell_sandbox.mode,
+                        ShellSandboxMode::Off | ShellSandboxMode::External
+                    ) || self.shell_sandbox.windows_sandbox_level
+                        == WindowsSandboxLevel::Elevated;
+                    if !windows_fs_isolated {
+                        metadata.insert("windows_no_fs_sandbox".to_string(), "true".to_string());
+                    }
+                }
                 if let Some(timeout_ms) = args.as_ref().and_then(|args| args.timeout_ms) {
                     metadata.insert("timeout_ms".to_string(), timeout_ms.to_string());
                 }

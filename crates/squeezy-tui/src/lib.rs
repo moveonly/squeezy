@@ -6293,9 +6293,36 @@ fn capability_project_label(
         | PermissionCapability::Compiler
         | PermissionCapability::Destructive => unreachable!(),
     };
+    // On Windows, warn when the shell prefix being persisted is broad
+    // (covers all commands run via pwsh, cmd, etc.) because the unisolated
+    // sandbox means this Allow rule has an especially wide blast radius (Bug 6).
+    let windows_broad_warning = if permission.capability == PermissionCapability::Shell
+        && permission
+            .metadata
+            .get("windows_no_fs_sandbox")
+            .is_some_and(|v| v == "true")
+        && is_broad_windows_shell_prefix(&scope)
+    {
+        " ⚠ broad rule on unisolated Windows shell"
+    } else {
+        ""
+    };
     (
-        Cow::Owned(format!("Always allow {kind} {scope_display}")),
+        Cow::Owned(format!(
+            "Always allow {kind} {scope_display}{windows_broad_warning}"
+        )),
         Cow::Owned(format!("save a project {hint_kind} rule")),
+    )
+}
+
+/// True when a shell prefix target covers a broad class of Windows shell
+/// commands (pwsh, powershell, cmd, gitbash with no further narrowing).
+fn is_broad_windows_shell_prefix(prefix: &str) -> bool {
+    let lower = prefix.to_ascii_lowercase();
+    let bare = lower.trim_end_matches(":*").trim();
+    matches!(
+        bare,
+        "pwsh" | "powershell" | "cmd" | "cmd.exe" | "gitbash" | "shell"
     )
 }
 
@@ -6303,8 +6330,17 @@ fn capability_project_label(
 /// design so the status bar remains useful for non-approval traffic.
 pub(crate) fn format_approval_status_line(request: &ToolApprovalRequest) -> String {
     let permission = &request.permission;
+    let windows_suffix = if permission
+        .metadata
+        .get("windows_no_fs_sandbox")
+        .is_some_and(|v| v == "true")
+    {
+        " sandbox=job-object-only"
+    } else {
+        ""
+    };
     format!(
-        "approval needed: {tool} risk={risk} target={target}",
+        "approval needed: {tool} risk={risk} target={target}{windows_suffix}",
         tool = request.tool_name,
         risk = permission.risk.as_str(),
         target = permission.target,
