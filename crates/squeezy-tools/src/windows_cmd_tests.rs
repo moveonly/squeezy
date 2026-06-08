@@ -65,6 +65,32 @@ fn flags_invoke_expression() {
 }
 
 #[test]
+fn flags_iex_alias_bypass_shapes() {
+    // No-space invocation: `iex("...")`
+    assert!(is_destructive_windows_segment(
+        "iex(\"Get-Process | Out-File evil.log\")"
+    ));
+    // Pipeline terminator with no following whitespace: `... | iex`
+    assert!(is_destructive_windows_segment(
+        "Get-Content payload.ps1 | iex"
+    ));
+    // No-whitespace pipeline: `...|iex`
+    assert!(is_destructive_windows_segment("cat payload.ps1|iex"));
+    // Statement-separator prefix: `;iex`
+    assert!(is_destructive_windows_segment("$x = 1;iex $payload"));
+    // PowerShell call-operator prefix: `&iex`
+    assert!(is_destructive_windows_segment("& iex $cmd"));
+}
+
+#[test]
+fn iex_alias_does_not_match_substring_identifiers() {
+    // Identifiers containing the literal `iex` must not trip the alias check.
+    assert!(!is_destructive_windows_segment("Get-Hexbin file"));
+    assert!(!is_destructive_windows_segment("write-host 'iexample'"));
+    assert!(!is_destructive_windows_segment("./find-iex.ps1 search"));
+}
+
+#[test]
 fn flags_wmic_delete() {
     assert!(is_destructive_windows_segment(
         "wmic process delete where name='notepad.exe'"
@@ -110,6 +136,10 @@ fn ignores_benign_commands() {
     assert!(!is_destructive_windows_segment("del foo.txt"));
     // del /q /f without /s only affects named files — not recursive
     assert!(!is_destructive_windows_segment("del /Q /F foo.txt"));
+    // del /q /f on a wildcard inside a single directory is still bounded:
+    // without /S it does not recurse, so we deliberately leave it benign.
+    // Re-promoting it would require a fixture flip here.
+    assert!(!is_destructive_windows_segment("del /Q /F somedir\\*"));
     assert!(!is_destructive_windows_segment("dir /S"));
     assert!(!is_destructive_windows_segment("Get-ChildItem -Recurse"));
     assert!(!is_destructive_windows_segment("echo hello"));
@@ -119,6 +149,11 @@ fn ignores_benign_commands() {
     assert!(!is_destructive_windows_segment("rm file.log"));
     // Remove-Item without -Force or -Recurse is not flagged
     assert!(!is_destructive_windows_segment("Remove-Item C:\\Tmp\\file"));
+    // -LiteralPath without -Force/-Recurse matches the plain Remove-Item
+    // policy: a single named file delete is not destructive.
+    assert!(!is_destructive_windows_segment(
+        "Remove-Item -LiteralPath C:\\Tmp\\file.txt"
+    ));
 }
 
 #[test]

@@ -15752,24 +15752,24 @@ fn parse_shortstat(text: &str) -> Option<(u32, u32)> {
 }
 
 fn compact_path(path: &std::path::Path) -> String {
-    let display = path.display().to_string();
+    let fallback = mention::path_display_normalized(path);
     let Some(home) = home_path_from_env(|key| env::var_os(key)) else {
-        return display;
+        return fallback;
     };
-    compact_path_with_home(path, &home).unwrap_or(display)
+    compact_path_with_home(path, &home).unwrap_or(fallback)
 }
 
 fn home_path_from_env<F>(env_get: F) -> Option<PathBuf>
 where
     F: Fn(&str) -> Option<std::ffi::OsString>,
 {
-    let home = match env_get("HOME") {
+    let home = match env_get("HOME").filter(|v| !v.is_empty()) {
         Some(home) => home,
         None => {
             // On Windows, HOME is often unset; USERPROFILE is the canonical home.
             #[cfg(windows)]
             {
-                env_get("USERPROFILE")?
+                env_get("USERPROFILE").filter(|v| !v.is_empty())?
             }
             #[cfg(not(windows))]
             {
@@ -16342,10 +16342,12 @@ pub(crate) struct PendingDiffResult {
 
 /// Build the runtime [`keymap::KeymapResolver`] by layering the optional
 /// user-editable `~/.squeezy/keybindings.toml` on top of the
-/// `[tui.keymap]` overrides from `settings.toml`. Failures (missing
-/// `$HOME`, unreadable file, malformed TOML, reserved-key violation)
-/// emit a warning and fall back to the base overrides so a broken
-/// keybindings file never prevents the TUI from starting.
+/// `[tui.keymap]` overrides from `settings.toml`. The home directory is
+/// resolved from `$HOME`, falling back to `$USERPROFILE` on Windows
+/// where `$HOME` is typically unset. Failures (no home env var,
+/// unreadable file, malformed TOML, reserved-key violation) emit a
+/// warning and fall back to the base overrides so a broken keybindings
+/// file never prevents the TUI from starting.
 fn build_keymap_resolver(base: &BTreeMap<String, String>) -> keymap::KeymapResolver {
     let user_path = keymap_config::default_keybindings_path();
     match keymap_config::merge_user_overrides(base.clone(), user_path.as_deref()) {

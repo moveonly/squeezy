@@ -59,6 +59,45 @@ fn default_keybindings_path_ignores_userprofile_off_windows() {
 }
 
 #[test]
+fn default_keybindings_path_treats_empty_home_as_unset() {
+    // Guard against a `HOME=""` regression: an empty env var used to
+    // resolve to `Some(PathBuf::from("/.squeezy/keybindings.toml"))`,
+    // which would silently look for the file at the filesystem root.
+    // On Unix, `USERPROFILE` is ignored, so we expect `None`.
+    #[cfg(not(windows))]
+    {
+        let path =
+            default_keybindings_path_from_env(|key| (key == "HOME").then(|| OsString::from("")));
+        assert_eq!(path, None);
+    }
+    // On Windows, empty `HOME` should also be ignored, with fall-through
+    // to `USERPROFILE` (or `None` when it is missing/empty as well).
+    #[cfg(windows)]
+    {
+        let none = default_keybindings_path_from_env(|key| match key {
+            "HOME" => Some(OsString::from("")),
+            "USERPROFILE" => Some(OsString::from("")),
+            _ => None,
+        });
+        assert_eq!(none, None);
+
+        let path = default_keybindings_path_from_env(|key| match key {
+            "HOME" => Some(OsString::from("")),
+            "USERPROFILE" => Some(OsString::from(r"C:\Users\Alice")),
+            _ => None,
+        });
+        assert_eq!(
+            path,
+            Some(
+                PathBuf::from(r"C:\Users\Alice")
+                    .join(".squeezy")
+                    .join("keybindings.toml")
+            )
+        );
+    }
+}
+
+#[test]
 fn empty_file_keeps_default_bindings() {
     let file = KeybindingsFile::from_toml_str("").expect("empty toml parses");
     let overrides = file.into_override_map().expect("no validation errors");

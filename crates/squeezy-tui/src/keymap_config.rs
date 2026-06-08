@@ -232,8 +232,9 @@ impl KeybindingsFile {
 
 /// Default location of the user-editable file:
 /// `~/.squeezy/keybindings.toml`. Returns `None` when neither `$HOME`
-/// nor (on Windows) `$USERPROFILE` is set (CI sandboxes, some test
-/// harnesses), in which case the loader degrades to "no user overrides".
+/// nor (on Windows) `$USERPROFILE` is set or both are empty (CI
+/// sandboxes, some test harnesses), in which case the loader degrades
+/// to "no user overrides".
 pub(crate) fn default_keybindings_path() -> Option<PathBuf> {
     default_keybindings_path_from_env(|key| env::var_os(key))
 }
@@ -242,13 +243,13 @@ fn default_keybindings_path_from_env<F>(env_get: F) -> Option<PathBuf>
 where
     F: Fn(&str) -> Option<std::ffi::OsString>,
 {
-    let home = match env_get("HOME") {
+    let home = match env_get("HOME").filter(|v| !v.is_empty()) {
         Some(home) => home,
         None => {
             // On Windows, HOME is often unset; USERPROFILE is the canonical home.
             #[cfg(windows)]
             {
-                env_get("USERPROFILE")?
+                env_get("USERPROFILE").filter(|v| !v.is_empty())?
             }
             #[cfg(not(windows))]
             {

@@ -39,9 +39,11 @@ logs the error and falls back to the base overrides — a broken
 keybindings file must never block startup or half-apply a partial
 config.
 
-Path resolution looks for `$HOME/.squeezy/keybindings.toml`. When
-`$HOME` is unset (some CI sandboxes), the loader degrades to "no user
-overrides" and the resolver runs on settings + defaults.
+Path resolution looks for `$HOME/.squeezy/keybindings.toml`. On Windows,
+where `$HOME` is typically unset, the loader falls back to
+`$USERPROFILE/.squeezy/keybindings.toml`. When neither variable is set
+(or both are empty — some CI sandboxes), the loader degrades to "no
+user overrides" and the resolver runs on settings + defaults.
 
 ## Action namespace
 

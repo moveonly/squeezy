@@ -13,6 +13,15 @@
 pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     let lower = segment.to_ascii_lowercase();
 
+    // Remove-Item -LiteralPath is only flagged when paired with -Force or
+    // -Recurse, matching the policy applied to plain Remove-Item: a single
+    // file delete without -Force is benign.
+    if lower.contains("remove-item -literalpath")
+        && (lower.contains("-force") || lower.contains("-recurse") || lower.contains(" -r "))
+    {
+        return true;
+    }
+
     // PowerShell cmdlets where the dangerous shape is unambiguous in the
     // raw text. Each needle is a contiguous substring that does not appear
     // inside benign commands.
@@ -22,7 +31,6 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         "remove-item -r -force",
         "remove-item -force -recurse",
         "remove-item -force -r",
-        "remove-item -literalpath",
         // PowerShell aliases for Remove-Item with recurse+force
         "ri -recurse -force",
         "ri -r -force",
@@ -42,9 +50,8 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         // Drive / volume operations
         "clear-recyclebin",
         "format-volume",
-        // Arbitrary code execution via expression string (full name and alias)
+        // Arbitrary code execution via expression string (full name)
         "invoke-expression",
-        "iex ",
         // WMIC destructive operations
         "wmic process delete",
         "wmic product delete",
@@ -54,6 +61,19 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         if lower.contains(needle) {
             return true;
         }
+    }
+
+    // PowerShell `iex` alias. Bypass shapes include `iex(...)`,
+    // `... | iex`, `;iex`, `&iex`, so checking for the literal `"iex "`
+    // substring misses common payloads. Instead, walk every byte and
+    // confirm `iex` sits between PowerShell statement/pipeline boundaries
+    // (start-of-string, whitespace, `|`, `;`, `&`) and is followed by an
+    // argument or pipeline terminator (whitespace, `(`, `'`, `"`, `$`,
+    // end-of-string, `|`, `;`, `&`). This catches `iex $cmd`, `| iex`,
+    // `iex("...")`, `;iex`, etc. without firing on identifiers like
+    // `Get-Hexbin`.
+    if contains_iex_alias(&lower) {
+        return true;
     }
 
     // cmd.exe destructive commands. Tokenise to avoid matching substrings
@@ -78,6 +98,32 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         _ => {}
     }
 
+    false
+}
+
+/// True when `lower` contains the PowerShell `iex` alias as a statement
+/// or pipeline element. Boundary characters on either side mirror the
+/// way PowerShell parses tokens: whitespace, `|`, `;`, `&` separate
+/// statements; `(`, `"`, `'`, `$` are valid first characters of the
+/// expression argument; end-of-string is also a valid boundary so
+/// `cat payload | iex` and a trailing `;iex` both classify.
+fn contains_iex_alias(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = lower[search_from..].find("iex") {
+        let start = search_from + rel;
+        let end = start + 3;
+        let before_ok = start == 0 || matches!(bytes[start - 1], b' ' | b'\t' | b'|' | b';' | b'&');
+        let after_ok = end == bytes.len()
+            || matches!(
+                bytes[end],
+                b' ' | b'\t' | b'(' | b'\'' | b'"' | b'$' | b'|' | b';' | b'&'
+            );
+        if before_ok && after_ok {
+            return true;
+        }
+        search_from = start + 1;
+    }
     false
 }
 

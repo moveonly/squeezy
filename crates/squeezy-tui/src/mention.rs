@@ -17,9 +17,13 @@ use std::time::{Duration, Instant, SystemTime};
 /// mention popup and for fuzzy scoring. On Windows, `path.to_string_lossy()`
 /// produces backslashes that users cannot type in the `@` query; normalising
 /// to `/` lets both match naturally. The replacement is unconditional so the
-/// function is testable on all platforms — replacing `\` with `/` is a no-op
-/// on Unix where backslash is a valid but never-produced filename character.
-/// Insertion always uses the native separator via `path.display()`.
+/// function is testable on all platforms — on Unix, `\` is a legal byte in a
+/// filename, but treating it like a separator here is intentional: it only
+/// affects how the path is rendered in the popup and fed to the fuzzy
+/// scorer. The actual `PathBuf` is preserved for insertion (which uses the
+/// native separator via `path.display()`), so a Unix file containing a
+/// literal `\` is still inserted byte-for-byte even though it appears with a
+/// `/` in the suggestion list.
 pub(crate) fn path_display_normalized(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }

@@ -304,3 +304,18 @@ fn path_display_normalized_converts_backslashes() {
         "crates/squeezy-tui/src/lib.rs"
     );
 }
+
+#[test]
+fn rank_files_treats_backslash_and_forward_slash_paths_equivalently() {
+    // The mention popup must rank a query `src/lib.rs` the same against
+    // a backslash-formatted candidate and an otherwise-identical
+    // forward-slash candidate. `path_display_normalized` runs as part of
+    // scoring, so both should match and the result should contain both.
+    let files = vec![PathBuf::from("src\\lib.rs"), PathBuf::from("src/lib.rs")];
+
+    let (out, total) = rank_files("src/lib.rs", &files);
+    assert_eq!(total, 2, "both forms should match the same query");
+    assert_eq!(out.len(), 2, "both forms should rank inside MAX_MATCHES");
+    // Order is not asserted (tie-break depends on path byte length and
+    // input order); parity of matching is the property under test.
+}
