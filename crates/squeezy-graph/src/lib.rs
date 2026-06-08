@@ -273,6 +273,20 @@ pub struct HierarchyNode {
     pub children: Vec<HierarchyNode>,
 }
 
+/// Result of [`SemanticGraph::compute_impact`]: files, symbols, and test
+/// symbols reachable from a set of changed files through reverse-import
+/// propagation.
+#[derive(Debug, Clone, Default)]
+pub struct ImpactSet {
+    /// All files reachable from the changed set through reverse-import edges.
+    pub affected_files: HashSet<FileId>,
+    /// All non-file symbols whose declaring file is in `affected_files`.
+    pub affected_symbols: Vec<GraphSymbol>,
+    /// Subset of `affected_symbols` that are test functions or carry a
+    /// `TestOf` edge to a symbol in the affected set.
+    pub affected_tests: Vec<GraphSymbol>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignatureQuery {
     pub text: String,
@@ -419,13 +433,13 @@ pub struct SemanticGraph {
     js_ts_resolver: JsTsResolver,
     /// Parallel index of `(file, name, arity) -> symbol` so the resolver
     /// can disambiguate overloaded callees by exact positional-parameter
-    /// count when the AST already gave us that information. The phased
-    /// resolver consumes this; the legacy single-pass path does not yet
-    /// read from it (Item 5 PR-2).
+    /// count when the AST already gave us that information. Populated on
+    /// every rebuild; the phased resolver will consume this when it replaces
+    /// the single-pass path.
     arity_index: HashMap<(FileId, String, u8), SymbolId>,
     /// Reverse import edge: which files import the key. Populated from
     /// `imports_by_file` plus per-language path resolution; used by
-    /// affected-set incremental refresh (Item 3 PR-2).
+    /// affected-set computation and [`SemanticGraph::compute_impact`].
     importers_by_file: HashMap<FileId, Vec<FileId>>,
     /// Per-file [`cross_file::ResolverSlot`] holding exports / imports /
     /// supertypes for the phased pipeline. Populated even before any
@@ -784,6 +798,13 @@ impl SemanticGraph {
         ))
     }
 
+    /// Return the **containment** hierarchy rooted at `root` (or at all file
+    /// symbols when `root` is `None`), following `Contains` edges up to
+    /// `max_depth` levels. The result represents lexical nesting (file →
+    /// module → class → method), **not** inheritance.
+    ///
+    /// For inheritance/subtype relationships use
+    /// [`Self::inheritance_ancestors`] and [`Self::inheritance_direct_subtypes`].
     pub fn hierarchy(&self, root: Option<&SymbolId>, max_depth: usize) -> Vec<HierarchyNode> {
         let roots = match root {
             Some(root) => vec![root.clone()],
@@ -1059,6 +1080,150 @@ impl SemanticGraph {
             .filter_map(|id| self.symbols.get(id))
             .cloned()
             .collect()
+    }
+
+    /// Return all inheritance-style ancestors of `start` (i.e. symbols
+    /// reachable via `UsesTrait`, `Extends`, and `Implements` edges in PHP
+    /// method-resolution order) as a breadth-first list, excluding `start`
+    /// itself.
+    ///
+    /// This is the public counterpart of the `pub(crate)` helper used by the
+    /// call resolver. It exposes the same walk for tools that need an
+    /// inheritance view of the type hierarchy rather than the containment view
+    /// produced by [`Self::hierarchy`].
+    pub fn inheritance_ancestors(&self, start: &SymbolId) -> Vec<GraphSymbol> {
+        self.walk_inheritance_ancestors(start)
+            .into_iter()
+            .filter_map(|id| self.symbols.get(&id))
+            .cloned()
+            .collect()
+    }
+
+    /// Return the first-generation direct inheritors of `target`: symbols that
+    /// carry a `UsesTrait`, `Extends`, or `Implements` edge pointing **to**
+    /// `target`. One hop only; callers that need transitive descendants can
+    /// recurse with [`Self::inheritance_ancestors`] on each result.
+    pub fn inheritance_direct_subtypes(&self, target: &SymbolId) -> Vec<GraphSymbol> {
+        self.edges_by_to
+            .get(target)
+            .into_iter()
+            .flatten()
+            .filter_map(|&edge_index| {
+                let edge = self.edges.get(edge_index)?;
+                if matches!(
+                    edge.kind,
+                    EdgeKind::UsesTrait | EdgeKind::Extends | EdgeKind::Implements
+                ) {
+                    self.symbols.get(&edge.from)
+                } else {
+                    None
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Compute the impact set for a set of changed file IDs. Returns all files
+    /// reachable through reverse-import propagation starting from any file
+    /// whose exports changed, together with the symbols in those files and any
+    /// test symbols that cover them.
+    ///
+    /// The three input sets mirror the parameters of
+    /// [`crate::affected::compute_affected`]: `changed` is every file observed
+    /// to have changed in the last refresh; `propagating` is the subset whose
+    /// exports actually changed (only those push downstream invalidation);
+    /// `removed` contains deleted files (always treated as propagating).
+    pub fn compute_impact(
+        &self,
+        changed: &HashSet<FileId>,
+        propagating: &HashSet<FileId>,
+        removed: &HashSet<FileId>,
+    ) -> ImpactSet {
+        let affected_files = crate::affected::compute_affected(
+            changed,
+            &self.importers_by_file,
+            propagating,
+            removed,
+        );
+
+        let affected_symbols: Vec<GraphSymbol> = self
+            .symbols
+            .values()
+            .filter(|sym| sym.kind != SymbolKind::File && affected_files.contains(&sym.file_id))
+            .cloned()
+            .collect();
+
+        let affected_tests: Vec<GraphSymbol> = affected_symbols
+            .iter()
+            .filter(|sym| {
+                sym.attributes
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case("test"))
+                    || self
+                        .edges_by_from
+                        .get(&sym.id)
+                        .into_iter()
+                        .flatten()
+                        .any(|&ei| {
+                            self.edges
+                                .get(ei)
+                                .map(|e| e.kind == EdgeKind::TestOf)
+                                .unwrap_or(false)
+                        })
+            })
+            .cloned()
+            .collect();
+
+        ImpactSet {
+            affected_files,
+            affected_symbols,
+            affected_tests,
+        }
+    }
+
+    /// Apply warm-start resolver-cache data loaded from persistence. For each
+    /// file whose on-disk fingerprint (modified-time + size) matches the stored
+    /// entry, replaces the in-memory [`cross_file::ResolverSlot`] with the
+    /// richer persisted version. If a `ResolverSnapshot` is provided it
+    /// replaces the in-memory `importers_by_file` map entirely.
+    ///
+    /// Called once per `GraphManager::open_with_optional_store` after
+    /// `SemanticGraph::from_parsed`; the rebuilt-from-scratch slots and
+    /// importers are overwritten only for files whose fingerprint still
+    /// matches, so stale entries are never applied.
+    pub(crate) fn apply_warm_resolver_cache(
+        &mut self,
+        entries: Vec<(FileId, resolver_cache::ResolverFileEntry)>,
+        snapshot: Option<resolver_cache::ResolverSnapshot>,
+    ) {
+        for (file_id, entry) in entries {
+            let Some(file) = self.files.get(&file_id) else {
+                continue;
+            };
+            if file.modified_unix_millis != entry.fingerprint.modified_unix_millis
+                || file.size_bytes != entry.fingerprint.size_bytes
+            {
+                continue;
+            }
+            if let Some(slot) = self.resolver_slots.get_mut(&file_id) {
+                slot.exports = entry.exports;
+                slot.imports = entry.imports;
+                slot.supertypes = entry.supertypes;
+            }
+        }
+        if let Some(snap) = snapshot {
+            if !snap.imports_by_file.is_empty() || !snap.importers_by_file.is_empty() {
+                self.importers_by_file.clear();
+                for (target_str, importer_strs) in &snap.importers_by_file {
+                    let target = FileId(target_str.clone());
+                    let importers: Vec<FileId> =
+                        importer_strs.iter().map(|s| FileId(s.clone())).collect();
+                    if !importers.is_empty() {
+                        self.importers_by_file.insert(target, importers);
+                    }
+                }
+            }
+        }
     }
 
     fn insert_parsed_file(&mut self, file: ParsedFile) {
@@ -1658,10 +1823,11 @@ impl SemanticGraph {
         self.rebuild_importers_by_file();
     }
 
-    /// Populate per-file [`cross_file::ResolverSlot`] entries. The phased
-    /// resolver does not yet consume these; the populate step exists so
-    /// the per-language flip can read a ready table on the first refresh
-    /// instead of paying a one-time backfill.
+    /// Populate per-file [`cross_file::ResolverSlot`] entries. Slots are
+    /// persisted by [`GraphManager::persist_resolver_cache`] and restored on
+    /// warm starts by [`Self::apply_warm_resolver_cache`], so the per-language
+    /// flip to the phased resolver can read a ready table immediately instead
+    /// of paying a one-time backfill.
     fn rebuild_resolver_slots(&mut self) {
         self.resolver_slots.clear();
         for file_id in self.files.keys() {
@@ -2089,6 +2255,12 @@ impl GraphManager {
 
     /// Open a `GraphManager` that uses its own private [`GraphStore`] under
     /// `<workspace_root>/.squeezy/cache` (or `cache_root` when overridden).
+    ///
+    /// If the store cannot be opened (redb schema mismatch, file-lock
+    /// contention, I/O error, …) a `tracing::warn` is emitted and the manager
+    /// falls back to an in-memory-only graph. Callers that need a hard
+    /// failure on persistence errors should call [`Self::open_with_store`]
+    /// directly and pass a pre-opened [`GraphStore`].
     pub fn open_persistent_with_crawl_options(
         root: impl AsRef<Path>,
         config: RefreshConfig,
@@ -2096,9 +2268,18 @@ impl GraphManager {
         cache_root: Option<PathBuf>,
     ) -> Result<Self> {
         let root_path = root.as_ref().to_path_buf();
-        let store = GraphStore::open(&root_path, cache_root.as_deref())
-            .ok()
-            .map(Arc::new);
+        let store = match GraphStore::open(&root_path, cache_root.as_deref()) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(err) => {
+                tracing::warn!(
+                    root = %root_path.display(),
+                    %err,
+                    "graph persistence disabled: GraphStore::open failed; \
+                     falling back to in-memory graph"
+                );
+                None
+            }
+        };
         Self::open_with_optional_store(root_path, config, crawl_options, store)
     }
 
@@ -2169,11 +2350,20 @@ impl GraphManager {
             }
             store.apply_graph_batch(&batch)?;
         }
-        let graph = SemanticGraph::from_parsed(merge_parsed_by_snapshot_order(
+        let mut graph = SemanticGraph::from_parsed(merge_parsed_by_snapshot_order(
             &snapshot.files,
             loaded.parsed,
             parsed_missed,
         ));
+        // Warm-start: if all partitions were loaded from persistence (no
+        // re-parses), attempt to restore resolver-slot and importer-index state
+        // from the V2 resolver-cache tables. Fingerprint mismatches are silently
+        // skipped so a stale entry never corrupts the in-memory graph.
+        if let Some(store) = store.as_deref() {
+            if let Ok((entries, snap)) = load_resolver_cache(store, &snapshot.files) {
+                graph.apply_warm_resolver_cache(entries, snap);
+            }
+        }
         let build_report = GraphBuildReport {
             duration_ms: started.elapsed().as_millis(),
             files_seen: snapshot.files.len(),
@@ -2269,12 +2459,17 @@ impl GraphManager {
         Arc::clone(&self.pending_changed_paths)
     }
 
-    /// Best-effort write of the V2 resolver-cache rows. Per-file entries
-    /// carry the workspace-side fingerprint that future warm-start reads
-    /// will compare against. The single-blob import adjacency is mirrored
-    /// from [`SemanticGraph::importers_by_file`]. Failures are swallowed
-    /// so persistence errors cannot poison the in-memory graph.
+    /// Best-effort write of the V2 resolver-cache rows. All per-file entries
+    /// and the single-blob import adjacency graph are accumulated into one
+    /// [`GraphWriteBatch`] and committed in a single redb transaction, so
+    /// large workspaces pay one fsync instead of one per file.
+    ///
+    /// The workspace-side fingerprint (modified-time + size) embedded in each
+    /// entry lets a warm-start read decide whether a snapshot is still
+    /// authoritative without rehashing the source. Failures are swallowed so
+    /// persistence errors cannot poison the in-memory graph.
     fn persist_resolver_cache(&self, store: &GraphStore) {
+        let mut batch = GraphWriteBatch::new();
         for (file_id, file) in &self.graph.files {
             let Some(slot) = self.graph.resolver_slots.get(file_id) else {
                 continue;
@@ -2289,7 +2484,10 @@ impl GraphManager {
                 supertypes: slot.supertypes.clone(),
                 builder_snapshot: resolver_cache::BuilderSnapshot::default(),
             };
-            let _ = store.put_resolver_entry(file_id, &entry);
+            if batch.upsert_resolver_entry(file_id, &entry).is_err() {
+                // Encoding failure: skip this file; warm-start will recompute.
+                continue;
+            }
         }
         let mut snapshot = resolver_cache::ResolverSnapshot::new();
         for (target, importers) in &self.graph.importers_by_file {
@@ -2297,7 +2495,8 @@ impl GraphManager {
                 snapshot.record_edge(importer, target);
             }
         }
-        let _ = store.put_import_graph(&snapshot);
+        let _ = batch.set_import_graph(&snapshot);
+        let _ = store.apply_graph_batch(&batch);
     }
 
     pub fn refresh_before_query(&mut self) -> Result<RefreshReport> {
@@ -2600,6 +2799,27 @@ struct LoadedPartitions {
     missed_records: Vec<FileRecord>,
     loaded_files: usize,
     rebuilt: bool,
+}
+
+/// Attempt to load V2 resolver-cache data for a warm start. Returns per-file
+/// `ResolverFileEntry` values (fingerprint will be checked by the caller) and
+/// the optional single-blob `ResolverSnapshot`. Both results are best-effort:
+/// missing or undecodable entries are silently omitted.
+fn load_resolver_cache(
+    store: &GraphStore,
+    records: &[FileRecord],
+) -> Result<(
+    Vec<(FileId, resolver_cache::ResolverFileEntry)>,
+    Option<resolver_cache::ResolverSnapshot>,
+)> {
+    let file_ids: Vec<FileId> = records.iter().map(|r| r.id.clone()).collect();
+    let entries = store
+        .resolver_entries_for::<resolver_cache::ResolverFileEntry>(&file_ids)
+        .unwrap_or_default();
+    let snapshot = store
+        .import_graph::<resolver_cache::ResolverSnapshot>()
+        .unwrap_or_default();
+    Ok((entries, snapshot))
 }
 
 fn load_persisted_partitions(

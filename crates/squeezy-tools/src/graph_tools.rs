@@ -107,6 +107,39 @@ struct HierarchyArgs {
     max_results: Option<usize>,
 }
 
+/// Arguments for the `impact` graph tool. Accepts a symbol, a file path, or
+/// a set of changed file paths to drive the affected-set computation.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImpactArgs {
+    /// Symbol whose declaring file is treated as the changed root.
+    symbol_id: Option<String>,
+    /// Direct query to resolve to a symbol (used when `symbol_id` is absent).
+    query: Option<String>,
+    /// File path treated as the changed root.
+    path: Option<String>,
+    /// Additional file paths that are also part of the changed set.
+    #[serde(default)]
+    extra_paths: Vec<String>,
+    /// Maximum number of affected symbols to return (default 50).
+    max_results: Option<usize>,
+}
+
+/// Arguments for the `inheritance_hierarchy` graph tool.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InheritanceHierarchyArgs {
+    /// Symbol whose ancestors or descendants are requested.
+    symbol_id: Option<String>,
+    /// Text query to resolve to a class/struct/interface symbol.
+    query: Option<String>,
+    /// When `true`, return subtypes (direct `UsesTrait`/`Extends`/`Implements`
+    /// children) instead of supertypes. Default: `false` (ancestors).
+    subtypes: Option<bool>,
+    /// Maximum results (default 50).
+    max_results: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadSliceArgs {
@@ -695,22 +728,37 @@ fn graph_tool_diff_mode(call: &ToolCall) -> DiffMode {
 }
 
 pub(crate) fn graph_unavailable_result(call: &ToolCall, still_indexing: bool) -> ToolResult {
+    graph_unavailable_result_with_error(call, still_indexing, None)
+}
+
+/// Like [`graph_unavailable_result`] but surfaces a `store_open_error` key
+/// when `open_error` is `Some`, so the model can distinguish a persistence
+/// failure (which leaves the graph structurally absent but recoverable on the
+/// next process start) from a workspace that genuinely has no graph.
+pub(crate) fn graph_unavailable_result_with_error(
+    call: &ToolCall,
+    still_indexing: bool,
+    open_error: Option<String>,
+) -> ToolResult {
     // `fallback.suggested_tools` is intentionally absent — the reason code is
     // enough for the model to pick a non-graph retry path on its own.
     //
-    // `still_indexing` distinguishes the transient cold-start window (the
-    // background `GraphManager::open_with_store` task is still running and
-    // the wait condvar timed out) from a workspace where the open completed
-    // with `None` (structurally unavailable). The transient case carries a
-    // `retryable: true` hint so the model knows the same call will succeed
-    // shortly — without it, a cold-open that overran the wait stranded the
-    // model on a single `graph_unavailable` reading and it fell back to
-    // grep instead of retrying.
+    // Three cases:
+    //   still_indexing=true → graph is building; retry shortly
+    //   still_indexing=false + open_error=Some → store/parse failure on open;
+    //     the graph is absent because of an error, not by design
+    //   still_indexing=false + open_error=None → workspace has no graph
     let (status, reason, retryable) = if still_indexing {
         (
             "graph_indexing",
             "semantic graph is still being indexed; retry this tool call",
             true,
+        )
+    } else if open_error.is_some() {
+        (
+            "graph_open_error",
+            "semantic graph is unavailable: the graph open failed (see store_open_error)",
+            false,
         )
     } else {
         (
@@ -719,19 +767,25 @@ pub(crate) fn graph_unavailable_result(call: &ToolCall, still_indexing: bool) ->
             false,
         )
     };
+    let mut body = serde_json::Map::new();
+    body.insert("tool".to_string(), json!(call.name));
+    body.insert("graph_available".to_string(), json!(false));
+    body.insert("reason".to_string(), json!(reason));
+    body.insert("packets".to_string(), json!([]));
+    body.insert(
+        "fallback".to_string(),
+        json!({
+            "status": status,
+            "retryable": retryable,
+        }),
+    );
+    if let Some(err) = open_error {
+        body.insert("store_open_error".to_string(), json!(err));
+    }
     make_result(
         call,
         ToolStatus::Success,
-        json!({
-            "tool": call.name,
-            "graph_available": false,
-            "reason": reason,
-            "packets": [],
-            "fallback": {
-                "status": status,
-                "retryable": retryable,
-            }
-        }),
+        Value::Object(body),
         ToolCostHint::default(),
         None,
     )
@@ -2641,7 +2695,10 @@ impl ToolRegistry {
                 drop(graph);
                 return self.execute_read_slice_blocking(call, args, None);
             }
-            return graph_unavailable_result(call, !graph_ready);
+            // Surface the open error (if any) so the model can distinguish a
+            // store/parse failure from a workspace that genuinely has no graph.
+            let open_error = self.graph_open_error();
+            return graph_unavailable_result_with_error(call, !graph_ready, open_error);
         };
         let refresh = match manager.refresh_before_query() {
             Ok(report) => report,
@@ -2695,6 +2752,18 @@ impl ToolRegistry {
             }
             "hierarchy" => match serde_json::from_value::<HierarchyArgs>(call.arguments.clone()) {
                 Ok(args) => self.execute_hierarchy_blocking(call, args, manager, &refresh),
+                Err(err) => tool_arg_error(call, err),
+            },
+            "inheritance_hierarchy" => {
+                match serde_json::from_value::<InheritanceHierarchyArgs>(call.arguments.clone()) {
+                    Ok(args) => {
+                        self.execute_inheritance_hierarchy_blocking(call, args, manager, &refresh)
+                    }
+                    Err(err) => tool_arg_error(call, err),
+                }
+            }
+            "impact" => match serde_json::from_value::<ImpactArgs>(call.arguments.clone()) {
+                Ok(args) => self.execute_impact_blocking(call, args, manager, &refresh),
                 Err(err) => tool_arg_error(call, err),
             },
             "read_slice" => match serde_json::from_value::<ReadSliceArgs>(call.arguments.clone()) {
@@ -3254,6 +3323,208 @@ impl ToolRegistry {
             nodes,
             max_depth,
             args.max_results,
+            None,
+        )
+    }
+
+    fn execute_inheritance_hierarchy_blocking(
+        &self,
+        call: &ToolCall,
+        args: InheritanceHierarchyArgs,
+        manager: &GraphManager,
+        refresh: &squeezy_graph::RefreshReport,
+    ) -> ToolResult {
+        let graph = manager.graph();
+        let max_results = graph_limit(args.max_results);
+        let subtypes = args.subtypes.unwrap_or(false);
+
+        // Resolve the root symbol via id or text query.
+        let root = if let Some(id) = args.symbol_id.as_deref() {
+            graph.symbols.get(&SymbolId::new(id)).cloned()
+        } else if let Some(q) = args.query.as_deref() {
+            graph_symbol_search(graph, Some(q), None, None, None, None, None)
+                .into_iter()
+                .next()
+        } else {
+            None
+        };
+
+        let Some(root_sym) = root else {
+            let mut payload = graph_payload("inheritance_hierarchy", manager, refresh);
+            payload.insert("error".to_string(), json!("symbol not found"));
+            payload.insert("packets".to_string(), json!([]));
+            return make_result(
+                call,
+                ToolStatus::Success,
+                Value::Object(payload),
+                ToolCostHint::default(),
+                None,
+            );
+        };
+
+        let related: Vec<GraphSymbol> = if subtypes {
+            graph.inheritance_direct_subtypes(&root_sym.id)
+        } else {
+            graph.inheritance_ancestors(&root_sym.id)
+        };
+
+        let truncated = related.len() > max_results;
+        let selected: Vec<&GraphSymbol> = related.iter().take(max_results).collect();
+
+        let packets: Vec<Value> = selected
+            .iter()
+            .map(|sym| symbol_packet(graph, sym, "inheritance_hierarchy", symbol_next_action(sym)))
+            .collect();
+
+        let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
+        let mut payload = graph_payload("inheritance_hierarchy", manager, refresh);
+        payload.insert("root".to_string(), symbol_json(graph, &root_sym));
+        payload.insert(
+            "direction".to_string(),
+            json!(if subtypes { "subtypes" } else { "supertypes" }),
+        );
+        payload.insert(
+            "symbols".to_string(),
+            json!(
+                selected
+                    .iter()
+                    .map(|s| symbol_json(graph, s))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        payload.insert("packets".to_string(), json!(packets));
+        payload.insert("truncated".to_string(), json!(truncated));
+        make_result(
+            call,
+            ToolStatus::Success,
+            Value::Object(payload),
+            ToolCostHint {
+                matches_returned: selected.len() as u64,
+                truncated,
+                confidence_distribution,
+                ..ToolCostHint::default()
+            },
+            None,
+        )
+    }
+
+    fn execute_impact_blocking(
+        &self,
+        call: &ToolCall,
+        args: ImpactArgs,
+        manager: &GraphManager,
+        refresh: &squeezy_graph::RefreshReport,
+    ) -> ToolResult {
+        let graph = manager.graph();
+        let max_results = graph_limit(args.max_results);
+
+        // Collect the set of changed file IDs from the arguments.
+        let mut changed: HashSet<FileId> = HashSet::new();
+
+        if let Some(id) = args.symbol_id.as_deref() {
+            if let Some(sym) = graph.symbols.get(&SymbolId::new(id)) {
+                changed.insert(sym.file_id.clone());
+            }
+        } else if let Some(q) = args.query.as_deref() {
+            if let Some(sym) = graph_symbol_search(graph, Some(q), None, None, None, None, None)
+                .into_iter()
+                .next()
+            {
+                changed.insert(sym.file_id.clone());
+            }
+        }
+        if let Some(path) = args.path.as_deref() {
+            for file in graph.files.values() {
+                if file.relative_path == path || file.relative_path.ends_with(path) {
+                    changed.insert(file.id.clone());
+                }
+            }
+        }
+        for extra in &args.extra_paths {
+            for file in graph.files.values() {
+                if file.relative_path == *extra || file.relative_path.ends_with(extra.as_str()) {
+                    changed.insert(file.id.clone());
+                }
+            }
+        }
+
+        if changed.is_empty() {
+            let mut payload = graph_payload("impact", manager, refresh);
+            payload.insert(
+                "error".to_string(),
+                json!("no symbol or file resolved; provide symbol_id, query, or path"),
+            );
+            payload.insert("packets".to_string(), json!([]));
+            return make_result(
+                call,
+                ToolStatus::Success,
+                Value::Object(payload),
+                ToolCostHint::default(),
+                None,
+            );
+        }
+
+        // All changed files are treated as potentially propagating for
+        // worst-case impact; callers needing finer control can supply dirty
+        // annotations through `annotate_dirty_ranges` first.
+        let propagating = changed.clone();
+        let removed: HashSet<FileId> = HashSet::new();
+        let impact = graph.compute_impact(&changed, &propagating, &removed);
+
+        let truncated = impact.affected_symbols.len() > max_results;
+        let selected_symbols: Vec<&squeezy_graph::GraphSymbol> =
+            impact.affected_symbols.iter().take(max_results).collect();
+
+        let packets: Vec<Value> = selected_symbols
+            .iter()
+            .map(|sym| symbol_packet(graph, sym, "impact", symbol_next_action(sym)))
+            .collect();
+
+        let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
+
+        let affected_files_json: Vec<Value> = impact
+            .affected_files
+            .iter()
+            .filter_map(|fid| graph.files.get(fid))
+            .map(|f| json!({"file_id": f.id.0, "path": f.relative_path}))
+            .collect();
+
+        let test_symbols_json: Vec<Value> = impact
+            .affected_tests
+            .iter()
+            .take(max_results)
+            .map(|sym| symbol_json(graph, sym))
+            .collect();
+
+        let mut payload = graph_payload("impact", manager, refresh);
+        payload.insert(
+            "changed_files".to_string(),
+            json!(
+                changed
+                    .iter()
+                    .filter_map(|fid| graph.files.get(fid))
+                    .map(|f| f.relative_path.clone())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        payload.insert("affected_files".to_string(), json!(affected_files_json));
+        payload.insert(
+            "affected_file_count".to_string(),
+            json!(impact.affected_files.len()),
+        );
+        payload.insert("packets".to_string(), json!(packets));
+        payload.insert("test_symbols".to_string(), json!(test_symbols_json));
+        payload.insert("truncated".to_string(), json!(truncated));
+        make_result(
+            call,
+            ToolStatus::Success,
+            Value::Object(payload),
+            ToolCostHint {
+                matches_returned: selected_symbols.len() as u64,
+                truncated,
+                confidence_distribution,
+                ..ToolCostHint::default()
+            },
             None,
         )
     }

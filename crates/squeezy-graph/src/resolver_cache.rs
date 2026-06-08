@@ -3,8 +3,13 @@
 //! the shapes declared here. The graph layer owns the types because the
 //! store layer does not depend on parsed-file or cross-file structures.
 //!
-//! No consumer yet writes through these tables; the read consumer in
-//! [`crate::GraphManager::open_with_optional_store`] lands in Item 2 PR-2.
+//! [`crate::GraphManager::persist_resolver_cache`] writes through these tables
+//! after every successful refresh, batching all per-file entries and the import
+//! adjacency graph into a single redb transaction. A warm-start read path that
+//! loads these entries during [`crate::GraphManager::open_with_optional_store`]
+//! to pre-populate [`crate::SemanticGraph::resolver_slots`] and
+//! `importers_by_file` is implemented: fingerprint matches (modified-time +
+//! size) gate reuse so stale entries are never applied.
 
 use std::collections::BTreeMap;
 
