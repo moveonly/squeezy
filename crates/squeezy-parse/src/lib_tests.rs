@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use squeezy_core::{ContentHash, FileId};
+use squeezy_core::{ContentHash, FileId, SourceSpan};
 use squeezy_workspace::{FileRecord, stable_content_hash};
 
 use super::*;
@@ -1642,9 +1642,8 @@ fn parse_record_utf16_be_returns_encoding_hint() {
 
 #[test]
 fn parse_source_strips_utf8_bom_and_adds_diagnostic() {
-    const BOM: &str = "\u{FEFF}";
     // Prepend BOM to a minimal valid Rust source.
-    let source_with_bom = format!("{BOM}fn hello() {{}}\n");
+    let source_with_bom = format!("{UTF8_BOM}fn hello() {{}}\n");
     let mut parser = LanguageParser::new().unwrap();
     // The file on disk mirrors what read_to_string would return for a BOM file.
     let record = record("src/lib.rs", &source_with_bom);
@@ -1657,21 +1656,33 @@ fn parse_source_strips_utf8_bom_and_adds_diagnostic() {
         parsed.unsupported.is_none(),
         "BOM-prefixed source should still parse successfully"
     );
-    assert!(
-        parsed.symbols.iter().any(|s| s.name == "hello"),
-        "symbols should be extracted from BOM-prefixed source"
-    );
+    let hello = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "hello")
+        .expect("symbols should be extracted from BOM-prefixed source");
+    assert_eq!(hello.span.start_byte, UTF8_BOM_BYTE_LEN);
+    assert_eq!(hello.span.start.column, UTF8_BOM_BYTE_LEN);
+    assert_eq!(raw_span_text(&source_with_bom, hello.span), "fn hello() {}");
     assert!(
         parsed.diagnostics.iter().any(|d| d.message.contains("BOM")),
         "a BOM diagnostic should be present; diagnostics: {:?}",
         parsed.diagnostics
     );
+    let bom_diagnostic = parsed
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("BOM"))
+        .expect("BOM diagnostic");
+    assert_eq!(
+        bom_diagnostic.span.map(|span| (span.start_byte, span.end_byte)),
+        Some((0, UTF8_BOM_BYTE_LEN))
+    );
 }
 
 #[test]
 fn parse_source_utf8_bom_cache_hit_retains_diagnostic() {
-    const BOM: &str = "\u{FEFF}";
-    let source_with_bom = format!("{BOM}fn hello() {{}}\n");
+    let source_with_bom = format!("{UTF8_BOM}fn hello() {{}}\n");
     let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", &source_with_bom);
 
@@ -1689,6 +1700,12 @@ fn parse_source_utf8_bom_cache_hit_retains_diagnostic() {
         "BOM diagnostic should survive a cache hit; diagnostics: {:?}",
         parsed.diagnostics
     );
+    let hello = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "hello")
+        .expect("cached symbols should keep raw byte spans");
+    assert_eq!(raw_span_text(&source_with_bom, hello.span), "fn hello() {}");
 }
 
 #[test]
@@ -1767,8 +1784,7 @@ fn incremental_parse_crlf_produces_changed_ranges() {
 
 #[test]
 fn parse_source_strips_utf8_bom_for_csharp() {
-    const BOM: &str = "\u{FEFF}";
-    let source_with_bom = format!("{BOM}class Main {{}}\n");
+    let source_with_bom = format!("{UTF8_BOM}class Main {{}}\n");
     let mut parser = LanguageParser::new().unwrap();
     let record = csharp_record("src/Main.cs", &source_with_bom);
 
@@ -1781,10 +1797,14 @@ fn parse_source_strips_utf8_bom_for_csharp() {
         "C# BOM-prefixed source should parse; {:?}",
         parsed.unsupported
     );
-    assert!(
-        parsed.symbols.iter().any(|s| s.name == "Main"),
-        "Main class should be extracted from BOM-prefixed C# source"
-    );
+    let main_class = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Main")
+        .expect("Main class should be extracted from BOM-prefixed C# source");
+    assert_eq!(main_class.span.start_byte, UTF8_BOM_BYTE_LEN);
+    assert_eq!(main_class.span.start.column, UTF8_BOM_BYTE_LEN);
+    assert_eq!(raw_span_text(&source_with_bom, main_class.span), "class Main {}");
     assert!(
         parsed.diagnostics.iter().any(|d| d.message.contains("BOM")),
         "BOM diagnostic should be emitted for C# source"
@@ -1793,8 +1813,7 @@ fn parse_source_strips_utf8_bom_for_csharp() {
 
 #[test]
 fn parse_source_strips_utf8_bom_for_typescript() {
-    const BOM: &str = "\u{FEFF}";
-    let source_with_bom = format!("{BOM}const x: number = 1;\n");
+    let source_with_bom = format!("{UTF8_BOM}const x: number = 1;\n");
     let mut parser = LanguageParser::new().unwrap();
     let record = ts_record("src/app.ts", &source_with_bom);
 
@@ -1815,8 +1834,7 @@ fn parse_source_strips_utf8_bom_for_typescript() {
 
 #[test]
 fn parse_source_strips_utf8_bom_for_python() {
-    const BOM: &str = "\u{FEFF}";
-    let source_with_bom = format!("{BOM}def hello():\n    pass\n");
+    let source_with_bom = format!("{UTF8_BOM}def hello():\n    pass\n");
     let mut parser = LanguageParser::new().unwrap();
     let record = python_record("src/app.py", &source_with_bom);
 
@@ -1836,6 +1854,40 @@ fn parse_source_strips_utf8_bom_for_python() {
     assert!(
         parsed.diagnostics.iter().any(|d| d.message.contains("BOM")),
         "BOM diagnostic should be emitted for Python source"
+    );
+}
+
+#[test]
+fn parallel_parse_utf8_bom_returns_raw_spans_and_diagnostic() {
+    let mut records: Vec<FileRecord> = (0..7)
+        .map(|index| record(&format!("src/file{index}.rs"), "pub fn f() {}\n"))
+        .collect();
+    let source_with_bom = format!("{UTF8_BOM}pub fn bom_parallel() {{}}\n");
+    records.push(record("src/bom.rs", &source_with_bom));
+
+    let mut parser = LanguageParser::new().unwrap();
+    let (parsed, _summary) = parser.parse_records(&records).unwrap();
+
+    let bom_result = parsed
+        .iter()
+        .find(|parsed_file| parsed_file.file.relative_path == "src/bom.rs")
+        .expect("BOM result");
+    assert!(
+        bom_result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("BOM")),
+        "parallel path should emit a BOM diagnostic"
+    );
+    let symbol = bom_result
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "bom_parallel")
+        .expect("parallel path should extract BOM-prefixed symbol");
+    assert_eq!(symbol.span.start_byte, UTF8_BOM_BYTE_LEN);
+    assert_eq!(
+        raw_span_text(&source_with_bom, symbol.span),
+        "pub fn bom_parallel() {}"
     );
 }
 
@@ -3849,6 +3901,11 @@ fn slow_point_for_byte(source: &str, byte: usize) -> Point {
         }
     }
     Point { row, column }
+}
+
+fn raw_span_text(source: &str, span: SourceSpan) -> &str {
+    std::str::from_utf8(&source.as_bytes()[span.start_byte as usize..span.end_byte as usize])
+        .unwrap()
 }
 
 fn ts_record(relative_path: &str, source: &str) -> FileRecord {

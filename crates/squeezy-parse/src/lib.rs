@@ -23,6 +23,8 @@ pub(crate) use languages::{
 
 pub const CRATE_NAME: &str = "squeezy-parse";
 const PARALLEL_PARSE_THRESHOLD: usize = 8;
+const UTF8_BOM: &str = "\u{FEFF}";
+const UTF8_BOM_BYTE_LEN: u32 = 3;
 
 pub fn crate_name() -> &'static str {
     CRATE_NAME
@@ -389,10 +391,9 @@ impl LanguageParser {
             ));
         }
 
-        // Strip a UTF-8 BOM before all cache operations so byte offsets are
-        // relative to BOM-stripped content and the in-memory cache stays
-        // internally consistent.  The BOM flag is stored alongside the tree so
-        // cache hits can still emit the diagnostic without re-reading the file.
+        // Strip a UTF-8 BOM before all cache operations so the in-memory tree
+        // stays internally consistent. Returned spans are translated back to
+        // raw file byte coordinates below.
         let (source, had_bom) = strip_utf8_bom(source);
 
         if let Some(cached) = self.cache.get(&record.id)
@@ -402,6 +403,7 @@ impl LanguageParser {
             let mut parsed = extract_language(record.clone(), &source, &cached.tree);
             parsed.changed_ranges = Vec::new();
             if cached.had_bom {
+                translate_parsed_spans_to_raw_coordinates(&mut parsed, UTF8_BOM_BYTE_LEN);
                 parsed.diagnostics.push(utf8_bom_diagnostic());
             }
             return Ok(parsed);
@@ -447,6 +449,7 @@ impl LanguageParser {
         let mut parsed = extract_language(record.clone(), &source, &tree);
         parsed.changed_ranges = changed_ranges;
         if had_bom {
+            translate_parsed_spans_to_raw_coordinates(&mut parsed, UTF8_BOM_BYTE_LEN);
             parsed.diagnostics.push(utf8_bom_diagnostic());
         }
         self.cache.insert(
@@ -548,6 +551,7 @@ fn parse_record_with_cache(parsers: &mut ParserPool, job: ParseJob) -> Result<Pa
             let mut parsed = extract_language(record.clone(), &cached.source, &cached.tree);
             parsed.changed_ranges = Vec::new();
             if had_bom {
+                translate_parsed_spans_to_raw_coordinates(&mut parsed, UTF8_BOM_BYTE_LEN);
                 parsed.diagnostics.push(utf8_bom_diagnostic());
             }
             return Ok(ParseOutput {
@@ -613,6 +617,7 @@ fn parse_record_with_cache(parsers: &mut ParserPool, job: ParseJob) -> Result<Pa
     let mut parsed = extract_language(record.clone(), &source, &tree);
     parsed.changed_ranges = changed_ranges;
     if had_bom {
+        translate_parsed_spans_to_raw_coordinates(&mut parsed, UTF8_BOM_BYTE_LEN);
         parsed.diagnostics.push(utf8_bom_diagnostic());
     }
     Ok(ParseOutput {
@@ -934,11 +939,10 @@ fn read_source_file(path: &std::path::Path) -> std::result::Result<String, Sourc
 /// Strips a UTF-8 BOM (`U+FEFF`, 3 bytes `\xEF\xBB\xBF`) from `source` if
 /// present and returns `(stripped_source, had_bom)`.  Stripping before parsing
 /// prevents the BOM from being treated as a syntax error by tree-sitter grammars
-/// that do not recognise it; byte offsets in the returned parse result are
-/// relative to the BOM-stripped content.
+/// that do not recognise it; returned parse spans are translated back to raw
+/// file byte coordinates after extraction.
 fn strip_utf8_bom(source: String) -> (String, bool) {
-    const BOM: &str = "\u{FEFF}";
-    if let Some(stripped) = source.strip_prefix(BOM) {
+    if let Some(stripped) = source.strip_prefix(UTF8_BOM) {
         (stripped.to_string(), true)
     } else {
         (source, false)
@@ -946,17 +950,63 @@ fn strip_utf8_bom(source: String) -> (String, bool) {
 }
 
 /// Returns a [`ParseDiagnostic`] that identifies a UTF-8 BOM at the start of
-/// the file and advises the user to save without BOM.  The span is `None`
-/// because the BOM has already been stripped: any byte offset in this
-/// `ParsedFile` is relative to the BOM-stripped content, so a span pointing
-/// at byte 0 would incorrectly identify the first real character of code.
+/// the file and advises the user to save without BOM. The span uses raw file
+/// coordinates, matching every parser-produced span returned for BOM files.
 fn utf8_bom_diagnostic() -> ParseDiagnostic {
     ParseDiagnostic {
         message: "UTF-8 BOM at start of file; save as UTF-8 without BOM for reliable \
-                  parsing; byte offsets are relative to BOM-stripped content"
+                  parsing; byte offsets use raw file coordinates"
             .to_string(),
-        span: None,
+        span: Some(SourceSpan::new(
+            0,
+            UTF8_BOM_BYTE_LEN,
+            SourcePoint::new(0, 0),
+            SourcePoint::new(0, UTF8_BOM_BYTE_LEN),
+        )),
         confidence: Confidence::Partial,
+    }
+}
+
+fn translate_parsed_spans_to_raw_coordinates(parsed: &mut ParsedFile, byte_offset: u32) {
+    for symbol in &mut parsed.symbols {
+        translate_span_to_raw_coordinates(&mut symbol.span, byte_offset);
+        if let Some(span) = &mut symbol.body_span {
+            translate_span_to_raw_coordinates(span, byte_offset);
+        }
+        if let Some(span) = &mut symbol.signature_span {
+            translate_span_to_raw_coordinates(span, byte_offset);
+        }
+    }
+    for import in &mut parsed.imports {
+        translate_span_to_raw_coordinates(&mut import.span, byte_offset);
+    }
+    for call in &mut parsed.calls {
+        translate_span_to_raw_coordinates(&mut call.span, byte_offset);
+    }
+    for reference in &mut parsed.references {
+        translate_span_to_raw_coordinates(&mut reference.span, byte_offset);
+    }
+    for body_hit in &mut parsed.body_hits {
+        translate_span_to_raw_coordinates(&mut body_hit.span, byte_offset);
+    }
+    for diagnostic in &mut parsed.diagnostics {
+        if let Some(span) = &mut diagnostic.span {
+            translate_span_to_raw_coordinates(span, byte_offset);
+        }
+    }
+    for changed_range in &mut parsed.changed_ranges {
+        translate_span_to_raw_coordinates(changed_range, byte_offset);
+    }
+}
+
+fn translate_span_to_raw_coordinates(span: &mut SourceSpan, byte_offset: u32) {
+    span.start_byte = span.start_byte.saturating_add(byte_offset);
+    span.end_byte = span.end_byte.saturating_add(byte_offset);
+    if span.start.line == 0 {
+        span.start.column = span.start.column.saturating_add(byte_offset);
+    }
+    if span.end.line == 0 {
+        span.end.column = span.end.column.saturating_add(byte_offset);
     }
 }
 
