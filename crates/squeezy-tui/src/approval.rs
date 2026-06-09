@@ -183,12 +183,12 @@ fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) 
         .map(String::as_str);
     match (backend, mode) {
         (Some(b), Some(m)) if b != "none" => {
-            let mut posture = format!("sandbox {b}  mode {m}");
+            let mut posture = format!("sandbox {b}, mode {m}");
             if let Some(fs) = filesystem {
-                posture.push_str(&format!("  filesystem {fs}"));
+                posture.push_str(&format!(", filesystem {fs}"));
             }
             if let Some(net) = network {
-                posture.push_str(&format!("  network {net}"));
+                posture.push_str(&format!(", network {net}"));
             }
             lines.push(dim(posture));
         }

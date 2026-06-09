@@ -562,8 +562,8 @@ fn shell_preview_shows_sandbox_posture_when_backend_known() {
         "sandbox backend should appear in preview: {out}"
     );
     assert!(
-        out.contains("required"),
-        "sandbox mode should appear in preview: {out}"
+        out.contains("sandbox linux-direct-syscalls, mode required"),
+        "sandbox mode should appear in preview with comma separators: {out}"
     );
     assert!(
         out.contains("enforced"),
@@ -576,6 +576,12 @@ fn shell_preview_shows_sandbox_posture_when_backend_known() {
     assert!(
         !out.contains("network-policy"),
         "posture row should not use the legacy `network-policy` label: {out}"
+    );
+    assert!(
+        !out.contains("linux-direct-syscalls  mode")
+            && !out.contains("required  filesystem")
+            && !out.contains("enforced  network"),
+        "posture row should not use double-space field separators: {out}"
     );
 }
 
