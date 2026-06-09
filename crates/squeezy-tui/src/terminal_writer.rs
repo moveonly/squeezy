@@ -12,7 +12,10 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+
+use crate::metrics::ByteCounter;
 
 /// Environment variable whose value is a path to the debug tap log
 /// file. Empty or unset means "do not tap". The file is opened in
@@ -20,10 +23,11 @@ use std::sync::{Arc, Mutex};
 /// frames in order; rotation/truncation is the operator's job.
 pub(crate) const WRITE_LOG_ENV: &str = "SQUEEZY_TUI_WRITE_LOG";
 
-/// Sink used as the crossterm backend writer for the TUI. Owns the
-/// process stdout handle and optionally tees every byte to the debug
-/// log file selected by [`WRITE_LOG_ENV`].
-pub(crate) enum TerminalWriter {
+/// The byte-sink behind a [`TerminalWriter`]: the real stdout, an optional
+/// file tap mirror, or an in-memory capture buffer. Split out from the wrapper
+/// so the per-frame byte counter ([`TerminalWriter::counter`]) lives on the
+/// wrapper and is shared by every variant without duplicating a field.
+pub(crate) enum WriterKind {
     /// No log tap configured.
     Plain(io::Stdout),
     /// Tap active. Every successful stdout write is mirrored into
@@ -38,13 +42,25 @@ pub(crate) enum TerminalWriter {
     /// terminal I/O. Used by tests and headless renderers that need to
     /// assert on the exact ANSI stream the TUI would emit.
     ///
-    /// Not yet wired into a production code path; constructed via
-    /// [`TerminalWriter::capture`] by tests/headless renderers. The
-    /// targeted `allow(dead_code)` keeps warning-clean builds green
-    /// without a module-wide allow that would hide dead code in the
-    /// already-wired `Plain`/`Tee` variants.
+    /// Constructed only via [`TerminalWriter::capture`] (tests / the
+    /// `for_capture_test` guard); the targeted `allow(dead_code)` keeps the
+    /// non-test build warning-clean without masking dead code in the wired
+    /// `Plain`/`Tee` variants.
     #[allow(dead_code)]
     Capture { sink: Arc<Mutex<Vec<u8>>> },
+}
+
+/// Sink used as the crossterm backend writer for the TUI. Owns the
+/// process stdout handle (or a tap/capture sink) and optionally counts every
+/// byte emitted into a shared [`ByteCounter`] so the render-budget
+/// instrumentation can report bytes-per-frame (see [`crate::metrics`]).
+pub(crate) struct TerminalWriter {
+    kind: WriterKind,
+    /// Per-frame byte counter, bumped by every successful `write`. Shared with
+    /// the `TerminalGuard`, which resets it at frame begin and reads it at
+    /// frame end. `None` when no instrumentation handle is installed (the
+    /// counting is then skipped entirely).
+    counter: Option<ByteCounter>,
 }
 
 impl TerminalWriter {
@@ -60,24 +76,38 @@ impl TerminalWriter {
     /// Exposed so tests can exercise the tap without mutating process
     /// environment, which is racy across `cargo test`'s thread pool.
     pub(crate) fn from_optional_path(stdout: io::Stdout, path: Option<OsString>) -> Self {
-        match path {
+        let kind = match path {
             Some(p) if !p.is_empty() => match Self::open_tap(&p) {
-                Ok(tap) => Self::Tee { stdout, tap },
-                Err(_) => Self::Plain(stdout),
+                Ok(tap) => WriterKind::Tee { stdout, tap },
+                Err(_) => WriterKind::Plain(stdout),
             },
-            _ => Self::Plain(stdout),
+            _ => WriterKind::Plain(stdout),
+        };
+        Self {
+            kind,
+            counter: None,
         }
     }
 
     /// Build a writer that captures every emitted byte into `sink`
     /// instead of touching the terminal. This is the in-memory
-    /// counterpart to the file-backed [`Self::Tee`] tap: it lets tests
+    /// counterpart to the file-backed [`WriterKind::Tee`] tap: it lets tests
     /// and headless renderers observe the exact byte stream without a
     /// real stdout or a temp file. The caller retains a clone of the
     /// `Arc` to read the accumulated bytes after writing.
-    #[allow(dead_code)] // Not yet wired into a production path; see `Capture` variant.
+    #[allow(dead_code)] // Test/headless-only; see the `Capture` variant.
     pub(crate) fn capture(sink: Arc<Mutex<Vec<u8>>>) -> Self {
-        Self::Capture { sink }
+        Self {
+            kind: WriterKind::Capture { sink },
+            counter: None,
+        }
+    }
+
+    /// Install the shared per-frame [`ByteCounter`] so every subsequent write
+    /// increments it. Called once by the `TerminalGuard` after construction;
+    /// the guard keeps the other end of the `Arc` to sample bytes-per-frame.
+    pub(crate) fn set_byte_counter(&mut self, counter: ByteCounter) {
+        self.counter = Some(counter);
     }
 
     fn open_tap(path: &OsStr) -> io::Result<BufWriter<File>> {
@@ -88,14 +118,14 @@ impl TerminalWriter {
 
 impl Write for TerminalWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            TerminalWriter::Plain(stdout) => stdout.write(buf),
-            TerminalWriter::Tee { stdout, tap } => {
+        let written = match &mut self.kind {
+            WriterKind::Plain(stdout) => stdout.write(buf)?,
+            WriterKind::Tee { stdout, tap } => {
                 let written = stdout.write(buf)?;
                 let _ = tap.write_all(&buf[..written]);
-                Ok(written)
+                written
             }
-            TerminalWriter::Capture { sink } => {
+            WriterKind::Capture { sink } => {
                 // Accept the whole buffer: an in-memory sink never
                 // short-writes. A poisoned lock is treated as a benign
                 // no-op so capture failures can never disrupt a render,
@@ -103,22 +133,29 @@ impl Write for TerminalWriter {
                 if let Ok(mut buffer) = sink.lock() {
                     buffer.extend_from_slice(buf);
                 }
-                Ok(buf.len())
+                buf.len()
             }
+        };
+        // Count exactly the bytes the sink accepted (so a short stdout write is
+        // reflected). Relaxed: this is a per-frame statistic, never a
+        // synchronization point.
+        if let Some(counter) = &self.counter {
+            counter.fetch_add(written as u64, Ordering::Relaxed);
         }
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self {
-            TerminalWriter::Plain(stdout) => stdout.flush(),
-            TerminalWriter::Tee { stdout, tap } => {
+        match &mut self.kind {
+            WriterKind::Plain(stdout) => stdout.flush(),
+            WriterKind::Tee { stdout, tap } => {
                 let result = stdout.flush();
                 let _ = tap.flush();
                 result
             }
             // The sink is written eagerly, so there is nothing to
             // flush; bytes are already visible to the holder of `sink`.
-            TerminalWriter::Capture { .. } => Ok(()),
+            WriterKind::Capture { .. } => Ok(()),
         }
     }
 }

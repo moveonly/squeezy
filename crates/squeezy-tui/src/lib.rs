@@ -81,8 +81,10 @@ mod input;
 mod interaction;
 mod keymap;
 mod keymap_config;
+mod main_render_cache;
 mod mcp_settings_edit;
 mod mention;
+mod metrics;
 mod modal;
 mod notification;
 mod overlay;
@@ -3105,6 +3107,19 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // that looks for `Char('e') + CONTROL`. This is the source of the
     // "Ctrl+E does nothing", "Ctrl+X Q types Q" class of bugs.
     let key = normalise_control_byte(key);
+
+    // Hidden render-budget HUD toggle (`Ctrl+Alt+M`). A deliberately obscure
+    // chord — never a normal composer keystroke — so it stays out of the way
+    // while still being reachable at runtime for a quick perf glance, alongside
+    // the `SQUEEZY_RENDER_METRICS` env opt-in. Handled before every other
+    // dispatch so no surface can swallow it.
+    if key.code == KeyCode::Char('m')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.modifiers.contains(KeyModifiers::ALT)
+    {
+        app.toggle_render_metrics();
+        return Ok(false);
+    }
 
     // Any keypress while a turn-done notification is up counts as the
     // user acknowledging it — drop the title back to cleared so the
@@ -9198,6 +9213,21 @@ fn main_transcript_height(app: &TuiApp, area: Rect, include_startup_card: bool) 
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
+    render_surfaces(frame, app);
+    // The hidden render-budget HUD draws LAST so it overlays every surface
+    // (main view, Ctrl+T overlay, config, status-line setup). Off unless the
+    // operator toggled it on; it reserves no layout rows and clips whatever it
+    // overlaps in the top-right, like the toast stack.
+    if app.show_render_metrics {
+        render_metrics_hud(frame, frame.area(), app);
+    }
+}
+
+/// The actual per-surface dispatch: main view vs. transcript overlay / config /
+/// status-line setup, selected purely from `app` state. Split from [`render`]
+/// so the metrics HUD can paint on top of whichever surface this drew, without
+/// duplicating the HUD call at every early return.
+fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     app.begin_frame_clickables();
     let area = frame.area();
     if app.transcript_overlay.is_some() {
@@ -9333,6 +9363,50 @@ fn render_toast_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         frame.render_widget(Clear, rect);
         frame.render_widget(Paragraph::new(Line::from(span)), rect);
     }
+}
+
+/// Paint the hidden render-budget HUD in the top-right corner: a small bordered
+/// box of the latest [`metrics::RenderMetrics`] snapshot. Reserves no layout
+/// rows; it clips whatever it overlaps (like the toast stack). Only drawn when
+/// `app.show_render_metrics` is set.
+fn render_metrics_hud(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    use ratatui::{
+        style::{Color, Modifier, Style},
+        text::{Line, Span},
+        widgets::{Block, Borders, Clear, Paragraph},
+    };
+    let snapshot = app.render_metrics.get();
+    let lines = snapshot.hud_lines();
+    if lines.is_empty() || area.height < 3 || area.width < 12 {
+        return;
+    }
+    // Box width: widest content line + borders, clamped to the area.
+    let content_w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+    let box_w = (content_w + 4).min(area.width);
+    let box_h = (lines.len() as u16 + 2).min(area.height);
+    let x = area.right().saturating_sub(box_w);
+    let y = area.top();
+    let rect = Rect {
+        x,
+        y,
+        width: box_w,
+        height: box_h,
+    };
+    let text: Vec<Line> = lines
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::Gray))))
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " render ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(Color::Black));
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(text).block(block), rect);
 }
 
 fn render_inline(
@@ -10371,6 +10445,10 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
     app.main_text_width.set(text_area.width);
     let lines = transcript_lines_for_render(app, Some(text_area.width), include_startup_card);
     let total_rows = lines.len();
+    // Record the wrapped-row count this frame materialized for the main view so
+    // the render-budget HUD can report "rows built". `draw_app` resets the
+    // accumulator at frame begin and reads it at frame end.
+    metrics::record_rows_built(total_rows);
     let viewport_h = text_area.height as usize;
     let state = active_transcript_scroll(app);
     // The logical scroll state holds the destination `from_bottom`; an in-flight
@@ -12183,7 +12261,114 @@ fn transcript_lines_for_render(
 /// hidden reasoning) still get an offset — the position they *would* occupy —
 /// so `entry_offsets` is always exactly `entries.len()` long and indexable by
 /// entry index.
+/// Cached front door for [`transcript_lines_and_entry_offsets_uncached`].
+///
+/// The live main view rebuilds and re-wraps the whole transcript every frame.
+/// This wrapper memoises the assembled `(rows, entry_offsets)` behind a
+/// revision-keyed LRU (`main_render_cache`) so an idle or unchanged frame
+/// reuses the previous result instead of rebuilding. The cache is bypassed in
+/// two cases that the key cannot represent:
+///
+/// - `width == None`: the logical-line (unwrapped) path is rare (off-frame
+///   copy/export at logical granularity) and not worth a key dimension.
+/// - any visible entry is mid settle-fold (`entry.settle == Some(..)`): that
+///   entry renders a per-frame eased height driven by an absolute clock, not
+///   `animation_tick`, so caching would serve a stale fold height. The bypass
+///   keeps the fold animation smooth and is the documented exception to the
+///   per-entry cache contract.
+///
+/// On the cached path the returned `Vec`s are cloned out of the shared `Arc`
+/// once, matching the existing owned-`Vec` API. Selection/search highlight is
+/// NOT folded in here — callers layer it onto a clone afterwards (see
+/// `render_transcript`), so the cache survives selection drags and search
+/// cursor moves.
+///
+/// ## Virtualization decision (Phase 8)
+///
+/// Broader viewport virtualization — building rows ONLY for the visible window —
+/// is deliberately NOT done here, and would break load-bearing invariants:
+/// `render_transcript`'s scroll math (`from_bottom`, `scrollbar_geometry`), the
+/// search row model (`search_row_kinds` builds the FULL filtered row list),
+/// selection/copy (surface-local `Pos` indexes the FULL wrapped `Vec<Line>`),
+/// and `entry_offsets` jump-nav all require the COMPLETE materialized row list
+/// to stay exact. Materializing only near-viewport rows would desync every one
+/// of those.
+///
+/// What IS done is the safe half the task scopes: the cheap row metadata for
+/// the whole logical transcript is always materialized (so scroll/search/
+/// selection/scrollbar math stays byte-exact), while the EXPENSIVE per-entry
+/// styling and wrapping are deferred to a cache — `cached_transcript_entry_lines`
+/// memoises an entry's styled lines and `main_render_cache::get_or_compute_entry_wrap`
+/// memoises its wrapped rows, both keyed by `(entry, width, detail, revision,
+/// theme)`. So an unchanged entry off-screen is never re-styled or re-wrapped;
+/// only entries whose inputs actually changed pay the cost. This is
+/// lazy-styling-with-reuse rather than row virtualization, and it preserves
+/// every scroll/search/selection/copy/scrollbar semantic exactly.
 fn transcript_lines_and_entry_offsets(
+    app: &TuiApp,
+    width: Option<u16>,
+    include_startup_card: bool,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    let Some(width) = width else {
+        return transcript_lines_and_entry_offsets_uncached(app, None, include_startup_card);
+    };
+    let width = width.max(1);
+    // Settle-fold entries render a per-frame eased height that is not part of
+    // the key; bypass the cache so the fold stays smooth (see doc comment).
+    if active_transcript_entries(app)
+        .iter()
+        .any(|entry| entry.settle.is_some())
+    {
+        return transcript_lines_and_entry_offsets_uncached(app, Some(width), include_startup_card);
+    }
+    let key = main_render_key(app, width, include_startup_card);
+    let cached = main_render_cache::get_or_compute_main(key, || {
+        transcript_lines_and_entry_offsets_uncached(app, Some(width), include_startup_card)
+    });
+    (cached.0.clone(), cached.1.clone())
+}
+
+/// Build the assembled main-render cache key: every input that can change the
+/// produced rows or entry offsets. Mirrors `transcript_overlay_render_key` and
+/// `transcript_surface::row_cache_key`, plus the main-only `include_startup_card`.
+fn main_render_key(
+    app: &TuiApp,
+    width: u16,
+    include_startup_card: bool,
+) -> main_render_cache::MainRenderKey {
+    let entries = active_transcript_entries(app);
+    let mut transcript_hasher = std::collections::hash_map::DefaultHasher::new();
+    for entry in entries {
+        entry.id.hash(&mut transcript_hasher);
+        entry.revision.hash(&mut transcript_hasher);
+    }
+
+    let mut pending_hasher = std::collections::hash_map::DefaultHasher::new();
+    active_pending_reasoning(app).hash(&mut pending_hasher);
+    if active_subagent_record(app).is_none() && !app.pending_assistant.trim_is_empty() {
+        app.pending_assistant.text().hash(&mut pending_hasher);
+    }
+
+    main_render_cache::MainRenderKey {
+        render_cache_session: app.render_cache_session,
+        width,
+        selected_entry: active_selected_entry(app),
+        tool_output_verbosity: app.tool_output_verbosity as u8,
+        show_reasoning_usage: app.show_reasoning_usage,
+        coalesce_tool_runs: app.coalesce_tool_runs,
+        palette_generation: render::palette::palette_generation(),
+        subagent_source_hash: main_render_cache::hash_u64(app.subagent_pane.active),
+        transcript_revision_hash: transcript_hasher.finish(),
+        pending_hash: pending_hasher.finish(),
+        turn_divider_hash: main_render_cache::hash_u64(transcript_turn_divider_snapshot(app)),
+        shortcut_hash: shortcut_hash(
+            key_hint(app, keymap::Action::ToggleTranscriptOverlay).as_str(),
+        ),
+        include_startup_card,
+    }
+}
+
+fn transcript_lines_and_entry_offsets_uncached(
     app: &TuiApp,
     width: Option<u16>,
     include_startup_card: bool,
@@ -12370,27 +12555,119 @@ fn transcript_lines_and_entry_offsets(
         lines.push(Line::from(""));
     }
     if let Some(width) = width {
-        // Wrap to visual rows, building a logical-line → wrapped-row prefix-sum
-        // so the per-entry offsets can be remapped into the wrapped-row space
-        // the scroll model uses. `wrap_transcript_overlay_rows` is the same wrap
-        // the renderer would apply; we just track each logical line's row count.
+        // Wrap the assembled logical lines to visual rows, segmented by entry
+        // boundary so the *incremental* per-entry wrap cache
+        // (`main_render_cache::get_or_compute_entry_wrap`) can reuse an
+        // unchanged entry's wrapped rows. Only entries whose width, content
+        // (`entry_revision`), detail, or theme actually changed re-wrap —
+        // instead of the whole transcript re-wrapping every frame.
+        //
+        // Each entry owns the half-open logical range `[entry_line_starts[i],
+        // entry_line_starts[i + 1])`, which is self-contained: its rail
+        // connector, block, and trailing turn divider all land within it, and
+        // every wrapped continuation row of a logical line in the range stays
+        // in the range. So `rows.len()` at the moment an entry's segment begins
+        // IS that entry's wrapped-row offset — no per-logical-line prefix-sum is
+        // needed. The leading head segment (title / startup card) and the
+        // trailing tail segment (pending reasoning + assistant stream) carry no
+        // stable entry id, so they wrap directly, uncached, every frame; they
+        // are a few lines at most.
+        //
+        // Wrapping is a pure function of `(segment logical lines, width)`. The
+        // per-entry cache key folds the segment's exact content hash with the
+        // width, so it is content-addressed and cannot serve a wrong result —
+        // any change to the rail gutter / connector / divider that lands in the
+        // segment but does NOT bump `entry.revision` still busts the slot.
+        let w = usize::from(width.max(1));
         let mut rows: Vec<Line<'static>> = Vec::with_capacity(lines.len());
-        // `row_starts[i]` = wrapped-row index where logical line `i` begins;
-        // one extra trailing entry holds the total row count.
-        let mut row_starts: Vec<usize> = Vec::with_capacity(lines.len() + 1);
-        for line in &lines {
-            row_starts.push(rows.len());
-            wrap_transcript_overlay_line(line, usize::from(width.max(1)), &mut rows);
+        let mut entry_offsets: Vec<usize> = vec![0; entry_line_starts.len()];
+        let palette_generation = render::palette::palette_generation();
+        let n = lines.len();
+        let mut cursor = 0usize;
+        for (index, &start) in entry_line_starts.iter().enumerate() {
+            let seg_lo = start.min(n);
+            let seg_hi = entry_line_starts
+                .get(index + 1)
+                .copied()
+                .unwrap_or(n)
+                .min(n)
+                .max(seg_lo);
+            // Head / chrome before this entry's recorded start (only the first
+            // entry can have any: the title or startup card). Wrap it directly.
+            if seg_lo > cursor {
+                for line in &lines[cursor..seg_lo] {
+                    wrap_transcript_overlay_line(line, w, &mut rows);
+                }
+                cursor = seg_lo;
+            }
+            // This entry's wrapped block begins at the current row count.
+            entry_offsets[index] = rows.len();
+            if seg_hi <= cursor {
+                // Empty segment (suppressed run member / coalesced entry):
+                // nothing to wrap, offset is the position it would occupy.
+                continue;
+            }
+            let entry = &entries[index];
+            let segment = &lines[cursor..seg_hi];
+            let detail_hash = hash_wrap_segment(segment);
+            let wrapped = main_render_cache::get_or_compute_entry_wrap(
+                app.render_cache_session,
+                entry.id,
+                entry.revision,
+                width.max(1),
+                detail_hash,
+                palette_generation,
+                || {
+                    let mut seg_rows: Vec<Line<'static>> = Vec::new();
+                    for line in segment {
+                        wrap_transcript_overlay_line(line, w, &mut seg_rows);
+                    }
+                    seg_rows
+                },
+            );
+            rows.extend(wrapped.iter().cloned());
+            cursor = seg_hi;
         }
-        row_starts.push(rows.len());
-        let entry_offsets = entry_line_starts
-            .iter()
-            .map(|&logical| row_starts.get(logical).copied().unwrap_or(rows.len()))
-            .collect();
+        // Trailing tail (pending reasoning + assistant stream) after the last
+        // entry's segment. No stable entry id → wrap directly.
+        if cursor < n {
+            for line in &lines[cursor..n] {
+                wrap_transcript_overlay_line(line, w, &mut rows);
+            }
+        }
+        // An entry whose logical start fell past the line list (e.g. a fully
+        // suppressed trailing run) anchors at the end of the wrapped rows,
+        // matching the prior `row_starts.get(logical).unwrap_or(rows.len())`.
+        for (index, &start) in entry_line_starts.iter().enumerate() {
+            if start >= n {
+                entry_offsets[index] = rows.len();
+            }
+        }
         (rows, entry_offsets)
     } else {
         (lines, entry_line_starts)
     }
+}
+
+/// Content fingerprint of one entry's wrapped-segment logical lines: every
+/// span's text + style, with a per-line boundary marker so two lines cannot
+/// collide with one line of the same concatenated text. Folded into the
+/// per-entry wrap cache key so the slot is content-addressed (correct even when
+/// rail/divider chrome changes the segment without bumping `entry.revision`).
+fn hash_wrap_segment(segment: &[Line<'static>]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for line in segment {
+        for span in &line.spans {
+            span.content.hash(&mut hasher);
+            span.style.fg.hash(&mut hasher);
+            span.style.bg.hash(&mut hasher);
+            span.style.add_modifier.bits().hash(&mut hasher);
+            span.style.sub_modifier.bits().hash(&mut hasher);
+        }
+        // Line boundary marker.
+        u8::MAX.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Render a finished work node mid settle-fold: its expanded block,
@@ -19695,6 +19972,18 @@ pub(crate) struct TuiApp {
     /// this gate the loop redraws every ~50 ms and idle terminals show
     /// continuous activity in their per-tab indicators.
     pub(crate) needs_redraw: bool,
+    /// Latest per-frame render-budget snapshot (timing, bytes, rows, cache
+    /// hit/miss, longest entry wrap). Stamped by `draw_app` on every PAINTED
+    /// frame; untouched on idle frames (no paint → no churn), preserving the
+    /// zero-idle-work contract. Read by the hidden HUD and the trace line.
+    /// `Cell` because it is written through `&TuiApp` from inside the render
+    /// closure path and is plain `Copy` data.
+    pub(crate) render_metrics: std::cell::Cell<metrics::RenderMetrics>,
+    /// When set, paint the render-metrics HUD in the top-right of the main view
+    /// and emit the per-frame `tracing::debug!` summary. Off by default; seeded
+    /// from `SQUEEZY_RENDER_METRICS` at startup and flipped at runtime by
+    /// [`Self::toggle_render_metrics`]. A normal session never shows it.
+    pub(crate) show_render_metrics: bool,
     pub(crate) exit_confirm_armed: bool,
     pub(crate) active_tool_calls: BTreeMap<String, ToolCall>,
     /// Elapsed time on the currently-running tool, sourced from the
@@ -20190,6 +20479,10 @@ impl TuiApp {
             // Start dirty so the first iteration of the main loop paints
             // the initial frame.
             needs_redraw: true,
+            render_metrics: std::cell::Cell::new(metrics::RenderMetrics::default()),
+            // Hidden render-budget HUD: off unless `SQUEEZY_RENDER_METRICS` is
+            // set to a non-empty, non-`0` value. Runtime-toggleable thereafter.
+            show_render_metrics: resolve_render_metrics(|key| std::env::var_os(key)),
             exit_confirm_armed: false,
             active_tool_calls: BTreeMap::new(),
             active_tool_elapsed_ms: None,
@@ -20459,6 +20752,14 @@ impl TuiApp {
             // A smooth-scroll ease is wall-clock driven too; keep repainting
             // while one is running so the painted position advances to target.
             || self.main_scroll_anim.is_some()
+    }
+
+    /// Flip the hidden render-budget HUD on/off and request a repaint so the
+    /// change shows immediately. Wired to a debug key path; the HUD also emits
+    /// the per-frame trace line while on.
+    pub(crate) fn toggle_render_metrics(&mut self) {
+        self.show_render_metrics = !self.show_render_metrics;
+        self.needs_redraw = true;
     }
 
     pub(crate) fn push_transcript_item(&mut self, item: TranscriptItem) {
@@ -21649,6 +21950,10 @@ struct TerminalGuard {
     /// tests inject a [`crate::size_source::FixedSize`] so the inline-repro
     /// `paint_main` path can be driven at a deterministic size with no real TTY.
     size_source: Box<dyn crate::size_source::SizeSource>,
+    /// Shared per-frame byte counter installed into the terminal writer. The
+    /// writer bumps it on every write; `draw_app` resets it at frame begin and
+    /// reads the delta at frame end into [`metrics::RenderMetrics::bytes_emitted`].
+    byte_counter: metrics::ByteCounter,
 }
 
 impl TerminalGuard {
@@ -21687,6 +21992,21 @@ where
     F: Fn(&str) -> Option<std::ffi::OsString>,
 {
     env_get("SQUEEZY_INLINE_REPRO")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+}
+
+/// Resolve the initial state of the hidden render-budget HUD from the
+/// environment. `SQUEEZY_RENDER_METRICS=1` (or any non-empty, non-`0` value)
+/// shows the HUD and enables the per-frame trace line from the first frame;
+/// default OFF. Runtime-toggleable thereafter via
+/// [`TuiApp::toggle_render_metrics`]. Injected `env_get` keeps it testable
+/// without process-env mutation.
+fn resolve_render_metrics<F>(env_get: F) -> bool
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    env_get("SQUEEZY_RENDER_METRICS")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false)
 }
@@ -21877,6 +22197,11 @@ impl TerminalGuard {
         // `SQUEEZY_TUI_WRITE_LOG` is set. When unset the wrapper is a
         // thin pass-through.
         let mut writer = TerminalWriter::from_env(io::stdout());
+        // Install the per-frame byte counter so the render-budget HUD can
+        // report bytes-emitted-per-frame. The guard keeps the other end of the
+        // `Arc` to reset/read it across each `draw_app`.
+        let byte_counter: metrics::ByteCounter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        writer.set_byte_counter(Arc::clone(&byte_counter));
         // Mouse capture defaults ON in fullscreen (the alt-screen norm:
         // click-to-focus / scroll / drag are part of the UI). It hijacks
         // native text selection and scrollback, so Shift+drag / Shift+wheel
@@ -21912,6 +22237,7 @@ impl TerminalGuard {
             book: PaintBookkeeping::default(),
             synchronized_output,
             size_source: Box::new(crate::size_source::RealSize),
+            byte_counter,
         })
     }
 
@@ -21933,7 +22259,10 @@ impl TerminalGuard {
         h: u16,
     ) -> (Self, Arc<std::sync::Mutex<Vec<u8>>>) {
         let sink: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let backend = CrosstermBackend::new(TerminalWriter::capture(sink.clone()));
+        let byte_counter: metrics::ByteCounter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut writer = TerminalWriter::capture(sink.clone());
+        writer.set_byte_counter(Arc::clone(&byte_counter));
+        let backend = CrosstermBackend::new(writer);
         let viewport = Viewport::Fixed(Rect::new(0, 0, w.max(1), h.max(1)));
         let terminal = Terminal::with_options(backend, TerminalOptions { viewport })
             .expect("capture terminal builds with a fixed viewport");
@@ -21946,8 +22275,18 @@ impl TerminalGuard {
             book: PaintBookkeeping::default(),
             synchronized_output: false,
             size_source: Box::new(crate::size_source::FixedSize(w, h)),
+            byte_counter,
         };
         (guard, sink)
+    }
+
+    /// Test-only: force the resolved DEC 2026 synchronized-output flag on (the
+    /// `for_capture_test` constructor defaults it off). Lets a capture test
+    /// drive a frame with synchronized output enabled and assert the begin/end
+    /// brackets without depending on terminal-capability env detection.
+    #[cfg(test)]
+    fn set_synchronized_output(&mut self, enabled: bool) {
+        self.synchronized_output = enabled;
     }
 
     fn set_exit_hint(&mut self, exit_hint: Option<String>) {
@@ -22067,6 +22406,62 @@ impl TerminalGuard {
             // every frame, so the flag is a no-op nudge on both paths.
             app.pending_resize = false;
         }
+        // ---- Frame-budget instrumentation: begin ----
+        // This whole method is the single per-frame chokepoint for both paint
+        // paths, so it is the one place to bracket render time, byte count,
+        // rows built, cache hit/miss, and the longest entry wrap. Sample the
+        // per-frame accumulators at frame begin so the deltas below isolate
+        // THIS frame's work from every prior frame's.
+        let frame_start = Instant::now();
+        self.byte_counter
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        metrics::reset_rows_built();
+        metrics::reset_longest_entry_wrap();
+        let (hits_before, misses_before) = {
+            let (mh, mm, eh, em) = main_render_cache::cache_stats();
+            (mh + eh, mm + em)
+        };
+
+        let paint = self.paint_one_frame(app);
+
+        // ---- Frame-budget instrumentation: end ----
+        // Stamp the snapshot ONLY on a painted frame (this method runs only when
+        // the loop's redraw gate fired), so an idle frame churns nothing.
+        let (hits_after, misses_after) = {
+            let (mh, mm, eh, em) = main_render_cache::cache_stats();
+            (mh + eh, mm + em)
+        };
+        let prev = app.render_metrics.get();
+        let snapshot = metrics::RenderMetrics {
+            render_time: frame_start.elapsed(),
+            bytes_emitted: self.byte_counter.load(std::sync::atomic::Ordering::Relaxed),
+            rows_built: metrics::rows_built() as usize,
+            cache_hits: hits_after.wrapping_sub(hits_before),
+            cache_misses: misses_after.wrapping_sub(misses_before),
+            longest_entry_wrap: metrics::longest_entry_wrap(),
+            frame: prev.frame.wrapping_add(1),
+        };
+        app.render_metrics.set(snapshot);
+        if app.show_render_metrics {
+            // At most one line per painted frame, gated on the HUD flag so a
+            // normal session logs nothing.
+            tracing::debug!(target: "squeezy_tui::render", "{}", snapshot.trace_summary());
+        }
+
+        paint
+    }
+
+    /// Paint exactly one frame: route to the fullscreen `render()` or the
+    /// inline `paint_main` path. Factored out of [`Self::draw_app`] so the
+    /// instrumentation there brackets the whole paint without duplicating the
+    /// routing in both the timed and untimed positions.
+    ///
+    /// On the fullscreen path the `Terminal::draw` call is wrapped in DEC 2026
+    /// synchronized-output brackets when [`Self::synchronized_output`] is set,
+    /// so a capable terminal commits the frame's cells atomically (no partial
+    /// repaint / tearing). The inline path emits its own brackets inside
+    /// [`paint_main_inner`].
+    fn paint_one_frame(&mut self, app: &mut TuiApp) -> Result<()> {
         if self.inline_repro {
             // Legacy append-only inline path (escape hatch).
             if app.terminal_clear_pending {
@@ -22084,11 +22479,43 @@ impl TerminalGuard {
             // and the next `draw` repaints it; just clear the flag.
             app.terminal_clear_pending = false;
         }
-        let terminal = self.term();
-        terminal
+        self.draw_fullscreen_synchronized(app)
+    }
+
+    /// Run one fullscreen `Terminal::draw`, bracketed by DEC 2026
+    /// synchronized-output begin/end when enabled.
+    ///
+    /// Ordering matters: ratatui's `Terminal::draw` flushes the backend at frame
+    /// end, so BEGIN must be written-and-flushed BEFORE `draw` (otherwise the
+    /// terminal could commit the cells before it saw the begin) and END
+    /// written-and-flushed AFTER `draw` returns. We write begin/end directly to
+    /// the backend and flush each, so the bracket reliably surrounds the whole
+    /// committed frame. END is best-effort on the close side (mirroring
+    /// `paint_main_inner`) so a stray begin can never be left open: it is
+    /// emitted whether or not the inner draw succeeded.
+    fn draw_fullscreen_synchronized(&mut self, app: &mut TuiApp) -> Result<()> {
+        let synchronized = self.synchronized_output;
+        if synchronized {
+            let backend = self.term().backend_mut();
+            backend
+                .write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes())
+                .and_then(|_| backend.flush())
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        }
+        let drawn = self
+            .term()
             .draw(|frame| render(frame, app))
             .map(|_| ())
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))
+            .map_err(|err| SqueezyError::Terminal(err.to_string()));
+        if synchronized {
+            // Close the synchronized update even if the draw failed, so a
+            // capable terminal is never left buffering. Best-effort flush.
+            let backend = self.term().backend_mut();
+            let _ = backend
+                .write_all(END_SYNCHRONIZED_UPDATE.as_bytes())
+                .and_then(|_| backend.flush());
+        }
+        drawn
     }
 
     /// Append-only main-view paint, in the cargo / indicatif model. Every
@@ -22441,6 +22868,20 @@ fn footer_content_height(buf: &Buffer) -> u16 {
 /// them as one: the moon-phase set and the dingbat "working" spinner. Treating
 /// them as wide when measuring emission keeps a full-width footer row (the
 /// composer horizon) from overflowing the last column and wrapping.
+///
+/// Phase 8 wide-glyph audit verdict — KEEP, do not remove or replace with the
+/// `unicode-width` crate. This is NOT a duplicate of the crate: it is a
+/// narrowly-scoped OVERRIDE for exactly the status glyphs squeezy emits, which
+/// the crate (correctly per the Unicode East Asian Width tables) measures as 1
+/// cell but xterm.js draws as 2. For every other glyph class — CJK ideographs,
+/// emoji (incl. variation selectors and ZWJ sequences), combining marks, and
+/// ambiguous-width codepoints — `term_display_width` defers to the crate
+/// verbatim (pinned by the `width_audit_*` tests in `lib_tests.rs`). Removing
+/// this and routing through the crate would let a full-width footer/composer row
+/// ending in a moon overflow the last column and wrap a stray line into native
+/// scrollback — the precise bug this exists to prevent. It is also not worth
+/// narrowing: the ranges are O(1), self-documenting as "the moon/spinner
+/// families," and tolerant of future animation-set tweaks.
 fn is_wide_rendered_glyph(c: char) -> bool {
     matches!(c as u32,
         0x25CB | 0x25CF            // ○ ●

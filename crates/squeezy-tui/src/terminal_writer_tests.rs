@@ -65,7 +65,7 @@ fn from_env_returns_plain_when_env_unset() {
     let _guard = EnvGuard::unset(WRITE_LOG_ENV);
 
     let writer = TerminalWriter::from_env(io::stdout());
-    assert!(matches!(writer, TerminalWriter::Plain(_)));
+    assert!(matches!(writer.kind, WriterKind::Plain(_)));
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn from_env_returns_plain_when_env_empty() {
     let _guard = EnvGuard::set(WRITE_LOG_ENV, &OsString::from(""));
 
     let writer = TerminalWriter::from_env(io::stdout());
-    assert!(matches!(writer, TerminalWriter::Plain(_)));
+    assert!(matches!(writer.kind, WriterKind::Plain(_)));
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn from_env_attaches_tap_when_env_points_at_writable_path() {
     let _guard = EnvGuard::set(WRITE_LOG_ENV, &path.clone().into_os_string());
 
     let writer = TerminalWriter::from_env(io::stdout());
-    assert!(matches!(writer, TerminalWriter::Tee { .. }));
+    assert!(matches!(writer.kind, WriterKind::Tee { .. }));
     drop(writer);
 
     let _ = fs::remove_file(&path);
@@ -106,7 +106,7 @@ fn from_env_silently_falls_back_to_plain_when_tap_path_is_unwritable() {
     let _guard = EnvGuard::set(WRITE_LOG_ENV, &path.clone().into_os_string());
 
     let writer = TerminalWriter::from_env(io::stdout());
-    assert!(matches!(writer, TerminalWriter::Plain(_)));
+    assert!(matches!(writer.kind, WriterKind::Plain(_)));
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn capture_writer_records_every_byte_across_writes_and_flush() {
     // this test is deterministic and races nothing.
     let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let mut writer = TerminalWriter::capture(Arc::clone(&sink));
-    assert!(matches!(writer, TerminalWriter::Capture { .. }));
+    assert!(matches!(writer.kind, WriterKind::Capture { .. }));
 
     // Plain multi-write path: each call appends to the same sink.
     writer.write_all(b"alpha-").unwrap();

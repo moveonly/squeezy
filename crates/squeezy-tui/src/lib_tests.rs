@@ -5702,6 +5702,223 @@ fn is_wide_rendered_glyph_classifies_the_special_set() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wide-glyph width audit (Phase 8): one pinned test per glyph class, fixing the
+// INTENDED display width and wrapping behaviour so a future change to either the
+// `unicode-width` crate or `is_wide_rendered_glyph` is a deliberate, visible
+// decision rather than a silent regression.
+//
+// Verdict (see also the comment on `is_wide_rendered_glyph` itself): the helper
+// MUST STAY. It is not a duplicate of the `unicode-width` crate — it is a
+// narrowly-scoped OVERRIDE for exactly the decorative status glyphs squeezy
+// emits (the moon coin/phases and the dingbat working spinner), which the crate
+// measures as 1 cell but xterm.js / VS Code's integrated terminal draws 2 cells
+// wide. For every other class (`CJK`, emoji, combining marks, ambiguous-width)
+// `term_display_width` defers to the crate verbatim, as the tests below pin. So
+// it cannot be removed and routed through the crate; doing so would let a
+// full-width footer/composer row ending in a moon overflow the last column and
+// wrap into native scrollback — the exact bug it exists to prevent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn width_audit_cjk_ideograph_defers_to_unicode_width() {
+    // CJK ideographs are genuinely wide (crate width 2) and NOT in the special
+    // set, so the helper passes the crate's value straight through — no
+    // override. Pins that we never special-case CJK.
+    assert_eq!(
+        "好".width(),
+        2,
+        "the crate measures the ideograph as 2 cells"
+    );
+    assert_eq!(
+        term_display_width("好"),
+        "好".width() as u16,
+        "the helper defers to unicode-width for CJK (no override)"
+    );
+}
+
+#[test]
+fn width_audit_emoji_presentation_defers_to_unicode_width() {
+    // An emoji base character: whatever the crate reports, the helper passes
+    // through unchanged (no blanket emoji hack). Pinned so a future emoji
+    // override is a conscious change, not an accident.
+    let emoji = "😀";
+    assert_eq!(
+        term_display_width(emoji),
+        emoji.width() as u16,
+        "the helper defers to unicode-width for emoji (no override)"
+    );
+}
+
+#[test]
+fn width_audit_emoji_variation_selector_defers_to_unicode_width() {
+    // A base char plus a U+FE0F emoji variation selector: VS-handling is the
+    // crate's job. Assert the helper returns the crate's value, and document
+    // that the selector is the crate's concern by comparing to the bare base.
+    let with_vs = "☺\u{FE0F}";
+    assert_eq!(
+        term_display_width(with_vs),
+        with_vs.width() as u16,
+        "the helper defers to unicode-width for variation-selector sequences"
+    );
+}
+
+#[test]
+fn width_audit_emoji_zwj_sequence_sums_per_codepoint() {
+    // A ZWJ sequence ("👨‍👩" = man + ZWJ + woman). This crate has no grapheme
+    // segmentation, so display columns are summed PER CODEPOINT (the ZWJ joiner
+    // is zero-width), not per grapheme. Pin that intended behaviour via the
+    // mouse hit-test mapping: a click past the whole sequence lands at the char
+    // offset after all of its codepoints, and the joiner consumes no column.
+    let zwj = "👨\u{200D}👩";
+    let char_count = zwj.chars().count(); // man, ZWJ, woman = 3 chars
+    assert_eq!(char_count, 3);
+    // The joiner is zero-width, so the two emoji occupy the only display cells.
+    let total_cols = crate::selection::display_width_of_chars(zwj, char_count);
+    assert_eq!(
+        total_cols,
+        "👨".width() + "👩".width(),
+        "ZWJ joiner is zero-width; columns are the two emoji summed per codepoint"
+    );
+    // A click far past the end clamps to the char count (caret after the last
+    // codepoint), confirming the per-codepoint (non-grapheme) basis is the
+    // intended hit-test contract.
+    assert_eq!(
+        crate::selection::char_offset_for_display_col(zwj, 999),
+        char_count,
+        "a click past the sequence clamps to the per-codepoint char count"
+    );
+}
+
+#[test]
+fn width_audit_moon_status_glyph_is_overridden_to_two() {
+    // The moon coin/phase glyphs: crate width 1, but the helper forces 2 (the
+    // VS Code override). This is the ONE class where the helper disagrees with
+    // the crate, and it must.
+    for moon in ['○', '●', '◐', '◗', '☽', '☾'] {
+        let s = moon.to_string();
+        assert_eq!(
+            s.as_str().width(),
+            1,
+            "the crate measures {moon:?} as 1 cell"
+        );
+        assert_eq!(
+            term_display_width(&s),
+            2,
+            "the helper overrides {moon:?} to 2 cells for xterm.js"
+        );
+    }
+}
+
+#[test]
+fn width_audit_spinner_status_glyphs_are_overridden_to_two() {
+    // The live `Scintillate` working-spinner frames (render/spinner.rs:41). Each
+    // is crate width 1 but drawn 2 cells wide, so the helper forces 2. Ties the
+    // helper's `0x2736..=0x273D` range to the actual spinner source — if the
+    // spinner glyphs change, this test flags the helper range to follow.
+    for frame in ['✶', '✷', '✸', '✹', '✺'] {
+        let s = frame.to_string();
+        assert_eq!(
+            s.as_str().width(),
+            1,
+            "the crate measures spinner {frame:?} as 1 cell"
+        );
+        assert_eq!(
+            term_display_width(&s),
+            2,
+            "the helper overrides spinner {frame:?} to 2 cells"
+        );
+    }
+}
+
+#[test]
+fn width_audit_combining_mark_is_zero_width() {
+    // A base char plus a combining mark ("e" + U+0301 acute). The mark is
+    // zero-width, so "é" (decomposed) occupies ONE display cell, and a click
+    // never resolves TO the mark — it skips it. Pins the intended combining
+    // behaviour the selection hit-tester relies on.
+    let combined = "e\u{0301}";
+    assert_eq!(
+        combined.chars().count(),
+        2,
+        "base + combining mark = 2 chars"
+    );
+    assert_eq!(
+        crate::selection::display_width_of_chars(combined, 2),
+        1,
+        "a base glyph + zero-width combining mark occupies one display cell"
+    );
+    // A click on the single occupied cell maps to the base char (offset 0); the
+    // mark is skipped, never selected on its own.
+    assert_eq!(
+        crate::selection::char_offset_for_display_col(combined, 0),
+        0,
+        "the only display cell maps to the base char"
+    );
+}
+
+#[test]
+fn width_audit_ambiguous_width_char_stays_narrow() {
+    // An East-Asian-ambiguous codepoint (U+00A7 SECTION SIGN). squeezy uses the
+    // crate's default (narrow = 1) and does NOT treat ambiguous as wide; nor is
+    // it in `is_wide_rendered_glyph`. Pin width 1 so any move to a CJK-wide
+    // policy is deliberate. Cross-reference: the emulator's own
+    // `ambiguous_glyph_width` policy lives in `termsim/types.rs` and is the
+    // place to change if ambiguous-wide handling is ever wanted.
+    let ambiguous = "§"; // U+00A7
+    assert_eq!(
+        ambiguous.width(),
+        1,
+        "the crate measures § as 1 cell (narrow default)"
+    );
+    assert!(
+        !is_wide_rendered_glyph('§'),
+        "§ is not a squeezy decorative glyph, so it is not forced wide"
+    );
+    assert_eq!(
+        term_display_width(ambiguous),
+        1,
+        "squeezy treats ambiguous-width as narrow (defers to the crate default)"
+    );
+}
+
+#[test]
+fn width_audit_mirror_keeps_wide_moon_at_exact_fit_and_drops_it_when_overflowing() {
+    // End-to-end guard tying the two defense layers together: a transcript row
+    // ending in a moon at the last content column. `term_display_width` forces
+    // the moon to 2 cells, so `emit_buffer_row_styled` (the mirror's per-glyph
+    // emitter) drops it when its second rendered column would overflow the row,
+    // and keeps it when the two columns fit exactly. This is the concrete
+    // overflow-prevention the helper exists for.
+    const WIDTH: u16 = 6;
+
+    // Overflow case: moon in the LAST column (x = WIDTH-1) has no room for its
+    // 2nd rendered column → dropped.
+    let mut overflow = Buffer::empty(Rect::new(0, 0, WIDTH, 1));
+    overflow.set_string(0, 0, "abcde", Style::default());
+    overflow.set_string(WIDTH - 1, 0, "●", Style::default());
+    let mut out = Vec::new();
+    emit_buffer_row_styled(&mut out, &overflow, 0, WIDTH).expect("emit");
+    let text = strip_ansi(&String::from_utf8_lossy(&out));
+    assert!(
+        !text.contains('●'),
+        "a wide moon at the last column would overflow and must be dropped: {text:?}"
+    );
+
+    // Exact-fit case: moon at x = WIDTH-2 so its two rendered columns are the
+    // final pair → kept.
+    let mut fit = Buffer::empty(Rect::new(0, 0, WIDTH, 1));
+    fit.set_string(0, 0, "abcd", Style::default());
+    fit.set_string(WIDTH - 2, 0, "●", Style::default());
+    let mut out2 = Vec::new();
+    emit_buffer_row_styled(&mut out2, &fit, 0, WIDTH).expect("emit");
+    let text2 = strip_ansi(&String::from_utf8_lossy(&out2));
+    assert!(
+        text2.contains('●'),
+        "a wide moon whose 2nd column lands on the last column fits and is kept: {text2:?}"
+    );
+}
+
 #[test]
 fn footer_content_height_empty_buffer_is_one() {
     // An all-blank buffer has no content rows; the footer still occupies at
@@ -8385,6 +8602,160 @@ async fn draw_app_routes_inline_repro_through_paint_main() {
         ansi.contains(DISABLE_LINE_WRAP),
         "inline-repro draw_app must run the append-only paint_main path"
     );
+}
+
+/// `\x1b[?2026h` / `\x1b[?2026l` — DEC 2026 synchronized-output begin/end. The
+/// fullscreen renderer brackets each painted frame with these when synchronized
+/// output is enabled so a capable terminal commits the frame's cells atomically.
+const SYNC_BEGIN: &str = "\x1b[?2026h";
+const SYNC_END: &str = "\x1b[?2026l";
+
+#[tokio::test]
+async fn fullscreen_draw_app_brackets_frame_in_synchronized_output_when_enabled() {
+    // The Phase 8 sync-output guarantee on the PRODUCTION fullscreen path: when
+    // synchronized output is enabled, the `Terminal::draw` is wrapped in DEC
+    // 2026 begin/end so a capable terminal never shows a partially-painted
+    // frame. Drive `draw_app` against the capture sink with the flag forced on
+    // and assert the painted frame is bracketed, with BEGIN before END.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hello from the model"));
+
+    let (mut guard, sink) =
+        TerminalGuard::for_capture_test(/* inline_repro = */ false, 120, 40);
+    guard.set_synchronized_output(true);
+    guard.draw_app(&mut app).expect("fullscreen draw_app");
+    let ansi = sink_to_string(&sink);
+
+    let begin = ansi
+        .find(SYNC_BEGIN)
+        .expect("a synchronized fullscreen frame must open with the DEC 2026 begin marker");
+    let end = ansi
+        .rfind(SYNC_END)
+        .expect("a synchronized fullscreen frame must close with the DEC 2026 end marker");
+    assert!(
+        begin < end,
+        "the begin marker must precede the end marker so the frame is wrapped, \
+         not the other way around"
+    );
+    // The actual frame content (the composer horizon main view) must land
+    // BETWEEN the brackets, proving they surround the commit rather than sitting
+    // adjacent to it.
+    let between = &ansi[begin + SYNC_BEGIN.len()..end];
+    assert!(
+        row_is_composer_horizon(&strip_ansi(between)),
+        "the painted frame must sit inside the synchronized-output brackets"
+    );
+}
+
+#[tokio::test]
+async fn fullscreen_draw_app_emits_no_synchronized_brackets_when_disabled() {
+    // The default capture guard has synchronized output OFF; the fullscreen
+    // frame must then emit no DEC 2026 brackets at all (the feature is opt-in by
+    // terminal capability / user policy).
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hello from the model"));
+
+    let (mut guard, sink) =
+        TerminalGuard::for_capture_test(/* inline_repro = */ false, 120, 40);
+    guard.draw_app(&mut app).expect("fullscreen draw_app");
+    let ansi = sink_to_string(&sink);
+
+    assert!(
+        !ansi.contains(SYNC_BEGIN) && !ansi.contains(SYNC_END),
+        "synchronized output is opt-in: a disabled frame emits no DEC 2026 brackets"
+    );
+}
+
+#[tokio::test]
+async fn draw_app_stamps_render_metrics_for_a_painted_frame() {
+    // Frame-budget instrumentation, end to end through the production
+    // `draw_app` chokepoint: a painted frame must stamp a non-trivial metrics
+    // snapshot — bytes actually emitted, rows built for the main view, and a
+    // frame ordinal that advances.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant(
+        "hello from the model, a reasonably long line so the wrap does some work",
+    ));
+
+    let before = app.render_metrics.get();
+    assert_eq!(before.frame, 0, "a fresh app has stamped no frames yet");
+
+    let (mut guard, _sink) =
+        TerminalGuard::for_capture_test(/* inline_repro = */ false, 120, 40);
+    guard.draw_app(&mut app).expect("fullscreen draw_app");
+
+    let m = app.render_metrics.get();
+    assert_eq!(m.frame, 1, "the first painted frame is frame #1");
+    assert!(m.bytes_emitted > 0, "a painted frame emits bytes: {m:?}");
+    assert!(
+        m.rows_built > 0,
+        "the main view materialized wrapped rows this frame: {m:?}"
+    );
+    // The second paint advances the ordinal, proving the stamp is per-frame.
+    guard
+        .draw_app(&mut app)
+        .expect("second fullscreen draw_app");
+    assert_eq!(
+        app.render_metrics.get().frame,
+        2,
+        "each painted frame advances the frame ordinal"
+    );
+}
+
+#[tokio::test]
+async fn render_metrics_hud_paints_only_when_toggled_on() {
+    // The HUD is hidden by default and shows the `render` box only after the
+    // toggle. Asserted on the captured glyph stream so it does not depend on
+    // exact escape framing.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hello"));
+
+    let (mut guard, sink) =
+        TerminalGuard::for_capture_test(/* inline_repro = */ false, 120, 40);
+    guard.draw_app(&mut app).expect("draw without HUD");
+    let plain_off = strip_ansi(&sink_to_string(&sink));
+    assert!(
+        !plain_off.contains("render"),
+        "the render-metrics HUD must be hidden by default"
+    );
+
+    app.toggle_render_metrics();
+    assert!(app.show_render_metrics, "toggle turns the HUD on");
+    // Fresh sink for the second frame so we inspect only the toggled-on paint.
+    let (mut guard2, sink2) =
+        TerminalGuard::for_capture_test(/* inline_repro = */ false, 120, 40);
+    guard2.draw_app(&mut app).expect("draw with HUD");
+    let plain_on = strip_ansi(&sink_to_string(&sink2));
+    assert!(
+        plain_on.contains("render"),
+        "the HUD's `render` title must paint once toggled on: {plain_on:?}"
+    );
+}
+
+#[test]
+fn toggle_render_metrics_flips_flag_and_requests_redraw() {
+    let mut app = test_app(SessionMode::Build);
+    app.needs_redraw = false;
+    assert!(!app.show_render_metrics, "HUD is off by default");
+    app.toggle_render_metrics();
+    assert!(app.show_render_metrics, "toggle turns it on");
+    assert!(
+        app.needs_redraw,
+        "toggling requests a repaint so it shows now"
+    );
+    app.toggle_render_metrics();
+    assert!(!app.show_render_metrics, "toggle turns it back off");
+}
+
+#[test]
+fn resolve_render_metrics_is_opt_in() {
+    use std::ffi::OsString;
+    // Unset / empty / "0" stay off; any other non-empty value turns it on.
+    assert!(!resolve_render_metrics(|_| None));
+    assert!(!resolve_render_metrics(|_| Some(OsString::from(""))));
+    assert!(!resolve_render_metrics(|_| Some(OsString::from("0"))));
+    assert!(resolve_render_metrics(|_| Some(OsString::from("1"))));
+    assert!(resolve_render_metrics(|_| Some(OsString::from("yes"))));
 }
 
 #[test]
@@ -20199,4 +20570,311 @@ fn sync_queue_ids_heals_back_enqueue() {
     let ids: Vec<u64> = app.prompt_queue_ids.iter().copied().collect();
     assert_eq!(ids[0..2], [0, 1]);
     assert_eq!(ids[2], 2);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8: main transcript render cache — integration tests.
+//
+// These drive the real `transcript_lines_and_entry_offsets` path through a
+// `TuiApp` (the unit tests for the cache primitives live in
+// `main_render_cache_tests.rs`). They prove: the assembled cache hits on an
+// unchanged second frame; it invalidates on every key dimension; the painted
+// output is byte-for-byte identical with and without the cache; and selection /
+// search highlight (a post-pass, deliberately NOT keyed) still changes the
+// painted output while keeping the underlying row cache warm.
+// ---------------------------------------------------------------------------
+
+/// One span's full visual fingerprint: text + fg + bg + set/cleared modifiers.
+type SpanFingerprint = (String, Option<Color>, Option<Color>, u16, u16);
+
+/// A fingerprint of one wrapped line that captures text AND every styling
+/// attribute, so "byte-for-byte identical" comparisons catch a style drift the
+/// plain-text projection would miss.
+fn line_fingerprint(line: &Line<'static>) -> Vec<SpanFingerprint> {
+    line.spans
+        .iter()
+        .map(|s| {
+            (
+                s.content.to_string(),
+                s.style.fg,
+                s.style.bg,
+                s.style.add_modifier.bits(),
+                s.style.sub_modifier.bits(),
+            )
+        })
+        .collect()
+}
+
+fn rows_fingerprint(rows: &[Line<'static>]) -> Vec<Vec<SpanFingerprint>> {
+    rows.iter().map(line_fingerprint).collect()
+}
+
+fn main_render_app() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user(
+        "explain the architecture of this module in detail please",
+    ));
+    app.push_transcript_item(TranscriptItem::assistant(
+        "The module is split into a builder and a wrapper. The builder assembles \
+         logical lines for every transcript entry and then wraps them to visual \
+         rows; the wrapper memoises that result behind a revision-keyed LRU so an \
+         idle frame reuses the rows instead of rebuilding them.",
+    ));
+    app.push_transcript_item(TranscriptItem::user("and what about caching?"));
+    app.push_transcript_item(TranscriptItem::assistant(
+        "Caching keys on the entry revision, wrap width, detail policy, and theme.",
+    ));
+    app
+}
+
+// Hit/miss is asserted via `contains_main_key` (presence of this app's exact
+// key in the process-wide LRU), which is race-free because every `TuiApp` mints
+// a private `render_cache_session`. The global hit/miss stat counters are NOT
+// used for exact assertions here — they race under parallel `cargo test`.
+//
+// Two shared resources make these tests order-sensitive:
+//   1. The process-wide assembled-render LRU is small (cap 24); a concurrent
+//      flood from another test could evict the slot we just warmed.
+//   2. The render-cache KEY folds the process-global theme generation; a
+//      sibling test that bumps it (`..._invalidates_on_theme_change`) could
+//      change our key between computing it and rendering.
+// So every test here holds BOTH the crate-shared cache lock (acquired first)
+// and the existing `THEME_TEST_LOCK` (acquired second). The fixed order — cache
+// before theme — matches the unit tests (which take only the cache lock) and
+// cannot deadlock.
+struct MainRenderTestGuard {
+    _cache: std::sync::MutexGuard<'static, ()>,
+    _theme: std::sync::MutexGuard<'static, ()>,
+}
+
+fn lock_main_render_theme() -> MainRenderTestGuard {
+    let cache = crate::main_render_cache::test_lock();
+    let theme = THEME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    MainRenderTestGuard {
+        _cache: cache,
+        _theme: theme,
+    }
+}
+
+#[test]
+fn main_render_cache_hits_on_unchanged_second_frame() {
+    let _theme = lock_main_render_theme();
+    let app = main_render_app();
+    let width = 60u16;
+    let key = main_render_key(&app, width, false);
+    assert!(
+        !main_render_cache::contains_main_key(&key),
+        "fresh app's key is not yet cached"
+    );
+
+    let first = transcript_lines_and_entry_offsets(&app, Some(width), false);
+    assert!(
+        main_render_cache::contains_main_key(&key),
+        "first frame populated the cache for this key"
+    );
+
+    // The unchanged second frame serves the same key from the cache: the rows
+    // and offsets are byte-for-byte identical to the first frame's.
+    let second = transcript_lines_and_entry_offsets(&app, Some(width), false);
+    assert_eq!(rows_fingerprint(&first.0), rows_fingerprint(&second.0));
+    assert_eq!(first.1, second.1);
+}
+
+#[test]
+fn main_render_cached_matches_uncached_byte_for_byte() {
+    // The painted rows + entry offsets from the cached path must equal the raw
+    // builder's output for the same state — across several widths and the
+    // startup-card toggle. This is the load-bearing correctness proof.
+    let _theme = lock_main_render_theme();
+    let app = main_render_app();
+    for &width in &[20u16, 40, 60, 80, 120] {
+        for &card in &[false, true] {
+            let cached = transcript_lines_and_entry_offsets(&app, Some(width), card);
+            let uncached = transcript_lines_and_entry_offsets_uncached(&app, Some(width), card);
+            assert_eq!(
+                rows_fingerprint(&cached.0),
+                rows_fingerprint(&uncached.0),
+                "cached rows must match uncached at width {width}, card {card}"
+            );
+            assert_eq!(
+                cached.1, uncached.1,
+                "cached entry offsets must match uncached at width {width}, card {card}"
+            );
+        }
+    }
+}
+
+#[test]
+fn main_render_cache_invalidates_on_revision_bump() {
+    let _theme = lock_main_render_theme();
+    let mut app = main_render_app();
+    let width = 50u16;
+    let before = transcript_lines_and_entry_offsets(&app, Some(width), false);
+    // Mutate an entry's content and bump its revision (what streaming/collapse do).
+    if let Some(entry) = app.transcript.first_mut() {
+        if let TranscriptEntryKind::Message(item) = &mut entry.kind {
+            item.content = "completely different first prompt text now".to_string();
+        }
+        entry.bump_revision();
+    }
+    let new_key = main_render_key(&app, width, false);
+    assert!(
+        !main_render_cache::contains_main_key(&new_key),
+        "a revision bump produces a new, uncached key"
+    );
+    let after = transcript_lines_and_entry_offsets(&app, Some(width), false);
+    assert_ne!(
+        rows_fingerprint(&before.0),
+        rows_fingerprint(&after.0),
+        "the changed entry must produce different rows"
+    );
+    // And the cached path still matches the raw builder for the new state.
+    let uncached = transcript_lines_and_entry_offsets_uncached(&app, Some(width), false);
+    assert_eq!(rows_fingerprint(&after.0), rows_fingerprint(&uncached.0));
+}
+
+#[test]
+fn main_render_cache_invalidates_on_width_change() {
+    let _theme = lock_main_render_theme();
+    let app = main_render_app();
+    let _ = transcript_lines_and_entry_offsets(&app, Some(60), false);
+    let key61 = main_render_key(&app, 61, false);
+    assert!(
+        !main_render_cache::contains_main_key(&key61),
+        "a different width is a different, uncached key"
+    );
+    let _ = transcript_lines_and_entry_offsets(&app, Some(61), false);
+    assert!(
+        main_render_cache::contains_main_key(&key61),
+        "the new width's key is now cached"
+    );
+}
+
+#[test]
+fn main_render_cache_invalidates_on_detail_toggle() {
+    let _theme = lock_main_render_theme();
+    let mut app = main_render_app();
+    let width = 60u16;
+    let _ = transcript_lines_and_entry_offsets(&app, Some(width), false);
+    // Toggle a detail-policy dimension (verbosity) — part of the key.
+    app.tool_output_verbosity = ToolOutputVerbosity::Verbose;
+    let verbose_key = main_render_key(&app, width, false);
+    assert!(
+        !main_render_cache::contains_main_key(&verbose_key),
+        "a verbosity change is a new, uncached key"
+    );
+    let _ = transcript_lines_and_entry_offsets(&app, Some(width), false);
+    assert!(main_render_cache::contains_main_key(&verbose_key));
+
+    // `show_reasoning_usage` is another detail dimension.
+    app.show_reasoning_usage = !app.show_reasoning_usage;
+    let reasoning_key = main_render_key(&app, width, false);
+    assert!(
+        !main_render_cache::contains_main_key(&reasoning_key),
+        "toggling show_reasoning_usage is a new, uncached key"
+    );
+    let _ = transcript_lines_and_entry_offsets(&app, Some(width), false);
+    assert!(main_render_cache::contains_main_key(&reasoning_key));
+}
+
+#[test]
+fn main_render_cache_invalidates_on_theme_change() {
+    let _theme = lock_main_render_theme();
+    let app = main_render_app();
+    let width = 60u16;
+    let _ = transcript_lines_and_entry_offsets(&app, Some(width), false);
+    // A `/theme` switch bumps the palette generation.
+    crate::render::theme::bump_theme_generation();
+    // The key rebuilt after the bump reflects the new palette generation and is
+    // not yet cached.
+    let themed_key = main_render_key(&app, width, false);
+    assert!(
+        !main_render_cache::contains_main_key(&themed_key),
+        "a theme change is a new, uncached key"
+    );
+    let _ = transcript_lines_and_entry_offsets(&app, Some(width), false);
+    assert!(main_render_cache::contains_main_key(&themed_key));
+}
+
+#[test]
+fn main_render_cache_invalidates_on_card_selection_change() {
+    let _theme = lock_main_render_theme();
+    let mut app = main_render_app();
+    let width = 60u16;
+    let _ = transcript_lines_and_entry_offsets(&app, Some(width), false);
+    // The card-selected entry restyles that entry's header → part of the key.
+    app.selected_entry = Some(1);
+    let selected_key = main_render_key(&app, width, false);
+    assert!(
+        !main_render_cache::contains_main_key(&selected_key),
+        "changing the card-selected entry is a new, uncached key"
+    );
+    let _ = transcript_lines_and_entry_offsets(&app, Some(width), false);
+    assert!(main_render_cache::contains_main_key(&selected_key));
+}
+
+#[test]
+fn main_render_text_selection_changes_paint_but_keeps_rows_cached() {
+    // A *text* selection (drag highlight) is layered onto a clone of the cached
+    // rows as a post-pass — deliberately NOT part of the cache key. So the
+    // underlying assembled rows stay a cache HIT, while the painted output still
+    // changes. This is the design's correctness property: highlight is a cheap
+    // per-frame restyle on already-built rows.
+    let _theme = lock_main_render_theme();
+    let mut app = main_render_app();
+    let width = 60u16;
+    let height = 20u16;
+    // `render_transcript` paints into a text area that reserves a 1-cell
+    // scrollbar gutter, so the cache key it builds uses `width - 1`. Capture the
+    // key ONCE up front and reuse it for every presence check: re-deriving it
+    // later would race on the process-wide theme generation that a concurrent
+    // test may bump. Arming a text selection cannot change the key anyway —
+    // `main_render_key` never reads `app.selection` — so the captured value is
+    // the one every frame in this test looks up.
+    let text_width = width.saturating_sub(1);
+    let key = main_render_key(&app, text_width, false);
+    let baseline = render_transcript_to_buffer(&app, width, height);
+    assert!(
+        main_render_cache::contains_main_key(&key),
+        "the baseline frame warmed the cache"
+    );
+
+    // Arm a main-surface selection spanning some visible rows.
+    app.selection = Some(selection::Selection::at(
+        selection::SelectionSurface::Main,
+        selection::Pos::new(0, 0),
+        selection::SelectionMode::Cell,
+        text_width,
+    ));
+    if let Some(sel) = app.selection.as_mut() {
+        sel.cursor = selection::Pos::new(3, 10);
+    }
+
+    // The selection frame reuses the cached rows (the key is unchanged), then
+    // restyles a clone as a post-pass.
+    let selected = render_transcript_to_buffer(&app, width, height);
+    assert!(
+        main_render_cache::contains_main_key(&key),
+        "the selection frame reused the cached rows (key unchanged)"
+    );
+
+    // The painted output differs: the selection highlight reverses the selected
+    // cells (`Modifier::REVERSED`), so compare full cell appearance — symbol +
+    // fg + bg + modifier — not just background.
+    let cell_appearance = |buf: &ratatui::buffer::Buffer| -> Vec<(String, Color, Color, Modifier)> {
+        (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let cell = &buf[(x, y)];
+                (cell.symbol().to_string(), cell.fg, cell.bg, cell.modifier)
+            })
+            .collect()
+    };
+    assert_ne!(
+        cell_appearance(&baseline),
+        cell_appearance(&selected),
+        "the selection highlight must change the painted output"
+    );
 }
