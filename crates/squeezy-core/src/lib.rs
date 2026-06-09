@@ -702,10 +702,18 @@ pub struct AppConfig {
     /// Optional pre-flight ceiling on the estimated input tokens of a single
     /// LLM round. `None` (the default) disables the gate entirely, leaving
     /// every round dispatched exactly as before. When set, the agent
-    /// estimates the assembled request's input tokens before sending; if the
-    /// estimate exceeds this value it first attempts mid-turn compaction and,
-    /// if the round is still over, gates the dispatch with a clear status
-    /// instead of paying for an oversized round.
+    /// estimates the **conversation items** before sending; if the estimate
+    /// exceeds this value it first attempts mid-turn compaction and, if the
+    /// round is still over, gates the dispatch with a clear status instead of
+    /// paying for an oversized round.
+    ///
+    /// Note: fixed request overhead (system instructions and tool schemas) is
+    /// **not** counted against this limit. Overhead is constant per round and
+    /// cannot be reduced by compaction, so including it would gate legitimate
+    /// rounds on agents with large tool registries regardless of conversation
+    /// size. If you need a hard total-input ceiling that includes overhead,
+    /// use `max_session_cost_usd_micros` (which accounts for all billed tokens)
+    /// alongside a per-token cost estimate.
     pub max_round_input_tokens: Option<u64>,
     pub routing: RoutingConfig,
     pub telemetry: TelemetryConfig,

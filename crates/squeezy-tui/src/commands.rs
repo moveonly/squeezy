@@ -240,6 +240,95 @@ pub(crate) fn format_cost_command(snapshot: &SessionAccountingSnapshot) -> Strin
         ));
     }
 
+    // Cache ROI: show the prompt-cache impact when any cache activity occurred.
+    let cache_reads = cost.cached_input_tokens.unwrap_or(0);
+    let cache_writes = cost.cache_write_input_tokens.unwrap_or(0);
+    if cache_reads > 0 || cache_writes > 0 {
+        out.push('\n');
+        out.push_str(&style::header("Cache ROI"));
+        out.push('\n');
+        out.push_str(&format!(
+            "  {} cache_read_tokens={} cache_write_tokens={}\n",
+            style::accent("⇌"),
+            style_u64(cache_reads),
+            style_u64(cache_writes),
+        ));
+        // Standard input = total input minus cached reads and cache writes.
+        let total_input = cost.input_tokens.unwrap_or(0);
+        let standard_input = total_input
+            .saturating_sub(cache_reads)
+            .saturating_sub(cache_writes);
+        out.push_str(&format!(
+            "  {} standard_input_tokens={} (non-cached, non-write fraction)\n",
+            style::accent("⇌"),
+            style_u64(standard_input),
+        ));
+    }
+
+    // Pricing diagnostics: warn when USD estimate is absent so users without
+    // a cost cap still notice missing pricing metadata.
+    if cost.estimated_usd_micros.is_none() {
+        out.push('\n');
+        out.push_str(&format!(
+            "  {} {}\n",
+            style::accent("⚠"),
+            style::muted(&format!(
+                "pricing metadata missing or incomplete for {}:{} — USD estimates unavailable; \
+                 update models.dev or add a manual rate to get cost tracking",
+                snapshot.provider, snapshot.model,
+            )),
+        ));
+    }
+
+    // Budget policy summary: all configured enforcement limits in one place.
+    // Always shown — even default values are useful for users debugging
+    // unexpected gating behavior. Explicit caps are highlighted.
+    {
+        let policy = &snapshot.budget_policy;
+        let cap_label = match policy.max_session_cost_usd_micros {
+            Some(cap) if cap > 0 => {
+                format!(
+                    "${:.4} ({})",
+                    cap as f64 / 1_000_000.0,
+                    style::accent("explicit")
+                )
+            }
+            _ => style::muted("none (uncapped)").to_string(),
+        };
+        let round_cap_label = match policy.max_round_input_tokens {
+            Some(tokens) => format!(
+                "{} ({})",
+                style::group_thousands(tokens),
+                style::accent("explicit")
+            ),
+            None => style::muted("none").to_string(),
+        };
+        out.push('\n');
+        out.push_str(&style::header("Budget policy"));
+        out.push('\n');
+        out.push_str(&format!(
+            "  {} session_cap={} warn_at={}% round_input_cap={}\n",
+            style::accent("⊛"),
+            cap_label,
+            policy.cost_warn_percent,
+            round_cap_label,
+        ));
+        out.push_str(&format!(
+            "  {} max_tool_calls={} max_bytes_read={} max_search_files={}\n",
+            style::accent("⊛"),
+            style_u64(policy.max_tool_calls_per_turn),
+            style_u64(policy.max_tool_bytes_read_per_turn),
+            style_u64(policy.max_search_files_per_turn),
+        ));
+        if policy.disable_prompt_cache {
+            out.push_str(&format!(
+                "  {} {}\n",
+                style::accent("⊛"),
+                style::muted("prompt_cache=disabled (SQUEEZY_DISABLE_PROMPT_CACHE)"),
+            ));
+        }
+    }
+
     out.push('\n');
     out.push_str(&style::header("Token calibration"));
     out.push('\n');
@@ -305,6 +394,29 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
                 style::accent_bold(&style::group_thousands(remaining)),
                 style::headroom(remaining_pct, &headroom_label),
             ));
+            // Effective input budget: the raw window minus the max-output
+            // reserve is the actionable ceiling for input content. Surface it
+            // here so users see the number that gates compaction triggers and
+            // cost-cap projections — not the wider full window.
+            // Guard against budget=0 (max_output_tokens >= context window)
+            // which would produce NaN/Infinity in the percentage calculation.
+            if let Some(input_budget) = snapshot.transmitted_request.input_budget_tokens
+                && input_budget > 0
+            {
+                let budget_remaining = input_budget.saturating_sub(consumed);
+                let budget_used_pct = (consumed as f64 / input_budget as f64) * 100.0;
+                let budget_remaining_pct =
+                    100.0_f64.min(100.0 * budget_remaining as f64 / input_budget as f64);
+                let budget_headroom_label = format!("{budget_remaining_pct:.1}% of input budget");
+                out.push_str(&format!(
+                    "  {} input budget: {} tokens available ({} used of {} budget · {})\n",
+                    style::accent("◐"),
+                    style::accent_bold(&style::group_thousands(budget_remaining)),
+                    style::accent(&format!("{budget_used_pct:.1}%")),
+                    style::accent(&style::group_thousands(input_budget)),
+                    style::headroom(budget_remaining_pct, &budget_headroom_label),
+                ));
+            }
         }
         _ => {
             out.push_str(&format!(

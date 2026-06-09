@@ -24,6 +24,8 @@ const STATUS_LINE_SEPARATOR: &str = " · ";
 /// duplicate of `provider-and-model`, the project-name duplicate of
 /// `current-dir`, and `context-used` (only meaningful well into a long
 /// session — users opt in via `/statusline` when they need it).
+/// `CacheHit` is included but only renders when cached or cache-write
+/// tokens are nonzero, so it is invisible until prompt caching warms up.
 pub(crate) const DEFAULT_STATUS_LINE_ITEMS: &[StatusLineItem] = &[
     StatusLineItem::ProviderAndModel,
     StatusLineItem::CurrentDir,
@@ -32,6 +34,7 @@ pub(crate) const DEFAULT_STATUS_LINE_ITEMS: &[StatusLineItem] = &[
     StatusLineItem::PullRequestNumber,
     StatusLineItem::BranchChanges,
     StatusLineItem::Cost,
+    StatusLineItem::CacheHit,
 ];
 
 /// Narrow status-line preset for SSH / tmux / narrow Linux terminals.
@@ -76,6 +79,11 @@ pub(crate) enum StatusLineItem {
     TotalOutputTokens,
     CachedTokens,
     CacheWriteTokens,
+    /// Compact cache indicator: renders only when cached or cache-write tokens
+    /// are nonzero, showing `cache ↑W/↓R` (write/read) or `cached R` for
+    /// read-only hits. Included in the default status line so prompt-cache
+    /// health is visible without `/statusline` customization.
+    CacheHit,
     Tools,
     BytesRead,
     // Limit
@@ -125,6 +133,7 @@ impl StatusLineItem {
             Self::TotalOutputTokens => "total-output-tokens",
             Self::CachedTokens => "cached-tokens",
             Self::CacheWriteTokens => "cache-write-tokens",
+            Self::CacheHit => "cache-hit",
             Self::Tools => "tools",
             Self::BytesRead => "bytes-read",
             Self::Cost => "cost",
@@ -171,6 +180,9 @@ impl StatusLineItem {
             Self::TotalOutputTokens => "Total output tokens spent this session",
             Self::CachedTokens => "Cached input tokens served from prompt cache",
             Self::CacheWriteTokens => "Input tokens written to prompt cache this session",
+            Self::CacheHit => {
+                "Compact cache-hit indicator (hidden when no cache activity); shows write↑ and read↓ counts"
+            }
             Self::Tools => "Number of tool calls this session",
             Self::BytesRead => "Bytes read from tool outputs this session",
             Self::Cost => "Spend in USD this session (with cap %)",
@@ -214,6 +226,7 @@ impl StatusLineItem {
         Self::TotalOutputTokens,
         Self::CachedTokens,
         Self::CacheWriteTokens,
+        Self::CacheHit,
         Self::Tools,
         Self::BytesRead,
         Self::Cost,
@@ -295,6 +308,7 @@ impl StatusLineAccent {
             | StatusLineItem::TotalOutputTokens
             | StatusLineItem::CachedTokens
             | StatusLineItem::CacheWriteTokens
+            | StatusLineItem::CacheHit
             | StatusLineItem::Tools
             | StatusLineItem::BytesRead => Self::Usage,
             StatusLineItem::Cost | StatusLineItem::CostCap | StatusLineItem::Budget => Self::Limit,
@@ -460,6 +474,16 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
             .cost
             .cache_write_input_tokens
             .map(|tokens| format!("cache_write {tokens}")),
+        StatusLineItem::CacheHit => {
+            let reads = app.cost.cached_input_tokens.unwrap_or(0);
+            let writes = app.cost.cache_write_input_tokens.unwrap_or(0);
+            match (writes, reads) {
+                (0, 0) => None,
+                (0, r) => Some(format!("cache ↓{r}")),
+                (w, 0) => Some(format!("cache ↑{w}")),
+                (w, r) => Some(format!("cache ↑{w}/↓{r}")),
+            }
+        }
         StatusLineItem::Tools => Some(format!("tools {}", app.metrics.tool_calls)),
         StatusLineItem::BytesRead => Some(format!("read {}", format_bytes(app.metrics.bytes_read))),
         StatusLineItem::Cost => Some(format_cost_segment(
@@ -604,9 +628,11 @@ pub(crate) fn format_cost_segment(
     let mut out = match cap_usd_micros {
         Some(cap) if cap > 0 => {
             let spent = cost.estimated_usd_micros.unwrap_or(0);
-            let percent = ((spent as u128 * 100) / cap as u128).min(255) as u8;
+            // Use one decimal place so small movements near a low cap are
+            // visible before a full percentage point changes.
+            let percent = ((spent as f64) / (cap as f64) * 100.0).min(999.9);
             format!(
-                "cost {} / ${:.2} ({}%)",
+                "cost {} / ${:.2} ({:.1}%)",
                 format_cost(cost),
                 cap as f64 / 1_000_000.0,
                 percent

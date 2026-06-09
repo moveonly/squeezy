@@ -741,6 +741,20 @@ impl CalibrationSource {
     }
 }
 
+/// Snapshot of the configured budget policy for display in `/cost`. Bundles
+/// all enforcement limits into one place so users can see every active
+/// constraint without reading config files.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BudgetPolicySnapshot {
+    pub max_session_cost_usd_micros: Option<u64>,
+    pub cost_warn_percent: u8,
+    pub max_round_input_tokens: Option<u64>,
+    pub max_tool_calls_per_turn: u64,
+    pub max_tool_bytes_read_per_turn: u64,
+    pub max_search_files_per_turn: u64,
+    pub disable_prompt_cache: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionAccountingSnapshot {
     pub session_id: Option<String>,
@@ -761,6 +775,7 @@ pub struct SessionAccountingSnapshot {
     pub mcp: McpAccounting,
     /// Where the token calibration was loaded from at session start.
     pub calibration_source: CalibrationSource,
+    pub budget_policy: BudgetPolicySnapshot,
 }
 
 impl SessionAccountingSnapshot {
@@ -1368,6 +1383,10 @@ where
     })
 }
 
+/// Shared, mutex-protected cache for the Ollama live context-window probe.
+/// Uses a type alias to satisfy the `type_complexity` lint.
+type OllamaWindowCache = Arc<tokio::sync::Mutex<Option<(Instant, Option<u64>)>>>;
+
 #[derive(Clone)]
 pub struct Agent {
     config: AppConfig,
@@ -1460,6 +1479,11 @@ pub struct Agent {
     /// re-derives the window for the new model via `re_derive_model_context_window`
     /// while still letting an explicit override win (finding #1).
     configured_model_context_window: Option<u64>,
+    /// Short-lived cache for the Ollama live context-window probe result.
+    /// `session_accounting_snapshot()` fires a blocking HTTP call for Ollama
+    /// providers; caching avoids repeated network probes when `/cost` or
+    /// `/context` is invoked in quick succession.
+    ollama_window_cache: OllamaWindowCache,
 }
 
 #[derive(Clone)]
@@ -2144,6 +2168,7 @@ impl Agent {
             routing_state: Arc::new(StdMutex::new(turn_router::RoutingPersistentState::default())),
             last_request_overhead_tokens: Arc::new(AtomicU64::new(0)),
             configured_model_context_window,
+            ollama_window_cache: Arc::new(tokio::sync::Mutex::new(None)),
         };
         if let Some(log) = agent.session_log.as_ref() {
             agent.telemetry.set_store_session_id(log.session_id());
@@ -2829,9 +2854,23 @@ impl Agent {
         // Live provider window probe (Ollama only today). Folded into the
         // resolver as the `provider_live_window` layer rather than a blanket
         // override so its provenance shows as "provider live".
+        // Cache with a 30-second TTL so repeated /cost or /context invocations
+        // in quick succession skip the blocking network probe.
+        const OLLAMA_WINDOW_CACHE_TTL: Duration = Duration::from_secs(30);
         let provider_live_window = match &self.config.provider {
             ProviderConfig::Ollama(ollama) => {
-                fetch_ollama_context_window(&ollama.base_url, &self.config.model).await
+                let mut cache = self.ollama_window_cache.lock().await;
+                let cached = cache
+                    .as_ref()
+                    .filter(|(at, _)| at.elapsed() < OLLAMA_WINDOW_CACHE_TTL);
+                if let Some((_, window)) = cached {
+                    *window
+                } else {
+                    let window =
+                        fetch_ollama_context_window(&ollama.base_url, &self.config.model).await;
+                    *cache = Some((Instant::now(), window));
+                    window
+                }
             }
             _ => None,
         };
@@ -2901,6 +2940,15 @@ impl Agent {
             skills: self.skills_accounting(),
             mcp: self.mcp_accounting(&loaded_tool_schemas),
             calibration_source: state.calibration_source,
+            budget_policy: BudgetPolicySnapshot {
+                max_session_cost_usd_micros: self.config.max_session_cost_usd_micros,
+                cost_warn_percent: self.config.cost_warn_percent,
+                max_round_input_tokens: self.config.max_round_input_tokens,
+                max_tool_calls_per_turn: self.config.max_tool_calls_per_turn,
+                max_tool_bytes_read_per_turn: self.config.max_tool_bytes_read_per_turn,
+                max_search_files_per_turn: self.config.max_search_files_per_turn,
+                disable_prompt_cache: self.config.disable_prompt_cache,
+            },
         }
     }
 
@@ -7288,7 +7336,25 @@ impl TurnRuntime {
             // bd ticket squeezy-xt2o / wave2-16 finding 2: anthropic run
             // landed at 124% of cap before the post-hoc check tripped).
             let cap_status = broker.session_cap_reached().or_else(|| {
-                let projected_input_tokens = estimate_context(&conversation).estimated_tokens;
+                // Include fixed request overhead (instructions + tool schemas)
+                // so the pre-flight cost estimate matches what will actually be
+                // billed. `estimate_context` only walks conversation items; the
+                // overhead from the most-recent assembled request closes the gap.
+                //
+                // Bootstrap note: `last_request_overhead_tokens` starts at 0
+                // and is only written after the first request body is assembled
+                // (see the `self.last_request_overhead_tokens.store(...)` call
+                // below). On the very first round of a fresh turn, overhead = 0,
+                // so the cap projection still under-counts instructions and tool
+                // schemas by one round. Every subsequent round uses the prior
+                // round's measured overhead and is accurate. A single-round
+                // overshoot on the first dispatch is acceptable; fully closing
+                // the gap would require assembling a skeleton request before the
+                // gate check, which is a larger refactor.
+                let overhead = self.last_request_overhead_tokens.load(Ordering::Relaxed);
+                let projected_input_tokens = estimate_context(&conversation)
+                    .estimated_tokens
+                    .saturating_add(overhead);
                 let projected_output_tokens = CostBroker::projected_output_tokens(
                     self.config.max_output_tokens,
                     squeezy_llm::model_info_for(self.provider.name(), &current_model)
@@ -7368,6 +7434,12 @@ impl TurnRuntime {
             // round is *still* over. This converts the existing reactive
             // overflow handling into a proactive one for the round we're about
             // to pay for.
+            // Note: the round-input gate counts conversation items only
+            // (not fixed overhead). The overhead (instructions + tool schemas)
+            // is constant per round and cannot be reduced by compaction, so
+            // including it would gate legitimate rounds when overhead is large.
+            // The session-cap projection includes overhead for accurate cost
+            // estimation (see cap_status check above).
             if let Some(initial_gate) = round_input_gate_status(
                 self.config.max_round_input_tokens,
                 estimate_context(&conversation).estimated_tokens,
