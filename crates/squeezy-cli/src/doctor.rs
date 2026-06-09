@@ -1,6 +1,6 @@
 use std::{env, fmt::Write as _, fs, path::PathBuf, time::Duration};
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde_json::json;
 use squeezy_core::{
     AppConfig, McpServerConfig, McpTransport, OllamaConfig, ProviderConfig, ProviderSettings,
@@ -23,7 +23,7 @@ use crate::update::{self, UpdateStatus};
 const STATE_CACHE_WARN_BYTES: u64 = 128 * 1024 * 1024;
 const GRAPH_CACHE_WARN_BYTES: u64 = 1024 * 1024 * 1024;
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Default)]
 pub struct DoctorArgs {
     /// Emit machine-readable JSON instead of the human table.
     #[arg(long)]
@@ -56,6 +56,25 @@ pub struct DoctorArgs {
     /// Linux detail only applies on Linux.
     #[arg(long)]
     pub linux_sandbox: bool,
+    /// Run only matching check names. Accepts exact names like
+    /// `session_store`, prefixed families like `provider`, and probe names
+    /// like `probe:mcp:docs`. Repeat for multiple checks.
+    #[arg(long = "only", value_name = "CHECK")]
+    pub only: Vec<String>,
+    /// Print only checks with this status. Repeat for multiple statuses.
+    #[arg(long = "status", value_enum)]
+    pub status: Vec<DoctorStatusFilter>,
+    /// Skip the release update check. Useful for offline diagnostics and CI.
+    #[arg(long = "skip-update")]
+    pub skip_update: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum DoctorStatusFilter {
+    Ok,
+    Warn,
+    Fail,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,9 +92,18 @@ impl Status {
             Status::Fail => "fail",
         }
     }
+
+    fn matches_filter(self, filter: DoctorStatusFilter) -> bool {
+        matches!(
+            (self, filter),
+            (Status::Ok, DoctorStatusFilter::Ok)
+                | (Status::Warn, DoctorStatusFilter::Warn)
+                | (Status::Fail, DoctorStatusFilter::Fail)
+        )
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Check {
     name: String,
     status: Status,
@@ -85,6 +113,8 @@ struct Check {
 #[derive(Debug)]
 pub struct DoctorReport {
     pub exit_code: i32,
+    warnings: usize,
+    failures: usize,
     checks: Vec<Check>,
     version: &'static str,
     target: &'static str,
@@ -93,29 +123,16 @@ pub struct DoctorReport {
 
 impl DoctorReport {
     pub fn print(&self) {
-        let (warnings, failures) = check_counts(&self.checks);
         if self.json {
-            let body = json!({
-                "version": self.version,
-                "target": self.target,
-                "ok": failures == 0,
-                "warnings": warnings,
-                "failures": failures,
-                "checks": self.checks.iter().map(|c| json!({
-                    "name": c.name,
-                    "status": c.status.as_str(),
-                    "detail": c.detail,
-                })).collect::<Vec<_>>(),
-            });
             println!(
                 "{}",
-                serde_json::to_string_pretty(&body).unwrap_or_default()
+                serde_json::to_string_pretty(&self.json_body()).unwrap_or_default()
             );
             return;
         }
         let header = if self.exit_code != 0 {
             "squeezy: fail"
-        } else if warnings > 0 {
+        } else if self.warnings > 0 {
             "squeezy: ok (warnings)"
         } else {
             "squeezy: ok"
@@ -138,6 +155,21 @@ impl DoctorReport {
                 name_width = name_width,
             );
         }
+    }
+
+    fn json_body(&self) -> serde_json::Value {
+        json!({
+            "version": self.version,
+            "target": self.target,
+            "ok": self.failures == 0,
+            "warnings": self.warnings,
+            "failures": self.failures,
+            "checks": self.checks.iter().map(|c| json!({
+                "name": c.name,
+                "status": c.status.as_str(),
+                "detail": c.detail,
+            })).collect::<Vec<_>>(),
+        })
     }
 }
 
@@ -170,6 +202,8 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         };
         return Ok(DoctorReport {
             exit_code,
+            warnings: usize::from(matches!(check.status, Status::Warn)),
+            failures: usize::from(matches!(check.status, Status::Fail)),
             checks: vec![check],
             version,
             target,
@@ -187,6 +221,8 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         };
         return Ok(DoctorReport {
             exit_code,
+            warnings: usize::from(matches!(check.status, Status::Warn)),
+            failures: usize::from(matches!(check.status, Status::Fail)),
             checks: vec![check],
             version,
             target,
@@ -196,95 +232,149 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
 
     let mut checks = Vec::new();
 
-    let config = match AppConfig::from_env_and_settings() {
-        Ok(config) => {
-            let labels = config.config_source_labels();
-            checks.push(Check {
-                name: "config".to_string(),
-                status: Status::Ok,
-                detail: format!("sources: {}", labels.join(", ")),
-            });
-            Some(config)
+    let config = if needs_config(args) {
+        match AppConfig::from_env_and_settings() {
+            Ok(config) => {
+                if should_include_check(args, "config") {
+                    let labels = config.config_source_labels();
+                    checks.push(Check {
+                        name: "config".to_string(),
+                        status: Status::Ok,
+                        detail: format!("sources: {}", labels.join(", ")),
+                    });
+                }
+                Some(config)
+            }
+            Err(error) => {
+                checks.push(Check {
+                    name: "config".to_string(),
+                    status: Status::Fail,
+                    detail: format!("{error}"),
+                });
+                None
+            }
         }
-        Err(error) => {
-            checks.push(Check {
-                name: "config".to_string(),
-                status: Status::Fail,
-                detail: format!("{error}"),
-            });
-            None
-        }
+    } else {
+        None
     };
 
     if let Some(config) = config.as_ref() {
-        match ensure_repo_profile(&config.workspace_root, &config.graph) {
-            Ok(loaded) => checks.push(Check {
-                name: "repo_profile".to_string(),
-                status: Status::Ok,
-                detail: format!(
-                    "status={} languages={}",
-                    loaded.status.as_str(),
-                    loaded.profile.languages.len()
-                ),
-            }),
-            Err(error) => checks.push(Check {
-                name: "repo_profile".to_string(),
-                status: Status::Warn,
-                detail: format!("{error}"),
-            }),
+        if should_include_check(args, "repo_profile") {
+            match ensure_repo_profile(&config.workspace_root, &config.graph) {
+                Ok(loaded) => checks.push(Check {
+                    name: "repo_profile".to_string(),
+                    status: Status::Ok,
+                    detail: format!(
+                        "status={} languages={}",
+                        loaded.status.as_str(),
+                        loaded.profile.languages.len()
+                    ),
+                }),
+                Err(error) => checks.push(Check {
+                    name: "repo_profile".to_string(),
+                    status: Status::Warn,
+                    detail: format!("{error}"),
+                }),
+            }
         }
-        checks.push(workspace_paths_check(config));
+        if should_include_check(args, "workspace_paths") {
+            checks.push(workspace_paths_check(config));
+        }
 
         let (provider_name, provider_check) = provider_credential_check(&config.provider);
-        checks.push(Check {
-            name: format!("provider:{provider_name}"),
-            status: provider_check.0,
-            detail: provider_check.1,
-        });
+        let provider_check_name = format!("provider:{provider_name}");
+        if should_include_check(args, &provider_check_name) {
+            checks.push(Check {
+                name: provider_check_name,
+                status: provider_check.0,
+                detail: provider_check.1,
+            });
+        }
 
-        checks.push(providers_check(&load_user_settings()));
+        if should_include_check(args, "providers") {
+            checks.push(providers_check(&load_user_settings()));
+        }
 
-        if args.probe {
+        let provider_probe_name = format!("probe:{provider_name}");
+        if args.probe && should_include_check(args, &provider_probe_name) {
             let (status, detail) = probe_provider(&config.provider).await;
             checks.push(Check {
-                name: format!("probe:{provider_name}"),
+                name: provider_probe_name,
                 status,
                 detail,
             });
         }
 
-        checks.push(mcp_check(&config.mcp_servers));
+        if should_include_check(args, "mcp") {
+            checks.push(mcp_check(&config.mcp_servers));
+        }
         if args.probe && config.mcp_servers.values().any(|server| server.enabled) {
-            checks.extend(probe_mcp_servers(&config.mcp_servers).await);
+            checks.extend(probe_mcp_servers(&config.mcp_servers, args).await);
         }
         let skill_catalog =
             squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
-        checks.push(skills_check(config, &skill_catalog));
-        if let Some(hooks) = hooks_check(config, &skill_catalog) {
+        if should_include_check(args, "skills") {
+            checks.push(skills_check(config, &skill_catalog));
+        }
+        if should_include_check(args, "hooks")
+            && let Some(hooks) = hooks_check(config, &skill_catalog)
+        {
             checks.push(hooks);
         }
-        checks.push(skills_roots_check(config));
-        checks.push(hook_shell_check(config));
-        checks.push(session_store_check(config));
-        checks.extend(session_paths_checks(config));
-        checks.push(state_store_check(config));
-        checks.push(cache_check(config, args.prune_cache));
+        if should_include_check(args, "skills_roots") {
+            checks.push(skills_roots_check(config));
+        }
+        if should_include_check(args, "hooks:shell") {
+            checks.push(hook_shell_check(config));
+        }
+        if should_include_check(args, "session_store") {
+            checks.push(session_store_check(config));
+        }
+        checks.extend(
+            session_paths_checks(config)
+                .into_iter()
+                .filter(|check| should_include_check(args, &check.name)),
+        );
+        if should_include_check(args, "state_store") {
+            checks.push(state_store_check(config));
+        }
+        if should_include_check(args, "cache") {
+            checks.push(cache_check(config, args.prune_cache));
+        }
     }
 
-    checks.push(parser_health_check());
-    checks.push(sandbox_check(config.as_ref()));
-    checks.push(update_check(update::check_for_update().await));
+    if should_include_check(args, "parser_health") {
+        checks.push(parser_health_check());
+    }
+    if should_include_check(args, "sandbox") {
+        checks.push(sandbox_check(config.as_ref()));
+    }
+    if !args.skip_update && should_include_check(args, "update") {
+        checks.push(update_check(update::check_for_update().await));
+    }
+
+    let config_failed = config.is_none() && needs_config(args);
+    let selector_failures = unmatched_selector_checks(args, &checks, config_failed);
+    checks.extend(selector_failures.iter().cloned());
 
     // Warnings (e.g. missing optional API keys, missing sandbox tool) print as
     // such but do not fail the command: smoke tests in CI / brew test run in
     // environments where keys are absent and still need the binary to come up
     // green. Only hard failures (config load broken, session store unwritable)
-    // produce a non-zero exit, matching the old `--health` contract.
-    let (_, failures) = check_counts(&checks);
-    let exit_code = if failures > 0 { 1 } else { 0 };
+    // produce a non-zero exit, matching the `--health` compatibility alias.
+    let (warnings, failures) = check_counts(&checks);
+    let exit_code = exit_code_for_checks(&checks);
+    let mut checks = filter_checks(args, checks);
+    for failure in selector_failures {
+        if !checks.iter().any(|check| check.name == failure.name) {
+            checks.push(failure);
+        }
+    }
 
     Ok(DoctorReport {
         exit_code,
+        warnings,
+        failures,
         checks,
         version,
         target,
@@ -341,6 +431,116 @@ fn probe_case_sensitivity(root: &std::path::Path) -> Option<bool> {
     let case_sensitive = !upper.exists();
     let _ = fs::remove_file(&lower);
     Some(case_sensitive)
+}
+
+fn needs_config(args: &DoctorArgs) -> bool {
+    if args.only.is_empty() {
+        return true;
+    }
+    args.only
+        .iter()
+        .any(|selector| !matches!(selector.as_str(), "parser_health" | "sandbox" | "update"))
+}
+
+fn exit_code_for_checks(checks: &[Check]) -> i32 {
+    let (_, failures) = check_counts(checks);
+    if failures > 0 { 1 } else { 0 }
+}
+
+fn should_include_check(args: &DoctorArgs, name: &str) -> bool {
+    args.only.iter().all(|selector| selector.trim().is_empty())
+        || args
+            .only
+            .iter()
+            .any(|selector| check_name_matches(selector, name))
+}
+
+fn check_name_matches(selector: &str, name: &str) -> bool {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return false;
+    }
+    name == selector
+        || (name.len() > selector.len()
+            && name.as_bytes().get(selector.len()) == Some(&b':')
+            && name.starts_with(selector))
+}
+
+fn filter_checks(args: &DoctorArgs, checks: Vec<Check>) -> Vec<Check> {
+    if args.status.is_empty() {
+        return checks;
+    }
+    checks
+        .into_iter()
+        .filter(|check| {
+            args.status
+                .iter()
+                .any(|filter| check.status.matches_filter(*filter))
+        })
+        .collect()
+}
+
+fn unmatched_selector_checks(
+    args: &DoctorArgs,
+    checks: &[Check],
+    config_failed: bool,
+) -> Vec<Check> {
+    // Split the unmatched selectors into two buckets:
+    //   * `unknown` -- typos / unrecognised selector names. These are
+    //     hard failures and tell the user to fix the command line.
+    //   * `skipped_due_to_config` -- selectors that *would* have been
+    //     evaluated, but config failed to load so the underlying check
+    //     never ran (e.g. `--only providers` against a corrupt
+    //     `settings.toml`). These are not user errors; they are a
+    //     downstream consequence of the `config` row already failing,
+    //     so we surface them as a single `selector` warn note instead
+    //     of silently dropping them.
+    let mut unknown = Vec::new();
+    let mut skipped_due_to_config = Vec::new();
+    for selector in &args.only {
+        let selector = selector.trim();
+        if selector.is_empty()
+            || checks
+                .iter()
+                .any(|check| check_name_matches(selector, &check.name))
+            || (selector == "update" && args.skip_update)
+        {
+            continue;
+        }
+        if config_failed && !matches!(selector, "parser_health" | "sandbox" | "update") {
+            skipped_due_to_config.push(selector.to_string());
+        } else {
+            unknown.push(selector.to_string());
+        }
+    }
+    let mut out = Vec::new();
+    if !unknown.is_empty() {
+        out.push(Check {
+            name: "selector".to_string(),
+            status: Status::Fail,
+            detail: format!("unknown doctor --only selector(s): {}", unknown.join(", ")),
+        });
+    }
+    if !skipped_due_to_config.is_empty() {
+        // Distinct name so the "always re-include selector failures
+        // after status filtering" loop in `run()` does not treat this
+        // warn row and the `selector` fail row above as the same entry.
+        out.push(Check {
+            name: "selector:skipped".to_string(),
+            status: Status::Warn,
+            detail: format!(
+                "unable to evaluate {} because the `config` row failed to load; \
+                 fix the configuration to re-enable {}",
+                skipped_due_to_config.join(", "),
+                if skipped_due_to_config.len() == 1 {
+                    "this check"
+                } else {
+                    "these checks"
+                }
+            ),
+        });
+    }
+    out
 }
 
 fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Status, String)) {
@@ -991,14 +1191,25 @@ fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> C
 /// failure without having to re-run the server manually.
 async fn probe_mcp_servers(
     servers: &std::collections::BTreeMap<String, McpServerConfig>,
+    args: &DoctorArgs,
 ) -> Vec<Check> {
+    let servers = servers
+        .iter()
+        .filter(|(name, server)| {
+            server.enabled && should_include_check(args, &format!("probe:mcp:{name}"))
+        })
+        .map(|(name, server)| (name.clone(), server.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if servers.is_empty() {
+        return Vec::new();
+    }
     let registry = McpClientRegistry::new(servers.clone());
     let outcome = registry.refresh_tools(CancellationToken::new()).await;
 
     // Collect stderr tails before shutdown so the ring buffer is still live.
     let mut stderr_tails: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
-    for (name, server) in servers {
+    for (name, server) in &servers {
         if server.enabled && matches!(server.transport, McpTransport::Stdio) {
             let tail = registry.stderr_tail(name).await;
             if !tail.is_empty() {

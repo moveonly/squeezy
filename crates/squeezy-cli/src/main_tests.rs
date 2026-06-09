@@ -207,6 +207,333 @@ fn cli_help_slash_command_topic_uses_tui_help_parser() {
 }
 
 #[test]
+fn cli_prompt_permission_mode_accepts_strict_modes() {
+    let cli = Cli::try_parse_from([
+        "squeezy",
+        "--prompt",
+        "hi",
+        "--prompt-permission-mode",
+        "deny-ask",
+    ])
+    .expect("parse deny-ask");
+    assert_eq!(cli.prompt_permission_mode, PromptPermissionMode::Deny);
+
+    let cli = Cli::try_parse_from([
+        "squeezy",
+        "--prompt",
+        "hi",
+        "--prompt-permission-mode",
+        "fail-on-ask",
+    ])
+    .expect("parse fail-on-ask");
+    assert_eq!(cli.prompt_permission_mode, PromptPermissionMode::Fail);
+}
+
+#[test]
+fn cli_sessions_and_repo_json_flags_parse() {
+    let cli =
+        Cli::try_parse_from(["squeezy", "sessions", "list", "--json"]).expect("parse sessions");
+    match cli.command {
+        Some(Command::Sessions {
+            command: SessionsCommand::List(args),
+        }) => assert!(args.json),
+        other => panic!("expected sessions list command, got {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from(["squeezy", "sessions", "show", "abc123", "--json"])
+        .expect("parse sessions show");
+    match cli.command {
+        Some(Command::Sessions {
+            command: SessionsCommand::Show { id, json },
+        }) => {
+            assert_eq!(id, "abc123");
+            assert!(json);
+        }
+        other => panic!("expected sessions show command, got {other:?}"),
+    }
+
+    let cli =
+        Cli::try_parse_from(["squeezy", "repo", "inspect", "--json"]).expect("parse repo inspect");
+    match cli.command {
+        Some(Command::Repo {
+            command: RepoCommand::Inspect { json },
+        }) => assert!(json),
+        other => panic!("expected repo inspect command, got {other:?}"),
+    }
+}
+
+#[test]
+fn session_cli_json_uses_public_id_field() {
+    let metadata = SessionMetadata {
+        session_id: "session-123".to_string(),
+        parent_id: Some("parent-session-456".to_string()),
+        ..Default::default()
+    };
+    let metadata_json = session_metadata_for_cli(&metadata).expect("metadata json");
+    assert_ne!(metadata_json["id"], "session-123");
+    assert!(
+        metadata_json["id"]
+            .as_str()
+            .expect("public id string")
+            .starts_with("sess_")
+    );
+    assert!(metadata_json.get("session_id").is_none());
+    assert_ne!(metadata_json["parent_id"], "parent-session-456");
+    assert!(
+        metadata_json["parent_id"]
+            .as_str()
+            .expect("public parent id string")
+            .starts_with("sess_")
+    );
+
+    let replay_json = session_replay_for_cli(SessionReplayTape {
+        schema_version: 1,
+        session_id: "session-123".to_string(),
+        events: Vec::new(),
+        warnings: 0,
+    })
+    .expect("replay json");
+    assert_eq!(replay_json["id"], metadata_json["id"]);
+    assert!(replay_json.get("session_id").is_none());
+}
+
+#[test]
+fn session_cli_replay_report_uses_public_id_field() {
+    let report = SessionReplayReport {
+        session_id: "session-123".to_string(),
+        turns: 1,
+        events_replayed: 2,
+        request_count: 1,
+        tool_results: 0,
+        final_answer: "resumed session-123".to_string(),
+    };
+
+    let report_json = session_replay_report_for_cli(&report).expect("replay report json");
+    let rendered = serde_json::to_string(&report_json).expect("render report");
+    assert!(report_json.get("session_id").is_none());
+    assert!(
+        report_json["id"]
+            .as_str()
+            .expect("public id string")
+            .starts_with("sess_")
+    );
+    assert!(!rendered.contains("session-123"));
+}
+
+#[test]
+fn session_cli_events_rewrite_raw_session_ids() {
+    let metadata = SessionMetadata {
+        session_id: "child-session".to_string(),
+        parent_id: Some("parent-session".to_string()),
+        ..Default::default()
+    };
+    let mapping = public_session_id_map_for_metadata(&metadata);
+    let mut mapping = mapping;
+    let events = vec![SessionEvent::new(
+        "session_forked",
+        None,
+        Some("forked from parent-session into child-session".to_string()),
+        serde_json::json!({
+            "parent_session_id": "parent-session",
+            "child_session_id": "child-session",
+        }),
+    )];
+
+    let events_json = session_events_for_cli(&events, &mut mapping).expect("events json");
+    let rendered = serde_json::to_string(&events_json).expect("render events");
+    assert!(!rendered.contains("parent-session"));
+    assert!(!rendered.contains("child-session"));
+    assert!(rendered.contains("sess_"));
+}
+
+#[test]
+fn session_cli_events_discover_session_ids_from_payload_fields() {
+    let metadata = SessionMetadata {
+        session_id: "new-session".to_string(),
+        ..Default::default()
+    };
+    let mut mapping = public_session_id_map_for_metadata(&metadata);
+    let events = vec![SessionEvent::new(
+        "session_cleared",
+        None,
+        Some("cleared from old-session".to_string()),
+        serde_json::json!({
+            "cleared_from": "old-session",
+        }),
+    )];
+
+    let events_json = session_events_for_cli(&events, &mut mapping).expect("events json");
+    let rendered = serde_json::to_string(&events_json).expect("render events");
+    assert!(!rendered.contains("old-session"));
+    assert!(rendered.contains("sess_"));
+}
+
+#[test]
+fn looks_like_public_session_handle_recognises_well_formed_handles() {
+    // Known-good handle shape (`sess_` + 16 hex). We accept upper and
+    // lowercase hex so the user pasting a handle from a chat or doc
+    // surface still routes to the handle-aware resolver (and gets a
+    // clear "no session found for handle …" message) rather than
+    // falling through to the prefix resolver and getting a generic
+    // "no session matches the id prefix" error.
+    assert!(looks_like_public_session_handle("sess_0123456789abcdef"));
+    assert!(looks_like_public_session_handle("sess_0123456789ABCDEF"));
+    // Wrong length / wrong characters / wrong prefix must fall through
+    // to prefix resolution so existing raw-id callers are unaffected.
+    assert!(!looks_like_public_session_handle("sess_short"));
+    assert!(!looks_like_public_session_handle(
+        "sess_0123456789abcdef_extra"
+    ));
+    assert!(!looks_like_public_session_handle("sess_0123456789abcdeg"));
+    assert!(!looks_like_public_session_handle("not_a_handle"));
+    assert!(!looks_like_public_session_handle(""));
+    assert!(!looks_like_public_session_handle("1700000000000-12345-0"));
+}
+
+#[test]
+fn resolve_session_input_round_trips_through_public_handle() {
+    // The regression we're locking down: `sessions list` prints opaque
+    // `sess_<16hex>` handles, but `sessions resume` / `--session` /
+    // `sessions fork` / etc. used to require the raw on-disk
+    // `<ms>-<pid>-<counter>` id. If the resolver doesn't unwrap the
+    // handle back into the raw id, every session-id-consuming
+    // subcommand silently breaks for users who copy/paste from
+    // `sessions list` output.
+    let root = temp_dir("resolve-session-input-handle");
+    let raw_id = "1700000000000-12345-0";
+    plant_session_metadata(&root, raw_id, "/some/cwd");
+    let store = open_store_at(&root);
+
+    let handle = PublicSessionHandle::for_store_id(raw_id);
+    let resolved = resolve_session_input(&store, handle.as_ref())
+        .expect("handle must round-trip back to the raw id");
+    assert_eq!(resolved, raw_id);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_session_input_accepts_exact_raw_id() {
+    let root = temp_dir("resolve-session-input-raw");
+    let raw_id = "1700000000001-12345-1";
+    plant_session_metadata(&root, raw_id, "/some/cwd");
+    let store = open_store_at(&root);
+
+    let resolved = resolve_session_input(&store, raw_id).expect("exact raw id resolves");
+    assert_eq!(resolved, raw_id);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_session_input_accepts_raw_id_prefix() {
+    let root = temp_dir("resolve-session-input-prefix");
+    let raw_id = "1700000000002-12345-2";
+    plant_session_metadata(&root, raw_id, "/some/cwd");
+    let store = open_store_at(&root);
+
+    let resolved = resolve_session_input(&store, "1700000000002")
+        .expect("unique prefix resolves to the raw id");
+    assert_eq!(resolved, raw_id);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_session_input_rejects_unknown_handle_with_actionable_error() {
+    let root = temp_dir("resolve-session-input-unknown-handle");
+    plant_session_metadata(&root, "1700000000003-12345-3", "/some/cwd");
+    let store = open_store_at(&root);
+
+    // Well-formed handle shape, but no live session generates it. The
+    // error must name the handle, not silently delegate to the prefix
+    // resolver which would otherwise yield a generic "no session
+    // matches" message that does not mention the public handle.
+    let bogus = "sess_deadbeefdeadbeef";
+    let err = resolve_session_input(&store, bogus).expect_err("unknown handle errors");
+    let msg = err.to_string();
+    assert!(msg.contains("sess_deadbeefdeadbeef"), "got: {msg}");
+    assert!(msg.contains("handle"), "got: {msg}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_session_input_empty_input_is_explicit_error() {
+    // Defence in depth: an empty value must not silently match the
+    // first session on disk via prefix resolution. The store layer
+    // already rejects empty prefixes, but we surface a more specific
+    // message at the CLI boundary so the user knows the issue is at
+    // their command line, not on disk.
+    let root = temp_dir("resolve-session-input-empty");
+    let store = open_store_at(&root);
+    let err = resolve_session_input(&store, "").expect_err("empty input must error");
+    let msg = err.to_string();
+    assert!(msg.contains("session id"), "got: {msg}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cli_health_conflicts_with_subcommands_and_print_mode() {
+    // `--health` short-circuits to `doctor` with `DoctorArgs::default()`,
+    // so pairing it with `--prompt`, `--list-providers`, `--list-models`,
+    // or any subcommand previously dropped the other flag's behavior
+    // silently. Clap's `conflicts_with_all` must reject these
+    // combinations at parse time. Subcommands aren't named arg ids in
+    // the derive macro, so we don't pin them via clap here; the dispatch
+    // table is responsible for that ordering. The flag combinations
+    // below are the ones we explicitly forbid.
+    Cli::try_parse_from(["squeezy", "--health", "--prompt", "hi"])
+        .expect_err("--health + --prompt must be rejected");
+    Cli::try_parse_from(["squeezy", "--health", "--list-providers"])
+        .expect_err("--health + --list-providers must be rejected");
+    Cli::try_parse_from(["squeezy", "--health", "--list-models"])
+        .expect_err("--health + --list-models must be rejected");
+    // Plain `--health` still parses (the compatibility alias).
+    let cli = Cli::try_parse_from(["squeezy", "--health"]).expect("parse plain --health");
+    assert!(cli.health);
+}
+
+#[test]
+fn cli_doctor_and_mcp_test_flags_parse() {
+    let cli = Cli::try_parse_from([
+        "squeezy",
+        "doctor",
+        "--json",
+        "--probe",
+        "--only",
+        "probe:mcp:docs",
+        "--status",
+        "fail",
+        "--skip-update",
+    ])
+    .expect("parse doctor filters");
+    match cli.command {
+        Some(Command::Doctor(args)) => {
+            assert!(args.json);
+            assert!(args.probe);
+            assert_eq!(args.only, vec!["probe:mcp:docs".to_string()]);
+            assert_eq!(args.status, vec![doctor::DoctorStatusFilter::Fail]);
+            assert!(args.skip_update);
+        }
+        other => panic!("expected doctor command, got {other:?}"),
+    }
+
+    let cli =
+        Cli::try_parse_from(["squeezy", "mcp", "test", "docs", "--json"]).expect("parse mcp test");
+    match cli.command {
+        Some(Command::Mcp {
+            command: McpCommand::Test { name, json },
+        }) => {
+            assert_eq!(name, "docs");
+            assert!(json);
+        }
+        other => panic!("expected mcp test command, got {other:?}"),
+    }
+}
+
+#[test]
 fn repo_profile_error_does_not_block_startup() {
     let mut config = AppConfig::default();
     let prepared = prepare_repo_profile_from_load(
@@ -906,9 +1233,15 @@ async fn print_mode_runs_tools_through_agent_loop_in_text_mode() {
 
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
-    pump_prompt_events(rx, PromptFormat::Default, &mut stdout, &mut stderr)
-        .await
-        .expect("print-mode turn completes");
+    pump_prompt_events(
+        rx,
+        PromptFormat::Default,
+        PromptPermissionMode::AutoApprove,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("print-mode turn completes");
 
     let stdout_text = String::from_utf8(stdout).expect("utf-8 stdout");
     let stderr_text = String::from_utf8(stderr).expect("utf-8 stderr");
@@ -975,9 +1308,15 @@ async fn print_mode_emits_tool_events_as_jsonl() {
 
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
-    pump_prompt_events(rx, PromptFormat::Json, &mut stdout, &mut stderr)
-        .await
-        .expect("print-mode JSON turn completes");
+    pump_prompt_events(
+        rx,
+        PromptFormat::Json,
+        PromptPermissionMode::AutoApprove,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("print-mode JSON turn completes");
 
     let stdout_text = String::from_utf8(stdout).expect("utf-8 stdout");
     let mut types = Vec::new();
@@ -1073,9 +1412,15 @@ async fn print_mode_auto_approves_ask_capability_so_ci_does_not_hang() {
 
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
-    pump_prompt_events(rx, PromptFormat::Default, &mut stdout, &mut stderr)
-        .await
-        .expect("pump completes");
+    pump_prompt_events(
+        rx,
+        PromptFormat::Default,
+        PromptPermissionMode::AutoApprove,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("pump completes");
 
     let decision = decision_rx.await.expect("approval decided");
     assert!(matches!(decision, ToolApprovalDecision::AllowOnce));
@@ -1083,6 +1428,152 @@ async fn print_mode_auto_approves_ask_capability_so_ci_does_not_hang() {
     assert!(
         stderr_text.contains("auto-approving shell"),
         "stderr should announce the auto-approval; got: {stderr_text:?}"
+    );
+}
+
+#[tokio::test]
+async fn print_mode_can_deny_ask_capability_in_strict_mode() {
+    use squeezy_agent::{ToolApprovalDecision, ToolApprovalRequest};
+    use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRisk, PermissionScope};
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    let permission = PermissionRequest {
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: "echo hi".to_string(),
+        risk: PermissionRisk::Medium,
+        summary: "echo hi".to_string(),
+        metadata: Default::default(),
+        suggested_rules: Vec::new(),
+    };
+    let request = ToolApprovalRequest {
+        id: 1,
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        scope: PermissionScope::Shell,
+        permission,
+        matched_rule: None,
+        reason: "default shell permission is ask".to_string(),
+        context: None,
+        preview: Vec::new(),
+    };
+    tx.send(squeezy_agent::AgentEvent::ApprovalRequested {
+        turn_id: squeezy_core::TurnId::new(0),
+        request,
+        decision_tx,
+    })
+    .await
+    .expect("send approval request");
+    tx.send(squeezy_agent::AgentEvent::Completed {
+        turn_id: squeezy_core::TurnId::new(0),
+        message: squeezy_core::TranscriptItem::assistant(String::new()),
+        response_id: None,
+        cost: squeezy_core::CostSnapshot::default(),
+        metrics: squeezy_core::TurnMetrics::default(),
+        context_estimate: squeezy_core::ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+        session_cost: None,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    pump_prompt_events(
+        rx,
+        PromptFormat::Default,
+        PromptPermissionMode::Deny,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("pump completes");
+
+    let decision = decision_rx.await.expect("approval decided");
+    assert!(matches!(decision, ToolApprovalDecision::Denied));
+    let stderr_text = String::from_utf8(stderr).expect("utf-8 stderr");
+    assert!(
+        stderr_text.contains("approval: denying shell"),
+        "stderr should announce the denial; got: {stderr_text:?}"
+    );
+}
+
+#[tokio::test]
+async fn print_mode_fail_on_ask_returns_error_and_stops_loop() {
+    use squeezy_agent::{ToolApprovalDecision, ToolApprovalRequest};
+    use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRisk, PermissionScope};
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    let permission = PermissionRequest {
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: "rm -rf /".to_string(),
+        risk: PermissionRisk::High,
+        summary: "dangerous shell command".to_string(),
+        metadata: Default::default(),
+        suggested_rules: Vec::new(),
+    };
+    let request = ToolApprovalRequest {
+        id: 1,
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        scope: PermissionScope::Shell,
+        permission,
+        matched_rule: None,
+        reason: "default shell permission is ask".to_string(),
+        context: None,
+        preview: Vec::new(),
+    };
+    tx.send(squeezy_agent::AgentEvent::ApprovalRequested {
+        turn_id: squeezy_core::TurnId::new(0),
+        request,
+        decision_tx,
+    })
+    .await
+    .expect("send approval request");
+    // The loop should break before consuming this Completed event.
+    tx.send(squeezy_agent::AgentEvent::Completed {
+        turn_id: squeezy_core::TurnId::new(0),
+        message: squeezy_core::TranscriptItem::assistant(String::new()),
+        response_id: None,
+        cost: squeezy_core::CostSnapshot::default(),
+        metrics: squeezy_core::TurnMetrics::default(),
+        context_estimate: squeezy_core::ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+        session_cost: None,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let pump_result = pump_prompt_events(
+        rx,
+        PromptFormat::Default,
+        PromptPermissionMode::Fail,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await;
+
+    assert!(pump_result.is_err(), "fail-on-ask must return Err");
+    let decision = decision_rx.await.expect("approval decided");
+    assert!(
+        matches!(decision, ToolApprovalDecision::Denied),
+        "decision must be Denied for fail-on-ask"
+    );
+    let stderr_text = String::from_utf8(stderr).expect("utf-8 stderr");
+    assert!(
+        stderr_text.contains("approval: failing on shell"),
+        "stderr should announce the fail; got: {stderr_text:?}"
     );
 }
 
@@ -1124,6 +1615,7 @@ async fn pump_prompts_runs_bang_bang_prompt_in_text_mode_without_llm_context() {
         &agent,
         prompts,
         PromptFormat::Default,
+        PromptPermissionMode::AutoApprove,
         &mut stdout,
         &mut stderr,
     )
@@ -1181,6 +1673,7 @@ async fn pump_prompts_emits_bang_bang_tool_events_in_json_mode() {
         &agent,
         prompts,
         PromptFormat::Json,
+        PromptPermissionMode::AutoApprove,
         &mut stdout,
         &mut stderr,
     )
@@ -1270,6 +1763,7 @@ async fn pump_prompts_runs_normal_prompts_unchanged_when_no_bang_bang_present() 
         &agent,
         prompts,
         PromptFormat::Default,
+        PromptPermissionMode::AutoApprove,
         &mut stdout,
         &mut stderr,
     )

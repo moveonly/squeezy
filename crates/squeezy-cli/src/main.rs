@@ -12,14 +12,18 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use squeezy_agent::{Agent, AgentEvent, RequestUserInputResponse, ToolApprovalDecision};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use squeezy_agent::{
+    Agent, AgentEvent, RequestUserInputResponse, SessionReplayReport, ToolApprovalDecision,
+};
 use squeezy_core::settings_writer::write_settings_atomic;
 use squeezy_core::{
-    AppConfig, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpTransport,
-    ModelProfile, OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode, ReasoningEffort,
-    SessionMode, SettingsFile, SqueezyError, default_settings_path, find_project_settings_path,
-    local_settings_template, per_repo_settings_path, project_settings_template,
-    user_settings_template,
+    AppConfig, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpServerConfig,
+    McpTransport, ModelProfile, OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode,
+    ReasoningEffort, SessionMode, SettingsFile, SqueezyError, default_settings_path,
+    find_project_settings_path, local_settings_template, per_repo_settings_path,
+    project_settings_template, user_settings_template,
 };
 use squeezy_llm::{
     LlmProvider, ModelInfo, PROVIDERS, UnavailableProvider, capabilities_for,
@@ -40,9 +44,9 @@ use squeezy_core::GraphConfig;
 use squeezy_parse::smoke_all_languages;
 use squeezy_store::{
     BugReportOptions, CleanupMode, RepoProfileLoad, STALE_RUNNING_SESSION_THRESHOLD_MS,
-    SemanticSupport, SessionMetadata, SessionQuery, SessionStatus, SessionStore,
-    default_bug_report_path, ensure_repo_profile, parse_bug_report_section, paths_same,
-    refresh_repo_profile,
+    SemanticSupport, SessionEvent, SessionMetadata, SessionQuery, SessionReplayTape, SessionStatus,
+    SessionStore, default_bug_report_path, ensure_repo_profile, parse_bug_report_section,
+    paths_same, refresh_repo_profile,
 };
 use squeezy_telemetry::{
     FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
@@ -66,6 +70,22 @@ use toml_edit::{DocumentMut, Item, Table, Value as TomlValue};
 enum PromptFormat {
     Default,
     Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum PromptPermissionMode {
+    /// Allow each permission request once. This preserves the historical
+    /// non-interactive behavior and keeps CI prompts from hanging.
+    #[value(name = "auto-approve-ask")]
+    AutoApprove,
+    /// Deny each permission request and let the agent continue with the
+    /// denied tool result.
+    #[value(name = "deny-ask")]
+    Deny,
+    /// Deny the request and make the CLI command fail immediately.
+    #[value(name = "fail-on-ask")]
+    Fail,
 }
 
 #[derive(Debug, Parser)]
@@ -118,6 +138,31 @@ struct Cli {
         default_value = "default"
     )]
     format: PromptFormat,
+    #[arg(
+        long = "prompt-permission-mode",
+        value_name = "MODE",
+        value_enum,
+        default_value_t = PromptPermissionMode::AutoApprove,
+        help = "Permission behavior for non-interactive --prompt runs: auto-approve-ask, deny-ask, or fail-on-ask"
+    )]
+    prompt_permission_mode: PromptPermissionMode,
+    #[arg(
+        long = "health",
+        hide = true,
+        // `--health` short-circuits the dispatch table and runs doctor
+        // with `DoctorArgs::default()`. Pairing it with one of the
+        // top-level print-mode / list flags would silently drop the
+        // other flag's behavior; reject those combinations at parse
+        // time so the deviation is loud instead of mysterious. The
+        // subcommand-with-`--health` combination is rejected at
+        // runtime in `run()` because the subcommand group does not
+        // expose a conflict-friendly arg id in clap derive. Use
+        // `squeezy doctor --json` (and other doctor flags) for non-
+        // default behavior; `--health` is a compatibility alias only.
+        conflicts_with_all = ["prompt", "list_providers", "list_models"],
+        help = "Hidden compatibility alias for `squeezy doctor` (no extra flags accepted; use `squeezy doctor` for --json/--probe/--only)"
+    )]
+    health: bool,
     #[arg(
         long,
         help = "Ignore saved provider/model defaults and run startup selection again"
@@ -320,6 +365,14 @@ enum McpCommand {
         #[arg(long)]
         probe: bool,
     },
+    #[command(
+        about = "Test one configured MCP server with the session initialize/tool-discovery handshake"
+    )]
+    Test {
+        name: String,
+        #[arg(long, help = "Emit machine-readable JSON instead of a status row")]
+        json: bool,
+    },
     #[command(about = "Add an MCP server to user or project settings")]
     Add(Box<McpAddArgs>),
     #[command(about = "Enable a configured MCP server")]
@@ -491,7 +544,10 @@ struct SkillsConfigScope {
 #[derive(Debug, Subcommand)]
 enum RepoCommand {
     #[command(about = "Print the stored or freshly computed repo profile")]
-    Inspect,
+    Inspect {
+        #[arg(long, help = "Emit machine-readable JSON instead of human text")]
+        json: bool,
+    },
     #[command(about = "Recompute and persist the generated local repo profile")]
     Refresh,
     #[command(about = "Print suggested project config settings for manual adoption")]
@@ -523,7 +579,11 @@ enum SessionsCommand {
     #[command(about = "List local sessions")]
     List(SessionListArgs),
     #[command(about = "Show a local session summary")]
-    Show { id: String },
+    Show {
+        id: String,
+        #[arg(long, help = "Emit machine-readable JSON instead of key=value lines")]
+        json: bool,
+    },
     #[command(about = "Resume a local session in the TUI")]
     Resume {
         id: String,
@@ -595,6 +655,11 @@ struct SessionListArgs {
     query: Option<String>,
     #[arg(long, help = "Include archived sessions (excluded by default)")]
     include_archived: bool,
+    #[arg(
+        long,
+        help = "Emit machine-readable JSON instead of tab-separated rows"
+    )]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -702,6 +767,29 @@ async fn run() -> squeezy_core::Result<()> {
             "--format json requires --prompt or piped stdin; interactive sessions and subcommands only emit human-formatted output"
                 .to_string(),
         ));
+    }
+    if cli.health {
+        // Clap's `conflicts_with_all` on `--health` already rejects
+        // `--prompt`, `--list-providers`, and `--list-models`, but the
+        // subcommand group is not addressable from `conflicts_with*`
+        // in the derive macro, so we surface that conflict here. The
+        // failure mode we are preventing is `squeezy --health doctor
+        // --probe` silently running plain doctor and dropping the
+        // subcommand's flags.
+        if cli.command.is_some() {
+            return Err(SqueezyError::Config(
+                "--health is a compatibility alias for `squeezy doctor` and cannot be combined with a subcommand; \
+                 drop --health, or run `squeezy doctor` directly to pass --json/--probe/--only"
+                    .to_string(),
+            ));
+        }
+        let report = doctor::run(&DoctorArgs::default()).await?;
+        report.print();
+        let code = report.exit_code;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
     }
     match &cli.command {
         Some(Command::Config { command }) => {
@@ -821,16 +909,20 @@ async fn run() -> squeezy_core::Result<()> {
     telemetry.spawn(TelemetryEvent::app_started(&config));
     squeezy_core::startup_trace::mark("telemetry_spawned");
 
-    // Resolve `--session <prefix>` against the on-disk session store
-    // before any downstream code sees it, so the user can pass a short
-    // unique prefix (`squeezy --session abc12`) the same way `squeezy
-    // sessions resume abc12` works. Ambiguous and unknown prefixes
-    // fail fast with a clear message instead of being forwarded into a
-    // generic "session not found" later.
+    // Resolve `--session <input>` against the on-disk session store
+    // before any downstream code sees it. The user can pass:
+    //   * the opaque `sess_<16hex>` handle printed by `squeezy
+    //     sessions list` (the documented surface),
+    //   * a short unique raw-id prefix (the same way `squeezy sessions
+    //     resume abc12` works), or
+    //   * the full raw id.
+    // Ambiguous and unknown values fail fast with a clear message
+    // instead of being forwarded into a generic "session not found"
+    // later.
+    let session_store = SessionStore::open(&config);
     let resolved_session_id: Option<String> = match cli.session.as_deref() {
         Some(id) => Some(
-            SessionStore::open(&config)
-                .resolve_session_id_prefix(id)
+            resolve_session_input(&session_store, id)
                 .map_err(|err| SqueezyError::Tool(format!("--session: {err}")))?,
         ),
         None => None,
@@ -848,7 +940,7 @@ async fn run() -> squeezy_core::Result<()> {
             note: None,
         }
     } else {
-        let sessions = SessionStore::open(&config)
+        let sessions = session_store
             .list(&SessionQuery::default())
             .unwrap_or_default();
         let cwd_str = config.workspace_root.display().to_string();
@@ -864,8 +956,7 @@ async fn run() -> squeezy_core::Result<()> {
     // is effectively a no-op for that path — the lookup is only on the
     // explicit `--session <id>` flow in practice.
     let resume_session_id_opt = if let Some(id) = resume_resolution.session_id.as_deref() {
-        let store = SessionStore::open(&config);
-        if !confirm_cross_project_resume_stdio(&store, id, cli.force_cross_project)? {
+        if !confirm_cross_project_resume_stdio(&session_store, id, cli.force_cross_project)? {
             println!("resume cancelled");
             flush_telemetry_best_effort(&telemetry).await;
             return Ok(());
@@ -910,6 +1001,7 @@ async fn run() -> squeezy_core::Result<()> {
             provider,
             typed_prompts,
             cli.format,
+            cli.prompt_permission_mode,
             resume_resolution.session_id,
             telemetry.clone(),
         )
@@ -1847,6 +1939,112 @@ async fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Re
                     }
                     println!("{line}");
                 }
+            }
+            Ok(())
+        }
+        McpCommand::Test { name, json } => {
+            let config = config_from_cli(cli)?;
+            let Some(server) = config.mcp_servers.get(name).cloned() else {
+                return Err(SqueezyError::Config(format!(
+                    "MCP server {name:?} is not configured"
+                )));
+            };
+            // `mcp test` is an explicit operator action ("probe this
+            // server now"), so we honor it even when `enabled = false`
+            // in settings — running `squeezy mcp disable foo &&
+            // squeezy mcp test foo` should still report whether `foo`
+            // would handshake. The probe is one-shot and uses a
+            // throwaway registry, so this never persists `enabled =
+            // true`; we just surface the override in both human and
+            // JSON output so the operator is not surprised when the
+            // probe succeeds against a `disabled` server.
+            let enabled_in_config = server.enabled;
+            let server = McpServerConfig {
+                enabled: true,
+                ..server
+            };
+            let mut servers = BTreeMap::new();
+            servers.insert(name.clone(), server);
+            const MCP_TEST_TIMEOUT_SECS: u64 = 30;
+            let registry = McpClientRegistry::new(servers);
+            let timed_out = tokio::time::timeout(
+                Duration::from_secs(MCP_TEST_TIMEOUT_SECS),
+                registry.refresh_tools(CancellationToken::new()),
+            )
+            .await;
+            registry.shutdown().await;
+            let (status_label, detail, tools_count) = match timed_out {
+                Err(_) => (
+                    "warn",
+                    format!("handshake timed out after {MCP_TEST_TIMEOUT_SECS}s"),
+                    None,
+                ),
+                Ok(outcome) => {
+                    let status = outcome.status.per_server.get(name);
+                    match status {
+                        Some(McpServerStatus::Ready { tools_count, .. }) => (
+                            "ok",
+                            format!("handshake ok; {tools_count} tools advertised"),
+                            Some(*tools_count),
+                        ),
+                        Some(McpServerStatus::Stale {
+                            tools_count,
+                            outcome,
+                        }) => (
+                            "warn",
+                            format!(
+                                "handshake stale; serving {tools_count} cached tools after {}",
+                                mcp_stale_outcome_detail(outcome)
+                            ),
+                            Some(*tools_count),
+                        ),
+                        Some(McpServerStatus::Failed { error }) => {
+                            ("fail", format!("handshake failed: {error}"), None)
+                        }
+                        Some(McpServerStatus::Cancelled) => (
+                            "warn",
+                            "handshake timed out or was cancelled".to_string(),
+                            None,
+                        ),
+                        Some(McpServerStatus::Starting) => {
+                            ("warn", "handshake did not complete".to_string(), None)
+                        }
+                        None => (
+                            "warn",
+                            "server did not produce a probe status".to_string(),
+                            None,
+                        ),
+                    }
+                }
+            };
+            let detail_with_note = if enabled_in_config {
+                detail.clone()
+            } else {
+                format!("(server was disabled in config; re-enabled for probe) {detail}")
+            };
+            if *json {
+                let body = serde_json::json!({
+                    "name": name,
+                    "status": status_label,
+                    "detail": &detail_with_note,
+                    "tools_count": tools_count,
+                    "enabled_in_config": enabled_in_config,
+                });
+                // Emit the JSON body before any potential error return
+                // below so machine consumers always receive a parseable
+                // payload, even on `fail`. The non-zero exit still
+                // signals failure for shell-level callers.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&body).map_err(|err| {
+                        SqueezyError::Parse(format!("failed to serialize MCP test: {err}"))
+                    })?
+                );
+            } else {
+                println!("[{status_label}] mcp:{name}  {detail_with_note}");
+            }
+            if status_label == "fail" {
+                return Err(SqueezyError::Tool(detail_with_note));
             }
             Ok(())
         }
@@ -2927,17 +3125,38 @@ fn parse_env_entry(entry: &str) -> squeezy_core::Result<(&str, &str)> {
     Ok((key, value))
 }
 
+fn mcp_stale_outcome_detail(outcome: &McpStaleOutcome) -> String {
+    match outcome {
+        McpStaleOutcome::Failed { error } => format!("discovery failed: {error}"),
+        McpStaleOutcome::Cancelled => "discovery was cancelled".to_string(),
+    }
+}
+
 fn handle_repo_command(command: &RepoCommand, cli: &Cli) -> squeezy_core::Result<()> {
     let config = config_from_cli(cli)?;
     match command {
-        RepoCommand::Inspect => {
+        RepoCommand::Inspect { json } => {
             let loaded = ensure_repo_profile(&config.workspace_root, &config.graph)?;
-            println!("{}", loaded.profile.render_human());
-            println!(
-                "registry: {} ({})",
-                loaded.registry_path.display(),
-                loaded.status.as_str()
-            );
+            if *json {
+                let body = serde_json::json!({
+                    "status": loaded.status.as_str(),
+                    "registry_path": loaded.registry_path,
+                    "profile": loaded.profile,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&body).map_err(|err| {
+                        SqueezyError::Parse(format!("failed to serialize repo profile: {err}"))
+                    })?
+                );
+            } else {
+                println!("{}", loaded.profile.render_human());
+                println!(
+                    "registry: {} ({})",
+                    loaded.registry_path.display(),
+                    loaded.status.as_str()
+                );
+            }
             Ok(())
         }
         RepoCommand::Refresh => {
@@ -3115,73 +3334,117 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
     match command {
         SessionsCommand::List(args) => {
             let sessions = store.list(&session_query_from_args(args)?)?;
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            for session in sessions {
-                let stale_marker = if session.status == SessionStatus::Running
-                    && now_ms.saturating_sub(session.started_at_ms)
-                        > STALE_RUNNING_SESSION_THRESHOLD_MS
-                {
-                    " [stale-running]"
-                } else {
-                    ""
-                };
+            if args.json {
+                let body = sessions
+                    .iter()
+                    .map(session_metadata_for_cli)
+                    .collect::<squeezy_core::Result<Vec<_>>>()?;
                 println!(
-                    "{}\t{}{}\t{}\t{}\t{}\t{}",
-                    session.session_id,
-                    session.status.as_str(),
-                    stale_marker,
-                    session.started_at_ms,
-                    session.branch.unwrap_or_else(|| "-".to_string()),
-                    session.provider,
-                    session
-                        .first_user_task
-                        .or(session.latest_summary)
-                        .unwrap_or_default()
-                        .replace('\n', " ")
+                    "{}",
+                    serde_json::to_string_pretty(&body).map_err(|err| {
+                        SqueezyError::Parse(format!("failed to serialize sessions: {err}"))
+                    })?
                 );
+            } else {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                for session in sessions {
+                    let handle = PublicSessionHandle::for_store_id(&session.session_id);
+                    let stale_marker = if session.status == SessionStatus::Running
+                        && now_ms.saturating_sub(session.started_at_ms)
+                            > STALE_RUNNING_SESSION_THRESHOLD_MS
+                    {
+                        " [stale-running]"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "{}\t{}{}\t{}\t{}\t{}\t{}",
+                        handle,
+                        session.status.as_str(),
+                        stale_marker,
+                        session.started_at_ms,
+                        session.branch.unwrap_or_else(|| "-".to_string()),
+                        session.provider,
+                        session
+                            .first_user_task
+                            .or(session.latest_summary)
+                            .unwrap_or_default()
+                            .replace('\n', " ")
+                    );
+                }
             }
             Ok(())
         }
-        SessionsCommand::Show { id } => {
-            let record = store.show(id)?;
-            println!("id={}", record.metadata.session_id);
-            println!("status={}", record.metadata.status.as_str());
-            println!("started_at_ms={}", record.metadata.started_at_ms);
-            println!(
-                "ended_at_ms={}",
-                format_optional_u64(record.metadata.ended_at_ms)
-            );
-            println!("cwd={}", record.metadata.cwd);
-            println!("workspace_root={}", record.metadata.workspace_root);
-            println!(
-                "repo_root={}",
-                record.metadata.repo_root.unwrap_or_else(|| "-".to_string())
-            );
-            println!(
-                "branch={}",
-                record.metadata.branch.unwrap_or_else(|| "-".to_string())
-            );
-            println!("provider={}", record.metadata.provider);
-            println!("model={}", record.metadata.model);
-            println!("mode={}", record.metadata.mode.as_str());
-            println!("events={}", record.metadata.event_count);
-            println!("event_warnings={}", record.event_warnings);
-            if let Some(ref tape) = record.replay {
-                println!("replay_warnings={}", tape.warnings);
-            }
-            println!("redactions={}", record.metadata.redactions);
-            println!("resume_available={}", record.metadata.resume_available);
-            if let Some(reason) = record.metadata.resume_unavailable_reason {
-                println!("resume_unavailable_reason={reason}");
-            }
-            if let Some(task) = record.metadata.first_user_task {
-                println!("first_user_task={}", task.replace('\n', " "));
-            }
-            if let Some(summary) = record.metadata.latest_summary {
-                println!("latest_summary={}", summary.replace('\n', " "));
+        SessionsCommand::Show { id, json } => {
+            let resolved = resolve_session_input(&store, id)?;
+            let record = store.show(&resolved)?;
+            if *json {
+                let mut session_id_map = public_session_id_map_for_metadata(&record.metadata);
+                let metadata = session_metadata_for_cli(&record.metadata)?;
+                let events = session_events_for_cli(&record.events, &mut session_id_map)?;
+                let replay = record
+                    .replay
+                    .map(|tape| session_replay_for_cli_with_mapping(tape, &mut session_id_map))
+                    .transpose()?;
+                let mut body = serde_json::json!({
+                    "metadata": metadata,
+                    "events": events,
+                    "event_warnings": record.event_warnings,
+                    "resume_state": record.resume_state,
+                    "attachments": record.attachments,
+                    "replay": replay,
+                });
+                // Discover any session IDs present only in resume_state/attachments
+                // before the final sanitization pass.
+                add_public_session_id_mappings_from_value(&body, &mut session_id_map);
+                sanitize_session_ids_in_value(&mut body, &session_id_map);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&body).map_err(|err| {
+                        SqueezyError::Parse(format!("failed to serialize session: {err}"))
+                    })?
+                );
+            } else {
+                let handle = PublicSessionHandle::for_store_id(&record.metadata.session_id);
+                println!("id={handle}");
+                println!("status={}", record.metadata.status.as_str());
+                println!("started_at_ms={}", record.metadata.started_at_ms);
+                println!(
+                    "ended_at_ms={}",
+                    format_optional_u64(record.metadata.ended_at_ms)
+                );
+                println!("cwd={}", record.metadata.cwd);
+                println!("workspace_root={}", record.metadata.workspace_root);
+                println!(
+                    "repo_root={}",
+                    record.metadata.repo_root.unwrap_or_else(|| "-".to_string())
+                );
+                println!(
+                    "branch={}",
+                    record.metadata.branch.unwrap_or_else(|| "-".to_string())
+                );
+                println!("provider={}", record.metadata.provider);
+                println!("model={}", record.metadata.model);
+                println!("mode={}", record.metadata.mode.as_str());
+                println!("events={}", record.metadata.event_count);
+                println!("event_warnings={}", record.event_warnings);
+                if let Some(ref tape) = record.replay {
+                    println!("replay_warnings={}", tape.warnings);
+                }
+                println!("redactions={}", record.metadata.redactions);
+                println!("resume_available={}", record.metadata.resume_available);
+                if let Some(reason) = record.metadata.resume_unavailable_reason {
+                    println!("resume_unavailable_reason={reason}");
+                }
+                if let Some(task) = record.metadata.first_user_task {
+                    println!("first_user_task={}", task.replace('\n', " "));
+                }
+                if let Some(summary) = record.metadata.latest_summary {
+                    println!("latest_summary={}", summary.replace('\n', " "));
+                }
             }
             // Warn when a session is still marked running but its last event
             // is old — this suggests the process was killed (SIGKILL, power loss,
@@ -3209,15 +3472,12 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             id,
             force_cross_project,
         } => {
-            // Pi-style prefix resolution: the user can type a short
-            // unique prefix of a session id (e.g. `squeezy sessions
-            // resume abc12`) and the store expands it to the full id
-            // before we hand it to the TUI. Ambiguous and unknown
-            // prefixes surface as actionable errors instead of being
-            // forwarded as-is into a "session not found" downstream.
-            let resolved = store
-                .resolve_session_id_prefix(id)
-                .map_err(|err| SqueezyError::Tool(err.to_string()))?;
+            // Accept either the opaque `sess_<16hex>` handle published
+            // by `squeezy sessions list` or a raw id / raw-id prefix.
+            // Ambiguous and unknown values surface as actionable errors
+            // instead of being forwarded as-is into a "session not
+            // found" downstream.
+            let resolved = resolve_session_input(&store, id)?;
             // F07: when the recorded `metadata.cwd` differs from the
             // caller's current directory, gate the resume behind a y/N
             // prompt so a stray `squeezy sessions resume <id>` from an
@@ -3238,19 +3498,22 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             // on disk, then drop into the TUI resuming the child. The
             // parent session is preserved so `squeezy sessions resume
             // <parent>` still works.
+            let resolved = resolve_session_input(&store, id)?;
             let provider = provider_from_app_config(&config);
             let child_metadata = SessionMetadata::new(&config, provider.name());
-            let child = store.fork_session(id, child_metadata)?;
+            let child = store.fork_session(&resolved, child_metadata)?;
             let child_id = child.session_id().to_string();
             drop(child);
             squeezy_tui::resume(config, provider, child_id).await
         }
         SessionsCommand::Replay { id, json } => {
-            let report = Agent::replay_session(config, id).await?;
+            let resolved = resolve_session_input(&store, id)?;
+            let report = Agent::replay_session(config, &resolved).await?;
             if *json {
+                let body = session_replay_report_for_cli(&report)?;
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&report).map_err(|err| {
+                    serde_json::to_string_pretty(&body).map_err(|err| {
                         SqueezyError::Tool(format!("failed to serialize replay report: {err}"))
                     })?
                 );
@@ -3275,23 +3538,33 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             } else {
                 CleanupMode::Archive
             };
-            let report = store.cleanup_with(ids, None, mode)?;
+            let resolved_ids = ids
+                .iter()
+                .map(|id| resolve_session_input(&store, id))
+                .collect::<squeezy_core::Result<Vec<_>>>()?;
+            let report = store.cleanup_with(&resolved_ids, None, mode)?;
             for id in report.archived {
-                println!("archived {id}");
+                let handle = PublicSessionHandle::for_store_id(&id);
+                println!("archived {handle}");
             }
             for id in report.removed {
-                println!("removed {id}");
+                let handle = PublicSessionHandle::for_store_id(&id);
+                println!("removed {handle}");
             }
             Ok(())
         }
         SessionsCommand::Archive { id } => {
-            store.archive_session(id)?;
-            println!("archived {id}");
+            let resolved = resolve_session_input(&store, id)?;
+            store.archive_session(&resolved)?;
+            let handle = PublicSessionHandle::for_store_id(&resolved);
+            println!("archived {handle}");
             Ok(())
         }
         SessionsCommand::Unarchive { id } => {
-            store.unarchive_session(id)?;
-            println!("unarchived {id}");
+            let resolved = resolve_session_input(&store, id)?;
+            store.unarchive_session(&resolved)?;
+            let handle = PublicSessionHandle::for_store_id(&resolved);
+            println!("unarchived {handle}");
             Ok(())
         }
     }
@@ -3326,23 +3599,30 @@ fn handle_session_export_command(
     store: &SessionStore,
     args: &SessionExportArgs,
 ) -> squeezy_core::Result<()> {
+    let resolved = resolve_session_input(store, &args.id)?;
     if args.html {
-        let record = store.show(&args.id)?;
+        let record = store.show(&resolved)?;
         let opts = squeezy_agent::ExportOpts {
             include_tool_outputs: !args.no_tool_outputs,
             theme: args.theme.to_theme(),
         };
         let html = squeezy_agent::export_session_to_html(&record, &opts)
             .map_err(|err| SqueezyError::Tool(format!("failed to render session html: {err}")))?;
+        // Public handle keeps the default filename safe to share without
+        // leaking the raw `<ms>-<pid>-<counter>` id.
+        let default_name = format!(
+            "squeezy-session-{}.html",
+            PublicSessionHandle::for_store_id(&resolved)
+        );
         let target = args
             .output
             .clone()
-            .unwrap_or_else(|| PathBuf::from(format!("squeezy-session-{}.html", args.id)));
+            .unwrap_or_else(|| PathBuf::from(default_name));
         fs::write(&target, &html)?;
         println!("wrote {} ({} bytes)", target.display(), html.len());
         return Ok(());
     }
-    let value = store.export(&args.id)?;
+    let value = store.export(&resolved)?;
     let json = serde_json::to_string_pretty(&value)
         .map_err(|err| SqueezyError::Tool(format!("failed to serialize session export: {err}")))?;
     if let Some(target) = args.output.as_ref() {
@@ -3364,7 +3644,9 @@ async fn handle_session_report_command(
         max_section_bytes: config.session_logs.max_event_bytes,
         max_archive_bytes: config.feedback.max_report_bytes,
     };
-    let bundle = SessionStore::open(config).build_bug_report(config, &args.id, options)?;
+    let store = SessionStore::open(config);
+    let resolved = resolve_session_input(&store, &args.id)?;
+    let bundle = store.build_bug_report(config, &resolved, options)?;
     if args.preview || args.send {
         print!("{}", bundle.preview_text());
     }
@@ -3402,10 +3684,15 @@ async fn handle_session_report_command(
             }
         }
     }
+    // Use the public handle for the default filename so the on-disk
+    // bug-report artifact also avoids leaking the raw
+    // `<ms>-<pid>-<counter>` id. `default_bug_report_path` already
+    // sanitizes input for filesystem-safe characters.
+    let handle = PublicSessionHandle::for_store_id(&resolved);
     let path = args
         .output
         .clone()
-        .unwrap_or_else(|| default_bug_report_path(config, &args.id));
+        .unwrap_or_else(|| default_bug_report_path(config, handle.as_ref()));
     bundle.write_archive(&path)?;
     println!("report archive: {}", path.display());
     Ok(())
@@ -4269,6 +4556,309 @@ fn parse_session_status(value: &str) -> squeezy_core::Result<SessionStatus> {
     }
 }
 
+/// Opaque, stable pseudonym derived from a raw `<ms>-<pid>-<counter>`
+/// session id. CLI output uses this form everywhere a session id would
+/// otherwise be logged (CodeQL's "cleartext logging of sensitive
+/// information" heuristic flags the raw shape), and
+/// [`resolve_session_input`] reverses it when the user passes a
+/// `sess_…` value back in.
+///
+/// **Wire format:** `sess_<16 lowercase hex>` (8 bytes / 64 bits of the
+/// SHA-256 digest). 64 bits is astronomically collision-resistant for a
+/// local single-user session store — even at a few hundred thousand
+/// sessions the expected collision count stays well below 1 — and the
+/// `v1` tag in the domain-separation key (`squeezy-public-session-id-v1\0`)
+/// reserves room to lengthen the digest without changing the prefix if
+/// future use lengthens the address space.
+///
+/// **Hash choice:** the cryptographic strength of SHA-256 is not load-
+/// bearing here (this is a pseudonym, not credential material). A
+/// cheaper hash with the same 64-bit pre-image property would be a
+/// drop-in replacement; the only consumer is this file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicSessionHandle(String);
+
+impl PublicSessionHandle {
+    fn for_store_id(value: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"squeezy-public-session-id-v1\0");
+        hasher.update(value.as_bytes());
+        let digest = hasher.finalize();
+        let mut out = String::from("sess_");
+        for byte in &digest[..8] {
+            let _ = write!(&mut out, "{byte:02x}");
+        }
+        Self(out)
+    }
+}
+
+impl AsRef<str> for PublicSessionHandle {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PublicSessionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for PublicSessionHandle {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+fn session_metadata_for_cli(metadata: &SessionMetadata) -> squeezy_core::Result<serde_json::Value> {
+    let session_id_map = public_session_id_map_for_metadata(metadata);
+    let mut value = serde_json::to_value(metadata).map_err(|err| {
+        SqueezyError::Parse(format!("failed to serialize session metadata: {err}"))
+    })?;
+    sanitize_session_ids_in_value(&mut value, &session_id_map);
+    let Some(object) = value.as_object_mut() else {
+        return Err(SqueezyError::Parse(
+            "session metadata did not serialize to an object".to_string(),
+        ));
+    };
+    object.remove("session_id");
+    let public_id = session_id_map
+        .get(&metadata.session_id)
+        .cloned()
+        .unwrap_or_else(|| PublicSessionHandle::for_store_id(&metadata.session_id).0);
+    object.insert("id".to_string(), serde_json::Value::String(public_id));
+    Ok(value)
+}
+
+#[cfg(test)]
+fn session_replay_for_cli(tape: SessionReplayTape) -> squeezy_core::Result<serde_json::Value> {
+    let mut session_id_map = BTreeMap::new();
+    add_public_session_id_mapping(&mut session_id_map, &tape.session_id);
+    session_replay_for_cli_with_mapping(tape, &mut session_id_map)
+}
+
+fn session_replay_for_cli_with_mapping(
+    tape: SessionReplayTape,
+    session_id_map: &mut BTreeMap<String, String>,
+) -> squeezy_core::Result<serde_json::Value> {
+    let mut events = serde_json::to_value(tape.events).map_err(|err| {
+        SqueezyError::Parse(format!("failed to serialize session replay events: {err}"))
+    })?;
+    add_public_session_id_mappings_from_value(&events, session_id_map);
+    sanitize_session_ids_in_value(&mut events, session_id_map);
+    Ok(serde_json::json!({
+        "schema_version": tape.schema_version,
+        "id": PublicSessionHandle::for_store_id(&tape.session_id),
+        "events": events,
+        "warnings": tape.warnings,
+    }))
+}
+
+fn session_replay_report_for_cli(
+    report: &SessionReplayReport,
+) -> squeezy_core::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(report)
+        .map_err(|err| SqueezyError::Parse(format!("failed to serialize replay report: {err}")))?;
+    let mut session_id_map = BTreeMap::new();
+    add_public_session_id_mapping(&mut session_id_map, &report.session_id);
+    sanitize_session_ids_in_value(&mut value, &session_id_map);
+    let Some(object) = value.as_object_mut() else {
+        return Err(SqueezyError::Parse(
+            "replay report did not serialize to an object".to_string(),
+        ));
+    };
+    object.remove("session_id");
+    let public_id = session_id_map
+        .get(&report.session_id)
+        .cloned()
+        .unwrap_or_else(|| PublicSessionHandle::for_store_id(&report.session_id).0);
+    object.insert("id".to_string(), serde_json::Value::String(public_id));
+    Ok(value)
+}
+
+fn session_events_for_cli(
+    events: &[SessionEvent],
+    session_id_map: &mut BTreeMap<String, String>,
+) -> squeezy_core::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(events)
+        .map_err(|err| SqueezyError::Parse(format!("failed to serialize session events: {err}")))?;
+    add_public_session_id_mappings_from_value(&value, session_id_map);
+    sanitize_session_ids_in_value(&mut value, session_id_map);
+    Ok(value)
+}
+
+fn public_session_id_map_for_metadata(metadata: &SessionMetadata) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    add_public_session_id_mapping(&mut map, &metadata.session_id);
+    if let Some(parent_id) = metadata.parent_id.as_deref() {
+        add_public_session_id_mapping(&mut map, parent_id);
+    }
+    map
+}
+
+fn add_public_session_id_mapping(map: &mut BTreeMap<String, String>, session_id: &str) {
+    if session_id.is_empty() {
+        return;
+    }
+    map.insert(
+        session_id.to_string(),
+        PublicSessionHandle::for_store_id(session_id)
+            .as_ref()
+            .to_string(),
+    );
+}
+
+fn add_public_session_id_mappings_from_value(
+    value: &serde_json::Value,
+    session_id_map: &mut BTreeMap<String, String>,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                add_public_session_id_mappings_from_value(item, session_id_map);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for (key, item) in object {
+                if is_session_id_json_key(key)
+                    && let Some(session_id) = item.as_str()
+                {
+                    add_public_session_id_mapping(session_id_map, session_id);
+                }
+                add_public_session_id_mappings_from_value(item, session_id_map);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
+fn is_session_id_json_key(key: &str) -> bool {
+    key == "session_id"
+        || key == "parent_id"
+        || key.ends_with("_session_id")
+        || key == "cleared_from"
+}
+
+fn sanitize_session_ids_in_value(
+    value: &mut serde_json::Value,
+    session_id_map: &BTreeMap<String, String>,
+) {
+    let mut replacements: Vec<(&String, &String)> = session_id_map.iter().collect();
+    // Longest raw id first so a shorter id that is a substring of a
+    // longer one cannot clobber the longer one's match.
+    replacements.sort_by_key(|(raw, _)| std::cmp::Reverse(raw.len()));
+    sanitize_session_ids_in_value_inner(value, &replacements);
+}
+
+fn sanitize_session_ids_in_value_inner(
+    value: &mut serde_json::Value,
+    replacements: &[(&String, &String)],
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            for (raw, public) in replacements {
+                if raw != public {
+                    *text = text.replace(raw.as_str(), public.as_str());
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                sanitize_session_ids_in_value_inner(item, replacements);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for item in object.values_mut() {
+                sanitize_session_ids_in_value_inner(item, replacements);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+/// Translate a user-supplied session identifier into a raw on-disk
+/// `<ms>-<pid>-<counter>` session id that the store layer accepts.
+///
+/// CLI output exposes only the opaque [`PublicSessionHandle`] form
+/// (`sess_<16hex>`) so the raw id is never written to a log surface that
+/// CodeQL flags as cleartext-sensitive, but the inputs the user actually
+/// types still have to round-trip back to a real session — otherwise
+/// `sessions list | xargs sessions resume` and friends silently break.
+/// This resolver is the single source of truth for that translation and
+/// is shared by every session-id-consuming subcommand and by
+/// `--session <id>` at startup.
+///
+/// Resolution order (first match wins):
+///
+/// 1. **Exact raw id**: if the input names an existing session
+///    directory (live or archived) directly, return it unchanged. This
+///    is the cheap happy path and also keeps backwards compatibility
+///    with scripts that already capture raw ids from `events.jsonl`
+///    or `.squeezy/sessions/<id>/` directly.
+/// 2. **Public handle**: if the input looks like a [`PublicSessionHandle`]
+///    (`sess_<16hex>`) we linear-scan the live and archived sessions and
+///    return the underlying raw id whose handle matches. The scan
+///    excludes archived sessions when the live root already produced a
+///    match, but this code path is dominated by the disk read so
+///    excluding archived first would not be a meaningful speedup.
+/// 3. **Prefix**: otherwise we hand the input to
+///    [`SessionStore::resolve_session_id_prefix`], which handles
+///    raw-id prefix matching with its own ambiguity diagnostics.
+///
+/// The function is intentionally infallible by default for valid public
+/// handles: callers should not need to know whether the user typed the
+/// public form or the raw form. For the prefix path it surfaces the
+/// store's ambiguity / not-found errors verbatim, prefixed by the
+/// caller's context where applicable.
+fn resolve_session_input(store: &SessionStore, input: &str) -> squeezy_core::Result<String> {
+    if input.is_empty() {
+        return Err(SqueezyError::Tool(
+            "session id is required; pass an id from `squeezy sessions list`".to_string(),
+        ));
+    }
+
+    if store.read_metadata(input).is_ok() {
+        return Ok(input.to_string());
+    }
+
+    if looks_like_public_session_handle(input) {
+        let query = SessionQuery {
+            include_archived: true,
+            ..Default::default()
+        };
+        for metadata in store.list(&query)? {
+            if PublicSessionHandle::for_store_id(&metadata.session_id).0 == input {
+                return Ok(metadata.session_id);
+            }
+        }
+        return Err(SqueezyError::Tool(format!(
+            "no session found for handle {input:?}; the handle is published by `squeezy sessions list`"
+        )));
+    }
+
+    store
+        .resolve_session_id_prefix(input)
+        .map_err(|err| SqueezyError::Tool(err.to_string()))
+}
+
+/// Return true when `value` matches the [`PublicSessionHandle`] shape
+/// (`sess_<16hex>`). Used by [`resolve_session_input`] to decide whether
+/// to scan the on-disk session list or treat the value as a raw prefix.
+/// The check is intentionally cheap; mismatches fall through to prefix
+/// resolution rather than erroring out.
+fn looks_like_public_session_handle(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("sess_") else {
+        return false;
+    };
+    suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn format_optional_u64(value: Option<u64>) -> String {
     value.map_or_else(|| "-".to_string(), |value| value.to_string())
 }
@@ -4278,6 +4868,7 @@ async fn run_prompts(
     provider: Arc<dyn LlmProvider>,
     prompts: Vec<print_mode::PromptInput>,
     format: PromptFormat,
+    permission_mode: PromptPermissionMode,
     resume_session_id: Option<String>,
     telemetry: TelemetryClient,
 ) -> squeezy_core::Result<()> {
@@ -4299,7 +4890,15 @@ async fn run_prompts(
     let stderr = io::stderr();
     let mut stdout = stdout.lock();
     let mut stderr = stderr.lock();
-    let result = pump_prompts(&agent, prompts, format, &mut stdout, &mut stderr).await;
+    let result = pump_prompts(
+        &agent,
+        prompts,
+        format,
+        permission_mode,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await;
     let exit_status = if result.is_ok() {
         SessionStatus::Completed
     } else {
@@ -4322,6 +4921,7 @@ async fn pump_prompts<O, E>(
     agent: &Agent,
     prompts: Vec<print_mode::PromptInput>,
     format: PromptFormat,
+    permission_mode: PromptPermissionMode,
     stdout: &mut O,
     stderr: &mut E,
 ) -> squeezy_core::Result<()>
@@ -4336,7 +4936,7 @@ where
             prompt.content
         };
         let rx = agent.start_turn(input, CancellationToken::new());
-        pump_prompt_events(rx, format, stdout, stderr).await?;
+        pump_prompt_events(rx, format, permission_mode, stdout, stderr).await?;
     }
     Ok(())
 }
@@ -4349,6 +4949,7 @@ where
 async fn pump_prompt_events<O, E>(
     mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
     format: PromptFormat,
+    permission_mode: PromptPermissionMode,
     stdout: &mut O,
     stderr: &mut E,
 ) -> squeezy_core::Result<()>
@@ -4412,29 +5013,66 @@ where
                 decision_tx,
                 ..
             } => {
-                // There is nobody to prompt in print mode. The
-                // permission policy already filtered out the
-                // hard-default deny cases (read=Allow, edit=Allow),
-                // so anything that reaches here was flagged Ask by
-                // configuration. Approving once keeps CI moving;
-                // operators who want stricter control can set
-                // permission rules in settings.toml or pin Plan
-                // mode via `--mode plan`.
                 let tool_name = request.tool_name.clone();
                 let reason = request.reason.clone();
-                match format {
-                    PromptFormat::Default => {
-                        writeln!(stderr, "approval: auto-approving {tool_name} ({reason})")?;
-                        stderr.flush()?;
+                match permission_mode {
+                    PromptPermissionMode::AutoApprove => {
+                        match format {
+                            PromptFormat::Default => {
+                                writeln!(
+                                    stderr,
+                                    "approval: auto-approving {tool_name} ({reason})"
+                                )?;
+                                stderr.flush()?;
+                            }
+                            PromptFormat::Json => {
+                                emit_prompt_event(
+                                    stdout,
+                                    &PromptWireEvent::ApprovalAutoApproved { tool_name, reason },
+                                )?;
+                            }
+                        }
+                        let _ = decision_tx.send(ToolApprovalDecision::AllowOnce);
                     }
-                    PromptFormat::Json => {
-                        emit_prompt_event(
-                            stdout,
-                            &PromptWireEvent::ApprovalAutoApproved { tool_name, reason },
-                        )?;
+                    PromptPermissionMode::Deny => {
+                        match format {
+                            PromptFormat::Default => {
+                                writeln!(stderr, "approval: denying {tool_name} ({reason})")?;
+                                stderr.flush()?;
+                            }
+                            PromptFormat::Json => {
+                                emit_prompt_event(
+                                    stdout,
+                                    &PromptWireEvent::ApprovalDenied { tool_name, reason },
+                                )?;
+                            }
+                        }
+                        let _ = decision_tx.send(ToolApprovalDecision::Denied);
+                    }
+                    PromptPermissionMode::Fail => {
+                        match format {
+                            PromptFormat::Default => {
+                                writeln!(stderr, "approval: failing on {tool_name} ({reason})")?;
+                                stderr.flush()?;
+                            }
+                            PromptFormat::Json => {
+                                emit_prompt_event(
+                                    stdout,
+                                    &PromptWireEvent::ApprovalDenied { tool_name, reason },
+                                )?;
+                            }
+                        }
+                        let _ = decision_tx.send(ToolApprovalDecision::Denied);
+                        result = Err(SqueezyError::Tool(
+                            "non-interactive prompt requested permission; \
+                             rerun with --prompt-permission-mode auto-approve-ask for a one-shot bypass, \
+                             or add a matching `[permissions]` default / `[[permissions.rules]]` entry \
+                             in settings.toml for a persistent allow"
+                                .to_string(),
+                        ));
+                        break;
                     }
                 }
-                let _ = decision_tx.send(ToolApprovalDecision::AllowOnce);
             }
             AgentEvent::McpElicitationRequested { response_tx, .. } => {
                 let _ = response_tx.send(McpElicitationResponse::cancel());
@@ -4524,7 +5162,7 @@ where
 /// help — additive changes are fine, but breaking ones should bump that
 /// disclaimer.
 ///
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum PromptWireEvent {
     Started,
@@ -4533,6 +5171,10 @@ enum PromptWireEvent {
     ToolCallStarted(ToolCall),
     ToolCallCompleted(ToolResult),
     ApprovalAutoApproved {
+        tool_name: String,
+        reason: String,
+    },
+    ApprovalDenied {
         tool_name: String,
         reason: String,
     },

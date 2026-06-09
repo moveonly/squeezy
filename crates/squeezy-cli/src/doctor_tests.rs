@@ -70,6 +70,122 @@ fn credential_check_reports_ok_when_env_set() {
 }
 
 #[test]
+fn status_filter_does_not_make_hidden_failures_exit_zero() {
+    let mut args = DoctorArgs::default();
+    args.status.push(DoctorStatusFilter::Ok);
+    let checks = vec![
+        Check {
+            name: "config".to_string(),
+            status: Status::Fail,
+            detail: "broken".to_string(),
+        },
+        Check {
+            name: "sandbox".to_string(),
+            status: Status::Ok,
+            detail: "available".to_string(),
+        },
+    ];
+
+    assert_eq!(exit_code_for_checks(&checks), 1);
+    let visible = filter_checks(&args, checks);
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].name, "sandbox");
+}
+
+#[test]
+fn json_summary_counts_full_result_even_when_rows_are_filtered() {
+    let report = DoctorReport {
+        exit_code: 1,
+        warnings: 0,
+        failures: 1,
+        checks: vec![Check {
+            name: "sandbox".to_string(),
+            status: Status::Ok,
+            detail: "available".to_string(),
+        }],
+        version: "test",
+        target: "test-target",
+        json: true,
+    };
+
+    let body = report.json_body();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["failures"], 1);
+    assert_eq!(body["checks"].as_array().expect("checks").len(), 1);
+    assert_eq!(body["checks"][0]["name"], "sandbox");
+}
+
+#[test]
+fn unmatched_only_selector_becomes_visible_failure() {
+    // Mimics the surfacing-after-status-filter contract that the
+    // `run()` post-pass enforces: an unknown selector must remain
+    // visible regardless of what `--status` allows through. We
+    // exercise `unmatched_selector_checks` directly because that is
+    // the unit producing the Fail row; the unconditional re-include
+    // step in `run()` consumes its output.
+    let mut args = DoctorArgs::default();
+    args.only.push("sesion_store".to_string());
+    let checks = vec![Check {
+        name: "session_store".to_string(),
+        status: Status::Ok,
+        detail: "ok".to_string(),
+    }];
+
+    let selector_failures = unmatched_selector_checks(&args, &checks, false);
+    assert_eq!(selector_failures.len(), 1);
+    assert_eq!(selector_failures[0].name, "selector");
+    assert_eq!(selector_failures[0].status, Status::Fail);
+    assert!(selector_failures[0].detail.contains("sesion_store"));
+}
+
+#[test]
+fn unmatched_selector_when_config_failed_warns_instead_of_silently_dropping() {
+    // Regression for the "config failed → selector silently dropped"
+    // behavior: when the user asks `--only providers session_store`
+    // against a broken config we still need to surface that those
+    // checks did not run, so the user knows to fix configuration
+    // rather than wonder where their selectors went.
+    let mut args = DoctorArgs::default();
+    args.only.push("providers".to_string());
+    args.only.push("session_store".to_string());
+    let checks: Vec<Check> = Vec::new();
+
+    let selector_failures = unmatched_selector_checks(&args, &checks, true);
+    assert_eq!(
+        selector_failures.len(),
+        1,
+        "expected a single warn row, got {selector_failures:?}"
+    );
+    assert_eq!(selector_failures[0].name, "selector:skipped");
+    assert_eq!(selector_failures[0].status, Status::Warn);
+    assert!(selector_failures[0].detail.contains("providers"));
+    assert!(selector_failures[0].detail.contains("session_store"));
+    assert!(selector_failures[0].detail.contains("config"));
+}
+
+#[test]
+fn unmatched_selector_after_config_load_passes_still_fails_on_typo() {
+    // With `config_failed = false` (the normal path) a misspelled
+    // selector still goes to the hard-fail bucket regardless of which
+    // checks list it would have matched. This is the half of the
+    // contract that the `config_failed` warn-only fork must not
+    // weaken.
+    let mut args = DoctorArgs::default();
+    args.only.push("sandbx".to_string());
+    let checks = vec![Check {
+        name: "sandbox".to_string(),
+        status: Status::Ok,
+        detail: "ok".to_string(),
+    }];
+
+    let selector_failures = unmatched_selector_checks(&args, &checks, false);
+    assert_eq!(selector_failures.len(), 1);
+    assert_eq!(selector_failures[0].name, "selector");
+    assert_eq!(selector_failures[0].status, Status::Fail);
+    assert!(selector_failures[0].detail.contains("sandbx"));
+}
+
+#[test]
 fn credential_check_warns_when_unresolved() {
     let _guard = ENV_LOCK.lock().expect("env lock");
     isolate_credentials_file();
@@ -265,7 +381,7 @@ async fn probe_mcp_reports_unreachable_stdio_server_as_fail() {
     // A disabled server must be skipped entirely: no probe row.
     servers.insert("idle".to_string(), mcp_fixture(false, McpTransport::Stdio));
 
-    let checks = probe_mcp_servers(&servers).await;
+    let checks = probe_mcp_servers(&servers, &DoctorArgs::default()).await;
 
     let broken_row = checks
         .iter()
