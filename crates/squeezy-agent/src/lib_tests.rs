@@ -29,6 +29,9 @@ use super::*;
 
 /// Agent turn + replay tests nest deep async state machines; debug builds on
 /// Windows' smaller default thread stacks can overflow without a larger pool.
+/// See `docs/internal/TEST_STACK_POSTURE.md` for the project posture and when
+/// to use this 8 MiB helper vs. the 32 MiB `run_high_stack_test` in
+/// `crates/squeezy-agent/tests/tool_loop.rs`.
 fn run_high_stack_async_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -4647,6 +4650,192 @@ fn shell_classifier_output_schema_mirrors_parse_target() {
     assert_eq!(deny.action, PermissionAction::Deny);
     let ask = parse_classifier_verdict(r#"{"action":"ask","reason":"x"}"#);
     assert_eq!(ask.action, PermissionAction::Ask);
+}
+
+/// Regression: when `shell_classifier` is enabled and a shell command
+/// produces an `Ask` verdict, the out-of-band classifier LLM call's
+/// billable cost must be folded into persisted session accounting
+/// (`state.cost`, `state.metrics.provider`, and `state.metrics.model_ledger`)
+/// — mirroring the AI-reviewer fold. Without this assertion, a future
+/// refactor that drops the `merge_cost`/`record` lines in
+/// `permission_decision_for_request` would silently regress to the
+/// pre-PR behaviour where classifier spend went uncounted.
+#[tokio::test]
+async fn shell_classifier_cost_persists_to_session_accounting() {
+    let root = temp_workspace("agent_shell_classifier_cost_fold");
+    // Round 1: model emits an *ambiguous* non-mutating shell command
+    // (`printf hi` — same probe the AI-reviewer test uses). With
+    // `permissions.shell = Ask` and `shell_classifier = true`, the
+    // verdict path runs the classifier LLM call before reaching the
+    // user-approval prompt; the classifier returns `deny` so the tool
+    // call is denied without us having to wire up an approval responder.
+    // The command must (a) map to `PermissionCapability::Shell` and
+    // (b) pre-classify as `AskAi` — picking a read-only command like
+    // `ls -la` would auto-allow before the classifier ever runs.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_printf".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf hi",
+                    "description": "ambiguous non-mutating shell probe",
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_round_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Classifier round: provider streams a deny verdict + non-zero
+        // cost. This is what we expect to see folded into session
+        // accounting.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                r#"{"action":"deny","reason":"too risky"}"#.to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_classifier".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(72),
+                    output_tokens: Some(18),
+                    estimated_usd_micros: Some(45_300),
+                    ..CostSnapshot::default()
+                },
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Round 2: model receives the denied tool result and finishes.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("understood".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_round_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            shell: PermissionMode::Ask,
+            shell_classifier: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+    let mut rx = agent.start_turn("probe shell".to_string(), CancellationToken::new());
+    while let Some(event) = rx.recv().await {
+        if matches!(
+            event,
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. }
+        ) {
+            break;
+        }
+    }
+    let snapshot = agent.session_accounting_snapshot().await;
+    // Round 1 + round 2 of the parent stream both carried zeroed
+    // `CostSnapshot`s, so the only spend in `state.cost` after the turn
+    // is the classifier round's 45_300 µUSD / 72 input / 18 output.
+    assert_eq!(
+        snapshot.cost.estimated_usd_micros,
+        Some(45_300),
+        "classifier-round cost must be folded into session cost",
+    );
+    assert_eq!(
+        snapshot.cost.input_tokens,
+        Some(72),
+        "classifier-round input tokens must be folded into session cost",
+    );
+    assert_eq!(snapshot.cost.output_tokens, Some(18));
+    assert_eq!(
+        snapshot.metrics.provider.estimated_usd_micros,
+        Some(45_300),
+        "classifier-round cost must be folded into provider metrics",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Regression: the shell classifier returns `None` on `LlmEvent::Cancelled`,
+/// which is treated as "no classification reached" by the caller — the
+/// verdict therefore stays at the upstream `Ask`, and the permission path
+/// falls back to the user-approval prompt rather than auto-resolving.
+/// This locks in the cancellation contract documented on `ClassifierResult`.
+#[tokio::test]
+async fn shell_classifier_cancellation_falls_back_to_ask_verdict() {
+    let root = temp_workspace("agent_shell_classifier_cancel");
+    // `printf hi` so pre_classify_shell falls through to `AskAi` and the
+    // classifier actually runs; a read-only command would auto-allow
+    // before the classifier ever sees it.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_printf".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf hi",
+                    "description": "ambiguous non-mutating shell probe",
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_round_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Classifier round: mid-stream cancellation. Any partial cost is
+        // dropped (bounded gap documented on `ClassifierResult`).
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("{\"action\":".to_string())),
+            Ok(LlmEvent::Cancelled),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            shell: PermissionMode::Ask,
+            shell_classifier: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+    let mut rx = agent.start_turn("probe shell".to_string(), CancellationToken::new());
+    let mut approval_seen = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ApprovalRequested { decision_tx, .. } => {
+                approval_seen = true;
+                let _ = decision_tx.send(ToolApprovalDecision::Denied);
+            }
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        approval_seen,
+        "classifier cancellation must fall back to the upstream Ask verdict, \
+         which fires an ApprovalRequested event",
+    );
+    let snapshot = agent.session_accounting_snapshot().await;
+    assert_eq!(
+        snapshot.cost.estimated_usd_micros, None,
+        "cancelled classifier must not write a partial cost row",
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -12169,4 +12358,264 @@ async fn agent_shutdown_renews_mcp_shutdown_token() {
         !agent.mcp_shutdown_child_token().is_cancelled(),
         "Agent remains reusable after shutdown, so new MCP work must receive a live token"
     );
+}
+
+/// Regression: subagent loop previously dropped `LlmEvent::Refusal` deltas,
+/// causing an empty summary when the provider stopped with `StopReason::Refusal`.
+/// After the fix the refusal prose should appear in the `SubagentFailed.error`,
+/// and the refusal round's billable cost must be folded into the subagent's
+/// metrics (so the parent's by-subagent ledger never silently reports zero
+/// for a refusal round).
+#[tokio::test]
+async fn subagent_refusal_surfaces_prose_in_failed_event() {
+    // Round 1: parent calls `delegate`.
+    // Round 2 (subagent): provider emits Refusal delta + Completed(Refusal).
+    // Round 3: parent receives SubagentFailed and completes the turn.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "del_refusal".to_string(),
+                name: "delegate".to_string(),
+                arguments: json!({"prompt": "do something unsafe"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::ToolUse),
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Subagent round: OpenAI-style refusal delta + Refusal stop reason
+        // with non-zero token counts so the cost-fold assertion below has
+        // something to bind to.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::Refusal {
+                content: "I cannot assist with that request.".to_string(),
+            }),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_sub_1".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(180),
+                    output_tokens: Some(40),
+                    estimated_usd_micros: Some(12_500),
+                    ..CostSnapshot::default()
+                },
+                stop_reason: Some(StopReason::Refusal),
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Parent: acknowledges the failed subagent and finishes.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("understood".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let agent = Agent::new(AppConfig::default(), provider);
+    let mut rx = agent.start_turn("delegate unsafe task".to_string(), CancellationToken::new());
+    let mut failed_error: Option<String> = None;
+    let mut failed_metrics: Option<TurnMetrics> = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::SubagentFailed { error, metrics, .. } => {
+                failed_error = Some(error);
+                failed_metrics = Some(metrics);
+            }
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+    let error = failed_error.expect("SubagentFailed must fire when subagent is refused");
+    assert!(
+        error.contains("refused") || error.contains("cannot"),
+        "SubagentFailed error must include refusal prose, got: {error}"
+    );
+    let metrics = failed_metrics.expect("SubagentFailed must carry the refusal round's metrics");
+    assert_eq!(
+        metrics.provider.input_tokens,
+        Some(180),
+        "refusal round's input tokens must be folded into subagent metrics",
+    );
+    assert_eq!(metrics.provider.output_tokens, Some(40));
+    assert_eq!(metrics.provider.estimated_usd_micros, Some(12_500));
+}
+
+/// Regression: Anthropic-style providers emit refusal text as ordinary
+/// `TextDelta` events rather than `LlmEvent::Refusal` deltas, then close the
+/// stream with `StopReason::Refusal` and no tool calls. The subagent loop
+/// must fall back to `assistant_message` so the parent's `SubagentFailed`
+/// still carries the refusal prose, never an empty error.
+#[tokio::test]
+async fn subagent_refusal_falls_back_to_text_delta_when_no_refusal_event() {
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "del_textdelta_refusal".to_string(),
+                name: "delegate".to_string(),
+                arguments: json!({"prompt": "do something unsafe"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::ToolUse),
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Subagent round: prose arrives via TextDelta (no `Refusal` event),
+        // then the stream closes with StopReason::Refusal.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "I cannot help with that request.".to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_sub_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::Refusal),
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("understood".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let agent = Agent::new(AppConfig::default(), provider);
+    let mut rx = agent.start_turn(
+        "delegate text-delta refusal".to_string(),
+        CancellationToken::new(),
+    );
+    let mut failed_error: Option<String> = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::SubagentFailed { error, .. } => {
+                failed_error = Some(error);
+            }
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+    let error = failed_error.expect(
+        "SubagentFailed must fire when the subagent stops with Refusal even \
+         without a dedicated `LlmEvent::Refusal` event",
+    );
+    assert!(
+        error.contains("refused") && error.contains("cannot"),
+        "SubagentFailed error must propagate the TextDelta refusal prose, got: {error}",
+    );
+}
+
+/// Regression: the refusal early-return is gated on `tool_calls.is_empty()`.
+/// If a provider asks for one or more tool calls *and* signals
+/// `StopReason::Refusal`, that contradiction is resolved by executing the
+/// requested tools — not by abandoning the round with a refusal error. This
+/// test locks the gate in by ensuring the subagent runs to completion
+/// successfully when a refusal stop arrives alongside a queued tool call.
+///
+/// Wrapped in `run_high_stack_async_test` because the subagent's two-round
+/// loop nested inside the parent's `TurnRuntime::run` pushes the async
+/// state machine past the default thread stack on macOS/ARM64 debug
+/// builds. See `docs/internal/TEST_STACK_POSTURE.md`.
+#[test]
+fn subagent_refusal_does_not_fire_when_tool_calls_pending() {
+    run_high_stack_async_test(async {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "del_refusal_with_tools".to_string(),
+                    name: "delegate".to_string(),
+                    arguments: json!({"prompt": "search for foo"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_parent_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::ToolUse),
+                    reasoning_only_stop: false,
+                }),
+            ],
+            // Subagent round 1: provider emits a Refusal delta *and* a ToolCall,
+            // then closes with StopReason::Refusal. The loop must execute the
+            // pending tool call rather than early-returning a refusal.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::Refusal {
+                    content: "I cannot do that directly.".to_string(),
+                }),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "sub_grep".to_string(),
+                    name: "grep".to_string(),
+                    arguments: json!({"pattern": "foo", "include": ["*.rs"]}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_sub_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::Refusal),
+                    reasoning_only_stop: false,
+                }),
+            ],
+            // Subagent round 2: tool result returned, subagent emits a normal
+            // summary and finishes cleanly. This must produce SubagentCompleted,
+            // not SubagentFailed.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("searched the tree".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_sub_2".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::EndTurn),
+                    reasoning_only_stop: false,
+                }),
+            ],
+            // Parent acknowledges the completed subagent and finishes.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_parent_2".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::EndTurn),
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let agent = Agent::new(AppConfig::default(), provider);
+        let mut rx = agent.start_turn(
+            "delegate refusal-with-tools".to_string(),
+            CancellationToken::new(),
+        );
+        let mut subagent_failed = false;
+        let mut subagent_completed = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::SubagentFailed { .. } => subagent_failed = true,
+                AgentEvent::SubagentCompleted { .. } => subagent_completed = true,
+                AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            !subagent_failed,
+            "refusal early-return must NOT fire when tool calls are pending",
+        );
+        assert!(
+            subagent_completed,
+            "subagent should run its pending tool call to completion when a \
+             Refusal stop arrives alongside ToolCall events",
+        );
+    });
 }

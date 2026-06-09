@@ -155,6 +155,13 @@ impl LlmProvider for DelegateFanoutProvider {
     }
 }
 
+/// Run the given future on a Tokio multi-thread runtime with an enlarged
+/// (32 MiB) worker thread stack. Used for tool-loop integration tests
+/// that drive `TurnRuntime::run` end-to-end, whose nested async state
+/// machines exceed the default OS thread stack on macOS/ARM64 debug
+/// builds. See `docs/internal/TEST_STACK_POSTURE.md` for the project
+/// posture and when to reuse this helper vs. the smaller
+/// `run_high_stack_async_test` in `crates/squeezy-agent/src/lib_tests.rs`.
 fn run_high_stack_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -3993,63 +4000,70 @@ async fn session_cost_warning_fires_once_at_threshold() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn cancelled_turn_persists_partial_cost_and_metrics() {
-    // The first round produces a real provider cost and a tool call, then
-    // the second round is cancelled by the provider before any further
-    // assistant text streams. The cancellation path must commit the
-    // already-paid cost and the tool counter into the session snapshot so
-    // `/cost` reflects what was actually spent.
-    let root = temp_workspace("cancel_persists_partial");
-    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "grep_call".to_string(),
-                name: "grep".to_string(),
-                arguments: serde_json::json!({"pattern": "needle", "include": ["*.rs"]}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_first".to_string()),
-                cost: CostSnapshot {
-                    input_tokens: Some(1_200),
-                    output_tokens: Some(340),
-                    estimated_usd_micros: Some(415_300),
-                    ..CostSnapshot::default()
-                },
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![Ok(LlmEvent::Started), Ok(LlmEvent::Cancelled)],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
+/// Cancelled-turn cost persistence test. Wrapped in `run_high_stack_test`
+/// (32 MiB thread stack) because the async state machines nested in
+/// `TurnRuntime::run` → `execute_tool_calls` → `flush_parallel_batch` can
+/// exceed the default OS thread stack on macOS/ARM64 debug builds. See
+/// `docs/internal/TEST_STACK_POSTURE.md` for the project posture.
+#[test]
+fn cancelled_turn_persists_partial_cost_and_metrics() {
+    run_high_stack_test(async {
+        // The first round produces a real provider cost and a tool call, then
+        // the second round is cancelled by the provider before any further
+        // assistant text streams. The cancellation path must commit the
+        // already-paid cost and the tool counter into the session snapshot so
+        // `/cost` reflects what was actually spent.
+        let root = temp_workspace("cancel_persists_partial");
+        fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "grep_call".to_string(),
+                    name: "grep".to_string(),
+                    arguments: serde_json::json!({"pattern": "needle", "include": ["*.rs"]}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_first".to_string()),
+                    cost: CostSnapshot {
+                        input_tokens: Some(1_200),
+                        output_tokens: Some(340),
+                        estimated_usd_micros: Some(415_300),
+                        ..CostSnapshot::default()
+                    },
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![Ok(LlmEvent::Started), Ok(LlmEvent::Cancelled)],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
 
-    let mut rx = agent.start_turn("locate needle".to_string(), CancellationToken::new());
-    let mut saw_cancelled = false;
-    while let Some(event) = rx.recv().await {
-        if matches!(event, AgentEvent::Cancelled { .. }) {
-            saw_cancelled = true;
+        let mut rx = agent.start_turn("locate needle".to_string(), CancellationToken::new());
+        let mut saw_cancelled = false;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::Cancelled { .. }) {
+                saw_cancelled = true;
+            }
         }
-    }
-    assert!(saw_cancelled, "expected an AgentEvent::Cancelled");
+        assert!(saw_cancelled, "expected an AgentEvent::Cancelled");
 
-    let snapshot = agent.session_accounting_snapshot().await;
-    assert_eq!(
-        snapshot.cost.estimated_usd_micros,
-        Some(415_300),
-        "cancelled turn must persist the provider-reported cost from the completed round",
-    );
-    assert_eq!(snapshot.cost.input_tokens, Some(1_200));
-    assert_eq!(snapshot.cost.output_tokens, Some(340));
-    assert!(
-        snapshot.metrics.tool_calls >= 1,
-        "expected at least the grep tool call to be persisted, got {}",
-        snapshot.metrics.tool_calls,
-    );
+        let snapshot = agent.session_accounting_snapshot().await;
+        assert_eq!(
+            snapshot.cost.estimated_usd_micros,
+            Some(415_300),
+            "cancelled turn must persist the provider-reported cost from the completed round",
+        );
+        assert_eq!(snapshot.cost.input_tokens, Some(1_200));
+        assert_eq!(snapshot.cost.output_tokens, Some(340));
+        assert!(
+            snapshot.metrics.tool_calls >= 1,
+            "expected at least the grep tool call to be persisted, got {}",
+            snapshot.metrics.tool_calls,
+        );
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]

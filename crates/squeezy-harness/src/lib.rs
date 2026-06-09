@@ -690,6 +690,15 @@ async fn run_agent_with_config(
             | AgentEvent::WindowsSandboxActive { .. }
             | AgentEvent::ShellWindowsDegraded { .. }
             | AgentEvent::TurnRouted { .. } => {}
+            // Citation annotations from provider streams: surfaced for future
+            // harness consumers (source attribution); ignored for now.
+            // Producer-side emission is deferred (see the
+            // `AgentEvent::Citation` doc).
+            AgentEvent::Citation { .. } => {}
+            // Control-tool trace events: useful for debugging and replay;
+            // ignored for now. Producer-side emission is deferred (see the
+            // `AgentEvent::ControlToolTrace` doc).
+            AgentEvent::ControlToolTrace { .. } => {}
         }
     }
     let _ = fs::remove_dir_all(&root);

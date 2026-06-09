@@ -31,7 +31,7 @@ use squeezy_core::{
 };
 use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
-    CacheRetention, CacheSpec, ContextLimitInput, INVALID_TOOL_ARGUMENTS_ERROR_KEY,
+    CacheRetention, CacheSpec, CitationSource, ContextLimitInput, INVALID_TOOL_ARGUMENTS_ERROR_KEY,
     INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem,
     LlmOutputSchema, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
     ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate, StopReason, capabilities_for,
@@ -8214,20 +8214,27 @@ impl TurnRuntime {
                     LlmEvent::ServerModel(model) => {
                         effective_model = Arc::from(model);
                     }
-                    // Known additive variants the main loop intentionally
-                    // does not act on yet. `Citation` (OpenAI annotations /
-                    // xAI Live Search sources) has no transcript recording
-                    // sink wired up here, and `ToolCallDelta` is a
-                    // progressive-args hint superseded by the canonical
-                    // `ToolCall` event the loop already consumes. Naming
-                    // them explicitly keeps the wildcard reserved for
-                    // genuinely unknown future variants.
-                    LlmEvent::Citation { .. } | LlmEvent::ToolCallDelta { .. } => {}
+                    // `ToolCallDelta` is a progressive-args hint superseded
+                    // by the canonical `ToolCall` event the loop already
+                    // consumes; ignore it.
+                    LlmEvent::ToolCallDelta { .. } => {}
+                    // Citation annotations (OpenAI source annotations, xAI
+                    // Live Search citations) are forwarded as
+                    // `AgentEvent::Citation` when there is a consumer
+                    // attached. Currently treated as a no-op here: the
+                    // `AgentEvent::Citation` variant is declared and the
+                    // infrastructure is ready, but emitting it from inside
+                    // the large `TurnRuntime::run` stream loop would create
+                    // a sizeof(AgentEvent)-byte (~1 KiB) temporary on the
+                    // execution stack, which pushes borderline tests over the
+                    // default thread stack limit. The emission will move to a
+                    // dedicated transcript-sink path once that exists.
+                    LlmEvent::Citation { .. } => {}
                     // `LlmEvent` is `#[non_exhaustive]`; unknown future
                     // variants flow past without disturbing the turn — they
                     // get a dedicated arm once consumers are taught about
                     // them.
-                    _ => { /* future variant */ }
+                    _ => {}
                 }
             }
 
@@ -11566,6 +11573,9 @@ async fn run_subagent_rounds(
         let mut tool_calls = Vec::new();
         let mut completed = false;
         let mut context_overflow_seen = false;
+        // Accumulate model-refusal text so it can be surfaced in the error
+        // when the stream closes with `StopReason::Refusal` and no tool calls.
+        let mut refusal_text = String::new();
         loop {
             let event = match next_llm_stream_event(
                 &mut stream,
@@ -11667,6 +11677,66 @@ async fn run_subagent_rounds(
                             transcript: Vec::new(),
                         };
                     }
+                    // Surface model refusals so the parent can see *why* the
+                    // subagent stopped instead of receiving an empty summary.
+                    // Refusal prose arrives on `LlmEvent::Refusal` deltas
+                    // accumulated in `refusal_text`; the `StopReason::Refusal`
+                    // terminal here gates the early return.
+                    //
+                    // The `tool_calls.is_empty()` gate is intentional: if the
+                    // provider asked for one or more tool calls and *also*
+                    // signalled `Refusal`, that contradiction is resolved by
+                    // executing the requested tools rather than abandoning the
+                    // round, matching `TurnRuntime::run`'s behaviour.
+                    if matches!(stop_reason, Some(StopReason::Refusal)) && tool_calls.is_empty() {
+                        // Fold the final round's cost before returning so the
+                        // parent's subagent metrics do not silently report zero
+                        // cost for this round.
+                        if cost.estimated_usd_micros.is_none() {
+                            cost.estimated_usd_micros =
+                                estimate_cost(parent.provider.name(), &effective_model, &cost);
+                        }
+                        broker.metrics.record_provider(&cost);
+                        // Flush the assistant stream before reading
+                        // `assistant_message`. `StreamRedactor::push` buffers
+                        // small deltas (sub-1KiB) so a complete refusal whose
+                        // prose arrived via `TextDelta` may still be sitting
+                        // in the buffer at this point; without the flush, the
+                        // Anthropic-style fallback below sees an empty
+                        // `assistant_message`.
+                        let tail = assistant_stream.finish();
+                        if !tail.text.is_empty() {
+                            assistant_message.push_str(&tail.text);
+                        }
+                        broker.metrics.redactions += assistant_stream.total_redactions();
+                        // Some providers (e.g. Anthropic) emit refusal text as
+                        // ordinary `TextDelta` rather than `Refusal` deltas;
+                        // fall back to `assistant_message` when the dedicated
+                        // refusal buffer is empty so the summary is never blank.
+                        let refusal_prose: &str = if refusal_text.is_empty() {
+                            assistant_message.as_str()
+                        } else {
+                            refusal_text.as_str()
+                        };
+                        let refusal_compact = compact_text(refusal_prose, 512);
+                        let detail = if refusal_prose.is_empty() {
+                            "subagent model refused the request".to_string()
+                        } else {
+                            format!("subagent model refused: {refusal_compact}")
+                        };
+                        return SubagentExecution {
+                            status: ToolStatus::Error,
+                            summary: refusal_compact,
+                            status_label: "refusal",
+                            error: Some(detail),
+                            metrics: broker.metrics.clone(),
+                            supporting_receipts: std::mem::take(supporting_receipts),
+                            model,
+                            structured_output: None,
+                            files_touched: Vec::new(),
+                            transcript: Vec::new(),
+                        };
+                    }
                     if cost.estimated_usd_micros.is_none() {
                         cost.estimated_usd_micros =
                             estimate_cost(parent.provider.name(), &effective_model, &cost);
@@ -11696,19 +11766,21 @@ async fn run_subagent_rounds(
                 LlmEvent::ServerModel(model) => {
                     effective_model = Arc::from(model);
                 }
-                // Known additive variants the subagent loop does not act on:
-                // `Refusal` text and `Citation` sources have no sink here
-                // (the subagent only accumulates assistant text + tool
-                // calls), and `ToolCallDelta` is superseded by the canonical
-                // `ToolCall` event. Named explicitly so the wildcard stays
-                // reserved for genuinely unknown future variants.
-                LlmEvent::Refusal { .. }
-                | LlmEvent::Citation { .. }
-                | LlmEvent::ToolCallDelta { .. } => {}
+                // Accumulate refusal text so it can surface in the subagent
+                // error when the stream terminates with StopReason::Refusal.
+                LlmEvent::Refusal { content } => {
+                    refusal_text.push_str(&content);
+                }
+                // `Citation` sources and `ToolCallDelta` incremental args
+                // have no sink in the subagent accumulator; `ToolCallDelta`
+                // is superseded by the canonical `ToolCall` event. Named
+                // explicitly so the wildcard stays reserved for genuinely
+                // unknown future variants.
+                LlmEvent::Citation { .. } | LlmEvent::ToolCallDelta { .. } => {}
                 // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
-                // are silently passed over in the subagent loop until a
-                // dedicated arm exists.
-                _ => { /* future variant */ }
+                // flow past without disturbing the subagent round — they
+                // get a dedicated arm once consumers are taught about them.
+                _ => {}
             }
         }
 
@@ -14880,7 +14952,18 @@ async fn maybe_emit_shell_sandbox_fallback_warning(
 }
 
 /// SHA-256 of the canonical JSON arguments the model sent for a tool call.
-/// Used to pair with `output_sha256` in telemetry (F06).
+/// Used to pair with `output_sha256` in telemetry (F06) and to detect
+/// intra-batch duplicates in `mark_intra_batch_duplicates`.
+///
+/// CANONICAL ORDERING: dedup correctness depends on `serde_json::to_vec`
+/// producing the same bytes for two semantically-identical
+/// `serde_json::Value` objects whose keys arrived in different
+/// insertion order. The default `serde_json` build backs `Value::Object`
+/// with `BTreeMap` (always sorted, canonical), so this holds today. If
+/// the agent crate ever enables `serde_json/preserve_order` the map flips
+/// to `IndexMap` (insertion-order) and dedup will start false-missing on
+/// reordered-but-equivalent calls; this hash must then be replaced with
+/// an explicit canonical serializer.
 fn tool_call_args_sha256(call: &ToolCall) -> Option<String> {
     serde_json::to_vec(&call.arguments)
         .ok()
@@ -15429,7 +15512,7 @@ async fn permission_decision_for_request(
     }
     if !mode_forced_ask
         && should_classify_shell(&context.config, context.provider.name(), &request, &verdict)
-        && let Some((classifier, classifier_cost)) = classify_ambiguous_shell(
+        && let Some(classifier) = classify_ambiguous_shell(
             context.provider.clone(),
             &context.config,
             &request,
@@ -15437,11 +15520,32 @@ async fn permission_decision_for_request(
         )
         .await
     {
+        // Mirrors the AI-reviewer fold above — same KNOWN LIMITATION (the
+        // active turn's CostBroker is not on the permission path, so the
+        // current turn's live status-line snapshot and cap checks lag by
+        // one turn). Tightened to `> 0` so a provider that streams a
+        // `CostSnapshot` with zeroed counters (e.g. cancelled mid-stream
+        // after some delta but before billing) does not churn the ledger
+        // with a no-op row.
+        let cost_present = classifier.cost.estimated_usd_micros.unwrap_or(0) > 0
+            || classifier.cost.input_tokens.unwrap_or(0) > 0
+            || classifier.cost.output_tokens.unwrap_or(0) > 0;
+        if cost_present && let Some(conversation_state) = &context.conversation_state {
+            let mut state = conversation_state.lock().await;
+            merge_cost(&mut state.cost, &classifier.cost);
+            merge_cost(&mut state.metrics.provider, &classifier.cost);
+            state.metrics.model_ledger.record(
+                context.provider.name(),
+                &classifier.model,
+                CostOrigin::Main,
+                &classifier.cost,
+            );
+        }
         // Accumulate classifier cost so the turn loop can fold it into
         // the active CostBroker alongside reviewer spend.
         reviewer_usd_micros =
-            reviewer_usd_micros.saturating_add(classifier_cost.estimated_usd_micros.unwrap_or(0));
-        verdict = classifier;
+            reviewer_usd_micros.saturating_add(classifier.cost.estimated_usd_micros.unwrap_or(0));
+        verdict = classifier.verdict;
     }
     log_permission_verdict(&request, &verdict);
     // Emit permission_decided telemetry for auto-evaluated verdicts (Allow/Deny
@@ -16114,16 +16218,33 @@ fn should_classify_shell(
         && verdict.action == PermissionAction::Ask
 }
 
-/// Returns `Some((verdict, cost))` when the classifier produces a response.
-/// `cost` carries the billable spend from the LLM round; callers must fold
-/// it into the active `CostBroker` so the live session-cost snapshot and cap
-/// checks reflect the spend within the turn.
+/// Result of the out-of-band shell-classifier LLM call: verdict, billed
+/// cost snapshot, and the model the classifier actually used. The caller
+/// folds `cost` into session accounting and keys the per-model ledger by
+/// `model`, mirroring `AiReviewerResult` so a future move of the
+/// classifier onto a cheap-tier model (separate from `config.model`) does
+/// not silently misroute ledger rows.
+///
+/// **Cancellation gap (intentional, bounded):** the classifier loop returns
+/// `None` on `LlmEvent::Cancelled`, dropping any partial cost the provider
+/// streamed before cancellation. Unlike `TurnRuntime::run`'s
+/// `fold_partial_cancel_cost` path, this path has no broker to attribute
+/// the partial spend to. The gap is bounded by the classifier's tiny
+/// prompt (one user message, `max_output_tokens: 80`) and the next turn
+/// reseeds session accounting from `state.cost`. Closing it fully needs
+/// the unified out-of-band LLM accounting path (Category3.md `:44`).
+struct ClassifierResult {
+    verdict: PermissionVerdict,
+    cost: CostSnapshot,
+    model: Arc<str>,
+}
+
 async fn classify_ambiguous_shell(
     provider: Arc<dyn LlmProvider>,
     config: &AppConfig,
     request: &PermissionRequest,
     cancel: CancellationToken,
-) -> Option<(PermissionVerdict, CostSnapshot)> {
+) -> Option<ClassifierResult> {
     let command = request.metadata.get("command")?;
     let prompt = format!(
         "Classify this shell command for a coding agent permission gate.\n\
@@ -16135,8 +16256,9 @@ Working target: {:?}",
     );
     let output_schema = provider_honors_output_schema(provider.name(), &config.model)
         .then(shell_classifier_output_schema);
+    let model: Arc<str> = Arc::from(config.model.as_str());
     let llm_request = LlmRequest {
-        model: Arc::from(config.model.as_str()),
+        model: model.clone(),
         instructions: Arc::from(
             "You classify shell-command risk for a local coding agent. Return JSON only.",
         ),
@@ -16157,17 +16279,19 @@ Working target: {:?}",
     };
     let mut stream = provider.stream_response(llm_request, cancel.clone());
     let mut text = String::new();
-    let mut classifier_cost = CostSnapshot::default();
+    let mut cost = CostSnapshot::default();
     while let Some(event) = next_llm_stream_event(&mut stream, &cancel, config.stream_idle_timeout)
         .await
         .ok()?
     {
         match event {
             LlmEvent::TextDelta(delta) => text.push_str(&delta),
-            LlmEvent::Completed { cost, .. } => {
-                classifier_cost = cost;
+            LlmEvent::Completed { cost: snap, .. } => {
+                cost = snap;
                 break;
             }
+            // Cancellation drops any partial cost streamed so far (see the
+            // `ClassifierResult` doc comment for the bounded gap rationale).
             LlmEvent::Cancelled => return None,
             LlmEvent::Started
             | LlmEvent::ToolCall(_)
@@ -16183,11 +16307,20 @@ Working target: {:?}",
             | LlmEvent::Citation { .. }
             | LlmEvent::ToolCallDelta { .. } => {}
             // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
-            // contribute nothing to the classifier verdict text.
-            _ => { /* future variant */ }
+            // flow past without disturbing the classifier — they get a
+            // dedicated arm once the verdict parser learns to read them.
+            _ => {}
         }
     }
-    Some((parse_classifier_verdict(&text), classifier_cost))
+    // Fill in estimated cost when the provider did not return a token count.
+    if cost.estimated_usd_micros.is_none() {
+        cost.estimated_usd_micros = estimate_cost(provider.name(), &model, &cost);
+    }
+    Some(ClassifierResult {
+        verdict: parse_classifier_verdict(&text),
+        cost,
+        model,
+    })
 }
 
 /// Parse the classifier's textual response into a verdict. Only `deny` can
@@ -18142,6 +18275,43 @@ pub enum AgentEvent {
         reason: SubagentRejectionReason,
         limit: usize,
         active: usize,
+    },
+    /// A source citation received from the provider stream (OpenAI
+    /// annotations, xAI Live Search). `text_index` is the byte offset in
+    /// the running assistant-text buffer the citation refers to. Consumers
+    /// that do not display source attribution can ignore this event.
+    ///
+    /// **Emission deferred** (same constraint as
+    /// [`AgentEvent::ControlToolTrace`] below): constructing a
+    /// `sizeof(AgentEvent)`-byte (~1 KiB) temporary inside the deeply
+    /// nested `TurnRuntime::run` stream loop pushes borderline tests over
+    /// the default thread-stack ceiling on macOS/ARM64 debug builds. The
+    /// variant + consumer-side handlers are in place; emission will move
+    /// to a dedicated transcript-sink path once that exists.
+    Citation {
+        turn_id: TurnId,
+        text_index: u32,
+        source: CitationSource,
+    },
+    /// A hidden control-plane tool completed without consuming normal tool
+    /// budget. Intended to be emitted for `load_tool_schema` and
+    /// `update_task_state` so debuggers and eval replay can observe
+    /// control-plane activity without adding noisy user-facing tool cards.
+    ///
+    /// **Emission deferred**: creating a ~1 KiB `AgentEvent` temporary inside
+    /// the deeply-nested `execute_tool_calls` / `TurnRuntime::run` call stack
+    /// pushes borderline tests over the default thread-stack limit on macOS.
+    /// The infrastructure is ready (all match sites handle this variant via
+    /// `_ => {}` or `{ .. } => {}`); emission will be wired up once the
+    /// control-tool result path is moved off the hot-path stack.
+    ControlToolTrace {
+        turn_id: TurnId,
+        /// Stable tool name token, e.g. `"load_tool_schema"` or
+        /// `"update_task_state"`.
+        tool_name: String,
+        /// Short human-readable summary, e.g. `"schema attached: grep"` or
+        /// `"task state updated"`.
+        label: String,
     },
     AiReviewerTripped {
         turn_id: TurnId,

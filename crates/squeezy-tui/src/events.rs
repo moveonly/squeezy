@@ -614,6 +614,12 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // same turn. The flag is cleared only when we observe an actual
                     // priced round (CostUpdate with micro_usd > 0).
                 }
+                // Citation annotations from provider streams: surfaced for future
+                // TUI rendering (source attribution panel); ignored for now.
+                AgentEvent::Citation { .. } => {}
+                // Control-tool trace events: useful for debugging and eval replay;
+                // not rendered in the TUI at this time.
+                AgentEvent::ControlToolTrace { .. } => {}
             }
         }
         if keep_rx {
