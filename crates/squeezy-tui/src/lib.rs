@@ -20828,9 +20828,15 @@ fn emit_terminal_emergency_teardown<W: Write>(
             LeaveAlternateScreen
         )?;
     }
+    // Keyboard progressive enhancement is unsupported on the legacy Windows
+    // console (crossterm returns `Unsupported`), so pop it best-effort — matching
+    // the best-effort push in `emit_terminal_enter_setup` — rather than failing
+    // the whole teardown on Windows. Every other restore here is ANSI-only
+    // (`Print`) or a custom command with a no-op `execute_winapi`, so they stay
+    // fallible. Byte order is unchanged on platforms where the pop succeeds.
+    let _ = execute!(writer, PopKeyboardEnhancementFlags);
     execute!(
         writer,
-        PopKeyboardEnhancementFlags,
         Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
         DisableModifyOtherKeys,
         DisableBracketedPaste,
@@ -20894,9 +20900,15 @@ fn emit_finish_fullscreen<W: Write>(
         writer.write_all(b"\r\n")?;
     }
     // 5: restore terminal modes (no second `LeaveAlternateScreen`, no `\x1b[3J`).
+    // Keyboard progressive enhancement is unsupported on the legacy Windows
+    // console (crossterm returns `Unsupported`), so pop it best-effort — matching
+    // the best-effort push in `emit_terminal_enter_setup` — rather than failing
+    // the whole teardown on Windows. Every other restore here is ANSI-only
+    // (`Print`) or a custom command with a no-op `execute_winapi`, so they stay
+    // fallible. Byte order is unchanged on platforms where the pop succeeds.
+    let _ = execute!(writer, PopKeyboardEnhancementFlags);
     execute!(
         writer,
-        PopKeyboardEnhancementFlags,
         Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
         DisableModifyOtherKeys,
         DisableBracketedPaste,
