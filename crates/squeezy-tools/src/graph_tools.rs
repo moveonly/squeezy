@@ -881,7 +881,25 @@ pub(crate) fn graph_payload(
             json!(refresh.unchanged_event_paths),
         );
     }
+    if !refresh.path_conflicts.is_empty() {
+        payload.insert(
+            "path_conflicts".to_string(),
+            path_conflicts_json(&refresh.path_conflicts),
+        );
+    }
     payload
+}
+
+fn path_conflicts_json(conflicts: &[squeezy_workspace::PathConflict]) -> Value {
+    json!({
+        "count": conflicts.len(),
+        "samples": conflicts.iter().take(5).map(|conflict| {
+            json!({
+                "normalized_relative_path": &conflict.normalized_relative_path,
+                "relative_paths": &conflict.relative_paths,
+            })
+        }).collect::<Vec<_>>(),
+    })
 }
 
 fn graph_stats_json(graph: &squeezy_graph::SemanticGraph) -> Value {
@@ -5096,6 +5114,7 @@ mod hierarchy_node_count_tests {
 mod graph_payload_refresh_status_tests {
     use super::graph_payload;
     use squeezy_graph::{GraphManager, RefreshConfig};
+    use squeezy_workspace::PathConflict;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn temp_root(name: &str) -> std::path::PathBuf {
@@ -5208,6 +5227,37 @@ mod graph_payload_refresh_status_tests {
         );
         assert!(payload.get("refresh_incomplete").is_none());
         assert!(payload.get("stale_pending").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn payload_surfaces_path_conflicts_when_present() {
+        let root = temp_root("path_conflicts");
+        std::fs::write(root.join("src").join("a.rs"), "fn a() {}\n").expect("write source");
+        let mut manager = GraphManager::open_with_config(
+            &root,
+            RefreshConfig {
+                debounce: Duration::from_millis(0),
+                idle_refresh_interval: Duration::from_millis(0),
+                per_tool_refresh_budget: Duration::from_secs(30),
+            },
+        )
+        .expect("open graph");
+        let mut report = manager.refresh_before_query().expect("refresh");
+        report.path_conflicts = vec![PathConflict {
+            normalized_relative_path: "src/foo.rs".to_string(),
+            relative_paths: vec!["src/Foo.rs".to_string(), "src/foo.rs".to_string()],
+        }];
+
+        let payload = graph_payload("repo_map", &manager, &report);
+        let conflicts = payload
+            .get("path_conflicts")
+            .expect("path conflicts should be surfaced");
+        assert_eq!(conflicts["count"], serde_json::json!(1));
+        assert_eq!(
+            conflicts["samples"][0]["normalized_relative_path"],
+            serde_json::json!("src/foo.rs")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

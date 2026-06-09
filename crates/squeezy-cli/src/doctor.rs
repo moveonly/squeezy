@@ -15,6 +15,7 @@ use squeezy_store::{
     cache_diagnostics, ensure_repo_profile, prune_cache_backups,
 };
 use squeezy_tools::{McpClientRegistry, McpServerStatus, McpStaleOutcome};
+use squeezy_workspace::{WorkspaceRootKind, WorkspaceRootProfile};
 use tokio_util::sync::CancellationToken;
 
 use crate::update::{self, UpdateStatus};
@@ -232,6 +233,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
                 detail: format!("{error}"),
             }),
         }
+        checks.push(workspace_paths_check(config));
 
         let (provider_name, provider_check) = provider_credential_check(&config.provider);
         checks.push(Check {
@@ -288,6 +290,57 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         target,
         json: args.json,
     })
+}
+
+fn workspace_paths_check(config: &AppConfig) -> Check {
+    let profile = WorkspaceRootProfile::from_path(&config.workspace_root);
+    let case = match probe_case_sensitivity(&config.workspace_root) {
+        Some(true) => "case_sensitive",
+        Some(false) => "case_insensitive",
+        None => "case_unknown",
+    };
+    let status = if matches!(
+        profile.kind,
+        WorkspaceRootKind::WindowsDriveRoot
+            | WorkspaceRootKind::WindowsSystemRoot
+            | WorkspaceRootKind::WindowsProfileRoot
+            | WorkspaceRootKind::WindowsCloudRoot
+            | WorkspaceRootKind::WindowsUncShareRoot
+            | WorkspaceRootKind::WindowsVerbatimRoot
+            | WorkspaceRootKind::UnixRoot
+            | WorkspaceRootKind::UnixProtectedRoot
+    ) {
+        Status::Warn
+    } else {
+        Status::Ok
+    };
+    Check {
+        name: "workspace_paths".to_string(),
+        status,
+        detail: format!(
+            "root={} canonical={} normalized={} kind={} volume={}",
+            profile.original,
+            profile.canonical.as_deref().unwrap_or("unavailable"),
+            profile.normalized,
+            profile.kind.as_str(),
+            case
+        ),
+    }
+}
+
+fn probe_case_sensitivity(root: &std::path::Path) -> Option<bool> {
+    let lower = root.join(format!(
+        ".squeezy-doctor-case-probe-{}-a",
+        std::process::id()
+    ));
+    let upper = root.join(format!(
+        ".SQUEEZY-DOCTOR-CASE-PROBE-{}-A",
+        std::process::id()
+    ));
+    fs::write(&lower, b"case").ok()?;
+    let case_sensitive = !upper.exists();
+    let _ = fs::remove_file(&lower);
+    Some(case_sensitive)
 }
 
 fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Status, String)) {

@@ -27,6 +27,7 @@ use std::time::Duration;
 use notify_debouncer_full::notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use squeezy_core::{Result, SqueezyError};
+use squeezy_workspace::filesystem_path_key;
 use tracing::warn;
 
 /// Configuration for a [`FileWatcher`].
@@ -203,8 +204,8 @@ fn handle_debounce_result(result: DebounceEventResult) -> Option<ChangeBatch> {
     for event in events {
         classify_event(event.event.kind, &event.event.paths, &mut all_paths);
     }
-    all_paths.sort_unstable();
-    all_paths.dedup();
+    all_paths.sort_by_key(|path| filesystem_path_key(path));
+    all_paths.dedup_by(|left, right| filesystem_path_key(left) == filesystem_path_key(right));
 
     let mut modified = Vec::new();
     let mut removed = Vec::new();

@@ -394,6 +394,126 @@ fn path_normalization_preserves_slash_compatibility() {
 }
 
 #[test]
+fn filesystem_path_identity_normalizes_windows_spellings() {
+    assert_eq!(
+        normalized_filesystem_path(Path::new(r"\\?\C:\Users\Alice\repo\")),
+        "c:/Users/Alice/repo"
+    );
+    assert_eq!(
+        normalized_filesystem_path(Path::new(r"\\?\UNC\server\share")),
+        "//server/share"
+    );
+    assert_eq!(
+        filesystem_path_key(Path::new(r"C:\Users\Alice\repo\src\Lib.rs")),
+        "c:/users/alice/repo/src/lib.rs"
+    );
+    assert!(filesystem_paths_match(
+        Path::new(r"C:\Users\Alice\repo\src\Lib.rs"),
+        Path::new(r"c:/users/alice/repo/src/lib.rs")
+    ));
+}
+
+#[test]
+fn windows_root_profiles_classify_broad_roots() {
+    assert_eq!(
+        WorkspaceRootProfile::from_path(Path::new(r"C:\")).kind,
+        WorkspaceRootKind::WindowsDriveRoot
+    );
+    assert_eq!(
+        WorkspaceRootProfile::from_path(Path::new(r"C:\Windows")).kind,
+        WorkspaceRootKind::WindowsSystemRoot
+    );
+    assert_eq!(
+        WorkspaceRootProfile::from_path(Path::new(r"C:\Users")).kind,
+        WorkspaceRootKind::WindowsProfileRoot
+    );
+    assert_eq!(
+        WorkspaceRootProfile::from_path(Path::new(r"\\server\share")).kind,
+        WorkspaceRootKind::WindowsUncShareRoot
+    );
+    assert_eq!(
+        WorkspaceRootProfile::from_path(Path::new(r"\\server\share\repo")).kind,
+        WorkspaceRootKind::Other
+    );
+    assert_eq!(
+        WorkspaceRootProfile::from_path(Path::new(r"C:\Users\Alice\OneDrive - Org")).kind,
+        WorkspaceRootKind::WindowsCloudRoot
+    );
+}
+
+#[test]
+fn cloud_folder_names_only_block_when_path_is_windows_shaped() {
+    let root = Path::new("/tmp/OneDrive");
+    let profile = WorkspaceRootProfile::from_path(root);
+    assert_eq!(profile.kind, WorkspaceRootKind::Other);
+
+    let decision = decide_indexing(root, true);
+    assert!(
+        !decision
+            .negative_signals
+            .iter()
+            .any(|signal| signal.contains("cloud-synced Windows folder")),
+        "{:?}",
+        decision.negative_signals
+    );
+}
+
+#[test]
+fn windows_broad_roots_block_indexing_even_with_positive_markers() {
+    let decision = decide_indexing(Path::new(r"C:\Users"), true);
+    assert!(!decision.should_index);
+    assert!(
+        decision
+            .negative_signals
+            .iter()
+            .any(|signal| signal.contains("broad Windows profile container")),
+        "{:?}",
+        decision.negative_signals
+    );
+
+    let cloud_decision = decide_indexing(Path::new(r"C:\Users\Alice\OneDrive"), true);
+    assert!(!cloud_decision.should_index);
+    assert!(
+        cloud_decision
+            .reason
+            .contains("cloud-synced Windows folder"),
+        "{}",
+        cloud_decision.reason
+    );
+}
+
+#[test]
+fn windows_home_candidates_include_native_environment_names() {
+    let mut homes = Vec::new();
+    push_home_candidate(&mut homes, Some(PathBuf::from(r"C:\Users\Alice")));
+    push_home_candidate(&mut homes, Some(PathBuf::from(r"c:/users/alice/")));
+    homes.sort_by_key(|path| filesystem_path_key(path));
+    homes.dedup_by(|left, right| filesystem_paths_match(left, right));
+
+    assert_eq!(homes.len(), 1);
+    assert!(filesystem_paths_match(
+        &homes[0],
+        Path::new(r"C:\Users\Alice")
+    ));
+}
+
+#[test]
+fn crawler_reports_windows_case_path_conflicts() {
+    let conflicts = detect_path_conflicts(&[
+        file_record_for_path("src/Foo.rs"),
+        file_record_for_path("src/foo.rs"),
+        file_record_for_path("src/bar.rs"),
+    ]);
+
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].normalized_relative_path, "src/foo.rs");
+    assert_eq!(
+        conflicts[0].relative_paths,
+        vec!["src/Foo.rs".to_string(), "src/foo.rs".to_string()]
+    );
+}
+
+#[test]
 fn indexing_policy_prunes_common_language_layouts_at_top_dir() {
     for (layout_dir, layout_file, expected_dir) in [
         ("rust/target/debug", "lib.rs", "rust/target"),
@@ -1062,7 +1182,7 @@ fn ancestor_vcs_scan_stops_at_cached_home_boundary() {
     let home = fs::canonicalize(home).unwrap();
     let project = fs::canonicalize(project).unwrap();
     let context = IndexingDecisionContext {
-        canonical_home: Some(home),
+        canonical_homes: vec![home],
     };
 
     assert_eq!(vcs_marker_signal(&project, &context), None);
@@ -1271,4 +1391,17 @@ fn temp_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("squeezy-{name}-{nonce}"));
     fs::create_dir_all(&root).unwrap();
     root
+}
+
+fn file_record_for_path(relative_path: &str) -> FileRecord {
+    FileRecord {
+        id: FileId::new(relative_path.to_string()),
+        path: PathBuf::from(relative_path),
+        relative_path: relative_path.to_string(),
+        hash: ContentHash::new("hash".to_string()),
+        size_bytes: 0,
+        modified_unix_millis: 0,
+        language: LanguageKind::Rust,
+        freshness: Freshness::Fresh,
+    }
 }

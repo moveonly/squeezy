@@ -316,9 +316,16 @@ pub struct WorkspaceSnapshot {
     pub files: Vec<FileRecord>,
     pub unsupported: Vec<UnsupportedFile>,
     pub excluded: Vec<ExcludedPath>,
+    pub path_conflicts: Vec<PathConflict>,
     pub coverage: IndexCoverage,
     pub walk_errors: Vec<String>,
     pub indexing_decision: IndexingDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathConflict {
+    pub normalized_relative_path: String,
+    pub relative_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,23 +338,20 @@ pub struct IndexingDecision {
 
 #[derive(Debug, Clone)]
 struct IndexingDecisionContext {
-    canonical_home: Option<PathBuf>,
+    canonical_homes: Vec<PathBuf>,
 }
 
 impl IndexingDecisionContext {
     fn from_env() -> Self {
         Self {
-            canonical_home: env::var_os("HOME")
-                .map(PathBuf::from)
-                .and_then(|home| fs::canonicalize(home).ok()),
+            canonical_homes: home_dirs_from_env(),
         }
     }
 
     fn is_home_dir(&self, root: &Path) -> bool {
-        self.canonical_home
-            .as_deref()
-            .map(|home| home == root)
-            .unwrap_or(false)
+        self.canonical_homes
+            .iter()
+            .any(|home| filesystem_paths_match(home, root))
     }
 }
 
@@ -393,6 +397,7 @@ impl WorkspaceCrawler {
                 files: Vec::new(),
                 unsupported: Vec::new(),
                 excluded: Vec::new(),
+                path_conflicts: Vec::new(),
                 coverage: IndexCoverage::default(),
                 walk_errors: Vec::new(),
                 indexing_decision,
@@ -626,12 +631,14 @@ impl WorkspaceCrawler {
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         unsupported.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         excluded.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        let path_conflicts = detect_path_conflicts(&files);
 
         Ok(WorkspaceSnapshot {
             root,
             files,
             unsupported,
             excluded,
+            path_conflicts,
             coverage,
             walk_errors,
             indexing_decision,
@@ -806,12 +813,21 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
     let context = IndexingDecisionContext::from_env();
     let workspace_signals = scan_workspace_signals(root);
     let has_case_mismatches = workspace_signals.has_case_mismatches();
+    let root_profile = WorkspaceRootProfile::from_path(root);
+    let mut blocked_by_root = false;
 
     if context.is_home_dir(root) {
-        negative_signals.push("workspace root is the user's home directory".to_string());
+        blocked_by_root = true;
+        negative_signals.push(format!(
+            "workspace root is the user's home directory ({})",
+            root_profile.normalized
+        ));
     }
-    if is_protected_root(root) {
-        negative_signals.push("workspace root is a protected system directory".to_string());
+    for signal in root_profile.negative_signals() {
+        if signal.blocking {
+            blocked_by_root = true;
+        }
+        negative_signals.push(signal.message);
     }
 
     let mut has_strong_positive = false;
@@ -842,9 +858,6 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
         negative_signals.push("workspace root looks like a personal folder".to_string());
     }
 
-    let blocked_by_root = negative_signals
-        .iter()
-        .any(|signal| signal.contains("home directory") || signal.contains("protected system"));
     let should_index = !blocked_by_root && has_strong_positive;
     let reason = if should_index {
         format!("indexing allowed: {}", positive_signals.join(", "))
@@ -876,35 +889,11 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
 }
 
 fn is_protected_root(root: &Path) -> bool {
-    // macOS system roots and Linux pseudo-filesystem roots are unconditionally
-    // blocked: they are never real project roots and can contain enormous or
-    // virtual file trees that must not be crawled.
-    //
-    // Broad Linux package/source trees (/opt, /usr, /var) are intentionally
-    // NOT listed here. They can contain real project checkouts and source trees.
-    // The indexing-signal check (VCS marker, project config, shallow sources)
-    // prevents accidental bulk indexing of system-managed content within them.
-    // On macOS, /var canonicalises to /private/var which is in the list below.
-    const PROTECTED: &[&str] = &[
-        "/",
-        "/Applications",
-        "/Library",
-        "/Network",
-        "/System",
-        "/Users",
-        "/Volumes",
-        "/bin",
-        "/dev",
-        "/etc",
-        "/private",
-        "/boot",
-        "/proc",
-        "/run",
-        "/sbin",
-        "/snap",
-        "/sys",
-    ];
-    PROTECTED.iter().any(|path| Path::new(path) == root)
+    let normalized = normalized_filesystem_path(root);
+    !matches!(
+        WorkspaceRootKind::from_normalized(&normalized),
+        WorkspaceRootKind::Other
+    )
 }
 
 fn is_personal_folder(root: &Path) -> bool {
@@ -913,8 +902,8 @@ fn is_personal_folder(root: &Path) -> bool {
     };
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "desktop" | "documents" | "downloads"
-    )
+        "desktop" | "documents" | "downloads" | "pictures" | "videos" | "music" | "saved games"
+    ) || is_cloud_sync_root_name(name)
 }
 
 fn vcs_marker_signal(root: &Path, context: &IndexingDecisionContext) -> Option<String> {
@@ -932,6 +921,325 @@ fn vcs_marker_signal(root: &Path, context: &IndexingDecisionContext) -> Option<S
         }
     }
     None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRootProfile {
+    pub original: String,
+    pub canonical: Option<String>,
+    pub normalized: String,
+    pub kind: WorkspaceRootKind,
+}
+
+impl WorkspaceRootProfile {
+    pub fn from_path(root: &Path) -> Self {
+        let original = root.display().to_string();
+        let canonical = fs::canonicalize(root)
+            .ok()
+            .map(|path| normalized_filesystem_path(&path));
+        let normalized = normalized_filesystem_path(root);
+        let kind = WorkspaceRootKind::from_normalized(&normalized);
+        Self {
+            original,
+            canonical,
+            normalized,
+            kind,
+        }
+    }
+
+    fn negative_signals(&self) -> Vec<RootSafetySignal> {
+        let mut signals = Vec::new();
+        match self.kind {
+            WorkspaceRootKind::WindowsDriveRoot => {
+                signals.push(RootSafetySignal::blocking(format!(
+                    "workspace root is a Windows drive root ({})",
+                    self.normalized
+                )))
+            }
+            WorkspaceRootKind::WindowsSystemRoot => {
+                signals.push(RootSafetySignal::blocking(format!(
+                    "workspace root is a protected Windows system directory ({})",
+                    self.normalized
+                )))
+            }
+            WorkspaceRootKind::WindowsProfileRoot => {
+                signals.push(RootSafetySignal::blocking(format!(
+                    "workspace root is a broad Windows profile container ({})",
+                    self.normalized
+                )))
+            }
+            WorkspaceRootKind::WindowsCloudRoot => {
+                signals.push(RootSafetySignal::blocking(format!(
+                    "workspace root is a cloud-synced Windows folder ({})",
+                    self.normalized
+                )))
+            }
+            WorkspaceRootKind::WindowsUncShareRoot => {
+                signals.push(RootSafetySignal::blocking(format!(
+                    "workspace root is a Windows UNC share root ({})",
+                    self.normalized
+                )))
+            }
+            WorkspaceRootKind::WindowsVerbatimRoot => {
+                signals.push(RootSafetySignal::blocking(format!(
+                    "workspace root is a Windows verbatim root ({})",
+                    self.normalized
+                )))
+            }
+            WorkspaceRootKind::UnixProtectedRoot | WorkspaceRootKind::UnixRoot => {
+                signals.push(RootSafetySignal::blocking(format!(
+                    "workspace root is a protected system directory ({})",
+                    self.normalized
+                )));
+            }
+            WorkspaceRootKind::Other => {}
+        }
+        signals
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceRootKind {
+    Other,
+    UnixRoot,
+    UnixProtectedRoot,
+    WindowsDriveRoot,
+    WindowsSystemRoot,
+    WindowsProfileRoot,
+    WindowsCloudRoot,
+    WindowsUncShareRoot,
+    WindowsVerbatimRoot,
+}
+
+impl WorkspaceRootKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Other => "other",
+            Self::UnixRoot => "unix_root",
+            Self::UnixProtectedRoot => "unix_protected_root",
+            Self::WindowsDriveRoot => "windows_drive_root",
+            Self::WindowsSystemRoot => "windows_system_root",
+            Self::WindowsProfileRoot => "windows_profile_root",
+            Self::WindowsCloudRoot => "windows_cloud_root",
+            Self::WindowsUncShareRoot => "windows_unc_share_root",
+            Self::WindowsVerbatimRoot => "windows_verbatim_root",
+        }
+    }
+
+    fn from_normalized(path: &str) -> Self {
+        if path == "/" {
+            return Self::UnixRoot;
+        }
+        if matches!(
+            path,
+            "/Applications"
+                | "/Library"
+                | "/Network"
+                | "/System"
+                | "/Users"
+                | "/Volumes"
+                | "/bin"
+                | "/dev"
+                | "/etc"
+                | "/opt"
+                | "/private"
+                | "/sbin"
+                | "/usr"
+                | "/var"
+        ) {
+            return Self::UnixProtectedRoot;
+        }
+        let lowered = path.to_ascii_lowercase();
+        if is_windows_verbatim_root(&lowered) {
+            return Self::WindowsVerbatimRoot;
+        }
+        if is_windows_unc_share_root(&lowered) {
+            return Self::WindowsUncShareRoot;
+        }
+        if is_windows_drive_root(&lowered) {
+            return Self::WindowsDriveRoot;
+        }
+        if is_windows_system_root(&lowered) {
+            return Self::WindowsSystemRoot;
+        }
+        if is_windows_profile_container(&lowered) {
+            return Self::WindowsProfileRoot;
+        }
+        if looks_windows_path(path)
+            && path
+                .rsplit('/')
+                .find(|part| !part.is_empty())
+                .map(is_cloud_sync_root_name)
+                .unwrap_or(false)
+        {
+            return Self::WindowsCloudRoot;
+        }
+        Self::Other
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RootSafetySignal {
+    message: String,
+    blocking: bool,
+}
+
+impl RootSafetySignal {
+    fn blocking(message: String) -> Self {
+        Self {
+            message,
+            blocking: true,
+        }
+    }
+}
+
+pub fn normalized_filesystem_path(path: &Path) -> String {
+    normalize_filesystem_path_text(&path.to_string_lossy())
+}
+
+pub fn filesystem_path_key(path: &Path) -> String {
+    let normalized = normalized_filesystem_path(path);
+    if looks_windows_path(&normalized) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+pub fn filesystem_paths_match(left: &Path, right: &Path) -> bool {
+    left == right
+        || fs::canonicalize(left)
+            .ok()
+            .zip(fs::canonicalize(right).ok())
+            .map(|(left, right)| left == right)
+            .unwrap_or(false)
+        || filesystem_path_key(left) == filesystem_path_key(right)
+}
+
+fn normalize_filesystem_path_text(path: &str) -> String {
+    let mut text = path.replace('\\', "/");
+    if let Some(rest) = strip_ascii_prefix(&text, "//?/UNC/") {
+        text = format!("//{rest}");
+    } else if let Some(rest) = strip_ascii_prefix(&text, "//?/") {
+        text = rest.to_string();
+    } else if let Some(rest) = strip_ascii_prefix(&text, "//./") {
+        text = rest.to_string();
+    }
+
+    if text.len() >= 2 && text.as_bytes()[1] == b':' && text.as_bytes()[0].is_ascii_alphabetic() {
+        let drive = text[..1].to_ascii_lowercase();
+        text.replace_range(0..1, &drive);
+    }
+
+    while text.contains("//") && !text.starts_with("//") {
+        text = text.replace("//", "/");
+    }
+    while text.len() > 1 && text.ends_with('/') && !is_windows_drive_root(&text) {
+        if is_windows_unc_share_root(&text) {
+            text = text.trim_end_matches('/').to_string();
+            break;
+        }
+        text.pop();
+    }
+    text
+}
+
+fn strip_ascii_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    text.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .and_then(|_| text.get(prefix.len()..))
+}
+
+fn looks_windows_path(path: &str) -> bool {
+    is_windows_drive_root(path)
+        || (path.len() >= 3
+            && path.as_bytes()[1] == b':'
+            && path.as_bytes()[0].is_ascii_alphabetic()
+            && path.as_bytes()[2] == b'/')
+        || path.starts_with("//")
+}
+
+fn is_windows_drive_root(path: &str) -> bool {
+    path.len() == 3
+        && path.as_bytes()[1] == b':'
+        && path.as_bytes()[0].is_ascii_alphabetic()
+        && path.as_bytes()[2] == b'/'
+}
+
+fn is_windows_verbatim_root(path: &str) -> bool {
+    path == "//?/" || path == "//?/unc"
+}
+
+fn is_windows_unc_share_root(path: &str) -> bool {
+    if !path.starts_with("//") {
+        return false;
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed != path {
+        return is_windows_unc_share_root(trimmed);
+    }
+    let parts = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    parts.len() == 2 && !path[2..].contains("//")
+}
+
+fn is_windows_system_root(path: &str) -> bool {
+    let rest = drive_rest(path);
+    matches!(
+        rest,
+        Some("windows") | Some("program files") | Some("program files (x86)") | Some("programdata")
+    )
+}
+
+fn is_windows_profile_container(path: &str) -> bool {
+    matches!(
+        drive_rest(path),
+        Some("users") | Some("documents and settings")
+    )
+}
+
+fn drive_rest(path: &str) -> Option<&str> {
+    if path.len() < 4 || path.as_bytes()[1] != b':' || path.as_bytes()[2] != b'/' {
+        return None;
+    }
+    let rest = path[3..].trim_matches('/');
+    (!rest.contains('/')).then_some(rest)
+}
+
+fn is_cloud_sync_root_name(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase();
+    lowered == "onedrive"
+        || lowered.starts_with("onedrive - ")
+        || lowered == "dropbox"
+        || lowered == "google drive"
+        || lowered == "icloud drive"
+}
+
+fn home_dirs_from_env() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    push_home_candidate(&mut homes, env::var_os("HOME").map(PathBuf::from));
+    push_home_candidate(&mut homes, env::var_os("USERPROFILE").map(PathBuf::from));
+    let drive = env::var_os("HOMEDRIVE");
+    let path = env::var_os("HOMEPATH");
+    if let (Some(drive), Some(path)) = (drive, path) {
+        let mut combined = OsString::new();
+        combined.push(drive);
+        combined.push(path);
+        push_home_candidate(&mut homes, Some(PathBuf::from(combined)));
+    }
+    homes.sort_by_key(|path| filesystem_path_key(path));
+    homes.dedup_by(|left, right| filesystem_paths_match(left, right));
+    homes
+}
+
+fn push_home_candidate(homes: &mut Vec<PathBuf>, candidate: Option<PathBuf>) {
+    let Some(candidate) = candidate.filter(|path| !path.as_os_str().is_empty()) else {
+        return;
+    };
+    homes.push(fs::canonicalize(&candidate).unwrap_or(candidate));
 }
 
 fn vcs_marker_at(path: &Path) -> Option<&'static str> {
@@ -1336,6 +1644,27 @@ fn unsupported_file(
         reason,
         suggested_fallback: "bounded read/grep/list navigation".to_string(),
     }
+}
+
+fn detect_path_conflicts(files: &[FileRecord]) -> Vec<PathConflict> {
+    let mut by_identity = BTreeMap::<String, Vec<String>>::new();
+    for file in files {
+        by_identity
+            .entry(normalize_path(&file.relative_path, false).to_ascii_lowercase())
+            .or_default()
+            .push(file.relative_path.clone());
+    }
+    by_identity
+        .into_iter()
+        .filter_map(|(normalized_relative_path, mut relative_paths)| {
+            relative_paths.sort();
+            relative_paths.dedup();
+            (relative_paths.len() > 1).then_some(PathConflict {
+                normalized_relative_path,
+                relative_paths,
+            })
+        })
+        .collect()
 }
 
 fn looks_binary(bytes: &[u8]) -> bool {

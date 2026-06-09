@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -91,6 +91,18 @@ fn signature_span_survives_graph_and_excludes_body() {
         !header.contains("total"),
         "header {header:?} must exclude the body"
     );
+}
+
+#[test]
+fn paths_match_deleted_windows_event_spelling_without_canonicalize() {
+    assert!(paths_match(
+        Path::new(r"C:\Users\Alice\repo\src\Lib.rs"),
+        Path::new(r"c:/users/alice/repo/src/lib.rs")
+    ));
+    assert!(paths_match(
+        Path::new(r"\\?\C:\Users\Alice\repo\src\Lib.rs"),
+        Path::new(r"c:/users/alice/repo/src/lib.rs")
+    ));
 }
 
 #[test]

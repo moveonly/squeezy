@@ -100,6 +100,24 @@ ignored. If there is no strong positive signal, or the root is a blocked
 system/home root, Squeezy returns an empty graph with the indexing decision
 instead of walking a likely non-code or dangerous directory.
 
+Windows roots use the same decision path with a normalized filesystem identity
+layer. Drive roots (`C:\`), Windows system directories (`C:\Windows`,
+`C:\Program Files`, `C:\ProgramData`), broad profile containers (`C:\Users`),
+UNC share roots (`\\server\share`), verbatim roots (`\\?\...`), and OneDrive or
+other cloud-sync roots are blocking negative signals and the skip reason includes
+the normalized root. Native Windows home variables (`USERPROFILE`,
+`HOMEDRIVE`/`HOMEPATH`) are considered alongside `HOME`, so the ancestor VCS
+scan stops at the real profile boundary even when `HOME` is absent or points at a
+Unix-like path. Personal folder names also cover `Pictures`, `Videos`, `Music`,
+and `Saved Games`.
+
+File records keep their exact slash-normalized relative paths, but the workspace
+snapshot also reports `path_conflicts`: groups whose lowercase normalized
+relative path collides. That catches Linux-valid states such as `src/Foo.rs` and
+`src/foo.rs` before they become fragile on default NTFS or case-insensitive
+Windows-compatible mounts. Graph tool payloads include a compact
+`path_conflicts` count and sample list when conflicts exist.
+
 - Direct calls resolve when the target is same-file, explicitly imported, or
   syntactically qualified as `Self::name`, `Type::name`, or `module::name` with
   one matching local candidate.
@@ -154,6 +172,16 @@ count so users and agents can distinguish native event refresh from fallback or
 one-shot crawl-only graph managers. Refresh recrawls tracked files, compares
 stable hashes, reparses changed files only, removes deleted files, and preserves
 unchanged graph partitions.
+
+Watcher event paths and refresh records are compared through the workspace path
+identity helper before falling back to canonicalization. This strips Windows
+verbatim prefixes, normalizes separators, folds drive-letter case, recognizes
+UNC roots, and still works for deleted files where canonicalization can no
+longer succeed. Watcher batches are deduplicated with the same key, so a
+case-only rename or alternate Windows spelling does not inflate the event count.
+`squeezy doctor` includes a `workspace_paths` row with original, canonical, and
+normalized roots, the classified root kind, and a best-effort case-sensitivity
+probe for support reports.
 
 The 250 ms per-tool refresh budget is a hard cap, not a soft hint. Reparse work
 yields with `budget_exhausted=true` on the refresh report once the budget is
