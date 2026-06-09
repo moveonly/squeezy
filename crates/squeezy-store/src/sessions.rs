@@ -215,12 +215,12 @@ impl SessionStore {
     }
 
     /// Path to the cross-project session index. When `XDG_STATE_HOME` is set
-    /// to an absolute path (Linux XDG Base Directory Specification) it resolves to
+    /// to an absolute path it resolves to
     /// `$XDG_STATE_HOME/squeezy/sessions/index.jsonl`; otherwise it uses the
     /// legacy `$HOME/.squeezy/sessions/index.jsonl` path so that existing
     /// macOS, Windows, and Linux state at that location is undisturbed.
     ///
-    /// Linux users who want the canonical XDG placement can set `XDG_STATE_HOME`
+    /// Users who want XDG-style placement can set `XDG_STATE_HOME`
     /// (typically `$HOME/.local/state`); `list_global_index` will then merge
     /// entries from the legacy path as a one-time migration source.
     ///
@@ -288,9 +288,9 @@ impl SessionStore {
     /// keeping the entry with the largest `last_event_at_ms` for each id.
     /// When the file exceeds [`GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES`], the
     /// deduped snapshot is rewritten atomically (tmp + rename) so the
-    /// next read stays fast. Returns entries newest-first by
-    /// `started_at_ms` so callers can take a recency-prefixed slice
-    /// without re-sorting.
+    /// next read stays fast. It caps by most-recent index activity, then
+    /// returns entries newest-first by `started_at_ms` to preserve the
+    /// resume picker's existing "newest session" ordering.
     ///
     /// Also merges any entries from the legacy `$HOME/.squeezy/sessions/index.jsonl`
     /// path when the active index has moved to an XDG location, so sessions
@@ -327,9 +327,9 @@ impl SessionStore {
             read_global_index_into(&path, &mut by_id, &mut raw_lines);
         }
         let mut entries: Vec<GlobalSessionIndexEntry> = by_id.into_values().collect();
-        // Drop all but the most-recent `GLOBAL_INDEX_MAX_ENTRIES` so the index
+        // Drop all but the entries with the newest index activity so the file
         // can never grow unbounded with a user's lifetime session count. The
-        // newest-first return order below is what the picker consumes.
+        // started-at return order below is what the picker consumes.
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.last_event_at_ms));
         let trimmed_to_cap = entries.len() > GLOBAL_INDEX_MAX_ENTRIES;
         entries.truncate(GLOBAL_INDEX_MAX_ENTRIES);
@@ -719,6 +719,26 @@ impl SessionStore {
             )));
         }
         read_json(&metadata_path)
+    }
+
+    /// Best-effort last activity timestamp for stale-running UX.
+    ///
+    /// Prefer terminal metadata when present, then durable event/replay timestamps,
+    /// and finally `started_at_ms` for legacy or partially-written sessions.
+    pub fn last_activity_at_ms(&self, metadata: &SessionMetadata) -> u64 {
+        let mut last = metadata.ended_at_ms.unwrap_or(metadata.started_at_ms);
+        let dir = self.locate_session_dir(&metadata.session_id);
+        if let Ok((events, _warnings)) = read_jsonl(&dir.join("events.jsonl"))
+            && let Some(event_last) = events.iter().map(|event| event.ts_unix_ms).max()
+        {
+            last = last.max(event_last);
+        }
+        if let Ok((replay, _warnings)) = read_replay_jsonl(&dir.join("replay.jsonl"))
+            && let Some(replay_last) = replay.iter().map(|event| event.ts_unix_ms).max()
+        {
+            last = last.max(replay_last);
+        }
+        last
     }
 
     pub fn replay_tape(&self, session_id: &str) -> Result<SessionReplayTape> {
@@ -3466,9 +3486,9 @@ fn json_error(error: serde_json::Error) -> SqueezyError {
 }
 
 /// Resolve the XDG-aware path for the global session index. When
-/// `XDG_STATE_HOME` is set to an absolute path it takes precedence (Linux XDG
-/// Base Dir Spec); otherwise falls back to `$HOME/.squeezy/sessions/index.jsonl`
-/// to preserve existing macOS/Windows state.
+/// `XDG_STATE_HOME` is set to an absolute path it takes precedence; otherwise
+/// falls back to `$HOME/.squeezy/sessions/index.jsonl` to preserve existing
+/// macOS/Windows state.
 fn xdg_global_index_path() -> Option<PathBuf> {
     if let Some(xdg) = env::var_os("XDG_STATE_HOME") {
         let path = PathBuf::from(xdg);

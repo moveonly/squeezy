@@ -10,7 +10,7 @@ If `[cache].root` is set and `[session].log_dir` is unset, sessions live under
 
 A separate user-global cross-project session index lives under
 `$HOME/.squeezy/sessions/index.jsonl` (or `$XDG_STATE_HOME/squeezy/sessions/index.jsonl`
-when `XDG_STATE_HOME` is set on Linux). This index is an append-only cache used
+when `XDG_STATE_HOME` is set to an absolute path). This index is an append-only cache used
 by the resume picker to surface sessions from sibling repos; the authoritative
 source is the per-project session directory. The global index is safe to delete —
 it will be repopulated on next use. Run `squeezy doctor` to see the resolved paths

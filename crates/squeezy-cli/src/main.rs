@@ -1851,7 +1851,7 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
                 .as_millis() as u64;
             for session in sessions {
                 let stale_marker = if session.status == SessionStatus::Running
-                    && now_ms.saturating_sub(session.started_at_ms)
+                    && now_ms.saturating_sub(store.last_activity_at_ms(&session))
                         > STALE_RUNNING_SESSION_THRESHOLD_MS
                 {
                     " [stale-running]"
@@ -1917,10 +1917,7 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             // is old — this suggests the process was killed (SIGKILL, power loss,
             // terminal teardown) before finalization.
             if record.metadata.status == SessionStatus::Running {
-                let last_ms = record
-                    .metadata
-                    .ended_at_ms
-                    .unwrap_or(record.metadata.started_at_ms);
+                let last_ms = store.last_activity_at_ms(&record.metadata);
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()

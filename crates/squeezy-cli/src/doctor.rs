@@ -461,10 +461,10 @@ fn session_paths_checks(config: &AppConfig) -> Vec<Check> {
             .map(|d| d.display().to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
         checks.push(Check {
-            name: "session_home".to_string(),
+            name: "session_global_index".to_string(),
             status: Status::Warn,
             detail: format!(
-                "global index directory {dir} appears read-only; index writes will fail"
+                "global index directory {dir} appears read-only; index writes may fail"
             ),
         });
     }
@@ -518,7 +518,7 @@ fn session_paths_checks(config: &AppConfig) -> Vec<Check> {
     let mut status = Status::Ok;
     if let Some(count) = stale_running {
         detail.push_str(&format!(
-            "; {count} stale running session(s) (started >{}h ago); \
+            "; {count} stale running session(s) (last activity >{}h ago); \
              run `squeezy sessions list` to review",
             STALE_RUNNING_SESSION_THRESHOLD_MS / (3600 * 1000)
         ));
@@ -548,7 +548,8 @@ fn count_stale_running_sessions(store: &SessionStore) -> usize {
         .iter()
         .filter(|s| {
             s.status == SessionStatus::Running
-                && now.saturating_sub(s.started_at_ms) > STALE_RUNNING_SESSION_THRESHOLD_MS
+                && now.saturating_sub(store.last_activity_at_ms(s))
+                    > STALE_RUNNING_SESSION_THRESHOLD_MS
         })
         .count()
 }

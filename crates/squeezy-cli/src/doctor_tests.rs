@@ -176,13 +176,14 @@ fn session_paths_check_warns_on_relative_xdg_state_home() {
             .iter()
             .find(|check| check.name == "session_paths")
             .expect("session paths row");
+        let expected_index = home
+            .join(".squeezy")
+            .join("sessions")
+            .join("index.jsonl")
+            .display()
+            .to_string();
         assert!(
-            paths.detail.contains(
-                &home
-                    .join(".squeezy/sessions/index.jsonl")
-                    .display()
-                    .to_string()
-            ),
+            paths.detail.contains(&expected_index),
             "{paths:?}"
         );
         assert!(
@@ -190,6 +191,43 @@ fn session_paths_check_warns_on_relative_xdg_state_home() {
             "relative XDG_STATE_HOME must not be reported as honored: {paths:?}"
         );
     });
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn stale_running_count_uses_last_activity_not_start_time() {
+    let root = skills_doctor_workspace("session_paths_active_running");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(squeezy_store::SessionMetadata::new(
+            &config,
+            "test-provider",
+        ))
+        .expect("start running session");
+    handle
+        .append_event(squeezy_store::SessionEvent::new(
+            "tool_call",
+            Some("1".to_string()),
+            Some("recent activity".to_string()),
+            json!({}),
+        ))
+        .expect("append recent event");
+    handle.flush_events().expect("flush event");
+    handle
+        .update_metadata(|metadata| {
+            metadata.started_at_ms = 1;
+        })
+        .expect("backdate session start");
+
+    assert_eq!(
+        count_stale_running_sessions(&store),
+        0,
+        "a recently active running session must not be counted stale"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
