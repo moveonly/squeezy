@@ -1,9 +1,10 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
     fs::{self, File, OpenOptions, TryLockError},
-    io::Write,
-    path::{Path, PathBuf},
+    io::{Read, Write},
+    path::{Component, Path, PathBuf},
     process::{Command, Output},
     sync::{
         Mutex, OnceLock,
@@ -24,6 +25,15 @@ pub const CRATE_NAME: &str = "squeezy-vcs";
 const DEFAULT_MAX_PATCH_BYTES: usize = 1_000_000;
 const DEFAULT_CHECKPOINT_RETENTION_DAYS: u64 = 7;
 const DEFAULT_MAX_CHECKPOINT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Upper bound on how many sibling-tempfile / sibling-symlink / sibling-
+/// hardlink candidates the rollback path will try before giving up. Each
+/// `create_sibling_*` helper draws a fresh `(pid, counter)` candidate per
+/// attempt; in practice the first attempt almost always succeeds because
+/// the counter is process-wide and monotonic. The cap is here to bound
+/// the loop in the pathological case where another process is racing the
+/// rollback (e.g. running `cleanup` while we restore) and to surface a
+/// clean `Tool` error instead of spinning indefinitely.
+const MAX_RESTORE_TEMPFILE_ATTEMPTS: usize = 128;
 const SHADOW_LOCK_FILENAME: &str = "shadow.lock";
 const SHADOW_STALE_DIR_RETENTION_DAYS: u64 = 14;
 static SHADOW_REPO_INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -80,6 +90,7 @@ pub struct CheckpointStore {
 pub struct WorkspaceSnapshot {
     pub tree: String,
     pub large_files: Vec<LargeFileFingerprint>,
+    pub hardlinks: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +229,22 @@ pub struct CheckpointFile {
     pub status: DiffFileStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_file_type: Option<CheckpointFileType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_file_type: Option<CheckpointFileType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_symlink_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_symlink_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_hardlink_paths: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_hardlink_paths: Option<Vec<String>>,
     pub before_sha256: Option<String>,
     pub after_sha256: Option<String>,
     pub additions: u64,
@@ -225,6 +252,24 @@ pub struct CheckpointFile {
     pub binary: bool,
     pub patch: Option<String>,
     pub patch_truncated: bool,
+}
+
+impl CheckpointFile {
+    fn before_entry_state(&self) -> WorkspaceEntryState {
+        WorkspaceEntryState {
+            sha256: self.before_sha256.clone(),
+            file_type: self.before_file_type,
+            mode: self.before_mode.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointFileType {
+    RegularFile,
+    Symlink,
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,9 +345,32 @@ pub struct RollbackResult {
     pub planned_files: usize,
     pub restored_files: Vec<String>,
     pub deleted_files: Vec<String>,
+    #[serde(default)]
+    pub file_actions: Vec<RollbackFileAction>,
     pub conflicts: Vec<RollbackConflict>,
     pub skipped: bool,
     pub applied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackFileAction {
+    pub checkpoint_id: String,
+    pub path: String,
+    pub action: RollbackFileActionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<CheckpointFileType>,
+    pub verified_after_rollback: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackFileActionKind {
+    RestoreRegular,
+    RestoreSymlink,
+    RestoreHardlink,
+    Delete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -918,9 +986,14 @@ impl CheckpointStore {
             rm_args.extend(large_files.iter().map(|file| file.path.clone()));
             let _ = self.git_vec(rm_args);
         }
+        let hardlinks = self.hardlink_groups()?;
         let output = self.git(["write-tree"])?;
         let tree = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(WorkspaceSnapshot { tree, large_files })
+        Ok(WorkspaceSnapshot {
+            tree,
+            large_files,
+            hardlinks,
+        })
     }
 
     pub fn create_checkpoint(
@@ -940,6 +1013,8 @@ impl CheckpointStore {
         let (files, skipped_files) = self.checkpoint_files(
             &before.tree,
             &after.tree,
+            &before.hardlinks,
+            &after.hardlinks,
             &after.large_files,
             &changed_large_paths,
         )?;
@@ -1051,6 +1126,7 @@ impl CheckpointStore {
                 planned_files: 0,
                 restored_files: Vec::new(),
                 deleted_files: Vec::new(),
+                file_actions: Vec::new(),
                 conflicts: Vec::new(),
                 skipped: true,
                 applied: false,
@@ -1065,6 +1141,7 @@ impl CheckpointStore {
             planned_files,
             restored_files: Vec::new(),
             deleted_files: Vec::new(),
+            file_actions: Vec::new(),
             conflicts,
             skipped: false,
             applied: false,
@@ -1089,7 +1166,15 @@ impl CheckpointStore {
             self.rollback_record(record, &mut result)?;
         }
         self.track_tree()?;
-        result.applied = true;
+        // `applied` reports whether the rollback finished as planned. A
+        // pass that emitted at least one per-file action clearly applied,
+        // but a *no-op* pass (no conflicts, every file already at the
+        // expected state) is also a success and should stay `applied`
+        // rather than tricking the tool layer into reporting `Stale`
+        // (see review N9). When conflicts gated all of the work,
+        // `file_actions` is empty and we keep `applied = false` so the
+        // tool layer can map it to `Stale`.
+        result.applied = !result.file_actions.is_empty() || result.conflicts.is_empty();
         self.append_journal(json!({
             "kind": "rollback",
             "created_at_ms": now_ms(),
@@ -1102,7 +1187,20 @@ impl CheckpointStore {
         let mut paths = BTreeSet::new();
         for record in self.selected_rollback_records(target)? {
             for file in record.files {
-                paths.insert(file.path);
+                paths.insert(file.path.clone());
+                if let Some(from_path) = file.from_path {
+                    paths.insert(from_path);
+                }
+                // Hardlink peers are mutated by `restore_hardlink_group`
+                // (unlinked + relinked), so the tool-layer sandbox preflight
+                // must see them too. Without this the policy gate could
+                // approve a rollback whose only writable-root violation
+                // lives on a peer outside `record.files` (see review N2).
+                if let Some(group) = file.before_hardlink_paths {
+                    for peer in group {
+                        paths.insert(peer);
+                    }
+                }
             }
         }
         Ok(paths.into_iter().collect())
@@ -1132,6 +1230,8 @@ impl CheckpointStore {
         &self,
         before_tree: &str,
         after_tree: &str,
+        before_hardlinks: &BTreeMap<String, Vec<String>>,
+        after_hardlinks: &BTreeMap<String, Vec<String>>,
         large_after: &[LargeFileFingerprint],
         changed_large_paths: &[String],
     ) -> Result<(Vec<CheckpointFile>, Vec<SkippedCheckpointFile>)> {
@@ -1211,6 +1311,10 @@ impl CheckpointStore {
             let before_lookup = from_path.as_deref().unwrap_or(path.as_str());
             let before = self.blob_bytes(before_tree, before_lookup).ok();
             let after = self.blob_bytes(after_tree, &path).ok();
+            let before_entry = self.tree_entry(before_tree, before_lookup)?;
+            let after_entry = self.tree_entry(after_tree, &path)?;
+            let before_hardlink_paths = hardlink_paths_for(before_hardlinks, before_lookup);
+            let after_hardlink_paths = hardlink_paths_for(after_hardlinks, &path);
             let patch = match status {
                 DiffFileStatus::Renamed => match (&from_path, &before, &after) {
                     (Some(_old), Some(_), Some(_)) => self
@@ -1230,6 +1334,22 @@ impl CheckpointStore {
                 path,
                 status,
                 from_path,
+                before_file_type: before_entry.as_ref().map(TreeEntry::checkpoint_file_type),
+                after_file_type: after_entry.as_ref().map(TreeEntry::checkpoint_file_type),
+                before_mode: before_entry.as_ref().map(|entry| entry.mode.clone()),
+                after_mode: after_entry.as_ref().map(|entry| entry.mode.clone()),
+                before_symlink_target: before_entry
+                    .as_ref()
+                    .filter(|entry| entry.is_symlink())
+                    .and(before.as_deref())
+                    .map(symlink_target_display),
+                after_symlink_target: after_entry
+                    .as_ref()
+                    .filter(|entry| entry.is_symlink())
+                    .and(after.as_deref())
+                    .map(symlink_target_display),
+                before_hardlink_paths,
+                after_hardlink_paths,
                 before_sha256: before.as_deref().map(sha256_hex),
                 after_sha256: after.as_deref().map(sha256_hex),
                 additions: stat.additions,
@@ -1256,30 +1376,100 @@ impl CheckpointStore {
 
     fn preflight_conflicts(&self, records: &[CheckpointRecord]) -> Result<Vec<RollbackConflict>> {
         let mut conflicts = Vec::new();
-        let mut virtual_hashes = BTreeMap::<String, Option<String>>::new();
+        let mut virtual_states = BTreeMap::<String, WorkspaceEntryState>::new();
+        let mut planned_paths = BTreeSet::new();
         for record in records {
             for file in &record.files {
-                let current_sha256 = match virtual_hashes.get(&file.path) {
-                    Some(hash) => hash.clone(),
+                planned_paths.insert(file.path.clone());
+                if let Some(from_path) = file.from_path.as_deref() {
+                    planned_paths.insert(from_path.to_string());
+                }
+            }
+        }
+        for record in records {
+            for file in &record.files {
+                let path = safe_workspace_path(&self.root, &file.path)?;
+                let current_state = match virtual_states.get(&file.path) {
+                    Some(state) => state.clone(),
                     None => {
-                        let path = self.root.join(&file.path);
-                        let hash = if path.exists() {
-                            Some(sha256_hex(&fs::read(&path)?))
-                        } else {
-                            None
-                        };
-                        virtual_hashes.insert(file.path.clone(), hash.clone());
-                        hash
+                        let state = workspace_entry_state(&path)?;
+                        virtual_states.insert(file.path.clone(), state.clone());
+                        state
                     }
                 };
-                if let Some(conflict) = self.rollback_conflict(record, file, current_sha256)? {
+                if let Some(conflict) =
+                    self.rollback_conflict(record, file, &file.path, &current_state)?
+                {
                     conflicts.push(conflict);
+                    continue;
+                }
+                if let Some(conflict) = self.hardlink_peer_conflict(record, file, &planned_paths)? {
+                    conflicts.push(conflict);
+                    continue;
+                }
+
+                if let Some(from_path) = file.from_path.as_deref() {
+                    let source_path = safe_workspace_path(&self.root, from_path)?;
+                    let source_state = match virtual_states.get(from_path) {
+                        Some(state) => state.clone(),
+                        None => {
+                            let state = workspace_entry_state(&source_path)?;
+                            virtual_states.insert(from_path.to_string(), state.clone());
+                            state
+                        }
+                    };
+                    if !source_state.is_absent() {
+                        conflicts.push(RollbackConflict {
+                            checkpoint_id: record.id.clone(),
+                            path: from_path.to_string(),
+                            expected_sha256: None,
+                            current_sha256: source_state.sha256.clone(),
+                            reason: "rename source path changed after checkpoint; leaving current content untouched".to_string(),
+                        });
+                        continue;
+                    }
+                    virtual_states.insert(from_path.to_string(), file.before_entry_state());
+                    virtual_states.insert(file.path.clone(), WorkspaceEntryState::absent());
                 } else {
-                    virtual_hashes.insert(file.path.clone(), file.before_sha256.clone());
+                    virtual_states.insert(file.path.clone(), file.before_entry_state());
                 }
             }
         }
         Ok(conflicts)
+    }
+
+    fn hardlink_peer_conflict(
+        &self,
+        record: &CheckpointRecord,
+        file: &CheckpointFile,
+        planned_paths: &BTreeSet<String>,
+    ) -> Result<Option<RollbackConflict>> {
+        let Some(group) = file.before_hardlink_paths.as_ref() else {
+            return Ok(None);
+        };
+        let expected = file.before_entry_state();
+        for peer in group {
+            if peer == &file.path || file.from_path.as_deref() == Some(peer.as_str()) {
+                continue;
+            }
+            if planned_paths.contains(peer) {
+                continue;
+            }
+            let peer_path = safe_workspace_path(&self.root, peer)?;
+            let current = workspace_entry_state(&peer_path)?;
+            if current != expected {
+                return Ok(Some(RollbackConflict {
+                    checkpoint_id: record.id.clone(),
+                    path: file.path.clone(),
+                    expected_sha256: expected.sha256.clone(),
+                    current_sha256: current.sha256,
+                    reason: format!(
+                        "hardlink peer {peer} changed after checkpoint; leaving current content untouched"
+                    ),
+                }));
+            }
+        }
+        Ok(None)
     }
 
     fn rollback_record(
@@ -1288,49 +1478,137 @@ impl CheckpointStore {
         result: &mut RollbackResult,
     ) -> Result<()> {
         for file in &record.files {
-            if result
-                .conflicts
-                .iter()
-                .any(|conflict| conflict.checkpoint_id == record.id && conflict.path == file.path)
-            {
+            if rollback_file_has_conflict(result, record, file) {
                 continue;
             }
-            let path = self.root.join(&file.path);
+            let path = safe_workspace_path(&self.root, &file.path)?;
 
             if file.status == DiffFileStatus::Renamed {
                 // Reverse a rename: remove the new path, restore the source path
                 // (whose original content is at `from_path` in the before tree).
-                if path.exists() {
-                    fs::remove_file(&path)?;
+                if remove_workspace_file(&path)? {
+                    result.deleted_files.push(file.path.clone());
+                    result.file_actions.push(RollbackFileAction {
+                        checkpoint_id: record.id.clone(),
+                        path: file.path.clone(),
+                        action: RollbackFileActionKind::Delete,
+                        mode: None,
+                        file_type: None,
+                        verified_after_rollback: !path_exists_no_follow(&path),
+                    });
                 }
-                result.deleted_files.push(file.path.clone());
                 if let Some(from_path) = file.from_path.as_deref()
-                    && let Ok(bytes) = self.blob_bytes(&record.before_tree, from_path)
+                    && let Some(action) =
+                        self.restore_tree_path(&record.before_tree, from_path, &record.id)?
                 {
-                    let restore_path = self.root.join(from_path);
-                    if let Some(parent) = restore_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::write(&restore_path, bytes)?;
                     result.restored_files.push(from_path.to_string());
+                    result.file_actions.push(action);
                 }
                 continue;
             }
 
-            match self.blob_bytes(&record.before_tree, &file.path) {
-                Ok(bytes) => {
-                    if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::write(&path, bytes)?;
-                    result.restored_files.push(file.path.clone());
+            if let Some(action) =
+                self.restore_tree_path(&record.before_tree, &file.path, &record.id)?
+            {
+                result.restored_files.push(file.path.clone());
+                result.file_actions.push(action);
+            } else if remove_workspace_file(&path)? {
+                result.deleted_files.push(file.path.clone());
+                result.file_actions.push(RollbackFileAction {
+                    checkpoint_id: record.id.clone(),
+                    path: file.path.clone(),
+                    action: RollbackFileActionKind::Delete,
+                    mode: None,
+                    file_type: None,
+                    verified_after_rollback: !path_exists_no_follow(&path),
+                });
+            }
+        }
+        self.restore_record_hardlinks(record, result)?;
+        Ok(())
+    }
+
+    fn restore_record_hardlinks(
+        &self,
+        record: &CheckpointRecord,
+        result: &mut RollbackResult,
+    ) -> Result<()> {
+        // Collect every workspace path that any conflict in this record's
+        // preflight already protected. The per-group loop below must skip
+        // those paths so a non-conflicted peer never overwrites a peer the
+        // gate told us to leave alone (see review N1).
+        let conflicted_paths: BTreeSet<&str> = result
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict.checkpoint_id == record.id)
+            .map(|conflict| conflict.path.as_str())
+            .collect();
+
+        let mut groups = BTreeSet::<Vec<String>>::new();
+        for file in &record.files {
+            if rollback_file_has_conflict(result, record, file) {
+                continue;
+            }
+            if let Some(group) = file.before_hardlink_paths.as_ref()
+                && group.len() > 1
+            {
+                groups.insert(group.clone());
+            }
+        }
+
+        for group in groups {
+            // If any peer in this group was preflighted as conflicted, skip
+            // the whole group rather than restoring some peers and relinking
+            // the rest to the freshly overwritten content.
+            if group
+                .iter()
+                .any(|peer| conflicted_paths.contains(peer.as_str()))
+            {
+                continue;
+            }
+            for rel in &group {
+                let Some(entry) = self.tree_entry(&record.before_tree, rel)? else {
+                    continue;
+                };
+                if entry.object_type != "blob" || entry.is_symlink() {
+                    continue;
                 }
-                Err(_) => {
-                    if path.exists() {
-                        fs::remove_file(&path)?;
-                    }
-                    result.deleted_files.push(file.path.clone());
+                let path = safe_workspace_path(&self.root, rel)?;
+                let bytes = self.blob_bytes(&record.before_tree, rel).map_err(|err| {
+                    SqueezyError::Tool(format!("checkpoint object for {rel} is missing: {err}"))
+                })?;
+                let expected = WorkspaceEntryState {
+                    sha256: Some(sha256_hex(&bytes)),
+                    file_type: Some(entry.checkpoint_file_type()),
+                    mode: Some(entry.mode),
+                };
+                if workspace_entry_state(&path)? != expected
+                    && let Some(action) =
+                        self.restore_tree_path(&record.before_tree, rel, &record.id)?
+                {
+                    result.restored_files.push(rel.clone());
+                    result.file_actions.push(action);
                 }
+            }
+
+            // `restore_hardlink_group` returns only after verifying that
+            // every relinked peer shares the source's inode, so we can
+            // record the verified result without a second walk.
+            let relinked = restore_hardlink_group(&self.root, &group)?;
+            for rel in relinked {
+                let Some(entry) = self.tree_entry(&record.before_tree, &rel)? else {
+                    continue;
+                };
+                let file_type = entry.checkpoint_file_type();
+                let mode = entry.mode;
+                result.file_actions.push(RollbackFileAction {
+                    checkpoint_id: record.id.clone(),
+                    path: rel,
+                    action: RollbackFileActionKind::RestoreHardlink,
+                    mode: Some(mode),
+                    file_type: Some(file_type),
+                    verified_after_rollback: true,
+                });
             }
         }
         Ok(())
@@ -1340,42 +1618,119 @@ impl CheckpointStore {
         &self,
         record: &CheckpointRecord,
         file: &CheckpointFile,
-        current_sha256: Option<String>,
+        path: &str,
+        current_state: &WorkspaceEntryState,
     ) -> Result<Option<RollbackConflict>> {
-        if current_sha256 != file.after_sha256 {
-            return Ok(Some(RollbackConflict {
-                checkpoint_id: record.id.clone(),
-                path: file.path.clone(),
-                expected_sha256: file.after_sha256.clone(),
-                current_sha256,
-                reason: "file changed after checkpoint; leaving current content untouched"
-                    .to_string(),
-            }));
-        }
-        if self.tree_has_path(&record.before_tree, &file.path)? {
-            let blob = self.blob_bytes(&record.before_tree, &file.path);
-            if blob.is_err() {
-                return Ok(Some(RollbackConflict {
-                    checkpoint_id: record.id.clone(),
-                    path: file.path.clone(),
-                    expected_sha256: file.after_sha256.clone(),
-                    current_sha256,
-                    reason: "checkpoint object is missing; leaving current content untouched"
-                        .to_string(),
-                }));
+        // Collect every failed predicate so a multi-cause divergence (e.g.
+        // both type and mode changed) shows up in a single conflict reason
+        // instead of silently collapsing to whichever check ran first
+        // (see review N10).
+        let mut reasons: Vec<String> = Vec::new();
+        if let Some(expected_type) = file.after_file_type
+            && current_state.file_type != Some(expected_type)
+        {
+            if current_state.file_type.is_none() {
+                reasons.push(format!(
+                    "file was deleted after checkpoint; expected {:?}; leaving it deleted",
+                    expected_type
+                ));
+            } else {
+                reasons.push(format!(
+                    "file type changed after checkpoint; expected {:?}, got {:?}; leaving current content untouched",
+                    expected_type, current_state.file_type
+                ));
             }
         }
-        Ok(None)
+        if let Some(expected_mode) = file.after_mode.as_deref()
+            && current_state.mode.as_deref() != Some(expected_mode)
+        {
+            reasons.push(format!(
+                "file mode changed after checkpoint; expected {expected_mode}, got {}; leaving current content untouched",
+                current_state.mode.as_deref().unwrap_or("absent")
+            ));
+        }
+        if current_state.sha256 != file.after_sha256 {
+            reasons.push(
+                "file changed after checkpoint; leaving current content untouched".to_string(),
+            );
+        }
+        let before_lookup = file.from_path.as_deref().unwrap_or(file.path.as_str());
+        if let Some(entry) = self.tree_entry(&record.before_tree, before_lookup)?
+            && (entry.object_type != "blob"
+                || self.blob_bytes(&record.before_tree, before_lookup).is_err())
+        {
+            reasons.push(
+                "checkpoint object is missing; leaving current content untouched".to_string(),
+            );
+        }
+        if reasons.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(RollbackConflict {
+            checkpoint_id: record.id.clone(),
+            path: path.to_string(),
+            expected_sha256: file.after_sha256.clone(),
+            current_sha256: current_state.sha256.clone(),
+            reason: reasons.join("; "),
+        }))
     }
 
-    fn tree_has_path(&self, tree: &str, path: &str) -> Result<bool> {
+    fn restore_tree_path(
+        &self,
+        tree: &str,
+        rel: &str,
+        checkpoint_id: &str,
+    ) -> Result<Option<RollbackFileAction>> {
+        let Some(entry) = self.tree_entry(tree, rel)? else {
+            return Ok(None);
+        };
+        if entry.object_type != "blob" {
+            return Err(SqueezyError::Tool(format!(
+                "checkpoint path {rel} is a {}, not a file blob",
+                entry.object_type
+            )));
+        }
+        let path = safe_workspace_path(&self.root, rel)?;
+        let bytes = self.blob_bytes(tree, rel).map_err(|err| {
+            SqueezyError::Tool(format!("checkpoint object for {rel} is missing: {err}"))
+        })?;
+        let file_type = entry.checkpoint_file_type();
+        let mode = entry.mode.clone();
+        let action = if entry.is_symlink() {
+            restore_symlink_atomic(&path, &bytes)?;
+            RollbackFileActionKind::RestoreSymlink
+        } else {
+            restore_regular_file_atomic(&path, &bytes, entry.unix_mode())?;
+            RollbackFileActionKind::RestoreRegular
+        };
+        verify_restored_entry(
+            rel,
+            &path,
+            &WorkspaceEntryState {
+                sha256: Some(sha256_hex(&bytes)),
+                file_type: Some(file_type),
+                mode: Some(mode.clone()),
+            },
+        )?;
+        Ok(Some(RollbackFileAction {
+            checkpoint_id: checkpoint_id.to_string(),
+            path: rel.to_string(),
+            action,
+            mode: Some(mode),
+            file_type: Some(file_type),
+            verified_after_rollback: true,
+        }))
+    }
+
+    fn tree_entry(&self, tree: &str, path: &str) -> Result<Option<TreeEntry>> {
         let output = self.git_vec(vec![
             "ls-tree".to_string(),
+            "-z".to_string(),
             tree.to_string(),
             "--".to_string(),
             path.to_string(),
         ])?;
-        Ok(!output.stdout.is_empty())
+        parse_tree_entry(&output.stdout)
     }
 
     fn ensure_shadow_repo(&self) -> Result<()> {
@@ -1429,57 +1784,86 @@ impl CheckpointStore {
 
     fn large_file_fingerprints(&self) -> Result<Vec<LargeFileFingerprint>> {
         let mut files = Vec::new();
-        self.collect_large_file_fingerprints(&self.root, &mut files)?;
-        files.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(files)
-    }
-
-    fn collect_large_file_fingerprints(
-        &self,
-        dir: &Path,
-        files: &mut Vec<LargeFileFingerprint>,
-    ) -> Result<()> {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let name = entry.file_name();
-            if name
-                .to_str()
-                .is_some_and(|name| matches!(name, ".git" | ".squeezy"))
-            {
+        let output = self.git_vec(vec![
+            "ls-files".to_string(),
+            "-z".to_string(),
+            "--cached".to_string(),
+            "--others".to_string(),
+            "--exclude-standard".to_string(),
+            "--".to_string(),
+            ".".to_string(),
+            ":(exclude).squeezy".to_string(),
+        ])?;
+        for rel in nul_fields(&output.stdout) {
+            if rel.is_empty() || rel == ".squeezy" || rel.starts_with(".squeezy/") {
                 continue;
             }
-            if self.is_git_ignored(&path)? {
+            let path = safe_workspace_path(&self.root, &rel)?;
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
                 continue;
-            }
-            let metadata = entry.metadata()?;
-            if metadata.is_dir() {
-                self.collect_large_file_fingerprints(&path, files)?;
-            } else if metadata.is_file() && metadata.len() > DEFAULT_MAX_CHECKPOINT_FILE_BYTES {
+            };
+            if metadata.is_file() && metadata.len() > DEFAULT_MAX_CHECKPOINT_FILE_BYTES {
                 let (mtime_secs, mtime_nanos) = mtime_parts(&metadata);
                 files.push(LargeFileFingerprint {
-                    path: rel_path(&self.root, &path),
+                    path: rel,
                     size_bytes: metadata.len(),
                     mtime_secs,
                     mtime_nanos,
                 });
             }
         }
-        Ok(())
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(files)
     }
 
-    fn is_git_ignored(&self, path: &Path) -> Result<bool> {
-        let rel = rel_path(&self.root, path);
-        let output = self.git_vec_allow_status(
-            vec![
-                "check-ignore".to_string(),
-                "--quiet".to_string(),
-                "--".to_string(),
-                rel,
-            ],
-            &[0, 1],
-        )?;
-        Ok(output.status.code() == Some(0))
+    #[cfg(unix)]
+    fn hardlink_groups(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let output = self.git_vec(vec![
+            "ls-files".to_string(),
+            "-z".to_string(),
+            "--cached".to_string(),
+            "--others".to_string(),
+            "--exclude-standard".to_string(),
+            "--".to_string(),
+            ".".to_string(),
+            ":(exclude).squeezy".to_string(),
+        ])?;
+        let mut by_inode = BTreeMap::<(u64, u64), Vec<String>>::new();
+        for rel in nul_fields(&output.stdout) {
+            if rel.is_empty() || rel == ".squeezy" || rel.starts_with(".squeezy/") {
+                continue;
+            }
+            let path = safe_workspace_path(&self.root, &rel)?;
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_file() && metadata.nlink() > 1 {
+                by_inode
+                    .entry((metadata.dev(), metadata.ino()))
+                    .or_default()
+                    .push(rel);
+            }
+        }
+
+        let mut by_path = BTreeMap::new();
+        for mut paths in by_inode.into_values() {
+            paths.sort();
+            paths.dedup();
+            if paths.len() < 2 {
+                continue;
+            }
+            for path in &paths {
+                by_path.insert(path.clone(), paths.clone());
+            }
+        }
+        Ok(by_path)
+    }
+
+    #[cfg(not(unix))]
+    fn hardlink_groups(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        Ok(BTreeMap::new())
     }
 
     fn protect_checkpoint_trees(&self, record: &CheckpointRecord) -> Result<()> {
@@ -1656,6 +2040,508 @@ struct Patch {
     truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeEntry {
+    mode: String,
+    object_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceEntryState {
+    sha256: Option<String>,
+    file_type: Option<CheckpointFileType>,
+    mode: Option<String>,
+}
+
+impl WorkspaceEntryState {
+    fn absent() -> Self {
+        Self {
+            sha256: None,
+            file_type: None,
+            mode: None,
+        }
+    }
+
+    fn is_absent(&self) -> bool {
+        // `workspace_entry_state` only ever returns `None` for `file_type`
+        // when the path itself was missing, so the `file_type.is_none()`
+        // check captures the absent state without re-asserting `sha256`
+        // and `mode` (which are correlated with `file_type` by
+        // construction).
+        self.file_type.is_none()
+    }
+}
+
+impl TreeEntry {
+    fn checkpoint_file_type(&self) -> CheckpointFileType {
+        if self.is_symlink() {
+            CheckpointFileType::Symlink
+        } else if self.object_type == "blob" {
+            CheckpointFileType::RegularFile
+        } else {
+            CheckpointFileType::Other
+        }
+    }
+
+    fn is_symlink(&self) -> bool {
+        self.mode == "120000"
+    }
+
+    fn unix_mode(&self) -> Option<u32> {
+        u32::from_str_radix(&self.mode, 8)
+            .ok()
+            .map(|mode| mode & 0o7777)
+    }
+}
+
+fn parse_tree_entry(output: &[u8]) -> Result<Option<TreeEntry>> {
+    let Some(record) = output
+        .split(|byte| *byte == 0)
+        .find(|field| !field.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+        return Err(SqueezyError::Tool(
+            "malformed checkpoint tree entry: missing path separator".to_string(),
+        ));
+    };
+    let header = String::from_utf8_lossy(&record[..tab]);
+    let mut parts = header.split_whitespace();
+    let Some(mode) = parts.next() else {
+        return Err(SqueezyError::Tool(
+            "malformed checkpoint tree entry: missing mode".to_string(),
+        ));
+    };
+    let Some(object_type) = parts.next() else {
+        return Err(SqueezyError::Tool(
+            "malformed checkpoint tree entry: missing object type".to_string(),
+        ));
+    };
+    Ok(Some(TreeEntry {
+        mode: mode.to_string(),
+        object_type: object_type.to_string(),
+    }))
+}
+
+fn hardlink_paths_for(groups: &BTreeMap<String, Vec<String>>, path: &str) -> Option<Vec<String>> {
+    groups.get(path).filter(|paths| paths.len() > 1).cloned()
+}
+
+fn verify_restored_entry(rel: &str, path: &Path, expected: &WorkspaceEntryState) -> Result<()> {
+    let actual = workspace_entry_state(path)?;
+    if &actual != expected {
+        return Err(SqueezyError::Tool(format!(
+            "checkpoint rollback verification failed for {rel}: expected {:?}, got {:?}",
+            expected, actual
+        )));
+    }
+    Ok(())
+}
+
+fn workspace_entry_state(path: &Path) -> Result<WorkspaceEntryState> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WorkspaceEntryState::absent());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path)?;
+        return Ok(WorkspaceEntryState {
+            sha256: Some(sha256_hex(&path_bytes(target.as_os_str()))),
+            file_type: Some(CheckpointFileType::Symlink),
+            mode: Some("120000".to_string()),
+        });
+    }
+    if metadata.is_file() {
+        return Ok(WorkspaceEntryState {
+            sha256: Some(sha256_file(path)?),
+            file_type: Some(CheckpointFileType::RegularFile),
+            mode: Some(workspace_regular_file_git_mode(&metadata)),
+        });
+    }
+    // For non-regular, non-symlink workspace entries (sockets, fifos,
+    // block/char devices) we hash a fixed sentinel string keyed by the
+    // path. The conflict gate only needs a *stable* sha that compares
+    // equal to itself across rollback attempts on the same path; the
+    // exact bytes are immaterial. Using the path keeps two unrelated
+    // device files from colliding into the same hash.
+    Ok(WorkspaceEntryState {
+        sha256: Some(sha256_hex(
+            format!("unsupported-file-type:{}", rel_display(path)).as_bytes(),
+        )),
+        file_type: Some(CheckpointFileType::Other),
+        mode: None,
+    })
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        push_hex_byte(&mut output, byte);
+    }
+    Ok(output)
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &OsStr) -> Vec<u8> {
+    // FIXME: `to_string_lossy` replaces non-UTF-8 sequences with U+FFFD,
+    // producing a sha256 that will never match the Git-blob hash for symlink
+    // targets that contain non-Unicode bytes. Acceptable for now because
+    // symlink restore is not supported on non-Unix platforms.
+    path.to_string_lossy().as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn workspace_regular_file_git_mode(metadata: &fs::Metadata) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o111 != 0 {
+        "100755".to_string()
+    } else {
+        "100644".to_string()
+    }
+}
+
+#[cfg(not(unix))]
+fn workspace_regular_file_git_mode(_metadata: &fs::Metadata) -> String {
+    "100644".to_string()
+}
+
+fn symlink_target_display(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Returns `root.join(rel)` after verifying that `rel` contains no absolute
+/// prefix, parent-dir components, or `.squeezy` protected-metadata prefix.
+///
+/// **Limitation:** this check is purely lexical. It does not resolve symlinks
+/// in intermediate directory components. A journal path whose parent directory
+/// is a symlink pointing outside `root` would pass these checks. Callers that
+/// create parent directories (e.g. `restore_regular_file_atomic`) may
+/// inadvertently follow such a symlink. Fully eliminating that risk requires
+/// walking and stat-checking each component before descent.
+fn safe_workspace_path(root: &Path, rel: &str) -> Result<PathBuf> {
+    let path = Path::new(rel);
+    let reason = if path.is_absolute() {
+        Some("absolute path")
+    } else if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        Some("path escapes workspace via parent or root component")
+    } else if rel == ".squeezy" || rel.starts_with(".squeezy/") {
+        Some("path targets the .squeezy protected metadata tree")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        return Err(SqueezyError::Tool(format!(
+            "checkpoint path is not safe to roll back ({reason}): {rel}"
+        )));
+    }
+    Ok(root.join(path))
+}
+
+fn restore_regular_file_atomic(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let (tmp, mut file) = create_sibling_tempfile(path)?;
+    {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    {
+        // No POSIX mode bits to apply on non-Unix; consume the parameter
+        // so `cargo clippy` does not flag it as dead.
+        let _ = mode;
+    }
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    sync_parent_dir(path);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restore_symlink_atomic(path: &Path, target: &[u8]) -> Result<()> {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = create_sibling_symlink(path, OsString::from_vec(target.to_vec()))?;
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    sync_parent_dir(path);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restore_symlink_atomic(_path: &Path, _target: &[u8]) -> Result<()> {
+    Err(SqueezyError::Tool(
+        "checkpoint rollback cannot restore symlinks on this platform".to_string(),
+    ))
+}
+
+fn remove_workspace_file(path: &Path) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Err(SqueezyError::Tool(format!(
+            "checkpoint rollback refuses to remove directory {}",
+            path.display()
+        )));
+    }
+    fs::remove_file(path)?;
+    sync_parent_dir(path);
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn restore_hardlink_group(root: &Path, group: &[String]) -> Result<Vec<String>> {
+    let Some(source_rel) = group.first() else {
+        return Ok(Vec::new());
+    };
+    let source = safe_workspace_path(root, source_rel)?;
+    let mut relinked = Vec::new();
+    for rel in group.iter().skip(1) {
+        let target = safe_workspace_path(root, rel)?;
+        if same_inode(&source, &target)? {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Crash-atomic relink: hard-link `source` to a sibling tempfile
+        // first, then `rename` over `target`. A power loss between the
+        // two steps leaves `target` either in its pre-rollback state or
+        // pointing at the source inode — never absent (see review N3).
+        atomic_relink(&source, &target)?;
+        sync_parent_dir(&target);
+        relinked.push(rel.clone());
+    }
+    if !verify_hardlink_group(root, group)? {
+        return Err(SqueezyError::Tool(format!(
+            "checkpoint rollback hardlink verification failed for {:?}",
+            group
+        )));
+    }
+    Ok(relinked)
+}
+
+#[cfg(unix)]
+fn atomic_relink(source: &Path, target: &Path) -> Result<()> {
+    let tmp = create_sibling_hardlink(source, target)?;
+    if let Err(err) = fs::rename(&tmp, target) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_sibling_hardlink(source: &Path, target: &Path) -> Result<PathBuf> {
+    let mut saw_collision = false;
+    for _ in 0..MAX_RESTORE_TEMPFILE_ATTEMPTS {
+        let tmp = next_sibling_tempfile(target);
+        match fs::hard_link(source, &tmp) {
+            Ok(()) => return Ok(tmp),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                saw_collision = true;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let message = if saw_collision {
+        "exhausted checkpoint restore hardlink tempfile candidates"
+    } else {
+        "no checkpoint restore hardlink tempfile candidates available"
+    };
+    Err(SqueezyError::Tool(message.to_string()))
+}
+
+#[cfg(not(unix))]
+fn restore_hardlink_group(_root: &Path, _group: &[String]) -> Result<Vec<String>> {
+    Ok(Vec::new())
+}
+
+#[cfg(unix)]
+fn verify_hardlink_group(root: &Path, group: &[String]) -> Result<bool> {
+    let Some(first) = group.first() else {
+        return Ok(true);
+    };
+    let first_path = safe_workspace_path(root, first)?;
+    for rel in group.iter().skip(1) {
+        let path = safe_workspace_path(root, rel)?;
+        if !same_inode(&first_path, &path)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn same_inode(left: &Path, right: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = match fs::symlink_metadata(left) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    let right = match fs::symlink_metadata(right) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+fn rollback_file_has_conflict(
+    result: &RollbackResult,
+    record: &CheckpointRecord,
+    file: &CheckpointFile,
+) -> bool {
+    result.conflicts.iter().any(|conflict| {
+        conflict.checkpoint_id == record.id
+            && (conflict.path == file.path
+                || file
+                    .from_path
+                    .as_deref()
+                    .is_some_and(|from_path| conflict.path == from_path))
+    })
+}
+
+fn path_exists_no_follow(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+}
+
+fn create_sibling_tempfile(target: &Path) -> std::io::Result<(PathBuf, File)> {
+    create_sibling_tempfile_from_candidates(
+        (0..MAX_RESTORE_TEMPFILE_ATTEMPTS).map(|_| next_sibling_tempfile(target)),
+    )
+}
+
+fn create_sibling_tempfile_from_candidates<I>(candidates: I) -> std::io::Result<(PathBuf, File)>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    let mut last_exists = None;
+    for tmp in candidates {
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_exists = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_exists.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "exhausted checkpoint restore tempfile candidates",
+        )
+    }))
+}
+
+#[cfg(unix)]
+fn create_sibling_symlink(target: &Path, link_target: std::ffi::OsString) -> Result<PathBuf> {
+    create_sibling_symlink_from_candidates(
+        (0..MAX_RESTORE_TEMPFILE_ATTEMPTS).map(|_| next_sibling_tempfile(target)),
+        link_target,
+    )
+}
+
+#[cfg(unix)]
+fn create_sibling_symlink_from_candidates<I>(
+    candidates: I,
+    link_target: std::ffi::OsString,
+) -> Result<PathBuf>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    use std::os::unix::fs::symlink;
+
+    let mut saw_collision = false;
+    for tmp in candidates {
+        match symlink(&link_target, &tmp) {
+            Ok(()) => return Ok(tmp),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                saw_collision = true;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let message = if saw_collision {
+        "exhausted checkpoint restore symlink candidates"
+    } else {
+        "no checkpoint restore symlink candidates provided"
+    };
+    Err(SqueezyError::Tool(message.to_string()))
+}
+
+fn next_sibling_tempfile(target: &Path) -> PathBuf {
+    let unique = CHECKPOINT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    sibling_tempfile_candidate(target, unique)
+}
+
+fn sibling_tempfile_candidate(target: &Path, unique: u64) -> PathBuf {
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("checkpoint-restore");
+    target.with_file_name(format!(
+        ".{name}.squeezy-restore-{}-{unique}.tmp",
+        std::process::id()
+    ))
+}
+
+fn rel_display(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
 fn git_text<const N: usize>(cwd: &Path, args: [&str; N]) -> std::result::Result<String, String> {
     let output = git_output(cwd, args)?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -1761,10 +2647,23 @@ fn acquire_shadow_lock(lock_path: &Path) -> Result<File> {
     match file.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {
+            let holder = fs::read_to_string(lock_path)
+                .ok()
+                .and_then(|body| {
+                    let mut lines = body.lines();
+                    let pid = lines.next()?.trim();
+                    let created_at_ms = lines.next()?.trim();
+                    if pid.is_empty() || created_at_ms.is_empty() {
+                        None
+                    } else {
+                        Some(format!(" holder pid={pid}, locked_at_ms={created_at_ms}"))
+                    }
+                })
+                .unwrap_or_else(|| " holder details unavailable".to_string());
             return Err(SqueezyError::Tool(format!(
                 "another squeezy process is holding the shadow-repo lock at {} \
-                 — start one squeezy per workspace or wait for it to exit",
-                lock_path.display()
+                 — start one squeezy per workspace or wait for it to exit;{holder}",
+                lock_path.display(),
             )));
         }
         Err(TryLockError::Error(err)) => {
@@ -1870,13 +2769,6 @@ fn diff_large_files(
         }
     }
     changed.into_iter().collect()
-}
-
-fn rel_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 fn file_len(path: &Path) -> std::io::Result<u64> {

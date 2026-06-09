@@ -17,7 +17,9 @@ A `CheckpointRecord` (`crates/squeezy-vcs/src/lib.rs`) carries:
 - `group_id` — the agent turn that produced the write. Every record
   emitted while handling one user turn shares this value.
 - `tool_name`, `call_id`, `status`, `before_tree`, `after_tree`, per-file
-  `before_sha256` / `after_sha256`.
+  `before_sha256` / `after_sha256`, POSIX file type, Git mode, symlink
+  targets when the tree entry is a symlink, and Unix hardlink peer paths when a
+  changed regular file belongs to a link group.
 - `files`, `skipped_files`, `summary`, `coverage_warnings`, and
   `created_at_ms`.
 
@@ -28,9 +30,10 @@ A `CheckpointRecord` (`crates/squeezy-vcs/src/lib.rs`) carries:
 - `Checkpoint(id)` — one specific record.
 
 Both `Atomic` and `BestEffort` rollback modes accept any of the three
-targets; the sha256 gate is identical in all cases. `checkpoint_undo` targets
-`Latest`; `checkpoint_revert` requires exactly one of `group_id` or
-`checkpoint_id`.
+targets; the sha256 and file-type gates are identical in all cases.
+`checkpoint_undo` targets `Latest`; `checkpoint_revert` requires exactly one
+of `group_id` or `checkpoint_id`. Both tool surfaces preflight the full set of
+paths that rollback can mutate, including the source side of a reversed rename.
 
 ## Why `Group(group_id)` Is Load-Bearing
 
@@ -65,11 +68,43 @@ hooks/gpg/commit-graph disabled) is what makes group rollback durable
 across `git gc` and invisible to the user's reflog. See
 `crates/squeezy-vcs/src/lib.rs` `ensure_shadow_repo` for the rationale.
 
+Rollback is tree-entry aware on Unix-like platforms. Regular files are
+restored through a sibling tempfile, file fsync, atomic rename, and parent-dir
+fsync. Git executable modes are reapplied from the before tree. Symlink entries
+are restored as symlinks from the Git symlink blob instead of by writing the
+target text into a regular file, and conflict preflight hashes the symlink
+target without following it. Deletes unlink the workspace entry itself and
+refuse to remove directories. Hardlinked regular files are restored to the
+before snapshot and then relinked so the recorded link group shares one inode;
+unchanged peers are preflighted before relinking so rollback does not overwrite
+user edits made after the checkpoint. The relink itself is crash-atomic: a
+sibling tempfile is hard-linked from the source inode and renamed over the
+peer, so an interrupt between the unlink and link cannot leave the peer
+absent. The rollback receipt includes a per-file `file_actions` list with
+`restore_regular`, `restore_symlink`, `restore_hardlink`, or `delete`, the
+mode/file type when relevant, and a `verified_after_rollback` boolean.
+Restores fail if post-rollback verification does not match the expected
+content hash, file type, Git mode, or hardlink identity.
+
+Rollback fidelity is limited to the Git tree model: the 9-bit Unix mode is
+reapplied, but extended attributes (`security.capability`, SELinux contexts,
+POSIX ACLs, user xattrs) are *not* preserved across a checkpoint cycle.
+Restoring a `setcap`'d binary, an SELinux-labeled config, or a file with a
+custom xattr will produce content-identical bytes but a stripped security
+envelope. Workspaces relying on those attributes should treat checkpoint
+rollback as a content-only restore and reapply labels/capabilities through
+the same tooling that set them.
+
 Checkpoint coverage is explicit. Files that exceed the checkpoint size limit
 are reported in `skipped_files` and add a coverage warning; rollback will not
 pretend those files are protected. Malformed journal lines are counted as
 `journal_warnings` and ignored rather than making the whole checkpoint list
 unreadable.
+
+Large-file discovery is Git-driven: the shadow repo asks `git ls-files -z
+--cached --others --exclude-standard` for eligible paths and then applies local
+metadata checks. This avoids recursive per-path `git check-ignore` calls on
+large Linux workspaces.
 
 ## What This Document Is Not
 

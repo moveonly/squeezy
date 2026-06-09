@@ -110,7 +110,11 @@ impl ToolRegistry {
         let Some(checkpoints) = self.checkpoints.as_ref() else {
             return checkpoints_disabled_result(call);
         };
-        match checkpoints.rollback(RollbackTarget::Latest, args.mode.unwrap_or_default()) {
+        let target = RollbackTarget::Latest;
+        if let Some(result) = self.preflight_checkpoint_rollback_paths(call, target) {
+            return result;
+        }
+        match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
             Ok(result) => {
                 self.invalidate_diff_cache();
                 // `rollback` returns `skipped && !applied` with no
@@ -167,29 +171,8 @@ impl ToolRegistry {
         let Some(checkpoints) = self.checkpoints.as_ref() else {
             return checkpoints_disabled_result(call);
         };
-        match checkpoints.rollback_paths(target) {
-            Ok(paths) => {
-                for path in paths {
-                    if let Err(err) =
-                        safety::assess_write_path(&path, &self.root, &self.shell_sandbox)
-                    {
-                        return make_result(
-                            call,
-                            ToolStatus::Denied,
-                            json!({
-                                "error": err.message(),
-                                "path": path,
-                                "reason": err.code(),
-                                "permission_denied": true,
-                                "policy_denied": true,
-                            }),
-                            ToolCostHint::default(),
-                            None,
-                        );
-                    }
-                }
-            }
-            Err(err) => return tool_error(call, err),
+        if let Some(result) = self.preflight_checkpoint_rollback_paths(call, target) {
+            return result;
         }
         match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
             Ok(result) => {
@@ -207,6 +190,39 @@ impl ToolRegistry {
                 )
             }
             Err(err) => tool_error(call, err),
+        }
+    }
+
+    fn preflight_checkpoint_rollback_paths(
+        &self,
+        call: &ToolCall,
+        target: RollbackTarget<'_>,
+    ) -> Option<ToolResult> {
+        let checkpoints = self.checkpoints.as_ref()?;
+        match checkpoints.rollback_paths(target) {
+            Ok(paths) => {
+                for path in paths {
+                    if let Err(err) =
+                        safety::assess_write_path(&path, &self.root, &self.shell_sandbox)
+                    {
+                        return Some(make_result(
+                            call,
+                            ToolStatus::Denied,
+                            json!({
+                                "error": err.message(),
+                                "path": path,
+                                "reason": err.code(),
+                                "permission_denied": true,
+                                "policy_denied": true,
+                            }),
+                            ToolCostHint::default(),
+                            None,
+                        ));
+                    }
+                }
+                None
+            }
+            Err(err) => Some(tool_error(call, err)),
         }
     }
 }
