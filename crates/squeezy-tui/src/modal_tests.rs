@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use ratatui::{
-    Terminal,
+    Terminal, TerminalOptions, Viewport,
     backend::{CrosstermBackend, TestBackend},
     layout::Rect,
     text::{Line, Span},
@@ -96,7 +96,17 @@ fn clear_after_close_runs_against_the_crossterm_backend_terminal() {
     // production uses) instead of reaching into the backend.
     let sink = Arc::new(Mutex::new(Vec::new()));
     let backend = CrosstermBackend::new(TerminalWriter::capture(Arc::clone(&sink)));
-    let mut terminal = Terminal::new(backend).expect("terminal");
+    // A fixed viewport keeps `Terminal::new`/`frame.area()` from querying the
+    // real OS terminal for its size. The capture writer has no backing tty, so
+    // a size probe fails with `WouldBlock` under CI's pipe-backed stdout; the
+    // fixed rect makes the render deterministic and headless-safe.
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+        },
+    )
+    .expect("terminal");
 
     // Paint the modal first so there is real content to clear.
     terminal
