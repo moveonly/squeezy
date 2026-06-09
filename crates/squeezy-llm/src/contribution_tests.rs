@@ -359,6 +359,122 @@ fn ollama_contribution_rejects_unknown_route_style() {
     );
 }
 
+/// Test-only sanitizer boundary mirroring the `RedactedRender` newtype in
+/// `squeezy-core::lib_tests`. CodeQL's `rust/cleartext-logging` analyzer
+/// follows taint from secret-shaped string literals into format-arg sinks;
+/// routing the leak check through `leaked_secret_count()` (which returns a
+/// scalar `usize`) keeps the seeded fixtures and the rendered Debug blob
+/// out of every `assert!` / `panic!` format argument. Mirrors PR #399's
+/// `RedactedDisplay` sanitizer-boundary pattern for the `config explain`
+/// path.
+struct RedactedRender {
+    rendered: String,
+    secrets: Vec<&'static str>,
+}
+
+impl RedactedRender {
+    fn new(rendered: String, secrets: Vec<&'static str>) -> Self {
+        Self { rendered, secrets }
+    }
+
+    fn leaked_secret_count(&self) -> usize {
+        self.secrets
+            .iter()
+            .filter(|s| self.rendered.contains(**s))
+            .count()
+    }
+
+    fn contains_redaction_marker(&self) -> bool {
+        self.rendered.contains("<redacted>")
+    }
+}
+
+#[test]
+fn contribution_configs_debug_redact_inline_api_key() {
+    use squeezy_core::ProviderTransportConfig;
+
+    let openai = OpenAiContributionConfig {
+        api_key_env: "OPENAI_API_KEY".to_string(),
+        api_key: Some("debug-openai-contrib-key".to_string()),
+        base_url: "https://api.openai.com/v1".to_string(),
+        transport: ProviderTransportConfig::default(),
+    };
+    let anthropic = AnthropicContributionConfig {
+        api_key_env: "ANTHROPIC_API_KEY".to_string(),
+        api_key: Some("debug-anthropic-contrib-key".to_string()),
+        base_url: "https://api.anthropic.com/v1".to_string(),
+        transport: ProviderTransportConfig::default(),
+    };
+    let google = GoogleContributionConfig {
+        api_key_env: "GOOGLE_API_KEY".to_string(),
+        api_key: Some("debug-google-contrib-key".to_string()),
+        base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+        transport: ProviderTransportConfig::default(),
+    };
+    let ollama = OllamaContributionConfig {
+        base_url: "http://localhost:11434/api".to_string(),
+        route_style: Some("native".to_string()),
+        api_key_env: Some("OLLAMA_API_KEY".to_string()),
+        api_key: Some("debug-ollama-contrib-key".to_string()),
+        keep_alive: Some("24h".to_string()),
+        transport: ProviderTransportConfig::default(),
+    };
+
+    let rendered = [
+        format!("{openai:?}"),
+        format!("{anthropic:?}"),
+        format!("{google:?}"),
+        format!("{ollama:?}"),
+    ]
+    .join("\n");
+
+    let render = RedactedRender::new(
+        rendered,
+        vec![
+            "debug-openai-contrib-key",
+            "debug-anthropic-contrib-key",
+            "debug-google-contrib-key",
+            "debug-ollama-contrib-key",
+        ],
+    );
+
+    assert_eq!(
+        render.leaked_secret_count(),
+        0,
+        "Contribution-config Debug must redact every seeded inline api_key",
+    );
+    assert!(
+        render.contains_redaction_marker(),
+        "Contribution-config Debug must include the `<redacted>` marker",
+    );
+}
+
+#[test]
+fn contribution_configs_debug_emits_none_when_api_key_unset() {
+    use squeezy_core::ProviderTransportConfig;
+
+    // `None` must render as `None`, not `Some("<redacted>")`. Distinguishing
+    // "operator opted out of inline auth" from "operator set an inline
+    // secret" matters for diagnostics; the redacted Debug must preserve
+    // that signal.
+    let openai = OpenAiContributionConfig {
+        api_key_env: "OPENAI_API_KEY".to_string(),
+        api_key: None,
+        base_url: "https://api.openai.com/v1".to_string(),
+        transport: ProviderTransportConfig::default(),
+    };
+
+    let rendered = format!("{openai:?}");
+    assert!(
+        rendered.contains("api_key: None"),
+        "expected `api_key: None` in redacted Debug output",
+    );
+    assert!(
+        !rendered.contains("<redacted>"),
+        "Debug must not render `<redacted>` when api_key is absent",
+    );
+}
+
 #[test]
 fn multiple_built_in_contributions_register_together() {
     let mut contributions = ProviderContributions::new();

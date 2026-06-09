@@ -45,6 +45,11 @@ pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
 pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-sonnet-4-6";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/api";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
+/// Conventional env var that holds the bearer token for Ollama Cloud /
+/// reverse-proxy-protected self-hosted deployments. `OllamaConfig.api_key_env`
+/// defaults to this; doctor and TOML loaders re-export the constant so the
+/// "default api key env" name lives in exactly one place.
+pub const DEFAULT_OLLAMA_API_KEY_ENV: &str = "OLLAMA_API_KEY";
 /// Synthetic model id for the in-process faux provider. The faux
 /// provider does not consult model registries during a request — this
 /// is purely a label that flows through cost/logging surfaces.
@@ -3431,6 +3436,12 @@ pub struct OllamaConfig {
     /// Defaults to `"OLLAMA_API_KEY"`. No-key local deployments still work —
     /// the key is simply not attached when the env var is unset and no
     /// inline `api_key` is provided.
+    ///
+    /// Resolution timing: the bearer token is resolved once when
+    /// `OllamaProvider` is constructed from this config (matching
+    /// `OpenAi`/`Anthropic`/`Google`). Rotating the env var mid-session does
+    /// not pick up the new value — restart Squeezy after rotating an Ollama
+    /// Cloud token.
     #[serde(default = "default_ollama_api_key_env")]
     pub api_key_env: String,
     /// Inline plaintext bearer token for Ollama Cloud / protected
@@ -3456,7 +3467,7 @@ pub struct OllamaConfig {
 }
 
 fn default_ollama_api_key_env() -> String {
-    "OLLAMA_API_KEY".to_string()
+    DEFAULT_OLLAMA_API_KEY_ENV.to_string()
 }
 
 impl fmt::Debug for OllamaConfig {
@@ -3992,11 +4003,14 @@ impl HardeningConfig {
     }
 }
 
-// M-63: redaction lives on the serde `Serialize` path only (see
-// `redact_secret_opt` below). The derived `Debug` is NOT redacted — the
-// inline `api_key` prints verbatim under `{:?}`. Never `{:?}`-log a
-// `ProviderSettings`; serialize it (or its fields individually) instead.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+// M-63: redaction lives on the serde `Serialize` path (see `redact_secret_opt`
+// and `redact_secret_map_opt` below) and on the manual `Debug` impl just below
+// the struct definition. Both `api_key` (inline plaintext bearer) and
+// `headers` (Custom-preset workaround for non-Bearer auth, e.g. LiteLLM
+// `x-litellm-key` / vLLM bearer / corporate proxy `x-api-key`) carry
+// credentials, so the `{:?}` rendering masks them while keeping the *shape*
+// of the struct visible for diagnostics.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSettings {
     pub api_key_env: Option<String>,
     /// Inline plaintext API key, persisted in the user/local TOML layer.
@@ -4103,6 +4117,44 @@ pub struct ProviderSettings {
     /// the built-in per-provider default (skip this provider's cheap tiers); an
     /// explicit empty string reroutes any model.
     pub expensive_models: Option<String>,
+}
+
+impl fmt::Debug for ProviderSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderSettings")
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("default_model", &self.default_model)
+            .field("api_version", &self.api_version)
+            .field("region", &self.region)
+            .field("preset", &self.preset)
+            .field("vertex_project", &self.vertex_project)
+            .field("vertex_location", &self.vertex_location)
+            .field("cloudflare_account_id", &self.cloudflare_account_id)
+            .field("cloudflare_gateway_id", &self.cloudflare_gateway_id)
+            .field("request_max_retries", &self.request_max_retries)
+            .field("stream_max_retries", &self.stream_max_retries)
+            .field("stream_idle_timeout_ms", &self.stream_idle_timeout_ms)
+            .field("headers", &RedactedMapOpt(&self.headers))
+            .field("request_metadata", &self.request_metadata)
+            .field("deployment_name_map", &self.deployment_name_map)
+            .field("route_style", &self.route_style)
+            .field("keep_alive", &self.keep_alive)
+            .field("script", &self.script)
+            .field("use_entra_id", &self.use_entra_id)
+            .field("organization", &self.organization)
+            .field("project", &self.project)
+            .field("service_tier", &self.service_tier)
+            .field("deployment_id", &self.deployment_id)
+            .field("cf_ai_gateway", &self.cf_ai_gateway)
+            .field("use_oauth", &self.use_oauth)
+            .field("cheap_model", &self.cheap_model)
+            .field("judge_model", &self.judge_model)
+            .field("judge_prompt", &self.judge_prompt)
+            .field("expensive_models", &self.expensive_models)
+            .finish()
+    }
 }
 
 impl ProviderSettings {
@@ -4461,6 +4513,23 @@ impl fmt::Debug for RedactedMap<'_> {
             map.entry(key, &"<redacted>");
         }
         map.finish()
+    }
+}
+
+/// Debug wrapper for `Option<BTreeMap<String, String>>` fields whose values
+/// may carry secrets (Custom-preset header workarounds: `x-api-key`,
+/// `x-litellm-key`, vLLM bearer headers, `cf-aig-authorization`). Preserves
+/// the tri-state shape — `None` stays `None`, empty map stays empty,
+/// populated keys stay visible — but masks every value as `"<redacted>"`.
+/// Mirrors [`redact_secret_map_opt`] for the `Debug` path.
+struct RedactedMapOpt<'a>(&'a Option<BTreeMap<String, String>>);
+
+impl fmt::Debug for RedactedMapOpt<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(map) => f.debug_tuple("Some").field(&RedactedMap(map)).finish(),
+            None => write!(f, "None"),
+        }
     }
 }
 

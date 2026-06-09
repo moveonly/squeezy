@@ -90,7 +90,7 @@ fn handle_list(
         .max(4);
     let env_w = entries
         .iter()
-        .map(|e| e.api_key_env.len())
+        .map(|e| env_column_label(e).len())
         .max()
         .unwrap_or(7)
         .max(7);
@@ -102,7 +102,7 @@ fn handle_list(
         println!(
             "{:<name_w$}  {:<env_w$}  {:<10}  {:>6}  {}",
             entry.name,
-            non_empty(entry.api_key_env),
+            env_column_label(entry),
             if entry.configured { "yes" } else { "no" },
             entry.model_count,
             non_empty(entry.base_url),
@@ -146,7 +146,7 @@ fn handle_info(
     }
     println!("{} ({})", entry.display_name, entry.name);
     println!("  base_url    {}", non_empty(entry.base_url));
-    println!("  api_key_env {}", non_empty(entry.api_key_env));
+    println!("  api_key_env {}", env_column_label(&entry));
     println!(
         "  configured  {}",
         if entry.configured { "yes" } else { "no" }
@@ -213,6 +213,24 @@ fn non_empty(value: &str) -> &str {
     if value.is_empty() { "(unset)" } else { value }
 }
 
+/// Label printed in the `env` column of `providers list` / `providers info`.
+/// Bedrock and Ollama deliberately set `api_key_env = ""` (Bedrock uses the
+/// AWS credential chain; Ollama runs unauthenticated by default), so the
+/// generic `(unset)` sentinel from [`non_empty`] would mislead operators
+/// into thinking the column is reporting a missing env var. Surface
+/// `(none required)` for those two rows instead so the UX matches the
+/// comments on the [`BASE_PROVIDERS`] entries.
+fn env_column_label(entry: &ProviderEntry) -> &'static str {
+    if entry.api_key_env.is_empty() {
+        match entry.name {
+            "bedrock" | "ollama" => "(none required)",
+            _ => "(unset)",
+        }
+    } else {
+        entry.api_key_env
+    }
+}
+
 /// Resolve user-typed provider names to the canonical registry id. Accepts
 /// `OpenAiCompatiblePreset` aliases (e.g. `grok` → `xai`) so users don't have
 /// to memorise the snake_case form.
@@ -269,7 +287,7 @@ pub(crate) fn registry_entries(env_lookup: &dyn Fn(&str) -> Option<String>) -> V
     entries
 }
 
-fn env_set(env_lookup: &dyn Fn(&str) -> Option<String>, name: &str) -> bool {
+pub(crate) fn env_set(env_lookup: &dyn Fn(&str) -> Option<String>, name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
@@ -278,22 +296,28 @@ fn env_set(env_lookup: &dyn Fn(&str) -> Option<String>, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// AWS credential env vars that signal a configured Bedrock deployment.
+/// Profile-based and IAM-instance-role auth do not surface as env vars at
+/// all — this list only enumerates the cheap best-effort signals usable by
+/// non-network checks. `squeezy doctor --probe` covers the rest.
+pub(crate) const AWS_CRED_VARS: &[&str] = &[
+    "AWS_ACCESS_KEY_ID",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_ROLE_ARN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+];
+
 /// Check whether any common AWS credential signal is present in the environment.
 /// The full AWS credential chain (profile files, IMDSv2, IRSA, SSO) cannot be
 /// probed with env vars alone — this is a best-effort check that covers the
 /// most common CI and developer workstation cases. `squeezy doctor --probe`
-/// gives a definitive live verdict.
-fn bedrock_configured(env_lookup: &dyn Fn(&str) -> Option<String>) -> bool {
-    const AWS_CRED_VARS: &[&str] = &[
-        "AWS_ACCESS_KEY_ID",
-        "AWS_PROFILE",
-        "AWS_DEFAULT_PROFILE",
-        "AWS_ROLE_ARN",
-        "AWS_WEB_IDENTITY_TOKEN_FILE",
-        "AWS_BEARER_TOKEN_BEDROCK",
-        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-    ];
+/// gives a definitive live verdict. Shared between `providers list` and
+/// `doctor` so the two stay in sync.
+pub(crate) fn bedrock_configured(env_lookup: &dyn Fn(&str) -> Option<String>) -> bool {
     AWS_CRED_VARS.iter().any(|var| env_set(env_lookup, var))
 }
 

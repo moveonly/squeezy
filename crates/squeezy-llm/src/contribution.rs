@@ -268,7 +268,11 @@ impl std::fmt::Debug for LoadedContributions {
 /// Mirrors the fields of [`OpenAiConfig`] but tolerates missing optional
 /// fields (`api_key`, `transport`) so a user can write a minimal
 /// `[providers.openai]` block with just `api_key_env = "…"`.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// M-63: custom `Debug` impl below redacts `api_key` so it matches the
+/// redaction contract applied to [`OpenAiConfig`] and the other built-in
+/// secret-bearing config types.
+#[derive(Clone, Deserialize)]
 pub struct OpenAiContributionConfig {
     pub api_key_env: String,
     #[serde(default)]
@@ -277,6 +281,17 @@ pub struct OpenAiContributionConfig {
     pub base_url: String,
     #[serde(default)]
     pub transport: ProviderTransportConfig,
+}
+
+impl fmt::Debug for OpenAiContributionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAiContributionConfig")
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("transport", &self.transport)
+            .finish()
+    }
 }
 
 fn default_openai_base_url() -> String {
@@ -307,7 +322,11 @@ impl ProviderContribution for OpenAiContribution {
 }
 
 /// Typed TOML payload for [`AnthropicContribution`].
-#[derive(Debug, Clone, Deserialize)]
+///
+/// M-63: custom `Debug` impl below redacts `api_key` so it matches the
+/// redaction contract applied to [`AnthropicConfig`] and the other
+/// built-in secret-bearing config types.
+#[derive(Clone, Deserialize)]
 pub struct AnthropicContributionConfig {
     pub api_key_env: String,
     #[serde(default)]
@@ -316,6 +335,17 @@ pub struct AnthropicContributionConfig {
     pub base_url: String,
     #[serde(default)]
     pub transport: ProviderTransportConfig,
+}
+
+impl fmt::Debug for AnthropicContributionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnthropicContributionConfig")
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("transport", &self.transport)
+            .finish()
+    }
 }
 
 fn default_anthropic_base_url() -> String {
@@ -343,7 +373,11 @@ impl ProviderContribution for AnthropicContribution {
 }
 
 /// Typed TOML payload for [`GoogleContribution`].
-#[derive(Debug, Clone, Deserialize)]
+///
+/// M-63: custom `Debug` impl below redacts `api_key` so it matches the
+/// redaction contract applied to [`GoogleConfig`] and the other built-in
+/// secret-bearing config types.
+#[derive(Clone, Deserialize)]
 pub struct GoogleContributionConfig {
     pub api_key_env: String,
     #[serde(default)]
@@ -352,6 +386,17 @@ pub struct GoogleContributionConfig {
     pub base_url: String,
     #[serde(default)]
     pub transport: ProviderTransportConfig,
+}
+
+impl fmt::Debug for GoogleContributionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GoogleContributionConfig")
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("transport", &self.transport)
+            .finish()
+    }
 }
 
 fn default_google_base_url() -> String {
@@ -412,10 +457,27 @@ impl fmt::Debug for OllamaContributionConfig {
             .field("base_url", &self.base_url)
             .field("route_style", &self.route_style)
             .field("api_key_env", &self.api_key_env)
-            .field("api_key", &self.api_key.as_deref().map(|_| "<redacted>"))
+            .field("api_key", &RedactedOpt(&self.api_key))
             .field("keep_alive", &self.keep_alive)
             .field("transport", &self.transport)
             .finish()
+    }
+}
+
+/// Debug wrapper for `Option<String>` fields that may carry secrets (API
+/// keys, bearer tokens). Displays as `Some("<redacted>")` when the value is
+/// set and `None` otherwise, so `{:?}`-formatted log lines and panic
+/// messages cannot leak credentials. Mirrors the helper of the same name in
+/// `squeezy-core::lib`; kept private here because that helper is not part
+/// of the public surface.
+struct RedactedOpt<'a>(&'a Option<String>);
+
+impl fmt::Debug for RedactedOpt<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(_) => write!(f, "Some(\"<redacted>\")"),
+            None => write!(f, "None"),
+        }
     }
 }
 

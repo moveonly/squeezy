@@ -80,13 +80,15 @@ impl OllamaProvider {
             // For plain no-auth local deployments the key is `None` and an
             // empty static key preserves the bypass behavior.
             OllamaRoute::OpenAiCompatible => {
-                let key_source = match api_key.clone() {
-                    Some(token) => static_api_key_source(token, "ollama"),
-                    None => static_api_key_source(
-                        String::new(),
-                        OpenAiCompatiblePreset::LMStudio.as_str(),
-                    ),
-                };
+                // Tag the key source as `"ollama"` for both keyed and no-key
+                // paths so diagnostics ("resolved via static (ollama)") line
+                // up with the user-facing provider id rather than the
+                // underlying `LMStudio` preset shape. Mismatched labels are
+                // only a diagnostics annoyance, but the keyed branch already
+                // used `"ollama"` and aligning the empty-key branch keeps
+                // logs coherent.
+                let key_source =
+                    static_api_key_source(api_key.clone().unwrap_or_default(), "ollama");
                 Some(OpenAiCompatibleProvider::with_api_key_source(
                     OpenAiCompatiblePreset::LMStudio,
                     key_source,

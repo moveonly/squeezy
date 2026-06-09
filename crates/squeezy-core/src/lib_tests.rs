@@ -5363,6 +5363,55 @@ api_key_env = "OPENAI_API_KEY"
     .expect("api_key + api_key_env both parse cleanly");
 }
 
+/// Test-only sanitizer boundary for the Debug-redaction sweep.
+///
+/// Mirrors the [`RedactedDisplay`] newtype pattern landed in PR #399 for
+/// `config explain`: the rendered `Debug` output and the seeded secret
+/// fixtures are both held inside the wrapper, and every assertion goes
+/// through accessors that return scalar booleans (`bool`, `usize`,
+/// counted-leak summaries) rather than letting the secret strings or the
+/// raw `rendered` blob flow into a `format!` / `assert!` / `panic!`
+/// argument. CodeQL's `rust/cleartext-logging` analyzer follows taint from
+/// secret-shaped string literals into format-arg sinks; routing the
+/// comparisons through this wrapper gives the analyzer a structural
+/// sanitizer boundary so the assertion logic stays intact without tripping
+/// `Cleartext logging of sensitive information` alerts on the test code.
+struct RedactedRender {
+    rendered: String,
+    secrets: Vec<&'static str>,
+}
+
+impl RedactedRender {
+    fn new(rendered: String, secrets: Vec<&'static str>) -> Self {
+        Self { rendered, secrets }
+    }
+
+    /// Number of seeded secret fixtures that survived the `Debug` rendering.
+    /// Returns a `usize` so the caller's assertion only sees a scalar — no
+    /// secret values and no raw `rendered` text flow into the assertion's
+    /// format args.
+    fn leaked_secret_count(&self) -> usize {
+        self.secrets
+            .iter()
+            .filter(|s| self.rendered.contains(**s))
+            .count()
+    }
+
+    /// `true` when the rendered output contains the canonical redaction
+    /// marker. Returning a bool keeps the rendered string out of the
+    /// caller's assertion message.
+    fn contains_redaction_marker(&self) -> bool {
+        self.rendered.contains("<redacted>")
+    }
+
+    /// `true` when the rendered output preserves the (non-secret) header
+    /// names operators rely on for diagnostics. Returning a bool keeps the
+    /// rendered string out of the caller's assertion message.
+    fn preserves_header_names(&self) -> bool {
+        self.rendered.contains("Authorization") && self.rendered.contains("api-key")
+    }
+}
+
 #[test]
 fn provider_config_debug_redacts_secret_fields() {
     let mut compatible_headers = BTreeMap::new();
@@ -5377,6 +5426,12 @@ fn provider_config_debug_redacts_secret_fields() {
     );
     let mut request_metadata = BTreeMap::new();
     request_metadata.insert("team".to_string(), "platform".to_string());
+
+    let mut settings_headers = BTreeMap::new();
+    settings_headers.insert(
+        "x-litellm-key".to_string(),
+        "debug-settings-header-secret".to_string(),
+    );
 
     let rendered = [
         format!(
@@ -5460,30 +5515,48 @@ fn provider_config_debug_redacts_secret_fields() {
                 transport: ProviderTransportConfig::default(),
             }
         ),
+        format!(
+            "{:?}",
+            ProviderSettings {
+                api_key_env: Some("PROVIDER_SETTINGS_API_KEY".to_string()),
+                api_key: Some("debug-provider-settings-api-key".to_string()),
+                headers: Some(settings_headers),
+                ..ProviderSettings::default()
+            }
+        ),
     ]
     .join("\n");
 
-    for secret in [
-        "debug-compatible-secret",
-        "debug-compatible-api-key",
-        "debug-openai-api-key",
-        "debug-anthropic-api-key",
-        "debug-google-api-key",
-        "debug-azure-header-secret",
-        "debug-azure-api-key",
-        "debug-entra-token",
-        "debug-bedrock-bearer-token",
-        "debug-ollama-api-key",
-    ] {
-        assert!(
-            !rendered.contains(secret),
-            "Debug output must redact {secret:?}; got: {rendered}"
-        );
-    }
-    assert!(rendered.contains("<redacted>"), "{rendered}");
+    let render = RedactedRender::new(
+        rendered,
+        vec![
+            "debug-compatible-secret",
+            "debug-compatible-api-key",
+            "debug-openai-api-key",
+            "debug-anthropic-api-key",
+            "debug-google-api-key",
+            "debug-azure-header-secret",
+            "debug-azure-api-key",
+            "debug-entra-token",
+            "debug-bedrock-bearer-token",
+            "debug-ollama-api-key",
+            "debug-provider-settings-api-key",
+            "debug-settings-header-secret",
+        ],
+    );
+
+    let leaked = render.leaked_secret_count();
+    assert_eq!(
+        leaked, 0,
+        "Debug output must redact every seeded secret fixture",
+    );
     assert!(
-        rendered.contains("Authorization") && rendered.contains("api-key"),
-        "Debug output should keep header names visible: {rendered}"
+        render.contains_redaction_marker(),
+        "Debug output must include the `<redacted>` marker",
+    );
+    assert!(
+        render.preserves_header_names(),
+        "Debug output must keep non-secret header names visible",
     );
 }
 
@@ -5511,15 +5584,20 @@ keep_alive = "24h"
         _ => None,
     });
 
-    match config.provider {
-        ProviderConfig::Ollama(ollama) => {
-            assert_eq!(ollama.route_style, OllamaRoute::OpenAiCompatible);
-            assert_eq!(ollama.api_key_env, "OLLAMA_ENV_KEY");
-            assert_eq!(ollama.api_key.as_deref(), Some("ollama-inline-secret"));
-            assert_eq!(ollama.keep_alive.as_deref(), Some("30m"));
-        }
-        other => panic!("expected Ollama provider, got {other:?}"),
-    }
+    // `let-else` rather than `match … other => panic!("… got {other:?}")`:
+    // CodeQL's `rust/cleartext-logging` analyzer follows taint into the
+    // `{other:?}` format arg even though `ProviderConfig::Ollama`'s nested
+    // `OllamaConfig` redacts `api_key` via the manual `Debug` impl. Dropping
+    // the diagnostic value out of the panic message removes the format-arg
+    // sink entirely; the `let-else` shape still produces a clear failure
+    // ("expected Ollama provider") if the variant ever drifts.
+    let ProviderConfig::Ollama(ollama) = config.provider else {
+        panic!("expected Ollama provider variant after env-precedence resolve");
+    };
+    assert_eq!(ollama.route_style, OllamaRoute::OpenAiCompatible);
+    assert_eq!(ollama.api_key_env, "OLLAMA_ENV_KEY");
+    assert_eq!(ollama.api_key.as_deref(), Some("ollama-inline-secret"));
+    assert_eq!(ollama.keep_alive.as_deref(), Some("30m"));
 }
 
 #[test]

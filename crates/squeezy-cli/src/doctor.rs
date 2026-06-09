@@ -3,8 +3,8 @@ use std::{env, fmt::Write as _, fs, path::PathBuf, time::Duration};
 use clap::Args;
 use serde_json::json;
 use squeezy_core::{
-    AppConfig, McpServerConfig, McpTransport, OllamaConfig, ProviderConfig, ProviderSettings,
-    Result, SettingsFile, default_settings_path,
+    AppConfig, DEFAULT_OLLAMA_API_KEY_ENV, McpServerConfig, McpTransport, OllamaConfig,
+    ProviderConfig, ProviderSettings, Result, SettingsFile, default_settings_path,
 };
 use squeezy_llm::{
     KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
@@ -208,7 +208,8 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
             }),
         }
 
-        let (provider_name, provider_check) = provider_credential_check(&config.provider);
+        let (provider_name, provider_check) =
+            provider_credential_check(&config.provider, &|name| std::env::var(name).ok());
         checks.push(Check {
             name: format!("provider:{provider_name}"),
             status: provider_check.0,
@@ -256,7 +257,10 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
     })
 }
 
-fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Status, String)) {
+fn provider_credential_check(
+    provider: &ProviderConfig,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+) -> (&'static str, (Status, String)) {
     match provider {
         ProviderConfig::OpenAi(c) => (
             "openai",
@@ -274,13 +278,7 @@ fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Statu
             "azure_openai",
             credential_check(c.api_key.as_deref(), &c.api_key_env),
         ),
-        ProviderConfig::Bedrock(c) => (
-            "bedrock",
-            (
-                Status::Ok,
-                format!("region={} (uses AWS credential chain)", c.region),
-            ),
-        ),
+        ProviderConfig::Bedrock(c) => ("bedrock", bedrock_credential_check(c, env_lookup)),
         ProviderConfig::Ollama(c) => ("ollama", ollama_credential_check(c)),
         ProviderConfig::OpenAiCodex(_) => ("openai_codex", openai_codex_auth_check()),
         ProviderConfig::GitHubCopilot(_) => ("github_copilot", github_copilot_auth_check()),
@@ -373,7 +371,35 @@ fn credential_check(inline: Option<&str>, env_name: &str) -> (Status, String) {
     }
 }
 
-const DEFAULT_OLLAMA_API_KEY_ENV: &str = "OLLAMA_API_KEY";
+/// Credential check for the Bedrock provider. Bedrock uses the full AWS
+/// credential chain (static keys, named profiles, IRSA/OIDC web-identity,
+/// container credentials, bearer tokens, IAM instance roles). The full
+/// chain cannot be verified without a network round-trip; we mirror
+/// `providers list --configured` and report `Ok` only when at least one
+/// well-known AWS credential env var is present, otherwise `Warn` with a
+/// hint to run `squeezy doctor --probe` for a live verdict. Keeps the
+/// `providers list` and `doctor` views in sync.
+fn bedrock_credential_check(
+    config: &squeezy_core::BedrockConfig,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+) -> (Status, String) {
+    if crate::providers::bedrock_configured(env_lookup) {
+        (
+            Status::Ok,
+            format!("region={} (AWS credential chain)", config.region),
+        )
+    } else {
+        (
+            Status::Warn,
+            format!(
+                "region={}; no AWS credential env var detected. \
+                 Profile-based / IAM-instance-role auth still works — \
+                 run `squeezy doctor --probe` for a live verdict.",
+                config.region
+            ),
+        )
+    }
+}
 
 /// Credential check for the Ollama provider. Ollama operates without auth by
 /// default, so an absent `OLLAMA_API_KEY` is not a failure. However, if a
