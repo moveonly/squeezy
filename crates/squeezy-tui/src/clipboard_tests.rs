@@ -580,3 +580,50 @@ fn platform_ok_script_is_well_formed() {
     let s = PLATFORM_OK.clone();
     assert!(s.terminal_error.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// RealSink: large-payload concurrency (deadlock regression)
+// ---------------------------------------------------------------------------
+
+/// A child that floods its stderr pipe *before* it drains stdin would deadlock
+/// a sink that writes the whole payload on the calling thread and only then
+/// reaps the child: the child blocks writing stderr (its pipe is full because
+/// nobody is reading it yet) and never reads the rest of stdin, while the sink
+/// blocks writing stdin and never reads stderr. `RealSink::run_command` writes
+/// stdin on a separate thread so the two pipes drain concurrently, so this
+/// returns instead of hanging. The payload is far larger than any pipe buffer
+/// (typically 64 KiB) so the deadlock is forced if the fix regresses.
+#[cfg(unix)]
+#[test]
+fn real_sink_run_command_does_not_deadlock_on_large_payload() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // ~512 KiB of payload, comfortably past the pipe buffer.
+    let payload = vec![b'x'; 512 * 1024];
+    // The child emits ~512 KiB to stderr first (yes >> pipe buffer), then
+    // drains stdin via `cat >/dev/null`, then exits non-zero so we also
+    // exercise the stderr-surfacing path with a full stderr pipe.
+    let script = "yes E | head -c 524288 1>&2; cat >/dev/null; exit 3";
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut sink = RealSink;
+        let outcome = sink.run_command("sh", &["-c", script], &payload);
+        let _ = tx.send(outcome);
+    });
+
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("run_command must not deadlock on a large payload")
+        .expect("sh should spawn and be reaped");
+    assert!(!outcome.success, "child exited non-zero");
+    assert_eq!(outcome.status_code, Some(3));
+    // Stderr was captured despite filling its pipe (proves it drained
+    // concurrently with the stdin write).
+    assert!(
+        outcome.stderr.contains('E'),
+        "captured stderr should carry the child's flood, got {:?}",
+        outcome.stderr
+    );
+}

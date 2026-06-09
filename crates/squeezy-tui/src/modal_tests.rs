@@ -84,16 +84,12 @@ fn surface_draws_a_border_and_title() {
 
 #[test]
 fn clear_after_close_runs_against_the_crossterm_backend_terminal() {
-    // `clear_after_close` is constrained to `CrosstermBackend<W>` so it binds
-    // to the same guard terminal both pickers hold. Drive it through an
-    // in-memory writer (the role `TerminalWriter` plays in production) and
-    // assert it draws + flushes a frame without error. The crossterm backend
-    // does not expose a queryable cell buffer, so we observe the emitted
-    // escape stream instead and prove the close-clear writes the modal's
-    // ghost rows away rather than leaving them on screen.
-    // `CrosstermBackend`'s inner writer is private, so capture the emitted
-    // bytes through the shared `TerminalWriter::Capture` sink (the same seam
-    // production uses) instead of reaching into the backend.
+    // `clear_after_close` is constrained to `CrosstermBackend<W>`, so it binds
+    // to the same guard terminal both pickers hold. The crossterm backend
+    // exposes no queryable cell buffer and its inner writer is private, so we
+    // capture the emitted escape stream through the shared
+    // `TerminalWriter::capture` sink (the seam production uses) and prove the
+    // close-clear writes a fresh cleared frame rather than leaving ghost rows.
     let sink = Arc::new(Mutex::new(Vec::new()));
     let backend = CrosstermBackend::new(TerminalWriter::capture(Arc::clone(&sink)));
     // A fixed viewport keeps `Terminal::new`/`frame.area()` from querying the

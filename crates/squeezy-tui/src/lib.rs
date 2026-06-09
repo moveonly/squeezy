@@ -2114,12 +2114,19 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // Visual selection over the MAIN transcript text area. Only outside the
     // overlay/config screens (those own their own surfaces). Press hit-tests the
     // text rectangle; drag/release track an in-flight drag.
+    //
+    // The painted main-surface rows are rebuilt once per gesture and threaded
+    // through the cell→`Pos` mapping AND the word/row snapping below, so a
+    // single press (which both maps the cell and may snap a word/row) rebuilds
+    // the transcript row list once instead of two or three times.
     if app.transcript_overlay.is_none() && app.config_screen.is_none() {
         match mouse.kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                if let Some(pos) = main_point_from_mouse(app, mouse.column, mouse.row) {
+                let rows = main_surface_rows(app);
+                if let Some(pos) = main_point_from_mouse(app, &rows, mouse.column, mouse.row) {
                     return handle_main_selection_press(
                         app,
+                        &rows,
                         pos,
                         mouse.column,
                         mouse.row,
@@ -2128,11 +2135,13 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                 }
             }
             MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                let rows = main_surface_rows(app);
                 if app
                     .selection
                     .as_ref()
                     .is_some_and(|s| s.surface == selection::SelectionSurface::Main)
-                    && let Some(pos) = main_point_from_mouse_clamped(app, mouse.column, mouse.row)
+                    && let Some(pos) =
+                        main_point_from_mouse_clamped(app, &rows, mouse.column, mouse.row)
                 {
                     let cursor_row = pos.row;
                     set_selection_cursor(app, pos);
@@ -2290,7 +2299,16 @@ fn selection_surface_rows(
 /// Map an absolute `(column, row)` mouse cell onto a surface-local
 /// `selection::Pos` for the MAIN text area, using the per-frame
 /// `main_text_area_cache`. `None` when the cell is outside the text rectangle.
-fn main_point_from_mouse(app: &TuiApp, column: u16, row: u16) -> Option<selection::Pos> {
+///
+/// `rows` is the painted main-surface row list, computed once per mouse gesture
+/// by the caller (see [`main_surface_rows`]) so a single press/drag does not
+/// rebuild it for every helper it touches.
+fn main_point_from_mouse(
+    app: &TuiApp,
+    rows: &[Line<'static>],
+    column: u16,
+    row: u16,
+) -> Option<selection::Pos> {
     let cache = app.main_text_area_cache.get()?;
     let area = cache.text_area;
     if column < area.x
@@ -2300,14 +2318,19 @@ fn main_point_from_mouse(app: &TuiApp, column: u16, row: u16) -> Option<selectio
     {
         return None;
     }
-    Some(main_pos_for_cell(app, &cache, column, row))
+    Some(main_pos_for_cell(&cache, rows, column, row))
 }
 
 /// Like [`main_point_from_mouse`] but clamps an out-of-bounds pointer onto the
 /// nearest edge cell instead of returning `None` — used while dragging so a
 /// pointer that slides above/below the text area still extends to the
 /// first/last visible row (auto-scroll then reveals more).
-fn main_point_from_mouse_clamped(app: &TuiApp, column: u16, row: u16) -> Option<selection::Pos> {
+fn main_point_from_mouse_clamped(
+    app: &TuiApp,
+    rows: &[Line<'static>],
+    column: u16,
+    row: u16,
+) -> Option<selection::Pos> {
     let cache = app.main_text_area_cache.get()?;
     let area = cache.text_area;
     if area.width == 0 || area.height == 0 {
@@ -2315,14 +2338,17 @@ fn main_point_from_mouse_clamped(app: &TuiApp, column: u16, row: u16) -> Option<
     }
     let col = column.clamp(area.x, area.x + area.width - 1);
     let r = row.clamp(area.y, area.y + area.height - 1);
-    Some(main_pos_for_cell(app, &cache, col, r))
+    Some(main_pos_for_cell(&cache, rows, col, r))
 }
 
 /// Shared cell→`Pos` math: resolve the wrapped-row index from the painted scroll
 /// window, then the wide-glyph-aware char column within that row's plain text.
+///
+/// `rows` is the painted main-surface row list (the same `Vec<Line>` the caller
+/// derived for the gesture), indexed by the resolved wrapped-row index.
 fn main_pos_for_cell(
-    app: &TuiApp,
     cache: &MainTextAreaCache,
+    rows: &[Line<'static>],
     column: u16,
     row: u16,
 ) -> selection::Pos {
@@ -2336,7 +2362,6 @@ fn main_pos_for_cell(
     let row_idx = (top_row + local_row).min(last);
 
     let display_col = usize::from(column.saturating_sub(cache.text_area.x));
-    let rows = main_surface_rows(app);
     let col = rows
         .get(row_idx)
         .map(|line| {
@@ -2495,6 +2520,7 @@ fn scroll_selection_cursor_into_view(app: &mut TuiApp, cursor_row: usize, last: 
 /// row, and a plain press starts a new cell selection. Returns `true` (consumed).
 fn handle_main_selection_press(
     app: &mut TuiApp,
+    rows: &[Line<'static>],
     pos: selection::Pos,
     column: u16,
     row: u16,
@@ -2524,8 +2550,8 @@ fn handle_main_selection_press(
     }
 
     match multiplicity {
-        2 => select_word_at(app, selection::SelectionSurface::Main, pos),
-        3 => select_row_at(app, selection::SelectionSurface::Main, pos),
+        2 => select_word_at(app, rows, selection::SelectionSurface::Main, pos),
+        3 => select_row_at(app, rows, selection::SelectionSurface::Main, pos),
         _ => start_selection(app, selection::SelectionSurface::Main, pos),
     }
     true
@@ -2533,8 +2559,15 @@ fn handle_main_selection_press(
 
 /// Double-click: select the word under `pos` over that row's plain text, snapping
 /// the anchor/cursor to word bounds (`SelectionMode::Word`).
-fn select_word_at(app: &mut TuiApp, surface: selection::SelectionSurface, pos: selection::Pos) {
-    let rows = selection_surface_rows(app, surface);
+///
+/// `rows` is the gesture's already-built main-surface row list (the press path
+/// is always on the main surface), reused here instead of rebuilding it.
+fn select_word_at(
+    app: &mut TuiApp,
+    rows: &[Line<'static>],
+    surface: selection::SelectionSurface,
+    pos: selection::Pos,
+) {
     let Some(line) = rows.get(pos.row) else {
         start_selection(app, surface, pos);
         return;
@@ -2557,8 +2590,15 @@ fn select_word_at(app: &mut TuiApp, surface: selection::SelectionSurface, pos: s
 }
 
 /// Triple-click: select the whole visual row under `pos` (`SelectionMode::Row`).
-fn select_row_at(app: &mut TuiApp, surface: selection::SelectionSurface, pos: selection::Pos) {
-    let rows = selection_surface_rows(app, surface);
+///
+/// `rows` is the gesture's already-built main-surface row list, reused here
+/// instead of rebuilding it.
+fn select_row_at(
+    app: &mut TuiApp,
+    rows: &[Line<'static>],
+    surface: selection::SelectionSurface,
+    pos: selection::Pos,
+) {
     let row_len = rows
         .get(pos.row)
         .map(|l| transcript_surface::plain_text_of_line(l).chars().count())
@@ -18745,6 +18785,13 @@ pub(crate) struct TuiApp {
     /// Screen row where the append-only footer currently starts (its top). The
     /// footer's click rects are registered footer-relative (origin 0), so mouse
     /// hit-testing subtracts this to map absolute terminal rows into the footer.
+    ///
+    /// Inline-repro-only render-coordinate state: it is mutated solely from the
+    /// `SQUEEZY_INLINE_REPRO` paint path (`paint_main_inner`, reached only when
+    /// `inline_repro` is set) and read only by that path's click mapping. The
+    /// fullscreen renderer registers absolute click rects, so it leaves this at
+    /// 0. Do not refactor for the fullscreen path — Phase 10 deletes the inline
+    /// path (and this field with it).
     pub(crate) footer_origin: u16,
     /// Set by `/clear` after the app transcript has been reset. The next
     /// terminal draw purges the visible screen and scrollback before any

@@ -74,17 +74,22 @@ pub(crate) fn surface(
 }
 
 /// Clear the whole terminal exactly once after a picker closes so the modal
-/// block leaves no ghost rows behind. Generic over the writer so it works
-/// against the real `TerminalWriter`-backed guard terminal in production and
-/// against the `TestBackend` the picker tests use.
+/// block leaves no ghost rows behind. Generic over the `CrosstermBackend`
+/// inner writer `W`, so it binds to the same guard terminal both pickers hold
+/// in production (a `CrosstermBackend<TerminalWriter>`); the tests drive it
+/// through a `CrosstermBackend<TerminalWriter::capture>` sink. A
+/// `Terminal<TestBackend>` cannot satisfy this signature, so the picker
+/// row/layout tests render directly instead of calling this.
 pub(crate) fn clear_after_close<W: io::Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
 ) -> io::Result<()> {
+    // `Terminal::draw` already flushes both the buffer diff and the backend
+    // writer, so no separate `terminal.flush()` is needed here.
     terminal.draw(|frame| {
         let full = frame.area();
         frame.render_widget(Clear, full);
     })?;
-    terminal.flush()
+    Ok(())
 }
 
 #[cfg(test)]

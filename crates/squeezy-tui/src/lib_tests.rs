@@ -18935,6 +18935,66 @@ fn bare_click_leaves_no_selection() {
     );
 }
 
+#[test]
+fn mouse_click_on_wide_glyph_maps_to_the_correct_char_column() {
+    // A press hit-tests through `main_pos_for_cell`, whose
+    // `char_offset_for_display_col` accounts for wide (CJK) glyphs that occupy
+    // two terminal cells. Each `好` is two columns wide, so the display-column
+    // → char-column mapping must skip the second cell of every wide glyph
+    // rather than counting columns 1:1. The two ASCII markers `A` and `B` are
+    // separated in display space by `好` (two cells) + `A` (one cell) = three
+    // cells, but in CHAR space by exactly two chars (one wide + one narrow).
+    // Asserting the deltas keeps the test robust against any leading
+    // rail/gutter prefix the renderer adds to the line.
+    //
+    //   "...好A好B"  →  char(B) - char(A) == 2, and the trailing cell of the
+    //   wide glyph just before `A` maps to char(A) - 1 (the glyph), not char(A).
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("好A好B"));
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+
+    // `find_text_cell` returns the column of the first cell of each ASCII
+    // marker — its wide-aware display column on the painted row.
+    let (a_x, row) = find_text_cell(&buffer, "A").expect("the A marker painted");
+    let (b_x, b_row) = find_text_cell(&buffer, "B").expect("the B marker painted");
+    assert_eq!(row, b_row, "both markers share one visual row");
+    // Sanity on the geometry: `B` sits three display cells past `A`
+    // (好 = 2 cells, A = 1 cell).
+    assert_eq!(b_x - a_x, 3, "好A occupies three display cells");
+
+    let press_col = |app: &mut TuiApp, x: u16| -> usize {
+        assert!(handle_mouse(app, left_down(x, row, KeyModifiers::NONE)));
+        let col = app
+            .selection
+            .as_ref()
+            .expect("press arms a selection")
+            .anchor
+            .col;
+        handle_mouse(app, left_up(x, row));
+        app.selection = None;
+        col
+    };
+
+    let a_col = press_col(&mut app, a_x);
+    let b_col = press_col(&mut app, b_x);
+    // Three display cells of separation, but only two chars: the wide-glyph
+    // skip is exactly what makes the difference 2 and not 3.
+    assert_eq!(
+        b_col - a_col,
+        2,
+        "clicking past one wide glyph + one narrow advances the char column by 2, not 3"
+    );
+
+    // The SECOND cell of the wide glyph immediately before `A` must still
+    // resolve to that glyph (char(A) - 1), not bleed forward into `A`.
+    let trailing_cell_col = press_col(&mut app, a_x - 1);
+    assert_eq!(
+        trailing_cell_col,
+        a_col - 1,
+        "the trailing cell of a wide glyph maps back to that glyph's char column"
+    );
+}
+
 #[tokio::test]
 async fn copy_acts_on_the_active_selection_over_the_focused_unit() {
     let mut agent = test_agent(SessionMode::Build);

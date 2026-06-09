@@ -351,7 +351,7 @@ pub(crate) fn run_picker<W: io::Write>(
     if state.themes.is_empty() || state.choices.is_empty() {
         return Ok(None);
     }
-    loop {
+    let result = loop {
         terminal.draw(|frame| render_picker(frame, &state, settings_path))?;
         match event::read()? {
             Event::Key(key) => match state.dispatch(key) {
@@ -367,21 +367,20 @@ pub(crate) fn run_picker<W: io::Write>(
                     crate::apply_theme_overrides(&next);
                 }
                 Some(PickerOutcome::Selected(selection)) => {
-                    // Both exit paths drew the modal block at least once; clear
-                    // the shared terminal once on close so no ghost rows remain.
-                    modal::clear_after_close(terminal)?;
-                    return Ok(Some(StartupModelPickerResult::Selected(selection)));
+                    break Some(StartupModelPickerResult::Selected(selection));
                 }
-                Some(PickerOutcome::Quit) => {
-                    modal::clear_after_close(terminal)?;
-                    return Ok(None);
-                }
+                Some(PickerOutcome::Quit) => break None,
                 None => {}
             },
             Event::Resize(_, _) => continue,
             _ => continue,
         }
-    }
+    };
+    // Every exit path above drew the modal block at least once; clear the
+    // shared terminal exactly once on close so no ghost rows survive into the
+    // next surface (mirrors `resume_picker::run_picker`).
+    modal::clear_after_close(terminal)?;
+    Ok(result)
 }
 
 fn persist_theme(settings_path: &Path, theme: &str) -> io::Result<()> {

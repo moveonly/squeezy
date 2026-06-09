@@ -149,18 +149,37 @@ impl ClipboardSink for RealSink {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        // Take stdin, write the payload, and drop it to signal EOF before we
-        // wait — otherwise the child may block forever reading. Capture the
-        // write result rather than `?`-ing it: short-circuiting here would skip
-        // the `wait` below and leak the child as a zombie. We ALWAYS reap, then
-        // propagate the write error if there was one.
-        let write_result = match child.stdin.take() {
-            Some(mut stdin) => stdin.write_all(payload),
-            None => Ok(()),
-        };
+        // Feed stdin on a SEPARATE thread so the payload write and the
+        // stderr/stdout drain run concurrently. Writing the whole payload on
+        // this thread before `wait_with_output` would deadlock on a large copy:
+        // a child that emits to stderr before it finishes draining stdin fills
+        // its (fixed-size) stderr pipe, blocks on the write, and never reads the
+        // rest of stdin — while we block writing stdin and never drain stderr.
+        // The writer thread owns the moved `stdin`; dropping it at the end of
+        // the closure signals EOF. `wait_with_output` on this thread drains
+        // stderr concurrently, then we join the writer and surface its error.
+        let writer = child.stdin.take().map(|mut stdin| {
+            let payload = payload.to_vec();
+            std::thread::spawn(move || {
+                let result = stdin.write_all(&payload);
+                drop(stdin);
+                result
+            })
+        });
 
+        // Always reap the child first (this drains stderr), so a write error
+        // never leaks the process as a zombie.
         let output = child.wait_with_output()?;
-        write_result?;
+        // Join the writer and propagate any write error. A panicked writer
+        // thread surfaces as a generic broken-pipe-style IO error.
+        if let Some(writer) = writer {
+            match writer.join() {
+                Ok(write_result) => write_result?,
+                Err(_) => {
+                    return Err(io::Error::other("clipboard stdin writer thread panicked"));
+                }
+            }
+        }
         Ok(CommandOutcome {
             status_code: output.status.code(),
             success: output.status.success(),
