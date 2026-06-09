@@ -378,7 +378,18 @@ fn doctor_detail_strings_render_each_variant() {
     };
     let detail = newer.doctor_detail();
     assert!(detail.contains("v1.1.0"));
-    assert!(detail.contains("cargo install"));
+    // The upgrade hint is platform-specific: winget on Windows, cargo on others.
+    if cfg!(target_os = "windows") {
+        assert!(
+            detail.contains("winget"),
+            "Windows detail should suggest winget: {detail}"
+        );
+    } else {
+        assert!(
+            detail.contains("cargo install"),
+            "non-Windows detail should suggest cargo: {detail}"
+        );
+    }
     assert!(newer.is_warning());
 
     let unavailable = UpdateStatus::Unavailable {

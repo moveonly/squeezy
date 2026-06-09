@@ -1,10 +1,16 @@
-use std::{env, fmt::Write as _, fs, path::PathBuf, time::Duration};
+use std::{
+    env,
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use clap::{Args, ValueEnum};
 use serde_json::json;
 use squeezy_core::{
     AppConfig, McpServerConfig, McpTransport, OllamaConfig, ProviderConfig, ProviderSettings,
-    Result, SettingsFile, SqueezyError, default_settings_path,
+    Result, SettingsFile, SqueezyError, default_prompt_history_path, default_settings_path,
 };
 use squeezy_llm::{
     KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
@@ -54,12 +60,12 @@ pub struct DoctorArgs {
     /// prompt). Creates the hidden local sandbox users and installs the WFP
     /// network egress-block filters, enabling `windows_sandbox_level =
     /// "elevated"`. Performs the action and exits without running other checks.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "sandbox_teardown")]
     pub sandbox_setup: bool,
     /// Windows only: remove all elevated shell-sandbox machine state (sandbox
     /// users, WFP filters, registry entries, secrets). Performs the action and
     /// exits without running other checks.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "sandbox_setup")]
     pub sandbox_teardown: bool,
     /// Report detailed Linux shell-sandbox posture (user namespace support,
     /// Landlock support, seccomp support, required-mode viability) and exit.
@@ -140,6 +146,18 @@ pub struct DoctorReport {
     version: &'static str,
     target: &'static str,
     json: bool,
+    /// Resolved state paths included in the `--json` output so support tooling
+    /// can distinguish `%APPDATA%`, `%LOCALAPPDATA%`, `%USERPROFILE%`, and
+    /// fallback `.squeezy` state locations on Windows.
+    paths: DoctorPaths,
+}
+
+#[derive(Debug, Default)]
+struct DoctorPaths {
+    settings_path: Option<PathBuf>,
+    session_root: Option<PathBuf>,
+    cache_path: Option<PathBuf>,
+    prompt_history_path: Option<PathBuf>,
 }
 
 impl DoctorReport {
@@ -179,12 +197,19 @@ impl DoctorReport {
     }
 
     fn json_body(&self) -> serde_json::Value {
+        let path_str = |p: &Option<PathBuf>| p.as_ref().map(|v| v.display().to_string());
         json!({
             "version": self.version,
             "target": self.target,
             "ok": self.failures == 0,
             "warnings": self.warnings,
             "failures": self.failures,
+            "paths": {
+                "settings_path": path_str(&self.paths.settings_path),
+                "session_root": path_str(&self.paths.session_root),
+                "cache_path": path_str(&self.paths.cache_path),
+                "prompt_history_path": path_str(&self.paths.prompt_history_path),
+            },
             "checks": self.checks.iter().map(|c| {
                 let mut obj = json!({
                     "name": c.name,
@@ -242,6 +267,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
             version,
             target,
             json: args.json,
+            paths: DoctorPaths::default(),
         });
     }
 
@@ -261,6 +287,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
             version,
             target,
             json: args.json,
+            paths: DoctorPaths::default(),
         });
     }
 
@@ -396,8 +423,14 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         if should_include_check(args, "cache") {
             checks.push(cache_check(config, args.prune_cache, args.storage));
         }
+        if should_include_check(args, "settings_location") {
+            checks.push(settings_location_check(config));
+        }
     }
 
+    if should_include_check(args, "terminal") {
+        checks.push(terminal_capability_check());
+    }
     if should_include_check(args, "parser_health") {
         checks.push(parser_health_check());
     }
@@ -435,6 +468,17 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         }
     }
 
+    // Collect resolved state paths for the --json output so support tooling
+    // can disambiguate %APPDATA%, %LOCALAPPDATA%, %USERPROFILE%, and fallback
+    // .squeezy state locations on Windows without having to reconstruct them
+    // from the check detail strings.
+    let settings_path = default_settings_path();
+    let session_root = config
+        .as_ref()
+        .map(|c| SessionStore::open(c).root().to_path_buf());
+    let cache_path = crate::update::cache_path();
+    let prompt_history_path = default_prompt_history_path();
+
     Ok(DoctorReport {
         exit_code,
         warnings,
@@ -443,6 +487,12 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         version,
         target,
         json: args.json,
+        paths: DoctorPaths {
+            settings_path: Some(settings_path),
+            session_root,
+            cache_path,
+            prompt_history_path: Some(prompt_history_path),
+        },
     })
 }
 
@@ -502,9 +552,12 @@ fn needs_config(args: &DoctorArgs) -> bool {
     if args.only.is_empty() {
         return true;
     }
-    args.only
-        .iter()
-        .any(|selector| !matches!(selector.as_str(), "parser_health" | "sandbox" | "update"))
+    args.only.iter().any(|selector| {
+        !matches!(
+            selector.as_str(),
+            "parser_health" | "sandbox" | "terminal" | "update"
+        )
+    })
 }
 
 fn exit_code_for_checks(checks: &[Check]) -> i32 {
@@ -572,7 +625,12 @@ fn unmatched_selector_checks(
         {
             continue;
         }
-        if config_failed && !matches!(selector, "parser_health" | "sandbox" | "update") {
+        if config_failed
+            && !matches!(
+                selector,
+                "parser_health" | "sandbox" | "terminal" | "update"
+            )
+        {
             skipped_due_to_config.push(selector.to_string());
         } else {
             unknown.push(selector.to_string());
@@ -993,7 +1051,7 @@ fn session_store_check(config: &AppConfig) -> Check {
     }
 }
 
-fn probe_writable(root: &PathBuf) -> std::io::Result<()> {
+fn probe_writable(root: &std::path::Path) -> std::io::Result<()> {
     fs::create_dir_all(root)?;
     let probe = root.join(".squeezy-doctor-probe");
     fs::write(&probe, b"ok")?;
@@ -2240,6 +2298,146 @@ fn parser_health_check() -> Check {
             ),
             extra: None,
         }
+    }
+}
+
+/// Warn when the resolved settings path lives inside the workspace root.
+///
+/// On Windows this is a common first-run pitfall: when neither
+/// `SQUEEZY_SETTINGS_PATH`, `%APPDATA%`, nor `$HOME` resolve, the code falls
+/// back to `.squeezy/settings.toml` relative to the working directory.  That
+/// can put API keys and other secrets inside a working tree that may be shared
+/// or version-controlled.  The check is cross-platform so the same warning
+/// fires on any OS where the fallback path is hit.
+fn settings_location_check(config: &AppConfig) -> Check {
+    let settings = default_settings_path();
+    let workspace = &config.workspace_root;
+    let is_repo_local = settings_path_is_repo_local(&settings, workspace);
+    if is_repo_local {
+        return Check {
+            name: "settings_location".to_string(),
+            status: Status::Warn,
+            detail: format!(
+                "settings resolved to a repo-local path ({}); \
+                 user secrets may be inside a working tree. \
+                 Set SQUEEZY_SETTINGS_PATH or ensure {} is writable.",
+                settings.display(),
+                if cfg!(target_os = "windows") {
+                    "%APPDATA%"
+                } else {
+                    "$HOME"
+                },
+            ),
+            extra: None,
+        };
+    }
+    Check {
+        name: "settings_location".to_string(),
+        status: Status::Ok,
+        detail: settings.display().to_string(),
+        extra: None,
+    }
+}
+
+fn settings_path_is_repo_local(settings: &Path, workspace: &Path) -> bool {
+    let first_meaningful_component = settings
+        .components()
+        .find(|component| !matches!(component, std::path::Component::CurDir));
+    if first_meaningful_component
+        .map(|component| component.as_os_str() == ".squeezy")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let settings_norm = normalize_path_for_boundary_compare(settings);
+    let workspace_norm = normalize_path_for_boundary_compare(workspace);
+
+    settings_norm == workspace_norm
+        || settings_norm
+            .strip_prefix(&workspace_norm)
+            .is_some_and(|rest| workspace_norm == "/" || rest.starts_with('/'))
+}
+
+fn normalize_path_for_boundary_compare(path: &Path) -> String {
+    let mut value = path.to_string_lossy().replace('\\', "/");
+    while value.ends_with('/') && value.len() > 1 {
+        value.pop();
+    }
+    if cfg!(target_os = "windows") {
+        value.to_ascii_lowercase()
+    } else {
+        value
+    }
+}
+
+/// Report terminal capabilities.
+///
+/// On Windows this is particularly useful because the ANSI virtual-terminal
+/// processing mode must be explicitly enabled and legacy console hosts do not
+/// support it.  On all platforms it confirms that stdout/stderr are connected
+/// to a terminal and shows what terminal emulator/multiplexer is in use.
+fn terminal_capability_check() -> Check {
+    use std::io::IsTerminal as _;
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    let stderr_is_tty = std::io::stderr().is_terminal();
+
+    let mut hints: Vec<String> = Vec::new();
+    hints.push(format!(
+        "stdout={} stderr={}",
+        if stdout_is_tty { "tty" } else { "pipe" },
+        if stderr_is_tty { "tty" } else { "pipe" },
+    ));
+
+    // Detect common terminal environments via environment variables.
+    let term_program = env::var("TERM_PROGRAM").ok();
+    let wt_session = env::var("WT_SESSION").is_ok(); // Windows Terminal
+    let term = env::var("TERM").ok();
+    let colorterm = env::var("COLORTERM").ok();
+
+    if wt_session {
+        hints.push("Windows Terminal (ConPTY)".to_string());
+    } else if let Some(ref prog) = term_program {
+        hints.push(format!("TERM_PROGRAM={prog}"));
+    } else if let Some(ref t) = term {
+        hints.push(format!("TERM={t}"));
+    }
+
+    if let Some(ref ct) = colorterm {
+        hints.push(format!("COLORTERM={ct}"));
+    }
+
+    // On Windows, add a note about ANSI virtual-terminal processing availability.
+    #[cfg(target_os = "windows")]
+    {
+        // We check whether the ENABLE_VIRTUAL_TERMINAL_PROCESSING console mode
+        // bit appears likely by looking for known signals.  We cannot call
+        // GetConsoleMode here without winapi, so we infer from environment:
+        // WT_SESSION (Windows Terminal) always supports VTP; ConEmu/Cmder set
+        // ConEmuANSI; legacy cmd.exe with no VTP enablement leaves these unset.
+        let ansi_likely = wt_session
+            || env::var("ConEmuANSI").is_ok()
+            || env::var("ANSICON").is_ok()
+            || term_program.is_some()
+            || colorterm.is_some();
+        hints.push(format!(
+            "ansi_vt={}",
+            if ansi_likely { "likely" } else { "unknown" }
+        ));
+
+        // Detect WSL vs native Windows vs Git Bash / MSYS2.
+        if env::var("WSL_DISTRO_NAME").is_ok() || env::var("WSLENV").is_ok() {
+            hints.push("WSL".to_string());
+        } else if env::var("MSYSTEM").is_ok() {
+            hints.push("Git Bash/MSYS2".to_string());
+        }
+    }
+
+    Check {
+        name: "terminal".to_string(),
+        status: Status::Ok,
+        detail: hints.join("; "),
+        extra: None,
     }
 }
 

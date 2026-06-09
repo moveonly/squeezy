@@ -91,7 +91,7 @@ pub enum UpdateStatus {
 
 impl UpdateStatus {
     /// Detail string for the doctor row. Pairs with `is_warning` so the
-    /// row prints e.g. `[warn] update  v0.2.0 available (cargo install ...)`
+    /// row prints e.g. `[warn] update  v0.2.0 available (winget upgrade ...)`
     /// or `[ok] update  up to date (v0.1.0)`.
     pub fn doctor_detail(&self) -> String {
         match self {
@@ -99,9 +99,8 @@ impl UpdateStatus {
             UpdateStatus::NewerAvailable {
                 current, latest, ..
             } => format!(
-                "v{latest} available (cargo install squeezy --version {latest} \
-                 or curl -sSL https://github.com/esqueezy/squeezy/releases/latest/download/install.sh | sh) \
-                 — running v{current}"
+                "v{latest} available ({}) — running v{current}",
+                upgrade_hint(latest),
             ),
             UpdateStatus::Unavailable { current, reason } => {
                 format!("version check unavailable ({reason}) — running v{current}")
@@ -233,10 +232,31 @@ pub fn banner_for_startup(status: &UpdateStatus) -> Option<String> {
     // banner again next startup, which is the right safety stance.
     let _ = write_cache(&cache);
     Some(format!(
-        "Update available: squeezy v{latest} (running v{current}). \
-         Install: cargo install squeezy --version {latest}  \
-         or  curl -sSL https://github.com/esqueezy/squeezy/releases/latest/download/install.sh | sh"
+        "Update available: squeezy v{latest} (running v{current}). Install: {}",
+        upgrade_hint(latest),
     ))
+}
+
+/// Return a platform-appropriate upgrade command string for the given version.
+///
+/// On Windows, prefer `winget upgrade esqueezy.Squeezy` because that is the
+/// fastest path for users who installed via winget; the manual zip is listed as
+/// the alternative for direct installs. Non-Windows users get the Cargo and
+/// POSIX one-liner that were shown previously.
+fn upgrade_hint(latest: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!(
+            "winget upgrade esqueezy.Squeezy  \
+             or download squeezy-x86_64-pc-windows-msvc.zip from \
+             https://github.com/esqueezy/squeezy/releases/tag/v{latest}"
+        )
+    } else {
+        format!(
+            "cargo install squeezy --version {latest}  \
+             or  curl -sSL \
+             https://github.com/esqueezy/squeezy/releases/latest/download/install.sh | sh"
+        )
+    }
 }
 
 fn status_from_versions(current: &str, latest: &str, from_cache: bool) -> UpdateStatus {

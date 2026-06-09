@@ -370,15 +370,15 @@ impl SessionStore {
         xdg_global_index_path()
     }
 
-    /// Legacy cross-project index path (`$HOME/.squeezy/sessions/index.jsonl`).
+    /// Legacy cross-project index path under the user-global Squeezy directory.
     /// Used as a migration source when the active path has moved to an XDG
     /// location; callers read from this path too so old entries remain visible
-    /// after the first XDG-aware launch.
+    /// after the first XDG-aware launch. On native Windows the user-global
+    /// helper falls back through `%APPDATA%` and `%USERPROFILE%` when `HOME`
+    /// is absent.
     pub fn legacy_global_index_path() -> Option<PathBuf> {
-        let home = env::var_os("HOME")?;
         Some(
-            PathBuf::from(home)
-                .join(".squeezy")
+            fs_util::user_squeezy_dir()?
                 .join("sessions")
                 .join("index.jsonl"),
         )

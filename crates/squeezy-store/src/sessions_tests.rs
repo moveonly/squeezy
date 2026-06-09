@@ -3116,24 +3116,30 @@ fn recall_returns_none_when_max_bytes_zero_or_missing() {
 #[test]
 fn memory_path_is_none_when_home_unset() {
     let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock");
-    let previous = std::env::var_os("HOME");
+    let previous_home = std::env::var_os("HOME");
+    let previous_userprofile = std::env::var_os("USERPROFILE");
     unsafe {
         std::env::remove_var("HOME");
+        std::env::remove_var("USERPROFILE");
     }
     let path = SessionStore::memory_path();
     let recall = SessionStore::recall(8_192);
     let remember = SessionStore::remember("unused");
     unsafe {
-        match previous {
+        match previous_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
+        match previous_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
     }
-    assert!(path.is_none(), "HOME unset means no memory path");
-    assert!(recall.is_none(), "HOME unset means no recall body");
+    assert!(path.is_none(), "no home variables means no memory path");
+    assert!(recall.is_none(), "no home variables means no recall body");
     assert!(
         remember.is_err(),
-        "remember fails loudly when HOME is unset"
+        "remember fails loudly when no home directory is available"
     );
 }
 
@@ -3167,6 +3173,38 @@ fn memory_path_uses_windows_profile_fallback_when_home_unset() {
     }
     assert_eq!(path, Some(appdata.join("Squeezy").join("memory.md")));
     let _ = fs::remove_dir_all(&appdata);
+}
+
+#[cfg(windows)]
+#[test]
+fn memory_path_uses_windows_userprofile_fallback_when_home_and_appdata_unset() {
+    let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock");
+    let home_previous = std::env::var_os("HOME");
+    let appdata_previous = std::env::var_os("APPDATA");
+    let profile_previous = std::env::var_os("USERPROFILE");
+    let profile = temp_root("windows-userprofile-memory");
+    unsafe {
+        std::env::remove_var("HOME");
+        std::env::remove_var("APPDATA");
+        std::env::set_var("USERPROFILE", &profile);
+    }
+    let path = SessionStore::memory_path();
+    unsafe {
+        match home_previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match appdata_previous {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        match profile_previous {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+    assert_eq!(path, Some(profile.join(".squeezy").join("memory.md")));
+    let _ = fs::remove_dir_all(&profile);
 }
 
 fn raw_event(
