@@ -1,4 +1,10 @@
-use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::PathBuf,
+    sync::{Arc, Barrier},
+    time::Duration,
+};
 
 use redb::{Database, TableDefinition};
 use serde_json::json;
@@ -3624,6 +3630,174 @@ fn write_json_is_atomic_no_stale_tmp_and_preserves_original() {
     let value: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&path).expect("read target")).expect("valid json");
     assert_eq!(value.get("k").and_then(|v| v.as_str()), Some("third"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn leftover_tmp_files(root: &std::path::Path) -> Vec<PathBuf> {
+    fs::read_dir(root)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".tmp"))
+        })
+        .collect()
+}
+
+#[test]
+fn write_json_bytes_uses_unique_temps_for_same_process_concurrent_writes() {
+    let root = temp_root("write-json-concurrent");
+    let path = root.join("metadata.json");
+    let writers = 12usize;
+    let barrier = Arc::new(Barrier::new(writers));
+    let handles = (0..writers)
+        .map(|writer| {
+            let barrier = Arc::clone(&barrier);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let payload = format!(r#"{{"writer":{writer}}}"#);
+                write_json_bytes(&path, payload.as_bytes()).expect("concurrent write succeeds");
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        handle.join().expect("writer thread should not panic");
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read target")).expect("valid json");
+    let writer = value
+        .get("writer")
+        .and_then(|value| value.as_u64())
+        .expect("writer field");
+    assert!(writer < writers as u64, "unexpected writer id {writer}");
+
+    let leftover = leftover_tmp_files(&root);
+    assert!(leftover.is_empty(), "stale temp file(s) left: {leftover:?}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rename_retry_retries_windows_lock_errors_and_stops_on_permission_denied() {
+    let root = temp_root("rename-retry-classification");
+    let from = root.join("from");
+    let to = root.join("to");
+
+    assert!(is_windows_sharing_violation(&std::io::Error::from_raw_os_error(32)));
+    assert!(is_windows_sharing_violation(&std::io::Error::from_raw_os_error(33)));
+    assert!(!is_windows_sharing_violation(&std::io::Error::from_raw_os_error(5)));
+
+    let mut attempts = 0usize;
+    retry_windows_rename_with(
+        &from,
+        &to,
+        |_, _| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from_raw_os_error(32))
+            } else {
+                Ok(())
+            }
+        },
+        |_| {},
+    )
+    .expect("eventual success after transient sharing violations");
+    assert_eq!(attempts, 3);
+
+    let mut denied_attempts = 0usize;
+    let denied = retry_windows_rename_with(
+        &from,
+        &to,
+        |_, _| {
+            denied_attempts += 1;
+            Err(std::io::Error::from_raw_os_error(5))
+        },
+        |_| {},
+    );
+    assert!(denied.is_err());
+    assert_eq!(denied_attempts, 1, "permanent permission errors must not retry");
+
+    let mut locked_attempts = 0usize;
+    let locked = retry_windows_rename_with(
+        &from,
+        &to,
+        |_, _| {
+            locked_attempts += 1;
+            Err(std::io::Error::from_raw_os_error(33))
+        },
+        |_| {},
+    );
+    assert!(locked.is_err());
+    assert_eq!(
+        locked_attempts,
+        WINDOWS_RENAME_RETRY_ATTEMPTS as usize + 1,
+        "retry attempts plus final rename"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn global_index_entry(session_id: String, started_at_ms: u64) -> GlobalSessionIndexEntry {
+    GlobalSessionIndexEntry {
+        session_id,
+        cwd: "/Users/dev/projects/example-workspace".to_string(),
+        workspace_root: "/Users/dev/projects/example-workspace".to_string(),
+        repo_root: None,
+        title: Some("concurrent rewrite".to_string()),
+        display_name: None,
+        started_at_ms,
+        last_event_at_ms: started_at_ms,
+        turn_count: 1,
+        resume_available: true,
+    }
+}
+
+#[test]
+fn rewrite_global_index_uses_unique_temps_for_same_process_concurrent_rewrites() {
+    let root = temp_root("global-index-concurrent-rewrite");
+    let path = root.join("index.jsonl");
+    let writers = 8usize;
+    let barrier = Arc::new(Barrier::new(writers));
+    let handles = (0..writers)
+        .map(|writer| {
+            let barrier = Arc::clone(&barrier);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let entries = vec![
+                    global_index_entry(format!("session-{writer}-a"), writer as u64 * 10),
+                    global_index_entry(format!("session-{writer}-b"), writer as u64 * 10 + 1),
+                ];
+                let refs = entries.iter().collect::<Vec<_>>();
+                barrier.wait();
+                rewrite_global_index(&path, &refs).expect("concurrent index rewrite succeeds");
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        handle.join().expect("writer thread should not panic");
+    }
+
+    let lines = fs::read_to_string(&path).expect("read rewritten index");
+    let parsed = lines
+        .lines()
+        .map(|line| serde_json::from_str::<GlobalSessionIndexEntry>(line).expect("valid entry"))
+        .collect::<Vec<_>>();
+    assert!(!parsed.is_empty(), "rewritten index should contain entries");
+    assert!(
+        parsed
+            .iter()
+            .all(|entry| entry.session_id.starts_with("session-")),
+        "rewritten index contains unexpected entries: {parsed:?}"
+    );
+
+    let leftover = leftover_tmp_files(&root);
+    assert!(leftover.is_empty(), "stale temp file(s) left: {leftover:?}");
 
     let _ = fs::remove_dir_all(&root);
 }

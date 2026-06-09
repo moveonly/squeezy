@@ -2850,10 +2850,8 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 /// Called by [`write_json`] (which serializes first) and by callers that
 /// have already serialized the value and want to avoid double-work.
 fn write_json_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    // Unique temp name: pid + monotonic counter so concurrent writers in
-    // the same process (multiple session handles writing metadata or
-    // calibration) never share a temp path. This is especially important
-    // on Windows where rename fails if another handle holds the temp file.
+    // Use pid + monotonic counter so concurrent in-process writers never
+    // share a temp path; Windows rejects renames while another handle owns it.
     let seq = WRITE_UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = match path.file_name().and_then(|name| name.to_str()) {
         Some(name) => path.with_file_name(format!(".{}.{}.{}.tmp", name, std::process::id(), seq)),
@@ -2875,6 +2873,30 @@ fn write_json_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+const WINDOWS_RENAME_RETRY_ATTEMPTS: u32 = 4;
+
+#[cfg(any(windows, test))]
+fn retry_windows_rename_with(
+    from: &Path,
+    to: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> std::io::Result<()> {
+    let mut delay_ms = 10u64;
+    for _ in 0..WINDOWS_RENAME_RETRY_ATTEMPTS {
+        match rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(ref e) if is_windows_sharing_violation(e) => {
+                sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(100);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    rename(from, to)
+}
+
 /// `fs::rename` wrapper that retries on Windows sharing-violation errors
 /// (OS error 32 / `ERROR_SHARING_VIOLATION`). Antivirus scanners, indexers,
 /// and shell preview panes briefly lock files without delete-sharing, causing
@@ -2883,20 +2905,7 @@ fn write_json_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        // 4 retry attempts with backoff, then one final attempt — 5 total.
-        const RETRY_ATTEMPTS: u32 = 4;
-        let mut delay_ms = 10u64;
-        for _ in 0..RETRY_ATTEMPTS {
-            match fs::rename(from, to) {
-                Ok(()) => return Ok(()),
-                Err(ref e) if is_windows_sharing_violation(e) => {
-                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                    delay_ms = (delay_ms * 2).min(100);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        fs::rename(from, to)
+        retry_windows_rename_with(from, to, fs::rename, std::thread::sleep)
     }
     #[cfg(not(windows))]
     {
@@ -3000,11 +3009,8 @@ fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> st
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // Unique temp name: pid + monotonic counter. A fixed `.jsonl.tmp`
-    // name caused races on Windows when multiple sessions finished
-    // concurrently — one writer could rename the other's partially
-    // prepared temp, losing session cost summaries from cross-project
-    // resume views.
+    // Use pid + monotonic counter so concurrent index rewrites never share
+    // a temp path; a fixed name could let one writer rename another's bytes.
     let seq = WRITE_UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = match path.file_name().and_then(|name| name.to_str()) {
         Some(name) => path.with_file_name(format!(".{}.{}.{}.tmp", name, std::process::id(), seq)),

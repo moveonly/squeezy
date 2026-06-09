@@ -909,6 +909,66 @@ async fn routing_session_disabled_persists_after_busy_state_lock() {
 }
 
 #[tokio::test]
+async fn accounting_persistence_errors_emit_session_event() {
+    let root = temp_workspace("accounting_persistence_error_event");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config.clone(), Arc::new(MockProvider::new(Vec::new())));
+    let session_id = agent.session_id().expect("session id");
+
+    agent.show_session(&session_id).expect("materialize session");
+    let store = squeezy_store::SessionStore::open(&config);
+    let resume_path = store.root().join(&session_id).join("resume_state.json");
+    fs::remove_file(&resume_path).expect("remove resume state");
+    fs::create_dir(&resume_path).expect("make resume state path unwritable");
+
+    agent
+        .persist_turn_accounting(
+            &CostSnapshot::default(),
+            &TurnMetrics::default(),
+            &squeezy_llm::TokenCalibration::default(),
+            true,
+        )
+        .await;
+
+    let record = agent.show_session(&session_id).expect("session record");
+    let (event, payload) = record
+        .events
+        .iter()
+        .find_map(|event| match squeezy_store::SessionEventKind::try_from_event(event) {
+            Some(squeezy_store::SessionEventKind::Custom { kind, payload }) => {
+                (kind == "accounting_persistence_error").then_some((event, payload))
+            }
+            _ => None,
+        })
+        .expect("accounting persistence diagnostic event");
+
+    assert_eq!(event.summary.as_deref(), Some("accounting persistence failed"));
+    assert!(event.turn_id.is_some(), "event should be tied to the turn");
+    assert!(
+        payload
+            .get("resume_state_error")
+            .and_then(|value| value.as_str())
+            .is_some(),
+        "resume-state failure should be recorded: {payload:?}"
+    );
+    assert!(
+        payload.get("metadata_error").is_some(),
+        "metadata error key should be present even when only resume failed"
+    );
+
+    let _ = fs::remove_dir(&resume_path);
+    drop(agent);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn stalled_model_stream_fails_after_idle_timeout() {
     let provider = Arc::new(HangingProvider::new());
     let config = AppConfig {
