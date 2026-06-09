@@ -359,6 +359,7 @@ pub(crate) fn run_mixed_scenario(graph: &SemanticGraph, scenario: &MixedScenario
     }
 }
 
+#[allow(deprecated, reason = "benchmark scaffolding; external callers should use try_new")]
 pub(crate) fn run_refresh_probe(
     repo: &Path,
     language: BenchmarkLanguage,

@@ -136,6 +136,7 @@ fn micro_compact_then_full_compact_works() {
         &mut state,
         &[],
         None,
+        None,
         &config,
         squeezy_core::ContextCompactionTrigger::Auto,
         true,

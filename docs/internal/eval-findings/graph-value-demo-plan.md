@@ -87,7 +87,7 @@ Step-4 squeezy improvement.
 
 ## 4. Environment & harness (how measurement works)
 
-- **Historical repo path:** `/Users/abbassabra/esqueezy/new`. Work on a branch off `main`
+- **Historical repo path:** `/Users/example/esqueezy/new`. Work on a branch off `main`
   (current scratch branch `perf/graph-favorable-tasks` — rebase onto `main` or
   start fresh; it currently has nothing but this plan).
 - **Release binary** (rebuild after any squeezy code change):
@@ -117,7 +117,7 @@ Step-4 squeezy improvement.
   `board_combined.py` (verdicts → CSV), `analyze.py <rundir>` (per-run cost breakdown: raw-in/cache-read/cache-write/output, tool counts, findings).
 - **Graders:** `/tmp/codex-runs/realworld/grade.py` (`GRADERS[lang]`, `grade_<lang>`) + `ground_truth.json`. Verdict = **WIN iff `sqz_recall ≥ rival_recall` AND `sqz_cost ≤ 0.95 × rival_cost`** (n=3 median). Pricing audited identical per tier.
 - **Cloned repos** for rivals at `/tmp/hth/repos/<lang>` (c,cpp,csharp,dart,go,java,js,kotlin,php,python,ruby,scala,swift,ts). Repo+sha map: nginx/nginx, gabime/spdlog, JamesNK/Newtonsoft.Json, flutter/flutter, spf13/cobra, google/gson, lodash/lodash, detekt/detekt, laravel/framework, psf/requests, sidekiq/sidekiq, akka/akka, vapor/vapor, nestjs/nest (rust = the squeezy repo itself, `local="."`).
-- **Keys:** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` in env (`source /Users/abbassabra/.env.sh` for the OpenAI key). Anthropic throttles under load — pace haiku runs (lc≤2). The eval is **high-variance** (per-cell cost spreads 1.5–2× across rep-sets) → always use **n=3 medians**; escalate close calls.
+- **Keys:** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` in env (`source $HOME/.env.sh` for the OpenAI key). Anthropic throttles under load — pace haiku runs (lc≤2). The eval is **high-variance** (per-cell cost spreads 1.5–2× across rep-sets) → always use **n=3 medians**; escalate close calls.
 
 ---
 

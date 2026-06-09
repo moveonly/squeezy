@@ -53,6 +53,84 @@ fn request_with(
 }
 
 #[test]
+fn shell_preview_warns_when_filesystem_best_effort_unavailable() {
+    // Job-Object-only Windows tier: no filesystem or network isolation. The
+    // approval prompt must surface that posture or users approve commands
+    // assuming a sandbox that isn't there.
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[
+            ("command", "cargo test"),
+            ("filesystem", "best_effort_unavailable"),
+        ],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("Windows: no filesystem/network isolation"),
+        "best-effort-unavailable warn line missing: {out}"
+    );
+}
+
+#[test]
+fn shell_preview_warns_when_filesystem_enforced_writes_only() {
+    // Restricted-token tier: writes are blocked by ACLs, but reads and
+    // network are not isolated. Users need that caveat before approving
+    // commands that may exfiltrate or hit the network.
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[
+            ("command", "cargo test"),
+            ("filesystem", "enforced_writes_only"),
+        ],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains(
+            "Windows: filesystem write isolation enforced; reads and network are not isolated"
+        ),
+        "enforced-writes-only warn line missing: {out}"
+    );
+}
+
+#[test]
+fn shell_preview_does_not_warn_when_filesystem_enforced() {
+    // Fully enforced sandbox (macOS / Linux Landlock / Windows elevated):
+    // no Windows-specific posture caveat in the prompt.
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[("command", "cargo test"), ("filesystem", "enforced")],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        !out.contains("Windows:"),
+        "enforced filesystem must not render a Windows posture warning: {out}"
+    );
+}
+
+#[test]
+fn shell_preview_omits_warn_line_without_filesystem_metadata() {
+    // Backwards-compat: pre-existing emitters that don't set the
+    // filesystem key keep the legacy preview shape.
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[("command", "cargo test")],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        !out.contains("Windows:"),
+        "missing filesystem metadata must not render a Windows posture warning: {out}"
+    );
+}
+
+#[test]
 fn shell_preview_shows_command_and_cwd() {
     let req = request_with(
         "shell",
@@ -539,5 +617,81 @@ fn edit_preview_without_diff_keeps_legacy_layout() {
     assert!(
         !out.contains("-"),
         "stray remove gutter in legacy layout: {out}"
+    );
+}
+
+#[test]
+fn shell_preview_shows_sandbox_posture_when_backend_known() {
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo build",
+        &[
+            ("command", "cargo build"),
+            ("sandbox", "required"),
+            ("sandbox_network", "deny_by_default"),
+            ("sandbox_backend", "linux-direct-syscalls"),
+            ("sandbox_filesystem", "enforced"),
+        ],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("linux-direct-syscalls"),
+        "sandbox backend should appear in preview: {out}"
+    );
+    assert!(
+        out.contains("required"),
+        "sandbox mode should appear in preview: {out}"
+    );
+    assert!(
+        out.contains("enforced"),
+        "sandbox filesystem posture should appear in preview: {out}"
+    );
+    assert!(
+        out.contains("deny_by_default"),
+        "sandbox network policy should appear in preview: {out}"
+    );
+}
+
+#[test]
+fn shell_preview_shows_ask_socket_unavailable_hint_for_linux() {
+    let hint = "squeezy ask is unavailable inside this shell child because the seccomp profile blocks AF_UNIX socket(2)";
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "make test",
+        &[
+            ("command", "make test"),
+            ("sandbox_backend", "linux-direct-syscalls"),
+            ("ask_socket_unavailable", hint),
+        ],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("AF_UNIX"),
+        "ask socket hint should appear in preview: {out}"
+    );
+    assert!(
+        out.contains("seccomp"),
+        "ask socket hint should mention seccomp: {out}"
+    );
+}
+
+#[test]
+fn shell_preview_omits_sandbox_row_when_backend_is_none() {
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "ls",
+        &[
+            ("command", "ls"),
+            ("sandbox", "off"),
+            ("sandbox_backend", "none"),
+        ],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        !out.contains("sandbox none"),
+        "backend=none must not emit a sandbox posture row: {out}"
     );
 }

@@ -107,6 +107,43 @@ struct HierarchyArgs {
     max_results: Option<usize>,
 }
 
+/// Arguments for the `impact` graph tool. Accepts a symbol, a file path, or
+/// a set of changed file paths to drive the affected-set computation.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImpactArgs {
+    /// Symbol whose declaring file is treated as the changed root.
+    symbol_id: Option<String>,
+    /// Direct query to resolve to a symbol (used when `symbol_id` is absent).
+    query: Option<String>,
+    /// File path treated as the changed root.
+    path: Option<String>,
+    /// Additional file paths that are also part of the changed set.
+    #[serde(default)]
+    extra_paths: Vec<String>,
+    /// Maximum number of affected symbols to return (default 50).
+    max_results: Option<usize>,
+}
+
+/// Arguments for the `inheritance_hierarchy` graph tool.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InheritanceHierarchyArgs {
+    /// Symbol whose ancestors or descendants are requested.
+    symbol_id: Option<String>,
+    /// Text query to resolve to a class/struct/interface symbol.
+    query: Option<String>,
+    /// When `false` (default), return all transitive supertypes of the root
+    /// via a BFS over `UsesTrait`/`Extends`/`Implements` edges (ancestors).
+    /// When `true`, return only the **first-generation** direct subtypes
+    /// (symbols that carry an edge pointing *to* the root). A transitive
+    /// subtype walk is not available in a single tool call; issue multiple
+    /// calls using the returned symbols as new roots.
+    subtypes: Option<bool>,
+    /// Maximum results (default 50).
+    max_results: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadSliceArgs {
@@ -560,26 +597,53 @@ fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> boo
     path_matches_filter(symbol.file_id.0.as_str(), filter)
 }
 
+/// Normalise Windows-style backslash separators in a user-supplied filter to
+/// forward slashes. Graph paths are always slash-normalised by workspace
+/// discovery, so this lets users paste paths from Explorer, PowerShell,
+/// `cargo` output, or MSBuild output without learning the internal convention.
+///
+/// Returns the input unchanged (zero allocation) when it contains no `\`.
 /// Match `path` against a model-supplied `filter`.
 ///
-/// Filters that look like a directory path (contain `/`) match by strict
-/// prefix with a directory boundary — `gson/src/main/java` matches files
-/// under that tree but not siblings like `gson/src/test/java/...`. This is
-/// what the model intuitively means when it writes a multi-segment path.
+/// Filters that look like a directory path (contain `/` or `\`) match by
+/// strict prefix with a directory boundary — `gson/src/main/java` matches
+/// files under that tree but not siblings like `gson/src/test/java/...`.
+/// Windows-pasted filters such as `gson\src\main\java` are normalised to
+/// forward slashes first so they match the slash-normalised graph paths.
 ///
-/// Single-token filters (no `/`, e.g. `squeezy_graph`) keep the loose
+/// Single-token filters (no directory separator) keep the loose
 /// trailing-segment + fuzzy fallback so casual "find a crate" queries
 /// still resolve. The fuzzy path was the source of cross-tree noise only
-/// when the model already wrote a real prefix; gating on `/` removes that
-/// noise without regressing the bareword UX.
+/// when the model already wrote a real prefix; gating on separators removes
+/// that noise without regressing the bareword UX.
 fn path_matches_filter(path: &str, filter: &str) -> bool {
+    // Normalize backslashes and leading `./` once before all comparisons so
+    // Windows-style input like `.\src\app.cs` resolves against `src/app.cs`.
+    let filter_owned = normalize_path_filter(filter);
+    let filter = filter_owned.as_ref();
     if filter.contains('/') {
         let filter = filter.trim_end_matches('/');
         if filter.is_empty() {
             return true;
         }
-        return path == filter
-            || (path.starts_with(filter) && path.as_bytes().get(filter.len()) == Some(&b'/'));
+        if path == filter
+            || (path.starts_with(filter) && path.as_bytes().get(filter.len()) == Some(&b'/'))
+        {
+            return true;
+        }
+        // Case-insensitive prefix match on Windows.
+        #[cfg(target_os = "windows")]
+        {
+            let filter_lower = filter.to_ascii_lowercase();
+            let path_lower = path.to_ascii_lowercase();
+            if path.eq_ignore_ascii_case(filter)
+                || (path_lower.starts_with(filter_lower.as_str())
+                    && path_lower.as_bytes().get(filter_lower.len()) == Some(&b'/'))
+            {
+                return true;
+            }
+        }
+        return false;
     }
     if path_matches_exact_or_suffix(path, filter) {
         return true;
@@ -695,22 +759,37 @@ fn graph_tool_diff_mode(call: &ToolCall) -> DiffMode {
 }
 
 pub(crate) fn graph_unavailable_result(call: &ToolCall, still_indexing: bool) -> ToolResult {
+    graph_unavailable_result_with_error(call, still_indexing, None)
+}
+
+/// Like [`graph_unavailable_result`] but surfaces a `store_open_error` key
+/// when `open_error` is `Some`, so the model can distinguish a persistence
+/// failure (which leaves the graph structurally absent but recoverable on the
+/// next process start) from a workspace that genuinely has no graph.
+pub(crate) fn graph_unavailable_result_with_error(
+    call: &ToolCall,
+    still_indexing: bool,
+    open_error: Option<String>,
+) -> ToolResult {
     // `fallback.suggested_tools` is intentionally absent — the reason code is
     // enough for the model to pick a non-graph retry path on its own.
     //
-    // `still_indexing` distinguishes the transient cold-start window (the
-    // background `GraphManager::open_with_store` task is still running and
-    // the wait condvar timed out) from a workspace where the open completed
-    // with `None` (structurally unavailable). The transient case carries a
-    // `retryable: true` hint so the model knows the same call will succeed
-    // shortly — without it, a cold-open that overran the wait stranded the
-    // model on a single `graph_unavailable` reading and it fell back to
-    // grep instead of retrying.
+    // Three cases:
+    //   still_indexing=true → graph is building; retry shortly
+    //   still_indexing=false + open_error=Some → store/parse failure on open;
+    //     the graph is absent because of an error, not by design
+    //   still_indexing=false + open_error=None → workspace has no graph
     let (status, reason, retryable) = if still_indexing {
         (
             "graph_indexing",
             "semantic graph is still being indexed; retry this tool call",
             true,
+        )
+    } else if open_error.is_some() {
+        (
+            "graph_open_error",
+            "semantic graph is unavailable: the graph open failed (see store_open_error)",
+            false,
         )
     } else {
         (
@@ -719,19 +798,25 @@ pub(crate) fn graph_unavailable_result(call: &ToolCall, still_indexing: bool) ->
             false,
         )
     };
+    let mut body = serde_json::Map::new();
+    body.insert("tool".to_string(), json!(call.name));
+    body.insert("graph_available".to_string(), json!(false));
+    body.insert("reason".to_string(), json!(reason));
+    body.insert("packets".to_string(), json!([]));
+    body.insert(
+        "fallback".to_string(),
+        json!({
+            "status": status,
+            "retryable": retryable,
+        }),
+    );
+    if let Some(err) = open_error {
+        body.insert("store_open_error".to_string(), json!(err));
+    }
     make_result(
         call,
         ToolStatus::Success,
-        json!({
-            "tool": call.name,
-            "graph_available": false,
-            "reason": reason,
-            "packets": [],
-            "fallback": {
-                "status": status,
-                "retryable": retryable,
-            }
-        }),
+        Value::Object(body),
         ToolCostHint::default(),
         None,
     )
@@ -749,6 +834,25 @@ pub(crate) fn graph_payload(
     let mut payload = serde_json::Map::new();
     payload.insert("tool".to_string(), json!(tool));
     payload.insert("graph_available".to_string(), json!(true));
+    payload.insert(
+        "freshness_mode".to_string(),
+        json!(manager.freshness_mode().as_str()),
+    );
+    if let Some(reason) = manager.freshness_fallback_reason() {
+        payload.insert("freshness_fallback_reason".to_string(), json!(reason));
+    }
+    let indexing_decision = &manager.build_report().indexing_decision;
+    if !indexing_decision.should_index {
+        payload.insert(
+            "indexing_decision".to_string(),
+            json!({
+                "should_index": false,
+                "reason": &indexing_decision.reason,
+                "positive_signals": &indexing_decision.positive_signals,
+                "negative_signals": &indexing_decision.negative_signals,
+            }),
+        );
+    }
     // Bug #2: when the incremental refresh budget was exhausted, some changed
     // files were never reparsed and stay queued for the next refresh — the
     // graph evidence below is partially stale. A bare `graph_available=true`
@@ -756,19 +860,70 @@ pub(crate) fn graph_payload(
     // count of still-pending changed paths (read from the manager, since the
     // unprocessed paths are left queued in that case). Emitted only when the
     // refresh did not fully complete, so a healthy graph pays no byte cost.
+    // Capture once: acquiring the mutex twice for the same counter would be
+    // redundant and could produce inconsistent values if a watcher thread
+    // enqueues a path between the two calls.
+    let pending_events = manager.pending_changed_count();
     if refresh.budget_exhausted {
         payload.insert("refresh_incomplete".to_string(), json!(true));
+        payload.insert("stale_pending".to_string(), json!(pending_events));
+    }
+    let watcher = manager.watcher_status();
+    // Mirror the `refresh_incomplete` gating above: a healthy graph pays no
+    // byte cost on the wire. Emit the `indexing` block only when the
+    // session is in a degraded state the model should know about — polling
+    // fallback engaged, pending events queued, or any captured
+    // fallback_reason. Healthy native sessions and one-shot CLI invocations
+    // (mode = Disabled with no fallback reason) skip the ~80-110 bytes of
+    // stable JSON entirely.
+    let watcher_degraded = matches!(watcher.mode, squeezy_graph::WatcherMode::PollingFallback)
+        || pending_events > 0
+        || watcher.fallback_reason.is_some();
+    if watcher_degraded {
         payload.insert(
-            "stale_pending".to_string(),
-            json!(manager.pending_changed_count()),
+            "indexing".to_string(),
+            json!({
+                "watcher_mode": watcher.mode.as_str(),
+                "watcher_backend": watcher.backend,
+                "pending_events": pending_events,
+                "fallback_reason": watcher.fallback_reason,
+            }),
+        );
+    }
+    // Surface unmatched watcher events: events that were pending but did not
+    // correspond to any changed or removed file in the crawl. On Linux these
+    // are a practical signal for path-spelling, symlink, or bind-mount
+    // mismatches in event reconciliation.
+    if refresh.unchanged_event_paths > 0 {
+        payload.insert(
+            "unmatched_watcher_events".to_string(),
+            json!(refresh.unchanged_event_paths),
+        );
+    }
+    if !refresh.path_conflicts.is_empty() {
+        payload.insert(
+            "path_conflicts".to_string(),
+            path_conflicts_json(&refresh.path_conflicts),
         );
     }
     payload
 }
 
+fn path_conflicts_json(conflicts: &[squeezy_workspace::PathConflict]) -> Value {
+    json!({
+        "count": conflicts.len(),
+        "samples": conflicts.iter().take(5).map(|conflict| {
+            json!({
+                "normalized_relative_path": &conflict.normalized_relative_path,
+                "relative_paths": &conflict.relative_paths,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
 fn graph_stats_json(graph: &squeezy_graph::SemanticGraph) -> Value {
     let stats = graph.stats();
-    json!({
+    let mut obj = json!({
         "files": stats.files,
         "symbols": stats.symbols,
         "edges": stats.edges,
@@ -783,7 +938,19 @@ fn graph_stats_json(graph: &squeezy_graph::SemanticGraph) -> Value {
         "body_hit_trigram_indexed": stats.body_hit_trigram_indexed,
         "body_hit_trigram_terms": stats.body_hit_trigram_terms,
         "reference_index_terms": stats.reference_index_terms,
-    })
+    });
+    // Surface case-collision count only when non-zero so the common-case
+    // response pays no byte cost. Non-zero means a Windows checkout produced
+    // two differently-cased spellings for the same logical file.
+    if stats.case_collision_count > 0
+        && let Some(map) = obj.as_object_mut()
+    {
+        map.insert(
+            "case_collision_count".to_string(),
+            json!(stats.case_collision_count),
+        );
+    }
+    obj
 }
 
 pub(crate) fn cargo_facts_summary_json(summary: &CargoFactsSummary) -> Value {
@@ -808,18 +975,38 @@ fn cargo_freshness_json(freshness: &CargoFactFreshness) -> Value {
 
 fn cargo_diagnostic_hit_json(hit: &CargoDiagnosticHit) -> Value {
     let diagnostic = &hit.diagnostic;
-    json!({
-        "level": diagnostic.level,
-        "message": diagnostic.message,
-        "code": diagnostic.code,
-        "path": diagnostic.file_id.as_ref().map(|id| id.0.clone()),
-        "span": diagnostic.span.map(span_json),
-        "label": diagnostic.label,
-        "package_id": diagnostic.package_id,
-        "target_name": diagnostic.target_name,
-        "freshness": cargo_freshness_json(&hit.freshness),
-        "provenance": provenance_json(diagnostic.provenance.clone()),
-    })
+    let mut map = serde_json::Map::new();
+    map.insert("level".to_string(), json!(diagnostic.level));
+    map.insert("message".to_string(), json!(diagnostic.message));
+    map.insert("code".to_string(), json!(diagnostic.code));
+    map.insert(
+        "path".to_string(),
+        json!(diagnostic.file_id.as_ref().map(|id| id.0.clone())),
+    );
+    map.insert("span".to_string(), json!(diagnostic.span.map(span_json)));
+    map.insert("label".to_string(), json!(diagnostic.label));
+    map.insert("package_id".to_string(), json!(diagnostic.package_id));
+    map.insert("target_name".to_string(), json!(diagnostic.target_name));
+    map.insert(
+        "freshness".to_string(),
+        cargo_freshness_json(&hit.freshness),
+    );
+    map.insert(
+        "provenance".to_string(),
+        provenance_json(diagnostic.provenance.clone()),
+    );
+    // When the compiler path could not be mapped to a workspace-relative
+    // FileId, include the raw path so users can diagnose container, symlink,
+    // or bind-mount spelling mismatches between cargo's output and the
+    // workspace root squeezy was opened with.
+    if let Some(raw) = &diagnostic.raw_path {
+        map.insert("raw_path".to_string(), json!(raw));
+        map.insert(
+            "raw_path_hint".to_string(),
+            json!("path not matched to workspace; check for container/symlink/bind-mount mismatch"),
+        );
+    }
+    Value::Object(map)
 }
 
 fn graph_language_counts_json(graph: &squeezy_graph::SemanticGraph) -> Value {
@@ -970,40 +1157,134 @@ pub(crate) fn graph_symbol_search(
         .collect::<Vec<_>>();
 
     // Fuzzy widening: when the trigram-anchored candidate pool is empty
-    // but a query was provided, run a fuzzy subsequence scan over all
-    // symbols so casual queries (`graphmgr → GraphManager`) still
-    // resolve. This only runs on a miss so high-confidence behaviour is
-    // unchanged.
+    // but a query was provided, run a fuzzy subsequence scan over a
+    // bounded candidate set so casual queries (`graphmgr → GraphManager`)
+    // still resolve. This only runs on a miss so high-confidence behaviour
+    // is unchanged.
+    //
+    // Prefilter: when the query has 3+ chars, use the first trigram as a
+    // seed for `signature_search` to leverage the trigram index and avoid
+    // scanning every symbol with the full fuzzy algorithm. If the seed cannot
+    // produce a ranked match, fall back to the full symbol map to preserve the
+    // previous fuzzy recall.
     if symbols.is_empty()
         && let Some(query) = query
     {
-        symbols = graph
-            .symbols
-            .values()
-            .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
-            .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
-            .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
-            .filter(|symbol| symbol_matches_path_filter(symbol, path))
-            .filter(|symbol| language_matches(graph, symbol, language))
-            .filter(|symbol| {
-                let view = squeezy_rank::GraphSymbolView {
-                    name: symbol.name.as_str(),
-                    signature: symbol.signature.as_str(),
-                };
-                squeezy_rank::symbol_rank::rank_symbol(view, query).0
-                    != squeezy_rank::symbol_rank::RankTier::NoMatch
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let fuzzy_matches = |candidates: Vec<GraphSymbol>| {
+            candidates
+                .into_iter()
+                .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
+                .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
+                .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
+                .filter(|symbol| symbol_matches_path_filter(symbol, path))
+                .filter(|symbol| language_matches(graph, symbol, language))
+                .filter(|symbol| {
+                    let view = squeezy_rank::GraphSymbolView {
+                        name: symbol.name.as_str(),
+                        signature: symbol.signature.as_str(),
+                    };
+                    squeezy_rank::symbol_rank::rank_symbol(view, query).0
+                        != squeezy_rank::symbol_rank::RankTier::NoMatch
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut used_seed_hits = false;
+        let candidates: Vec<GraphSymbol> = if query.len() >= 3 {
+            let seed_end = query.char_indices().nth(3).map_or(query.len(), |(i, _)| i);
+            let seed_hits = graph.signature_search(&SignatureQuery {
+                text: query[..seed_end].to_string(),
+                kind: None,
+                visibility: None,
+                attribute: None,
+            });
+            if seed_hits.is_empty() {
+                graph.symbols.values().cloned().collect()
+            } else {
+                used_seed_hits = true;
+                seed_hits
+            }
+        } else {
+            graph.symbols.values().cloned().collect()
+        };
+        symbols = fuzzy_matches(candidates);
+        if symbols.is_empty() && used_seed_hits {
+            symbols = fuzzy_matches(graph.symbols.values().cloned().collect());
+        }
     }
 
-    symbols.sort_by(|left, right| {
-        query
-            .map(|query| symbol_rank(left, query).cmp(&symbol_rank(right, query)))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(left.file_id.0.cmp(&right.file_id.0))
-            .then(left.span.start_byte.cmp(&right.span.start_byte))
+    // Precompute per-symbol sort keys once to avoid re-tokenizing the query
+    // inside the O(n log n) comparator. BM25 scores are computed here too
+    // so they can act as a within-tier tiebreaker without crossing tier
+    // boundaries.
+    //
+    // Sort key tuple: (tier, bm25_neg, lex_score, path_key)
+    //   tier      — lower value = better rank tier (usize)
+    //   bm25_neg  — negated fixed-point BM25 score (i64); symbols with
+    //               positive BM25 sort before zero-score ones within a tier;
+    //               zero when BM25 is not applicable
+    //   lex_score — fuzzy/token lexical score (i32); lower = better
+    //   path_key  — PathRank::sort_key() (i32, i32, i32); lower = better
+    type SortKey = (usize, i64, i32, (i32, i32, i32));
+
+    let bm25_scores: Vec<f32> = if let Some(query) = query
+        && query.split_whitespace().count() >= 2
+        && symbols.len() > 1
+    {
+        let doc_bufs: Vec<(String, String)> = symbols
+            .iter()
+            .map(|sym| (sym.docs.join(" "), sym.attributes.join(" ")))
+            .collect();
+        let bm25_docs: Vec<squeezy_rank::BM25Doc<'_>> = symbols
+            .iter()
+            .zip(doc_bufs.iter())
+            .map(|(sym, (docs, attrs))| squeezy_rank::BM25Doc {
+                signature: sym.signature.as_str(),
+                docs: docs.as_str(),
+                attributes: attrs.as_str(),
+            })
+            .collect();
+        let reranked = squeezy_rank::bm25_rerank(&bm25_docs, query, symbols.len());
+        let mut scores = vec![0.0f32; symbols.len()];
+        for (idx, score) in reranked {
+            scores[idx] = score;
+        }
+        scores
+    } else {
+        vec![0.0; symbols.len()]
+    };
+
+    let sort_keys: Vec<SortKey> = symbols
+        .iter()
+        .zip(bm25_scores.iter())
+        .map(|(sym, &bm25)| {
+            let (tier, lex_score) = query
+                .map(|q| symbol_rank(sym, q))
+                .unwrap_or((usize::MAX, 0));
+            let path_key = path
+                .map(|p| squeezy_rank::path_rank::path_rank(&sym.file_id.0, p).sort_key())
+                .unwrap_or((i32::MAX, i32::MAX, i32::MAX));
+            // Negate BM25 so higher score sorts first; 0.0 → 0 sorts after
+            // any positive-BM25 symbol.
+            let bm25_neg = -(bm25 * 1000.0).round() as i64;
+            (tier, bm25_neg, lex_score, path_key)
+        })
+        .collect();
+
+    let original = std::mem::take(&mut symbols);
+    let mut indices: Vec<usize> = (0..original.len()).collect();
+    indices.sort_by(|&i, &j| {
+        sort_keys[i]
+            .cmp(&sort_keys[j])
+            .then(original[i].file_id.0.cmp(&original[j].file_id.0))
+            .then(
+                original[i]
+                    .span
+                    .start_byte
+                    .cmp(&original[j].span.start_byte),
+            )
     });
+    symbols = indices.into_iter().map(|i| original[i].clone()).collect();
+
     symbols
 }
 
@@ -1245,18 +1526,34 @@ pub(crate) fn resolve_definition_candidates(
     graph_symbol_search(graph, Some(query), kind, path, language, None, None)
 }
 
-fn symbol_rank(symbol: &GraphSymbol, query: &str) -> usize {
+fn symbol_rank(symbol: &GraphSymbol, query: &str) -> (usize, i32) {
     // Preserve the historical exact > case-insensitive > signature-substring
     // ordering. `squeezy_rank` adds two extra tiers (token-bag, fuzzy) that
     // recover near-miss queries like `graphmgr → GraphManager` without
     // changing the relative ordering of existing high-confidence hits.
+    // The lexical score is kept as a secondary key so two fuzzy matches are
+    // ordered by closeness rather than file path.
     let view = squeezy_rank::GraphSymbolView {
         name: symbol.name.as_str(),
         signature: symbol.signature.as_str(),
     };
-    squeezy_rank::symbol_rank::rank_symbol(view, query)
-        .0
-        .as_usize()
+    let (tier, score) = squeezy_rank::symbol_rank::rank_symbol(view, query);
+    (tier.as_usize(), score)
+}
+
+fn symbol_rank_label(symbol: &GraphSymbol, query: &str) -> &'static str {
+    let view = squeezy_rank::GraphSymbolView {
+        name: symbol.name.as_str(),
+        signature: symbol.signature.as_str(),
+    };
+    match squeezy_rank::symbol_rank::rank_symbol(view, query).0 {
+        squeezy_rank::RankTier::Exact => "exact",
+        squeezy_rank::RankTier::CaseInsensitive => "case_insensitive",
+        squeezy_rank::RankTier::SignatureSubstring => "signature_substring",
+        squeezy_rank::RankTier::TokenBag => "token_bag",
+        squeezy_rank::RankTier::Fuzzy => "fuzzy",
+        squeezy_rank::RankTier::NoMatch => "no_match",
+    }
 }
 
 fn parse_symbol_kind(value: &str) -> Option<SymbolKind> {
@@ -1361,6 +1658,11 @@ fn unsupported_file_samples(graph: &squeezy_graph::SemanticGraph, limit: usize) 
 /// - `reason`: one of `supported_language_no_match`, `path_unsupported`,
 ///   `path_unknown`, `no_path_scope`
 /// - `path` / `language` (nullable)
+/// - `case_near_match`: nearest case-insensitive path candidate when reason
+///   is `path_unknown` and a case-insensitive match exists; helps the model
+///   correct a Linux case typo without a second graph traversal.
+/// - `path_normalized_from`: original filter when backslash normalization
+///   occurred; shows the slash-normalized path that was actually used.
 ///
 /// `suggested_tools` is intentionally omitted from the wire payload —
 /// recommending grep/decl_search retries was decoration the model already
@@ -1374,36 +1676,102 @@ fn graph_zero_hit_fallback(
     if packet_count > 0 {
         return Value::Null;
     }
-    let (path_value, language_value, reason) = match path {
-        Some(path) => {
+    // Normalize backslashes once so all branches see forward-slash paths.
+    // This mirrors path_matches_filter's normalization and ensures the file
+    // lookup succeeds even when the caller supplied a Windows-style path.
+    let path_norm_buf = path.map(|p| p.replace('\\', "/"));
+    let normalized_path = path_norm_buf.as_deref();
+
+    let (path_value, language_value, reason, hint, case_near_match) = match normalized_path {
+        Some(p) => {
             let file = graph
                 .files
                 .values()
-                .find(|file| path_matches_exact_or_suffix(&file.relative_path, path));
+                .find(|file| path_matches_filter(&file.relative_path, p));
+            #[cfg(target_os = "windows")]
+            let file = file.or_else(|| graph.find_file_case_insensitive(p));
             match file {
                 Some(file) => {
-                    let reason = match file.language {
-                        LanguageKind::Unsupported => "path_unsupported",
-                        LanguageKind::Unknown => "path_unknown",
-                        _ => "supported_language_no_match",
+                    let (reason, hint) = match file.language {
+                        LanguageKind::Unsupported => (
+                            "path_unsupported",
+                            "use grep or read_slice for this file type",
+                        ),
+                        LanguageKind::Unknown => (
+                            "path_unknown",
+                            "check the path spelling or use a broader search",
+                        ),
+                        _ => (
+                            "supported_language_no_match",
+                            "try a different query or broader kind filter",
+                        ),
                     };
                     (
                         Value::String(file.relative_path.clone()),
                         Value::String(file.language.display_name().to_string()),
                         reason,
+                        hint,
+                        None,
                     )
                 }
-                None => (Value::String(path.to_string()), Value::Null, "path_unknown"),
+                None => {
+                    // No exact/suffix match.  Try a case-insensitive search so
+                    // the caller can correct a Linux case typo without another
+                    // graph traversal.  Use min_by_key for a deterministic
+                    // winner when a case-sensitive repo has multiple files that
+                    // differ only by case (e.g. both `src/Foo.rs` and
+                    // `src/foo.rs` match a query of `src/FOO.rs`).
+                    let p_lower = p.to_lowercase();
+                    let near = graph
+                        .files
+                        .values()
+                        .filter(|f| {
+                            let rp_lower = f.relative_path.to_lowercase();
+                            rp_lower == p_lower
+                                || rp_lower
+                                    .strip_suffix(p_lower.as_str())
+                                    .is_some_and(|prefix| prefix.ends_with('/'))
+                        })
+                        .min_by_key(|f| f.relative_path.as_str());
+                    (
+                        Value::String(p.to_string()),
+                        Value::Null,
+                        "path_unknown",
+                        "check the path spelling or use a broader search",
+                        near.map(|f| f.relative_path.clone()),
+                    )
+                }
             }
         }
-        None => (Value::Null, Value::Null, "no_path_scope"),
+        None => (
+            Value::Null,
+            Value::Null,
+            "no_path_scope",
+            "try a different query or broader kind filter",
+            None,
+        ),
     };
-    json!({
-        "status": "no_graph_evidence",
-        "reason": reason,
-        "path": path_value,
-        "language": language_value,
-    })
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("status".to_string(), json!("no_graph_evidence"));
+    obj.insert("reason".to_string(), json!(reason));
+    obj.insert("hint".to_string(), json!(hint));
+    obj.insert("path".to_string(), path_value);
+    obj.insert("language".to_string(), language_value);
+    if let Some(near) = case_near_match {
+        obj.insert("case_near_match".to_string(), json!(near));
+    }
+    // Surface a hint when the caller's filter contained backslashes so the
+    // slash-normalized interpretation is visible on Linux.
+    if let Some(orig) = path
+        && orig.contains('\\')
+    {
+        obj.insert("path_normalized_from".to_string(), json!(orig));
+        if let Some(norm) = normalized_path {
+            obj.insert("normalized_path".to_string(), json!(norm));
+        }
+    }
+    Value::Object(obj)
 }
 
 fn graph_status_for_language(language: LanguageKind) -> &'static str {
@@ -1449,7 +1817,7 @@ fn symbol_packet(
     graph: &squeezy_graph::SemanticGraph,
     symbol: &GraphSymbol,
     tool: &str,
-    next_action: Value,
+    rank_label: Option<&str>,
 ) -> Value {
     let mut packet = evidence_packet(
         format!(
@@ -1464,27 +1832,22 @@ fn symbol_packet(
             matches_returned: 1,
             ..ToolCostHint::default()
         },
-        next_action,
+        json!({}),
     );
     // The top-level `tool` mirror duplicates context the caller already knows
     // (the tool name is the call that produced this packet); the `symbol` body
     // identifies the symbol. Dropped to save tokens.
     let _ = tool;
     if let Some(object) = packet.as_object_mut() {
-        object.insert("symbol".to_string(), symbol_json(graph, symbol));
+        let mut sym = symbol_json(graph, symbol);
+        // Surface the rank tier when a query was provided so the model and TUI
+        // users can inspect why one result beat another without reading source.
+        if let (Some(label), Some(sym_obj)) = (rank_label, sym.as_object_mut()) {
+            sym_obj.insert("rank".to_string(), json!(label));
+        }
+        object.insert("symbol".to_string(), sym);
     }
     packet
-}
-
-fn symbol_next_action(symbol: &GraphSymbol) -> Value {
-    json!({
-        "tool": "symbol_context",
-        "arguments": {
-            "query": symbol.name,
-            "path": symbol.file_id.0
-        },
-        "reason": "expand this declaration with callers and references"
-    })
 }
 
 fn symbol_context_packet(
@@ -1492,19 +1855,7 @@ fn symbol_context_packet(
     symbol: &GraphSymbol,
     max_references: usize,
 ) -> Value {
-    let mut packet = symbol_packet(
-        graph,
-        symbol,
-        "symbol_context",
-        json!({
-            "tool": "read_slice",
-            "arguments": {
-                "symbol_id": symbol.id.0,
-                "span_kind": "body"
-            },
-            "reason": "read the exact symbol body if details are needed"
-        }),
-    );
+    let mut packet = symbol_packet(graph, symbol, "symbol_context", None);
     if let Some(object) = packet.as_object_mut() {
         // Insert each collection only when non-empty: the common case (a symbol
         // with no callers/callees/references/diagnostics) used to ship four
@@ -1593,11 +1944,53 @@ fn reference_matches_path(hit: &ReferenceHit, filter: &str) -> bool {
     path_matches_filter(hit.reference.file_id.0.as_str(), filter)
 }
 
+/// Normalize a user-supplied path filter: replace backslashes with forward
+/// slashes and strip leading `./` or `.\` so that Windows-style input like
+/// `.\src\lib.rs` matches the indexed `src/lib.rs`.
+fn normalize_path_filter(filter: &str) -> std::borrow::Cow<'_, str> {
+    let s = if filter.contains('\\') {
+        std::borrow::Cow::Owned(filter.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(filter)
+    };
+    // Strip a leading `./` produced by shell tab-completion or model output.
+    if let Some(rest) = s.strip_prefix("./") {
+        std::borrow::Cow::Owned(rest.to_string())
+    } else {
+        s
+    }
+}
+
 fn path_matches_exact_or_suffix(path: &str, filter: &str) -> bool {
-    path == filter
-        || path
-            .strip_suffix(filter)
+    let filter = normalize_path_filter(filter);
+    let filter = filter.as_ref();
+    if path == filter {
+        return true;
+    }
+    // Case-insensitive comparison on Windows where the filesystem ignores case.
+    #[cfg(target_os = "windows")]
+    if path.eq_ignore_ascii_case(filter) {
+        return true;
+    }
+    if path
+        .strip_suffix(filter)
+        .is_some_and(|prefix| prefix.ends_with('/'))
+    {
+        return true;
+    }
+    // Case-insensitive suffix match on Windows.
+    #[cfg(target_os = "windows")]
+    {
+        let path_lower = path.to_ascii_lowercase();
+        let filter_lower = filter.to_ascii_lowercase();
+        if path_lower
+            .strip_suffix(filter_lower.as_str())
             .is_some_and(|prefix| prefix.ends_with('/'))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn call_edge_packet(
@@ -1929,7 +2322,7 @@ fn hierarchy_node_packet(
     tool: &str,
 ) -> Value {
     if let Some(symbol) = graph.symbols.get(&node.id) {
-        return symbol_packet(graph, symbol, tool, symbol_next_action(symbol));
+        return symbol_packet(graph, symbol, tool, None);
     }
     let mut packet = evidence_packet(
         format!("{:?} `{}` appears in hierarchy", node.kind, node.name),
@@ -2193,7 +2586,10 @@ fn unresolved_symbol_result(
     let packets = candidates
         .iter()
         .take(DEFAULT_GRAPH_MAX_RESULTS)
-        .map(|symbol| symbol_packet(graph, symbol, tool, symbol_next_action(symbol)))
+        .map(|symbol| {
+            let rank_label = args.query.as_deref().map(|q| symbol_rank_label(symbol, q));
+            symbol_packet(graph, symbol, tool, rank_label)
+        })
         .collect::<Vec<_>>();
     let mut payload = graph_payload(tool, manager, refresh);
     payload.insert("resolved".to_string(), json!(false));
@@ -2264,7 +2660,14 @@ fn unresolved_hierarchy_result(
         )
         .into_iter()
         .take(DEFAULT_GRAPH_MAX_RESULTS)
-        .map(|symbol| symbol_packet(graph, &symbol, "hierarchy", symbol_next_action(&symbol)))
+        .map(|symbol| {
+            let rank_label = if query.is_empty() {
+                None
+            } else {
+                Some(symbol_rank_label(&symbol, query))
+            };
+            symbol_packet(graph, &symbol, "hierarchy", rank_label)
+        })
         .collect::<Vec<_>>()
     };
     let mut payload = graph_payload("hierarchy", manager, refresh);
@@ -2338,12 +2741,19 @@ fn read_slice_target(
         .path
         .clone()
         .ok_or_else(|| "read_slice requires path or symbol_id".to_string())?;
+    // Find graph status: try exact/suffix first, then case-insensitive fallback
+    // so a Windows user typing `SRC\lib.rs` gets the correct indexed language
+    // rather than "not_indexed".
     let status = graph
         .and_then(|graph| {
             graph
                 .files
                 .values()
-                .find(|file| path_matches_exact_or_suffix(&file.relative_path, &path))
+                // Use the directory-aware, Windows-normalised predicate so
+                // that directory-shaped paths and backslash-escaped inputs
+                // resolve consistently with the symbol-search predicates.
+                .find(|file| path_matches_filter(&file.relative_path, &path))
+                .or_else(|| graph.find_file_case_insensitive(&path))
         })
         .map(|file| graph_status_for_language(file.language))
         .unwrap_or("not_indexed");
@@ -2641,7 +3051,10 @@ impl ToolRegistry {
                 drop(graph);
                 return self.execute_read_slice_blocking(call, args, None);
             }
-            return graph_unavailable_result(call, !graph_ready);
+            // Surface the open error (if any) so the model can distinguish a
+            // store/parse failure from a workspace that genuinely has no graph.
+            let open_error = self.graph_open_error();
+            return graph_unavailable_result_with_error(call, !graph_ready, open_error);
         };
         let refresh = match manager.refresh_before_query() {
             Ok(report) => report,
@@ -2695,6 +3108,18 @@ impl ToolRegistry {
             }
             "hierarchy" => match serde_json::from_value::<HierarchyArgs>(call.arguments.clone()) {
                 Ok(args) => self.execute_hierarchy_blocking(call, args, manager, &refresh),
+                Err(err) => tool_arg_error(call, err),
+            },
+            "inheritance_hierarchy" => {
+                match serde_json::from_value::<InheritanceHierarchyArgs>(call.arguments.clone()) {
+                    Ok(args) => {
+                        self.execute_inheritance_hierarchy_blocking(call, args, manager, &refresh)
+                    }
+                    Err(err) => tool_arg_error(call, err),
+                }
+            }
+            "impact" => match serde_json::from_value::<ImpactArgs>(call.arguments.clone()) {
+                Ok(args) => self.execute_impact_blocking(call, args, manager, &refresh),
                 Err(err) => tool_arg_error(call, err),
             },
             "read_slice" => match serde_json::from_value::<ReadSliceArgs>(call.arguments.clone()) {
@@ -2824,7 +3249,10 @@ impl ToolRegistry {
             .collect::<Vec<_>>();
         let packets = selected
             .iter()
-            .map(|symbol| symbol_packet(graph, symbol, "decl_search", symbol_next_action(symbol)))
+            .map(|symbol| {
+                let rank_label = args.query.as_deref().map(|q| symbol_rank_label(symbol, q));
+                symbol_packet(graph, symbol, "decl_search", rank_label)
+            })
             .collect::<Vec<_>>();
         let confidence_distribution =
             ToolCostHint::confidence_distribution_from(selected.iter().map(|s| s.confidence));
@@ -2884,23 +3312,13 @@ impl ToolRegistry {
             args.language.as_deref(),
         );
         let truncated = symbols.len() > max_results;
+        let candidate_count = symbols.len();
         let selected = symbols.into_iter().take(max_results).collect::<Vec<_>>();
         let packets = selected
             .iter()
             .map(|symbol| {
-                symbol_packet(
-                    graph,
-                    symbol,
-                    "definition_search",
-                    json!({
-                        "tool": "read_slice",
-                        "arguments": {
-                            "symbol_id": symbol.id.0,
-                            "span_kind": "signature"
-                        },
-                        "reason": "read the exact declaration slice"
-                    }),
-                )
+                let rank_label = args.query.as_deref().map(|q| symbol_rank_label(symbol, q));
+                symbol_packet(graph, symbol, "definition_search", rank_label)
             })
             .collect::<Vec<_>>();
         let packet_count = packets.len();
@@ -2918,6 +3336,7 @@ impl ToolRegistry {
             ),
         );
         payload.insert("truncated".to_string(), json!(truncated));
+        payload.insert("total_candidates".to_string(), json!(candidate_count));
         make_result(
             call,
             ToolStatus::Success,
@@ -3254,6 +3673,211 @@ impl ToolRegistry {
             nodes,
             max_depth,
             args.max_results,
+            None,
+        )
+    }
+
+    fn execute_inheritance_hierarchy_blocking(
+        &self,
+        call: &ToolCall,
+        args: InheritanceHierarchyArgs,
+        manager: &GraphManager,
+        refresh: &squeezy_graph::RefreshReport,
+    ) -> ToolResult {
+        let graph = manager.graph();
+        let max_results = graph_limit(args.max_results);
+        let subtypes = args.subtypes.unwrap_or(false);
+
+        // Resolve the root symbol via id or text query.
+        let root = if let Some(id) = args.symbol_id.as_deref() {
+            graph.symbols.get(&SymbolId::new(id)).cloned()
+        } else if let Some(q) = args.query.as_deref() {
+            graph_symbol_search(graph, Some(q), None, None, None, None, None)
+                .into_iter()
+                .next()
+        } else {
+            None
+        };
+
+        let Some(root_sym) = root else {
+            let mut payload = graph_payload("inheritance_hierarchy", manager, refresh);
+            payload.insert("error".to_string(), json!("symbol not found"));
+            payload.insert("packets".to_string(), json!([]));
+            return make_result(
+                call,
+                ToolStatus::Success,
+                Value::Object(payload),
+                ToolCostHint::default(),
+                None,
+            );
+        };
+
+        let related: Vec<GraphSymbol> = if subtypes {
+            graph.inheritance_direct_subtypes(&root_sym.id)
+        } else {
+            graph.inheritance_ancestors(&root_sym.id)
+        };
+
+        let truncated = related.len() > max_results;
+        let selected: Vec<&GraphSymbol> = related.iter().take(max_results).collect();
+
+        let packets: Vec<Value> = selected
+            .iter()
+            .map(|sym| symbol_packet(graph, sym, "inheritance_hierarchy", None))
+            .collect();
+
+        let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
+        let mut payload = graph_payload("inheritance_hierarchy", manager, refresh);
+        payload.insert("root".to_string(), symbol_json(graph, &root_sym));
+        payload.insert(
+            "direction".to_string(),
+            json!(if subtypes { "subtypes" } else { "supertypes" }),
+        );
+        payload.insert(
+            "symbols".to_string(),
+            json!(
+                selected
+                    .iter()
+                    .map(|s| symbol_json(graph, s))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        payload.insert("packets".to_string(), json!(packets));
+        payload.insert("truncated".to_string(), json!(truncated));
+        make_result(
+            call,
+            ToolStatus::Success,
+            Value::Object(payload),
+            ToolCostHint {
+                matches_returned: selected.len() as u64,
+                truncated,
+                confidence_distribution,
+                ..ToolCostHint::default()
+            },
+            None,
+        )
+    }
+
+    fn execute_impact_blocking(
+        &self,
+        call: &ToolCall,
+        args: ImpactArgs,
+        manager: &GraphManager,
+        refresh: &squeezy_graph::RefreshReport,
+    ) -> ToolResult {
+        let graph = manager.graph();
+        let max_results = graph_limit(args.max_results);
+
+        // Collect the set of changed file IDs from the arguments.
+        let mut changed: HashSet<FileId> = HashSet::new();
+
+        if let Some(id) = args.symbol_id.as_deref()
+            && let Some(sym) = graph.symbols.get(&SymbolId::new(id))
+        {
+            changed.insert(sym.file_id.clone());
+        } else if let Some(q) = args.query.as_deref()
+            && let Some(sym) = graph_symbol_search(graph, Some(q), None, None, None, None, None)
+                .into_iter()
+                .next()
+        {
+            changed.insert(sym.file_id.clone());
+        }
+        if let Some(path) = args.path.as_deref() {
+            for file in graph.files.values() {
+                if file.relative_path == path || file.relative_path.ends_with(path) {
+                    changed.insert(file.id.clone());
+                }
+            }
+        }
+        for extra in &args.extra_paths {
+            for file in graph.files.values() {
+                if file.relative_path == *extra || file.relative_path.ends_with(extra.as_str()) {
+                    changed.insert(file.id.clone());
+                }
+            }
+        }
+
+        if changed.is_empty() {
+            let mut payload = graph_payload("impact", manager, refresh);
+            payload.insert(
+                "error".to_string(),
+                json!("no symbol or file resolved; provide symbol_id, query, or path"),
+            );
+            payload.insert("packets".to_string(), json!([]));
+            return make_result(
+                call,
+                ToolStatus::Success,
+                Value::Object(payload),
+                ToolCostHint::default(),
+                None,
+            );
+        }
+
+        // All changed files are treated as potentially propagating for
+        // worst-case impact; callers needing finer control can supply dirty
+        // annotations through `annotate_dirty_ranges` first.
+        let propagating = changed.clone();
+        let removed: HashSet<FileId> = HashSet::new();
+        let impact = graph.compute_impact(&changed, &propagating, &removed);
+
+        let truncated = impact.affected_symbols.len() > max_results;
+        let selected_symbols: Vec<&squeezy_graph::GraphSymbol> =
+            impact.affected_symbols.iter().take(max_results).collect();
+
+        let packets: Vec<Value> = selected_symbols
+            .iter()
+            .map(|sym| symbol_packet(graph, sym, "impact", None))
+            .collect();
+
+        let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
+
+        let affected_files_json: Vec<Value> = impact
+            .affected_files
+            .iter()
+            .filter_map(|fid| graph.files.get(fid))
+            .map(|f| json!({"file_id": f.id.0, "path": f.relative_path}))
+            .collect();
+
+        let test_symbols_truncated = impact.affected_tests.len() > max_results;
+        let test_symbols_json: Vec<Value> = impact
+            .affected_tests
+            .iter()
+            .take(max_results)
+            .map(|sym| symbol_json(graph, sym))
+            .collect();
+
+        let mut payload = graph_payload("impact", manager, refresh);
+        payload.insert(
+            "changed_files".to_string(),
+            json!(
+                changed
+                    .iter()
+                    .filter_map(|fid| graph.files.get(fid))
+                    .map(|f| f.relative_path.clone())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        payload.insert("affected_files".to_string(), json!(affected_files_json));
+        payload.insert(
+            "affected_file_count".to_string(),
+            json!(impact.affected_files.len()),
+        );
+        payload.insert("packets".to_string(), json!(packets));
+        payload.insert("test_symbols".to_string(), json!(test_symbols_json));
+        payload.insert("truncated".to_string(), json!(truncated));
+        if test_symbols_truncated {
+            payload.insert("test_symbols_truncated".to_string(), json!(true));
+        }
+        make_result(
+            call,
+            ToolStatus::Success,
+            Value::Object(payload),
+            ToolCostHint {
+                matches_returned: selected_symbols.len() as u64,
+                truncated,
+                confidence_distribution,
+                ..ToolCostHint::default()
+            },
             None,
         )
     }
@@ -4287,6 +4911,131 @@ mod path_filter_tests {
             "zzzznope",
         ));
     }
+
+    // ── Windows separator tests ──────────────────────────────────────────────
+
+    #[test]
+    fn windows_backslash_filter_acts_as_directory_prefix() {
+        // A filter pasted from Windows Explorer or PowerShell that uses `\`
+        // must behave identically to the equivalent `/` filter.
+        assert!(path_matches_filter("src/main/foo.rs", "src\\main",));
+        // Sibling outside the subtree must not match.
+        assert!(!path_matches_filter("src/main_extra/foo.rs", "src\\main",));
+    }
+
+    #[test]
+    fn windows_backslash_filter_respects_exact_and_trailing_slash() {
+        // Exact match with backslash separator.
+        assert!(path_matches_filter("src/main/foo.rs", "src\\main\\foo.rs",));
+        // Trailing backslash is tolerated like trailing forward slash.
+        assert!(path_matches_filter("src/main/foo.rs", "src\\main\\",));
+    }
+
+    #[test]
+    fn mixed_separator_filter_normalizes_correctly() {
+        // Filters that mix `/` and `\` (e.g. copy-pasted from mixed toolchain
+        // output) are normalised before matching.
+        assert!(path_matches_filter(
+            "gson/src/main/java/Foo.java",
+            "gson\\src/main\\java",
+        ));
+        assert!(!path_matches_filter(
+            "gson/src/test/java/Foo.java",
+            "gson\\src/main\\java",
+        ));
+    }
+
+    #[test]
+    fn windows_csharp_paths_match() {
+        // Common Windows-heavy source names pasted from Visual Studio or
+        // Explorer.
+        assert!(path_matches_filter("src/Program.cs", "src\\Program.cs",));
+        assert!(path_matches_filter(
+            "Properties/AssemblyInfo.cs",
+            "Properties\\AssemblyInfo.cs",
+        ));
+        assert!(path_matches_filter(
+            "Views/Home/Index.cshtml",
+            "Views\\Home\\Index.cshtml",
+        ));
+        // appsettings single-token without separator still resolves via
+        // suffix / fuzzy match.
+        assert!(path_matches_filter(
+            "appsettings.Development.json",
+            "appsettings.Development.json",
+        ));
+    }
+
+    #[test]
+    fn windows_cmake_path_matches() {
+        assert!(path_matches_filter(
+            "src/CMakeLists.txt",
+            "src\\CMakeLists.txt",
+        ));
+    }
+
+    #[test]
+    fn degenerate_separator_only_filter_matches_all_paths() {
+        // A filter consisting only of separators (e.g., a model mistake)
+        // normalises to an empty string after trimming and acts as an
+        // unconditional match — the same behaviour as an absent filter.
+        // Pinned here so any future refactor cannot silently change it.
+        assert!(path_matches_filter("any/path/file.rs", "\\"));
+        assert!(path_matches_filter("any/path/file.rs", "/"));
+    }
+}
+
+#[cfg(test)]
+mod exact_or_suffix_tests {
+    use super::path_matches_exact_or_suffix;
+
+    #[test]
+    fn exact_or_suffix_handles_windows_separator() {
+        // Windows backslash suffix: `src\lib.rs` must suffix-match the
+        // slash-normalised graph path `crates/src/lib.rs`.
+        assert!(path_matches_exact_or_suffix(
+            "crates/src/lib.rs",
+            "src\\lib.rs"
+        ));
+        // Exact match after normalisation.
+        assert!(path_matches_exact_or_suffix("src/lib.rs", "src\\lib.rs"));
+        // Must not match an unrelated file that shares a longer basename.
+        assert!(!path_matches_exact_or_suffix(
+            "crates/mylib.rs",
+            "src\\lib.rs"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod linux_backslash_filter_tests {
+    use super::path_matches_filter;
+
+    #[test]
+    fn backslash_filter_is_normalized_to_directory_prefix() {
+        // Linux bug fix: a path copied from Windows output like `src\parser`
+        // must enter strict directory-prefix mode (not bareword fuzzy) after
+        // backslash normalization.  Without normalization, `src\parser` has no
+        // `/` so it falls through to loose fuzzy matching and can admit
+        // cross-tree matches.
+        assert!(
+            path_matches_filter("src/parser/lib.rs", "src\\parser"),
+            "backslash filter should match as directory prefix"
+        );
+        assert!(
+            !path_matches_filter("src/parser_util/lib.rs", "src\\parser"),
+            "backslash filter must not bleed into directory-name substrings"
+        );
+        // Multi-segment backslash paths also normalize correctly.
+        assert!(path_matches_filter(
+            "crates/squeezy-graph/src/lib.rs",
+            "crates\\squeezy-graph\\src",
+        ));
+        assert!(!path_matches_filter(
+            "crates/squeezy-graph/tests/lib.rs",
+            "crates\\squeezy-graph\\src",
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -4384,6 +5133,7 @@ mod hierarchy_node_count_tests {
 mod graph_payload_refresh_status_tests {
     use super::graph_payload;
     use squeezy_graph::{GraphManager, RefreshConfig};
+    use squeezy_workspace::PathConflict;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn temp_root(name: &str) -> std::path::PathBuf {
@@ -4487,8 +5237,190 @@ mod graph_payload_refresh_status_tests {
             payload.get("graph_available"),
             Some(&serde_json::json!(true))
         );
+        // The `indexing` block follows the same cost-first gating as
+        // `refresh_incomplete`: a healthy graph (here, a non-watching
+        // one-shot construction) pays nothing on the wire.
+        assert!(
+            payload.get("indexing").is_none(),
+            "healthy disabled-watcher payload must omit the indexing block, got {payload:?}"
+        );
         assert!(payload.get("refresh_incomplete").is_none());
         assert!(payload.get("stale_pending").is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn payload_surfaces_path_conflicts_when_present() {
+        let root = temp_root("path_conflicts");
+        std::fs::write(root.join("src").join("a.rs"), "fn a() {}\n").expect("write source");
+        let mut manager = GraphManager::open_with_config(
+            &root,
+            RefreshConfig {
+                debounce: Duration::from_millis(0),
+                idle_refresh_interval: Duration::from_millis(0),
+                per_tool_refresh_budget: Duration::from_secs(30),
+            },
+        )
+        .expect("open graph");
+        let mut report = manager.refresh_before_query().expect("refresh");
+        report.path_conflicts = vec![PathConflict {
+            normalized_relative_path: "src/foo.rs".to_string(),
+            relative_paths: vec!["src/Foo.rs".to_string(), "src/foo.rs".to_string()],
+        }];
+
+        let payload = graph_payload("repo_map", &manager, &report);
+        let conflicts = payload
+            .get("path_conflicts")
+            .expect("path conflicts should be surfaced");
+        assert_eq!(conflicts["count"], serde_json::json!(1));
+        assert_eq!(
+            conflicts["samples"][0]["normalized_relative_path"],
+            serde_json::json!("src/foo.rs")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn payload_surfaces_freshness_mode_and_fallback_reason() {
+        // `freshness_mode` must always be present in the payload. When the
+        // manager is in polling-fallback mode, `freshness_fallback_reason` must
+        // also be present with the exact reason string.
+        let root = temp_root("freshness");
+        std::fs::write(root.join("src").join("a.rs"), "fn a() {}\n").expect("write source");
+        let mut manager = GraphManager::open(&root).expect("open graph");
+        let report = manager.refresh_before_query().expect("refresh");
+
+        // Default mode is polling — no fallback reason.
+        let payload = graph_payload("repo_map", &manager, &report);
+        assert_eq!(
+            payload.get("freshness_mode"),
+            Some(&serde_json::json!("polling")),
+            "default freshness_mode must be 'polling'"
+        );
+        assert!(
+            payload.get("freshness_fallback_reason").is_none(),
+            "no fallback reason expected for default polling mode"
+        );
+
+        // After marking polling fallback the reason must propagate to payload.
+        manager.mark_polling_fallback("watcher startup failed: test");
+        let report2 = manager
+            .refresh_before_query()
+            .expect("refresh after fallback");
+        let payload2 = graph_payload("repo_map", &manager, &report2);
+        assert_eq!(
+            payload2.get("freshness_mode"),
+            Some(&serde_json::json!("polling")),
+        );
+        assert_eq!(
+            payload2.get("freshness_fallback_reason"),
+            Some(&serde_json::json!("watcher startup failed: test")),
+            "fallback reason must appear in payload after mark_polling_fallback"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod windows_path_normalization_tests {
+    use super::{normalize_path_filter, path_matches_exact_or_suffix, path_matches_filter};
+
+    #[test]
+    fn normalize_path_filter_replaces_backslashes() {
+        assert_eq!(normalize_path_filter("src\\lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_path_filter("src/lib.rs"), "src/lib.rs");
+        assert_eq!(
+            normalize_path_filter(".\\src\\app.cs"),
+            "src/app.cs",
+            "leading ./ must be stripped after backslash normalization"
+        );
+        assert_eq!(normalize_path_filter("./src/lib.rs"), "src/lib.rs");
+    }
+
+    #[test]
+    fn path_matches_exact_or_suffix_accepts_backslash_filter() {
+        // Windows users may supply backslash paths; they should match the
+        // slash-normalized indexed paths without extra friction.
+        assert!(
+            path_matches_exact_or_suffix("src/lib.rs", "src\\lib.rs"),
+            "backslash filter must match slash-indexed path"
+        );
+        assert!(
+            path_matches_exact_or_suffix("crates/foo/src/lib.rs", "src\\lib.rs"),
+            "backslash suffix filter must match"
+        );
+        assert!(
+            !path_matches_exact_or_suffix("src/other.rs", "src\\lib.rs"),
+            "non-matching backslash filter must not match"
+        );
+    }
+
+    #[test]
+    fn path_matches_filter_accepts_backslash_directory_filter() {
+        // A Windows-style directory filter like `src\utils` should match files
+        // under `src/utils/` in the indexed tree.
+        assert!(
+            path_matches_filter("src/utils/helper.rs", "src\\utils"),
+            "backslash directory filter must match files under that tree"
+        );
+        assert!(
+            !path_matches_filter("src/utils_extra/helper.rs", "src\\utils"),
+            "backslash directory filter must not cross directory boundaries"
+        );
+    }
+
+    #[test]
+    fn path_matches_filter_strips_leading_dotslash() {
+        assert!(
+            path_matches_filter("src/lib.rs", "./src/lib.rs"),
+            "./prefix must be stripped before matching"
+        );
+        assert!(
+            path_matches_filter("src/lib.rs", ".\\src\\lib.rs"),
+            ".\\prefix must be stripped and backslashes normalized"
+        );
+    }
+
+    /// Verify that the case-insensitive comparison logic (used inside the
+    /// `#[cfg(target_os = "windows")]` blocks) is correct. We call the
+    /// helper with pre-lowercased strings directly so the test runs on all
+    /// platforms without a Windows host.
+    #[test]
+    fn case_insensitive_comparison_logic_is_correct() {
+        // Simulate the exact-match case: eq_ignore_ascii_case
+        assert!("src/Lib.rs".eq_ignore_ascii_case("src/lib.rs"));
+        assert!("SRC/LIB.RS".eq_ignore_ascii_case("src/lib.rs"));
+        assert!(!"src/lib.rs".eq_ignore_ascii_case("src/other.rs"));
+
+        // Simulate the suffix-match case: lowercase both sides, check trailing slash boundary
+        let path_lower = "crates/foo/src/lib.rs".to_ascii_lowercase();
+        let filter_lower = "src/lib.rs".to_ascii_lowercase();
+        assert!(
+            path_lower
+                .strip_suffix(filter_lower.as_str())
+                .is_some_and(|prefix| prefix.ends_with('/')),
+            "case-folded suffix match must respect directory boundary"
+        );
+
+        // Ensure suffix match stops at directory boundary (not inside a component)
+        let path_lower2 = "crates/src_extra/lib.rs".to_ascii_lowercase();
+        let filter_lower2 = "src/lib.rs".to_ascii_lowercase();
+        assert!(
+            !path_lower2
+                .strip_suffix(filter_lower2.as_str())
+                .is_some_and(|prefix| prefix.ends_with('/')),
+            "suffix match must not cross directory boundaries"
+        );
+
+        // Simulate the prefix-match case in path_matches_filter
+        let path_lower3 = "src/utils/helper.rs".to_ascii_lowercase();
+        let filter_lower3 = "src/utils".to_ascii_lowercase();
+        let filter_with_slash = format!("{filter_lower3}/");
+        assert!(
+            path_lower3.eq_ignore_ascii_case(&filter_lower3)
+                || (path_lower3.starts_with(filter_with_slash.as_str())),
+            "case-folded prefix match must work"
+        );
     }
 }

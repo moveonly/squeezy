@@ -63,7 +63,7 @@ jobs:
           fi
 
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
@@ -313,7 +313,7 @@ jobs:
 
       - name: Checkout Squeezy
         if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
@@ -326,7 +326,7 @@ jobs:
 
       - name: Checkout Homebrew tap
         if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: ${{ env.TAP_REPOSITORY }}
           token: ${{ env.HOMEBREW_TAP_TOKEN }}
@@ -369,7 +369,7 @@ jobs:
 
       - name: Checkout Squeezy
         if: ${{ env.WINGET_PKGS_TOKEN != '' }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
@@ -382,7 +382,7 @@ jobs:
 
       - name: Checkout winget-pkgs fork
         if: ${{ env.WINGET_PKGS_TOKEN != '' }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: ${{ env.WINGET_FORK_REPOSITORY }}
           token: ${{ env.WINGET_PKGS_TOKEN }}

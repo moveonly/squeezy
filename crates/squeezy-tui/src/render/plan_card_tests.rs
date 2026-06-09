@@ -109,7 +109,7 @@ fn render_plan_card_uses_calm_heading_not_box() {
 fn render_plan_card_does_not_abbreviate_plan_table_cells() {
     let root = fresh_workspace("full_table");
     let body = "\
-| Dimension | repo_map | sonar context |
+| Dimension | repo_map | semantic graph |
 | --- | --- | --- |
 | Module names | Directory names from workspace inventory | Artifact IDs from dependency graph |
 | Symbol-level detail | Classes, functions, fields, and signatures | Stopped at module dependency boundaries |

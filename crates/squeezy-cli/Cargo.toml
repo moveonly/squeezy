@@ -22,14 +22,21 @@ dirs.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Used only to derive `PublicSessionHandle` (a 64-bit truncated pseudonym
+# over raw session ids). The cryptographic strength of sha2 is not load-
+# bearing here; a cheaper non-cryptographic hash with the same 64-bit
+# pre-image property would be a drop-in replacement.
+sha2.workspace = true
 squeezy-agent.workspace = true
 squeezy-core.workspace = true
 squeezy-llm.workspace = true
+squeezy-parse.workspace = true
 squeezy-skills.workspace = true
 squeezy-store.workspace = true
 squeezy-telemetry.workspace = true
 squeezy-tools.workspace = true
 squeezy-tui.workspace = true
+squeezy-workspace.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 toml_edit.workspace = true

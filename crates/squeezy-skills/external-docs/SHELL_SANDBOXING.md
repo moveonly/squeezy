@@ -34,7 +34,9 @@ The current implementation:
   prefix for policy matching.
 - Closes stdin for non-TTY shell runs so tools cannot accidentally read from
   the agent terminal; `tty = true` attaches the process to a PTY and captures
-  PTY output as stdout.
+  PTY output as stdout. On Windows, ConPTY is not yet wired; `tty = true`
+  degrades to pipe-backed stdio and the tool result includes a `tty_note`
+  field explaining the degradation.
 - Splits the retained output budget between stdout and stderr, then rebalances
   unused capacity so a noisy stream cannot starve the other one.
 - Runs shell commands in their own process group and terminates the whole group
@@ -58,8 +60,10 @@ The current implementation:
   on path segments so `cat .environment` is not falsely flagged as `.env`.
 - Emits redacted JSONL audit records to `.squeezy/audit/shell.jsonl` under a
   process-wide mutex with rotation at 8 MiB and up to four archived files.
-- Adds `policy`, `sandbox`, `sandbox_network`, and `env` metadata to shell
-  tool results.
+- Adds `sandbox.best_effort_fallback` metadata to shell tool results when the
+  sandbox backend degrades to the direct path; full sandbox metadata
+  (`policy`, `sandbox`, `sandbox_network`, `env`) is audit-only for normal
+  runs and is not included in model-facing tool results.
 
 On **macOS**, Squeezy launches shell commands through `/usr/bin/sandbox-exec`
 with a `(deny default)` SBPL profile. The profile then re-allows the minimum
@@ -75,10 +79,23 @@ after the permission policy has allowed the command.
 
 On **Windows**, the backend is selected by `windows_sandbox_level`
 (`restricted_token` by default, `elevated`, or `disabled`). The shell is
-PowerShell 7 (preferred), Windows PowerShell, or `cmd.exe` (configurable via
-`SQUEEZY_SHELL`), and every descendant is still bound into a Win32 Job Object
-(`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) for reliable process-tree termination —
-the Windows analog of `setpgid` + SIGKILL.
+PowerShell 7 (`pwsh`, preferred), Windows PowerShell (`powershell`), or
+`cmd.exe` in that priority order, resolved via `PATH` at startup and cached
+per process. Set `SQUEEZY_SHELL=gitbash` to use Git Bash instead — this is
+a compatibility and CI testing override, not the production default. Any other
+value of `SQUEEZY_SHELL` is treated as the absolute path of a shell binary.
+Every shell child and all its descendants are bound into a Win32 Job Object
+(`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) for reliable process-tree termination
+— the Windows analog of `setpgid` + SIGKILL. The selected shell name is
+recorded in sandbox audit metadata (`selected_shell`).
+
+**Windows sandbox isolation:** process-tree cleanup is not the same as
+filesystem or network isolation. The `disabled` level (Job Object only) and
+the `windows-job-object` backend provide **no** filesystem or network
+confinement. Network policy values in the audit (`denied_best_effort`,
+`allowed_approved`) reflect the configured posture and classifier outcome,
+not an enforced OS boundary. Use `restricted_token` or `elevated` for
+actual isolation guarantees.
 
 - **`restricted_token` (default, no admin).** The command runs under a
   `CreateRestrictedToken` token (`WRITE_RESTRICTED | LUA_TOKEN |
@@ -321,6 +338,61 @@ admin), `elevated` (sandbox-user isolation + WFP network egress control, after a
 one-time `squeezy doctor --sandbox-setup` UAC prompt), or `disabled` (Job Object
 process-tree cleanup only). See the Windows paragraph above.
 
+`macos_socket_domain_allowlist` (macOS only; ignored elsewhere) is a list of
+absolute path prefixes for AF_UNIX sockets that the sandbox child may open when
+`network = "deny_by_default"`. The Seatbelt `(deny default)` rule otherwise
+blocks all AF_UNIX sockets when network is denied. The default is an empty list
+(full AF_UNIX denial). Add entries like `/private/tmp/mytool-` for build tools
+or local daemons that need Unix socket access from within the sandbox. Entries
+are merged additively across config layers. Entries must start with `/`.
+
+**Linux note**: `squeezy ask` (in-shell approval escalation via
+`SQUEEZY_ASK_SOCKET`) is unavailable under the `linux-direct-syscalls` backend
+because the seccomp filter denies `socket(AF_UNIX, …)`. Squeezy does not export
+`SQUEEZY_ASK_SOCKET` in that environment. Workflows that require in-shell
+approval escalation must run with `mode = "off"` or `mode = "external"`, or on
+macOS/Windows where AF_UNIX is not blocked by the sandbox filter.
+
+`linux_shell` (Linux only; ignored elsewhere) sets the shell binary used to
+run sandboxed commands. Must be an absolute path (e.g. `"/bin/bash"` or
+`"/usr/bin/fish"`). Defaults to `/bin/sh` (which on many Linux distributions
+is `dash` or `busybox`, not Bash). Projects requiring Bash syntax, Fish/Zsh
+aliases, or `$SHELL` semantics should set this explicitly. The effective shell
+path is recorded in the sandbox plan for audit.
+
+## Common Linux sandbox failures
+
+- **Docker default seccomp profile** — Docker applies a seccomp profile that
+  blocks `unshare`, so `CLONE_NEWUSER` fails with `EPERM`. Use
+  `--security-opt seccomp=unconfined` or `--privileged` for the container, or
+  set `mode = "best_effort"` / `mode = "off"` to run without OS isolation.
+- **Locked-down enterprise kernels** — Some distributions set
+  `/proc/sys/kernel/unprivileged_userns_clone = 0`. Check this value with
+  `cat /proc/sys/kernel/unprivileged_userns_clone`; a `0` means the sandbox
+  backend is unavailable. An admin can enable it with
+  `sysctl kernel.unprivileged_userns_clone=1`. Run `squeezy doctor` to see the
+  current verdict.
+- **WSL1** — WSL1 has no Linux kernel namespace support; `/proc/self/ns/user`
+  does not exist. The backend reports unavailable. WSL2 fully supports
+  namespaces. Use `mode = "best_effort"` to degrade gracefully on WSL1.
+- **Missing Landlock** — Kernels older than 5.13 do not support Landlock. The
+  sandbox still provides network isolation via `CLONE_NEWNET` when network is
+  denied, but filesystem restrictions are not enforced
+  (`filesystem = "best_effort_unavailable"`). Set `mode = "required"` to deny
+  commands when filesystem enforcement is unavailable.
+- **Container seccomp blocking pre_exec** — Some container runtimes apply a
+  seccomp policy that blocks `unshare` or `landlock_create_ruleset`. The
+  sandboxed child exits with code 1 and empty stderr; Squeezy detects this as
+  a sandbox failure and falls back in `best_effort` mode. Use
+  `squeezy doctor` to confirm which capabilities are available.
+- **Sandbox mode behavior summary:**
+  - `required` — command is denied pre-spawn when OS isolation is unavailable.
+  - `best_effort` — falls back to running without OS isolation when the backend
+    fails; env allowlist, timeout/output caps, and audit still apply.
+  - `external` — the caller is responsible for OS isolation; Squeezy runs the
+    command as-is with no namespace or Landlock setup.
+  - `off` — no OS isolation; permission policy and audit still apply.
+
 ## Limits
 
 The sandbox is intentionally local and deterministic. **It is not a substitute
@@ -356,8 +428,22 @@ Known limits:
   require the opt-in `elevated` tier (`squeezy doctor --sandbox-setup`), which
   provisions persistent local sandbox users + WFP filters (removed by
   `--sandbox-teardown`). The elevated tier's interactive ConPTY/runner layer is
-  not yet wired, so `tty = true` degrades to pipes. Windows isolation cannot be
-  validated by macOS/Linux CI; it is verified by a Windows host QA checklist.
+  not yet wired, so `tty = true` degrades to pipes on all Windows backends.
+  The `disabled` level (Job Object only) provides **no** filesystem or network
+  isolation at all; the audit fields `filesystem = "best_effort_unavailable"`
+  and `network = "denied_best_effort"` reflect the posture, not an enforced
+  boundary. Do not rely on the network audit value as evidence of enforcement
+  on Windows when using `disabled` or `restricted_token`. Windows isolation
+  cannot be validated by macOS/Linux CI; it is verified by a Windows host QA
+  checklist.
+- Windows Job Object process-tree cleanup: on the `disabled` backend (non-sandbox
+  tokio path), the Job Object is created and the child process is assigned after
+  spawn. There is a narrow spawn-before-assign race where grandchildren launched
+  before assignment completes may not be covered. The sandbox tiers
+  (`restricted_token`, `elevated`) avoid this via `CREATE_SUSPENDED` inside
+  `squeezy-win-sandbox`. The `windows_process_tree.job_object` field in the
+  tool result reports whether assignment succeeded (`"assigned"`,
+  `"not_assigned"`, or `"creation_failed"`).
 - The classifier is parser-backed but conservative. Truly dynamic constructs
   (`$(...)`, `${...}`, backticks, process substitution, parse errors) always
   classify as `Shell` with risk `High`, even if the inner command would look

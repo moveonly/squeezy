@@ -31,7 +31,7 @@ use squeezy_core::{
 };
 use squeezy_hooks::{AgentHookBus, Decision, HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
-    CacheRetention, CacheSpec, ContextLimitInput, INVALID_TOOL_ARGUMENTS_ERROR_KEY,
+    CacheRetention, CacheSpec, CitationSource, ContextLimitInput, INVALID_TOOL_ARGUMENTS_ERROR_KEY,
     INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem,
     LlmOutputSchema, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
     ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate, StopReason, capabilities_for,
@@ -59,10 +59,11 @@ use squeezy_telemetry::{
 use squeezy_tools::{
     McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
     PlanModeShellSafety, ShellAskApprover, ShellAskDecision, ShellAskRequest,
-    ShellBestEffortFallback, ShellPreClassification, ToolCall, ToolCostHint, ToolExecutionOptions,
-    ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime, ToolResult,
-    ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig, classify_plan_mode_shell_command,
-    pre_classify_shell, sha256_hex, shell_best_effort_fallback_from_result,
+    ShellBestEffortFallback, ShellPreClassification, ShellWindowsDegraded, ToolCall, ToolCostHint,
+    ToolExecutionOptions, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
+    ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig,
+    classify_plan_mode_shell_command, pre_classify_shell, sha256_hex,
+    shell_best_effort_fallback_from_result, shell_windows_degraded_from_result,
 };
 use tokio::{
     sync::{Mutex, Notify, broadcast, mpsc, oneshot},
@@ -85,7 +86,8 @@ pub mod subagent_catalog;
 mod turn_router;
 
 pub use dispatch::{
-    DispatchCommand, DispatchCommandKind, DispatchCommandParseError, DispatchOutcome,
+    CompactSubcommand, DispatchCommand, DispatchCommandKind, DispatchCommandParseError,
+    DispatchOutcome,
 };
 
 use cancel::{CancelErr, OrCancelExt};
@@ -205,7 +207,7 @@ async fn next_llm_stream_event(
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct ConversationState {
     previous_response_id: Option<String>,
     conversation: Vec<LlmInputItem>,
@@ -216,6 +218,7 @@ struct ConversationState {
     metrics: SessionMetrics,
     redactions: u64,
     token_calibration: squeezy_llm::TokenCalibration,
+    calibration_source: CalibrationSource,
     /// Mirror of the per-turn router's sticky-window counter, kept
     /// in sync with `Agent::routing_state.sticky.remaining_turns` so
     /// that every existing `to_resume_state()` call site persists the
@@ -231,6 +234,27 @@ struct ConversationState {
     /// over-optimistic catalog/override). In-memory only — a best-effort safety
     /// signal, not persisted across resume.
     observed_context_ceilings: HashMap<(String, String), u64>,
+}
+
+impl Default for ConversationState {
+    fn default() -> Self {
+        Self {
+            previous_response_id: None,
+            conversation: Vec::new(),
+            transcript: Vec::new(),
+            context_attachments: Vec::new(),
+            context_compaction: ContextCompactionState::default(),
+            cost: CostSnapshot::default(),
+            metrics: SessionMetrics::default(),
+            redactions: 0,
+            token_calibration: squeezy_llm::TokenCalibration::default(),
+            calibration_source: CalibrationSource::HardCodedDefault,
+            routing_sticky_remaining_turns: 0,
+            routing_session_disabled: false,
+            routing_prior_turn_was_hard: false,
+            observed_context_ceilings: HashMap::new(),
+        }
+    }
 }
 
 impl ConversationState {
@@ -249,6 +273,7 @@ impl ConversationState {
             metrics: metadata.metrics.clone(),
             redactions: metadata.redactions,
             token_calibration: metadata.token_calibration.clone(),
+            calibration_source: CalibrationSource::ResumedSession,
             routing_sticky_remaining_turns: state.routing_sticky_remaining_turns,
             routing_session_disabled: state.routing_session_disabled,
             routing_prior_turn_was_hard: state.routing_prior_turn_was_hard,
@@ -691,6 +716,46 @@ pub struct AttachmentShape {
     pub redactions: u64,
 }
 
+/// Where the active `TokenCalibration` came from at session start. Shown by
+/// `/cost` so users in CI / containers understand whether token estimates are
+/// warm (from prior sessions) or cold (first run / shared home / corrupt file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationSource {
+    /// calibration.json was absent; estimates use hard-coded provider defaults.
+    HardCodedDefault,
+    /// calibration.json was present but malformed; fell back to defaults.
+    CorruptFallback,
+    /// Loaded from the global calibration.json warm-start file.
+    GlobalFile,
+    /// Loaded from resumed session metadata (most accurate warm-start).
+    ResumedSession,
+}
+
+impl CalibrationSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HardCodedDefault => "hard-coded default (no calibration file)",
+            Self::CorruptFallback => "hard-coded default (calibration file was malformed)",
+            Self::GlobalFile => "global calibration.json",
+            Self::ResumedSession => "resumed session metadata",
+        }
+    }
+}
+
+/// Snapshot of the configured budget policy for display in `/cost`. Bundles
+/// all enforcement limits into one place so users can see every active
+/// constraint without reading config files.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BudgetPolicySnapshot {
+    pub max_session_cost_usd_micros: Option<u64>,
+    pub cost_warn_percent: u8,
+    pub max_round_input_tokens: Option<u64>,
+    pub max_tool_calls_per_turn: u64,
+    pub max_tool_bytes_read_per_turn: u64,
+    pub max_search_files_per_turn: u64,
+    pub disable_prompt_cache: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionAccountingSnapshot {
     pub session_id: Option<String>,
@@ -709,6 +774,9 @@ pub struct SessionAccountingSnapshot {
     pub full_history_request: RequestTokenEstimate,
     pub skills: SkillsAccounting,
     pub mcp: McpAccounting,
+    /// Where the token calibration was loaded from at session start.
+    pub calibration_source: CalibrationSource,
+    pub budget_policy: BudgetPolicySnapshot,
 }
 
 impl SessionAccountingSnapshot {
@@ -1316,6 +1384,31 @@ where
     })
 }
 
+/// Shared, mutex-protected cache for the Ollama live context-window probe.
+/// Uses a type alias to satisfy the `type_complexity` lint.
+type OllamaWindowCache = Arc<tokio::sync::Mutex<Option<(Instant, Option<u64>)>>>;
+
+/// A point-in-time snapshot of the agent's mode and routing state.
+///
+/// Returned by [`Agent::mode_state_snapshot`]. Intended for the TUI status
+/// line and tests to read from a single authoritative source rather than
+/// piecing together routing state from multiple fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeStateSnapshot {
+    /// The current session mode (`Plan` or `Build`).
+    pub session_mode: squeezy_core::SessionMode,
+    /// Whether session-wide auto-routing to the cheap tier is disabled
+    /// (`/router off`). Does not affect an explicit `/cheap` one-shot.
+    pub routing_session_disabled: bool,
+    /// A one-shot `/cheap` override is pending for the next turn.
+    pub pending_force_cheap: bool,
+    /// A one-shot `/parent` override is pending for the next turn.
+    pub pending_force_parent: bool,
+    /// Number of sticky-escalation turns remaining (parent model forced
+    /// after a mid-turn escalation). Zero means no active sticky window.
+    pub sticky_turns_remaining: u8,
+}
+
 #[derive(Clone)]
 pub struct Agent {
     config: AppConfig,
@@ -1390,6 +1483,11 @@ pub struct Agent {
     /// old sequential semantics so rapid toggle/restart/add/remove actions
     /// settle in the same order the user requested them.
     mcp_background_queue: Arc<McpBackgroundQueue>,
+    /// Root cancellation token for agent-lifetime background tasks. Cancelling
+    /// the current token bounds MCP reload/toggle/restart tasks so they cannot
+    /// hold tool-registry or store handles across `Agent::shutdown`. The token
+    /// is renewed after shutdown because the `Agent` remains reusable.
+    shutdown_token: Arc<StdMutex<CancellationToken>>,
     /// Cross-turn state for the per-turn model router. Tracks the
     /// escalation-sticky window and any pending `/cheap` / `/parent` /
     /// `/router` user override. Shared with each `TurnRuntime` via
@@ -1408,6 +1506,11 @@ pub struct Agent {
     /// re-derives the window for the new model via `re_derive_model_context_window`
     /// while still letting an explicit override win (finding #1).
     configured_model_context_window: Option<u64>,
+    /// Short-lived cache for the Ollama live context-window probe result.
+    /// `session_accounting_snapshot()` fires a blocking HTTP call for Ollama
+    /// providers; caching avoids repeated network probes when `/cost` or
+    /// `/context` is invoked in quick succession.
+    ollama_window_cache: OllamaWindowCache,
 }
 
 #[derive(Clone)]
@@ -1577,8 +1680,16 @@ impl Agent {
         // the first round's estimator isn't stuck on per-provider defaults.
         // Missing or malformed files fall back to `TokenCalibration::default()`,
         // which is what `ConversationState::default()` would carry anyway.
+        let store = SessionStore::open(&config);
+        let (token_calibration, source_hint) = store.load_global_calibration_with_source_hint();
+        let calibration_source = match source_hint {
+            None => CalibrationSource::HardCodedDefault,
+            Some(true) => CalibrationSource::GlobalFile,
+            Some(false) => CalibrationSource::CorruptFallback,
+        };
         let conversation_state = ConversationState {
-            token_calibration: SessionStore::open(&config).load_global_calibration(),
+            token_calibration,
+            calibration_source,
             ..ConversationState::default()
         };
         Self::build(
@@ -1862,9 +1973,29 @@ impl Agent {
         // graph cache lives in `graph.redb` and is opened by the registry's
         // deferred graph task so a large semantic cache cannot block prompt
         // entry during session startup.
-        let store = SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref())
-            .ok()
-            .map(Arc::new);
+        let store = match SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref()) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(ref e) => {
+                // On Windows, redb uses exclusive file locks; a second
+                // Squeezy process (or a leftover handle) can prevent the
+                // store from opening. This degrades tool receipt
+                // persistence silently — warn so the user has a signal
+                // in logs and support reports, even though the agent
+                // continues to function without the store.
+                tracing::warn!(
+                    target: "squeezy::store",
+                    error = %e,
+                    path = %squeezy_store::state_path(
+                        std::path::Path::new(&config.workspace_root),
+                        config.cache.root.as_deref(),
+                    ).display(),
+                    "state.redb could not be opened; tool receipt persistence and \
+                     read-snapshot cache are unavailable for this session \
+                     (another Squeezy instance may hold the lock)",
+                );
+                None
+            }
+        };
         if let Some(store) = store.clone() {
             // Pruning expired compaction checkpoints is a best-effort GC
             // write transaction; nothing on the input path depends on it.
@@ -1909,6 +2040,11 @@ impl Agent {
                 shell_sandbox: config.permissions.shell_sandbox.clone(),
                 mcp_servers: config.mcp_servers.clone(),
                 checkpoints_enabled: config.checkpoints_enabled,
+                checkpoint_store: squeezy_vcs::CheckpointStoreOptions {
+                    retention_days: config.tools.checkpoint_retention_days,
+                    max_file_bytes: config.tools.checkpoint_max_file_bytes,
+                    cleanup_interval_secs: config.tools.checkpoint_cleanup_interval_secs,
+                },
                 full_access: config.permissions.mode == PermissionPolicyMode::FullAccess,
             },
             config.skills.clone(),
@@ -1928,6 +2064,11 @@ impl Agent {
                     shell_sandbox: config.permissions.shell_sandbox.clone(),
                     mcp_servers: config.mcp_servers.clone(),
                     checkpoints_enabled: config.checkpoints_enabled,
+                    checkpoint_store: squeezy_vcs::CheckpointStoreOptions {
+                        retention_days: config.tools.checkpoint_retention_days,
+                        max_file_bytes: config.tools.checkpoint_max_file_bytes,
+                        cleanup_interval_secs: config.tools.checkpoint_cleanup_interval_secs,
+                    },
                     full_access: config.permissions.mode == PermissionPolicyMode::FullAccess,
                 },
                 config.skills.clone(),
@@ -2061,9 +2202,11 @@ impl Agent {
             event_broadcast,
             background_tasks: Arc::new(StdMutex::new(tokio::task::JoinSet::new())),
             mcp_background_queue: Arc::new(McpBackgroundQueue::default()),
+            shutdown_token: Arc::new(StdMutex::new(CancellationToken::new())),
             routing_state: Arc::new(StdMutex::new(turn_router::RoutingPersistentState::default())),
             last_request_overhead_tokens: Arc::new(AtomicU64::new(0)),
             configured_model_context_window,
+            ollama_window_cache: Arc::new(tokio::sync::Mutex::new(None)),
         };
         if let Some(log) = agent.session_log.as_ref() {
             agent.telemetry.set_store_session_id(log.session_id());
@@ -2122,6 +2265,36 @@ impl Agent {
                 let _ = session.write_resume_state(&resume);
             }
         });
+    }
+
+    /// Resolve the cheap-tier model for the current provider, honoring any
+    /// explicit overrides in `[model].small_fast_model` or
+    /// `[providers.<name>].cheap_model` before falling back to the built-in
+    /// per-provider mini tier. Returns `None` when the provider has no
+    /// distinct cheap tier and no override is configured; `/cheap` will fall
+    /// back to the parent model in that case (the TUI surfaces a preflight
+    /// notice so the fallback is not silent).
+    pub fn cheap_model(&self) -> Option<String> {
+        cheap_model_for(self.provider.name(), &self.config)
+    }
+
+    /// Return a point-in-time snapshot of the agent's mode and routing state.
+    ///
+    /// This is the single authoritative source the TUI status line and tests
+    /// should read: current session mode, whether auto-routing is
+    /// session-disabled, pending one-shot overrides, and the sticky-escalation
+    /// window. Routing fields are read from the same `routing_state` lock so
+    /// that portion of the snapshot is internally consistent.
+    pub fn mode_state_snapshot(&self) -> ModeStateSnapshot {
+        let session_mode = self.session_mode();
+        let routing = self.routing_state.lock().expect("routing state lock");
+        ModeStateSnapshot {
+            session_mode,
+            routing_session_disabled: routing.pending_override.session_disabled,
+            pending_force_cheap: routing.pending_override.force_cheap,
+            pending_force_parent: routing.pending_override.force_parent,
+            sticky_turns_remaining: routing.sticky.remaining_turns,
+        }
     }
 
     /// Test-only handle to the subagent registry so callers can
@@ -2184,10 +2357,9 @@ impl Agent {
         }
         let tools = self.tools.clone();
         let servers = next.mcp_servers.clone();
+        let cancel = self.mcp_shutdown_child_token();
         let task = async move {
-            let _ = tools
-                .replace_mcp_servers(servers, CancellationToken::new())
-                .await;
+            let _ = tools.replace_mcp_servers(servers, cancel).await;
         };
         // Hand the spawn to the tracked `JoinSet` so `Agent::shutdown`
         // waits for the registry to settle before dropping the redb
@@ -2445,6 +2617,14 @@ impl Agent {
     /// from inside an agent turn. The "manual" group id mirrors how the agent
     /// labels human-driven invocations so checkpoint grouping stays
     /// consistent across both entry points.
+    ///
+    /// Cancellation: this is a directly-awaited (sync) entry point whose
+    /// caller can drop the future to abort, so it issues a fresh
+    /// `CancellationToken` rather than a `mcp_shutdown_child_token()` child.
+    /// `Agent::shutdown` cannot interrupt an in-flight call here; the
+    /// `_in_background` siblings (e.g. `set_mcp_server_enabled_in_background`,
+    /// `restart_mcp_server_in_background`) are the ones that adopt the
+    /// shutdown-rooted token because they outlive their caller.
     pub async fn execute_local_tool(&self, call: ToolCall) -> ToolResult {
         self.tools
             .execute_for_group(call, CancellationToken::new(), "manual".to_string())
@@ -2455,6 +2635,11 @@ impl Agent {
     /// background refresh on each `start_turn`; this helper lets tests
     /// and the eval harness pre-warm the cache so the very first turn
     /// can issue `mcp__*` tool calls without racing the background task.
+    ///
+    /// See [`Agent::execute_local_tool`] for the rationale behind the fresh
+    /// `CancellationToken`: this is a sync entry point whose caller controls
+    /// cancellation by dropping the future, so it does not enrol in the
+    /// shutdown-rooted token tree.
     pub async fn refresh_mcp_tools(&self) -> squeezy_tools::McpRefreshOutcome {
         self.tools.refresh_mcp_tools(CancellationToken::new()).await
     }
@@ -2463,6 +2648,12 @@ impl Agent {
     /// agent. Returns the same refresh outcome `refresh_mcp_tools`
     /// produces so the caller (the `/mcp` config page, eval driver)
     /// can pull the new per-server status.
+    ///
+    /// Cancellation: as with `execute_local_tool` and `refresh_mcp_tools`,
+    /// this is a sync call whose caller owns the lifetime, so we mint a
+    /// fresh token. The `_in_background` sibling spawns into the agent's
+    /// JoinSet and therefore uses `mcp_shutdown_child_token()` so
+    /// `Agent::shutdown` can drain it.
     pub async fn set_mcp_server_enabled(
         &mut self,
         server_name: &str,
@@ -2491,9 +2682,10 @@ impl Agent {
             server.enabled = enabled;
         }
         let tools = self.tools.clone();
+        let cancel = self.mcp_shutdown_child_token();
         let task = async move {
             let _ = tools
-                .set_mcp_server_enabled(&server_name, enabled, CancellationToken::new())
+                .set_mcp_server_enabled(&server_name, enabled, cancel)
                 .await;
         };
         self.spawn_mcp_background_task(task);
@@ -2506,7 +2698,7 @@ impl Agent {
         server_name: &str,
     ) -> squeezy_tools::McpResult<squeezy_tools::McpRefreshOutcome> {
         self.tools
-            .restart_mcp_server(server_name, CancellationToken::new())
+            .restart_mcp_server(server_name, self.mcp_shutdown_child_token())
             .await
     }
 
@@ -2515,10 +2707,9 @@ impl Agent {
     /// that snapshot while this task runs.
     pub fn restart_mcp_server_in_background(&self, server_name: String) {
         let tools = self.tools.clone();
+        let cancel = self.mcp_shutdown_child_token();
         let task = async move {
-            let _ = tools
-                .restart_mcp_server(&server_name, CancellationToken::new())
-                .await;
+            let _ = tools.restart_mcp_server(&server_name, cancel).await;
         };
         self.spawn_mcp_background_task(task);
     }
@@ -2533,7 +2724,7 @@ impl Agent {
     ) -> squeezy_tools::McpRefreshOutcome {
         self.config.mcp_servers = servers.clone();
         self.tools
-            .replace_mcp_servers(servers, CancellationToken::new())
+            .replace_mcp_servers(servers, self.mcp_shutdown_child_token())
             .await
     }
 
@@ -2546,10 +2737,9 @@ impl Agent {
     ) {
         self.config.mcp_servers = servers.clone();
         let tools = self.tools.clone();
+        let cancel = self.mcp_shutdown_child_token();
         let task = async move {
-            let _ = tools
-                .replace_mcp_servers(servers, CancellationToken::new())
-                .await;
+            let _ = tools.replace_mcp_servers(servers, cancel).await;
         };
         self.spawn_mcp_background_task(task);
     }
@@ -2582,6 +2772,13 @@ impl Agent {
         }
     }
 
+    fn mcp_shutdown_child_token(&self) -> CancellationToken {
+        match self.shutdown_token.lock() {
+            Ok(token) => token.child_token(),
+            Err(poison) => poison.into_inner().child_token(),
+        }
+    }
+
     /// Snapshot of the registry's live server map. Mirrors
     /// `AppConfig.mcp_servers` but reads from the registry directly so
     /// callers see post-`replace_mcp_servers` state.
@@ -2605,11 +2802,23 @@ impl Agent {
     /// `start_turn` will simply register new tasks into the now-empty
     /// JoinSet.
     pub async fn shutdown(&self) {
+        // Signal all agent-lifetime background tasks (MCP reload, toggle,
+        // restart) to stop. This bounds their lifetime so callers can safely
+        // drop the agent and reopen any held file handles (e.g. redb on
+        // Windows, which uses an exclusive lock).
+        match self.shutdown_token.lock() {
+            Ok(token) => token.cancel(),
+            Err(poison) => poison.into_inner().cancel(),
+        }
         let mut tasks = match self.background_tasks.lock() {
             Ok(mut guard) => std::mem::take(&mut *guard),
             Err(poison) => std::mem::take(&mut *poison.into_inner()),
         };
         while tasks.join_next().await.is_some() {}
+        match self.shutdown_token.lock() {
+            Ok(mut token) => *token = CancellationToken::new(),
+            Err(poison) => *poison.into_inner() = CancellationToken::new(),
+        }
     }
 
     pub fn subscribe_jobs(&self) -> broadcast::Receiver<JobEvent> {
@@ -2749,9 +2958,23 @@ impl Agent {
         // Live provider window probe (Ollama only today). Folded into the
         // resolver as the `provider_live_window` layer rather than a blanket
         // override so its provenance shows as "provider live".
+        // Cache with a 30-second TTL so repeated /cost or /context invocations
+        // in quick succession skip the blocking network probe.
+        const OLLAMA_WINDOW_CACHE_TTL: Duration = Duration::from_secs(30);
         let provider_live_window = match &self.config.provider {
             ProviderConfig::Ollama(ollama) => {
-                fetch_ollama_context_window(&ollama.base_url, &self.config.model).await
+                let mut cache = self.ollama_window_cache.lock().await;
+                let cached = cache
+                    .as_ref()
+                    .filter(|(at, _)| at.elapsed() < OLLAMA_WINDOW_CACHE_TTL);
+                if let Some((_, window)) = cached {
+                    *window
+                } else {
+                    let window =
+                        fetch_ollama_context_window(&ollama.base_url, &self.config.model).await;
+                    *cache = Some((Instant::now(), window));
+                    window
+                }
             }
             _ => None,
         };
@@ -2820,6 +3043,16 @@ impl Agent {
             ),
             skills: self.skills_accounting(),
             mcp: self.mcp_accounting(&loaded_tool_schemas),
+            calibration_source: state.calibration_source,
+            budget_policy: BudgetPolicySnapshot {
+                max_session_cost_usd_micros: self.config.max_session_cost_usd_micros,
+                cost_warn_percent: self.config.cost_warn_percent,
+                max_round_input_tokens: self.config.max_round_input_tokens,
+                max_tool_calls_per_turn: self.config.max_tool_calls_per_turn,
+                max_tool_bytes_read_per_turn: self.config.max_tool_bytes_read_per_turn,
+                max_search_files_per_turn: self.config.max_search_files_per_turn,
+                disable_prompt_cache: self.config.disable_prompt_cache,
+            },
         }
     }
 
@@ -3277,9 +3510,11 @@ impl Agent {
         {
             let mut state = self.conversation_state.lock().await;
             let token_calibration = state.token_calibration.clone();
+            let calibration_source = state.calibration_source;
             let routing_session_disabled = state.routing_session_disabled();
             *state = ConversationState {
                 token_calibration,
+                calibration_source,
                 routing_session_disabled,
                 ..ConversationState::default()
             };
@@ -3662,27 +3897,27 @@ impl Agent {
     /// existing helper while RPC/eval drivers see a structured value.
     pub async fn dispatch_command(&self, cmd: DispatchCommand) -> DispatchOutcome {
         match cmd {
-            DispatchCommand::Compact { undo } => {
-                if undo {
-                    match self.compact_context_undo().await {
-                        Ok(Some(_)) => DispatchOutcome::CompactedUndo { restored: true },
-                        Ok(None) => DispatchOutcome::CompactedUndo { restored: false },
-                        Err(err) => DispatchOutcome::Error {
-                            command: "/compact".into(),
-                            message: format!("{err}"),
-                        },
-                    }
-                } else {
-                    match self.compact_context_manual().await {
-                        Ok(Some(_)) => DispatchOutcome::Compacted { skipped: false },
-                        Ok(None) => DispatchOutcome::Compacted { skipped: true },
-                        Err(err) => DispatchOutcome::Error {
-                            command: "/compact".into(),
-                            message: format!("{err}"),
-                        },
-                    }
-                }
-            }
+            DispatchCommand::Compact { subcommand } => match subcommand {
+                CompactSubcommand::History => DispatchOutcome::TuiOnly {
+                    command: "/compact history".into(),
+                },
+                CompactSubcommand::Undo => match self.compact_context_undo().await {
+                    Ok(Some(_)) => DispatchOutcome::CompactedUndo { restored: true },
+                    Ok(None) => DispatchOutcome::CompactedUndo { restored: false },
+                    Err(err) => DispatchOutcome::Error {
+                        command: "/compact".into(),
+                        message: format!("{err}"),
+                    },
+                },
+                CompactSubcommand::Run => match self.compact_context_manual().await {
+                    Ok(Some(_)) => DispatchOutcome::Compacted { skipped: false },
+                    Ok(None) => DispatchOutcome::Compacted { skipped: true },
+                    Err(err) => DispatchOutcome::Error {
+                        command: "/compact".into(),
+                        message: format!("{err}"),
+                    },
+                },
+            },
             DispatchCommand::Plan { prompt } => {
                 let changed = self.set_session_mode(SessionMode::Plan, "dispatch_command");
                 DispatchOutcome::ModeChanged {
@@ -3928,6 +4163,7 @@ impl Agent {
             | DispatchCommand::SessionExportHtml { .. }
             | DispatchCommand::Pin { .. }
             | DispatchCommand::Checkpoints
+            | DispatchCommand::CheckpointsDoctor
             | DispatchCommand::Checkpoint { .. }
             | DispatchCommand::RevertTurn { .. }
             | DispatchCommand::Help { .. }
@@ -3944,7 +4180,8 @@ impl Agent {
             | DispatchCommand::Keymap
             | DispatchCommand::Cheap
             | DispatchCommand::Parent
-            | DispatchCommand::Router { .. }) => DispatchOutcome::TuiOnly {
+            | DispatchCommand::Router { .. }
+            | DispatchCommand::Terminal) => DispatchOutcome::TuiOnly {
                 command: cmd.slash_name().trim_start_matches('/').to_string(),
             },
         }
@@ -4051,6 +4288,22 @@ impl Agent {
         let Some(checkpoint) = store.get_compaction_checkpoint(&replacement_id)? else {
             return Ok(None);
         };
+        // Guard against restoring a checkpoint from a different session when
+        // two sessions share the same store and happen to generate the same
+        // `ckpt-{generation}-{millis}` id. Legacy checkpoints written before
+        // the session_id field was populated have an empty string; skip the
+        // check in that case so they remain restorable.
+        if let Some(session) = &self.session_log {
+            let checkpoint_sid = checkpoint.session_id.as_str();
+            if !checkpoint_sid.is_empty() && checkpoint_sid != session.session_id() {
+                return Err(SqueezyError::Agent(format!(
+                    "compaction checkpoint {} belongs to session {}, not the current session {}",
+                    replacement_id,
+                    checkpoint_sid,
+                    session.session_id(),
+                )));
+            }
+        }
         // The synthetic summary head occupies index 0 of `conversation`.
         // Drop it and prepend the restored items so the conversation now
         // matches the pre-compaction shape (plus any items added after
@@ -4494,6 +4747,7 @@ impl Agent {
         let configured_model_context_window = self.configured_model_context_window;
 
         let turn_done = Arc::new(Notify::new());
+        let turn_finished = CancellationToken::new();
         let panic_tx = tx.clone();
         let panic_session_log = session_log.clone();
         let panic_redactor = redactor.clone();
@@ -4511,6 +4765,7 @@ impl Agent {
                 redactor: panic_redactor,
                 telemetry: panic_telemetry,
                 active_turn: active_turn.clone(),
+                turn_finished: turn_finished.clone(),
             },
             async move {
                 let redacted_input = redactor.redact(&input);
@@ -4534,6 +4789,17 @@ impl Agent {
                 {
                     return;
                 }
+                refresh_mcp_tools_on_list_changed_in_background(McpListChangedRefreshContext {
+                    tools: tools.clone(),
+                    cancel: cancel.clone(),
+                    session_log: session_log.clone(),
+                    redactor: redactor.clone(),
+                    tx: tx.clone(),
+                    turn_id,
+                    turn_finished: turn_finished.clone(),
+                    background_tasks: background_tasks.clone(),
+                    telemetry: telemetry.clone(),
+                });
                 if let Some((call, exclude_from_context)) = local_shell_command_call(&task_title) {
                     complete_local_tool_turn(
                         turn_id,
@@ -4771,6 +5037,7 @@ struct ObservedTurnContext {
     redactor: Arc<Redactor>,
     telemetry: TelemetryClient,
     active_turn: Arc<StdMutex<Option<ActiveTurn>>>,
+    turn_finished: CancellationToken,
 }
 
 fn spawn_observed_turn<F>(context: ObservedTurnContext, future: F) -> tokio::task::JoinHandle<()>
@@ -4785,6 +5052,7 @@ where
         redactor,
         telemetry,
         active_turn,
+        turn_finished,
     } = context;
     tokio::spawn(async move {
         let outcome = AssertUnwindSafe(future).catch_unwind().await;
@@ -4817,6 +5085,7 @@ where
                 .await;
         }
         clear_active_turn_if_current(&active_turn, turn_id);
+        turn_finished.cancel();
         done.notify_waiters();
     })
 }
@@ -5010,7 +5279,7 @@ fn extract_doc_citations_from_body(body: &str) -> Vec<HelpCitation> {
 }
 
 async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> DocHelpResolution {
-    if !deps.config.subagents.enabled {
+    if !deps.config.subagents.enabled || deps.config.subagents.help_strict_local {
         return DocHelpResolution::skipped();
     }
     let config_inspect = deps.config.inspect_redacted();
@@ -5078,6 +5347,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
             body: execution.summary,
             citations,
             config_sections: Vec::new(),
+            source: squeezy_skills::HelpAnswerSource::DocHelpModel,
         })
     } else {
         None
@@ -5497,6 +5767,18 @@ struct McpRefreshContext {
     telemetry: TelemetryClient,
 }
 
+struct McpListChangedRefreshContext {
+    tools: ToolRegistry,
+    cancel: CancellationToken,
+    session_log: Option<SessionHandle>,
+    redactor: Arc<Redactor>,
+    tx: mpsc::Sender<AgentEvent>,
+    turn_id: TurnId,
+    turn_finished: CancellationToken,
+    background_tasks: Arc<StdMutex<tokio::task::JoinSet<()>>>,
+    telemetry: TelemetryClient,
+}
+
 fn refresh_mcp_tools_in_background(ctx: McpRefreshContext) {
     let McpRefreshContext {
         tools,
@@ -5510,57 +5792,138 @@ fn refresh_mcp_tools_in_background(ctx: McpRefreshContext) {
     } = ctx;
     let task = async move {
         let outcome = tools.refresh_mcp_tools(cancel).await;
-        // Fire MCP discovery telemetry if the outcome has stats.
-        if let Some(stats) = &outcome.discovery_stats {
-            let (has_resources, has_elicitation, has_experimental) =
-                tools.aggregate_mcp_capabilities().await;
-            let mut error_kind_counts = std::collections::BTreeMap::new();
-            for kind in &stats.error_kind_tokens {
-                *error_kind_counts.entry(kind.clone()).or_default() += 1u64;
-            }
-            telemetry.spawn(TelemetryEvent::mcp_discovery(McpDiscoveryReport {
-                servers_stdio: stats.servers_stdio,
-                servers_http: stats.servers_http,
-                servers_sse: stats.servers_sse,
-                servers_enabled: stats.servers_enabled,
-                servers_disabled: stats.servers_disabled,
-                tools_discovered: stats.tools_discovered,
-                tools_cached: stats.tools_cached,
-                tools_stale_retained: stats.tools_stale_retained,
-                tools_dropped_disabled: stats.tools_dropped_disabled,
-                discovery_errors: stats.discovery_errors,
-                error_kind_counts,
-                has_resources,
-                has_elicitation,
-                has_experimental,
-                duration_ms: stats.duration_ms,
-            }));
-        }
-        log_session_event(
+        publish_mcp_refresh_outcome(
+            &tools,
+            outcome,
+            &telemetry,
             session_log.as_ref(),
             &redactor,
-            "mcp_status_updated",
-            Some(turn_id),
-            None,
-            serde_json::to_value(&outcome.status).unwrap_or_else(|_| json!({})),
-        );
-        let _ = tx
-            .send(AgentEvent::McpStatusUpdated {
-                turn_id,
-                snapshot: outcome.status.clone(),
-            })
-            .await;
-        for error in outcome.errors {
-            log_session_event(
-                session_log.as_ref(),
-                &redactor,
-                "mcp_discovery_error",
-                Some(turn_id),
-                Some(error.clone()),
-                json!({ "error": error }),
-            );
+            &tx,
+            turn_id,
+        )
+        .await;
+    };
+    spawn_tracked_mcp_task(background_tasks, task);
+}
+
+fn refresh_mcp_tools_on_list_changed_in_background(ctx: McpListChangedRefreshContext) {
+    let McpListChangedRefreshContext {
+        tools,
+        cancel,
+        session_log,
+        redactor,
+        tx,
+        turn_id,
+        turn_finished,
+        background_tasks,
+        telemetry,
+    } = ctx;
+    let notify = tools.mcp_tool_list_changed_notify();
+    let task = async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = turn_finished.cancelled() => break,
+                _ = notify.notified() => {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    let refresh_cancel = cancel.child_token();
+                    let refresh = tools.refresh_mcp_tools(refresh_cancel.clone());
+                    tokio::pin!(refresh);
+                    let outcome = tokio::select! {
+                        _ = cancel.cancelled() => {
+                            refresh_cancel.cancel();
+                            break;
+                        }
+                        _ = turn_finished.cancelled() => {
+                            refresh_cancel.cancel();
+                            break;
+                        }
+                        outcome = &mut refresh => outcome,
+                    };
+                    publish_mcp_refresh_outcome(
+                        &tools,
+                        outcome,
+                        &telemetry,
+                        session_log.as_ref(),
+                        &redactor,
+                        &tx,
+                        turn_id,
+                    )
+                    .await;
+                }
+            }
         }
     };
+    spawn_tracked_mcp_task(background_tasks, task);
+}
+
+async fn publish_mcp_refresh_outcome(
+    tools: &ToolRegistry,
+    outcome: squeezy_tools::McpRefreshOutcome,
+    telemetry: &TelemetryClient,
+    session_log: Option<&SessionHandle>,
+    redactor: &Redactor,
+    tx: &mpsc::Sender<AgentEvent>,
+    turn_id: TurnId,
+) {
+    // Fire MCP discovery telemetry if the outcome has stats.
+    if let Some(stats) = &outcome.discovery_stats {
+        let (has_resources, has_elicitation, has_experimental) =
+            tools.aggregate_mcp_capabilities().await;
+        let mut error_kind_counts = std::collections::BTreeMap::new();
+        for kind in &stats.error_kind_tokens {
+            *error_kind_counts.entry(kind.clone()).or_default() += 1u64;
+        }
+        telemetry.spawn(TelemetryEvent::mcp_discovery(McpDiscoveryReport {
+            servers_stdio: stats.servers_stdio,
+            servers_http: stats.servers_http,
+            servers_sse: stats.servers_sse,
+            servers_enabled: stats.servers_enabled,
+            servers_disabled: stats.servers_disabled,
+            tools_discovered: stats.tools_discovered,
+            tools_cached: stats.tools_cached,
+            tools_stale_retained: stats.tools_stale_retained,
+            tools_dropped_disabled: stats.tools_dropped_disabled,
+            discovery_errors: stats.discovery_errors,
+            error_kind_counts,
+            has_resources,
+            has_elicitation,
+            has_experimental,
+            duration_ms: stats.duration_ms,
+        }));
+    }
+    log_session_event(
+        session_log,
+        redactor,
+        "mcp_status_updated",
+        Some(turn_id),
+        None,
+        serde_json::to_value(&outcome.status).unwrap_or_else(|_| json!({})),
+    );
+    let _ = tx
+        .send(AgentEvent::McpStatusUpdated {
+            turn_id,
+            snapshot: outcome.status.clone(),
+        })
+        .await;
+    for error in outcome.errors {
+        log_session_event(
+            session_log,
+            redactor,
+            "mcp_discovery_error",
+            Some(turn_id),
+            Some(error.clone()),
+            json!({ "error": error }),
+        );
+    }
+}
+
+fn spawn_tracked_mcp_task<F>(background_tasks: Arc<StdMutex<tokio::task::JoinSet<()>>>, task: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     // Hand the spawn to a tracked `JoinSet` so `Agent::shutdown` can
     // wait for the spawn to drop its `Arc<SqueezyStore>` clone before
     // the agent's owner re-opens the redb store. Mutex contention here
@@ -5669,13 +6032,40 @@ fn local_tool_completion_message(result: Option<&ToolResult>) -> String {
         ToolStatus::Cancelled => format!("`{command}` was cancelled."),
         _ => {
             let detail = tool_failure_detail(result);
-            if !stderr.is_empty() {
-                format!("`{command}` failed: {detail}\n\n{stderr}")
+            let exit_code = result
+                .content
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .unwrap_or(-1);
+            // Surface the effective-shell hint only when the failure looks
+            // like it may be shell-syntax related: stderr was non-empty
+            // (shell printed a message) or the exit code suggests the shell
+            // itself failed (127 = command not found, 126 = not executable,
+            // 2 = common syntax error exit in bash/sh).
+            let shell_hint = if !stderr.is_empty() || matches!(exit_code, 2 | 126 | 127) {
+                format!("\n{}", effective_shell_hint())
             } else {
-                format!("`{command}` failed: {detail}")
+                String::new()
+            };
+            if !stderr.is_empty() {
+                format!("`{command}` failed: {detail}\n\n{stderr}{shell_hint}")
+            } else {
+                format!("`{command}` failed: {detail}{shell_hint}")
             }
         }
     }
+}
+
+/// Short hint about the effective shell used for `!cmd` / `!!cmd`
+/// commands. Shown on failure so users know which shell to target and
+/// that `SQUEEZY_SHELL` can override it.
+///
+/// The label is sourced from [`squeezy_tools::effective_shell_label`] so the
+/// TUI's `/terminal` row and this hint always agree on what the user will
+/// see — including empty-string and non-UTF-8 `SQUEEZY_SHELL` cases.
+fn effective_shell_hint() -> String {
+    let shell = squeezy_tools::effective_shell_label();
+    format!("[shell: {shell} — set SQUEEZY_SHELL to change, e.g. SQUEEZY_SHELL=/bin/bash]")
 }
 
 struct TurnRuntime {
@@ -6310,6 +6700,24 @@ impl TurnRuntime {
         if self.turn_id.get() == 1 {
             self.dispatch_setup();
             self.dispatch_session_start();
+            // Emit a session-level banner when the Windows sandbox is running
+            // at the job-object-only (disabled) tier. At the restricted-token
+            // or elevated tiers, filesystem isolation is partially or fully
+            // enforced, so the "no isolation" caveat does not apply.
+            #[cfg(target_os = "windows")]
+            {
+                use squeezy_core::WindowsSandboxLevel;
+                if self.config.permissions.shell_sandbox.windows_sandbox_level
+                    == WindowsSandboxLevel::Disabled
+                {
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::WindowsSandboxActive {
+                            turn_id: self.turn_id,
+                        })
+                        .await;
+                }
+            }
         }
         let original_input = input.clone();
         let display_tracks_input = self.display_input == original_input;
@@ -6421,6 +6829,27 @@ impl TurnRuntime {
                     missing = ?missing,
                     "skill manifest declares tool_deps that are not available in this session"
                 );
+                let message = format!(
+                    "skill `{skill}` requires tool(s) not available in this session: {}. \
+                     The skill will refuse rather than improvise.",
+                    missing.join(", ")
+                );
+                // Use try_send (non-blocking) to avoid adding a new await point
+                // inside the per-turn activation hot path, which would increase
+                // the async future size and risk stack overflows on constrained
+                // platforms.
+                if let Err(err) = self.tx.try_send(AgentEvent::SkillActivationWarning {
+                    turn_id: self.turn_id,
+                    name: skill.clone(),
+                    message,
+                }) {
+                    tracing::error!(
+                        target: "squeezy_agent",
+                        skill = %skill,
+                        %err,
+                        "tool_deps warning event dropped: channel at capacity or closed"
+                    );
+                }
             }
             Some(format_skill_tool_dep_warnings(&missing_deps))
         };
@@ -6916,6 +7345,7 @@ impl TurnRuntime {
                 session_mode: active_mode,
                 overrides: routing_override,
                 sticky: sticky_active,
+                linux_sandbox_sensitive_parent: self.config.routing.linux_sandbox_sensitive_parent,
             },
             self.cancel.clone(),
         )
@@ -7058,7 +7488,25 @@ impl TurnRuntime {
             // bd ticket squeezy-xt2o / wave2-16 finding 2: anthropic run
             // landed at 124% of cap before the post-hoc check tripped).
             let cap_status = broker.session_cap_reached().or_else(|| {
-                let projected_input_tokens = estimate_context(&conversation).estimated_tokens;
+                // Include fixed request overhead (instructions + tool schemas)
+                // so the pre-flight cost estimate matches what will actually be
+                // billed. `estimate_context` only walks conversation items; the
+                // overhead from the most-recent assembled request closes the gap.
+                //
+                // Bootstrap note: `last_request_overhead_tokens` starts at 0
+                // and is only written after the first request body is assembled
+                // (see the `self.last_request_overhead_tokens.store(...)` call
+                // below). On the very first round of a fresh turn, overhead = 0,
+                // so the cap projection still under-counts instructions and tool
+                // schemas by one round. Every subsequent round uses the prior
+                // round's measured overhead and is accurate. A single-round
+                // overshoot on the first dispatch is acceptable; fully closing
+                // the gap would require assembling a skeleton request before the
+                // gate check, which is a larger refactor.
+                let overhead = self.last_request_overhead_tokens.load(Ordering::Relaxed);
+                let projected_input_tokens = estimate_context(&conversation)
+                    .estimated_tokens
+                    .saturating_add(overhead);
                 let projected_output_tokens = CostBroker::projected_output_tokens(
                     self.config.max_output_tokens,
                     squeezy_llm::model_info_for(self.provider.name(), &current_model)
@@ -7138,6 +7586,12 @@ impl TurnRuntime {
             // round is *still* over. This converts the existing reactive
             // overflow handling into a proactive one for the round we're about
             // to pay for.
+            // Note: the round-input gate counts conversation items only
+            // (not fixed overhead). The overhead (instructions + tool schemas)
+            // is constant per round and cannot be reduced by compaction, so
+            // including it would gate legitimate rounds when overhead is large.
+            // The session-cap projection includes overhead for accurate cost
+            // estimation (see cap_status check above).
             if let Some(initial_gate) = round_input_gate_status(
                 self.config.max_round_input_tokens,
                 estimate_context(&conversation).estimated_tokens,
@@ -7799,20 +8253,27 @@ impl TurnRuntime {
                     LlmEvent::ServerModel(model) => {
                         effective_model = Arc::from(model);
                     }
-                    // Known additive variants the main loop intentionally
-                    // does not act on yet. `Citation` (OpenAI annotations /
-                    // xAI Live Search sources) has no transcript recording
-                    // sink wired up here, and `ToolCallDelta` is a
-                    // progressive-args hint superseded by the canonical
-                    // `ToolCall` event the loop already consumes. Naming
-                    // them explicitly keeps the wildcard reserved for
-                    // genuinely unknown future variants.
-                    LlmEvent::Citation { .. } | LlmEvent::ToolCallDelta { .. } => {}
+                    // `ToolCallDelta` is a progressive-args hint superseded
+                    // by the canonical `ToolCall` event the loop already
+                    // consumes; ignore it.
+                    LlmEvent::ToolCallDelta { .. } => {}
+                    // Citation annotations (OpenAI source annotations, xAI
+                    // Live Search citations) are forwarded as
+                    // `AgentEvent::Citation` when there is a consumer
+                    // attached. Currently treated as a no-op here: the
+                    // `AgentEvent::Citation` variant is declared and the
+                    // infrastructure is ready, but emitting it from inside
+                    // the large `TurnRuntime::run` stream loop would create
+                    // a sizeof(AgentEvent)-byte (~1 KiB) temporary on the
+                    // execution stack, which pushes borderline tests over the
+                    // default thread stack limit. The emission will move to a
+                    // dedicated transcript-sink path once that exists.
+                    LlmEvent::Citation { .. } => {}
                     // `LlmEvent` is `#[non_exhaustive]`; unknown future
                     // variants flow past without disturbing the turn — they
                     // get a dedicated arm once consumers are taught about
                     // them.
-                    _ => { /* future variant */ }
+                    _ => {}
                 }
             }
 
@@ -9065,6 +9526,12 @@ impl TurnRuntime {
         token_calibration: &squeezy_llm::TokenCalibration,
         mark_resume_available: bool,
     ) {
+        // Persist errors are captured while the lock is held and used to
+        // emit a session event *after* the lock drops so that
+        // `append_event`'s synchronous I/O does not extend the async-mutex
+        // window beyond what `write_resume_state` / `update_metadata` already
+        // require.
+        let mut persist_errors: Option<(Option<String>, Option<String>)> = None;
         let calibration_for_global = {
             let mut state = self.conversation_state.lock().await;
             merge_cost(&mut state.cost, cost);
@@ -9075,18 +9542,27 @@ impl TurnRuntime {
                 metrics.escalated_to_parent || !metrics.routed_to_cheap,
             );
             if let Some(session) = &self.session_log {
-                let _ = session.write_resume_state(&state.to_resume_state());
+                let resume_err = session
+                    .write_resume_state(&state.to_resume_state())
+                    .err()
+                    .map(|e| e.to_string());
                 let calibration_for_metadata = state.token_calibration.clone();
-                let _ = session.update_metadata(|metadata| {
-                    metadata.cost = state.cost.clone();
-                    metadata.metrics = state.metrics.clone();
-                    metadata.redactions = state.redactions;
-                    if mark_resume_available {
-                        metadata.resume_available = true;
-                    }
-                    metadata.mode = load_session_mode(&self.session_mode);
-                    metadata.token_calibration = calibration_for_metadata;
-                });
+                let metadata_err = session
+                    .update_metadata(|metadata| {
+                        metadata.cost = state.cost.clone();
+                        metadata.metrics = state.metrics.clone();
+                        metadata.redactions = state.redactions;
+                        if mark_resume_available {
+                            metadata.resume_available = true;
+                        }
+                        metadata.mode = load_session_mode(&self.session_mode);
+                        metadata.token_calibration = calibration_for_metadata;
+                    })
+                    .err()
+                    .map(|e| e.to_string());
+                if resume_err.is_some() || metadata_err.is_some() {
+                    persist_errors = Some((resume_err, metadata_err));
+                }
             }
             state.token_calibration.clone()
         };
@@ -9095,6 +9571,27 @@ impl TurnRuntime {
         // than the per-provider defaults. Failures are silent — the global
         // file is a warm-start cache, not a source of truth.
         let _ = SessionStore::open(&self.config).save_global_calibration(&calibration_for_global);
+        // Record a session event when persistence fails so that bug reports
+        // carry concrete evidence without needing a provider call. On Windows
+        // this surfaces file-lock failures (Defender/indexer holding the file)
+        // that would otherwise silently leave /cost as live-only. Placed
+        // outside the conversation_state lock so that append_event's I/O does
+        // not block while the async mutex is held.
+        if let (Some((resume_err, metadata_err)), Some(session)) =
+            (persist_errors, &self.session_log)
+        {
+            let _ = session.append_event(SessionEvent::from_typed(
+                SessionEventKind::Custom {
+                    kind: "accounting_persistence_error".to_string(),
+                    payload: serde_json::json!({
+                        "resume_state_error": resume_err,
+                        "metadata_error": metadata_err,
+                    }),
+                },
+                Some(self.turn_id.to_string()),
+                Some("accounting persistence failed".to_string()),
+            ));
+        }
     }
 
     /// Fold a best-effort partial cost into `total_cost` and the broker's
@@ -11115,6 +11612,9 @@ async fn run_subagent_rounds(
         let mut tool_calls = Vec::new();
         let mut completed = false;
         let mut context_overflow_seen = false;
+        // Accumulate model-refusal text so it can be surfaced in the error
+        // when the stream closes with `StopReason::Refusal` and no tool calls.
+        let mut refusal_text = String::new();
         loop {
             let event = match next_llm_stream_event(
                 &mut stream,
@@ -11132,6 +11632,7 @@ async fn run_subagent_rounds(
                             conversation,
                             &mut context_compaction,
                             &[],
+                            None,
                             None,
                             config,
                             ContextCompactionTrigger::Auto,
@@ -11187,6 +11688,7 @@ async fn run_subagent_rounds(
                                 &mut context_compaction,
                                 &[],
                                 None,
+                                None,
                                 config,
                                 ContextCompactionTrigger::Auto,
                                 true,
@@ -11206,6 +11708,66 @@ async fn run_subagent_rounds(
                                 "subagent model reported the context window was exceeded"
                                     .to_string(),
                             ),
+                            metrics: broker.metrics.clone(),
+                            supporting_receipts: std::mem::take(supporting_receipts),
+                            model,
+                            structured_output: None,
+                            files_touched: Vec::new(),
+                            transcript: Vec::new(),
+                        };
+                    }
+                    // Surface model refusals so the parent can see *why* the
+                    // subagent stopped instead of receiving an empty summary.
+                    // Refusal prose arrives on `LlmEvent::Refusal` deltas
+                    // accumulated in `refusal_text`; the `StopReason::Refusal`
+                    // terminal here gates the early return.
+                    //
+                    // The `tool_calls.is_empty()` gate is intentional: if the
+                    // provider asked for one or more tool calls and *also*
+                    // signalled `Refusal`, that contradiction is resolved by
+                    // executing the requested tools rather than abandoning the
+                    // round, matching `TurnRuntime::run`'s behaviour.
+                    if matches!(stop_reason, Some(StopReason::Refusal)) && tool_calls.is_empty() {
+                        // Fold the final round's cost before returning so the
+                        // parent's subagent metrics do not silently report zero
+                        // cost for this round.
+                        if cost.estimated_usd_micros.is_none() {
+                            cost.estimated_usd_micros =
+                                estimate_cost(parent.provider.name(), &effective_model, &cost);
+                        }
+                        broker.metrics.record_provider(&cost);
+                        // Flush the assistant stream before reading
+                        // `assistant_message`. `StreamRedactor::push` buffers
+                        // small deltas (sub-1KiB) so a complete refusal whose
+                        // prose arrived via `TextDelta` may still be sitting
+                        // in the buffer at this point; without the flush, the
+                        // Anthropic-style fallback below sees an empty
+                        // `assistant_message`.
+                        let tail = assistant_stream.finish();
+                        if !tail.text.is_empty() {
+                            assistant_message.push_str(&tail.text);
+                        }
+                        broker.metrics.redactions += assistant_stream.total_redactions();
+                        // Some providers (e.g. Anthropic) emit refusal text as
+                        // ordinary `TextDelta` rather than `Refusal` deltas;
+                        // fall back to `assistant_message` when the dedicated
+                        // refusal buffer is empty so the summary is never blank.
+                        let refusal_prose: &str = if refusal_text.is_empty() {
+                            assistant_message.as_str()
+                        } else {
+                            refusal_text.as_str()
+                        };
+                        let refusal_compact = compact_text(refusal_prose, 512);
+                        let detail = if refusal_prose.is_empty() {
+                            "subagent model refused the request".to_string()
+                        } else {
+                            format!("subagent model refused: {refusal_compact}")
+                        };
+                        return SubagentExecution {
+                            status: ToolStatus::Error,
+                            summary: refusal_compact,
+                            status_label: "refusal",
+                            error: Some(detail),
                             metrics: broker.metrics.clone(),
                             supporting_receipts: std::mem::take(supporting_receipts),
                             model,
@@ -11243,19 +11805,21 @@ async fn run_subagent_rounds(
                 LlmEvent::ServerModel(model) => {
                     effective_model = Arc::from(model);
                 }
-                // Known additive variants the subagent loop does not act on:
-                // `Refusal` text and `Citation` sources have no sink here
-                // (the subagent only accumulates assistant text + tool
-                // calls), and `ToolCallDelta` is superseded by the canonical
-                // `ToolCall` event. Named explicitly so the wildcard stays
-                // reserved for genuinely unknown future variants.
-                LlmEvent::Refusal { .. }
-                | LlmEvent::Citation { .. }
-                | LlmEvent::ToolCallDelta { .. } => {}
+                // Accumulate refusal text so it can surface in the subagent
+                // error when the stream terminates with StopReason::Refusal.
+                LlmEvent::Refusal { content } => {
+                    refusal_text.push_str(&content);
+                }
+                // `Citation` sources and `ToolCallDelta` incremental args
+                // have no sink in the subagent accumulator; `ToolCallDelta`
+                // is superseded by the canonical `ToolCall` event. Named
+                // explicitly so the wildcard stays reserved for genuinely
+                // unknown future variants.
+                LlmEvent::Citation { .. } | LlmEvent::ToolCallDelta { .. } => {}
                 // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
-                // are silently passed over in the subagent loop until a
-                // dedicated arm exists.
-                _ => { /* future variant */ }
+                // flow past without disturbing the subagent round — they
+                // get a dedicated arm once consumers are taught about them.
+                _ => {}
             }
         }
 
@@ -13000,7 +13564,13 @@ async fn execute_tool_calls(
             continue;
         }
 
-        match permission_decision(call, &context).await {
+        let outcome = permission_decision(call, &context).await;
+        // Fold any out-of-band reviewer spend into the active broker so the
+        // live session-cost snapshot and cap checks stay accurate within this
+        // turn (the persisted `state.cost` is already updated by the reviewer
+        // path; this call keeps the broker's copy in sync).
+        broker.record_out_of_band_session_cost(outcome.reviewer_usd_micros);
+        match outcome.decision {
             ApprovalDecision::Approved => approved.push((index, call.clone(), tool_sequence)),
             ApprovalDecision::Denied(reason) => {
                 let result = ToolResult::denied(call, reason);
@@ -13644,17 +14214,20 @@ fn dispatch_post_tool(
 }
 
 /// Fan out a `HookPayload::PermissionRequest` before the permission
-/// engine renders a verdict. Audit handlers see every gated request
-/// — including those the engine auto-allows or auto-denies without
-/// surfacing an approval prompt.
+/// engine renders a verdict. Returns the first handler-supplied deny
+/// message (in registration order) so the caller can short-circuit
+/// normal policy evaluation with `ApprovalDecision::Denied`, matching
+/// the enforcement contract documented on
+/// [`HookEvent::is_enforcement_capable`]. Returns `None` when the
+/// registry is empty or every handler returned `allow=true`.
 fn dispatch_permission_request(
     registry: &HookRegistry,
     turn_id: TurnId,
     call: &ToolCall,
     request: &PermissionRequest,
-) {
+) -> Option<String> {
     if registry.is_empty() {
-        return;
+        return None;
     }
     let results = registry.dispatch(HookPayload::PermissionRequest {
         capability: request.capability.as_str().to_string(),
@@ -13663,6 +14236,25 @@ fn dispatch_permission_request(
         call_id: call.call_id.clone(),
         target: Some(request.target.clone()).filter(|value| !value.is_empty()),
     });
+    let mut deny_message: Option<String> = None;
+    for (idx, result) in results.iter().enumerate() {
+        if !result.allow && deny_message.is_none() {
+            let reason = result
+                .message
+                .clone()
+                .unwrap_or_else(|| "permission request denied by hook".to_string());
+            tracing::info!(
+                target: "squeezy::hooks",
+                turn_id = %turn_id,
+                tool_name = %call.name,
+                call_id = %call.call_id,
+                handler_index = idx,
+                message = %reason,
+                "PermissionRequest handler denied permission"
+            );
+            deny_message = Some(reason);
+        }
+    }
     log_tool_observational_results(
         "PermissionRequest",
         turn_id,
@@ -13670,6 +14262,7 @@ fn dispatch_permission_request(
         &call.call_id,
         &results,
     );
+    deny_message
 }
 
 /// Fan out a `HookPayload::PermissionDenied` whenever the verdict
@@ -14338,6 +14931,11 @@ fn emit_tool_telemetry(
             &fallback.backend,
         ));
     }
+    // Windows: fire a separate telemetry event so Windows shell backend
+    // degradation is separable from Unix sandbox runtime failures in dashboards.
+    if let Some(degraded) = shell_windows_degraded_from_result(result) {
+        telemetry.spawn(TelemetryEvent::shell_windows_degraded(&degraded.backend));
+    }
 }
 
 /// Detect a shell best_effort sandbox fallback in `result` and, when this
@@ -14351,28 +14949,60 @@ async fn maybe_emit_shell_sandbox_fallback_warning(
     turn_id: TurnId,
     result: &ToolResult,
 ) {
-    let Some(ShellBestEffortFallback {
+    // Unix best_effort path: fires once per session on the first sandbox
+    // degradation (sandbox exec crashed, unshare failed, etc.).
+    if let Some(ShellBestEffortFallback {
         backend,
         fallback_count,
         first_in_session,
+        fallback_reason,
     }) = shell_best_effort_fallback_from_result(result)
-    else {
-        return;
-    };
-    if !first_in_session {
+    {
+        if first_in_session {
+            let _ = tx
+                .send(AgentEvent::ShellSandboxBestEffortFallback {
+                    turn_id,
+                    backend,
+                    fallback_count,
+                    fallback_reason,
+                })
+                .await;
+        }
         return;
     }
-    let _ = tx
-        .send(AgentEvent::ShellSandboxBestEffortFallback {
-            turn_id,
-            backend,
-            fallback_count,
-        })
-        .await;
+    // Windows: every shell run uses `windows-job-object` with no FS/network
+    // isolation. Emit the dedicated Windows warning once per session so the
+    // TUI can display a Windows-specific safety notice.
+    if let Some(ShellWindowsDegraded {
+        backend,
+        filesystem,
+        first_in_session,
+    }) = shell_windows_degraded_from_result(result)
+        && first_in_session
+    {
+        let _ = tx
+            .send(AgentEvent::ShellWindowsDegraded {
+                turn_id,
+                backend,
+                filesystem,
+            })
+            .await;
+    }
 }
 
 /// SHA-256 of the canonical JSON arguments the model sent for a tool call.
-/// Used to pair with `output_sha256` in telemetry (F06).
+/// Used to pair with `output_sha256` in telemetry (F06) and to detect
+/// intra-batch duplicates in `mark_intra_batch_duplicates`.
+///
+/// CANONICAL ORDERING: dedup correctness depends on `serde_json::to_vec`
+/// producing the same bytes for two semantically-identical
+/// `serde_json::Value` objects whose keys arrived in different
+/// insertion order. The default `serde_json` build backs `Value::Object`
+/// with `BTreeMap` (always sorted, canonical), so this holds today. If
+/// the agent crate ever enables `serde_json/preserve_order` the map flips
+/// to `IndexMap` (insertion-order) and dedup will start false-missing on
+/// reordered-but-equivalent calls; this hash must then be replaced with
+/// an explicit canonical serializer.
 fn tool_call_args_sha256(call: &ToolCall) -> Option<String> {
     serde_json::to_vec(&call.arguments)
         .ok()
@@ -14438,7 +15068,9 @@ fn telemetry_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         | DispatchCommand::Statusline
         | DispatchCommand::Keymap
         | DispatchCommand::Cheap
-        | DispatchCommand::Parent => SlashArgShape::None,
+        | DispatchCommand::Parent
+        | DispatchCommand::Terminal => SlashArgShape::None,
+        DispatchCommand::CheckpointsDoctor => SlashArgShape::FixedSubcommand,
         DispatchCommand::Attach { .. } => SlashArgShape::Path,
         DispatchCommand::Plan { prompt } | DispatchCommand::Build { prompt } => {
             if option_has_text(prompt.as_ref()) {
@@ -14477,13 +15109,10 @@ fn telemetry_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
                 SlashArgShape::None
             }
         }
-        DispatchCommand::Compact { undo } => {
-            if *undo {
-                SlashArgShape::FixedSubcommand
-            } else {
-                SlashArgShape::None
-            }
-        }
+        DispatchCommand::Compact { subcommand } => match subcommand {
+            CompactSubcommand::Undo | CompactSubcommand::History => SlashArgShape::FixedSubcommand,
+            CompactSubcommand::Run => SlashArgShape::None,
+        },
         DispatchCommand::Plans { args }
         | DispatchCommand::Feedback { args }
         | DispatchCommand::Report { args } => {
@@ -14677,9 +15306,9 @@ fn approval_context_excerpt(value: &str) -> Option<String> {
 async fn permission_decision(
     call: &ToolCall,
     context: &ToolExecutionContext<'_>,
-) -> ApprovalDecision {
+) -> PermissionOutcome {
     if is_direct_user_shell_call(call) {
-        return ApprovalDecision::Approved;
+        return PermissionOutcome::no_reviewer_cost(ApprovalDecision::Approved);
     }
     let runtime = PermissionDecisionContext::from_tool_context(context);
     let request = runtime.tools.permission_request(call);
@@ -14690,13 +15319,20 @@ async fn permission_decision_for_request(
     context: &PermissionDecisionContext,
     call: &ToolCall,
     request: PermissionRequest,
-) -> ApprovalDecision {
+) -> PermissionOutcome {
+    let mut reviewer_usd_micros: u64 = 0;
     // PermissionRequest fires once per decision attempt, before any
     // verdict is computed. Lets audit handlers record every gated
     // request — including those resolved by an auto-allow rule or
-    // mode policy before the user is asked.
-    if let Some(registry) = context.hooks.as_ref() {
-        dispatch_permission_request(registry, context.turn_id, call, &request);
+    // mode policy before the user is asked. A non-zero exit from a
+    // skill hook returns `allow=false` which is now enforced here,
+    // consistent with PreToolUse denial semantics.
+    if let Some(registry) = context.hooks.as_ref()
+        && let Some(deny_reason) =
+            dispatch_permission_request(registry, context.turn_id, call, &request)
+    {
+        dispatch_permission_denied(registry, context.turn_id, call, &request, &deny_reason);
+        return PermissionOutcome::no_reviewer_cost(ApprovalDecision::Denied(deny_reason));
     }
     let active_mode = load_session_mode(&context.session_mode);
     let session_id_for_plan_mode = context.session_id_for_plan_mode();
@@ -14718,12 +15354,16 @@ async fn permission_decision_for_request(
                         &verdict.reason,
                     );
                 }
-                return ApprovalDecision::Denied(verdict_deny_reason_for_model(context, &verdict));
+                return PermissionOutcome::no_reviewer_cost(ApprovalDecision::Denied(
+                    verdict_deny_reason_for_model(context, &verdict),
+                ));
             }
             PermissionAction::Ask => {
                 mode_ask_verdict = Some(verdict);
             }
-            PermissionAction::Allow => return approved_decision(context, &request),
+            PermissionAction::Allow => {
+                return PermissionOutcome::no_reviewer_cost(approved_decision(context, &request));
+            }
         }
     }
     let session_rules = snapshot_session_rules(&context.session_rules);
@@ -14775,7 +15415,7 @@ async fn permission_decision_for_request(
                     };
                 }
             }
-            ShellPreClassification::AutoDeny { reason } => {
+            ShellPreClassification::RequiresApproval { reason } => {
                 // Tighten permissive verdicts into a gate so the command cannot
                 // run silently. Existing Ask/Deny verdicts already carry the
                 // desired user or policy boundary and should not be escalated
@@ -14833,21 +15473,12 @@ async fn permission_decision_for_request(
             telemetry: context.telemetry.clone(),
         })
         .await;
-        // The reviewer's LLM call is real billable spend, but there is no
-        // `CostBroker` on the permission path. Record it straight into the
-        // persisted session cost + per-model ledger (keyed by the reviewer
-        // model, main-origin), keeping `state.cost` and `state.metrics.provider`
-        // in lockstep so the `/cost` headline and the By-model drill agree.
-        //
-        // KNOWN LIMITATION: this bypasses the active turn's `CostBroker`, so
-        // the *current* turn's cap checks and live status-line snapshot (both
-        // read from the broker) don't see this reviewer spend until the next
-        // turn re-seeds the broker from `state.cost`. The gap is bounded by a
-        // single turn's reviewer spend — cheap-tier calls capped at
-        // `max_output_tokens: 120` — and persisted `/cost` accounting is always
-        // correct. Closing it fully needs out-of-band LLM cost to flow back to
-        // the round-loop broker (also true of the shell classifier), a
-        // separable change.
+        // The reviewer's LLM call is real billable spend. Record it into
+        // the persisted session cost + per-model ledger so `/cost` and
+        // the By-model drill are always correct. Also accumulate the USD
+        // micros in `reviewer_usd_micros` so the turn loop can fold this
+        // spend into the active `CostBroker`, keeping the live
+        // session-cost snapshot and cap checks accurate within the turn.
         if (reviewer_result.cost.estimated_usd_micros.is_some()
             || reviewer_result.cost.input_tokens.is_some()
             || reviewer_result.cost.output_tokens.is_some())
@@ -14859,10 +15490,12 @@ async fn permission_decision_for_request(
             state.metrics.model_ledger.record(
                 context.provider.name(),
                 &reviewer_result.model,
-                CostOrigin::Main,
+                CostOrigin::AiReviewer,
                 &reviewer_result.cost,
             );
         }
+        reviewer_usd_micros = reviewer_usd_micros
+            .saturating_add(reviewer_result.cost.estimated_usd_micros.unwrap_or(0));
         match reviewer_result.outcome {
             ai_reviewer::AiReviewerOutcome::Verdict(reviewed) => {
                 log_session_event(
@@ -14928,7 +15561,32 @@ async fn permission_decision_for_request(
         )
         .await
     {
-        verdict = classifier;
+        // Mirrors the AI-reviewer fold above — same KNOWN LIMITATION (the
+        // active turn's CostBroker is not on the permission path, so the
+        // current turn's live status-line snapshot and cap checks lag by
+        // one turn). Tightened to `> 0` so a provider that streams a
+        // `CostSnapshot` with zeroed counters (e.g. cancelled mid-stream
+        // after some delta but before billing) does not churn the ledger
+        // with a no-op row.
+        let cost_present = classifier.cost.estimated_usd_micros.unwrap_or(0) > 0
+            || classifier.cost.input_tokens.unwrap_or(0) > 0
+            || classifier.cost.output_tokens.unwrap_or(0) > 0;
+        if cost_present && let Some(conversation_state) = &context.conversation_state {
+            let mut state = conversation_state.lock().await;
+            merge_cost(&mut state.cost, &classifier.cost);
+            merge_cost(&mut state.metrics.provider, &classifier.cost);
+            state.metrics.model_ledger.record(
+                context.provider.name(),
+                &classifier.model,
+                CostOrigin::Main,
+                &classifier.cost,
+            );
+        }
+        // Accumulate classifier cost so the turn loop can fold it into
+        // the active CostBroker alongside reviewer spend.
+        reviewer_usd_micros =
+            reviewer_usd_micros.saturating_add(classifier.cost.estimated_usd_micros.unwrap_or(0));
+        verdict = classifier.verdict;
     }
     log_permission_verdict(&request, &verdict);
     // Emit permission_decided telemetry for auto-evaluated verdicts (Allow/Deny
@@ -14947,7 +15605,9 @@ async fn permission_decision_for_request(
         ));
     }
     match verdict.action {
-        PermissionAction::Allow => approved_decision(context, &request),
+        PermissionAction::Allow => {
+            PermissionOutcome::no_reviewer_cost(approved_decision(context, &request))
+        }
         PermissionAction::Deny => {
             if verdict.silent {
                 log_silent_deny(context, &request, &verdict);
@@ -14961,7 +15621,12 @@ async fn permission_decision_for_request(
                     &verdict.reason,
                 );
             }
-            ApprovalDecision::Denied(verdict_deny_reason_for_model(context, &verdict))
+            PermissionOutcome {
+                decision: ApprovalDecision::Denied(verdict_deny_reason_for_model(
+                    context, &verdict,
+                )),
+                reviewer_usd_micros,
+            }
         }
         PermissionAction::Ask => {
             let (decision_tx, decision_rx) = oneshot::channel();
@@ -14998,18 +15663,31 @@ async fn permission_decision_for_request(
             });
             let send_result = match send_approval.or_cancel(&context.cancel).await {
                 Ok(result) => result,
-                Err(CancelErr::Cancelled) => return ApprovalDecision::Cancelled,
+                Err(CancelErr::Cancelled) => {
+                    return PermissionOutcome {
+                        decision: ApprovalDecision::Cancelled,
+                        reviewer_usd_micros,
+                    };
+                }
             };
             if send_result.is_err() {
                 let reason = "approval channel closed".to_string();
                 if let Some(registry) = context.hooks.as_ref() {
                     dispatch_permission_denied(registry, context.turn_id, call, &request, &reason);
                 }
-                return ApprovalDecision::Denied(reason);
+                return PermissionOutcome {
+                    decision: ApprovalDecision::Denied(reason),
+                    reviewer_usd_micros,
+                };
             }
             let decision = match decision_rx.or_cancel(&context.cancel).await {
                 Ok(decision) => decision,
-                Err(CancelErr::Cancelled) => return ApprovalDecision::Cancelled,
+                Err(CancelErr::Cancelled) => {
+                    return PermissionOutcome {
+                        decision: ApprovalDecision::Cancelled,
+                        reviewer_usd_micros,
+                    };
+                }
             };
             log_session_event(
                 context.session_log.as_ref(),
@@ -15179,7 +15857,10 @@ async fn permission_decision_for_request(
                 approval_decision_token,
                 "user",
             ));
-            outcome
+            PermissionOutcome {
+                decision: outcome,
+                reviewer_usd_micros,
+            }
         }
     }
 }
@@ -15207,7 +15888,16 @@ fn shell_ask_approver_for_context(context: &ToolExecutionContext<'_>) -> ShellAs
                 }),
             };
             let permission = runtime.tools.permission_request(&synthetic_call);
-            match permission_decision_for_request(&runtime, &synthetic_call, permission).await {
+            // reviewer_usd_micros is not folded into a broker here because
+            // shell_ask callbacks run outside the main turn loop and have no
+            // broker reference. The spend IS already persisted to state.cost
+            // (and thus visible to the next turn's broker seed), so the
+            // cap-basis total is always eventually correct. The intra-turn
+            // live snapshot has a minor lag bounded by a single reviewer or
+            // classifier call (max_output_tokens: 120 / 80).
+            let outcome =
+                permission_decision_for_request(&runtime, &synthetic_call, permission).await;
+            match outcome.decision {
                 ApprovalDecision::Approved => ShellAskDecision::allow(),
                 ApprovalDecision::Denied(reason) => ShellAskDecision::deny(reason),
                 ApprovalDecision::Cancelled => {
@@ -15256,16 +15946,52 @@ fn load_session_mode(session_mode: &Arc<AtomicU8>) -> SessionMode {
     })
 }
 
+/// Short hint about Build-mode shell-sandbox readiness for inclusion in
+/// Plan-mode denial messages. The underlying kernel probes
+/// (`linux_unshare_supported`, `linux_landlock_supported`) are OnceLock-cached
+/// so they are cheap after the first call; the `ShellSandboxDoctor` struct
+/// itself is allocated on each call (only `backend: &'static str` and
+/// `available: bool` are read from it here).
+fn build_mode_sandbox_hint() -> String {
+    let doc = squeezy_tools::shell_sandbox_doctor();
+    if doc.available {
+        format!("Build mode would use sandbox backend {}", doc.backend)
+    } else {
+        format!(
+            "Build mode sandbox backend {} is unavailable — required mode would fail",
+            doc.backend
+        )
+    }
+}
+
 pub(crate) fn mode_permission_verdict(
     mode: SessionMode,
     request: &PermissionRequest,
     active_plan_path: Option<&Path>,
 ) -> Option<PermissionVerdict> {
+    // Pre-canonicalize the active plan path once so it can be reused for
+    // both the permission gate (via is_active_plan_path_with_canon) and the
+    // denial-message display, avoiding a redundant fs::canonicalize syscall.
+    // On Windows this also normalises drive-letter case, UNC prefixes, and
+    // junction targets before either comparison or display.
+    //
+    // Gate the canonicalize on the only branches that consume the result:
+    // Plan-mode + Edit (used by `plan_edit_allowed` and the denial display).
+    // Read / Search / Network / Mcp / Shell / Git / Compiler permission
+    // decisions (the high-volume path on every Plan-mode turn) skip the
+    // syscall entirely.
+    let active_plan_canon =
+        if mode == SessionMode::Plan && request.capability == PermissionCapability::Edit {
+            active_plan_path.and_then(plan_mode::canonicalize_active_plan_path)
+        } else {
+            None
+        };
     let plan_edit_allowed = matches!(
         (mode, request.capability),
         (SessionMode::Plan, PermissionCapability::Edit)
-    ) && active_plan_path
-        .is_some_and(|active| plan_mode::is_active_plan_path(Path::new(&request.target), active));
+    ) && active_plan_canon.as_deref().is_some_and(|active| {
+        plan_mode::is_active_plan_path_with_canon(Path::new(&request.target), active)
+    });
     if mode == SessionMode::Plan && request.tool_name == "shell" {
         if matches!(
             request.capability,
@@ -15274,7 +16000,11 @@ pub(crate) fn mode_permission_verdict(
             return Some(PermissionVerdict {
                 action: PermissionAction::Deny,
                 matched_rule: None,
-                reason: format!("{} mode refuses mutating shell command", mode.as_str()),
+                reason: format!(
+                    "{} mode refuses mutating shell command; switch to Build mode (Shift+Tab) — {}",
+                    mode.as_str(),
+                    build_mode_sandbox_hint()
+                ),
                 silent: false,
             });
         }
@@ -15300,7 +16030,11 @@ pub(crate) fn mode_permission_verdict(
                 PlanModeShellSafety::Mutating => Some(PermissionVerdict {
                     action: PermissionAction::Deny,
                     matched_rule: None,
-                    reason: format!("{} mode refuses mutating shell command", mode.as_str()),
+                    reason: format!(
+                        "{} mode refuses mutating shell command; switch to Build mode (Shift+Tab) — {}",
+                        mode.as_str(),
+                        build_mode_sandbox_hint()
+                    ),
                     silent: false,
                 }),
                 PlanModeShellSafety::NeedsApproval => Some(PermissionVerdict {
@@ -15319,12 +16053,25 @@ pub(crate) fn mode_permission_verdict(
         return None;
     }
     let reason = if mode == SessionMode::Plan && request.capability == PermissionCapability::Edit {
-        match active_plan_path {
-            Some(active) => format!(
-                "Plan mode: only the active plan file is editable ({}); requested target was {}",
-                active.display(),
-                request.target,
-            ),
+        // Prefer the pre-canonicalized path for display so the message
+        // shows the resolved (drive-letter-normalized, UNC-resolved,
+        // junction-followed) form that the permission gate actually compared.
+        match active_plan_canon.as_deref().or(active_plan_path) {
+            Some(active) => {
+                // Normalise both paths to forward-slashes so the message is
+                // readable on Windows (where Display would otherwise print
+                // backslashes) and to help users spot drive-letter or UNC
+                // differences. The guard itself uses canonicalize/PathBuf
+                // equality; this is display-only.
+                let active_display = active.display().to_string().replace('\\', "/");
+                let target_display = request.target.replace('\\', "/");
+                format!(
+                    "Plan mode: only the active plan file is editable \
+                     (active: {active_display}; requested: {target_display}). \
+                     If paths differ only in drive-letter case, UNC prefix, or \
+                     junction resolution, accept the plan-handoff prompt to reload the session.",
+                )
+            }
             None => format!(
                 "{} mode refuses {} (no active plan file to edit)",
                 mode.as_str(),
@@ -15332,11 +16079,30 @@ pub(crate) fn mode_permission_verdict(
             ),
         }
     } else {
-        format!(
+        let base = format!(
             "{} mode refuses {}",
             mode.as_str(),
             request.capability.as_str()
-        )
+        );
+        // Append sandbox readiness hint for capabilities that involve
+        // shell execution so the user knows what Build mode would do.
+        if mode == SessionMode::Plan
+            && matches!(
+                request.capability,
+                PermissionCapability::Shell
+                    | PermissionCapability::Git
+                    | PermissionCapability::Compiler
+                    | PermissionCapability::Destructive
+            )
+        {
+            format!(
+                "{}; switch to Build mode (Shift+Tab) — {}",
+                base,
+                build_mode_sandbox_hint()
+            )
+        } else {
+            base
+        }
     };
     Some(PermissionVerdict {
         action: PermissionAction::Deny,
@@ -15356,7 +16122,9 @@ pub(crate) fn mode_permission_verdict(
 /// capability is a compile-time prompt to decide whether plan mode admits it.
 /// `plan_edit_allowed` is computed by
 /// `plan_mode::plan_edit_allowed_in_workspace` at schema-build sites and by
-/// `plan_mode::is_active_plan_path` at runtime (issue 2).
+/// `mode_permission_verdict`'s pre-canonicalized pair
+/// (`plan_mode::canonicalize_active_plan_path` +
+/// `plan_mode::is_active_plan_path_with_canon`) at runtime (issue 2).
 fn mode_refuses_capability(
     mode: SessionMode,
     capability: PermissionCapability,
@@ -15491,12 +16259,33 @@ fn should_classify_shell(
         && verdict.action == PermissionAction::Ask
 }
 
+/// Result of the out-of-band shell-classifier LLM call: verdict, billed
+/// cost snapshot, and the model the classifier actually used. The caller
+/// folds `cost` into session accounting and keys the per-model ledger by
+/// `model`, mirroring `AiReviewerResult` so a future move of the
+/// classifier onto a cheap-tier model (separate from `config.model`) does
+/// not silently misroute ledger rows.
+///
+/// **Cancellation gap (intentional, bounded):** the classifier loop returns
+/// `None` on `LlmEvent::Cancelled`, dropping any partial cost the provider
+/// streamed before cancellation. Unlike `TurnRuntime::run`'s
+/// `fold_partial_cancel_cost` path, this path has no broker to attribute
+/// the partial spend to. The gap is bounded by the classifier's tiny
+/// prompt (one user message, `max_output_tokens: 80`) and the next turn
+/// reseeds session accounting from `state.cost`. Closing it fully needs
+/// the unified out-of-band LLM accounting path (Category3.md `:44`).
+struct ClassifierResult {
+    verdict: PermissionVerdict,
+    cost: CostSnapshot,
+    model: Arc<str>,
+}
+
 async fn classify_ambiguous_shell(
     provider: Arc<dyn LlmProvider>,
     config: &AppConfig,
     request: &PermissionRequest,
     cancel: CancellationToken,
-) -> Option<PermissionVerdict> {
+) -> Option<ClassifierResult> {
     let command = request.metadata.get("command")?;
     let prompt = format!(
         "Classify this shell command for a coding agent permission gate.\n\
@@ -15508,8 +16297,9 @@ Working target: {:?}",
     );
     let output_schema = provider_honors_output_schema(provider.name(), &config.model)
         .then(shell_classifier_output_schema);
+    let model: Arc<str> = Arc::from(config.model.as_str());
     let llm_request = LlmRequest {
-        model: Arc::from(config.model.as_str()),
+        model: model.clone(),
         instructions: Arc::from(
             "You classify shell-command risk for a local coding agent. Return JSON only.",
         ),
@@ -15530,13 +16320,19 @@ Working target: {:?}",
     };
     let mut stream = provider.stream_response(llm_request, cancel.clone());
     let mut text = String::new();
+    let mut cost = CostSnapshot::default();
     while let Some(event) = next_llm_stream_event(&mut stream, &cancel, config.stream_idle_timeout)
         .await
         .ok()?
     {
         match event {
             LlmEvent::TextDelta(delta) => text.push_str(&delta),
-            LlmEvent::Completed { .. } => break,
+            LlmEvent::Completed { cost: snap, .. } => {
+                cost = snap;
+                break;
+            }
+            // Cancellation drops any partial cost streamed so far (see the
+            // `ClassifierResult` doc comment for the bounded gap rationale).
             LlmEvent::Cancelled => return None,
             LlmEvent::Started
             | LlmEvent::ToolCall(_)
@@ -15552,11 +16348,20 @@ Working target: {:?}",
             | LlmEvent::Citation { .. }
             | LlmEvent::ToolCallDelta { .. } => {}
             // `LlmEvent` is `#[non_exhaustive]`; unknown future variants
-            // contribute nothing to the classifier verdict text.
-            _ => { /* future variant */ }
+            // flow past without disturbing the classifier — they get a
+            // dedicated arm once the verdict parser learns to read them.
+            _ => {}
         }
     }
-    Some(parse_classifier_verdict(&text))
+    // Fill in estimated cost when the provider did not return a token count.
+    if cost.estimated_usd_micros.is_none() {
+        cost.estimated_usd_micros = estimate_cost(provider.name(), &model, &cost);
+    }
+    Some(ClassifierResult {
+        verdict: parse_classifier_verdict(&text),
+        cost,
+        model,
+    })
 }
 
 /// Parse the classifier's textual response into a verdict. Only `deny` can
@@ -17292,6 +18097,30 @@ enum ApprovalDecision {
     Cancelled,
 }
 
+/// Return value of [`permission_decision`] and
+/// [`permission_decision_for_request`]. Carries the gate outcome together
+/// with any out-of-band LLM cost incurred by the AI reviewer during this
+/// decision so the caller can fold it into the active turn's [`CostBroker`]
+/// without a separate channel.
+struct PermissionOutcome {
+    decision: ApprovalDecision,
+    /// Total reviewer spend in USD micros recorded during this permission
+    /// evaluation. Zero when the reviewer did not run or had no priced
+    /// response. Must be folded into the active [`CostBroker`] by the
+    /// turn loop so the live session-cost snapshot and cap checks stay
+    /// accurate within the turn.
+    reviewer_usd_micros: u64,
+}
+
+impl PermissionOutcome {
+    fn no_reviewer_cost(decision: ApprovalDecision) -> Self {
+        Self {
+            decision,
+            reviewer_usd_micros: 0,
+        }
+    }
+}
+
 /// Request payload sent to the TUI when the model calls
 /// `request_user_input` from Plan mode. The TUI renders a modal, gathers
 /// the user's choice, and replies via the matching
@@ -17488,6 +18317,43 @@ pub enum AgentEvent {
         limit: usize,
         active: usize,
     },
+    /// A source citation received from the provider stream (OpenAI
+    /// annotations, xAI Live Search). `text_index` is the byte offset in
+    /// the running assistant-text buffer the citation refers to. Consumers
+    /// that do not display source attribution can ignore this event.
+    ///
+    /// **Emission deferred** (same constraint as
+    /// [`AgentEvent::ControlToolTrace`] below): constructing a
+    /// `sizeof(AgentEvent)`-byte (~1 KiB) temporary inside the deeply
+    /// nested `TurnRuntime::run` stream loop pushes borderline tests over
+    /// the default thread-stack ceiling on macOS/ARM64 debug builds. The
+    /// variant + consumer-side handlers are in place; emission will move
+    /// to a dedicated transcript-sink path once that exists.
+    Citation {
+        turn_id: TurnId,
+        text_index: u32,
+        source: CitationSource,
+    },
+    /// A hidden control-plane tool completed without consuming normal tool
+    /// budget. Intended to be emitted for `load_tool_schema` and
+    /// `update_task_state` so debuggers and eval replay can observe
+    /// control-plane activity without adding noisy user-facing tool cards.
+    ///
+    /// **Emission deferred**: creating a ~1 KiB `AgentEvent` temporary inside
+    /// the deeply-nested `execute_tool_calls` / `TurnRuntime::run` call stack
+    /// pushes borderline tests over the default thread-stack limit on macOS.
+    /// The infrastructure is ready (all match sites handle this variant via
+    /// `_ => {}` or `{ .. } => {}`); emission will be wired up once the
+    /// control-tool result path is moved off the hot-path stack.
+    ControlToolTrace {
+        turn_id: TurnId,
+        /// Stable tool name token, e.g. `"load_tool_schema"` or
+        /// `"update_task_state"`.
+        tool_name: String,
+        /// Short human-readable summary, e.g. `"schema attached: grep"` or
+        /// `"task state updated"`.
+        label: String,
+    },
     AiReviewerTripped {
         turn_id: TurnId,
         reason: String,
@@ -17548,11 +18414,35 @@ pub enum AgentEvent {
     /// failure, runtime sandbox_apply error, etc.). The TUI surfaces a
     /// warning so users see the degradation; the per-call telemetry counter
     /// `approval.best_effort.fallback{tool=shell}` keeps ticking on every
-    /// fallback for backend dashboards.
+    /// fallback for backend dashboards. `fallback_reason` carries the
+    /// human-readable root cause so the TUI can explain the specific failure
+    /// (e.g. spawn/pre-exec blocked, probe signal, cached unavailable).
     ShellSandboxBestEffortFallback {
         turn_id: TurnId,
         backend: String,
         fallback_count: u64,
+        fallback_reason: Option<String>,
+    },
+    /// Emitted exactly once, on the first turn of a Windows session, to
+    /// surface the steady-state sandbox posture. Unlike
+    /// `ShellSandboxBestEffortFallback` (which fires when a previously
+    /// capable backend silently downgrades), this variant fires because
+    /// Windows Job-Object cleanup is the *intentional* Windows design, not a
+    /// runtime fallback. The TUI renders a durable session-level notice so
+    /// users running Build-mode shell work on Windows see the isolation
+    /// caveat without having to execute a shell command first.
+    WindowsSandboxActive {
+        turn_id: TurnId,
+    },
+    /// Fires once per session on Windows when the first shell result reports
+    /// `windows-job-object` or `best_effort_unavailable` filesystem isolation.
+    /// Unlike [`ShellSandboxBestEffortFallback`] this is not a runtime
+    /// failure; it describes the steady-state Windows sandbox posture and lets
+    /// the TUI display a Windows-specific safety notice.
+    ShellWindowsDegraded {
+        turn_id: TurnId,
+        backend: String,
+        filesystem: String,
     },
     /// Per-turn progress callout emitted every few tool calls so a user
     /// watching a live transcript can see cost accumulating before the

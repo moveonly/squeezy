@@ -1,11 +1,19 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use super::*;
+
+/// Process-wide lock for tests that mutate environment variables. Acquire
+/// this guard for the entire duration of any test that calls `set_var` or
+/// `remove_var` to prevent races with other concurrently-running tests.
+static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 /// Per-test temp root. Same idea as `lib_tests.rs::temp_workspace` but
 /// scoped here so the catalog tests can live in a paired module without
@@ -286,6 +294,7 @@ fn discover_skips_malformed_and_unrelated_files() {
 
 #[test]
 fn user_dir_default_uses_home_when_set() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let home = temp_root("default_user_home");
     let agents = home.join(".squeezy").join("agents");
     fs::create_dir_all(&agents).expect("mkdir user agents");
@@ -296,23 +305,113 @@ fn user_dir_default_uses_home_when_set() {
     .expect("write homie");
 
     let previous_home = std::env::var_os("HOME");
-    // SAFETY: tests in this crate are serialized only by name; setting
-    // HOME for the duration of this test and restoring it before
-    // returning keeps other tests' env reads stable enough for the
-    // discovery check we care about here.
     unsafe { std::env::set_var("HOME", &home) };
 
     let workspace = temp_root("default_user_workspace");
     let catalog = SubagentCatalog::discover(&workspace, None);
 
-    if let Some(previous) = previous_home {
-        unsafe { std::env::set_var("HOME", previous) };
-    } else {
-        unsafe { std::env::remove_var("HOME") };
+    unsafe {
+        match previous_home {
+            Some(prev) => std::env::set_var("HOME", prev),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     let homie = catalog
         .find("homie")
         .expect("home-discovered subagent present");
     assert_eq!(homie.source, SubagentSource::User);
+}
+
+#[test]
+fn discover_does_not_panic_when_home_unset() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // Verify that discover() does not panic when $HOME is absent.
+    // On Windows we also clear APPDATA and USERPROFILE so the function
+    // reaches the None path cleanly.
+    let previous_home = std::env::var_os("HOME");
+    #[cfg(target_os = "windows")]
+    let previous_appdata = std::env::var_os("APPDATA");
+    #[cfg(target_os = "windows")]
+    let previous_userprofile = std::env::var_os("USERPROFILE");
+
+    unsafe {
+        std::env::remove_var("HOME");
+        #[cfg(target_os = "windows")]
+        std::env::remove_var("APPDATA");
+        #[cfg(target_os = "windows")]
+        std::env::remove_var("USERPROFILE");
+    }
+
+    let workspace = temp_root("no_home_workspace");
+    // Should not panic; only builtin and project entries can appear.
+    let catalog = SubagentCatalog::discover(&workspace, None);
+    assert!(
+        catalog
+            .entries()
+            .iter()
+            .all(|e| matches!(e.source, SubagentSource::Builtin | SubagentSource::Project)),
+        "without HOME/APPDATA/USERPROFILE only builtin+project entries expected"
+    );
+
+    // Restore env.
+    unsafe {
+        if let Some(prev) = previous_home {
+            std::env::set_var("HOME", prev);
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(prev) = previous_appdata {
+            std::env::set_var("APPDATA", prev);
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(prev) = previous_userprofile {
+            std::env::set_var("USERPROFILE", prev);
+        }
+    }
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn discover_uses_appdata_on_windows() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // HOME takes precedence when set; clear it so we reach the APPDATA branch.
+    let previous_home = std::env::var_os("HOME");
+    let previous_appdata = std::env::var_os("APPDATA");
+
+    let appdata_root = temp_root("appdata_discover");
+    let agents_dir = appdata_root.join("squeezy").join("agents");
+    fs::create_dir_all(&agents_dir).expect("mkdir appdata agents");
+    fs::write(
+        agents_dir.join("winagent.md"),
+        "---\nname: winagent\ndescription: from APPDATA\n---\nbody",
+    )
+    .expect("write winagent");
+
+    unsafe {
+        std::env::remove_var("HOME");
+        std::env::set_var("APPDATA", &appdata_root);
+    }
+
+    let workspace = temp_root("appdata_workspace");
+    let catalog = SubagentCatalog::discover(&workspace, None);
+
+    // Restore env.
+    unsafe {
+        if let Some(prev) = previous_home {
+            std::env::set_var("HOME", prev);
+        }
+        if let Some(prev) = previous_appdata {
+            std::env::set_var("APPDATA", prev);
+        } else {
+            std::env::remove_var("APPDATA");
+        }
+    }
+
+    let winagent = catalog
+        .find("winagent")
+        .expect("APPDATA-discovered subagent present");
+    assert_eq!(winagent.source, SubagentSource::User);
+    let _ = fs::remove_dir_all(&appdata_root);
+    let _ = fs::remove_dir_all(&workspace);
 }

@@ -10,6 +10,10 @@ thread_local! {
 
 impl SemanticGraph {
     pub(crate) fn rebuild_semantic_edges(&mut self) {
+        self.rebuild_semantic_edges_with_cached_resolver(false);
+    }
+
+    pub(crate) fn rebuild_semantic_edges_with_cached_resolver(&mut self, resolver_loaded: bool) {
         #[cfg(test)]
         SEMANTIC_REBUILD_COUNT.with(|count| count.set(count.get() + 1));
         self.edges.retain(|edge| {
@@ -21,7 +25,7 @@ impl SemanticGraph {
                     .map(|to| self.symbols.contains_key(to))
                     .unwrap_or(true)
         });
-        self.rebuild_resolution_indexes();
+        self.rebuild_resolution_indexes_with_cached_resolver(resolver_loaded);
         // Incrementally update the JS/TS module-resolution table: configs
         // (tsconfig.json / package.json) whose `ContentHash` matches the
         // cached entry are reused, only changed/added/removed configs are

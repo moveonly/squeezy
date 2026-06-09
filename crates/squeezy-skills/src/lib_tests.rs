@@ -13,6 +13,51 @@ use tracing_subscriber::fmt::MakeWriter;
 use super::*;
 
 static LOG_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(unix)]
+static HOOK_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(unix)]
+struct ScopedHookPayloadEnv {
+    payload: Option<std::ffi::OsString>,
+    payload_file: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl ScopedHookPayloadEnv {
+    fn with_stale_values() -> Self {
+        let payload = std::env::var_os("SQUEEZY_HOOK_PAYLOAD");
+        let payload_file = std::env::var_os("SQUEEZY_HOOK_PAYLOAD_FILE");
+        unsafe {
+            std::env::set_var("SQUEEZY_HOOK_PAYLOAD", "stale-inline-payload");
+            std::env::set_var("SQUEEZY_HOOK_PAYLOAD_FILE", "stale-payload-file");
+        }
+        Self {
+            payload,
+            payload_file,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ScopedHookPayloadEnv {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.payload {
+                Some(value) => std::env::set_var("SQUEEZY_HOOK_PAYLOAD", value),
+                None => std::env::remove_var("SQUEEZY_HOOK_PAYLOAD"),
+            }
+            match &self.payload_file {
+                Some(value) => std::env::set_var("SQUEEZY_HOOK_PAYLOAD_FILE", value),
+                None => std::env::remove_var("SQUEEZY_HOOK_PAYLOAD_FILE"),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sh_quote_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
 
 #[test]
 fn bundled_skills_load_with_valid_metadata() {
@@ -147,11 +192,11 @@ fn parses_folded_block_scalar_description() {
     // for other agents. The continuation line must fold into the value rather
     // than be rejected as an "invalid frontmatter line".
     let (metadata, body) = parse_skill_file(
-        "---\nname: sonar\ndescription: >-\n  ALWAYS invoke this skill on the first prompt,\n  whether you are the Agent or a subagent.\n---\n# Body\n",
+        "---\nname: example-skill\ndescription: >-\n  ALWAYS invoke this skill on the first prompt,\n  whether you are the Agent or a subagent.\n---\n# Body\n",
     )
     .expect("parse");
 
-    assert_eq!(metadata.name, "sonar");
+    assert_eq!(metadata.name, "example-skill");
     assert_eq!(
         metadata.description,
         "ALWAYS invoke this skill on the first prompt, whether you are the Agent or a subagent."
@@ -161,9 +206,10 @@ fn parses_folded_block_scalar_description() {
 
 #[test]
 fn parses_literal_block_scalar_preserving_newlines() {
-    let (metadata, _body) =
-        parse_skill_file("---\nname: sonar\ndescription: |\n  line one\n  line two\n---\nbody\n")
-            .expect("parse");
+    let (metadata, _body) = parse_skill_file(
+        "---\nname: example-skill\ndescription: |\n  line one\n  line two\n---\nbody\n",
+    )
+    .expect("parse");
 
     // Literal `|` keeps the line break; default (clip) chomping keeps a single
     // trailing newline.
@@ -172,9 +218,10 @@ fn parses_literal_block_scalar_preserving_newlines() {
 
 #[test]
 fn literal_block_scalar_strip_chomping_drops_trailing_newline() {
-    let (metadata, _body) =
-        parse_skill_file("---\nname: sonar\ndescription: |-\n  line one\n  line two\n---\nbody\n")
-            .expect("parse");
+    let (metadata, _body) = parse_skill_file(
+        "---\nname: example-skill\ndescription: |-\n  line one\n  line two\n---\nbody\n",
+    )
+    .expect("parse");
 
     // `|-` strips every trailing line break.
     assert_eq!(metadata.description, "line one\nline two");
@@ -183,7 +230,7 @@ fn literal_block_scalar_strip_chomping_drops_trailing_newline() {
 #[test]
 fn literal_block_scalar_keep_chomping_preserves_trailing_blanks() {
     let (metadata, _body) =
-        parse_skill_file("---\nname: sonar\ndescription: |+\n  line one\n\n---\nbody\n")
+        parse_skill_file("---\nname: example-skill\ndescription: |+\n  line one\n\n---\nbody\n")
             .expect("parse");
 
     // `|+` keeps the final line break plus the trailing blank line.
@@ -195,7 +242,7 @@ fn block_scalar_indicator_in_ordinary_value_is_not_treated_as_block() {
     // A value that merely starts with `>` but is not a bare block indicator
     // (here `>` followed by text) must stay an ordinary single-line scalar.
     let (metadata, _body) =
-        parse_skill_file("---\nname: sonar\ndescription: > 50% coverage\n---\nbody\n")
+        parse_skill_file("---\nname: example-skill\ndescription: > 50% coverage\n---\nbody\n")
             .expect("parse");
 
     assert_eq!(metadata.description, "> 50% coverage");
@@ -204,7 +251,7 @@ fn block_scalar_indicator_in_ordinary_value_is_not_treated_as_block() {
 #[test]
 fn block_scalar_ends_at_dedented_next_key() {
     let (metadata, _body) = parse_skill_file(
-        "---\nname: sonar\ndescription: >-\n  folded value\nwhen_to_use: after the block\n---\nbody\n",
+        "---\nname: example-skill\ndescription: >-\n  folded value\nwhen_to_use: after the block\n---\nbody\n",
     )
     .expect("parse");
 
@@ -215,7 +262,7 @@ fn block_scalar_ends_at_dedented_next_key() {
 #[test]
 fn folded_block_scalar_folds_blank_line_to_newline() {
     let (metadata, _body) = parse_skill_file(
-        "---\nname: sonar\ndescription: >-\n  first paragraph\n\n  second paragraph\n---\nbody\n",
+        "---\nname: example-skill\ndescription: >-\n  first paragraph\n\n  second paragraph\n---\nbody\n",
     )
     .expect("parse");
 
@@ -2103,6 +2150,40 @@ fn skill_scan_dirs_includes_ancestor_project_roots() {
 }
 
 #[test]
+fn validate_skill_dirs_includes_xdg_user_dir() {
+    let root = temp_workspace("skills_validate_xdg_malformed");
+    let xdg_root = root.join("xdg").join("squeezy").join("skills");
+    let bad_dir = xdg_root.join("bad-xdg");
+    fs::create_dir_all(&bad_dir).expect("mkdir bad-xdg");
+    fs::write(bad_dir.join("SKILL.md"), "not frontmatter at all").expect("write bad skill");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        xdg_user_dir: Some(xdg_root),
+        ..Default::default()
+    };
+
+    let results = super::validate_skill_dirs(&root, &config);
+    let bad = results
+        .iter()
+        .find(|r| {
+            r.path
+                .to_str()
+                .map(|s| s.contains("bad-xdg"))
+                .unwrap_or(false)
+        })
+        .expect("bad-xdg result must be present");
+    assert!(
+        bad.outcome.is_err(),
+        "malformed XDG skill must produce an error: {:?}",
+        bad.outcome
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn validate_skill_dirs_includes_ancestor_malformed_skill() {
     // Same monorepo layout, but with a malformed SKILL.md in the ancestor root.
     let root = temp_workspace("skills_validate_ancestor_malformed");
@@ -2304,6 +2385,27 @@ fn parses_hooks_block_with_matchers_and_specs() {
 }
 
 #[test]
+fn parses_hooks_block_with_omitted_matcher_as_match_all() {
+    let (metadata, _body) = parse_skill_file(
+        "---\nname: validator\ndescription: \"validates all tools\"\nhooks:\n  PreToolUse:\n    - hooks:\n        - type: command\n          command: \"scripts/all-tools.sh\"\n          once: true\n---\n# body\n",
+    )
+    .expect("parse");
+
+    let hooks = metadata
+        .hooks
+        .get(&HookEvent::PreToolUse)
+        .expect("PreToolUse parsed");
+    assert_eq!(hooks.len(), 1);
+    assert!(
+        hooks[0].matcher.is_none(),
+        "omitted matcher should match every payload for the event"
+    );
+    assert_eq!(hooks[0].hooks.len(), 1);
+    assert_eq!(hooks[0].hooks[0].command, "scripts/all-tools.sh");
+    assert!(hooks[0].hooks[0].once);
+}
+
+#[test]
 fn parses_hooks_block_drops_unknown_event_without_failing_load() {
     let (metadata, _body) = parse_skill_file(
         "---\nname: validator\ndescription: \"d\"\nhooks:\n  NoSuchEvent:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"scripts/x.sh\"\n  PreToolUse:\n    - matcher: \"Bash\"\n      hooks:\n        - type: command\n          command: \"scripts/y.sh\"\n---\n# body\n",
@@ -2311,6 +2413,53 @@ fn parses_hooks_block_drops_unknown_event_without_failing_load() {
     .expect("parse");
     assert!(metadata.hooks.contains_key(&HookEvent::PreToolUse));
     assert_eq!(metadata.hooks.len(), 1);
+}
+
+#[test]
+fn parses_hooks_block_accepts_all_hook_event_names_and_aliases() {
+    let cases = [
+        ("PreTurn", HookEvent::PreTurn),
+        ("pre_turn", HookEvent::PreTurn),
+        ("PreToolUse", HookEvent::PreToolUse),
+        ("pre_tool_use", HookEvent::PreToolUse),
+        ("PostToolUse", HookEvent::PostToolUse),
+        ("post_tool_use", HookEvent::PostToolUse),
+        ("PostToolUseFailure", HookEvent::PostToolUseFailure),
+        ("post_tool_use_failure", HookEvent::PostToolUseFailure),
+        ("PostTool", HookEvent::PostTool),
+        ("post_tool", HookEvent::PostTool),
+        ("PreCompact", HookEvent::PreCompact),
+        ("pre_compact", HookEvent::PreCompact),
+        ("PostCompact", HookEvent::PostCompact),
+        ("post_compact", HookEvent::PostCompact),
+        ("SubagentStart", HookEvent::SubagentStart),
+        ("subagent_start", HookEvent::SubagentStart),
+        ("SubagentStop", HookEvent::SubagentStop),
+        ("subagent_stop", HookEvent::SubagentStop),
+        ("PermissionRequest", HookEvent::PermissionRequest),
+        ("permission_request", HookEvent::PermissionRequest),
+        ("PermissionDenied", HookEvent::PermissionDenied),
+        ("permission_denied", HookEvent::PermissionDenied),
+        ("UserPromptSubmit", HookEvent::UserPromptSubmit),
+        ("user_prompt_submit", HookEvent::UserPromptSubmit),
+        ("SessionStart", HookEvent::SessionStart),
+        ("session_start", HookEvent::SessionStart),
+        ("Stop", HookEvent::Stop),
+        ("stop", HookEvent::Stop),
+        ("Setup", HookEvent::Setup),
+        ("setup", HookEvent::Setup),
+    ];
+
+    for (key, event) in cases {
+        let content = format!(
+            "---\nname: validator\ndescription: \"d\"\nhooks:\n  {key}:\n    - matcher: \"*\"\n      hooks:\n        - type: command\n          command: \"true\"\n---\n# body\n"
+        );
+        let (metadata, _body) = parse_skill_file(&content).expect("parse");
+        assert!(
+            metadata.hooks.contains_key(&event),
+            "{key} should parse as {event:?}"
+        );
+    }
 }
 
 #[test]
@@ -2336,10 +2485,18 @@ fn register_skill_hooks_installs_one_handler_per_spec() {
                     SkillHookSpec {
                         command: "true".to_string(),
                         once: false,
+                        timeout_secs: None,
+                        fail_open: true,
+                        kind_valid: true,
+                        failure_policy: HookFailurePolicy::Allow,
                     },
                     SkillHookSpec {
                         command: "true".to_string(),
                         once: true,
+                        timeout_secs: None,
+                        fail_open: true,
+                        kind_valid: true,
+                        failure_policy: HookFailurePolicy::Allow,
                     },
                 ],
             }],
@@ -2422,6 +2579,10 @@ fn skill_hook_fires_on_matching_event_and_skips_others() {
     let spec = SkillHookSpec {
         command: script.display().to_string(),
         once: false,
+        timeout_secs: None,
+        fail_open: true,
+        kind_valid: true,
+        failure_policy: HookFailurePolicy::Allow,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),
@@ -2482,6 +2643,10 @@ fn skill_hook_once_self_removes_after_first_run() {
     let spec = SkillHookSpec {
         command: script.display().to_string(),
         once: true,
+        timeout_secs: None,
+        fail_open: true,
+        kind_valid: true,
+        failure_policy: HookFailurePolicy::Allow,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),
@@ -2502,6 +2667,69 @@ fn skill_hook_once_self_removes_after_first_run() {
     }
     let count = fs::read_to_string(&counter).expect("read counter");
     assert_eq!(count.trim(), "1", "once: true must fire exactly once");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_hook_once_claims_concurrent_dispatches_atomically() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_workspace("skill_hook_once_concurrent");
+    let counter = root.join("count");
+    let script = root.join("hook.sh");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\nsleep 1\nprintf x >> {}\n", counter.display()),
+    )
+    .expect("write hook script");
+    let mut perms = fs::metadata(&script).expect("script meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script, perms).expect("chmod hook");
+
+    let spec = SkillHookSpec {
+        command: script.display().to_string(),
+        once: true,
+        timeout_secs: None,
+        fail_open: true,
+        kind_valid: true,
+        failure_policy: HookFailurePolicy::Allow,
+    };
+    let handler = SkillHookHandler::new(
+        "validator".to_string(),
+        HookEvent::PreToolUse,
+        None,
+        spec,
+        root.clone(),
+    );
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(handler));
+    let registry = Arc::new(registry);
+
+    const THREADS: usize = 8;
+    let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+    let mut handles = Vec::new();
+    for index in 0..THREADS {
+        let registry = Arc::clone(&registry);
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            let _ = registry.dispatch(squeezy_hooks::HookPayload::PreToolUse {
+                turn_id: "1".into(),
+                tool_name: "Bash".into(),
+                call_id: format!("c{index}"),
+            });
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("dispatch thread should finish");
+    }
+
+    let count = fs::read_to_string(&counter).unwrap_or_default().len();
+    assert_eq!(
+        count, 1,
+        "once: true must allow only one concurrent dispatch to execute"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2533,6 +2761,10 @@ fn skill_hook_once_retries_after_failed_first_run() {
     let spec = SkillHookSpec {
         command: script.display().to_string(),
         once: true,
+        timeout_secs: None,
+        fail_open: true,
+        kind_valid: true,
+        failure_policy: HookFailurePolicy::Allow,
     };
     let handler = SkillHookHandler::new(
         "validator".to_string(),
@@ -2589,6 +2821,205 @@ fn skill_hook_once_retries_after_failed_first_run() {
         fs::read_to_string(&counter).expect("read counter").trim(),
         "2",
         "after a successful run the hook self-skips"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+// ── XDG skill root discovery ──────────────────────────────────────────────────
+
+/// Skills placed in the XDG data directory are discovered alongside the legacy
+/// user directory.
+#[test]
+fn xdg_user_dir_skills_are_discovered() {
+    let root = lib_tests_tempdir("xdg_skill_discover");
+    let xdg_skills = root.join("xdg_data").join("squeezy").join("skills");
+    let xdg_skill_dir = xdg_skills.join("xdg-nav");
+    fs::create_dir_all(&xdg_skill_dir).expect("create xdg skill dir");
+    fs::write(
+        xdg_skill_dir.join("SKILL.md"),
+        "---\nname: xdg-nav\ndescription: \"XDG skill\"\ntriggers: [\"xdg nav\"]\n---\n# xdg-nav\n",
+    )
+    .expect("write xdg skill");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user-noop"),
+        compat_user_dir: root.join("compat-noop"),
+        xdg_user_dir: Some(xdg_skills),
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+    assert!(
+        catalog.skills.contains_key("xdg-nav"),
+        "xdg-nav skill should be discovered via xdg_user_dir"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// When `xdg_user_dir` is `None`, discovery does not panic and works normally.
+#[test]
+fn discover_works_without_xdg_user_dir() {
+    let root = lib_tests_tempdir("xdg_none_discover");
+    let config = SkillsConfig {
+        user_dir: root.join("user-noop"),
+        compat_user_dir: root.join("compat-noop"),
+        xdg_user_dir: None,
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+    assert!(catalog.summaries().is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Legacy user_dir skills take precedence over same-name XDG skills.
+#[test]
+fn legacy_user_dir_shadows_xdg_same_name_skill() {
+    let root = lib_tests_tempdir("xdg_shadow_test");
+
+    let user_skill = root.join("user").join("my-skill");
+    fs::create_dir_all(&user_skill).expect("create user skill");
+    fs::write(
+        user_skill.join("SKILL.md"),
+        "---\nname: my-skill\ndescription: \"from user\"\ntriggers: [\"my skill\"]\n---\n# user\n",
+    )
+    .expect("write user skill");
+
+    let xdg_skills = root.join("xdg").join("squeezy").join("skills");
+    let xdg_skill = xdg_skills.join("my-skill");
+    fs::create_dir_all(&xdg_skill).expect("create xdg skill");
+    fs::write(
+        xdg_skill.join("SKILL.md"),
+        "---\nname: my-skill\ndescription: \"from xdg\"\ntriggers: [\"my skill\"]\n---\n# xdg\n",
+    )
+    .expect("write xdg skill");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat-noop"),
+        xdg_user_dir: Some(xdg_skills),
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+    let skill = catalog.skills.get("my-skill").expect("skill present");
+    assert_eq!(
+        skill.summary.description, "from user",
+        "legacy user_dir should shadow xdg for same-name skill"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+fn lib_tests_tempdir(name: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("squeezy-{name}-{}-{nonce}", std::process::id()));
+    fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_hook_inline_payload_removes_stale_payload_file_env() {
+    let _guard = HOOK_ENV_LOCK.lock().expect("hook env lock");
+    let _env = ScopedHookPayloadEnv::with_stale_values();
+    let root = temp_workspace("skill_hook_inline_payload_env");
+    let capture = root.join("payload.json");
+    let command = format!(
+        "test -z \"${{SQUEEZY_HOOK_PAYLOAD_FILE+x}}\" && printf '%s' \"$SQUEEZY_HOOK_PAYLOAD\" > {}",
+        sh_quote_path(&capture)
+    );
+
+    let handler = SkillHookHandler::new(
+        "validator".to_string(),
+        HookEvent::UserPromptSubmit,
+        None,
+        SkillHookSpec {
+            command,
+            once: false,
+            timeout_secs: None,
+            fail_open: true,
+            kind_valid: true,
+            failure_policy: HookFailurePolicy::Allow,
+        },
+        root.clone(),
+    );
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(handler));
+
+    let results = registry.dispatch(squeezy_hooks::HookPayload::UserPromptSubmit {
+        prompt: "hello".into(),
+        turn_id: "1".into(),
+    });
+
+    assert!(results.iter().all(|result| result.allow), "{results:?}");
+    let captured = fs::read_to_string(&capture).expect("read captured payload");
+    assert!(captured.contains("\"prompt\":\"hello\""), "{captured}");
+    assert!(
+        !captured.contains("stale-payload-file"),
+        "stale parent env leaked into hook payload: {captured}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_hook_large_payload_uses_file_and_removes_stale_inline_env() {
+    let _guard = HOOK_ENV_LOCK.lock().expect("hook env lock");
+    let _env = ScopedHookPayloadEnv::with_stale_values();
+    let root = temp_workspace("skill_hook_large_payload_file");
+    let payload_file_path_capture = root.join("payload-file-path");
+    let copied_payload = root.join("payload-copy.json");
+    let command = format!(
+        "test -z \"${{SQUEEZY_HOOK_PAYLOAD+x}}\" \
+         && test -n \"$SQUEEZY_HOOK_PAYLOAD_FILE\" \
+         && test -f \"$SQUEEZY_HOOK_PAYLOAD_FILE\" \
+         && printf '%s' \"$SQUEEZY_HOOK_PAYLOAD_FILE\" > {} \
+         && cp \"$SQUEEZY_HOOK_PAYLOAD_FILE\" {}",
+        sh_quote_path(&payload_file_path_capture),
+        sh_quote_path(&copied_payload)
+    );
+
+    let handler = SkillHookHandler::new(
+        "validator".to_string(),
+        HookEvent::UserPromptSubmit,
+        None,
+        SkillHookSpec {
+            command,
+            once: false,
+            timeout_secs: None,
+            fail_open: true,
+            kind_valid: true,
+            failure_policy: HookFailurePolicy::Allow,
+        },
+        root.clone(),
+    );
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(handler));
+
+    let prompt = "x".repeat(PAYLOAD_INLINE_THRESHOLD + 128);
+    let results = registry.dispatch(squeezy_hooks::HookPayload::UserPromptSubmit {
+        prompt,
+        turn_id: "1".into(),
+    });
+
+    assert!(results.iter().all(|result| result.allow), "{results:?}");
+    let temp_payload_path =
+        fs::read_to_string(&payload_file_path_capture).expect("read payload file path");
+    assert!(
+        !Path::new(temp_payload_path.trim()).exists(),
+        "temporary hook payload file should be removed after dispatch"
+    );
+    let copied = fs::read_to_string(&copied_payload).expect("read copied payload");
+    assert!(copied.len() > PAYLOAD_INLINE_THRESHOLD, "{copied}");
+    assert!(
+        copied.contains("\"event\":\"user_prompt_submit\""),
+        "{copied}"
+    );
+    assert!(
+        !copied.contains("stale-inline-payload"),
+        "stale parent env leaked into hook payload: {copied}"
     );
 
     let _ = fs::remove_dir_all(root);

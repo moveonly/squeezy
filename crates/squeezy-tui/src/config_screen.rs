@@ -1924,11 +1924,20 @@ pub(crate) fn provider_api_key_env(
         P::Anthropic(c) => Some(("Anthropic", c.api_key_env.clone())),
         P::Google(c) => Some(("Google", c.api_key_env.clone())),
         P::AzureOpenAi(c) => Some(("Azure OpenAI", c.api_key_env.clone())),
-        // Bedrock uses AWS SDK creds; Ollama is local; OAuth
-        // providers store tokens at `~/.squeezy/auth/`; the faux
-        // provider runs in-process and has no credential. None of
-        // these have an env-var keychain entry the screen can write.
-        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
+        // Bedrock uses AWS SDK creds; OAuth providers store tokens at
+        // `~/.squeezy/auth/`; the faux provider runs in-process and
+        // has no credential. None of these have an env-var keychain
+        // entry the screen can write.
+        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
+        // Ollama can optionally use a bearer token for Cloud / reverse-proxy
+        // deployments. Surface the key entry when api_key_env is set.
+        P::Ollama(c) => {
+            if c.api_key_env.is_empty() {
+                None
+            } else {
+                Some(("Ollama", c.api_key_env.clone()))
+            }
+        }
         P::OpenAiCompatible(c) => {
             if c.api_key_env.is_empty() {
                 None
@@ -1955,7 +1964,16 @@ pub(crate) fn provider_section_name(
         // provider TOML tables. The faux provider exposes `script`
         // instead of an api_key, which is handled by the field-level
         // editor rather than the secret-entry path.
-        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
+        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
+        // Ollama supports an optional inline api_key for Cloud / reverse-proxy
+        // deployments; write it under [providers.ollama] like any key-bearing provider.
+        P::Ollama(c) => {
+            if c.api_key_env.is_empty() {
+                None
+            } else {
+                Some("ollama")
+            }
+        }
         P::OpenAiCompatible(c) => Some(c.preset.as_str()),
     }
 }
@@ -1971,7 +1989,8 @@ pub(crate) fn provider_inline_api_key(provider: &squeezy_core::ProviderConfig) -
         P::Anthropic(c) => c.api_key.clone(),
         P::Google(c) => c.api_key.clone(),
         P::AzureOpenAi(c) => c.api_key.clone(),
-        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
+        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
+        P::Ollama(c) => c.api_key.clone(),
         P::OpenAiCompatible(c) => c.api_key.clone(),
     }
 }

@@ -97,6 +97,7 @@ pub(crate) fn collect_c_family_accuracy(
     })
 }
 
+#[allow(deprecated, reason = "benchmark scaffolding; external callers should use try_new")]
 pub(crate) fn collect_clang_ast_symbol_scan(
     root: &Path,
     language: LanguageKind,

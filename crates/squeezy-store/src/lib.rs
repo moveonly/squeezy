@@ -14,20 +14,26 @@
 
 use std::{
     collections::BTreeSet,
-    fs,
+    env, fs, io,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    TableDefinition,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use squeezy_core::{FileId, Result, SqueezyError};
+use squeezy_core::{FileId, Result, SqueezyError, repo_settings_id};
 
+mod fs_util;
 pub mod migrations;
 pub mod repo_profile;
 pub mod reports;
 pub mod sessions;
 
+pub use fs_util::user_squeezy_dir_detail;
 pub use migrations::{
     Migration, MigrationRegistry, default_registry, run_migrations, run_registry,
 };
@@ -42,6 +48,9 @@ pub const STATE_FILE_NAME: &str = "state.redb";
 pub const GRAPH_FILE_NAME: &str = "graph.redb";
 
 const OVERSIZED_STATE_FAST_ROTATE_BYTES: u64 = 256 * 1024 * 1024;
+
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]
@@ -83,12 +92,19 @@ pub fn crate_name() -> &'static str {
 pub struct SqueezyStore {
     path: PathBuf,
     database: Database,
+    graph_store: Mutex<Option<Arc<GraphStore>>>,
 }
 
 #[derive(Debug)]
 pub struct GraphStore {
     path: PathBuf,
     database: Database,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphStoreProbe {
+    pub path: PathBuf,
+    pub schema_version: Option<u64>,
 }
 
 impl SqueezyStore {
@@ -100,16 +116,34 @@ impl SqueezyStore {
         }
         if oversized_state_needs_fast_rotate(&path)? {
             let backup = backup_path_with_label(&path, "oversized-state");
-            fs::rename(&path, &backup)?;
-            bootstrap_store(workspace_root, cache_root)?;
-            tracing::warn!(
-                target: "squeezy::store",
-                threshold_bytes = OVERSIZED_STATE_FAST_ROTATE_BYTES,
-                backup = %backup.display(),
-                "state.redb exceeded the split-cache threshold; existing cache backed up without opening redb",
-            );
+            match fs_util::rotate_file(&path, &backup) {
+                Ok(()) => {
+                    sync_parent_dir(&backup)?;
+                    bootstrap_store(workspace_root, cache_root)?;
+                    tracing::warn!(
+                        target: "squeezy::store",
+                        threshold_bytes = OVERSIZED_STATE_FAST_ROTATE_BYTES,
+                        backup = %backup.display(),
+                        "state.redb exceeded the split-cache threshold; existing cache backed up without opening redb",
+                    );
+                }
+                Err(rotate_err) => {
+                    // On Windows, a file indexer or AV scanner may hold the
+                    // file open, making rename fail. Continue with the
+                    // oversized store rather than refusing to start.
+                    tracing::warn!(
+                        target: "squeezy::store",
+                        error = %rotate_err,
+                        "state.redb is oversized but rotation failed; continuing with existing store",
+                    );
+                }
+            }
             let database = open_database(&path)?;
-            return Ok(Self { path, database });
+            return Ok(Self {
+                path,
+                database,
+                graph_store: Mutex::new(None),
+            });
         }
         let initial = open_database(&path)?;
         // Three cases:
@@ -124,16 +158,61 @@ impl SqueezyStore {
             Some(on_disk_version) => {
                 drop(initial);
                 let backup = backup_path(&path, on_disk_version);
-                fs::rename(&path, &backup)?;
-                bootstrap_store(workspace_root, cache_root)?;
-                copy_state_tables(&backup, &path)?;
-                tracing::warn!(
-                    target: "squeezy::store",
-                    on_disk_version,
-                    schema_version = SCHEMA_VERSION,
-                    backup = %backup.display(),
-                    "state.redb schema mismatch; existing store backed up and reinitialised",
-                );
+                match fs_util::rotate_file(&path, &backup) {
+                    Ok(()) => {
+                        sync_parent_dir(&backup)?;
+                        bootstrap_store(workspace_root, cache_root)?;
+                        copy_state_tables(&backup, &path)?;
+                        tracing::warn!(
+                            target: "squeezy::store",
+                            on_disk_version,
+                            schema_version = SCHEMA_VERSION,
+                            backup = %backup.display(),
+                            "state.redb schema mismatch; existing store backed up and reinitialised",
+                        );
+                    }
+                    Err(rotate_err) => {
+                        // The plain `fs::rename` rotation above goes through
+                        // Win32 `MoveFileExW` *without* the `\\?\` extended-path
+                        // prefix, so it loses on paths past MAX_PATH. Retry via
+                        // `fs_util::replace_file`, which adds the prefix (and
+                        // `MOVEFILE_REPLACE_EXISTING`). When that succeeds we
+                        // still get a backup + table copy; only when both
+                        // attempts fail do we fall through to the destructive
+                        // reset.
+                        match fs_util::replace_file(&path, &backup) {
+                            Ok(()) => {
+                                sync_parent_dir(&backup)?;
+                                bootstrap_store(workspace_root, cache_root)?;
+                                copy_state_tables(&backup, &path)?;
+                                tracing::warn!(
+                                    target: "squeezy::store",
+                                    on_disk_version,
+                                    schema_version = SCHEMA_VERSION,
+                                    backup = %backup.display(),
+                                    rotate_error = %rotate_err,
+                                    "state.redb schema mismatch; rename rotation failed but extended-path replace succeeded; existing store backed up and reinitialised",
+                                );
+                            }
+                            Err(replace_err) => {
+                                // Both rotation attempts blocked (e.g.
+                                // Windows file lock). Delete and bootstrap
+                                // fresh — we cannot safely use a store with
+                                // a mismatched schema.
+                                let _ = fs::remove_file(&path);
+                                bootstrap_store(workspace_root, cache_root)?;
+                                tracing::warn!(
+                                    target: "squeezy::store",
+                                    on_disk_version,
+                                    schema_version = SCHEMA_VERSION,
+                                    rotate_error = %rotate_err,
+                                    replace_error = %replace_err,
+                                    "state.redb schema mismatch; rotation failed, existing store deleted and reinitialised without migration",
+                                );
+                            }
+                        }
+                    }
+                }
                 open_database(&path)?
             }
             None => {
@@ -142,7 +221,11 @@ impl SqueezyStore {
                 open_database(&path)?
             }
         };
-        Ok(Self { path, database })
+        Ok(Self {
+            path,
+            database,
+            graph_store: Mutex::new(None),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -150,38 +233,39 @@ impl SqueezyStore {
     }
 
     pub fn set_graph_metadata(&self, metadata: &GraphStoreMetadata) -> Result<()> {
-        self.graph_store()?.set_graph_metadata(metadata)
+        self.with_graph_store(|store| store.set_graph_metadata(metadata))
     }
 
     pub fn graph_metadata(&self) -> Result<Option<GraphStoreMetadata>> {
-        self.graph_store()?.graph_metadata()
+        self.with_graph_store(GraphStore::graph_metadata)
     }
 
     pub fn put_graph_partition<T: Serialize>(&self, file_id: &FileId, partition: &T) -> Result<()> {
-        self.graph_store()?.put_graph_partition(file_id, partition)
+        self.with_graph_store(|store| store.put_graph_partition(file_id, partition))
     }
 
     pub fn graph_partition<T: DeserializeOwned>(&self, file_id: &FileId) -> Result<Option<T>> {
-        self.graph_store()?.graph_partition(file_id)
+        self.with_graph_store(|store| store.graph_partition(file_id))
     }
 
     pub fn remove_graph_partition(&self, file_id: &FileId) -> Result<()> {
-        self.graph_store()?.remove_graph_partition(file_id)
+        self.with_graph_store(|store| store.remove_graph_partition(file_id))
     }
 
     pub fn clear_graph_partitions(&self) -> Result<()> {
-        self.graph_store()?.clear_graph_partitions()
+        self.with_graph_store(GraphStore::clear_graph_partitions)
     }
 
-    /// Apply a coherent set of graph changes (metadata + partition upserts and
-    /// removals) inside a single redb write transaction. Callers should batch
-    /// per-refresh churn through this rather than calling
-    /// [`set_graph_metadata`], [`put_graph_partition`], or
-    /// [`remove_graph_partition`] in a tight loop: each of those commits
-    /// independently and pays a fresh fsync, which dominates wall-clock cost
-    /// on a cold workspace crawl.
+    /// Apply a coherent set of graph changes (metadata, partition upserts and
+    /// removals, resolver snapshots, and resolver import graph) inside a
+    /// single redb write transaction. Callers should batch per-refresh churn
+    /// through this rather than calling [`set_graph_metadata`],
+    /// [`put_graph_partition`], [`remove_graph_partition`], or
+    /// [`put_import_graph`] in a tight loop: each of those commits
+    /// independently and pays a fresh fsync, which dominates wall-clock cost on
+    /// a cold workspace crawl.
     pub fn apply_graph_batch(&self, batch: &GraphWriteBatch) -> Result<()> {
-        self.graph_store()?.apply_graph_batch(batch)
+        self.with_graph_store(|store| store.apply_graph_batch(batch))
     }
 
     /// Upsert a per-file resolver snapshot into the V2 resolver cache.
@@ -189,36 +273,36 @@ impl SqueezyStore {
     /// stored value so a later open can decide whether the snapshot is
     /// still authoritative.
     pub fn put_resolver_entry<T: Serialize>(&self, file_id: &FileId, entry: &T) -> Result<()> {
-        self.graph_store()?.put_resolver_entry(file_id, entry)
+        self.with_graph_store(|store| store.put_resolver_entry(file_id, entry))
     }
 
     pub fn resolver_entry<T: DeserializeOwned>(&self, file_id: &FileId) -> Result<Option<T>> {
-        self.graph_store()?.resolver_entry(file_id)
+        self.with_graph_store(|store| store.resolver_entry(file_id))
     }
 
     pub fn resolver_entries_for<T: DeserializeOwned>(
         &self,
         file_ids: &[FileId],
     ) -> Result<Vec<(FileId, T)>> {
-        self.graph_store()?.resolver_entries_for(file_ids)
+        self.with_graph_store(|store| store.resolver_entries_for(file_ids))
     }
 
     pub fn remove_resolver_entry(&self, file_id: &FileId) -> Result<()> {
-        self.graph_store()?.remove_resolver_entry(file_id)
+        self.with_graph_store(|store| store.remove_resolver_entry(file_id))
     }
 
     pub fn clear_resolver_entries(&self) -> Result<()> {
-        self.graph_store()?.clear_resolver_entries()
+        self.with_graph_store(GraphStore::clear_resolver_entries)
     }
 
     /// Replace the persisted file-level import adjacency blob. Stored under
     /// one key so reading on warm-start is a single table get.
     pub fn put_import_graph<T: Serialize>(&self, graph: &T) -> Result<()> {
-        self.graph_store()?.put_import_graph(graph)
+        self.with_graph_store(|store| store.put_import_graph(graph))
     }
 
     pub fn import_graph<T: DeserializeOwned>(&self) -> Result<Option<T>> {
-        self.graph_store()?.import_graph()
+        self.with_graph_store(|store| store.import_graph())
     }
 
     pub fn put_tool_receipt(&self, receipt: &StoredToolReceipt) -> Result<()> {
@@ -538,8 +622,24 @@ impl SqueezyStore {
         self.database.begin_write().map_err(store_error)
     }
 
-    fn graph_store(&self) -> Result<GraphStore> {
-        GraphStore::open_path(self.path.with_file_name(GRAPH_FILE_NAME))
+    fn graph_store(&self) -> Result<Arc<GraphStore>> {
+        let mut cached = self
+            .graph_store
+            .lock()
+            .map_err(|_| SqueezyError::Tool("graph store lock poisoned".to_string()))?;
+        if let Some(store) = cached.as_ref() {
+            return Ok(Arc::clone(store));
+        }
+        let store = Arc::new(GraphStore::open_path(
+            self.path.with_file_name(GRAPH_FILE_NAME),
+        )?);
+        *cached = Some(Arc::clone(&store));
+        Ok(store)
+    }
+
+    fn with_graph_store<T>(&self, action: impl FnOnce(&GraphStore) -> Result<T>) -> Result<T> {
+        let store = self.graph_store()?;
+        action(store.as_ref())
     }
 }
 
@@ -560,14 +660,51 @@ impl GraphStore {
             Some(on_disk_version) => {
                 drop(initial);
                 let backup = backup_path(&path, on_disk_version);
-                fs::rename(&path, &backup)?;
-                tracing::warn!(
-                    target: "squeezy::store",
-                    on_disk_version,
-                    schema_version = GRAPH_SCHEMA_VERSION,
-                    backup = %backup.display(),
-                    "graph.redb schema mismatch; existing graph cache backed up and reinitialised",
-                );
+                match fs_util::rotate_file(&path, &backup) {
+                    Ok(()) => {
+                        sync_parent_dir(&backup)?;
+                        tracing::warn!(
+                            target: "squeezy::store",
+                            on_disk_version,
+                            schema_version = GRAPH_SCHEMA_VERSION,
+                            backup = %backup.display(),
+                            "graph.redb schema mismatch; existing graph cache backed up and reinitialised",
+                        );
+                    }
+                    Err(rotate_err) => {
+                        // Same extended-path retry as the state-store path:
+                        // try `replace_file` (MoveFileExW + `\\?\`) before
+                        // deleting, so paths past MAX_PATH still get the
+                        // friendly backup.
+                        match fs_util::replace_file(&path, &backup) {
+                            Ok(()) => {
+                                sync_parent_dir(&backup)?;
+                                tracing::warn!(
+                                    target: "squeezy::store",
+                                    on_disk_version,
+                                    schema_version = GRAPH_SCHEMA_VERSION,
+                                    backup = %backup.display(),
+                                    rotate_error = %rotate_err,
+                                    "graph.redb schema mismatch; rename rotation failed but extended-path replace succeeded; existing graph cache backed up and reinitialised",
+                                );
+                            }
+                            Err(replace_err) => {
+                                // Both rotation attempts blocked (e.g.
+                                // Windows file lock). Delete and reinitialise
+                                // fresh without the backup.
+                                let _ = fs::remove_file(&path);
+                                tracing::warn!(
+                                    target: "squeezy::store",
+                                    on_disk_version,
+                                    schema_version = GRAPH_SCHEMA_VERSION,
+                                    rotate_error = %rotate_err,
+                                    replace_error = %replace_err,
+                                    "graph.redb schema mismatch; rotation failed, existing graph cache deleted and reinitialised",
+                                );
+                            }
+                        }
+                    }
+                }
                 bootstrap_graph_store(&path)?;
                 open_database(&path)?
             }
@@ -582,6 +719,16 @@ impl GraphStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn probe_path_read_only(path: impl Into<PathBuf>) -> Result<GraphStoreProbe> {
+        let path = path.into();
+        let database = ReadOnlyDatabase::open(&path).map_err(store_error)?;
+        let schema_version = current_schema_version(&database)?;
+        Ok(GraphStoreProbe {
+            path,
+            schema_version,
+        })
     }
 
     pub fn set_graph_metadata(&self, metadata: &GraphStoreMetadata) -> Result<()> {
@@ -670,6 +817,14 @@ impl GraphStore {
                 table.remove(key.as_str()).map_err(store_error)?;
             }
         }
+        if let Some(blob) = &batch.import_graph {
+            let mut table = write
+                .open_table(RESOLVER_IMPORT_GRAPH)
+                .map_err(store_error)?;
+            table
+                .insert("resolver_import_graph", blob.as_slice())
+                .map_err(store_error)?;
+        }
         write.commit().map_err(store_error)
     }
 
@@ -721,14 +876,9 @@ impl GraphStore {
     }
 
     pub fn put_import_graph<T: Serialize>(&self, graph: &T) -> Result<()> {
-        let write = self.begin_write()?;
-        {
-            let mut table = write
-                .open_table(RESOLVER_IMPORT_GRAPH)
-                .map_err(store_error)?;
-            insert_json(&mut table, "resolver_import_graph", graph)?;
-        }
-        write.commit().map_err(store_error)
+        let mut batch = GraphWriteBatch::new();
+        batch.set_import_graph(graph)?;
+        self.apply_graph_batch(&batch)
     }
 
     pub fn import_graph<T: DeserializeOwned>(&self) -> Result<Option<T>> {
@@ -764,6 +914,11 @@ pub struct GraphWriteBatch {
     removals: Vec<String>,
     resolver_upserts: Vec<(String, Vec<u8>)>,
     resolver_removals: Vec<String>,
+    /// Encoded replacement for the single-blob `RESOLVER_IMPORT_GRAPH` entry.
+    /// When `Some`, the batch writes this value in the same transaction as the
+    /// per-file resolver upserts/removals, so all resolver-cache state is
+    /// committed atomically.
+    import_graph: Option<Vec<u8>>,
 }
 
 impl GraphWriteBatch {
@@ -803,19 +958,30 @@ impl GraphWriteBatch {
         self.resolver_removals.push(file_id.0.clone());
     }
 
+    /// Encode and stage a replacement for the single-blob import-adjacency
+    /// graph. Committed in the same transaction as any resolver-entry
+    /// upserts/removals so all resolver-cache state lands atomically.
+    pub fn set_import_graph<T: Serialize>(&mut self, graph: &T) -> Result<()> {
+        self.import_graph = Some(encode(graph)?);
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.metadata.is_none()
             && self.upserts.is_empty()
             && self.removals.is_empty()
             && self.resolver_upserts.is_empty()
             && self.resolver_removals.is_empty()
+            && self.import_graph.is_none()
     }
 
     pub fn len(&self) -> usize {
-        self.upserts.len()
+        usize::from(self.metadata.is_some())
+            + self.upserts.len()
             + self.removals.len()
             + self.resolver_upserts.len()
             + self.resolver_removals.len()
+            + usize::from(self.import_graph.is_some())
     }
 }
 
@@ -896,6 +1062,7 @@ pub struct CacheFileReport {
     pub path: PathBuf,
     pub exists: bool,
     pub size_bytes: u64,
+    pub modified_unix_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -903,32 +1070,120 @@ pub struct CacheDiagnostics {
     pub cache_dir: PathBuf,
     pub state: CacheFileReport,
     pub graph: CacheFileReport,
+    pub state_stats: Option<StateCacheStats>,
+    pub graph_stats: Option<GraphCacheStats>,
     pub backups: Vec<CacheFileReport>,
     pub backup_total_bytes: u64,
+    pub storage: Vec<StoragePathReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoragePathReport {
+    pub label: String,
+    pub path: PathBuf,
+    pub mount_source: Option<String>,
+    pub filesystem_type: Option<String>,
+    pub classification: StorageMountClassification,
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StorageMountClassification {
+    Local,
+    Network,
+    Virtual,
+    Unknown,
+}
+
+impl StorageMountClassification {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Network => "network",
+            Self::Virtual => "virtual",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Outcome of [`prune_cache_backups`]. Partial failures land in
+/// `failed_files` instead of short-circuiting the prune so the caller can
+/// surface a per-file summary (the doctor row uses both halves), but
+/// callers that previously pattern-matched `Err(io::ErrorKind::…)` on the
+/// old signature would silently miss those failures — hence `#[must_use]`
+/// and [`Self::errored`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateCacheStats {
+    pub schema_version: Option<u64>,
+    pub tool_receipts: usize,
+    pub read_snapshots: usize,
+    pub mcp_tool_cache_entries: usize,
+    pub observations: usize,
+    pub compaction_checkpoints: usize,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphCacheStats {
+    pub schema_version: Option<u64>,
+    pub graph_partitions: usize,
+    pub resolver_entries: usize,
+    pub import_graph_present: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[must_use = "CachePruneReport carries partial failures in `failed_files`; ignore only intentionally"]
 pub struct CachePruneReport {
     pub removed_files: Vec<CacheFileReport>,
     pub removed_bytes: u64,
+    pub failed_files: Vec<(PathBuf, String)>,
+}
+
+impl CachePruneReport {
+    /// `Some` iff at least one backup failed to delete. Lets callers test
+    /// for partial failure without re-checking the `failed_files` field.
+    pub fn errored(&self) -> Option<&[(PathBuf, String)]> {
+        (!self.failed_files.is_empty()).then_some(self.failed_files.as_slice())
+    }
 }
 
 pub fn cache_diagnostics(
     workspace_root: impl AsRef<Path>,
     cache_root: Option<&Path>,
 ) -> Result<CacheDiagnostics> {
+    cache_diagnostics_with_session_dir(workspace_root, cache_root, None)
+}
+
+pub fn cache_diagnostics_with_session_dir(
+    workspace_root: impl AsRef<Path>,
+    cache_root: Option<&Path>,
+    session_log_dir: Option<&Path>,
+) -> Result<CacheDiagnostics> {
     let workspace_root = workspace_root.as_ref();
     let cache_dir = cache_dir_path(workspace_root, cache_root);
     let state = cache_file_report(state_path(workspace_root, cache_root));
     let graph = cache_file_report(graph_path(workspace_root, cache_root));
+    let state_stats = state.exists.then(|| state_cache_stats(&state.path));
+    let graph_stats = graph.exists.then(|| graph_cache_stats(&graph.path));
     let backups = cache_backups(&cache_dir)?;
     let backup_total_bytes = backups.iter().map(|file| file.size_bytes).sum();
+    let session_dir = session_dir_path(workspace_root, cache_root, session_log_dir);
+    let storage = storage_reports([
+        ("cache", cache_dir.as_path()),
+        ("sessions", session_dir.as_path()),
+        ("state.redb", state.path.as_path()),
+        ("graph.redb", graph.path.as_path()),
+    ]);
     Ok(CacheDiagnostics {
         cache_dir,
         state,
         graph,
+        state_stats,
+        graph_stats,
         backups,
         backup_total_bytes,
+        storage,
     })
 }
 
@@ -938,20 +1193,22 @@ pub fn prune_cache_backups(
 ) -> Result<CachePruneReport> {
     let diagnostics = cache_diagnostics(workspace_root, cache_root)?;
     let mut removed_files = Vec::new();
+    let mut failed_files = Vec::new();
     let mut removed_bytes = 0;
     for backup in diagnostics.backups {
-        match fs::remove_file(&backup.path) {
+        match fs_util::remove_file(&backup.path) {
             Ok(()) => {
                 removed_bytes += backup.size_bytes;
                 removed_files.push(backup);
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
+            Err(SqueezyError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => failed_files.push((backup.path.clone(), err.to_string())),
         }
     }
     Ok(CachePruneReport {
         removed_files,
         removed_bytes,
+        failed_files,
     })
 }
 
@@ -973,12 +1230,107 @@ fn bootstrap_graph_store(path: &Path) -> Result<()> {
     initialize_graph_schema(&database)
 }
 
+fn state_cache_stats(path: &Path) -> StateCacheStats {
+    match open_database(path) {
+        Ok(database) => StateCacheStats {
+            schema_version: current_schema_version(&database).ok().flatten(),
+            tool_receipts: table_entry_count(&database, TOOL_RECEIPTS).unwrap_or(0),
+            read_snapshots: table_entry_count(&database, READ_SNAPSHOTS).unwrap_or(0),
+            mcp_tool_cache_entries: table_entry_count(&database, MCP_TOOL_CACHE).unwrap_or(0),
+            observations: table_entry_count(&database, OBSERVATIONS).unwrap_or(0),
+            compaction_checkpoints: table_entry_count(&database, COMPACTION_CHECKPOINTS)
+                .unwrap_or(0),
+            error: None,
+        },
+        Err(error) => StateCacheStats {
+            schema_version: None,
+            tool_receipts: 0,
+            read_snapshots: 0,
+            mcp_tool_cache_entries: 0,
+            observations: 0,
+            compaction_checkpoints: 0,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn graph_cache_stats(path: &Path) -> GraphCacheStats {
+    match open_database(path) {
+        Ok(database) => GraphCacheStats {
+            schema_version: current_schema_version(&database).ok().flatten(),
+            graph_partitions: table_entry_count(&database, GRAPH_PARTITIONS).unwrap_or(0),
+            resolver_entries: table_entry_count(&database, RESOLVER_SNAPSHOT_PER_FILE).unwrap_or(0),
+            import_graph_present: table_has_key(
+                &database,
+                RESOLVER_IMPORT_GRAPH,
+                "resolver_import_graph",
+            )
+            .unwrap_or(false),
+            error: None,
+        },
+        Err(error) => GraphCacheStats {
+            schema_version: None,
+            graph_partitions: 0,
+            resolver_entries: 0,
+            import_graph_present: false,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn table_entry_count(
+    database: &Database,
+    definition: TableDefinition<&str, &[u8]>,
+) -> Result<usize> {
+    let read = database.begin_read().map_err(store_error)?;
+    let table = match read.open_table(definition) {
+        Ok(table) => table,
+        Err(_) => return Ok(0),
+    };
+    // redb 4.x exposes a constant-time `len()` on every readable table via
+    // [`ReadableTableMetadata`]. Falling back to iteration would do a full
+    // table scan for what cache diagnostics treat as a one-line summary —
+    // noticeable on graph caches with tens of thousands of partitions.
+    table.len().map(|len| len as usize).map_err(store_error)
+}
+
+fn table_has_key(
+    database: &Database,
+    definition: TableDefinition<&str, &[u8]>,
+    key: &str,
+) -> Result<bool> {
+    let read = database.begin_read().map_err(store_error)?;
+    let table = match read.open_table(definition) {
+        Ok(table) => table,
+        Err(_) => return Ok(false),
+    };
+    table
+        .get(key)
+        .map(|value| value.is_some())
+        .map_err(store_error)
+}
+
 pub fn cache_dir_path(workspace_root: &Path, cache_root: Option<&Path>) -> PathBuf {
     match cache_root {
+        Some(path) if is_xdg_cache_root(path) => xdg_cache_dir_path(workspace_root),
         Some(path) if path.is_absolute() => path.to_path_buf(),
         Some(path) => workspace_root.join(path),
         None => workspace_root.join(".squeezy").join("cache"),
     }
+}
+
+pub fn session_dir_path(
+    workspace_root: &Path,
+    cache_root: Option<&Path>,
+    session_log_dir: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = session_log_dir {
+        return resolve_workspace_path(workspace_root, path);
+    }
+    if let Some(root) = cache_root {
+        return cache_dir_path(workspace_root, Some(root)).join("sessions");
+    }
+    workspace_root.join(".squeezy").join("sessions")
 }
 
 pub fn state_path(workspace_root: &Path, cache_root: Option<&Path>) -> PathBuf {
@@ -1026,7 +1378,7 @@ pub(crate) fn initialize_graph_schema(database: &Database) -> Result<()> {
     write.commit().map_err(store_error)
 }
 
-pub(crate) fn current_schema_version(database: &Database) -> Result<Option<u64>> {
+pub(crate) fn current_schema_version(database: &impl ReadableDatabase) -> Result<Option<u64>> {
     let read = database.begin_read().map_err(store_error)?;
     let table = match read.open_table(META) {
         Ok(table) => table,
@@ -1080,11 +1432,17 @@ fn cache_file_report(path: PathBuf) -> CacheFileReport {
             path,
             exists: true,
             size_bytes: metadata.len(),
+            modified_unix_ms: metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis()),
         },
         Err(_) => CacheFileReport {
             path,
             exists: false,
             size_bytes: 0,
+            modified_unix_ms: None,
         },
     }
 }
@@ -1124,8 +1482,307 @@ fn backup_path(path: &Path, on_disk_version: u64) -> PathBuf {
 }
 
 fn backup_path_with_label(path: &Path, label: &str) -> PathBuf {
-    let suffix = format!("{label}-{}.redb.bak", unix_millis());
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("store");
+    let suffix = format!("{stem}-{label}-{}.redb.bak", unix_millis());
     path.with_file_name(suffix)
+}
+
+pub(crate) fn is_xdg_cache_root(path: &Path) -> bool {
+    // Case-sensitive sentinel: only literal "xdg" opts into XDG resolution.
+    // `"XDG"`, `"Xdg"`, and `"xdg/"` are treated as ordinary relative paths,
+    // matching the lowercase-only convention used by `CacheDurability::parse`.
+    path == Path::new("xdg")
+}
+
+/// Resolve the on-disk location backing `[cache].root = "xdg"`.
+///
+/// Walks the standard XDG chain: `$XDG_CACHE_HOME` first, then
+/// `$HOME/.cache`, and finally `<workspace_root>/.squeezy/cache` when
+/// neither environment variable is set (typically only happens in sandboxes
+/// or test runs that strip both env vars). The repo-stable
+/// `squeezy/<repo-id>` suffix is appended in every branch so the resolved
+/// path survives workspace re-canonicalizations.
+fn xdg_cache_dir_path(workspace_root: &Path) -> PathBuf {
+    let base = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(|| workspace_root.join(".squeezy").join("cache"));
+    base.join("squeezy").join(repo_settings_id(workspace_root))
+}
+
+fn resolve_workspace_path(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+/// Atomically replace `path` with `bytes`.
+///
+/// Writes to a unique sibling temp file, calls `sync_all` on it, then
+/// `rename`s it over the destination.  On Linux, also fsyncs the parent
+/// directory so the directory entry survives a crash; on other platforms the
+/// parent fsync is a no-op (APFS provides equivalent rename durability without
+/// it).
+///
+/// Temp file naming pattern: `.{name}.{pid}.{stamp}.{counter}.tmp` (hidden,
+/// per-process). The sibling advisory lock used by the global session index
+/// follows the matching `.{name}.compact.lock` pattern. Both names are
+/// dot-prefixed so they stay out of `ls` listings; grep on either suffix when
+/// debugging a half-written state.
+pub(crate) fn atomic_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        // Newly-created session directories must themselves survive a crash:
+        // a grandparent fsync after the freshly created directory ensures the
+        // directory entry is durable before the file inside is renamed into
+        // place, closing the gap between `create_dir_all` and `fs::rename`.
+        let parent_existed = parent.exists();
+        fs::create_dir_all(parent)?;
+        if !parent_existed {
+            sync_parent_dir(parent)?;
+        }
+    }
+    let tmp = unique_tmp_path(path);
+    let result = (|| -> io::Result<()> {
+        {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp)?;
+            use std::io::Write as _;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
+        sync_parent_dir(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    let pid = std::process::id();
+    let stamp = unix_millis();
+    let counter = NEXT_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => path.with_file_name(format!(".{name}.{pid}.{stamp}.{counter}.tmp")),
+        None => path.with_extension(format!("{pid}.{stamp}.{counter}.tmp")),
+    }
+}
+
+static NEXT_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        let dir = fs::File::open(parent)?;
+        match dir.sync_all() {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+                ) =>
+            {
+                tracing::warn!(
+                    target: "squeezy::store",
+                    path = %parent.display(),
+                    error = %error,
+                    "filesystem rejected directory fsync after atomic rename",
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+fn storage_reports<'a>(
+    paths: impl IntoIterator<Item = (&'a str, &'a Path)>,
+) -> Vec<StoragePathReport> {
+    paths
+        .into_iter()
+        .map(|(label, path)| storage_report(label, path))
+        .collect()
+}
+
+fn storage_report(label: &str, path: &Path) -> StoragePathReport {
+    let mount = mount_for_path(path);
+    let filesystem_type = mount.as_ref().map(|mount| mount.fs_type.clone());
+    let mount_source = mount.as_ref().map(|mount| mount.source.clone());
+    let classification = filesystem_type
+        .as_deref()
+        .map(classify_filesystem)
+        .unwrap_or(StorageMountClassification::Unknown);
+    let warning = storage_warning(label, classification, filesystem_type.as_deref());
+    StoragePathReport {
+        label: label.to_string(),
+        path: path.to_path_buf(),
+        mount_source,
+        filesystem_type,
+        classification,
+        warning,
+    }
+}
+
+/// Suggested config key to relocate when `label` lands on a remote/volatile mount.
+/// `sessions` paths come from `[session].log_dir`; every other label
+/// (`cache`, `state.redb`, `graph.redb`) is governed by `[cache].root`.
+pub fn storage_relocation_hint(label: &str) -> &'static str {
+    match label {
+        "sessions" => "[session].log_dir",
+        _ => "[cache].root",
+    }
+}
+
+fn storage_warning(
+    label: &str,
+    classification: StorageMountClassification,
+    filesystem_type: Option<&str>,
+) -> Option<String> {
+    let hint = storage_relocation_hint(label);
+    match classification {
+        StorageMountClassification::Network => Some(format!(
+            "{} filesystems can surprise redb locking, mmap, rename, or fsync; move {hint} to a local SSD path",
+            filesystem_type.unwrap_or("network")
+        )),
+        StorageMountClassification::Virtual => Some(format!(
+            "{} filesystems can make cache locking or fsync slower or less durable; move {hint} to a local SSD path",
+            filesystem_type.unwrap_or("virtual")
+        )),
+        StorageMountClassification::Local | StorageMountClassification::Unknown => None,
+    }
+}
+
+fn classify_filesystem(fs_type: &str) -> StorageMountClassification {
+    let fs_type = fs_type.to_ascii_lowercase();
+    match fs_type.as_str() {
+        "nfs" | "nfs4" | "cifs" | "smb" | "smb2" | "smb3" | "sshfs" | "9p" | "afs" | "ceph"
+        | "glusterfs" | "davfs" => StorageMountClassification::Network,
+        "fuse" | "fuseblk" | "fuse.sshfs" | "overlay" | "overlayfs" | "aufs" | "unionfs"
+        | "virtiofs" | "proc" => StorageMountClassification::Virtual,
+        "ext2" | "ext3" | "ext4" | "xfs" | "btrfs" | "apfs" | "hfs" | "hfsplus" | "zfs"
+        | "f2fs" | "ufs" => StorageMountClassification::Local,
+        // tmpfs is RAM-backed and volatile: contents are lost on reboot/unmount.
+        // Classify it alongside virtual/container filesystems so the durability
+        // warning fires when cache or session paths land on a tmpfs mount.
+        "tmpfs" => StorageMountClassification::Virtual,
+        _ => StorageMountClassification::Unknown,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MountEntry {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    mount_point: PathBuf,
+    fs_type: String,
+    source: String,
+}
+
+fn mount_for_path(path: &Path) -> Option<MountEntry> {
+    #[cfg(target_os = "linux")]
+    {
+        let entries = parse_linux_mountinfo(&fs::read_to_string("/proc/self/mountinfo").ok()?);
+        let canonical = path
+            .canonicalize()
+            .or_else(|_| {
+                path.parent()
+                    .map(Path::canonicalize)
+                    .unwrap_or_else(|| Ok(path.to_path_buf()))
+            })
+            .unwrap_or_else(|_| path.to_path_buf());
+        entries
+            .into_iter()
+            .filter(|entry| canonical.starts_with(&entry.mount_point))
+            .max_by_key(|entry| entry.mount_point.as_os_str().len())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_mountinfo(contents: &str) -> Vec<MountEntry> {
+    contents
+        .lines()
+        .filter_map(parse_linux_mountinfo_line)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_mountinfo_line(line: &str) -> Option<MountEntry> {
+    // Per `proc(5)`, the variable-length optional-fields tail between
+    // `mount_point` and the `" - "` separator is consumed by `split_once`
+    // (we never count those fields directly); the post-separator side begins
+    // unconditionally with `fs_type` then `mount_source`.
+    let (pre, post) = line.split_once(" - ")?;
+    let mut pre_fields = pre.split_whitespace();
+    let _mount_id = pre_fields.next()?;
+    let _parent_id = pre_fields.next()?;
+    let _major_minor = pre_fields.next()?;
+    let _root = pre_fields.next()?;
+    let mount_point = unescape_mountinfo_path(pre_fields.next()?);
+    let mut post_fields = post.split_whitespace();
+    let fs_type = post_fields.next()?.to_string();
+    let source = post_fields
+        .next()
+        .map(unescape_mountinfo_path)
+        .unwrap_or_default();
+    Some(MountEntry {
+        mount_point: PathBuf::from(mount_point),
+        fs_type,
+        source,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo_path(value: &str) -> String {
+    // Accumulate raw bytes so multi-byte UTF-8 sequences encoded as consecutive
+    // octal escapes (e.g. \303\251 for 'é') are decoded correctly.
+    let mut raw: Vec<u8> = Vec::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            let mut octal = String::new();
+            for _ in 0..3 {
+                match chars.peek().copied() {
+                    Some(next) if next.is_ascii_digit() => {
+                        octal.push(next);
+                        chars.next();
+                    }
+                    _ => break,
+                }
+            }
+            if octal.len() == 3
+                && let Ok(byte) = u8::from_str_radix(&octal, 8)
+            {
+                raw.push(byte);
+                continue;
+            }
+            // Not a valid octal escape — emit the backslash and any digits we consumed.
+            raw.push(b'\\');
+            raw.extend_from_slice(octal.as_bytes());
+        } else {
+            // ASCII-only char in mountinfo field names; push its UTF-8 byte(s).
+            let mut buf = [0u8; 4];
+            raw.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    String::from_utf8_lossy(&raw).into_owned()
 }
 
 fn insert_json<T: Serialize>(
@@ -1176,7 +1833,19 @@ fn decode<T: DeserializeOwned>(value: &[u8]) -> Result<T> {
 }
 
 fn store_error(error: impl std::fmt::Display) -> SqueezyError {
-    SqueezyError::Tool(format!("store error: {error}"))
+    // The Windows storage hint mentions file locks / AV / sync clients, which
+    // is appropriate for IO-shaped failures (sharing violation, access denied,
+    // etc.) and misleading for JSON decode, schema migration, or other
+    // redb-internal errors. `std::io::Error`'s `Display` impl always includes
+    // the `(os error N)` suffix, so we gate the hint on that marker — IO
+    // errors keep the explanation, structured-data errors stay terse.
+    let text = error.to_string();
+    let formatted = if text.contains("os error") {
+        fs_util::windows_storage_hint(&text)
+    } else {
+        text
+    };
+    SqueezyError::Tool(format!("store error: {formatted}"))
 }
 
 fn receipt_key(tool_name: &str, stable_output_sha256: &str) -> String {

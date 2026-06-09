@@ -45,11 +45,11 @@ use squeezy_telemetry::{
     OutcomeStatus, RefreshKind, TelemetryClient, TelemetryEvent,
 };
 use squeezy_vcs::{
-    CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions, DiffSnapshot, GitVcs,
-    canonicalize_workspace_root, strip_verbatim_prefix,
+    CheckpointStore, CheckpointStoreOptions, DiffFile, DiffFileStatus, DiffMode, DiffOptions,
+    DiffSnapshot, GitVcs, canonicalize_workspace_root, strip_verbatim_prefix,
 };
 use squeezy_workspace::{CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexingPolicy};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 
 /// One connected MCP tool's contribution to the request framing, surfaced by
 /// [`ToolRegistry::mcp_tool_schema_infos`] for the `/context` accounting view.
@@ -138,10 +138,13 @@ use shell_parse::{analyze_shell_command, extract_shell_write_targets};
 use shell_parse::{shell_coverage_warnings, shell_segments};
 #[cfg(test)]
 use shell_program::ShellProgram;
+pub use shell_program::effective_shell_label;
 use specs::{
-    apply_patch_spec, checkpoint_list_spec, checkpoint_revert_spec, checkpoint_show_spec,
+    apply_patch_spec, checkpoint_check_spec, checkpoint_doctor_spec, checkpoint_list_spec,
+    checkpoint_restore_file_spec, checkpoint_revert_spec, checkpoint_show_spec,
     checkpoint_undo_spec, decl_search_spec, definition_search_spec, diff_context_spec,
-    downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, list_skills_spec, load_skill_spec,
+    downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, impact_spec,
+    inheritance_hierarchy_spec, list_skills_spec, load_skill_spec,
     mcp_list_resource_templates_spec, mcp_list_resources_spec, mcp_read_resource_spec,
     mcp_tool_spec, notebook_edit_spec, notes_recall_spec, notes_remember_spec, observations_spec,
     plan_patch_spec, prepare_path_arguments, read_file_spec, read_slice_spec,
@@ -151,6 +154,8 @@ use specs::{
 };
 pub use squeezy_graph::LanguageReport;
 
+#[cfg(target_os = "macos")]
+use shell_sandbox::macos_sandbox_exec_supported;
 #[cfg(all(test, target_os = "macos"))]
 use shell_sandbox::macos_shell_sandbox_profile;
 #[cfg(test)]
@@ -163,6 +168,8 @@ use shell_sandbox::{
     ShellSandboxHealth, ShellSandboxPlan, apply_shell_sandbox_backend_health,
     prepare_shell_sandbox_plan, shell_sandbox_backend_probe_failure,
 };
+#[cfg(target_os = "linux")]
+use shell_sandbox::{linux_landlock_supported, linux_unshare_supported};
 
 /// Provision the Windows elevated sandbox tier (one-time, prompts for UAC):
 /// creates the hidden local sandbox users and installs the persistent WFP
@@ -211,9 +218,7 @@ pub fn windows_sandbox_teardown() -> std::result::Result<String, String> {
     }
 }
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-use shell_sandbox::{
-    shell_sandbox_best_effort_fallback_reason, shell_sandbox_direct_fallback_reason,
-};
+use shell_sandbox::shell_sandbox_best_effort_fallback_reason;
 use truncate::truncate_middle_bytes;
 pub use web::{DEFAULT_PARALLEL_MCP_URL, WebSearchProvider};
 #[cfg(test)]
@@ -242,7 +247,7 @@ pub(crate) const DEFAULT_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
 pub(crate) const MAX_SHELL_OUTPUT_BYTE_CAP: usize = 128_000;
 const DIFF_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 /// Upper bound a graph tool waits for the deferred
-/// `GraphManager::open_with_store` background task to finish before it
+/// background graph-open task to finish before it
 /// falls back to `graph_unavailable_result`. The condvar fires the instant
 /// the background open completes, so the model only ever pays this wait on
 /// the very first graph tool call of a session and small/medium projects
@@ -263,6 +268,26 @@ pub(crate) fn graph_ready_wait() -> Duration {
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_secs(30))
+    })
+}
+
+/// Shorter graph-ready wait used for optional inheritance-grep augmentation.
+///
+/// Graph-first tools justify a full 30-second wait because they cannot
+/// produce a useful result without the graph. Grep augmentation is purely
+/// ADDITIVE: the grep result is complete and correct without it. A long
+/// wait would stall every inheritance-pattern grep call on a cold start.
+/// Override with `SQUEEZY_GRAPH_AUGMENT_WAIT_MS` when the graph typically
+/// finishes quickly or the workspace is small.
+pub(crate) fn graph_augment_wait() -> Duration {
+    use std::sync::OnceLock;
+    static WAIT: OnceLock<Duration> = OnceLock::new();
+    *WAIT.get_or_init(|| {
+        std::env::var("SQUEEZY_GRAPH_AUGMENT_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(5))
     })
 }
 pub(crate) const POLICY_PREFIX_BYTES: usize = 4096;
@@ -349,7 +374,7 @@ fn emit_graph_build_telemetry(
     telemetry.spawn(event);
 }
 
-/// Bug #7: fold a `GraphManager::open_with_store` result into the graph slot
+/// Bug #7: fold a `GraphManager` open result into the graph slot
 /// while preserving the open error. On `Ok` the manager is returned to be
 /// stored; on `Err` the slot stays `None` but the reason is recorded in
 /// `error_slot` so an *errored* open (parser/crawl/store failure) is
@@ -366,6 +391,33 @@ fn record_graph_open(
                 *slot = Some(err.to_string());
             }
             None
+        }
+    }
+}
+
+fn open_registry_graph(
+    root: &Path,
+    crawl_options: CrawlOptions,
+    graph_store: Option<Arc<GraphStore>>,
+) -> squeezy_core::Result<GraphManager> {
+    let opened_watching = GraphManager::open_watching(
+        root,
+        Default::default(),
+        crawl_options.clone(),
+        graph_store.clone(),
+        squeezy_graph::watcher::WatcherConfig::for_workspace_root(root.to_path_buf()),
+    );
+    match opened_watching {
+        Ok(manager) => Ok(manager),
+        Err(err) => {
+            let mut manager = GraphManager::open_with_store(
+                root,
+                Default::default(),
+                crawl_options,
+                graph_store,
+            )?;
+            manager.mark_polling_fallback(format!("watcher startup failed: {err}"));
+            Ok(manager)
         }
     }
 }
@@ -775,10 +827,13 @@ pub fn human_label_for_call(name: &str, args: &Value) -> String {
         },
         "read_tool_output" => "expanding earlier tool output".to_string(),
         "diff_context" => "gathering diff context".to_string(),
+        "checkpoint_doctor" => "checking checkpoint health".to_string(),
         "checkpoint_list" => "listing checkpoints".to_string(),
         "checkpoint_show" => "inspecting a checkpoint".to_string(),
         "checkpoint_undo" => "undoing to a checkpoint".to_string(),
         "checkpoint_revert" => "reverting to a checkpoint".to_string(),
+        "checkpoint_restore_file" => "restoring a checkpoint file".to_string(),
+        "checkpoint_check" => "checking checkpoint integrity".to_string(),
         "list_skills" => "listing skills".to_string(),
         "load_skill" => match s("name") {
             Some(n) => format!("loading skill `{n}`"),
@@ -913,6 +968,7 @@ pub struct ToolRuntimeConfig {
     pub shell_sandbox: ShellSandboxConfig,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub checkpoints_enabled: bool,
+    pub checkpoint_store: CheckpointStoreOptions,
     pub full_access: bool,
 }
 
@@ -1118,11 +1174,11 @@ pub struct ToolRegistry {
     pub(crate) graph: Arc<StdMutex<Option<GraphManager>>>,
     /// `(ready, cv)` paired with `graph`. Tools that need the graph wait
     /// on the condvar with a bounded timeout when the slot is still
-    /// `None` so a background `open_with_store` (started during
+    /// `None` so a background graph open (started during
     /// construction) doesn't strand them on `graph_unavailable` while
     /// the workspace crawl + tree-sitter init is still finishing.
     pub(crate) graph_ready: Arc<(StdMutex<bool>, Condvar)>,
-    /// Bug #7: records the error from a failed `GraphManager::open_with_store`
+    /// Bug #7: records the error from a failed `GraphManager` open
     /// so an *errored* open (parser/crawl/store failure) is distinguishable
     /// from a structurally-absent graph. When the slot is `Some(reason)` the
     /// graph is `None` because the open *failed*, not because the workspace
@@ -1387,6 +1443,7 @@ impl ToolRegistry {
                 shell_sandbox,
                 mcp_servers: BTreeMap::new(),
                 checkpoints_enabled: false,
+                checkpoint_store: CheckpointStoreOptions::default(),
                 full_access: false,
             },
             skills,
@@ -1435,6 +1492,7 @@ impl ToolRegistry {
                 shell_sandbox,
                 mcp_servers: BTreeMap::new(),
                 checkpoints_enabled: false,
+                checkpoint_store: CheckpointStoreOptions::default(),
                 full_access: false,
             },
             skills,
@@ -1463,7 +1521,7 @@ impl ToolRegistry {
         // `SqueezyError::Config` here instead of silently disabling the
         // policy on every hot-path call.
         let compiled_policy = Arc::new(crawl_options.policy.compile()?);
-        // Defer the graph open: `GraphManager::open_with_store` walks the
+        // Defer the graph open: opening the graph walks the
         // workspace, initialises every tree-sitter grammar, and hydrates
         // redb partitions — typically the single largest contributor to
         // session startup. Hand that work to the blocking pool when a
@@ -1496,12 +1554,8 @@ impl ToolRegistry {
                                 .map(Arc::new)
                         })
                         .flatten();
-                    let opened_result = GraphManager::open_with_store(
-                        &root_for_graph,
-                        Default::default(),
-                        crawl_options_for_graph,
-                        graph_store,
-                    );
+                    let opened_result =
+                        open_registry_graph(&root_for_graph, crawl_options_for_graph, graph_store);
                     if let Some(telemetry) = telemetry_for_graph.as_ref() {
                         emit_graph_build_telemetry(telemetry, &opened_result);
                     }
@@ -1530,12 +1584,7 @@ impl ToolRegistry {
                             .map(Arc::new)
                     })
                     .flatten();
-                let opened_result = GraphManager::open_with_store(
-                    &root,
-                    Default::default(),
-                    crawl_options.clone(),
-                    graph_store,
-                );
+                let opened_result = open_registry_graph(&root, crawl_options.clone(), graph_store);
                 if let Some(telemetry) = telemetry.as_ref() {
                     emit_graph_build_telemetry(telemetry, &opened_result);
                 }
@@ -1556,7 +1605,10 @@ impl ToolRegistry {
         let vcs = GitVcs::open(&root)?;
         let shell_audit = ShellAuditStore::new(&root);
         let checkpoints = if config.checkpoints_enabled {
-            Some(Arc::new(CheckpointStore::open(&root)?))
+            Some(Arc::new(CheckpointStore::open_with_options(
+                &root,
+                config.checkpoint_store,
+            )?))
         } else {
             None
         };
@@ -1654,7 +1706,7 @@ impl ToolRegistry {
     }
 
     /// Block (on a `std::sync::Condvar`) for up to `max_wait` waiting
-    /// for the deferred `GraphManager::open_with_store` background task
+    /// for the deferred `GraphManager` background open task
     /// to mark the graph slot ready. Returns whether the graph is ready
     /// (i.e. the caller can expect `self.graph.lock().as_mut()` to be
     /// `Some` unless the open itself failed). Callers fall back to the
@@ -1673,7 +1725,7 @@ impl ToolRegistry {
         }
     }
 
-    /// Bug #7: the reason a `GraphManager::open_with_store` *failed*, if it
+    /// Bug #7: the reason a `GraphManager` open *failed*, if it
     /// did. `Some(reason)` means the graph slot is `None` because the open
     /// errored (parser/crawl/store failure) — distinguishable from a workspace
     /// that legitimately has no graph (`None` here, graph slot `None`). Returns
@@ -1728,6 +1780,14 @@ impl ToolRegistry {
         let Some(checkpoints) = self.checkpoints.as_ref() else {
             return Ok(None);
         };
+        for path in checkpoints.rollback_paths(squeezy_vcs::RollbackTarget::Latest)? {
+            if let Err(err) = safety::assess_write_path(&path, &self.root, &self.shell_sandbox) {
+                return Err(SqueezyError::Tool(format!(
+                    "checkpoint undo denied for {path}: {}",
+                    err.message()
+                )));
+            }
+        }
         let result = checkpoints.rollback(
             squeezy_vcs::RollbackTarget::Latest,
             mode.unwrap_or_default(),
@@ -1757,8 +1817,13 @@ impl ToolRegistry {
                 Ok(ShellSandboxPlan::external(command, &self.shell_sandbox))
             }
             ShellSandboxMode::BestEffort | ShellSandboxMode::Required => {
-                let plan =
-                    prepare_shell_sandbox_plan(command, analysis, &self.root, &self.shell_sandbox)?;
+                let plan = prepare_shell_sandbox_plan(
+                    command,
+                    analysis,
+                    &self.root,
+                    &self.shell_sandbox,
+                    &self.shell_sandbox_health,
+                )?;
                 apply_shell_sandbox_backend_health(
                     command,
                     &self.shell_sandbox,
@@ -1905,7 +1970,7 @@ impl ToolRegistry {
     /// Return the advertised tool list. The result is cached behind an
     /// `Arc<Vec<ToolSpec>>` and re-used across turns; the cache is
     /// Current per-language file counts from the graph, or `None` when
-    /// the background `GraphManager::open_with_store` hasn't finished
+    /// the background `GraphManager` open hasn't finished
     /// yet. When the watcher has accumulated pending changes since the
     /// last refresh, opportunistically calls `refresh_before_query`
     /// (which has its own debounce + idle interval, so the cost is
@@ -1946,6 +2011,8 @@ impl ToolRegistry {
             glob_spec(),
             grep_spec(),
             hierarchy_spec(),
+            impact_spec(),
+            inheritance_hierarchy_spec(),
             notebook_edit_spec(),
             plan_patch_spec(),
             read_file_spec(),
@@ -1974,9 +2041,15 @@ impl ToolRegistry {
                 mcp_read_resource_spec(),
             ]);
         }
+        // `checkpoint_list` is always advertised so the model and UI can
+        // discover the disabled state (the handler returns `enabled:false`)
+        // rather than treating checkpoint tools as entirely absent.
+        specs.push(checkpoint_list_spec());
         if self.checkpoints.is_some() {
             specs.extend([
-                checkpoint_list_spec(),
+                checkpoint_check_spec(),
+                checkpoint_doctor_spec(),
+                checkpoint_restore_file_spec(),
                 checkpoint_revert_spec(),
                 checkpoint_show_spec(),
                 checkpoint_undo_spec(),
@@ -2003,8 +2076,17 @@ impl ToolRegistry {
             }
         }
         // `mcp_tool_spec` already compacts at construction; append after the
-        // first-party loop to avoid double work.
-        specs.extend(self.mcp.tools().into_iter().map(mcp_tool_spec));
+        // first-party loop to avoid double work.  Annotate tools belonging to
+        // stale servers so the model knows it is calling an external tool
+        // whose palette may not reflect the server's current capability.
+        let mcp_status = self.mcp.status_snapshot();
+        specs.extend(self.mcp.tools().into_iter().map(|tool| {
+            let is_stale = matches!(
+                mcp_status.per_server.get(&tool.server),
+                Some(McpServerStatus::Stale { .. })
+            );
+            mcp_tool_spec(tool, is_stale)
+        }));
         // Partition first-party before MCP, alphabetic within each group. The
         // contiguous first-party prefix lets the Anthropic adapter place its
         // tools-array `cache_control` breakpoint on the last first-party tool,
@@ -2103,6 +2185,10 @@ impl ToolRegistry {
         self.mcp.status_snapshot()
     }
 
+    pub fn mcp_tool_list_changed_notify(&self) -> Arc<Notify> {
+        self.mcp.tool_list_changed_notify()
+    }
+
     /// Per-tool accounting view for `/context`: every connected MCP tool with
     /// its owning server, first-line description, and both its lazy stub cost
     /// (the `<tools_index>` line, always present) and its full schema cost (the
@@ -2133,8 +2219,10 @@ impl ToolRegistry {
                 )
                 .len();
                 // Full schema sized exactly as advertised to the model — same
-                // ToolSpec shape produced for the live request.
-                let full_bytes = serde_json::to_string(&mcp_tool_spec(tool))
+                // ToolSpec shape produced for the live request.  Stale state
+                // is unknown at this call site (diagnostic only); pass false
+                // so the schema bytes exclude the stale notice suffix.
+                let full_bytes = serde_json::to_string(&mcp_tool_spec(tool, false))
                     .map(|json| json.len())
                     .unwrap_or(0);
                 McpToolSchemaInfo {
@@ -2193,7 +2281,9 @@ impl ToolRegistry {
             return PermissionScope::Mcp;
         }
         match call.name.as_str() {
-            "apply_patch" | "checkpoint_undo" | "checkpoint_revert" => PermissionScope::Edit,
+            "apply_patch" | "checkpoint_undo" | "checkpoint_revert" | "checkpoint_restore_file" => {
+                PermissionScope::Edit
+            }
             "write_file" | "notebook_edit" => PermissionScope::Edit,
             "shell" | "verify" | "refresh_compiler_facts" => PermissionScope::Shell,
             "webfetch" | "websearch" => PermissionScope::Web,
@@ -2207,11 +2297,13 @@ impl ToolRegistry {
             "read_slice" if self.read_slice_targets_ignored_policy(&call.arguments) => {
                 PermissionScope::IgnoredSearch
             }
-            "checkpoint_list" | "checkpoint_show" | "decl_search" | "definition_search"
-            | "diff_context" | "downstream_flow" | "glob" | "grep" | "hierarchy" | "plan_patch"
-            | "read_file" | "read_slice" | "read_tool_output" | "reference_search" | "repo_map"
-            | "symbol_context" | "upstream_flow" | "list_skills" | "load_skill"
-            | "observations" => PermissionScope::Read,
+            "checkpoint_check" | "checkpoint_doctor" | "checkpoint_list" | "checkpoint_show"
+            | "decl_search" | "definition_search" | "diff_context" | "downstream_flow" | "glob"
+            | "grep" | "hierarchy" | "plan_patch" | "read_file" | "read_slice"
+            | "read_tool_output" | "reference_search" | "repo_map" | "symbol_context"
+            | "upstream_flow" | "list_skills" | "load_skill" | "observations" => {
+                PermissionScope::Read
+            }
             _ => PermissionScope::Read,
         }
     }
@@ -2284,7 +2376,7 @@ impl ToolRegistry {
                 }
                 (PermissionCapability::Edit, target, PermissionRisk::High)
             }
-            "checkpoint_undo" | "checkpoint_revert" => (
+            "checkpoint_undo" | "checkpoint_revert" | "checkpoint_restore_file" => (
                 PermissionCapability::Edit,
                 "workspace:*".to_string(),
                 PermissionRisk::High,
@@ -2407,6 +2499,87 @@ impl ToolRegistry {
                     "sandbox_network".to_string(),
                     self.shell_sandbox.network.as_str().to_string(),
                 );
+                // Surface the active OS sandbox backend and filesystem posture at
+                // approval time so the TUI can show isolation level before spawn.
+                // Uses the same probe functions the planner calls so the displayed
+                // backend matches the one the planner will actually select.
+                #[cfg(target_os = "linux")]
+                let (sandbox_backend, sandbox_filesystem) = {
+                    let will_use_direct_syscalls = linux_unshare_supported()
+                        && !matches!(
+                            self.shell_sandbox.mode,
+                            ShellSandboxMode::Off | ShellSandboxMode::External
+                        );
+                    if will_use_direct_syscalls {
+                        let fs = if linux_landlock_supported() {
+                            "enforced"
+                        } else {
+                            "best_effort_unavailable"
+                        };
+                        ("linux-direct-syscalls", fs)
+                    } else {
+                        ("none", "not_enforced")
+                    }
+                };
+                #[cfg(target_os = "macos")]
+                let (sandbox_backend, sandbox_filesystem) = {
+                    if macos_sandbox_exec_supported()
+                        && !matches!(
+                            self.shell_sandbox.mode,
+                            ShellSandboxMode::Off | ShellSandboxMode::External
+                        )
+                    {
+                        ("macos-sandbox-exec", "enforced")
+                    } else {
+                        ("none", "not_enforced")
+                    }
+                };
+                #[cfg(target_os = "windows")]
+                let (sandbox_backend, sandbox_filesystem) = {
+                    if matches!(
+                        self.shell_sandbox.mode,
+                        ShellSandboxMode::Off | ShellSandboxMode::External
+                    ) {
+                        ("none", "not_enforced")
+                    } else {
+                        match self.shell_sandbox.windows_sandbox_level {
+                            squeezy_core::WindowsSandboxLevel::Disabled => {
+                                ("windows-job-object", "best_effort_unavailable")
+                            }
+                            squeezy_core::WindowsSandboxLevel::RestrictedToken => {
+                                ("windows-restricted-token", "enforced_writes_only")
+                            }
+                            squeezy_core::WindowsSandboxLevel::Elevated
+                                if squeezy_win_sandbox::elevated_setup_is_complete(
+                                    &win_sandbox_spec::win_state_dir(),
+                                ) =>
+                            {
+                                ("windows-elevated", "enforced")
+                            }
+                            squeezy_core::WindowsSandboxLevel::Elevated => {
+                                ("windows-restricted-token", "enforced_writes_only")
+                            }
+                        }
+                    }
+                };
+                #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                let (sandbox_backend, sandbox_filesystem) = ("none", "not_enforced");
+                metadata.insert("sandbox_backend".to_string(), sandbox_backend.to_string());
+                metadata.insert(
+                    "sandbox_filesystem".to_string(),
+                    sandbox_filesystem.to_string(),
+                );
+                // On linux-direct-syscalls the seccomp filter denies AF_UNIX
+                // socket(2), so squeezy ask cannot connect from inside the child.
+                // Only emit this hint when the direct-syscalls backend will
+                // actually be used (i.e. unshare is available and sandbox is on).
+                #[cfg(target_os = "linux")]
+                if sandbox_backend == "linux-direct-syscalls" {
+                    metadata.insert(
+                        "ask_socket_unavailable".to_string(),
+                        "squeezy ask is unavailable inside this shell child because the seccomp profile blocks AF_UNIX socket(2)".to_string(),
+                    );
+                }
                 metadata.insert(
                     "sandbox_read_roots".to_string(),
                     path_list_metadata(&self.shell_sandbox.read_roots),
@@ -2415,6 +2588,56 @@ impl ToolRegistry {
                     "sandbox_write_roots".to_string(),
                     path_list_metadata(&self.shell_sandbox.write_roots),
                 );
+                // Surface the active filesystem-isolation posture (e.g.
+                // "enforced", "enforced_writes_only", "best_effort_unavailable")
+                // so the approval prompt can warn when the active backend
+                // does not actually isolate filesystem reads or writes.
+                if let Ok(plan) = prepare_shell_sandbox_plan(
+                    command,
+                    &analysis,
+                    &self.root,
+                    &self.shell_sandbox,
+                    &self.shell_sandbox_health,
+                ) {
+                    metadata.insert("filesystem".to_string(), plan.filesystem.to_string());
+                }
+                // Surface the effective Windows sandbox posture to the
+                // approval UI. The default restricted-token tier enforces
+                // workspace write boundaries, but it does not isolate reads or
+                // network. Disabled/off mode is only Job Object cleanup.
+                #[cfg(target_os = "windows")]
+                {
+                    use squeezy_core::WindowsSandboxLevel;
+                    let posture = match self.shell_sandbox.mode {
+                        ShellSandboxMode::External => None,
+                        ShellSandboxMode::Off => Some("job-object-only"),
+                        ShellSandboxMode::Required | ShellSandboxMode::BestEffort => {
+                            match self.shell_sandbox.windows_sandbox_level {
+                                WindowsSandboxLevel::Disabled => Some("job-object-only"),
+                                WindowsSandboxLevel::RestrictedToken => {
+                                    Some("restricted-token-writes-only")
+                                }
+                                WindowsSandboxLevel::Elevated
+                                    if squeezy_win_sandbox::elevated_setup_is_complete(
+                                        &crate::win_sandbox_spec::win_state_dir(),
+                                    ) =>
+                                {
+                                    None
+                                }
+                                WindowsSandboxLevel::Elevated => {
+                                    Some("restricted-token-writes-only")
+                                }
+                            }
+                        }
+                    };
+                    if let Some(posture) = posture {
+                        metadata.insert("windows_sandbox_posture".to_string(), posture.to_string());
+                        if posture == "job-object-only" {
+                            metadata
+                                .insert("windows_no_fs_sandbox".to_string(), "true".to_string());
+                        }
+                    }
+                }
                 if let Some(timeout_ms) = args.as_ref().and_then(|args| args.timeout_ms) {
                     metadata.insert("timeout_ms".to_string(), timeout_ms.to_string());
                 }
@@ -2425,6 +2648,20 @@ impl ToolRegistry {
                     args.as_ref().and_then(|args| args.description.as_deref())
                 {
                     metadata.insert("description".to_string(), description.to_string());
+                }
+                // On Windows, show the resolved shell in the approval metadata so
+                // the reviewer can see whether the command runs under pwsh, powershell,
+                // cmd.exe, or a custom override. Quoting, redirects, and destructive
+                // verbs differ significantly between these shells.
+                #[cfg(windows)]
+                {
+                    let shell = shell_program::ShellProgram::for_command(command);
+                    let shell_name = std::path::Path::new(&shell.program)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&shell.program)
+                        .to_string();
+                    metadata.insert("resolved_shell".to_string(), shell_name);
                 }
                 suggested_rules.push(PermissionRule::new(
                     analysis.capability.as_str(),
@@ -2564,7 +2801,9 @@ impl ToolRegistry {
                 "workspace:*".to_string(),
                 PermissionRisk::Low,
             ),
-            "checkpoint_list"
+            "checkpoint_check"
+            | "checkpoint_doctor"
+            | "checkpoint_list"
             | "checkpoint_show"
             | "diff_context"
             | "downstream_flow"
@@ -2742,6 +2981,7 @@ impl ToolRegistry {
             return format!("mcp server={:?} tool={:?}", tool.server, tool.raw_name);
         }
         match call.name.as_str() {
+            "checkpoint_doctor" => "checkpoint_doctor".to_string(),
             "checkpoint_list" => "checkpoint_list".to_string(),
             "checkpoint_show" => {
                 let args =
@@ -3123,10 +3363,13 @@ impl ToolRegistry {
         } else {
             match call.name.as_str() {
                 "apply_patch" => self.execute_apply_patch(&call, &group_id).await,
+                "checkpoint_doctor" => self.execute_checkpoint_doctor(&call).await,
                 "checkpoint_list" => self.execute_checkpoint_list(&call).await,
                 "checkpoint_show" => self.execute_checkpoint_show(&call).await,
                 "checkpoint_undo" => self.execute_checkpoint_undo(&call).await,
                 "checkpoint_revert" => self.execute_checkpoint_revert(&call).await,
+                "checkpoint_restore_file" => self.execute_checkpoint_restore_file(&call).await,
+                "checkpoint_check" => self.execute_checkpoint_check(&call).await,
                 "repo_map" | "decl_search" | "definition_search" | "reference_search"
                 | "upstream_flow" | "downstream_flow" | "hierarchy" | "read_slice"
                 | "symbol_context" => self.execute_graph_tool(&call).await,
@@ -4560,6 +4803,11 @@ impl ToolRegistry {
         // mtime bump and the journal entry that would otherwise be recorded
         // for a no-op edit.
         let after_sha256 = sha256_hex(args.content.as_bytes());
+        let newline_before = before
+            .as_ref()
+            .map(|b| detect_newline_style(b))
+            .unwrap_or("none");
+        let newline_after = detect_newline_style(args.content.as_bytes());
         if before_sha256.as_deref() == Some(after_sha256.as_str()) {
             let cost = ToolCostHint {
                 bytes_read: before.as_ref().map_or(0, |bytes| bytes.len() as u64),
@@ -4571,6 +4819,8 @@ impl ToolRegistry {
                 "after_sha256": after_sha256,
                 "bytes_written": 0,
                 "noop": true,
+                "newline_style_before": newline_before,
+                "newline_style_after": newline_after,
             });
             return make_result(call, ToolStatus::Success, content, cost, Some(after_sha256));
         }
@@ -4591,13 +4841,28 @@ impl ToolRegistry {
             ..ToolCostHint::default()
         };
 
+        let le_after = detect_line_endings(args.content.as_bytes());
+        let le_before = before.as_deref().map(detect_line_endings);
         let mut content = json!({
             "path": rel.to_string_lossy(),
             "before_sha256": before_sha256,
             "after_sha256": after_sha256,
             "bytes_written": args.content.len(),
             "noop": false,
+            "newline_style_before": newline_before,
+            "newline_style_after": newline_after,
         });
+        // Surface line-ending metadata so the model can detect when an edit
+        // silently converts CRLF line endings to LF (common on Windows).
+        if let Some(le_b) = le_before
+            && let Some(obj) = content.as_object_mut()
+        {
+            obj.insert("line_endings_before".into(), json!(le_b));
+            obj.insert("line_endings_after".into(), json!(le_after));
+            if le_b != le_after && le_b != "none" && le_after != "none" {
+                obj.insert("line_endings_changed".into(), json!(true));
+            }
+        }
         self.append_checkpoint_to_content(
             &mut content,
             checkpoint_before.as_ref(),
@@ -5071,10 +5336,13 @@ impl ToolOutputStore {
             return result;
         }
 
-        let output = result
-            .spill_model_output
-            .take()
-            .unwrap_or_else(|| model_output.clone());
+        // Compute the preview from the model-visible output before potentially
+        // moving `model_output` into the on-disk write buffer. This lets us
+        // avoid an O(n) clone when `spill_model_output` is absent.
+        let (preview, _) = truncate_middle_bytes(&model_output, self.preview_bytes);
+        // Move `model_output` into the write buffer when no pre-computed spill
+        // output was provided — avoids a second O(n) copy for large results.
+        let output = result.spill_model_output.take().unwrap_or(model_output);
         let sha256 = sha256_hex(output.as_bytes());
         let path = self.path_for(&sha256);
         if let Err(err) = fs::write(&path, output.as_bytes()) {
@@ -5085,8 +5353,6 @@ impl ToolOutputStore {
                 sha256_hex(serde_json::to_vec(&result.content).unwrap_or_default());
             return result;
         }
-
-        let (preview, _) = truncate_middle_bytes(&model_output, self.preview_bytes);
         let ToolResult {
             call_id,
             tool_name,
@@ -5481,6 +5747,7 @@ fn crawl_options_from_graph_config(config: &GraphConfig) -> CrawlOptions {
         include_hidden: config.include_hidden,
         max_file_bytes: config.max_file_bytes,
         require_indexing_signal: config.require_indexing_signal,
+        languages: config.languages.clone(),
         policy: IndexingPolicy {
             include: config.include.clone(),
             exclude: config.exclude.clone(),
@@ -6284,12 +6551,19 @@ pub(crate) fn shell_exit_signal(status: Option<&std::process::ExitStatus>) -> Op
 }
 
 pub(crate) fn checkpoints_disabled_result(call: &ToolCall) -> ToolResult {
+    // `message` mirrors the `error` body so TUI checkpoint cards can
+    // surface the disabled-checkpoints opt-in hint through the same
+    // `string_arg(content, "message")` lookup the list card already
+    // uses. Rollback / restore-file / check cards otherwise read
+    // `content["rollback"]`, which is absent here, and would render a
+    // useless `0 restored · 0 deleted` summary.
     make_result(
         call,
         ToolStatus::Stale,
         json!({
             "enabled": false,
             "error": CHECKPOINTS_DISABLED_MESSAGE,
+            "message": CHECKPOINTS_DISABLED_MESSAGE,
         }),
         ToolCostHint::default(),
         None,
@@ -6331,11 +6605,14 @@ pub(crate) fn tool_error(call: &ToolCall, err: impl ToString) -> ToolResult {
 }
 
 pub(crate) fn build_required_glob(pattern: &str) -> std::result::Result<GlobSet, String> {
+    // Normalise Windows-style backslashes to forward slashes so that patterns
+    // like `src\**\*.rs` are treated as path-aware globs on all platforms.
+    let pattern = pattern.replace('\\', "/");
     let mut builder = GlobSetBuilder::new();
     if pattern.contains('/') {
-        builder.add(Glob::new(pattern).map_err(|err| err.to_string())?);
+        builder.add(Glob::new(&pattern).map_err(|err| err.to_string())?);
     } else {
-        builder.add(Glob::new(pattern).map_err(|err| err.to_string())?);
+        builder.add(Glob::new(&pattern).map_err(|err| err.to_string())?);
         builder.add(Glob::new(&format!("**/{pattern}")).map_err(|err| err.to_string())?);
     }
     builder.build().map_err(|err| err.to_string())
@@ -6351,11 +6628,15 @@ pub(crate) fn build_include_set(
         return Ok(None);
     }
     let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
+    for raw in patterns {
+        // Normalise backslashes once per pattern so include/exclude filters
+        // from Windows callers align with the slash-normalised paths that
+        // glob/grep return.
+        let pattern = raw.replace('\\', "/");
         if pattern.contains('/') {
-            builder.add(Glob::new(pattern).map_err(|err| err.to_string())?);
+            builder.add(Glob::new(&pattern).map_err(|err| err.to_string())?);
         } else {
-            builder.add(Glob::new(pattern).map_err(|err| err.to_string())?);
+            builder.add(Glob::new(&pattern).map_err(|err| err.to_string())?);
             builder.add(Glob::new(&format!("**/{pattern}")).map_err(|err| err.to_string())?);
         }
     }
@@ -6759,14 +7040,16 @@ fn patch_match_contexts(content: &str, search: &str, max_matches: usize) -> Vec<
 ///
 /// `backend` is the OS sandbox backend that was attempted (e.g.
 /// `macos-sandbox-exec`); `fallback_count` is the cumulative number of
-/// fallbacks across the registry's lifetime (so per session); and
+/// fallbacks across the registry's lifetime (so per session);
 /// `first_in_session` is the one-shot latch indicating whether this is the
-/// first time the registry has seen a fallback.
+/// first time the registry has seen a fallback; and `fallback_reason` is the
+/// human-readable degradation cause surfaced in the TUI warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellBestEffortFallback {
     pub backend: String,
     pub fallback_count: u64,
     pub first_in_session: bool,
+    pub fallback_reason: Option<String>,
 }
 
 /// Extract the best_effort fallback descriptor from a shell `ToolResult`,
@@ -6783,9 +7066,61 @@ pub fn shell_best_effort_fallback_from_result(
     let backend = payload.get("backend")?.as_str()?.to_string();
     let fallback_count = payload.get("fallback_count")?.as_u64()?;
     let first_in_session = payload.get("first_in_session")?.as_bool()?;
+    let fallback_reason = payload
+        .get("fallback_reason")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
     Some(ShellBestEffortFallback {
         backend,
         fallback_count,
+        first_in_session,
+        fallback_reason,
+    })
+}
+
+/// Classify the dominant line ending present in `bytes`.
+///
+/// Returns `"crlf"`, `"lf"`, `"mixed"`, or `"none"` (no newlines).  Used to
+/// surface line-ending changes in `write_file` and `apply_patch` results so
+/// callers can detect when an edit silently converts a CRLF file to LF.
+pub(crate) fn detect_line_endings(bytes: &[u8]) -> &'static str {
+    let crlf = bytes.windows(2).filter(|w| *w == b"\r\n").count();
+    let total_lf = bytes.iter().filter(|&&b| b == b'\n').count();
+    let bare_lf = total_lf.saturating_sub(crlf);
+    match (crlf > 0, bare_lf > 0) {
+        (true, true) => "mixed",
+        (true, false) => "crlf",
+        (false, true) => "lf",
+        (false, false) => "none",
+    }
+}
+
+/// Describes the once-per-session Windows degradation event embedded in a
+/// shell result when the run used `windows-job-object` or
+/// `best_effort_unavailable` filesystem isolation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellWindowsDegraded {
+    pub backend: String,
+    pub filesystem: String,
+    /// `true` the first time this is seen in the session so the TUI can emit
+    /// a one-shot banner; `false` for every subsequent degraded run.
+    pub first_in_session: bool,
+}
+
+/// Extract the Windows degradation descriptor from a shell `ToolResult`.
+/// Returns `None` when the result is not a Windows-degraded shell run or when
+/// the payload does not carry the expected fields.
+pub fn shell_windows_degraded_from_result(result: &ToolResult) -> Option<ShellWindowsDegraded> {
+    if result.tool_name != "shell" {
+        return None;
+    }
+    let payload = result.content.get("sandbox")?.get("windows_degraded")?;
+    let backend = payload.get("backend")?.as_str()?.to_string();
+    let filesystem = payload.get("filesystem")?.as_str()?.to_string();
+    let first_in_session = payload.get("first_in_session")?.as_bool()?;
+    Some(ShellWindowsDegraded {
+        backend,
+        filesystem,
         first_in_session,
     })
 }
@@ -6801,6 +7136,28 @@ pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
 }
 
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// Detect the dominant newline style of a byte slice.
+///
+/// Returns `"crlf"` when the first newline found is `\r\n`, `"lf"` when
+/// the first newline is a bare `\n`, or `"none"` when the content contains
+/// no newline characters at all.  Inspects only the first 8 KB + 1 byte so
+/// the check is O(1) for large files.  The extra byte ensures a CRLF pair
+/// straddling the 8 192-byte boundary is not missed.
+pub(crate) fn detect_newline_style(bytes: &[u8]) -> &'static str {
+    // +1 so a \r\n pair where \r lands at byte 8191 and \n at byte 8192 is
+    // still detected correctly.
+    let probe = &bytes[..bytes.len().min(8193)];
+    for (i, &b) in probe.iter().enumerate() {
+        if b == b'\n' {
+            if i > 0 && probe[i - 1] == b'\r' {
+                return "crlf";
+            }
+            return "lf";
+        }
+    }
+    "none"
+}
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

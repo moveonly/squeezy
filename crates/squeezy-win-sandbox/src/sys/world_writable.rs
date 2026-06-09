@@ -35,6 +35,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 use super::{acl, path_norm, winutil};
 use crate::WinSandboxSpec;
 
+#[cfg(test)]
+#[path = "world_writable_tests.rs"]
+mod tests;
+
 // ── Scan limits ───────────────────────────────────────────────────────────────
 
 const AUDIT_TIME_LIMIT: Duration = Duration::from_secs(2);
@@ -252,6 +256,24 @@ fn gather_candidates(cwd: &Path, env: &HashMap<String, String>) -> Vec<PathBuf> 
     out
 }
 
+fn path_key_is_equal_or_beneath(child_key: &str, parent_key: &str) -> bool {
+    if child_key == parent_key {
+        return true;
+    }
+    let prefix = if parent_key.ends_with('/') {
+        parent_key.to_string()
+    } else {
+        format!("{parent_key}/")
+    };
+    child_key.starts_with(&prefix)
+}
+
+fn deny_write_ace_should_inherit(dir_key: &str, writable_root_keys: &HashSet<String>) -> bool {
+    !writable_root_keys
+        .iter()
+        .any(|root_key| root_key != dir_key && path_key_is_equal_or_beneath(root_key, dir_key))
+}
+
 // ── Audit entry point ─────────────────────────────────────────────────────────
 
 /// Scan candidate directories (bounded by time and count) and return those that
@@ -388,8 +410,10 @@ pub(crate) fn audit_world_writable(
 
 // ── Public harness entry point ────────────────────────────────────────────────
 
-/// Run the world-writable audit and add a deny-write ACE for `deny_cap_sid` on
-/// every escape directory that is not under a writable root.
+/// Run the world-writable audit and add a non-inheriting deny-write ACE for
+/// `deny_cap_sid` on every escape directory that is not under a writable root.
+/// The deny is object-only so world-writable ancestors such as `%TEMP%` cannot
+/// override explicit writable-root allows on their descendants.
 ///
 /// This is best-effort: failures are logged with `tracing::warn!` but never
 /// propagate (a scan failure must not prevent a spawn).
@@ -409,11 +433,19 @@ pub(crate) fn apply_world_writable_denies(
     let flagged = audit_world_writable(cwd, env, &writable_root_keys);
 
     for dir in &flagged {
-        match acl::add_deny_write_ace(dir, deny_cap_sid) {
+        let dir_key = path_norm::canonical_key(dir);
+        let should_inherit = deny_write_ace_should_inherit(&dir_key, &writable_root_keys);
+        let result = if should_inherit {
+            acl::add_deny_write_ace(dir, deny_cap_sid)
+        } else {
+            acl::add_deny_write_ace_no_inherit(dir, deny_cap_sid)
+        };
+        match result {
             Ok(()) => {
                 tracing::debug!(
                     path = %dir.display(),
                     sid = deny_cap_sid,
+                    inherit = should_inherit,
                     "world_writable: applied cap-SID deny-write ACE"
                 );
             }
@@ -421,6 +453,7 @@ pub(crate) fn apply_world_writable_denies(
                 tracing::warn!(
                     path = %dir.display(),
                     sid = deny_cap_sid,
+                    inherit = should_inherit,
                     err = %e,
                     "world_writable: failed to apply cap-SID deny-write ACE; continuing"
                 );

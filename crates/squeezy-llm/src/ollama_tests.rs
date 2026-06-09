@@ -78,11 +78,49 @@ fn with_keep_alive_sets_field_for_plumbing() {
         base_url: "http://localhost:11434/api".to_string(),
         route_style: squeezy_core::OllamaRoute::Native,
         transport: squeezy_core::ProviderTransportConfig::default(),
+        ..Default::default()
     })
     .with_keep_alive("-1")
     .with_api_key("secret-token");
     assert_eq!(provider.keep_alive.as_deref(), Some("-1"));
     assert_eq!(provider.api_key.as_deref(), Some("secret-token"));
+}
+
+#[test]
+fn from_config_plumbs_keep_alive_and_api_key() {
+    let config = squeezy_core::OllamaConfig {
+        base_url: "http://localhost:11434/api".to_string(),
+        route_style: squeezy_core::OllamaRoute::Native,
+        transport: squeezy_core::ProviderTransportConfig::default(),
+        api_key_env: "OLLAMA_API_KEY".to_string(),
+        api_key: Some("inline-secret".to_string()),
+        keep_alive: Some("24h".to_string()),
+    };
+    let provider = OllamaProvider::from_config(&config);
+    // Inline api_key takes precedence over env-var resolution.
+    assert_eq!(provider.api_key.as_deref(), Some("inline-secret"));
+    // keep_alive is forwarded directly from config.
+    assert_eq!(provider.keep_alive.as_deref(), Some("24h"));
+}
+
+#[test]
+fn from_config_no_key_leaves_api_key_none() {
+    // When neither inline key nor the env var are set, api_key should be None
+    // (no bearer-token header is attached — plain local Ollama continues to work).
+    let config = squeezy_core::OllamaConfig {
+        base_url: "http://localhost:11434/api".to_string(),
+        route_style: squeezy_core::OllamaRoute::Native,
+        transport: squeezy_core::ProviderTransportConfig::default(),
+        api_key_env: "SQUEEZY_TEST_OLLAMA_KEY_THAT_SHOULD_NOT_BE_SET".to_string(),
+        api_key: None,
+        keep_alive: None,
+    };
+    let provider = OllamaProvider::from_config(&config);
+    assert!(
+        provider.api_key.is_none(),
+        "api_key must be None when env var is unset and no inline key is configured"
+    );
+    assert!(provider.keep_alive.is_none());
 }
 
 #[test]
@@ -746,6 +784,7 @@ fn route_style_compat_builds_lmstudio_delegate() {
         base_url: "http://localhost:11434/api".to_string(),
         route_style: squeezy_core::OllamaRoute::OpenAiCompatible,
         transport: squeezy_core::ProviderTransportConfig::default(),
+        ..Default::default()
     });
     let compat = provider
         .compat
@@ -765,6 +804,7 @@ fn route_style_native_leaves_compat_delegate_unset() {
         base_url: "http://localhost:11434/api".to_string(),
         route_style: squeezy_core::OllamaRoute::Native,
         transport: squeezy_core::ProviderTransportConfig::default(),
+        ..Default::default()
     });
     assert!(
         provider.compat.is_none(),

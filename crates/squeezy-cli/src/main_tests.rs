@@ -196,6 +196,344 @@ fn cli_prompt_format_rejects_unknown_value() {
 }
 
 #[test]
+fn cli_help_slash_command_topic_uses_tui_help_parser() {
+    let help = squeezy_skills::SqueezyHelp::new("");
+    let answer = cli_help_answer(&help, Some("/theme"));
+
+    assert_eq!(answer.topic, "/theme");
+    let rendered = answer.render_markdown();
+    assert!(rendered.contains("## /theme"), "{rendered}");
+    assert!(rendered.contains("Syntax:"), "{rendered}");
+}
+
+#[test]
+fn cli_prompt_permission_mode_accepts_strict_modes() {
+    let cli = Cli::try_parse_from([
+        "squeezy",
+        "--prompt",
+        "hi",
+        "--prompt-permission-mode",
+        "deny-ask",
+    ])
+    .expect("parse deny-ask");
+    assert_eq!(cli.prompt_permission_mode, PromptPermissionMode::Deny);
+
+    let cli = Cli::try_parse_from([
+        "squeezy",
+        "--prompt",
+        "hi",
+        "--prompt-permission-mode",
+        "fail-on-ask",
+    ])
+    .expect("parse fail-on-ask");
+    assert_eq!(cli.prompt_permission_mode, PromptPermissionMode::Fail);
+}
+
+#[test]
+fn cli_sessions_and_repo_json_flags_parse() {
+    let cli =
+        Cli::try_parse_from(["squeezy", "sessions", "list", "--json"]).expect("parse sessions");
+    match cli.command {
+        Some(Command::Sessions {
+            command: SessionsCommand::List(args),
+        }) => assert!(args.json),
+        other => panic!("expected sessions list command, got {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from(["squeezy", "sessions", "show", "abc123", "--json"])
+        .expect("parse sessions show");
+    match cli.command {
+        Some(Command::Sessions {
+            command: SessionsCommand::Show { id, json },
+        }) => {
+            assert_eq!(id, "abc123");
+            assert!(json);
+        }
+        other => panic!("expected sessions show command, got {other:?}"),
+    }
+
+    let cli =
+        Cli::try_parse_from(["squeezy", "repo", "inspect", "--json"]).expect("parse repo inspect");
+    match cli.command {
+        Some(Command::Repo {
+            command: RepoCommand::Inspect { json },
+        }) => assert!(json),
+        other => panic!("expected repo inspect command, got {other:?}"),
+    }
+}
+
+#[test]
+fn session_cli_json_uses_public_id_field() {
+    let metadata = SessionMetadata {
+        session_id: "session-123".to_string(),
+        parent_id: Some("parent-session-456".to_string()),
+        ..Default::default()
+    };
+    let metadata_json = session_metadata_for_cli(&metadata).expect("metadata json");
+    assert_ne!(metadata_json["id"], "session-123");
+    assert!(
+        metadata_json["id"]
+            .as_str()
+            .expect("public id string")
+            .starts_with("sess_")
+    );
+    assert!(metadata_json.get("session_id").is_none());
+    assert_ne!(metadata_json["parent_id"], "parent-session-456");
+    assert!(
+        metadata_json["parent_id"]
+            .as_str()
+            .expect("public parent id string")
+            .starts_with("sess_")
+    );
+
+    let replay_json = session_replay_for_cli(SessionReplayTape {
+        schema_version: 1,
+        session_id: "session-123".to_string(),
+        events: Vec::new(),
+        warnings: 0,
+    })
+    .expect("replay json");
+    assert_eq!(replay_json["id"], metadata_json["id"]);
+    assert!(replay_json.get("session_id").is_none());
+}
+
+#[test]
+fn session_cli_replay_report_uses_public_id_field() {
+    let report = SessionReplayReport {
+        session_id: "session-123".to_string(),
+        turns: 1,
+        events_replayed: 2,
+        request_count: 1,
+        tool_results: 0,
+        final_answer: "resumed session-123".to_string(),
+    };
+
+    let report_json = session_replay_report_for_cli(&report).expect("replay report json");
+    let rendered = serde_json::to_string(&report_json).expect("render report");
+    assert!(report_json.get("session_id").is_none());
+    assert!(
+        report_json["id"]
+            .as_str()
+            .expect("public id string")
+            .starts_with("sess_")
+    );
+    assert!(!rendered.contains("session-123"));
+}
+
+#[test]
+fn session_cli_events_rewrite_raw_session_ids() {
+    let metadata = SessionMetadata {
+        session_id: "child-session".to_string(),
+        parent_id: Some("parent-session".to_string()),
+        ..Default::default()
+    };
+    let mapping = public_session_id_map_for_metadata(&metadata);
+    let mut mapping = mapping;
+    let events = vec![SessionEvent::new(
+        "session_forked",
+        None,
+        Some("forked from parent-session into child-session".to_string()),
+        serde_json::json!({
+            "parent_session_id": "parent-session",
+            "child_session_id": "child-session",
+        }),
+    )];
+
+    let events_json = session_events_for_cli(&events, &mut mapping).expect("events json");
+    let rendered = serde_json::to_string(&events_json).expect("render events");
+    assert!(!rendered.contains("parent-session"));
+    assert!(!rendered.contains("child-session"));
+    assert!(rendered.contains("sess_"));
+}
+
+#[test]
+fn session_cli_events_discover_session_ids_from_payload_fields() {
+    let metadata = SessionMetadata {
+        session_id: "new-session".to_string(),
+        ..Default::default()
+    };
+    let mut mapping = public_session_id_map_for_metadata(&metadata);
+    let events = vec![SessionEvent::new(
+        "session_cleared",
+        None,
+        Some("cleared from old-session".to_string()),
+        serde_json::json!({
+            "cleared_from": "old-session",
+        }),
+    )];
+
+    let events_json = session_events_for_cli(&events, &mut mapping).expect("events json");
+    let rendered = serde_json::to_string(&events_json).expect("render events");
+    assert!(!rendered.contains("old-session"));
+    assert!(rendered.contains("sess_"));
+}
+
+#[test]
+fn looks_like_public_session_handle_recognises_well_formed_handles() {
+    // Known-good handle shape (`sess_` + 16 hex). We accept upper and
+    // lowercase hex so the user pasting a handle from a chat or doc
+    // surface still routes to the handle-aware resolver (and gets a
+    // clear "no session found for handle …" message) rather than
+    // falling through to the prefix resolver and getting a generic
+    // "no session matches the id prefix" error.
+    assert!(looks_like_public_session_handle("sess_0123456789abcdef"));
+    assert!(looks_like_public_session_handle("sess_0123456789ABCDEF"));
+    // Wrong length / wrong characters / wrong prefix must fall through
+    // to prefix resolution so existing raw-id callers are unaffected.
+    assert!(!looks_like_public_session_handle("sess_short"));
+    assert!(!looks_like_public_session_handle(
+        "sess_0123456789abcdef_extra"
+    ));
+    assert!(!looks_like_public_session_handle("sess_0123456789abcdeg"));
+    assert!(!looks_like_public_session_handle("not_a_handle"));
+    assert!(!looks_like_public_session_handle(""));
+    assert!(!looks_like_public_session_handle("1700000000000-12345-0"));
+}
+
+#[test]
+fn resolve_session_input_round_trips_through_public_handle() {
+    // The regression we're locking down: `sessions list` prints opaque
+    // `sess_<16hex>` handles, but `sessions resume` / `--session` /
+    // `sessions fork` / etc. used to require the raw on-disk
+    // `<ms>-<pid>-<counter>` id. If the resolver doesn't unwrap the
+    // handle back into the raw id, every session-id-consuming
+    // subcommand silently breaks for users who copy/paste from
+    // `sessions list` output.
+    let root = temp_dir("resolve-session-input-handle");
+    let raw_id = "1700000000000-12345-0";
+    plant_session_metadata(&root, raw_id, "/some/cwd");
+    let store = open_store_at(&root);
+
+    let handle = PublicSessionHandle::for_store_id(raw_id);
+    let resolved = resolve_session_input(&store, handle.as_ref())
+        .expect("handle must round-trip back to the raw id");
+    assert_eq!(resolved, raw_id);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_session_input_accepts_exact_raw_id() {
+    let root = temp_dir("resolve-session-input-raw");
+    let raw_id = "1700000000001-12345-1";
+    plant_session_metadata(&root, raw_id, "/some/cwd");
+    let store = open_store_at(&root);
+
+    let resolved = resolve_session_input(&store, raw_id).expect("exact raw id resolves");
+    assert_eq!(resolved, raw_id);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_session_input_accepts_raw_id_prefix() {
+    let root = temp_dir("resolve-session-input-prefix");
+    let raw_id = "1700000000002-12345-2";
+    plant_session_metadata(&root, raw_id, "/some/cwd");
+    let store = open_store_at(&root);
+
+    let resolved = resolve_session_input(&store, "1700000000002")
+        .expect("unique prefix resolves to the raw id");
+    assert_eq!(resolved, raw_id);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_session_input_rejects_unknown_handle_with_actionable_error() {
+    let root = temp_dir("resolve-session-input-unknown-handle");
+    plant_session_metadata(&root, "1700000000003-12345-3", "/some/cwd");
+    let store = open_store_at(&root);
+
+    // Well-formed handle shape, but no live session generates it. The
+    // error must name the handle, not silently delegate to the prefix
+    // resolver which would otherwise yield a generic "no session
+    // matches" message that does not mention the public handle.
+    let bogus = "sess_deadbeefdeadbeef";
+    let err = resolve_session_input(&store, bogus).expect_err("unknown handle errors");
+    let msg = err.to_string();
+    assert!(msg.contains("sess_deadbeefdeadbeef"), "got: {msg}");
+    assert!(msg.contains("handle"), "got: {msg}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_session_input_empty_input_is_explicit_error() {
+    // Defence in depth: an empty value must not silently match the
+    // first session on disk via prefix resolution. The store layer
+    // already rejects empty prefixes, but we surface a more specific
+    // message at the CLI boundary so the user knows the issue is at
+    // their command line, not on disk.
+    let root = temp_dir("resolve-session-input-empty");
+    let store = open_store_at(&root);
+    let err = resolve_session_input(&store, "").expect_err("empty input must error");
+    let msg = err.to_string();
+    assert!(msg.contains("session id"), "got: {msg}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cli_health_conflicts_with_subcommands_and_print_mode() {
+    // `--health` short-circuits to `doctor` with `DoctorArgs::default()`,
+    // so pairing it with `--prompt`, `--list-providers`, `--list-models`,
+    // or any subcommand previously dropped the other flag's behavior
+    // silently. Clap's `conflicts_with_all` must reject these
+    // combinations at parse time. Subcommands aren't named arg ids in
+    // the derive macro, so we don't pin them via clap here; the dispatch
+    // table is responsible for that ordering. The flag combinations
+    // below are the ones we explicitly forbid.
+    Cli::try_parse_from(["squeezy", "--health", "--prompt", "hi"])
+        .expect_err("--health + --prompt must be rejected");
+    Cli::try_parse_from(["squeezy", "--health", "--list-providers"])
+        .expect_err("--health + --list-providers must be rejected");
+    Cli::try_parse_from(["squeezy", "--health", "--list-models"])
+        .expect_err("--health + --list-models must be rejected");
+    // Plain `--health` still parses (the compatibility alias).
+    let cli = Cli::try_parse_from(["squeezy", "--health"]).expect("parse plain --health");
+    assert!(cli.health);
+}
+
+#[test]
+fn cli_doctor_and_mcp_test_flags_parse() {
+    let cli = Cli::try_parse_from([
+        "squeezy",
+        "doctor",
+        "--json",
+        "--probe",
+        "--only",
+        "probe:mcp:docs",
+        "--status",
+        "fail",
+        "--skip-update",
+    ])
+    .expect("parse doctor filters");
+    match cli.command {
+        Some(Command::Doctor(args)) => {
+            assert!(args.json);
+            assert!(args.probe);
+            assert_eq!(args.only, vec!["probe:mcp:docs".to_string()]);
+            assert_eq!(args.status, vec![doctor::DoctorStatusFilter::Fail]);
+            assert!(args.skip_update);
+        }
+        other => panic!("expected doctor command, got {other:?}"),
+    }
+
+    let cli =
+        Cli::try_parse_from(["squeezy", "mcp", "test", "docs", "--json"]).expect("parse mcp test");
+    match cli.command {
+        Some(Command::Mcp {
+            command: McpCommand::Test { name, json },
+        }) => {
+            assert_eq!(name, "docs");
+            assert!(json);
+        }
+        other => panic!("expected mcp test command, got {other:?}"),
+    }
+}
+
+#[test]
 fn repo_profile_error_does_not_block_startup() {
     let mut config = AppConfig::default();
     let prepared = prepare_repo_profile_from_load(
@@ -307,6 +645,27 @@ fn continue_flag_falls_back_with_stderr_note_when_no_match() {
     let note = resolved.note.expect("fallback note");
     assert!(note.contains("--continue"));
     assert!(note.contains("starting fresh"));
+}
+
+#[test]
+fn continue_flag_emits_normalization_note_when_path_differs_but_same_location() {
+    // A session stored with a trailing separator is the same location as
+    // the current cwd without one. paths_same() matches them; the note
+    // surface should indicate that normalization was applied.
+    let sessions = vec![meta("s", "/repo/", 100, true)];
+
+    let resolved = resolve_resume_session(ResumeFlag::Continue, &sessions, "/repo");
+
+    assert_eq!(
+        resolved.session_id.as_deref(),
+        Some("s"),
+        "should match via normalization"
+    );
+    let note = resolved.note.expect("normalization note expected");
+    assert!(
+        note.contains("path normalization"),
+        "note should mention normalization; got: {note}"
+    );
 }
 
 #[test]
@@ -874,9 +1233,15 @@ async fn print_mode_runs_tools_through_agent_loop_in_text_mode() {
 
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
-    pump_prompt_events(rx, PromptFormat::Default, &mut stdout, &mut stderr)
-        .await
-        .expect("print-mode turn completes");
+    pump_prompt_events(
+        rx,
+        PromptFormat::Default,
+        PromptPermissionMode::AutoApprove,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("print-mode turn completes");
 
     let stdout_text = String::from_utf8(stdout).expect("utf-8 stdout");
     let stderr_text = String::from_utf8(stderr).expect("utf-8 stderr");
@@ -943,9 +1308,15 @@ async fn print_mode_emits_tool_events_as_jsonl() {
 
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
-    pump_prompt_events(rx, PromptFormat::Json, &mut stdout, &mut stderr)
-        .await
-        .expect("print-mode JSON turn completes");
+    pump_prompt_events(
+        rx,
+        PromptFormat::Json,
+        PromptPermissionMode::AutoApprove,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("print-mode JSON turn completes");
 
     let stdout_text = String::from_utf8(stdout).expect("utf-8 stdout");
     let mut types = Vec::new();
@@ -1041,9 +1412,15 @@ async fn print_mode_auto_approves_ask_capability_so_ci_does_not_hang() {
 
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
-    pump_prompt_events(rx, PromptFormat::Default, &mut stdout, &mut stderr)
-        .await
-        .expect("pump completes");
+    pump_prompt_events(
+        rx,
+        PromptFormat::Default,
+        PromptPermissionMode::AutoApprove,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("pump completes");
 
     let decision = decision_rx.await.expect("approval decided");
     assert!(matches!(decision, ToolApprovalDecision::AllowOnce));
@@ -1051,6 +1428,152 @@ async fn print_mode_auto_approves_ask_capability_so_ci_does_not_hang() {
     assert!(
         stderr_text.contains("auto-approving shell"),
         "stderr should announce the auto-approval; got: {stderr_text:?}"
+    );
+}
+
+#[tokio::test]
+async fn print_mode_can_deny_ask_capability_in_strict_mode() {
+    use squeezy_agent::{ToolApprovalDecision, ToolApprovalRequest};
+    use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRisk, PermissionScope};
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    let permission = PermissionRequest {
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: "echo hi".to_string(),
+        risk: PermissionRisk::Medium,
+        summary: "echo hi".to_string(),
+        metadata: Default::default(),
+        suggested_rules: Vec::new(),
+    };
+    let request = ToolApprovalRequest {
+        id: 1,
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        scope: PermissionScope::Shell,
+        permission,
+        matched_rule: None,
+        reason: "default shell permission is ask".to_string(),
+        context: None,
+        preview: Vec::new(),
+    };
+    tx.send(squeezy_agent::AgentEvent::ApprovalRequested {
+        turn_id: squeezy_core::TurnId::new(0),
+        request,
+        decision_tx,
+    })
+    .await
+    .expect("send approval request");
+    tx.send(squeezy_agent::AgentEvent::Completed {
+        turn_id: squeezy_core::TurnId::new(0),
+        message: squeezy_core::TranscriptItem::assistant(String::new()),
+        response_id: None,
+        cost: squeezy_core::CostSnapshot::default(),
+        metrics: squeezy_core::TurnMetrics::default(),
+        context_estimate: squeezy_core::ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+        session_cost: None,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    pump_prompt_events(
+        rx,
+        PromptFormat::Default,
+        PromptPermissionMode::Deny,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+    .expect("pump completes");
+
+    let decision = decision_rx.await.expect("approval decided");
+    assert!(matches!(decision, ToolApprovalDecision::Denied));
+    let stderr_text = String::from_utf8(stderr).expect("utf-8 stderr");
+    assert!(
+        stderr_text.contains("approval: denying shell"),
+        "stderr should announce the denial; got: {stderr_text:?}"
+    );
+}
+
+#[tokio::test]
+async fn print_mode_fail_on_ask_returns_error_and_stops_loop() {
+    use squeezy_agent::{ToolApprovalDecision, ToolApprovalRequest};
+    use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRisk, PermissionScope};
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    let permission = PermissionRequest {
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: "rm -rf /".to_string(),
+        risk: PermissionRisk::High,
+        summary: "dangerous shell command".to_string(),
+        metadata: Default::default(),
+        suggested_rules: Vec::new(),
+    };
+    let request = ToolApprovalRequest {
+        id: 1,
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        scope: PermissionScope::Shell,
+        permission,
+        matched_rule: None,
+        reason: "default shell permission is ask".to_string(),
+        context: None,
+        preview: Vec::new(),
+    };
+    tx.send(squeezy_agent::AgentEvent::ApprovalRequested {
+        turn_id: squeezy_core::TurnId::new(0),
+        request,
+        decision_tx,
+    })
+    .await
+    .expect("send approval request");
+    // The loop should break before consuming this Completed event.
+    tx.send(squeezy_agent::AgentEvent::Completed {
+        turn_id: squeezy_core::TurnId::new(0),
+        message: squeezy_core::TranscriptItem::assistant(String::new()),
+        response_id: None,
+        cost: squeezy_core::CostSnapshot::default(),
+        metrics: squeezy_core::TurnMetrics::default(),
+        context_estimate: squeezy_core::ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+        session_cost: None,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let pump_result = pump_prompt_events(
+        rx,
+        PromptFormat::Default,
+        PromptPermissionMode::Fail,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await;
+
+    assert!(pump_result.is_err(), "fail-on-ask must return Err");
+    let decision = decision_rx.await.expect("approval decided");
+    assert!(
+        matches!(decision, ToolApprovalDecision::Denied),
+        "decision must be Denied for fail-on-ask"
+    );
+    let stderr_text = String::from_utf8(stderr).expect("utf-8 stderr");
+    assert!(
+        stderr_text.contains("approval: failing on shell"),
+        "stderr should announce the fail; got: {stderr_text:?}"
     );
 }
 
@@ -1092,6 +1615,7 @@ async fn pump_prompts_runs_bang_bang_prompt_in_text_mode_without_llm_context() {
         &agent,
         prompts,
         PromptFormat::Default,
+        PromptPermissionMode::AutoApprove,
         &mut stdout,
         &mut stderr,
     )
@@ -1149,6 +1673,7 @@ async fn pump_prompts_emits_bang_bang_tool_events_in_json_mode() {
         &agent,
         prompts,
         PromptFormat::Json,
+        PromptPermissionMode::AutoApprove,
         &mut stdout,
         &mut stderr,
     )
@@ -1238,6 +1763,7 @@ async fn pump_prompts_runs_normal_prompts_unchanged_when_no_bang_bang_present() 
         &agent,
         prompts,
         PromptFormat::Default,
+        PromptPermissionMode::AutoApprove,
         &mut stdout,
         &mut stderr,
     )
@@ -1287,6 +1813,253 @@ fn project_init_target_resolves_ancestor_then_falls_back_to_cwd() {
     );
 
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn config_explain_matches_concrete_wildcard_field_paths() {
+    let exact = find_config_field_for_path(&["model", "provider"]).expect("exact field");
+    assert_eq!(exact.toml_path, ["model", "provider"]);
+
+    let provider = find_config_field_for_path(&["providers", "openai", "cheap_model"])
+        .expect("provider field");
+    assert_eq!(provider.toml_path, ["providers", "*", "cheap_model"]);
+
+    let model_limit =
+        find_config_field_for_path(&["model_limits", "openai:gpt-5.5", "context_window"])
+            .expect("model limit field");
+    assert_eq!(
+        model_limit.toml_path,
+        ["model_limits", "*", "context_window"]
+    );
+
+    assert!(find_config_field_for_path(&["providers", "openai"]).is_none());
+}
+
+#[test]
+fn config_explain_resolves_wildcard_sources_with_concrete_path() {
+    use squeezy_core::{SeparatedSources, TierSource, config_schema::FieldSource};
+
+    let user_doc = "[providers.openai]\ncheap_model = \"user-mini\"\n"
+        .parse::<toml_edit::DocumentMut>()
+        .expect("parse user doc");
+    let repo_doc = "[providers.openai]\ncheap_model = \"local-mini\"\n"
+        .parse::<toml_edit::DocumentMut>()
+        .expect("parse local doc");
+    let sources = SeparatedSources {
+        user: Some(TierSource {
+            path: std::path::PathBuf::from("user.toml"),
+            doc: user_doc,
+        }),
+        project: None,
+        repo: Some(TierSource {
+            path: std::path::PathBuf::from("local.toml"),
+            doc: repo_doc,
+        }),
+        user_path_default: std::path::PathBuf::from("user.toml"),
+        project_path_default: std::path::PathBuf::from("squeezy.toml"),
+        repo_path_default: std::path::PathBuf::from("local.toml"),
+    };
+
+    let requested = ["providers", "openai", "cheap_model"];
+    let field = find_config_field_for_path(&requested).expect("provider field");
+    assert_eq!(
+        resolve_explain_field_source(&sources, field, &requested),
+        FieldSource::Repo
+    );
+
+    let other_provider = ["providers", "anthropic", "cheap_model"];
+    assert_eq!(
+        resolve_explain_field_source(&sources, field, &other_provider),
+        FieldSource::Default
+    );
+}
+
+#[test]
+fn config_explain_displays_concrete_wildcard_values() {
+    let mut config = AppConfig::default();
+    config.providers.insert(
+        "anthropic".to_string(),
+        squeezy_core::ProviderSettings {
+            cheap_model: Some("custom-haiku".to_string()),
+            ..Default::default()
+        },
+    );
+    config.model_limits.insert(
+        "anthropic:claude-sonnet-4-6".to_string(),
+        squeezy_core::ModelLimitOverride {
+            context_window: Some(123_456),
+        },
+    );
+
+    let provider_path = ["providers", "anthropic", "cheap_model"];
+    let provider_field = find_config_field_for_path(&provider_path).expect("provider field");
+    assert_eq!(
+        explain_effective_value(&config, provider_field, &provider_path),
+        "custom-haiku"
+    );
+
+    let model_limit_path = [
+        "model_limits",
+        "anthropic:claude-sonnet-4-6",
+        "context_window",
+    ];
+    let model_limit_field = find_config_field_for_path(&model_limit_path).expect("limit field");
+    assert_eq!(
+        explain_effective_value(&config, model_limit_field, &model_limit_path),
+        "123456"
+    );
+}
+
+#[test]
+fn split_config_field_path_handles_bare_dotted_keys() {
+    assert_eq!(
+        split_config_field_path("model.provider").expect("parse"),
+        vec!["model", "provider"]
+    );
+    assert_eq!(
+        split_config_field_path("tui.tick_rate_ms").expect("parse"),
+        vec!["tui", "tick_rate_ms"]
+    );
+}
+
+#[test]
+fn split_config_field_path_respects_basic_string_quoting() {
+    // Realistic model id with a dot — the dominant case for `model_limits`.
+    let parts =
+        split_config_field_path(r#"model_limits."openai:gpt-5.5".context_window"#).expect("parse");
+    assert_eq!(
+        parts,
+        vec!["model_limits", "openai:gpt-5.5", "context_window"]
+    );
+}
+
+#[test]
+fn split_config_field_path_respects_literal_string_quoting() {
+    let parts = split_config_field_path("providers.'weird.alias'.cheap_model").expect("parse");
+    assert_eq!(parts, vec!["providers", "weird.alias", "cheap_model"]);
+}
+
+#[test]
+fn split_config_field_path_rejects_unterminated_quote() {
+    let err = split_config_field_path(r#"model_limits."openai:gpt-5.5"#).expect_err("err");
+    assert!(
+        err.contains("unterminated"),
+        "expected an unterminated-quote error, got: {err}"
+    );
+}
+
+#[test]
+fn split_config_field_path_rejects_empty_segments_and_input() {
+    assert!(split_config_field_path("").is_err());
+    assert!(split_config_field_path("model..provider").is_err());
+    assert!(split_config_field_path(".model.provider").is_err());
+    assert!(split_config_field_path("model.provider.").is_err());
+}
+
+#[test]
+fn split_config_field_path_rejects_junk_after_closing_quote() {
+    let err = split_config_field_path(r#"model_limits."openai:gpt-5.5"junk.context_window"#)
+        .expect_err("err");
+    assert!(
+        err.contains("after closing quote"),
+        "expected post-quote diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn config_explain_resolves_dotted_model_id_via_quoted_path() {
+    let mut config = AppConfig::default();
+    config.model_limits.insert(
+        "openai:gpt-5.5".to_string(),
+        squeezy_core::ModelLimitOverride {
+            context_window: Some(2_000_000),
+        },
+    );
+
+    let raw_path = r#"model_limits."openai:gpt-5.5".context_window"#;
+    let parts_owned = split_config_field_path(raw_path).expect("parse");
+    let parts: Vec<&str> = parts_owned.iter().map(String::as_str).collect();
+
+    let field = find_config_field_for_path(&parts).expect("schema match");
+    assert_eq!(field.toml_path, ["model_limits", "*", "context_window"]);
+    assert_eq!(explain_effective_value(&config, field, &parts), "2000000");
+}
+
+#[test]
+fn config_explain_rejects_unquoted_dotted_model_id_and_hints_quoting() {
+    // The naïve `split('.')` behavior breaks `gpt-5.5` into two parts and
+    // produces a 4-segment path that can never match the 3-segment schema.
+    // We keep that failure mode (TOML semantics force it), but surface a
+    // hint mentioning the quoted spelling.
+    let parts_owned = split_config_field_path("model_limits.openai:gpt-5.5.context_window")
+        .expect("split should still succeed for an unquoted dot path");
+    let parts: Vec<&str> = parts_owned.iter().map(String::as_str).collect();
+    assert!(
+        find_config_field_for_path(&parts).is_none(),
+        "unquoted dotted model id must fall through to the unknown-field branch",
+    );
+}
+
+#[test]
+fn explain_effective_value_redacts_secret_fields() {
+    use squeezy_core::config_schema::{ApplyTier, FieldKind, FieldMeta, FieldValue};
+
+    fn raw_string_get(_: &AppConfig) -> FieldValue {
+        // Stand in for a misbehaving getter that returns plaintext rather than
+        // `FieldValue::Secret`. The redaction in `explain_effective_value`
+        // must not depend on the getter's discipline.
+        FieldValue::String("super-secret-token".to_string())
+    }
+    fn noop_set(_: &mut AppConfig, _: FieldValue) -> Result<(), &'static str> {
+        Ok(())
+    }
+    fn unset_default() -> FieldValue {
+        FieldValue::Unset
+    }
+
+    let kind_secret = FieldMeta {
+        label: "api key",
+        toml_path: &["providers", "openai", "api_key"],
+        kind: FieldKind::Secret {
+            env_var: "OPENAI_API_KEY",
+        },
+        tier: ApplyTier::NextPrompt,
+        get: raw_string_get,
+        set: noop_set,
+        default_display: "—",
+        default: unset_default,
+        help: "",
+        env_override: None,
+        secret: false,
+    };
+
+    let flag_secret = FieldMeta {
+        label: "api key (flagged)",
+        toml_path: &["providers", "openai", "api_key"],
+        kind: FieldKind::String { multiline: false },
+        tier: ApplyTier::NextPrompt,
+        get: raw_string_get,
+        set: noop_set,
+        default_display: "—",
+        default: unset_default,
+        help: "",
+        env_override: None,
+        secret: true,
+    };
+
+    let config = AppConfig::default();
+    let requested = ["providers", "openai", "api_key"];
+
+    assert_eq!(
+        explain_effective_value(&config, &kind_secret, &requested).to_string(),
+        "••••",
+        "FieldKind::Secret must short-circuit to the redacted sentinel"
+    );
+    assert_eq!(
+        explain_effective_value(&config, &flag_secret, &requested).to_string(),
+        "••••",
+        "FieldMeta::secret = true must short-circuit to the redacted sentinel"
+    );
 }
 
 #[test]
@@ -1346,4 +2119,150 @@ fn skills_upsert_entry_inserts_by_path_when_no_match() {
     );
     assert_eq!(first.get("enabled").and_then(|v| v.as_bool()), Some(true));
     assert!(first.get("name").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Windows-specific path normalization tests (compile and run on all platforms
+// so regressions are caught in Linux/macOS CI too).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn normalize_cwd_strips_verbatim_prefix() {
+    // \\?\ verbatim prefix should be stripped before comparison.
+    assert_eq!(
+        normalize_cwd_for_compare(r"\\?\C:\repo"),
+        normalize_cwd_for_compare(r"C:\repo"),
+    );
+}
+
+#[test]
+fn normalize_cwd_strips_verbatim_unc_prefix() {
+    // \\?\UNC\server\share should normalize to the same as \\server\share.
+    assert_eq!(
+        normalize_cwd_for_compare(r"\\?\UNC\server\share\dir"),
+        normalize_cwd_for_compare(r"\\server\share\dir"),
+    );
+}
+
+#[test]
+fn normalize_cwd_folds_drive_letter_case() {
+    // Only the drive letter (`C` vs `c`) differs; directory names are identical.
+    assert_eq!(
+        normalize_cwd_for_compare(r"C:\Repo"),
+        normalize_cwd_for_compare(r"c:\Repo"),
+        "drive-letter case difference must not trigger cross-project prompt"
+    );
+    assert_eq!(
+        normalize_cwd_for_compare(r"C:/Repo/sub"),
+        normalize_cwd_for_compare(r"c:/Repo/sub"),
+    );
+}
+
+#[test]
+fn normalize_cwd_normalizes_backslash_to_slash() {
+    assert_eq!(
+        normalize_cwd_for_compare(r"C:\Repo\sub"),
+        normalize_cwd_for_compare("C:/Repo/sub"),
+    );
+}
+
+#[test]
+fn cross_project_resume_prompt_skips_for_windows_drive_case() {
+    // `C:\Repo` and `c:\Repo` are the same directory on Windows (drive letter is case-insensitive).
+    assert!(cross_project_resume_prompt(r"C:\Repo", r"c:\Repo").is_none());
+    assert!(cross_project_resume_prompt(r"C:/Repo", r"c:/Repo").is_none());
+}
+
+#[test]
+fn cross_project_resume_prompt_skips_for_verbatim_prefix() {
+    assert!(cross_project_resume_prompt(r"\\?\C:\Repo", r"C:\Repo").is_none());
+}
+
+#[test]
+fn cross_project_resume_prompt_skips_for_verbatim_unc() {
+    // \\?\UNC\server\share\dir and \\server\share\dir refer to the same location.
+    assert!(
+        cross_project_resume_prompt(r"\\?\UNC\server\share\dir", r"\\server\share\dir").is_none()
+    );
+}
+
+#[test]
+fn cross_project_resume_prompt_skips_for_mixed_separators() {
+    assert!(cross_project_resume_prompt(r"C:\Repo\sub", "C:/Repo/sub").is_none());
+}
+
+#[test]
+fn cross_project_resume_prompt_fires_for_different_windows_paths() {
+    let prompt = cross_project_resume_prompt(r"C:\old", r"C:\new")
+        .expect("genuinely different paths should trigger a prompt");
+    assert!(prompt.contains(r"C:\old"));
+    assert!(prompt.contains(r"C:\new"));
+}
+
+#[test]
+fn resolve_resume_session_continue_matches_with_drive_case() {
+    let meta = SessionMetadata {
+        session_id: "abc123".to_string(),
+        cwd: r"C:\Repo".to_string(),
+        resume_available: true,
+        ..SessionMetadata::default()
+    };
+    // Querying with lower-case drive letter (but same directory name case) should still match.
+    let result = resolve_resume_session(ResumeFlag::Continue, &[meta], r"c:\Repo");
+    assert_eq!(
+        result.session_id.as_deref(),
+        Some("abc123"),
+        "drive-letter case must not prevent --continue from finding the session"
+    );
+}
+
+#[test]
+fn normalize_cwd_strips_verbatim_unc_prefix_case_insensitive() {
+    // \\?\unc\… (lowercase `unc`) must normalize the same as
+    // \\?\UNC\… because Windows treats the literal verbatim-UNC marker
+    // case-insensitively.
+    assert_eq!(
+        normalize_cwd_for_compare(r"\\?\unc\server\share\dir"),
+        normalize_cwd_for_compare(r"\\server\share\dir"),
+    );
+    assert_eq!(
+        normalize_cwd_for_compare(r"\\?\Unc\server\share\dir"),
+        normalize_cwd_for_compare(r"\\?\UNC\server\share\dir"),
+    );
+}
+
+#[test]
+fn cross_project_resume_prompt_skips_for_verbatim_unc_lowercase() {
+    assert!(
+        cross_project_resume_prompt(r"\\?\unc\server\share\dir", r"\\server\share\dir").is_none()
+    );
+}
+
+// On Windows the directory-component case fold also runs, so a session
+// recorded against `C:\Projects\Repo\sub` resumes cleanly from a shell
+// whose cwd is `C:\projects\repo\sub`. Gated behind cfg because POSIX
+// targets must not lowercase path components.
+#[cfg(target_os = "windows")]
+#[test]
+fn cross_project_resume_prompt_skips_for_windows_directory_case() {
+    assert!(
+        cross_project_resume_prompt(r"C:\Projects\Repo\sub", r"C:\projects\repo\sub").is_none()
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn resolve_resume_session_continue_matches_with_directory_case() {
+    let meta = SessionMetadata {
+        session_id: "win-dir-case".to_string(),
+        cwd: r"C:\Projects\Repo".to_string(),
+        resume_available: true,
+        ..SessionMetadata::default()
+    };
+    let result = resolve_resume_session(ResumeFlag::Continue, &[meta], r"c:\projects\repo");
+    assert_eq!(
+        result.session_id.as_deref(),
+        Some("win-dir-case"),
+        "directory-component case must not prevent --continue from finding the session"
+    );
 }

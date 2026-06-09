@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,6 +17,84 @@ fn unique_temp_path(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("squeezy_keymap_cfg_{label}_{nonce}"));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir.join("keybindings.toml")
+}
+
+#[test]
+fn default_keybindings_path_uses_home_from_env() {
+    let path = default_keybindings_path_from_env(|key| {
+        (key == "HOME").then(|| OsString::from("/home/alice"))
+    });
+
+    assert_eq!(
+        path,
+        Some(PathBuf::from("/home/alice/.squeezy/keybindings.toml"))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn default_keybindings_path_falls_back_to_userprofile_on_windows() {
+    let path = default_keybindings_path_from_env(|key| {
+        (key == "USERPROFILE").then(|| OsString::from(r"C:\Users\Alice"))
+    });
+
+    assert_eq!(
+        path,
+        Some(
+            PathBuf::from(r"C:\Users\Alice")
+                .join(".squeezy")
+                .join("keybindings.toml")
+        )
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn default_keybindings_path_ignores_userprofile_off_windows() {
+    let path = default_keybindings_path_from_env(|key| {
+        (key == "USERPROFILE").then(|| OsString::from("/Users/Alice"))
+    });
+
+    assert_eq!(path, None);
+}
+
+#[test]
+fn default_keybindings_path_treats_empty_home_as_unset() {
+    // Guard against a `HOME=""` regression: an empty env var used to
+    // resolve to `Some(PathBuf::from("/.squeezy/keybindings.toml"))`,
+    // which would silently look for the file at the filesystem root.
+    // On Unix, `USERPROFILE` is ignored, so we expect `None`.
+    #[cfg(not(windows))]
+    {
+        let path =
+            default_keybindings_path_from_env(|key| (key == "HOME").then(|| OsString::from("")));
+        assert_eq!(path, None);
+    }
+    // On Windows, empty `HOME` should also be ignored, with fall-through
+    // to `USERPROFILE` (or `None` when it is missing/empty as well).
+    #[cfg(windows)]
+    {
+        let none = default_keybindings_path_from_env(|key| match key {
+            "HOME" => Some(OsString::from("")),
+            "USERPROFILE" => Some(OsString::from("")),
+            _ => None,
+        });
+        assert_eq!(none, None);
+
+        let path = default_keybindings_path_from_env(|key| match key {
+            "HOME" => Some(OsString::from("")),
+            "USERPROFILE" => Some(OsString::from(r"C:\Users\Alice")),
+            _ => None,
+        });
+        assert_eq!(
+            path,
+            Some(
+                PathBuf::from(r"C:\Users\Alice")
+                    .join(".squeezy")
+                    .join("keybindings.toml")
+            )
+        );
+    }
 }
 
 #[test]

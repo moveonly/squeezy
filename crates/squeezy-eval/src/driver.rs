@@ -2531,6 +2531,7 @@ impl Driver {
                     turn_id,
                     backend,
                     fallback_count,
+                    ..
                 } => {
                     let turn_str = format!("{turn_id:?}");
                     self.capture.record(
@@ -2538,6 +2539,21 @@ impl Driver {
                         EvalEventKind::ShellSandboxDegraded {
                             backend,
                             fallback_count,
+                        },
+                    )?;
+                }
+                AgentEvent::ShellWindowsDegraded {
+                    turn_id, backend, ..
+                } => {
+                    let turn_str = format!("{turn_id:?}");
+                    self.capture.record(
+                        Some(turn_str),
+                        EvalEventKind::ShellSandboxDegraded {
+                            backend,
+                            // Windows degradation is steady-state, not a
+                            // runtime fallback; use 0 as the count so eval
+                            // findings can distinguish Windows from Unix.
+                            fallback_count: 0,
                         },
                     )?;
                 }
@@ -2674,6 +2690,16 @@ impl Driver {
                 AgentEvent::TurnRouted { .. } => {}
                 AgentEvent::ContextUsageUpdate { .. } => {}
                 AgentEvent::CostCapUnenforceable { .. } => {}
+                AgentEvent::WindowsSandboxActive { .. } => {}
+                // Citation annotations from provider streams: surfaced for
+                // future eval-replay rendering (source attribution); ignored
+                // for now. Producer-side emission is deferred (see the
+                // `AgentEvent::Citation` doc).
+                AgentEvent::Citation { .. } => {}
+                // Control-tool trace events: useful for debugging and eval
+                // replay; ignored for now. Producer-side emission is deferred
+                // (see the `AgentEvent::ControlToolTrace` doc).
+                AgentEvent::ControlToolTrace { .. } => {}
             }
             if should_break_on_text {
                 cancel.cancel();

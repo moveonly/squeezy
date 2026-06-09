@@ -345,13 +345,19 @@ impl OpenAiProvider {
             // warmed prefix; pairs with the instructions nonce above to
             // guarantee a cold prefill.
             body["prompt_cache_key"] = json!(format!("nocache-{}", cache_bust_nonce()));
-        } else if let Some(key) = request.effective_cache_key() {
-            // OpenAI's Responses API silently drops `prompt_cache_key`
-            // values longer than 64 codepoints — the request succeeds
-            // but the field is ignored server-side, so every turn pays
-            // full uncached input cost while telemetry shows zero
-            // cache hits. Clamp client-side. See [`clamp_prompt_cache_key`].
-            body["prompt_cache_key"] = json!(clamp_prompt_cache_key(key));
+        } else if request.effective_cache_retention() != crate::CacheRetention::None {
+            // Only emit `prompt_cache_key` when the caller actually wants
+            // cache affinity. `CacheRetention::None` is a hard no-cache
+            // signal — suppressing the key here honours the documented
+            // contract that `None` means "do not cache this request".
+            if let Some(key) = request.effective_cache_key() {
+                // OpenAI's Responses API silently drops `prompt_cache_key`
+                // values longer than 64 codepoints — the request succeeds
+                // but the field is ignored server-side, so every turn pays
+                // full uncached input cost while telemetry shows zero
+                // cache hits. Clamp client-side. See [`clamp_prompt_cache_key`].
+                body["prompt_cache_key"] = json!(clamp_prompt_cache_key(key));
+            }
         }
         if request.effective_cache_retention() == crate::CacheRetention::Long {
             body["prompt_cache_retention"] = json!("24h");
@@ -436,7 +442,7 @@ impl OpenAiProvider {
     }
 
     /// Prompt-cache affinity headers attached to every Responses request
-    /// that carries a cache key. OpenAI's load balancer uses these to
+    /// that carries an active cache key. OpenAI's load balancer uses these to
     /// route the session to the same backend that warmed the cached
     /// prefix; without them, repeat turns can land on a cold node and
     /// silently miss cache even when `prompt_cache_key` matches. The
@@ -450,6 +456,9 @@ impl OpenAiProvider {
     /// from user-controlled session ids) would panic the request builder
     /// before the cap kicks in.
     pub(crate) fn affinity_headers(request: &LlmRequest) -> Vec<(&'static str, String)> {
+        if request.effective_cache_retention() == crate::CacheRetention::None {
+            return Vec::new();
+        }
         let Some(key) = request.effective_cache_spec().key else {
             return Vec::new();
         };

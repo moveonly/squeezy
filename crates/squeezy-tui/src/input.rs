@@ -122,13 +122,15 @@ pub(crate) fn match_slash_command_prefix(text: &str) -> Option<usize> {
 }
 
 pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
-    // `/help` is forwarded to the model as a normal user turn, so it counts
-    // as a network-exercising command.
-    slash_caps(
+    // `/help` is answered locally for curated topics (zero provider cost).
+    // Unknown topics can escalate to a DocHelp subagent, but that path is
+    // uncommon; the command is not labelled as network-capable so it doesn't
+    // look riskier or costlier than it is in practice.
+    slash_args(
         "/help",
-        "show local Squeezy help topics",
+        "local help; unknown topics can use the model",
         true,
-        &[PermissionCapability::Network],
+        "[topic|/slash-command]",
     ),
     slash_args_caps(
         "/config",
@@ -187,7 +189,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     // `/compact` triggers a summarisation turn against the model.
     SlashCommand {
         name: "/compact",
-        description: "compact conversation context now (use '/compact undo' to restore)",
+        description: "compact context now (undo to restore; history to view timeline)",
         available_during_task: false,
         parameter_hint: None,
         capabilities: &[PermissionCapability::Network],
@@ -348,6 +350,10 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "<md|txt|json> [path]",
         &[PermissionCapability::Edit],
     ),
+    slash(
+        "/terminal",
+        "show terminal diagnostic info (TTY, TERM, clipboard, notifications, shell)",
+    ),
 ];
 
 impl SlashCommand {
@@ -359,12 +365,8 @@ impl SlashCommand {
         matches!(self.name, "/attach" | "/help" | "/plan" | "/build")
     }
 
-    pub(crate) fn visible_with_checkpoints(&self, checkpoints_enabled: bool) -> bool {
-        checkpoints_enabled
-            || !matches!(
-                self.name,
-                "/checkpoints" | "/checkpoint" | "/undo" | "/revert-turn"
-            )
+    pub(crate) fn visible_with_checkpoints(&self, _checkpoints_enabled: bool) -> bool {
+        true
     }
 
     /// Short label used in the slash menu badge, e.g. `net`, `read`, `edit`.

@@ -22,7 +22,10 @@ use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, 
 
 use crate::{TeardownReport, WinSandboxError, WinSandboxSpec};
 
-use super::acl::{add_allow_ace, add_allow_read_ace, add_deny_read_ace, add_deny_write_ace};
+use super::acl::{
+    add_allow_ace_recursive, add_allow_read_ace_recursive, add_deny_read_ace_recursive,
+    add_deny_write_ace_recursive,
+};
 use super::deny_read_resolver::resolve_deny_read_paths;
 use super::helper_materialization::setup_helper_exe;
 use super::identity::{
@@ -427,7 +430,7 @@ fn apply_root_acls(
         // Grant read on read_roots.
         for root in &spec.read_roots {
             if root.exists()
-                && let Err(e) = add_allow_read_ace(root, sid)
+                && let Err(e) = add_allow_read_ace_recursive(root, sid)
             {
                 tracing::warn!(
                     path = %root.display(),
@@ -441,7 +444,7 @@ fn apply_root_acls(
         // Grant read+write on writable roots; deny-write on subpaths.
         for wr in &spec.writable_roots {
             if wr.root.exists()
-                && let Err(e) = add_allow_ace(&wr.root, sid)
+                && let Err(e) = add_allow_ace_recursive(&wr.root, sid)
             {
                 tracing::warn!(
                     path = %wr.root.display(),
@@ -454,7 +457,7 @@ fn apply_root_acls(
             // Deny-write on read-only subpaths.
             for ro_sub in &wr.read_only_subpaths {
                 if ro_sub.exists()
-                    && let Err(e) = add_deny_write_ace(ro_sub, sid)
+                    && let Err(e) = add_deny_write_ace_recursive(ro_sub, sid)
                 {
                     tracing::warn!(
                         path = %ro_sub.display(),
@@ -469,7 +472,7 @@ fn apply_root_acls(
             for name in &spec.protected_metadata_names {
                 let meta_path = wr.root.join(name);
                 if meta_path.exists()
-                    && let Err(e) = add_deny_write_ace(&meta_path, sid)
+                    && let Err(e) = add_deny_write_ace_recursive(&meta_path, sid)
                 {
                     tracing::warn!(
                         path = %meta_path.display(),
@@ -500,7 +503,7 @@ fn apply_root_acls(
 
         for path in &deny_paths {
             if path.exists()
-                && let Err(e) = add_deny_read_ace(path, sid)
+                && let Err(e) = add_deny_read_ace_recursive(path, sid)
             {
                 tracing::warn!(
                     path = %path.display(),

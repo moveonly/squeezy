@@ -24,7 +24,11 @@ use squeezy_parse::{
     ParsedReference, ParsedSymbol, ReferenceKind, edge_kind_for_call,
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
-use squeezy_workspace::{CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler};
+use squeezy_workspace::{
+    CrawlOptions, FileRecord, IndexCoverage, IndexingDecision, PathConflict,
+    VCS_AND_CACHE_DIR_NAMES, WorkspaceCrawler, filesystem_paths_match,
+};
+use tracing::{error, warn};
 
 use crate::languages::{
     csharp::{
@@ -203,6 +207,13 @@ pub struct CargoDiagnostic {
     pub package_id: Option<String>,
     pub target_name: Option<String>,
     pub provenance: Provenance,
+    /// Raw path string from the compiler span, populated only when `file_id`
+    /// normalization failed (i.e. `file_id` is `None` and the span had a
+    /// non-empty, non-`<…>` file path). Lets callers report the raw path and
+    /// workspace root so users can diagnose container, symlink, or bind-mount
+    /// path-spelling mismatches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_path: Option<String>,
 }
 
 /// Freshness verdict for the cached cargo compiler facts.
@@ -271,6 +282,20 @@ pub struct HierarchyNode {
     pub span: SourceSpan,
     pub freshness: Freshness,
     pub children: Vec<HierarchyNode>,
+}
+
+/// Result of [`SemanticGraph::compute_impact`]: files, symbols, and test
+/// symbols reachable from a set of changed files through reverse-import
+/// propagation.
+#[derive(Debug, Clone, Default)]
+pub struct ImpactSet {
+    /// All files reachable from the changed set through reverse-import edges.
+    pub affected_files: HashSet<FileId>,
+    /// All non-file symbols whose declaring file is in `affected_files`.
+    pub affected_symbols: Vec<GraphSymbol>,
+    /// Subset of `affected_symbols` that are test functions or carry a
+    /// `TestOf` edge to a symbol in the affected set.
+    pub affected_tests: Vec<GraphSymbol>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,6 +384,11 @@ pub struct GraphStats {
     pub body_hit_trigram_indexed: bool,
     pub body_hit_trigram_terms: usize,
     pub reference_index_terms: usize,
+    /// Number of path pairs whose lowercase spellings collide. Non-zero on
+    /// Windows when a checkout produces two differently-cased spellings for
+    /// the same logical file. Surfaced in graph-status output so operators
+    /// can detect Windows casing-drift artefacts.
+    pub case_collision_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -419,13 +449,13 @@ pub struct SemanticGraph {
     js_ts_resolver: JsTsResolver,
     /// Parallel index of `(file, name, arity) -> symbol` so the resolver
     /// can disambiguate overloaded callees by exact positional-parameter
-    /// count when the AST already gave us that information. The phased
-    /// resolver consumes this; the legacy single-pass path does not yet
-    /// read from it (Item 5 PR-2).
+    /// count when the AST already gave us that information. Populated on
+    /// every rebuild; the phased resolver will consume this when it replaces
+    /// the single-pass path.
     arity_index: HashMap<(FileId, String, u8), SymbolId>,
     /// Reverse import edge: which files import the key. Populated from
     /// `imports_by_file` plus per-language path resolution; used by
-    /// affected-set incremental refresh (Item 3 PR-2).
+    /// affected-set computation and [`SemanticGraph::compute_impact`].
     importers_by_file: HashMap<FileId, Vec<FileId>>,
     /// Per-file [`cross_file::ResolverSlot`] holding exports / imports /
     /// supertypes for the phased pipeline. Populated even before any
@@ -441,6 +471,17 @@ pub struct SemanticGraph {
     /// the workspace per resolved call — the dominant cost of the cold build
     /// on large repos, where it turned call resolution quadratic in symbols.
     symbols_by_language_identity: HashMap<String, Vec<SymbolId>>,
+    /// Lowercase slash-normalized relative path → `FileId` for O(1)
+    /// case-insensitive lookups. Populated by `rebuild_indexes` from every
+    /// indexed file. On case-insensitive filesystems (Windows) this index
+    /// lets path-filter helpers skip linear scans and avoids redundant
+    /// `canonicalize` calls during watcher event reconciliation.
+    pub(crate) files_by_normalized_id: HashMap<String, FileId>,
+    /// Case-collision log: pairs of `FileId` strings whose lowercase forms
+    /// are equal. Populated during `rebuild_indexes`; empty on well-formed
+    /// repositories, non-empty on Windows when a checkout leaves two
+    /// differently-cased spellings for the same logical path.
+    pub(crate) case_collisions: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -516,10 +557,20 @@ impl SemanticGraph {
             importers_by_file: HashMap::new(),
             resolver_slots: cross_file::ResolverSlots::new(),
             symbols_by_language_identity: HashMap::new(),
+            files_by_normalized_id: HashMap::new(),
+            case_collisions: Vec::new(),
         }
     }
 
     pub fn from_parsed(files: Vec<ParsedFile>) -> Self {
+        Self::from_parsed_with_resolver_cache(files, None, &[]).0
+    }
+
+    fn from_parsed_with_resolver_cache(
+        files: Vec<ParsedFile>,
+        store: Option<&GraphStore>,
+        records: &[FileRecord],
+    ) -> (Self, ResolverCacheLoadReport) {
         let mut graph = Self::empty();
         graph.reserve_parsed_capacity(&files);
         for file in files {
@@ -528,9 +579,18 @@ impl SemanticGraph {
         graph.rebuild_java_project_facts();
         graph.rebuild_dotnet_project_facts();
         graph.rebuild_kotlin_project_facts();
-        graph.rebuild_semantic_edges();
+        let resolver_cache = load_resolver_cache(store, &mut graph, records).unwrap_or({
+            ResolverCacheLoadReport {
+                entries_loaded: 0,
+                entries_missed: records.len(),
+                import_graph_loaded: false,
+            }
+        });
+        graph.rebuild_semantic_edges_with_cached_resolver(
+            resolver_cache.entries_missed == 0 && resolver_cache.import_graph_loaded,
+        );
         graph.rebuild_indexes();
-        graph
+        (graph, resolver_cache)
     }
 
     fn reserve_parsed_capacity(&mut self, files: &[ParsedFile]) {
@@ -572,6 +632,27 @@ impl SemanticGraph {
         self.rebuild_kotlin_project_facts();
         self.rebuild_semantic_edges();
         self.rebuild_indexes();
+    }
+
+    /// Look up a `FileRecord` by a case-insensitive, backslash-normalized path.
+    ///
+    /// Returns the first indexed record whose lowercase slash-normalized id
+    /// equals `lowercase(normalize_backslashes(query))`. This is used for
+    /// Windows-friendly path resolution without requiring an exact-case match.
+    pub fn find_file_case_insensitive(&self, query: &str) -> Option<&FileRecord> {
+        let normalized = query.replace('\\', "/").to_ascii_lowercase();
+        self.files_by_normalized_id
+            .get(&normalized)
+            .and_then(|id| self.files.get(id))
+    }
+
+    /// When an exact path lookup misses, check if only casing differs and
+    /// return the indexed spelling for a user-facing hint.
+    pub fn case_insensitive_match_hint(&self, query: &str) -> Option<&str> {
+        let normalized = query.replace('\\', "/").to_ascii_lowercase();
+        self.files_by_normalized_id
+            .get(&normalized)
+            .map(|id| id.0.as_str())
     }
 
     fn remove_file_data(&mut self, file_id: &FileId) {
@@ -616,6 +697,7 @@ impl SemanticGraph {
             body_hit_trigram_indexed: self.body_hit_trigram_indexed,
             body_hit_trigram_terms: self.body_hit_trigram_index.len(),
             reference_index_terms: self.references_by_text.len(),
+            case_collision_count: self.case_collisions.len(),
         }
     }
 
@@ -784,6 +866,13 @@ impl SemanticGraph {
         ))
     }
 
+    /// Return the **containment** hierarchy rooted at `root` (or at all file
+    /// symbols when `root` is `None`), following `Contains` edges up to
+    /// `max_depth` levels. The result represents lexical nesting (file →
+    /// module → class → method), **not** inheritance.
+    ///
+    /// For inheritance/subtype relationships use
+    /// [`Self::inheritance_ancestors`] and [`Self::inheritance_direct_subtypes`].
     pub fn hierarchy(&self, root: Option<&SymbolId>, max_depth: usize) -> Vec<HierarchyNode> {
         let roots = match root {
             Some(root) => vec![root.clone()],
@@ -1059,6 +1148,151 @@ impl SemanticGraph {
             .filter_map(|id| self.symbols.get(id))
             .cloned()
             .collect()
+    }
+
+    /// Return all inheritance-style ancestors of `start` (i.e. symbols
+    /// reachable via `UsesTrait`, `Extends`, and `Implements` edges in PHP
+    /// method-resolution order) as a breadth-first list, excluding `start`
+    /// itself.
+    ///
+    /// This is the public counterpart of the `pub(crate)` helper used by the
+    /// call resolver. It exposes the same walk for tools that need an
+    /// inheritance view of the type hierarchy rather than the containment view
+    /// produced by [`Self::hierarchy`].
+    pub fn inheritance_ancestors(&self, start: &SymbolId) -> Vec<GraphSymbol> {
+        self.walk_inheritance_ancestors(start)
+            .into_iter()
+            .filter_map(|id| self.symbols.get(&id))
+            .cloned()
+            .collect()
+    }
+
+    /// Return the first-generation direct inheritors of `target`: symbols that
+    /// carry a `UsesTrait`, `Extends`, or `Implements` edge pointing **to**
+    /// `target`. One hop only; callers that need transitive descendants can
+    /// recurse with [`Self::inheritance_ancestors`] on each result.
+    pub fn inheritance_direct_subtypes(&self, target: &SymbolId) -> Vec<GraphSymbol> {
+        self.edges_by_to
+            .get(target)
+            .into_iter()
+            .flatten()
+            .filter_map(|&edge_index| {
+                let edge = self.edges.get(edge_index)?;
+                if matches!(
+                    edge.kind,
+                    EdgeKind::UsesTrait | EdgeKind::Extends | EdgeKind::Implements
+                ) {
+                    self.symbols.get(&edge.from)
+                } else {
+                    None
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Compute the impact set for a set of changed file IDs. Returns all files
+    /// reachable through reverse-import propagation starting from any file
+    /// whose exports changed, together with the symbols in those files and any
+    /// test symbols that cover them.
+    ///
+    /// The three input sets mirror the parameters of
+    /// [`crate::affected::compute_affected`]: `changed` is every file observed
+    /// to have changed in the last refresh; `propagating` is the subset whose
+    /// exports actually changed (only those push downstream invalidation);
+    /// `removed` contains deleted files (always treated as propagating).
+    pub fn compute_impact(
+        &self,
+        changed: &HashSet<FileId>,
+        propagating: &HashSet<FileId>,
+        removed: &HashSet<FileId>,
+    ) -> ImpactSet {
+        let affected_files = crate::affected::compute_affected(
+            changed,
+            &self.importers_by_file,
+            propagating,
+            removed,
+        );
+
+        let affected_symbols: Vec<GraphSymbol> = self
+            .symbols
+            .values()
+            .filter(|sym| sym.kind != SymbolKind::File && affected_files.contains(&sym.file_id))
+            .cloned()
+            .collect();
+
+        let affected_tests: Vec<GraphSymbol> = affected_symbols
+            .iter()
+            .filter(|sym| {
+                sym.attributes
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case("test"))
+                    || self
+                        .edges_by_from
+                        .get(&sym.id)
+                        .into_iter()
+                        .flatten()
+                        .any(|&ei| {
+                            self.edges
+                                .get(ei)
+                                .map(|e| e.kind == EdgeKind::TestOf)
+                                .unwrap_or(false)
+                        })
+            })
+            .cloned()
+            .collect();
+
+        ImpactSet {
+            affected_files,
+            affected_symbols,
+            affected_tests,
+        }
+    }
+
+    /// Apply warm-start resolver-cache data loaded from persistence. For each
+    /// file whose on-disk fingerprint (modified-time + size) matches the stored
+    /// entry, replaces the in-memory [`cross_file::ResolverSlot`] with the
+    /// richer persisted version. If a `ResolverSnapshot` is provided it
+    /// replaces the in-memory `importers_by_file` map entirely.
+    ///
+    /// Called once per `GraphManager::open_with_optional_store` after
+    /// `SemanticGraph::from_parsed`; the rebuilt-from-scratch slots and
+    /// importers are overwritten only for files whose fingerprint still
+    /// matches, so stale entries are never applied.
+    #[allow(dead_code)]
+    pub(crate) fn apply_warm_resolver_cache(
+        &mut self,
+        entries: Vec<(FileId, resolver_cache::ResolverFileEntry)>,
+        snapshot: Option<resolver_cache::ResolverSnapshot>,
+    ) {
+        for (file_id, entry) in entries {
+            let Some(file) = self.files.get(&file_id) else {
+                continue;
+            };
+            if file.modified_unix_millis != entry.fingerprint.modified_unix_millis
+                || file.size_bytes != entry.fingerprint.size_bytes
+            {
+                continue;
+            }
+            if let Some(slot) = self.resolver_slots.get_mut(&file_id) {
+                slot.exports = entry.exports;
+                slot.imports = entry.imports;
+                slot.supertypes = entry.supertypes;
+            }
+        }
+        if let Some(snap) = snapshot
+            && (!snap.imports_by_file.is_empty() || !snap.importers_by_file.is_empty())
+        {
+            self.importers_by_file.clear();
+            for (target_str, importer_strs) in &snap.importers_by_file {
+                let target = FileId(target_str.clone());
+                let importers: Vec<FileId> =
+                    importer_strs.iter().map(|s| FileId(s.clone())).collect();
+                if !importers.is_empty() {
+                    self.importers_by_file.insert(target, importers);
+                }
+            }
+        }
     }
 
     fn insert_parsed_file(&mut self, file: ParsedFile) {
@@ -1499,7 +1733,24 @@ impl SemanticGraph {
         self.edges_by_from.clear();
         self.edges_by_to.clear();
         self.symbols_by_language_identity.clear();
+        self.files_by_normalized_id.clear();
+        self.case_collisions.clear();
         self.rebuild_import_indexes();
+
+        // Build a lowercase path → FileId index for O(1) case-insensitive
+        // lookups and detect case collisions that indicate Windows casing drift.
+        for file_id in self.files.keys() {
+            let normalized = file_id.0.to_ascii_lowercase();
+            if let Some(existing) = self.files_by_normalized_id.get(&normalized) {
+                if existing != file_id {
+                    self.case_collisions
+                        .push((existing.0.clone(), file_id.0.clone()));
+                }
+            } else {
+                self.files_by_normalized_id
+                    .insert(normalized, file_id.clone());
+            }
+        }
 
         self.symbols_by_name.reserve(self.symbols.len());
         self.symbol_signature_lower.reserve(self.symbols.len());
@@ -1611,7 +1862,10 @@ impl SemanticGraph {
         }
     }
 
-    fn rebuild_resolution_indexes(&mut self) {
+    pub(crate) fn rebuild_resolution_indexes_with_cached_resolver(
+        &mut self,
+        resolver_loaded: bool,
+    ) {
         self.symbols_by_name.clear();
         self.children_by_parent.clear();
         self.arity_index.clear();
@@ -1654,14 +1908,17 @@ impl SemanticGraph {
             }
         }
 
-        self.rebuild_resolver_slots();
-        self.rebuild_importers_by_file();
+        if !resolver_loaded {
+            self.rebuild_resolver_slots();
+            self.rebuild_importers_by_file();
+        }
     }
 
-    /// Populate per-file [`cross_file::ResolverSlot`] entries. The phased
-    /// resolver does not yet consume these; the populate step exists so
-    /// the per-language flip can read a ready table on the first refresh
-    /// instead of paying a one-time backfill.
+    /// Populate per-file [`cross_file::ResolverSlot`] entries. Slots are
+    /// persisted by [`GraphManager::extend_resolver_cache_batch`] and restored
+    /// on warm starts by `load_resolver_cache`, so the per-language
+    /// flip to the phased resolver can read a ready table immediately instead
+    /// of paying a one-time backfill.
     fn rebuild_resolver_slots(&mut self) {
         self.resolver_slots.clear();
         for file_id in self.files.keys() {
@@ -1993,13 +2250,20 @@ pub struct GraphBuildReport {
     pub persisted_files_loaded: usize,
     pub persisted_files_missed: usize,
     pub persistence_rebuilt: bool,
+    pub resolver_entries_loaded: usize,
+    pub resolver_entries_missed: usize,
+    pub resolver_import_graph_loaded: bool,
     pub excluded_files: usize,
     pub excluded_dirs: usize,
     pub excluded_bytes: u64,
+    pub path_conflicts: Vec<PathConflict>,
     pub coverage: IndexCoverage,
     pub bytes_seen: u64,
     pub language: LanguageReport,
     pub stats: GraphStats,
+    pub indexing_decision: IndexingDecision,
+    pub freshness_mode: GraphFreshnessMode,
+    pub freshness_fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2016,6 +2280,7 @@ pub struct RefreshReport {
     pub excluded_files: usize,
     pub excluded_dirs: usize,
     pub excluded_bytes: u64,
+    pub path_conflicts: Vec<PathConflict>,
     pub coverage: IndexCoverage,
     pub bytes_seen: u64,
     pub bytes_reparsed: u64,
@@ -2023,6 +2288,58 @@ pub struct RefreshReport {
     pub stats: GraphStats,
     pub skipped_due_to_interval: bool,
     pub budget_exhausted: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphFreshnessMode {
+    Watcher,
+    #[default]
+    Polling,
+}
+
+impl GraphFreshnessMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Watcher => "watcher",
+            Self::Polling => "polling",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WatcherMode {
+    #[default]
+    Disabled,
+    Native,
+    PollingFallback,
+}
+
+impl WatcherMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Native => "native",
+            Self::PollingFallback => "polling_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatcherStatus {
+    pub mode: WatcherMode,
+    pub backend: &'static str,
+    pub fallback_reason: Option<String>,
+}
+
+impl Default for WatcherStatus {
+    fn default() -> Self {
+        Self {
+            mode: WatcherMode::Disabled,
+            backend: "none",
+            fallback_reason: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2049,6 +2366,69 @@ pub struct LanguageReport {
     pub unknown_files: usize,
 }
 
+/// Map the outcome of the native watcher's `start` (and a lazily-evaluated
+/// polling fallback closure) to the watcher slot + status the
+/// [`GraphManager`] should publish.
+///
+/// Extracted so the dual-failure → [`WatcherMode::Disabled`] path can be
+/// unit-tested directly, without depending on platform-specific failure
+/// modes (inotify watch budget exhaustion, FUSE/NFS refusal, etc.).
+///
+/// B1 contract: if both backends fail, return `None` + a Disabled status
+/// that captures both reasons. Do NOT propagate an error — losing the
+/// whole graph for the session because the watcher couldn't attach would
+/// be a strict regression versus the pre-watcher constructor.
+fn resolve_watcher_attachment<P>(
+    native: Result<watcher::FileWatcher>,
+    polling_start: P,
+) -> (Option<watcher::FileWatcher>, WatcherStatus)
+where
+    P: FnOnce() -> Result<watcher::FileWatcher>,
+{
+    match native {
+        Ok(file_watcher) => (
+            Some(file_watcher),
+            WatcherStatus {
+                mode: WatcherMode::Native,
+                backend: watcher::native_backend_name(),
+                fallback_reason: None,
+            },
+        ),
+        Err(native_err) => {
+            let fallback_reason = native_err.to_string();
+            warn!(
+                reason = %fallback_reason,
+                "native watcher failed; falling back to polling watcher"
+            );
+            match polling_start() {
+                Ok(file_watcher) => (
+                    Some(file_watcher),
+                    WatcherStatus {
+                        mode: WatcherMode::PollingFallback,
+                        backend: watcher::polling_backend_name(),
+                        fallback_reason: Some(fallback_reason),
+                    },
+                ),
+                Err(poll_err) => {
+                    let combined_reason = format!("native: {fallback_reason}; polling: {poll_err}");
+                    error!(
+                        reason = %combined_reason,
+                        "native watcher failed and polling fallback failed; live refresh disabled for this session"
+                    );
+                    (
+                        None,
+                        WatcherStatus {
+                            mode: WatcherMode::Disabled,
+                            backend: "none",
+                            fallback_reason: Some(combined_reason),
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
 pub struct GraphManager {
     root: PathBuf,
     crawler: WorkspaceCrawler,
@@ -2066,8 +2446,12 @@ pub struct GraphManager {
     pending_changed_paths: Arc<Mutex<HashSet<PathBuf>>>,
     /// Optional running file-system watcher whose lifetime is tied to this
     /// manager. `RAII` drop stops it. `None` for one-shot CLI callers that
-    /// open the graph without watching the filesystem.
-    _watcher: Option<watcher::FileWatcher>,
+    /// open the graph without watching the filesystem, and also `None` when
+    /// both the native and polling backends failed to start (see
+    /// `open_watching`).
+    #[allow(dead_code)]
+    watcher: Option<watcher::FileWatcher>,
+    watcher_status: WatcherStatus,
 }
 
 impl GraphManager {
@@ -2089,6 +2473,12 @@ impl GraphManager {
 
     /// Open a `GraphManager` that uses its own private [`GraphStore`] under
     /// `<workspace_root>/.squeezy/cache` (or `cache_root` when overridden).
+    ///
+    /// If the store cannot be opened (redb schema mismatch, file-lock
+    /// contention, I/O error, …) a `tracing::warn` is emitted and the manager
+    /// falls back to an in-memory-only graph. Callers that need a hard
+    /// failure on persistence errors should call [`Self::open_with_store`]
+    /// directly and pass a pre-opened [`GraphStore`].
     pub fn open_persistent_with_crawl_options(
         root: impl AsRef<Path>,
         config: RefreshConfig,
@@ -2096,9 +2486,20 @@ impl GraphManager {
         cache_root: Option<PathBuf>,
     ) -> Result<Self> {
         let root_path = root.as_ref().to_path_buf();
-        let store = GraphStore::open(&root_path, cache_root.as_deref())
-            .ok()
-            .map(Arc::new);
+        let store = match GraphStore::open(&root_path, cache_root.as_deref()) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(error) => {
+                let cache_dir = squeezy_store::cache_dir_path(&root_path, cache_root.as_deref());
+                tracing::warn!(
+                    target: "squeezy::graph",
+                    root = %root_path.display(),
+                    cache_dir = %cache_dir.display(),
+                    error = %error,
+                    "graph persistence disabled: GraphStore::open failed; falling back to in-memory graph",
+                );
+                None
+            }
+        };
         Self::open_with_optional_store(root_path, config, crawl_options, store)
     }
 
@@ -2128,16 +2529,46 @@ impl GraphManager {
         watcher_config: watcher::WatcherConfig,
     ) -> Result<Self> {
         let mut manager = Self::open_with_optional_store(root, config, crawl_options, store)?;
+        let watcher_config = watcher_config.with_default_root(manager.root.clone());
         let handle = Arc::clone(&manager.pending_changed_paths);
-        let file_watcher = watcher::FileWatcher::start(watcher_config, move |batch| {
+        let watched_root = manager.root.clone();
+        let native_result = watcher::FileWatcher::start(watcher_config.clone(), move |batch| {
             if let Ok(mut paths) = handle.lock() {
                 for path in batch.modified.into_iter().chain(batch.removed) {
-                    paths.insert(path);
+                    if watcher_path_should_enqueue(&watched_root, &path) {
+                        paths.insert(path);
+                    }
                 }
             }
-        })?;
-        manager._watcher = Some(file_watcher);
+        });
+        let polling_start = || {
+            let handle = Arc::clone(&manager.pending_changed_paths);
+            let watched_root = manager.root.clone();
+            watcher::FileWatcher::start_polling(watcher_config, move |batch| {
+                if let Ok(mut paths) = handle.lock() {
+                    for path in batch.modified.into_iter().chain(batch.removed) {
+                        if watcher_path_should_enqueue(&watched_root, &path) {
+                            paths.insert(path);
+                        }
+                    }
+                }
+            })
+        };
+        let (file_watcher, watcher_status) =
+            resolve_watcher_attachment(native_result, polling_start);
+        manager.watcher = file_watcher;
+        manager.build_report.freshness_mode = match watcher_status.mode {
+            WatcherMode::Native => GraphFreshnessMode::Watcher,
+            WatcherMode::PollingFallback | WatcherMode::Disabled => GraphFreshnessMode::Polling,
+        };
+        manager.build_report.freshness_fallback_reason = watcher_status.fallback_reason.clone();
+        manager.watcher_status = watcher_status;
         Ok(manager)
+    }
+
+    pub fn mark_polling_fallback(&mut self, reason: impl Into<String>) {
+        self.build_report.freshness_mode = GraphFreshnessMode::Polling;
+        self.build_report.freshness_fallback_reason = Some(reason.into());
     }
 
     fn open_with_optional_store(
@@ -2151,8 +2582,9 @@ impl GraphManager {
         let store_metadata = store
             .as_ref()
             .map(|_| graph_store_metadata(&root, &crawl_options));
-        let crawler = WorkspaceCrawler::new(crawl_options);
+        let crawler = WorkspaceCrawler::try_new(crawl_options)?;
         let snapshot = crawler.crawl(&root)?;
+        warn_case_collisions(&snapshot.files);
         let mut parser = LanguageParser::new()?;
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
         let language = language_report(&snapshot.files);
@@ -2169,11 +2601,11 @@ impl GraphManager {
             }
             store.apply_graph_batch(&batch)?;
         }
-        let graph = SemanticGraph::from_parsed(merge_parsed_by_snapshot_order(
+        let (graph, resolver_cache) = SemanticGraph::from_parsed_with_resolver_cache(
+            merge_parsed_by_snapshot_order(&snapshot.files, loaded.parsed, parsed_missed),
+            store.as_deref(),
             &snapshot.files,
-            loaded.parsed,
-            parsed_missed,
-        ));
+        );
         let build_report = GraphBuildReport {
             duration_ms: started.elapsed().as_millis(),
             files_seen: snapshot.files.len(),
@@ -2186,15 +2618,22 @@ impl GraphManager {
             persisted_files_loaded: loaded.loaded_files,
             persisted_files_missed: loaded.missed_records.len(),
             persistence_rebuilt: loaded.rebuilt,
+            resolver_entries_loaded: resolver_cache.entries_loaded,
+            resolver_entries_missed: resolver_cache.entries_missed,
+            resolver_import_graph_loaded: resolver_cache.import_graph_loaded,
             excluded_files: snapshot.coverage.skipped_files,
             excluded_dirs: snapshot.coverage.skipped_dirs,
             excluded_bytes: snapshot.coverage.skipped_bytes,
+            path_conflicts: snapshot.path_conflicts.clone(),
             coverage: snapshot.coverage.clone(),
             bytes_seen,
             language,
             stats: graph.stats(),
+            indexing_decision: snapshot.indexing_decision.clone(),
+            freshness_mode: GraphFreshnessMode::Polling,
+            freshness_fallback_reason: None,
         };
-        Ok(Self {
+        let manager = Self {
             root,
             crawler,
             parser,
@@ -2205,8 +2644,25 @@ impl GraphManager {
             last_refresh: Instant::now(),
             build_report,
             pending_changed_paths: Arc::new(Mutex::new(HashSet::new())),
-            _watcher: None,
-        })
+            watcher: None,
+            watcher_status: WatcherStatus {
+                mode: WatcherMode::Disabled,
+                backend: "none",
+                fallback_reason: None,
+            },
+        };
+        if let Some(store) = manager.store.as_deref() {
+            // Cold-build commits the partition/metadata batch above with
+            // error propagation; the resolver-cache rows go in a separate,
+            // best-effort batch so an encoding or write failure here cannot
+            // poison the freshly-built graph.
+            let mut batch = GraphWriteBatch::new();
+            manager.extend_resolver_cache_batch(&mut batch);
+            if !batch.is_empty() {
+                let _ = store.apply_graph_batch(&batch);
+            }
+        }
+        Ok(manager)
     }
 
     pub fn graph(&self) -> &SemanticGraph {
@@ -2219,6 +2675,14 @@ impl GraphManager {
 
     pub fn build_report(&self) -> &GraphBuildReport {
         &self.build_report
+    }
+
+    pub fn freshness_mode(&self) -> GraphFreshnessMode {
+        self.build_report.freshness_mode
+    }
+
+    pub fn freshness_fallback_reason(&self) -> Option<&str> {
+        self.build_report.freshness_fallback_reason.as_deref()
     }
 
     /// Per-language file counts derived from the current graph state.
@@ -2250,6 +2714,10 @@ impl GraphManager {
             .unwrap_or(0)
     }
 
+    pub fn watcher_status(&self) -> &WatcherStatus {
+        &self.watcher_status
+    }
+
     pub fn record_changed_path(&mut self, path: impl Into<PathBuf>) {
         if let Ok(mut paths) = self.pending_changed_paths.lock() {
             paths.insert(path.into());
@@ -2269,12 +2737,18 @@ impl GraphManager {
         Arc::clone(&self.pending_changed_paths)
     }
 
-    /// Best-effort write of the V2 resolver-cache rows. Per-file entries
+    /// Extend `batch` with the V2 resolver-cache rows. Per-file entries
     /// carry the workspace-side fingerprint that future warm-start reads
     /// will compare against. The single-blob import adjacency is mirrored
-    /// from [`SemanticGraph::importers_by_file`]. Failures are swallowed
-    /// so persistence errors cannot poison the in-memory graph.
-    fn persist_resolver_cache(&self, store: &GraphStore) {
+    /// from [`SemanticGraph::importers_by_file`]. Encoding failures are
+    /// swallowed so persistence errors cannot poison the in-memory graph.
+    ///
+    /// Callers fold this into the same `GraphWriteBatch` they already
+    /// stage partition/metadata changes onto, so the resulting redb
+    /// commit covers metadata, partitions, and resolver cache in one
+    /// fsync. Deletion of stale rows for removed files is handled by
+    /// the caller via [`GraphWriteBatch::remove_resolver_entry`].
+    fn extend_resolver_cache_batch(&self, batch: &mut GraphWriteBatch) {
         for (file_id, file) in &self.graph.files {
             let Some(slot) = self.graph.resolver_slots.get(file_id) else {
                 continue;
@@ -2289,7 +2763,10 @@ impl GraphManager {
                 supertypes: slot.supertypes.clone(),
                 builder_snapshot: resolver_cache::BuilderSnapshot::default(),
             };
-            let _ = store.put_resolver_entry(file_id, &entry);
+            if batch.upsert_resolver_entry(file_id, &entry).is_err() {
+                // Encoding failure: skip this file; warm-start will recompute.
+                continue;
+            }
         }
         let mut snapshot = resolver_cache::ResolverSnapshot::new();
         for (target, importers) in &self.graph.importers_by_file {
@@ -2297,7 +2774,7 @@ impl GraphManager {
                 snapshot.record_edge(importer, target);
             }
         }
-        let _ = store.put_import_graph(&snapshot);
+        let _ = batch.set_import_graph(&snapshot);
     }
 
     pub fn refresh_before_query(&mut self) -> Result<RefreshReport> {
@@ -2320,6 +2797,7 @@ impl GraphManager {
                 excluded_files: self.build_report.excluded_files,
                 excluded_dirs: self.build_report.excluded_dirs,
                 excluded_bytes: self.build_report.excluded_bytes,
+                path_conflicts: self.build_report.path_conflicts.clone(),
                 coverage: self.build_report.coverage.clone(),
                 bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
                 bytes_reparsed: 0,
@@ -2348,6 +2826,7 @@ impl GraphManager {
                 excluded_files: self.build_report.excluded_files,
                 excluded_dirs: self.build_report.excluded_dirs,
                 excluded_bytes: self.build_report.excluded_bytes,
+                path_conflicts: self.build_report.path_conflicts.clone(),
                 coverage: self.build_report.coverage.clone(),
                 bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
                 bytes_reparsed: 0,
@@ -2359,8 +2838,10 @@ impl GraphManager {
         }
 
         let snapshot = self.crawler.crawl(&self.root)?;
+        warn_case_collisions(&snapshot.files);
         let files_seen = snapshot.files.len();
         let coverage = snapshot.coverage.clone();
+        let path_conflicts = snapshot.path_conflicts.clone();
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
         let language = language_report(&snapshot.files);
         let current = snapshot
@@ -2413,6 +2894,10 @@ impl GraphManager {
             .lock()
             .map(|paths| paths.clone())
             .unwrap_or_default();
+        // Pre-compute canonical forms for all pending event paths once so the
+        // matching loops below do not repeatedly call canonicalize on the same
+        // event path.
+        let pending_canonicals = PendingCanonicals::from_paths(&pending_changed_paths);
         let mut supported_changed_records = current
             .values()
             .filter(|record| record.language != LanguageKind::Unsupported)
@@ -2458,33 +2943,61 @@ impl GraphManager {
             .iter()
             .map(|record| record.id.clone())
             .collect::<Vec<_>>();
+        // Pre-compute canonical paths for all changed (supported + metadata +
+        // unsupported) and removed records once. The same Vec is reused for
+        // both the `changed_paths_from_events` count and the
+        // `event_changed_or_removed` count, avoiding double canonicalization.
+        // Non-metadata unsupported files are included so that a watcher event
+        // for a changed .txt/.json file is not falsely reported as unmatched.
+        let all_changed_canonicals: Vec<(PathBuf, Option<PathBuf>)> = changed_records
+            .iter()
+            .chain(
+                unsupported_changed_records
+                    .iter()
+                    .filter(|r| !metadata_changed_records.iter().any(|m| m.id == r.id)),
+            )
+            .map(|r| (r.path.clone(), std::fs::canonicalize(&r.path).ok()))
+            .collect();
         let changed_paths_from_events = changed_records
             .iter()
             .filter(|record| {
-                pending_changed_paths
+                all_changed_canonicals
                     .iter()
-                    .any(|path| paths_match(path, &record.path))
+                    .find(|(raw, _)| raw == &record.path)
+                    .map(|(raw, rec_can)| pending_canonicals.matches_record(raw, rec_can.as_ref()))
+                    .unwrap_or(false)
             })
             .count();
         let changed_paths_from_polling = changed_records
             .len()
             .saturating_sub(changed_paths_from_events);
-        let event_changed_or_removed = pending_changed_paths
-            .iter()
-            .filter(|path| {
-                changed_records
-                    .iter()
-                    .any(|record| paths_match(path, &record.path))
-                    || removed_files_all.iter().any(|id| {
-                        self.graph
-                            .files
-                            .get(id)
-                            .map(|old| paths_match(path, &old.path))
-                            .unwrap_or(false)
+        let event_changed_or_removed = {
+            let removed_canonicals: Vec<(PathBuf, Option<PathBuf>)> = removed_files_all
+                .iter()
+                .filter_map(|id| self.graph.files.get(id))
+                .map(|old| (old.path.clone(), std::fs::canonicalize(&old.path).ok()))
+                .collect();
+            let path_pair_matches =
+                |raw: &PathBuf, canon: &Option<PathBuf>, vec: &[(PathBuf, Option<PathBuf>)]| {
+                    vec.iter().any(|(rec_raw, rec_can)| {
+                        raw == rec_raw
+                            || canon
+                                .as_ref()
+                                .zip(rec_can.as_ref())
+                                .map(|(l, r)| l == r)
+                                .unwrap_or(false)
                     })
-            })
-            .count();
-        let unchanged_event_paths = pending_changed_paths
+                };
+            pending_canonicals
+                .entries
+                .iter()
+                .filter(|(raw, canon)| {
+                    path_pair_matches(raw, canon, &all_changed_canonicals)
+                        || path_pair_matches(raw, canon, &removed_canonicals)
+                })
+                .count()
+        };
+        let unchanged_event_paths = pending_canonicals
             .len()
             .saturating_sub(event_changed_or_removed);
         // Accumulate persistence side effects across the refresh and flush in
@@ -2495,10 +3008,21 @@ impl GraphManager {
         for file_id in &removed_files {
             self.graph.remove_file_data(file_id);
             graph_batch.remove_partition(file_id);
+            // Drop the matching resolver-cache row so deleted files do
+            // not accumulate as dead weight in `RESOLVER_SNAPSHOT_PER_FILE`
+            // — the per-file partition removal above already covers
+            // `GRAPH_PARTITIONS`, but the resolver row would otherwise
+            // outlive its file and over-count
+            // `cache_diagnostics.resolver_entries`.
+            graph_batch.remove_resolver_entry(file_id);
         }
         for file_id in &unsupported_removed_files {
             self.graph.files.remove(file_id);
             graph_batch.remove_partition(file_id);
+            // Best-effort: unsupported files rarely carry resolver rows, but
+            // when they do (e.g. a file flipped from supported to unsupported
+            // on a previous run) the row would otherwise leak.
+            graph_batch.remove_resolver_entry(file_id);
         }
         for record in unsupported_changed_records {
             // A file that flipped from a supported language to unsupported
@@ -2544,17 +3068,18 @@ impl GraphManager {
             self.graph.rebuild_semantic_edges();
             self.graph.rebuild_indexes();
         }
-        if let Some(store) = self.store.as_deref()
-            && !graph_batch.is_empty()
-        {
-            let _ = store.apply_graph_batch(&graph_batch);
-        }
-        // Persist the resolver-cache rows for every file the rebuild
-        // touched. Best-effort: encoding or write failure must not poison
+        // Fold the resolver-cache rows (per-file entries + import-graph
+        // blob) into the same batch as the partition/metadata changes so a
+        // refresh that touches one or two files pays a single redb fsync
+        // instead of one for partitions and a second for the resolver
+        // cache. Best-effort: encoding or write failure must not poison
         // the in-memory graph update; the warm-start path will fall back
         // to a full rebuild when it cannot find an entry.
         if let Some(store) = self.store.as_deref() {
-            self.persist_resolver_cache(store);
+            self.extend_resolver_cache_batch(&mut graph_batch);
+            if !graph_batch.is_empty() {
+                let _ = store.apply_graph_batch(&graph_batch);
+            }
         }
 
         // Only declare the pending set fully drained when we actually parsed
@@ -2571,6 +3096,7 @@ impl GraphManager {
             }
             self.last_refresh = Instant::now();
         }
+        self.build_report.path_conflicts = path_conflicts.clone();
         Ok(RefreshReport {
             refreshed: reparsed_files > 0 || !removed_files.is_empty() || metadata_refresh_needed,
             changed_files,
@@ -2584,6 +3110,7 @@ impl GraphManager {
             excluded_files: coverage.skipped_files,
             excluded_dirs: coverage.skipped_dirs,
             excluded_bytes: coverage.skipped_bytes,
+            path_conflicts,
             coverage,
             bytes_seen,
             bytes_reparsed,
@@ -2595,11 +3122,134 @@ impl GraphManager {
     }
 }
 
+fn watcher_path_should_enqueue(root: &Path, path: &Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    // Conservative filter: drop only VCS metadata and Squeezy's own cache
+    // (`VCS_AND_CACHE_DIR_NAMES`) so persisting the graph cannot self-trigger
+    // a refresh loop. Heavy-churn build dirs like `target/` and
+    // `node_modules/` stay visible because an `include` glob may re-enable
+    // a subset of them; the crawler does the policy-aware filtering.
+    !relative.components().any(|component| {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        VCS_AND_CACHE_DIR_NAMES.contains(&name)
+    })
+}
+
 struct LoadedPartitions {
     parsed: Vec<ParsedFile>,
     missed_records: Vec<FileRecord>,
     loaded_files: usize,
     rebuilt: bool,
+}
+
+#[derive(Debug, Default)]
+struct ResolverCacheLoadReport {
+    entries_loaded: usize,
+    entries_missed: usize,
+    import_graph_loaded: bool,
+}
+
+fn load_resolver_cache(
+    store: Option<&GraphStore>,
+    graph: &mut SemanticGraph,
+    records: &[FileRecord],
+) -> Result<ResolverCacheLoadReport> {
+    let Some(store) = store else {
+        return Ok(ResolverCacheLoadReport {
+            entries_loaded: 0,
+            entries_missed: records.len(),
+            import_graph_loaded: false,
+        });
+    };
+    let ids = records
+        .iter()
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    let entries = store.resolver_entries_for::<resolver_cache::ResolverFileEntry>(&ids)?;
+    let mut by_id = entries.into_iter().collect::<HashMap<_, _>>();
+
+    // Pass 1: validate all entries without mutating the graph. If any entry is
+    // missing or has a stale fingerprint the whole cache is unusable (because
+    // rebuild_resolver_slots would clear resolver_slots immediately), so we bail
+    // early rather than inserting matched entries that would be discarded anyway.
+    let mut slots = Vec::with_capacity(records.len());
+    let mut entries_missed: usize = 0;
+    for record in records {
+        let Some(entry) = by_id.remove(&record.id) else {
+            entries_missed += 1;
+            continue;
+        };
+        if entry.fingerprint.modified_unix_millis != record.modified_unix_millis
+            || entry.fingerprint.size_bytes != record.size_bytes
+        {
+            entries_missed += 1;
+            continue;
+        }
+        slots.push((
+            record.id.clone(),
+            cross_file::ResolverSlot {
+                exports: entry.exports,
+                imports: entry.imports,
+                supertypes: entry.supertypes,
+            },
+        ));
+    }
+
+    if entries_missed > 0 {
+        return Ok(ResolverCacheLoadReport {
+            entries_loaded: 0,
+            entries_missed,
+            import_graph_loaded: false,
+        });
+    }
+
+    // Check the import-graph blob BEFORE inserting slots. If it is absent
+    // or unreadable, the caller's gate
+    // (`entries_missed == 0 && import_graph_loaded`) would force a
+    // `rebuild_resolver_slots()` that wipes anything we just inserted —
+    // paying slot-population cost for nothing. Bail early instead.
+    let Some(snapshot) = store.import_graph::<resolver_cache::ResolverSnapshot>()? else {
+        return Ok(ResolverCacheLoadReport {
+            entries_loaded: 0,
+            entries_missed: 0,
+            import_graph_loaded: false,
+        });
+    };
+
+    // Pass 2: all entries matched and import-graph available — commit into the graph.
+    let entries_loaded = slots.len();
+    for (id, slot) in slots {
+        graph.resolver_slots.insert(id, slot);
+    }
+
+    let known = graph.files.keys().cloned().collect::<HashSet<_>>();
+    let mut importers_by_file = HashMap::new();
+    for (target, importers) in snapshot.importers_by_file {
+        let target = FileId::new(target);
+        if !known.contains(&target) {
+            continue;
+        }
+        let importers = importers
+            .into_iter()
+            .map(FileId::new)
+            .filter(|id| known.contains(id) && id != &target)
+            .collect::<Vec<_>>();
+        if !importers.is_empty() {
+            importers_by_file.insert(target, importers);
+        }
+    }
+    graph.importers_by_file = importers_by_file;
+
+    Ok(ResolverCacheLoadReport {
+        entries_loaded,
+        entries_missed: 0,
+        import_graph_loaded: true,
+    })
 }
 
 fn load_persisted_partitions(
@@ -2678,6 +3328,7 @@ fn graph_store_metadata(root: &Path, crawl_options: &CrawlOptions) -> GraphStore
         "include_hidden": crawl_options.include_hidden,
         "max_file_bytes": crawl_options.max_file_bytes,
         "require_indexing_signal": crawl_options.require_indexing_signal,
+        "languages": crawl_options.languages,
         "include": crawl_options.policy.include,
         "exclude": crawl_options.policy.exclude,
         "include_classes": crawl_options.policy.include_classes,
@@ -2880,6 +3531,8 @@ fn parse_cargo_metadata(
     provenance: &CargoFactProvenance,
     root: &Path,
 ) -> Result<CargoCompilerFacts> {
+    let canonical_root = std::fs::canonicalize(root).ok();
+    let canonical_root = canonical_root.as_deref();
     let metadata = serde_json::from_str::<CargoMetadataJson>(metadata_json).map_err(|err| {
         SqueezyError::Graph(format!("failed to parse cargo metadata JSON: {err}"))
     })?;
@@ -2887,8 +3540,12 @@ fn parse_cargo_metadata(
     nodes.push(CargoFactNode {
         id: "cargo:workspace".to_string(),
         kind: CargoFactNodeKind::Workspace,
-        name: normalize_optional_cargo_path(root, metadata.workspace_root.as_deref())
-            .unwrap_or_else(|| ".".to_string()),
+        name: normalize_optional_cargo_path(
+            root,
+            canonical_root,
+            metadata.workspace_root.as_deref(),
+        )
+        .unwrap_or_else(|| ".".to_string()),
         package_id: None,
         manifest_path: None,
         source_path: None,
@@ -2907,7 +3564,8 @@ fn parse_cargo_metadata(
         if !workspace_members.is_empty() && !workspace_members.contains(&package.id) {
             continue;
         }
-        let manifest_path = normalize_optional_cargo_path(root, package.manifest_path.as_deref());
+        let manifest_path =
+            normalize_optional_cargo_path(root, canonical_root, package.manifest_path.as_deref());
         nodes.push(CargoFactNode {
             id: format!("cargo:package:{}", package.id),
             kind: CargoFactNodeKind::Package,
@@ -2925,7 +3583,11 @@ fn parse_cargo_metadata(
                 name: target.name,
                 package_id: Some(package.id.clone()),
                 manifest_path: manifest_path.clone(),
-                source_path: normalize_optional_cargo_path(root, target.src_path.as_deref()),
+                source_path: normalize_optional_cargo_path(
+                    root,
+                    canonical_root,
+                    target.src_path.as_deref(),
+                ),
                 target_kinds: target.kind,
                 provenance: Provenance::new("cargo metadata", "package target"),
             });
@@ -2946,8 +3608,16 @@ fn parse_cargo_metadata(
     nodes.sort_by(|left, right| left.id.cmp(&right.id));
 
     Ok(CargoCompilerFacts {
-        workspace_root: normalize_optional_cargo_path(root, metadata.workspace_root.as_deref()),
-        target_directory: normalize_optional_cargo_path(root, metadata.target_directory.as_deref()),
+        workspace_root: normalize_optional_cargo_path(
+            root,
+            canonical_root,
+            metadata.workspace_root.as_deref(),
+        ),
+        target_directory: normalize_optional_cargo_path(
+            root,
+            canonical_root,
+            metadata.target_directory.as_deref(),
+        ),
         nodes,
         diagnostics: Vec::new(),
         provenance: provenance.clone(),
@@ -2960,6 +3630,10 @@ fn parse_cargo_diagnostics(
     provenance: &CargoFactProvenance,
     root: &Path,
 ) -> Result<Vec<CargoDiagnostic>> {
+    // Compute once so the fallback path in normalize_cargo_file_id does not
+    // repeat the stat/readlink syscalls for every diagnostic span.
+    let canonical_root = std::fs::canonicalize(root).ok();
+    let canonical_root = canonical_root.as_deref();
     let mut diagnostics = Vec::new();
     for line in diagnostics_json.lines() {
         let line = line.trim();
@@ -2987,6 +3661,7 @@ fn parse_cargo_diagnostics(
                 package_id: event.package_id,
                 target_name: event.target.and_then(|target| target.name),
                 provenance: Provenance::new("cargo check", provenance.command.clone()),
+                raw_path: None,
             });
             continue;
         }
@@ -2998,11 +3673,25 @@ fn parse_cargo_diagnostics(
             let line_end = span.line_end.saturating_sub(1);
             let column_start = span.column_start.saturating_sub(1);
             let column_end = span.column_end.saturating_sub(1);
+            let file_id =
+                normalize_cargo_file_id(root, canonical_root, &span.file_name).map(FileId::new);
+            // When the path cannot be mapped to a workspace-relative FileId,
+            // keep the raw compiler path so callers can report both the raw
+            // diagnostic path and the workspace root spelling, helping users
+            // spot container, symlink, or bind-mount path-spelling mismatches.
+            let raw_path = if file_id.is_none()
+                && !span.file_name.is_empty()
+                && !span.file_name.starts_with('<')
+            {
+                Some(span.file_name.clone())
+            } else {
+                None
+            };
             diagnostics.push(CargoDiagnostic {
                 level: message.level.clone(),
                 message: message.message.clone(),
                 code: message.code.as_ref().map(|code| code.code.clone()),
-                file_id: normalize_cargo_file_id(root, &span.file_name).map(FileId::new),
+                file_id,
                 span: Some(SourceSpan::new(
                     span.byte_start,
                     span.byte_end,
@@ -3013,6 +3702,7 @@ fn parse_cargo_diagnostics(
                 package_id: event.package_id.clone(),
                 target_name: event.target.as_ref().and_then(|target| target.name.clone()),
                 provenance: Provenance::new("cargo check", provenance.command.clone()),
+                raw_path,
             });
         }
     }
@@ -3043,17 +3733,58 @@ fn primary_or_first_spans(spans: &[RustcSpanJson]) -> Vec<&RustcSpanJson> {
     }
 }
 
-fn normalize_optional_cargo_path(root: &Path, path: Option<&str>) -> Option<String> {
-    path.and_then(|path| normalize_cargo_file_id(root, path))
+fn normalize_optional_cargo_path(
+    root: &Path,
+    canonical_root: Option<&Path>,
+    path: Option<&str>,
+) -> Option<String> {
+    path.and_then(|path| normalize_cargo_file_id(root, canonical_root, path))
 }
 
-fn normalize_cargo_file_id(root: &Path, path: &str) -> Option<String> {
+/// Map a cargo compiler span path to a workspace-relative slash-joined string
+/// suitable for use as a `FileId`.
+///
+/// `canonical_root` should be the pre-computed `canonicalize(root)` result,
+/// passed in by the caller so that the fallback path does not repeat the
+/// syscall once per diagnostic span.
+fn normalize_cargo_file_id(
+    root: &Path,
+    canonical_root: Option<&Path>,
+    path: &str,
+) -> Option<String> {
     if path.starts_with('<') {
         return None;
     }
     let path = Path::new(path);
     let relative = if path.is_absolute() {
-        path.strip_prefix(root).ok()?.to_path_buf()
+        // Fast path: exact prefix match (the common case).
+        if let Ok(rel) = path.strip_prefix(root) {
+            rel.to_path_buf()
+        } else {
+            #[cfg(windows)]
+            if let Some(rel) = case_insensitive_relative_path(root, path) {
+                return Some(
+                    rel.components()
+                        .filter_map(|component| match component {
+                            std::path::Component::Normal(part) => {
+                                Some(part.to_string_lossy().to_string())
+                            }
+                            std::path::Component::CurDir => None,
+                            _ => Some(component.as_os_str().to_string_lossy().to_string()),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                );
+            }
+            // Fallback: canonicalize the diagnostic path and retry against the
+            // pre-computed canonical root. This handles symlinked workspaces,
+            // bind-mounted build environments, and container setups where cargo
+            // emits a different path spelling than the workspace root squeezy
+            // was opened with.
+            let cr = canonical_root?;
+            let canonical_path = std::fs::canonicalize(path).ok()?;
+            canonical_path.strip_prefix(cr).ok()?.to_path_buf()
+        }
     } else {
         path.to_path_buf()
     };
@@ -3067,6 +3798,29 @@ fn normalize_cargo_file_id(root: &Path, path: &str) -> Option<String> {
         .collect::<Vec<_>>()
         .join("/");
     (!normalized.is_empty()).then_some(normalized)
+}
+
+#[cfg(any(windows, test))]
+fn case_insensitive_relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    // Use lowercase for comparison only, then slice the original
+    // slash-normalized path so relative-path casing (e.g. `src/MyModule.cs`)
+    // is preserved in the FileId.
+    let path_str = path.to_string_lossy();
+    let path_norm = path_str.replace('\\', "/");
+    let root_str = root.to_string_lossy();
+    let root_norm = root_str.replace('\\', "/");
+    let path_lower = path_norm.to_ascii_lowercase();
+    let root_lower = root_norm.to_ascii_lowercase();
+    let root_prefix = if root_lower.ends_with('/') {
+        root_lower.clone()
+    } else {
+        format!("{root_lower}/")
+    };
+    // Verify the match, then use the prefix length to slice the original
+    // normalized path.
+    path_lower.strip_prefix(&root_prefix)?;
+    let remainder = &path_norm[root_prefix.len()..];
+    Some(Path::new(remainder).to_path_buf())
 }
 
 fn file_symbol(file: &FileRecord) -> GraphSymbol {
@@ -3479,13 +4233,45 @@ fn module_path_for_file(path: &str) -> Vec<String> {
     segments
 }
 
-fn paths_match(left: &Path, right: &Path) -> bool {
-    left == right
-        || std::fs::canonicalize(left)
-            .ok()
-            .zip(std::fs::canonicalize(right).ok())
-            .map(|(left, right)| left == right)
-            .unwrap_or(false)
+/// Pre-computed canonical paths for a set of pending watcher event paths.
+///
+/// [`paths_match`] calls `canonicalize` twice per invocation. When matching
+/// `N` pending paths against `M` record paths, the naive approach calls
+/// `canonicalize` O(N×M) times. This struct computes each pending-path
+/// canonical form once at construction and reuses it for all subsequent
+/// `matches` calls, reducing the stat/readlink count to O(N + M).
+struct PendingCanonicals {
+    /// Each entry is `(raw_path, canonicalized_path_or_none)`.
+    entries: Vec<(PathBuf, Option<PathBuf>)>,
+}
+
+impl PendingCanonicals {
+    fn from_paths(paths: &HashSet<PathBuf>) -> Self {
+        let entries = paths
+            .iter()
+            .map(|p| (p.clone(), std::fs::canonicalize(p).ok()))
+            .collect();
+        Self { entries }
+    }
+
+    /// Return `true` if `record_path` is covered by any pending event path.
+    /// `record_canonical` is the caller-supplied canonical form of the record
+    /// path (may be `None` if canonicalization failed, e.g. for a file that
+    /// was deleted after the crawl).
+    fn matches_record(&self, record_path: &Path, record_canonical: Option<&PathBuf>) -> bool {
+        self.entries.iter().any(|(raw, canon)| {
+            filesystem_paths_match(raw, record_path)
+                || canon
+                    .as_ref()
+                    .zip(record_canonical)
+                    .map(|(l, r)| l == r)
+                    .unwrap_or(false)
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 fn path_segments_suffix_match(left: &[String], right: &[String]) -> bool {
@@ -3707,6 +4493,50 @@ pub(crate) fn crate_underscore_alias_for_relative_path(path: &str) -> Option<Str
         return None;
     }
     Some(crate_dir.replace('-', "_"))
+}
+
+/// Detect indexed file paths that differ only in case. Linux filesystems
+/// preserve exact case-sensitive identity, so both paths are indexed
+/// correctly on ext4/xfs/btrfs. However, the same spellings may collide
+/// on macOS/Windows or on Linux case-insensitive mounts, and persisted
+/// cache entries keyed by the exact `FileId` string will be unusable after
+/// a checkout on those platforms.
+///
+/// Returns one `[a, b]` pair for every distinct colliding combination so
+/// an N-way collision yields C(N,2) pairs. Returning the pairs makes the
+/// function testable without a tracing subscriber.
+fn detect_case_collisions(files: &[squeezy_workspace::FileRecord]) -> Vec<[String; 2]> {
+    let mut lower_to_paths: HashMap<String, Vec<&str>> = HashMap::with_capacity(files.len());
+    for file in files {
+        lower_to_paths
+            .entry(file.relative_path.to_lowercase())
+            .or_default()
+            .push(&file.relative_path);
+    }
+    let mut collisions = Vec::new();
+    for paths in lower_to_paths.values() {
+        if paths.len() >= 2 {
+            for i in 0..paths.len() {
+                for j in (i + 1)..paths.len() {
+                    collisions.push([paths[i].to_string(), paths[j].to_string()]);
+                }
+            }
+        }
+    }
+    collisions
+}
+
+/// Emit a `tracing::warn!` for each case-colliding path pair detected by
+/// [`detect_case_collisions`].
+fn warn_case_collisions(files: &[squeezy_workspace::FileRecord]) {
+    for [a, b] in detect_case_collisions(files) {
+        tracing::warn!(
+            "squeezy: case-collision: '{}' and '{}' fold to the same lowercase path; \
+             cross-platform checkout or cached-entry reuse may be unreliable",
+            a,
+            b,
+        );
+    }
 }
 
 #[cfg(test)]

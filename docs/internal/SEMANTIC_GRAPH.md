@@ -60,7 +60,14 @@ that forwards raw LSP responses to the model.
 
 Unsupported files are retained as structured unsupported results so callers can
 fall back to bounded read/grep/list navigation without pretending the graph knows
-more than it does.
+more than it does. Files in a supported language that is disabled by
+`[graph].languages` use the same fallback record shape with a distinct disabled
+language reason, so the allow-list affects parser scheduling without hiding
+files from coverage and repo-profile diagnostics.
+Parser diagnostics retain partial tree-sitter evidence with language, smallest
+error spans, parent-node context, compact source excerpts, and
+partial-confidence summaries so graph/tool callers can show why a file is only
+partially trusted.
 
 Generated, vendored, dependency cache, build output, binary, lockfile, and large
 files are excluded from graph indexing by default with compact reason-tagged
@@ -88,12 +95,35 @@ scan to depth two with a small entry cap and include every `LanguageFamily` in
 files. Common code directories such as `src`, `lib`, `app`,
 `packages`, `crates`, `cmd`, `pkg`, `internal`, and `include` are positive only
 when they contain shallow source files. The user's home directory and protected
-system roots such as `/`, `/System`, `/Library`, `/Users`, `/usr`, and `/var`
-are blocking negative signals. Personal folder names such as `Desktop`,
-`Documents`, and `Downloads` are weak negative signals, but real project markers
-can override them. If there is no strong positive signal, or the root is a
-blocked system/home root, Squeezy returns an empty graph with the indexing
-decision instead of walking a likely non-code or dangerous directory.
+system roots such as `/`, `/System`, `/Library`, `/Users`, `/proc`, `/sys`,
+`/run`, `/boot`, and `/snap` are blocking negative signals. Broad Linux package
+and source roots such as `/opt`, `/usr`, and `/var` are not blocked solely by
+name; they still need a strong project or source signal before indexing starts.
+Personal folder names such as `Desktop`, `Documents`, and `Downloads` are weak
+negative signals, but real project markers can override them. On case-sensitive
+filesystems, near-miss project markers such as `cargo.toml` when `Cargo.toml`
+was expected are reported as negative diagnostics instead of being silently
+ignored. If there is no strong positive signal, or the root is a blocked
+system/home root, Squeezy returns an empty graph with the indexing decision
+instead of walking a likely non-code or dangerous directory.
+
+Windows roots use the same decision path with a normalized filesystem identity
+layer. Drive roots (`C:\`), Windows system directories (`C:\Windows`,
+`C:\Program Files`, `C:\ProgramData`), broad profile containers (`C:\Users`),
+UNC share roots (`\\server\share`), verbatim roots (`\\?\...`), and OneDrive or
+other cloud-sync roots are blocking negative signals and the skip reason includes
+the normalized root. Native Windows home variables (`USERPROFILE`,
+`HOMEDRIVE`/`HOMEPATH`) are considered alongside `HOME`, so the ancestor VCS
+scan stops at the real profile boundary even when `HOME` is absent or points at a
+Unix-like path. Personal folder names also cover `Pictures`, `Videos`, `Music`,
+and `Saved Games`.
+
+File records keep their exact slash-normalized relative paths, but the workspace
+snapshot also reports `path_conflicts`: groups whose lowercase normalized
+relative path collides. That catches Linux-valid states such as `src/Foo.rs` and
+`src/foo.rs` before they become fragile on default NTFS or case-insensitive
+Windows-compatible mounts. Graph tool payloads include a compact
+`path_conflicts` count and sample list when conflicts exist.
 
 - Direct calls resolve when the target is same-file, explicitly imported, or
   syntactically qualified as `Self::name`, `Type::name`, or `module::name` with
@@ -134,17 +164,42 @@ Defaults:
 - per-tool refresh budget: 250 ms
 
 Refresh is pending-event-first when callers provide authoritative changed
-paths, with a polling fallback otherwise. Callers that know paths changed can
-call `record_changed_path`; the next graph query refreshes immediately after
-debounce. `GraphManager::open_watching` can attach the
-`squeezy-graph::watcher::FileWatcher`, which uses
-`notify-debouncer-full` and OS-native backends (FSEvents, inotify, or
+paths, with a bounded recrawl fallback otherwise. Callers that know paths
+changed can call `record_changed_path`; the next graph query refreshes
+immediately after debounce. Long-lived tool registries open the graph with
+`GraphManager::open_watching`, which attaches the
+`squeezy-graph::watcher::FileWatcher`. The watcher uses
+`notify-debouncer-full` and OS-native backends (FSEvents, Linux inotify, or
 ReadDirectoryChangesW) to queue debounced changed paths into the same pending
-set. The default tool registry still opens the graph with `open_with_store`
-instead of `open_watching`, so normal tool calls rely on refresh calls and the
-15 second polling safety net rather than an always-on OS watcher. Refresh
-recrawls tracked files, compares stable hashes, reparses changed files only,
-removes deleted files, and preserves unchanged graph partitions.
+set. If native watcher registration fails, for example because Linux inotify
+watch limits are exhausted or a mount cannot be watched recursively, Squeezy
+falls back to a polling watcher and records the fallback reason; if both native
+and polling backends fail, live event refresh is disabled but the graph remains
+usable through polling recrawls.
+
+Graph tool payloads include a compact `freshness_mode` value (`watcher` or
+`polling`) and include a `freshness_fallback_reason` only when watcher startup
+degrades. Degraded watcher sessions also expose `watcher_mode`,
+`watcher_backend`, and pending event count inside the `indexing` block so users
+and agents can distinguish native event refresh from fallback or one-shot
+crawl-only graph managers. Watcher-backed graph managers hard-ignore Squeezy's
+own `.squeezy/` cache and VCS metadata events via the shared
+`VCS_AND_CACHE_DIR_NAMES` list, so graph persistence writes do not self-trigger
+refresh loops; other default-pruned directories are left visible to the watcher
+so user policy such as `include = ["vendor/allowed/**"]` can still refresh
+re-included files. Refresh recrawls tracked files, compares stable hashes,
+reparses changed files only, removes deleted files, and preserves unchanged
+graph partitions.
+
+Watcher event paths and refresh records are compared through the workspace path
+identity helper before falling back to canonicalization. This strips Windows
+verbatim prefixes, normalizes separators, folds drive-letter case, recognizes
+UNC roots, and still works for deleted files where canonicalization can no
+longer succeed. Watcher batches are deduplicated with the same key, so a
+case-only rename or alternate Windows spelling does not inflate the event count.
+`squeezy doctor` includes a `workspace_paths` row with original, canonical, and
+normalized roots, the classified root kind, and a best-effort case-sensitivity
+probe for support reports.
 
 The 250 ms per-tool refresh budget is a hard cap, not a soft hint. Reparse work
 yields with `budget_exhausted=true` on the refresh report once the budget is
@@ -173,10 +228,12 @@ split graph `redb` database under the configured cache root
 receipt metadata, read snapshots, observations, and small session-side cache
 state. On a later session, unchanged files are hydrated from persisted
 partitions and skip tree-sitter parsing; changed or missing partitions are
-reparsed and written back. The graph store records a schema version plus
-workspace, crawl-policy, language-registry, and graph-format metadata. A schema
-mismatch backs up the old database and rebuilds fresh state instead of mutating
-unknown data in place.
+reparsed and written back. When the graph metadata and per-file fingerprints
+match, resolver exports/imports/supertypes and the import adjacency graph are
+also hydrated from `graph.redb` so cross-file resolver state survives process
+restart. The graph store records a schema version plus workspace, crawl-policy,
+language-registry, and graph-format metadata. A schema mismatch backs up the old
+database and rebuilds fresh state instead of mutating unknown data in place.
 
 Tree-sitter parse work is parallelized for batches of at least eight files. Each
 worker owns its own parser instance, and the final graph merge plus index rebuild
@@ -185,13 +242,13 @@ refreshes, including the common one- or two-file edit case, stay serial to avoid
 thread setup overhead.
 
 Graph build and refresh reports include duration, file counts, persisted
-partition hit/miss counts, reparsed byte counts, symbol/edge counts, and
-Rust/Python/JS/TS/supported/unsupported/unknown language distribution. Refresh
-reports also separate changed paths observed from events, changed paths
-discovered by polling, and unchanged event paths so file-watcher FP/FN behavior
-can be benchmarked without sending paths or source text. Telemetry callers use
-these reports for one-shot graph build events and repeated graph refresh events
-without sending paths or source text.
+partition hit/miss counts, resolver-cache hit/miss counts, reparsed byte counts,
+symbol/edge counts, and Rust/Python/JS/TS/supported/unsupported/unknown language
+distribution. Refresh reports also separate changed paths observed from events,
+changed paths discovered by polling, and unchanged event paths so file-watcher
+FP/FN behavior can be benchmarked without sending paths or source text.
+Telemetry callers use these reports for one-shot graph build events and repeated
+graph refresh events without sending paths or source text.
 
 ## Compiler Facts
 
@@ -240,8 +297,16 @@ The agent-facing graph tool surface is:
   enclosing symbol span (function, method, impl, test) is a follow-up rather
   than something this surface already implements.
 
-Graph navigation tools return uniform evidence packets with `claim`, `spans`,
-`confidence`, `freshness`, `provenance`, `cost_hint`, and `next_action`.
+Graph navigation tools return compact evidence packets. The wire payload has been
+deliberately trimmed: `claim`, `freshness`, `provenance`, `cost_hint`, and
+`next_action` are dropped to reduce per-result token cost — these signals flow to
+telemetry via typed graph events rather than the tool result JSON. The `symbol`
+body carries `id`, `name`, `kind`, `path`, `signature`, `span`, `confidence`,
+and optionally `rank` (present when a query was provided; values: `exact`,
+`case_insensitive`, `signature_substring`, `token_bag`, `fuzzy`) plus
+`visibility` and `dirty` when set. Zero-hit results include a structured
+`fallback` object with `status`, `reason`, and a one-line `hint` that
+distinguishes unsupported-language paths from indexed-language misses.
 Unsupported or unknown-language paths return structured fallback suggestions for
 bounded grep/read navigation rather than graph confidence. Raw file reads should
 be targeted by graph spans or `read_slice` ranges.

@@ -22,7 +22,10 @@ use aws_sdk_bedrockruntime::{
 };
 use aws_smithy_types::{Blob, Document, Number};
 use serde_json::Value;
-use squeezy_core::{BedrockConfig, CostSnapshot, ProviderTransportConfig, Result, SqueezyError};
+use squeezy_core::{
+    BedrockConfig, CostSnapshot, ProviderTransportConfig, Result, SqueezyError,
+    is_metadata_or_link_local_host,
+};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -84,6 +87,21 @@ pub struct BedrockProvider {
 
 impl BedrockProvider {
     pub fn from_config(config: &BedrockConfig) -> Result<Self> {
+        // Validate the custom endpoint URL at construction time.  A Bedrock
+        // `endpoint_url` bypasses squeezy's hardened reqwest resolver (see
+        // the SECURITY note in `load_aws_config`) so we reject literal
+        // metadata / link-local hosts eagerly to prevent SSRF credential
+        // exfiltration on Linux cloud hosts where IMDS is reachable.
+        if let Some(url) = &config.base_url
+            && let Some(host) = extract_url_host(url)
+            && is_metadata_or_link_local_host(&host)
+        {
+            return Err(SqueezyError::Config(format!(
+                "bedrock base_url {url:?} targets a cloud-metadata or \
+                 link-local host ({host}); refusing to configure to prevent \
+                 potential credential exfiltration via IMDS"
+            )));
+        }
         Ok(Self {
             region: config.region.clone(),
             base_url: config.base_url.clone(),
@@ -110,6 +128,46 @@ impl BedrockProvider {
         // forcing operators to rebuild the provider.
         let bearer_token = current_bearer_token(self.bearer_token.as_deref());
         build_bedrock_client(shared, bearer_token.as_deref())
+    }
+}
+
+/// Extract the hostname from a URL string without requiring a full URL
+/// parser.  Strips the scheme prefix (`://`), any userinfo@ component,
+/// the optional `:port` suffix, and — for IPv6 literals — the enclosing
+/// `[` `]` brackets.  Returns `None` for inputs with no authority
+/// component (relative paths, opaque URIs, etc.).
+///
+/// The returned string is suitable for direct use with
+/// `is_metadata_or_link_local_host`: IPv6 literals are unbracketed so
+/// they can be parsed as `IpAddr` by that function.
+fn extract_url_host(url: &str) -> Option<String> {
+    let after_scheme = url.find("://").map(|i| &url[i + 3..]).unwrap_or(url);
+    let authority = after_scheme.split('/').next()?;
+    let after_userinfo = authority.split('@').next_back().unwrap_or(authority);
+    let host = if after_userinfo.starts_with('[') {
+        // IPv6 literal: "[::1]" or "[::1]:8080" — strip brackets.
+        // If ']' is absent (malformed input like "[") use `len()` so the
+        // slice `[1..len]` is valid and yields an empty string, which the
+        // trailing `host.is_empty()` check turns into `None`.
+        let close = after_userinfo.find(']').unwrap_or(after_userinfo.len());
+        &after_userinfo[1..close]
+    } else {
+        // Strip port if present and purely numeric.
+        match after_userinfo.rfind(':') {
+            Some(colon)
+                if after_userinfo[colon + 1..]
+                    .chars()
+                    .all(|c| c.is_ascii_digit()) =>
+            {
+                &after_userinfo[..colon]
+            }
+            _ => after_userinfo,
+        }
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
     }
 }
 
@@ -140,18 +198,13 @@ async fn load_aws_config(region: String, base_url: Option<String>) -> SdkConfig 
     // chain itself is whatever the AWS SDK ships as best practice.
     let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(Region::new(region));
     if let Some(url) = base_url {
-        // SECURITY (out-of-scope gap, documented): a custom Bedrock
-        // `endpoint_url` is dispatched by the AWS SDK's own
-        // `aws-smithy-runtime` hyper transport, NOT squeezy's hardened
-        // `shared_client` resolver that blocks link-local / cloud-
-        // metadata hosts (see the "Bedrock gap" note in
-        // `transport.rs`). An operator who points `base_url` at an
-        // internal/metadata address therefore bypasses the SSRF guard
-        // the other providers get for free. Centralizing this would
-        // require swapping the smithy `HttpConnector`, which is out of
-        // scope here; the config is operator-supplied (not model- or
-        // request-derived), so the trust boundary is the operator's
-        // config file, the same as `AWS_PROFILE` / `~/.aws/config`.
+        // SECURITY: literal metadata / link-local hosts are rejected at
+        // provider-construction time in `from_config` via
+        // `extract_url_host` + `is_metadata_or_link_local_host`.  The
+        // residual gap — a DNS name that resolves to a metadata address
+        // at connect time — cannot be closed here without swapping the
+        // smithy HttpConnector; the trust boundary remains the
+        // operator's config file (same as `AWS_PROFILE` / `~/.aws/config`).
         loader = loader.endpoint_url(url);
     }
     loader.load().await

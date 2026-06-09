@@ -14,13 +14,19 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use fs2::FileExt as _;
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use squeezy_core::{
-    AppConfig, ContextAttachment, ContextCompactionState, CostSnapshot, ReasoningPayload,
-    ReasoningSnapshot, Result, SessionMetrics, SessionMode, SqueezyError, TranscriptItem,
+    AppConfig, CacheDurability, ContextAttachment, ContextCompactionState, CostSnapshot,
+    ReasoningPayload, ReasoningSnapshot, Result, SessionMetrics, SessionMode, SqueezyError,
+    TranscriptItem,
 };
+
+use crate::{atomic_replace, fs_util, session_dir_path, sync_parent_dir};
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
@@ -36,9 +42,19 @@ pub const ROLLOUT_TRACE_SCHEMA_VERSION: u32 = 1;
 /// files keep loading after future schema changes without filename
 /// sniffing.
 pub const SESSION_METADATA_SCHEMA_VERSION: u32 = 1;
+/// Redb file under the session root that indexes `metadata.json` snapshots.
+/// The JSON files remain the durable/auditable session records; this compact
+/// index exists so list/filter/resume surfaces do not have to scan every
+/// session directory on the hot path.
+pub const SESSION_INDEX_FILE_NAME: &str = "index.redb";
+pub const SESSION_INDEX_SCHEMA_VERSION: u64 = 1;
 /// Subdirectory under the session root that holds archived sessions.
 /// Sibling to live session ids; never used as a session id itself.
 pub const ARCHIVED_SUBDIR: &str = "archived";
+
+const SESSION_INDEX_META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+const SESSION_INDEX_METADATA: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("session_metadata");
 
 /// Rewrite the cross-project session index when it grows beyond this many
 /// bytes. Append-only writes are cheap, but unbounded growth would slow
@@ -81,26 +97,107 @@ struct GlobalIndexCache {
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     root: PathBuf,
+    /// Pre-computed `<root>/index.redb` path. Cached alongside `root` so
+    /// every `with_index_db` / `upsert_session_index` / index diagnostics
+    /// call does not re-allocate a `PathBuf` on the hot metadata-write
+    /// path.
+    index_path: PathBuf,
     retention_days: u64,
     retention_archive_days: u64,
     max_event_bytes: usize,
     max_session_bytes: usize,
+    /// Cached redb handle for `index.redb`. Shared across all clones of this
+    /// `SessionStore` (e.g. clones held by `SessionHandle`) so the file is
+    /// opened at most once per process, mirroring the `SqueezyStore` pattern
+    /// for `graph.redb`.
+    index_db: Arc<StdMutex<Option<Database>>>,
+    durability: CacheDurability,
 }
 
 impl SessionStore {
     pub fn open(config: &AppConfig) -> Self {
         let root = session_root(config);
+        let index_path = root.join(SESSION_INDEX_FILE_NAME);
         Self {
             root,
+            index_path,
             retention_days: config.session_logs.log_retention_days,
             retention_archive_days: config.session_logs.log_retention_archive_days,
             max_event_bytes: config.session_logs.max_event_bytes,
             max_session_bytes: config.session_logs.max_session_bytes,
+            index_db: Arc::new(StdMutex::new(None)),
+            durability: config.cache.durability,
         }
+    }
+
+    fn with_index_db<T>(&self, action: impl FnOnce(&Database) -> Result<T>) -> Result<T> {
+        let mut guard = self
+            .index_db
+            .lock()
+            .map_err(|_| SqueezyError::Tool("session index lock poisoned".into()))?;
+        // If the underlying file was removed externally (e.g. cleanup or tests),
+        // drop the cached handle so open_session_index recreates it on next access.
+        if guard.is_some() && !self.index_path.exists() {
+            *guard = None;
+        }
+        if guard.is_none() {
+            *guard = Some(open_session_index(&self.index_path)?);
+        }
+        action(
+            guard
+                .as_ref()
+                .ok_or_else(|| SqueezyError::Tool("session index unavailable after init".into()))?,
+        )
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn session_index_path(&self) -> PathBuf {
+        self.index_path.clone()
+    }
+
+    /// Best-effort snapshot of the session-metadata index. Surfaces in
+    /// `squeezy doctor`'s session-store sub-line so a user can see whether
+    /// the redb index is present, how many sessions it tracks, and which
+    /// schema version stamped it. Never errors — open/read failures are
+    /// returned in the `error` field rather than propagated, matching the
+    /// "JSON files are the source of truth, the index is an accelerator"
+    /// invariant.
+    pub fn session_index_diagnostics(&self) -> SessionIndexDiagnostics {
+        let path = self.session_index_path();
+        if !path.exists() {
+            return SessionIndexDiagnostics {
+                path,
+                exists: false,
+                indexed_sessions: 0,
+                schema_version: None,
+                error: None,
+            };
+        }
+        match self.with_index_db(|database| {
+            let schema_version = session_index_schema_version(database).ok().flatten();
+            let indexed_sessions = session_index_records(database)
+                .map(|sessions| sessions.len())
+                .unwrap_or(0);
+            Ok((schema_version, indexed_sessions))
+        }) {
+            Ok((schema_version, indexed_sessions)) => SessionIndexDiagnostics {
+                path,
+                exists: true,
+                indexed_sessions,
+                schema_version,
+                error: None,
+            },
+            Err(error) => SessionIndexDiagnostics {
+                path,
+                exists: true,
+                indexed_sessions: 0,
+                schema_version: None,
+                error: Some(error.to_string()),
+            },
+        }
     }
 
     /// Path to the cross-session token calibration file. Lives next to the
@@ -109,37 +206,79 @@ impl SessionStore {
         self.root.join("calibration.json")
     }
 
-    /// Load the cross-session `TokenCalibration` if present. Missing or
-    /// malformed files yield `TokenCalibration::default()` rather than an
-    /// error: the calibration is a best-effort cache, not a source of truth.
+    /// Load the cross-session `TokenCalibration` if present. Missing files
+    /// yield `TokenCalibration::default()` silently. Malformed files also
+    /// fall back to the default, but emit a one-time diagnostic to stderr so
+    /// the user knows the warm-start cache is cold (e.g. in CI or on shared
+    /// homes where corruption is more likely to go unnoticed).
     pub fn load_global_calibration(&self) -> squeezy_llm::TokenCalibration {
+        self.load_global_calibration_inner().0
+    }
+
+    /// Like [`Self::load_global_calibration`] but also returns a hint about
+    /// where the calibration came from:
+    /// - `(cal, None)` — file was absent; `cal` is the hard-coded default.
+    /// - `(cal, Some(true))` — file existed and was parsed successfully.
+    /// - `(cal, Some(false))` — file existed but was malformed; `cal` is the
+    ///   default and a warning was emitted to stderr.
+    pub fn load_global_calibration_with_source_hint(
+        &self,
+    ) -> (squeezy_llm::TokenCalibration, Option<bool>) {
+        self.load_global_calibration_inner()
+    }
+
+    fn load_global_calibration_inner(&self) -> (squeezy_llm::TokenCalibration, Option<bool>) {
         let path = self.calibration_path();
-        if !path.exists() {
-            return squeezy_llm::TokenCalibration::default();
+        // Read directly without a separate `exists()` check to avoid TOCTOU: on
+        // NFS / shared homes the file can be deleted between the two syscalls.
+        // Pattern-match on the error kind so "not found" is silent but other
+        // failures (permission denied, I/O error, parse error) emit a diagnostic.
+        match read_json::<squeezy_llm::TokenCalibration>(&path) {
+            Ok(calibration) => (calibration, Some(true)),
+            Err(SqueezyError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                (squeezy_llm::TokenCalibration::default(), None)
+            }
+            Err(e) => {
+                let error_kind = calibration_load_error_kind(&e);
+                eprintln!(
+                    "squeezy: warning: calibration.json could not be loaded ({error_kind}); falling back to default token calibration"
+                );
+                (squeezy_llm::TokenCalibration::default(), Some(false))
+            }
         }
-        read_json(&path).unwrap_or_default()
     }
 
     /// Atomically persist the cross-session `TokenCalibration`. Errors are
     /// returned to the caller but expected to be logged-and-ignored — a
     /// failed write only costs us the next session's warm-start.
+    ///
+    /// Skips the write when the serialized content is byte-for-byte identical
+    /// to the current file. This avoids unnecessary rename operations on
+    /// Windows (common when calibration ratios are stable across consecutive
+    /// turns) and reduces contention on the shared calibration file.
     pub fn save_global_calibration(
         &self,
         calibration: &squeezy_llm::TokenCalibration,
     ) -> Result<()> {
         fs::create_dir_all(&self.root)?;
-        write_json(&self.calibration_path(), calibration)
+        let path = self.calibration_path();
+        let new_bytes = serde_json::to_vec_pretty(calibration).map_err(json_error)?;
+        if let Ok(existing) = fs::read(&path)
+            && existing == new_bytes
+        {
+            return Ok(());
+        }
+        // Reuse the already-serialized bytes to avoid double serialization.
+        write_json_bytes(&path, &new_bytes)
     }
 
-    /// Path to the user-global memory file. Returns `None` when `HOME` is
-    /// unset — the same condition under which the agent's prompt-side
-    /// ingestion (`ingest_user_memory`) declines to do anything. The file
-    /// itself is the single static memory store described in
+    /// Path to the user-global memory file. Uses `HOME/.squeezy` when
+    /// available and falls back to native Windows profile/app-data roots when
+    /// `HOME` is unset. The file itself is the single static memory store described in
     /// `docs/internal/MEMORY_SCOPE.md`; this primitive does not introduce a
     /// new directory or partition scheme.
     pub fn memory_path() -> Option<PathBuf> {
-        let home = env::var_os("HOME")?;
-        Some(PathBuf::from(home).join(".squeezy").join("memory.md"))
+        Some(fs_util::user_squeezy_dir()?.join("memory.md"))
     }
 
     /// Append one normalized line to the user-global memory file
@@ -159,9 +298,10 @@ impl SessionStore {
             return Ok(0);
         }
         let Some(path) = Self::memory_path() else {
-            return Err(SqueezyError::Agent(
-                "remember requires HOME to be set to locate ~/.squeezy/memory.md".to_string(),
-            ));
+            return Err(SqueezyError::Agent(format!(
+                "remember requires a user profile directory to be set ({})",
+                fs_util::user_squeezy_dir_detail()
+            )));
         };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -188,8 +328,8 @@ impl SessionStore {
     /// Matches the semantics of the agent's prompt-side
     /// `ingest_user_memory` so call sites can rely on a single source of
     /// truth for the recall shape. Returns `None` when ingestion is
-    /// disabled (`max_bytes == 0`), `HOME` is unset, or the file is
-    /// absent / empty / unreadable. Errors are silent on purpose — recall
+    /// disabled (`max_bytes == 0`), no user-global directory can be resolved,
+    /// or the file is absent / empty / unreadable. Errors are silent on purpose — recall
     /// is best-effort enrichment, never load-bearing.
     pub fn recall(max_bytes: usize) -> Option<String> {
         if max_bytes == 0 {
@@ -213,17 +353,33 @@ impl SessionStore {
         Some(truncated)
     }
 
-    /// Path to the cross-project session index, an append-only JSONL file
-    /// at `~/.squeezy/sessions/index.jsonl`. Per-project session roots
-    /// live under each workspace, so a global index is the only way the
-    /// resume picker can show sessions started from sibling repos.
-    /// Returns `None` when `HOME` is unset — same condition under which
-    /// the user-global memory file declines to operate.
+    /// Path to the cross-project session index. When `XDG_STATE_HOME` is set
+    /// to an absolute path (Linux XDG Base Directory Specification) it resolves to
+    /// `$XDG_STATE_HOME/squeezy/sessions/index.jsonl`; otherwise it uses the
+    /// user-global Squeezy directory (`$HOME/.squeezy` or the Windows native
+    /// profile/app-data fallback) so existing local state remains visible.
+    ///
+    /// Linux users who want the canonical XDG placement can set `XDG_STATE_HOME`
+    /// (typically `$HOME/.local/state`); `list_global_index` will then merge
+    /// entries from the legacy path as a one-time migration source.
+    ///
+    /// Per-project session roots live under each workspace, so a global index
+    /// is the only way the resume picker can show sessions started from sibling
+    /// repos. Returns `None` when neither an absolute `XDG_STATE_HOME` nor a
+    /// user-global directory can be resolved.
     pub fn global_index_path() -> Option<PathBuf> {
-        let home = env::var_os("HOME")?;
+        xdg_global_index_path()
+    }
+
+    /// Legacy cross-project index path under the user-global Squeezy directory.
+    /// Used as a migration source when the active path has moved to an XDG
+    /// location; callers read from this path too so old entries remain visible
+    /// after the first XDG-aware launch. On native Windows the user-global
+    /// helper falls back through `%APPDATA%` and `%USERPROFILE%` when `HOME`
+    /// is absent.
+    pub fn legacy_global_index_path() -> Option<PathBuf> {
         Some(
-            PathBuf::from(home)
-                .join(".squeezy")
+            fs_util::user_squeezy_dir()?
                 .join("sessions")
                 .join("index.jsonl"),
         )
@@ -234,21 +390,24 @@ impl SessionStore {
     /// enrichment, the per-project session store is authoritative.
     /// Append-only writes keep the hot path cheap; readers dedupe by
     /// `session_id` and compaction is deferred to `list_global_index`.
+    /// An advisory exclusive lock on a sidecar `.lock` file serialises
+    /// concurrent same-host appends so large multi-`write` records cannot
+    /// interleave across processes.
     pub fn append_global_index_entry(entry: &GlobalSessionIndexEntry) {
         let Some(path) = Self::global_index_path() else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         let Ok(mut payload) = serde_json::to_vec(entry) else {
             return;
         };
         payload.push(b'\n');
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
-            return;
-        };
-        let _ = file.write_all(&payload);
+        if let Err(error) = with_global_index_lock(&path, || {
+            let mut ignored_size =
+                fs::metadata(&path).map_or(0, |metadata| metadata.len() as usize);
+            append_payload_with_recovery(&path, &payload, &mut ignored_size)
+        }) {
+            log_global_index_lock_failure(&path, "append", &error);
+        }
     }
 
     /// Read the cross-project session index, deduping by `session_id` and
@@ -258,57 +417,54 @@ impl SessionStore {
     /// next read stays fast. Returns entries newest-first by
     /// `started_at_ms` so callers can take a recency-prefixed slice
     /// without re-sorting.
+    ///
+    /// Also merges any entries from the legacy `$HOME/.squeezy/sessions/index.jsonl`
+    /// path when the active index has moved to an XDG location, so sessions
+    /// recorded before the migration remain visible.
     pub fn list_global_index() -> Vec<GlobalSessionIndexEntry> {
         let Some(path) = Self::global_index_path() else {
             return Vec::new();
         };
-        if !path.exists() {
+        // If neither the primary nor legacy path exists yet, there is nothing to list.
+        let legacy_path = Self::legacy_global_index_path();
+        let primary_exists = path.exists();
+        let legacy_differs = legacy_path
+            .as_ref()
+            .is_some_and(|lp| *lp != path && lp.exists());
+        if !primary_exists && !legacy_differs {
             return Vec::new();
         }
         let initial_fingerprint = fs::metadata(&path)
             .ok()
             .map(|metadata| global_index_fingerprint(&metadata));
-        if let Some(fingerprint) = &initial_fingerprint
+        if !legacy_differs
+            && let Some(fingerprint) = &initial_fingerprint
             && let Some(entries) = cached_global_index(&path, fingerprint)
         {
             return entries;
         }
-        let Ok(file) = fs::File::open(&path) else {
-            return Vec::new();
-        };
-        let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        let mut raw_lines = 0usize;
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => return Vec::new(),
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(trimmed) else {
-                continue;
-            };
-            raw_lines += 1;
-            match by_id.get(&entry.session_id) {
-                Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => continue,
-                _ => {
-                    by_id.insert(entry.session_id.clone(), entry);
-                }
-            }
+        let mut raw_entries = Vec::new();
+        // Read the legacy path first (lower priority) so primary-path entries win.
+        if legacy_differs
+            && let Some(ref lp) = legacy_path
+            && let Ok(entries) = read_global_index_entries(lp)
+        {
+            raw_entries.extend(entries);
         }
-        let mut entries: Vec<GlobalSessionIndexEntry> = by_id.into_values().collect();
-        // Drop all but the most-recent `GLOBAL_INDEX_MAX_ENTRIES` so the index
-        // can never grow unbounded with a user's lifetime session count. The
-        // newest-first return order below is what the picker consumes.
-        entries.sort_by_key(|entry| std::cmp::Reverse(entry.last_event_at_ms));
-        let trimmed_to_cap = entries.len() > GLOBAL_INDEX_MAX_ENTRIES;
-        entries.truncate(GLOBAL_INDEX_MAX_ENTRIES);
+        if primary_exists {
+            let Ok(entries) = read_global_index_entries(&path) else {
+                return Vec::new();
+            };
+            raw_entries.extend(entries);
+        }
+        let raw_lines = raw_entries.len();
+        // `compact_global_index_entries` is shared with `rewrite_global_index`
+        // so the dedup-by-id + cap policy lives in one place. Both callers
+        // agree on "newest `last_event_at_ms` wins" and the
+        // `GLOBAL_INDEX_MAX_ENTRIES` ceiling; only the post-compaction
+        // ordering differs (this caller surfaces newest-first by
+        // `started_at_ms`; the rewriter persists oldest-first).
+        let mut entries = compact_global_index_entries(raw_entries);
         let oversized = fs::metadata(&path)
             .map(|meta| meta.len() > GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES)
             .unwrap_or(false);
@@ -316,15 +472,21 @@ impl SessionStore {
         // the cap, or dedup collapsed duplicate appends). Rewriting an already
         // minimal, all-distinct index on every read — as the byte-threshold
         // alone did — is pure write+fsync waste that scales with history.
-        if oversized && (trimmed_to_cap || raw_lines > entries.len()) {
+        if primary_exists && oversized && raw_lines > entries.len() {
             let mut ordered: Vec<&GlobalSessionIndexEntry> = entries.iter().collect();
             // Compact in oldest-first order so future appends keep the newest
             // entries at the tail — matches how readers see time.
             ordered.sort_by_key(|entry| entry.started_at_ms);
-            let _ = rewrite_global_index(&path, &ordered);
+            if let Err(error) =
+                with_global_index_lock(&path, || rewrite_global_index(&path, &ordered))
+            {
+                log_global_index_lock_failure(&path, "compact", &error);
+            }
         }
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
-        cache_global_index(&path, &entries);
+        if !legacy_differs {
+            cache_global_index(&path, &entries);
+        }
         entries
     }
 
@@ -345,6 +507,60 @@ impl SessionStore {
         }
         let entry = GlobalSessionIndexEntry::from_metadata(metadata, now_ms());
         Self::append_global_index_entry(&entry);
+    }
+
+    fn write_metadata_file(&self, dir: &Path, metadata: &SessionMetadata) -> Result<()> {
+        write_json(&dir.join("metadata.json"), metadata)?;
+        self.upsert_session_index(metadata);
+        Ok(())
+    }
+
+    fn upsert_session_index(&self, metadata: &SessionMetadata) {
+        let metadata_path = self.metadata_path_for(metadata);
+        // If mtime is unavailable (OS buffering race), skip the upsert so the
+        // next list call rebuilds the index with a real mtime rather than
+        // storing 0 as a fingerprint that self-invalidates on every list cycle.
+        let Some(modified_unix_nanos) = session_metadata_modified_unix_nanos(&metadata_path) else {
+            return;
+        };
+        let record = SessionIndexRecord {
+            metadata: metadata.clone(),
+            modified_unix_nanos,
+        };
+        let root_str = self.root.display().to_string();
+        // The outer `let _` keeps this whole path best-effort (the JSON file
+        // is the source of truth); commit failures are surfaced inside the
+        // closure rather than swallowed in place so tests and future
+        // diagnostics can observe them when the outer caller chooses to.
+        let _ = self.with_index_db(|database| {
+            let write = database.begin_write().map_err(crate::store_error)?;
+            if let Ok(mut table) = write.open_table(SESSION_INDEX_METADATA)
+                && let Ok(encoded) = crate::encode(&record)
+            {
+                let _ = table.insert(record.metadata.session_id.as_str(), encoded.as_slice());
+            }
+            if let Ok(mut meta) = write.open_table(SESSION_INDEX_META)
+                && let Ok(encoded) = crate::encode(&root_str)
+            {
+                let _ = meta.insert("root", encoded.as_slice());
+            }
+            write.commit().map_err(crate::store_error)?;
+            Ok(())
+        });
+    }
+
+    fn remove_session_index_entry(&self, session_id: &str) {
+        if !self.index_path.exists() {
+            return;
+        }
+        let _ = self.with_index_db(|database| {
+            let write = database.begin_write().map_err(crate::store_error)?;
+            if let Ok(mut table) = write.open_table(SESSION_INDEX_METADATA) {
+                let _ = table.remove(session_id);
+            }
+            write.commit().map_err(crate::store_error)?;
+            Ok(())
+        });
     }
 
     /// Start a fresh session.
@@ -488,6 +704,25 @@ impl SessionStore {
     }
 
     pub fn list(&self, query: &SessionQuery) -> Result<Vec<SessionMetadata>> {
+        if let Some(indexed) = self.list_from_session_index(query)? {
+            return Ok(indexed);
+        }
+        let all_sessions = self.scan_session_metadata(true)?;
+        self.rebuild_session_index(&all_sessions);
+        let mut sessions = all_sessions
+            .into_iter()
+            .filter(|metadata| {
+                (query.include_archived
+                    || matches!(query.status, Some(SessionStatus::Archived))
+                    || !matches!(metadata.status, SessionStatus::Archived))
+                    && query.matches(metadata)
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.started_at_ms));
+        Ok(sessions)
+    }
+
+    fn scan_session_metadata(&self, include_archived: bool) -> Result<Vec<SessionMetadata>> {
         let mut sessions = Vec::new();
         if !self.root.exists() {
             return Ok(sessions);
@@ -509,11 +744,9 @@ impl SessionStore {
             let Ok(metadata) = deserialize_session_metadata(&text) else {
                 continue;
             };
-            if query.matches(&metadata) {
-                sessions.push(metadata);
-            }
+            sessions.push(metadata);
         }
-        if query.include_archived || matches!(query.status, Some(SessionStatus::Archived)) {
+        if include_archived {
             let archived_root = self.root.join(ARCHIVED_SUBDIR);
             if archived_root.exists() {
                 for entry in fs::read_dir(&archived_root)? {
@@ -528,14 +761,173 @@ impl SessionStore {
                     let Ok(metadata) = deserialize_session_metadata(&text) else {
                         continue;
                     };
-                    if query.matches(&metadata) {
-                        sessions.push(metadata);
-                    }
+                    sessions.push(metadata);
                 }
             }
         }
-        sessions.sort_by_key(|session| std::cmp::Reverse(session.started_at_ms));
         Ok(sessions)
+    }
+
+    fn list_from_session_index(
+        &self,
+        query: &SessionQuery,
+    ) -> Result<Option<Vec<SessionMetadata>>> {
+        if !self.index_path.exists() {
+            return Ok(None);
+        }
+        let root_str = self.root.display().to_string();
+        let records = match self.with_index_db(|database| {
+            let Some(index_root) = session_index_root(database).ok().flatten() else {
+                return Ok(None);
+            };
+            if index_root != root_str {
+                return Ok(None);
+            }
+            session_index_records(database).map(Some)
+        }) {
+            Ok(Some(records)) => records,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        if !self.session_index_matches_filesystem(&records)? {
+            return Ok(None);
+        }
+        let mut sessions = records
+            .into_iter()
+            .map(|record| record.metadata)
+            .filter(|metadata| {
+                (query.include_archived
+                    || matches!(query.status, Some(SessionStatus::Archived))
+                    || !matches!(metadata.status, SessionStatus::Archived))
+                    && query.matches(metadata)
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.started_at_ms));
+        Ok(Some(sessions))
+    }
+
+    fn session_index_matches_filesystem(&self, records: &[SessionIndexRecord]) -> Result<bool> {
+        // Cheap count check first: if the number of session directories has changed
+        // (e.g. a new session was created by another process or a session was deleted)
+        // we can bail out before paying the per-file metadata syscall for every entry.
+        let live_count = count_session_dirs(&self.root)?;
+        let archived_root = self.root.join(ARCHIVED_SUBDIR);
+        let archived_count = if archived_root.exists() {
+            count_session_dirs(&archived_root)?
+        } else {
+            0
+        };
+        if live_count + archived_count != records.len() {
+            return Ok(false);
+        }
+        // Counts match — do the full per-file mtime check.
+        let actual = self.scan_session_metadata_fingerprints()?;
+        for record in records {
+            if actual
+                .get(&record.metadata.session_id)
+                .is_none_or(|fingerprint| *fingerprint != record.modified_unix_nanos)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn scan_session_metadata_fingerprints(&self) -> Result<HashMap<String, u128>> {
+        let mut out = HashMap::new();
+        if !self.root.exists() {
+            return Ok(out);
+        }
+        self.collect_metadata_fingerprints_from(&self.root, &mut out)?;
+        let archived_root = self.root.join(ARCHIVED_SUBDIR);
+        if archived_root.exists() {
+            self.collect_metadata_fingerprints_from(&archived_root, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    fn collect_metadata_fingerprints_from(
+        &self,
+        root: &Path,
+        out: &mut HashMap<String, u128>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if entry.file_name() == ARCHIVED_SUBDIR {
+                continue;
+            }
+            let path = entry.path().join("metadata.json");
+            let Some(session_id) = entry.file_name().to_str().map(ToString::to_string) else {
+                continue;
+            };
+            let Some(modified_unix_nanos) = session_metadata_modified_unix_nanos(&path) else {
+                continue;
+            };
+            out.insert(session_id, modified_unix_nanos);
+        }
+        Ok(())
+    }
+
+    fn rebuild_session_index(&self, sessions: &[SessionMetadata]) {
+        // Skip sessions whose metadata.json mtime is unreadable for the same
+        // reason `upsert_session_index` does: storing `0` as the fingerprint
+        // would be immediately invalidated by `scan_session_metadata_fingerprints`
+        // (which itself returns `None` for unreadable-mtime entries), forcing a
+        // benign-but-wasteful infinite rebuild loop on every `list()` call until
+        // the OS surfaces a real mtime.
+        let records: Vec<SessionIndexRecord> = sessions
+            .iter()
+            .filter_map(|metadata| {
+                let path = self.metadata_path_for(metadata);
+                let modified_unix_nanos = session_metadata_modified_unix_nanos(&path)?;
+                Some(SessionIndexRecord {
+                    metadata: metadata.clone(),
+                    modified_unix_nanos,
+                })
+            })
+            .collect();
+        let root_str = self.root.display().to_string();
+        let _ = self.with_index_db(|database| {
+            let write = database.begin_write().map_err(crate::store_error)?;
+            if let Ok(mut metadata_table) = write.open_table(SESSION_INDEX_METADATA) {
+                let keys = metadata_table
+                    .iter()
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| entry.ok().map(|(key, _)| key.value().to_string()))
+                    .collect::<Vec<_>>();
+                for key in keys {
+                    let _ = metadata_table.remove(key.as_str());
+                }
+                for record in &records {
+                    if let Ok(encoded) = crate::encode(record) {
+                        let _ = metadata_table
+                            .insert(record.metadata.session_id.as_str(), encoded.as_slice());
+                    }
+                }
+            }
+            if let Ok(mut meta) = write.open_table(SESSION_INDEX_META)
+                && let Ok(encoded) = crate::encode(&root_str)
+            {
+                let _ = meta.insert("root", encoded.as_slice());
+            }
+            write.commit().map_err(crate::store_error)?;
+            Ok(())
+        });
+    }
+
+    fn metadata_path_for(&self, metadata: &SessionMetadata) -> PathBuf {
+        if matches!(metadata.status, SessionStatus::Archived) {
+            self.root
+                .join(ARCHIVED_SUBDIR)
+                .join(&metadata.session_id)
+                .join("metadata.json")
+        } else {
+            self.session_dir(&metadata.session_id).join("metadata.json")
+        }
     }
 
     /// Move a session out of the live root into `archived/<id>/` and flip
@@ -560,7 +952,7 @@ impl SessionStore {
                 dest.display()
             )));
         }
-        fs::rename(&src, &dest)?;
+        fs_util::move_path(&src, &dest)?;
         let metadata_path = dest.join("metadata.json");
         if let Ok(text) = fs::read_to_string(&metadata_path)
             && let Ok(mut metadata) = deserialize_session_metadata(&text)
@@ -571,7 +963,7 @@ impl SessionStore {
             if metadata.ended_at_ms.is_none() {
                 metadata.ended_at_ms = Some(stamp);
             }
-            let _ = write_json(&metadata_path, &metadata);
+            let _ = self.write_metadata_file(&dest, &metadata);
             Self::record_global_index(&metadata);
         }
         Ok(())
@@ -593,14 +985,14 @@ impl SessionStore {
                 dest.display()
             )));
         }
-        fs::rename(&src, &dest)?;
+        fs_util::move_path(&src, &dest)?;
         let metadata_path = dest.join("metadata.json");
         if let Ok(text) = fs::read_to_string(&metadata_path)
             && let Ok(mut metadata) = deserialize_session_metadata(&text)
         {
             metadata.status = SessionStatus::Completed;
             metadata.archived_at_ms = None;
-            let _ = write_json(&metadata_path, &metadata);
+            let _ = self.write_metadata_file(&dest, &metadata);
             Self::record_global_index(&metadata);
         }
         Ok(())
@@ -810,8 +1202,9 @@ impl SessionStore {
                 if force_remove {
                     let dir = self.root.join(ARCHIVED_SUBDIR).join(&metadata.session_id);
                     if dir.exists() {
-                        fs::remove_dir_all(&dir)?;
+                        fs::remove_dir_all(&dir).map_err(|e| enrich_lock_error(e, &dir))?;
                     }
+                    self.remove_session_index_entry(&metadata.session_id);
                     removed.push(metadata.session_id);
                     continue;
                 }
@@ -832,8 +1225,9 @@ impl SessionStore {
                 if archived_at < archive_cutoff {
                     let dir = self.root.join(ARCHIVED_SUBDIR).join(&metadata.session_id);
                     if dir.exists() {
-                        fs::remove_dir_all(&dir)?;
+                        fs::remove_dir_all(&dir).map_err(|e| enrich_lock_error(e, &dir))?;
                     }
+                    self.remove_session_index_entry(&metadata.session_id);
                     removed.push(metadata.session_id);
                 }
                 continue;
@@ -863,8 +1257,9 @@ impl SessionStore {
                     CleanupMode::Purge => {
                         let dir = self.session_dir(&metadata.session_id);
                         if dir.exists() {
-                            fs::remove_dir_all(&dir)?;
+                            fs::remove_dir_all(&dir).map_err(|e| enrich_lock_error(e, &dir))?;
                         }
+                        self.remove_session_index_entry(&metadata.session_id);
                         removed.push(metadata.session_id);
                     }
                 }
@@ -1065,8 +1460,16 @@ struct SessionLogAppend {
 
 enum SessionLogCmd {
     Append(SessionLogAppend),
-    Flush { ack: mpsc::Sender<Result<()>> },
-    Shutdown { ack: mpsc::Sender<Result<()>> },
+    /// Route `replay.jsonl` writes through the same queued writer as
+    /// `events.jsonl` so concurrent replay appends serialise their I/O
+    /// and avoid per-write open/close churn on Windows.
+    AppendReplay(SessionLogAppend),
+    Flush {
+        ack: mpsc::Sender<Result<()>>,
+    },
+    Shutdown {
+        ack: mpsc::Sender<Result<()>>,
+    },
 }
 
 #[derive(Debug)]
@@ -1097,6 +1500,14 @@ impl SessionLogWriter {
         self.check_failure()?;
         self.tx
             .send(SessionLogCmd::Append(append))
+            .map_err(|_| SqueezyError::Agent("session log writer stopped".to_string()))?;
+        self.check_failure()
+    }
+
+    fn append_replay(&self, append: SessionLogAppend) -> Result<()> {
+        self.check_failure()?;
+        self.tx
+            .send(SessionLogCmd::AppendReplay(append))
             .map_err(|_| SqueezyError::Agent("session log writer stopped".to_string()))?;
         self.check_failure()
     }
@@ -1158,8 +1569,12 @@ fn run_session_log_writer(
 ) {
     let path = dir.join("events.jsonl");
     let mut current_size = fs::metadata(&path).map_or(0, |metadata| metadata.len() as usize);
+    let replay_path = dir.join("replay.jsonl");
+    let mut replay_current_size =
+        fs::metadata(&replay_path).map_or(0, |metadata| metadata.len() as usize);
     let mut terminal_failure: Option<String> = None;
     let mut truncated = false;
+    let mut replay_truncated = false;
     for command in rx {
         match command {
             SessionLogCmd::Append(append) => {
@@ -1181,10 +1596,61 @@ fn run_session_log_writer(
                     terminal_failure = Some(message);
                 }
             }
+            SessionLogCmd::AppendReplay(append) => {
+                if terminal_failure.is_some() {
+                    continue;
+                }
+                if let Err(error) = write_replay_log_append(
+                    &store,
+                    &dir,
+                    &replay_path,
+                    &mut replay_current_size,
+                    &mut replay_truncated,
+                    append,
+                ) {
+                    let message = error.to_string();
+                    if let Some(writer) = writer.upgrade() {
+                        writer.record_failure(&message);
+                    }
+                    terminal_failure = Some(message);
+                }
+            }
             SessionLogCmd::Flush { ack } => {
+                if terminal_failure.is_none()
+                    && matches!(
+                        store.durability,
+                        CacheDurability::Turn | CacheDurability::Strict
+                    )
+                    && let Err(error) = sync_file_if_exists(&path)
+                        .and_then(|()| sync_parent_dir(&path))
+                        .and_then(|()| sync_file_if_exists(&replay_path))
+                        .and_then(|()| sync_parent_dir(&replay_path))
+                {
+                    let message = error.to_string();
+                    if let Some(writer) = writer.upgrade() {
+                        writer.record_failure(&message);
+                    }
+                    terminal_failure = Some(message);
+                }
                 let _ = ack.send(session_log_writer_result(terminal_failure.as_deref()));
             }
             SessionLogCmd::Shutdown { ack } => {
+                if terminal_failure.is_none()
+                    && matches!(
+                        store.durability,
+                        CacheDurability::Turn | CacheDurability::Strict
+                    )
+                    && let Err(error) = sync_file_if_exists(&path)
+                        .and_then(|()| sync_parent_dir(&path))
+                        .and_then(|()| sync_file_if_exists(&replay_path))
+                        .and_then(|()| sync_parent_dir(&replay_path))
+                {
+                    let message = error.to_string();
+                    if let Some(writer) = writer.upgrade() {
+                        writer.record_failure(&message);
+                    }
+                    terminal_failure = Some(message);
+                }
                 let _ = ack.send(session_log_writer_result(terminal_failure.as_deref()));
                 break;
             }
@@ -1214,7 +1680,7 @@ fn write_session_log_append(
         // branch and rewrite byte-identical metadata.json for the rest of the
         // session.
         if !*truncated {
-            update_metadata_file(dir, |metadata| {
+            update_metadata_file(store, dir, |metadata| {
                 metadata.status = SessionStatus::Truncated;
                 metadata.resume_available = false;
                 metadata.resume_unavailable_reason =
@@ -1225,6 +1691,43 @@ fn write_session_log_append(
         return Ok(());
     }
     append_payload_with_recovery(path, &append.payload, current_size)?;
+    if store.durability == CacheDurability::Strict {
+        sync_file_if_exists(path)?;
+        sync_parent_dir(path)?;
+    }
+    Ok(())
+}
+
+/// Writer-thread handler for `replay.jsonl` appends. Mirrors
+/// `write_session_log_append` but targets the replay file and uses the
+/// "replay trace exceeded" reason string on truncation, matching the
+/// message emitted by the old direct-write path.
+fn write_replay_log_append(
+    store: &SessionStore,
+    dir: &Path,
+    replay_path: &Path,
+    replay_current_size: &mut usize,
+    replay_truncated: &mut bool,
+    append: SessionLogAppend,
+) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    if replay_current_size.saturating_add(append.payload.len()) > store.max_session_bytes {
+        if !*replay_truncated {
+            update_metadata_file(store, dir, |metadata| {
+                metadata.status = SessionStatus::Truncated;
+                metadata.resume_available = false;
+                metadata.resume_unavailable_reason =
+                    Some("replay trace exceeded max_session_bytes".to_string());
+            })?;
+            *replay_truncated = true;
+        }
+        return Ok(());
+    }
+    append_payload_with_recovery(replay_path, &append.payload, replay_current_size)?;
+    if store.durability == CacheDurability::Strict {
+        sync_file_if_exists(replay_path)?;
+        sync_parent_dir(replay_path)?;
+    }
     Ok(())
 }
 
@@ -1261,33 +1764,78 @@ fn append_payload_once(
     path: &Path,
     payload: &[u8],
 ) -> std::result::Result<usize, (usize, std::io::Error)> {
+    let lock = lock_append_path(path).map_err(|error| (0, error))?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|error| (0, error))?;
     let mut written = 0;
-    while written < payload.len() {
-        match file.write(&payload[written..]) {
-            Ok(0) => {
-                return Err((
-                    written,
-                    std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write event"),
-                ));
+    let result = (|| {
+        while written < payload.len() {
+            match file.write(&payload[written..]) {
+                Ok(0) => {
+                    return Err((
+                        written,
+                        std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write event"),
+                    ));
+                }
+                Ok(bytes) => written += bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err((written, error)),
             }
-            Ok(bytes) => written += bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err((written, error)),
         }
-    }
-    Ok(written)
+        Ok(written)
+    })();
+    // Unlock best-effort; the OS releases the lock when `lock` drops regardless.
+    let _ = lock.unlock();
+    result
 }
 
-fn update_metadata_file(dir: &Path, update: impl FnOnce(&mut SessionMetadata)) -> Result<()> {
+fn sync_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match fs::File::open(path) {
+        Ok(file) => file.sync_all(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn update_metadata_file(
+    store: &SessionStore,
+    dir: &Path,
+    update: impl FnOnce(&mut SessionMetadata),
+) -> Result<()> {
     let path = dir.join("metadata.json");
     let mut metadata = read_session_metadata(&path)?;
     update(&mut metadata);
-    write_json(&path, &metadata)
+    store.write_metadata_file(dir, &metadata)
+}
+
+fn lock_append_path(path: &Path) -> std::io::Result<fs::File> {
+    let lock_path = append_lock_path(path);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // `truncate(false)` is the `OpenOptions` default, but clippy's
+    // `suspicious_open_options` lint requires an explicit choice when
+    // `create(true).write(true)` is set so a reader of the call site does
+    // not have to remember which side of the default the call falls on.
+    // Lock files are zero-byte sentinels; preserving any contents is fine.
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)?;
+    lock.lock_exclusive()?;
+    Ok(lock)
+}
+
+fn append_lock_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("append");
+    path.with_file_name(format!(".{name}.lock"))
 }
 
 impl SessionHandle {
@@ -1331,7 +1879,7 @@ impl SessionHandle {
         }
         let mut metadata = self.metadata()?;
         update(&mut metadata);
-        write_json(&self.dir().join("metadata.json"), &metadata)
+        self.store.write_metadata_file(&self.dir(), &metadata)
     }
 
     /// Like [`Self::update_metadata`] but also refreshes the
@@ -1368,7 +1916,16 @@ impl SessionHandle {
                 InnerState::Transitioning => unreachable!(),
             }
         };
-        writer.flush()
+        writer.flush()?;
+        if matches!(
+            self.store.durability,
+            CacheDurability::Turn | CacheDurability::Strict
+        ) {
+            let replay_path = self.dir().join("replay.jsonl");
+            sync_file_if_exists(&replay_path)?;
+            sync_parent_dir(&replay_path)?;
+        }
+        Ok(())
     }
 
     /// Promote a pending session to the live form: create the session
@@ -1406,7 +1963,7 @@ impl SessionHandle {
         let dir = self.store.session_dir(&self.session_id);
         let prepare = || -> Result<()> {
             fs::create_dir_all(&dir)?;
-            write_json(&dir.join("metadata.json"), &pending.metadata)?;
+            self.store.write_metadata_file(&dir, &pending.metadata)?;
             write_json(
                 &dir.join("resume_state.json"),
                 &SessionResumeState {
@@ -1542,10 +2099,7 @@ impl SessionHandle {
         // Replay events describe model interaction; they are always
         // substantive enough to promote a pending session to live so
         // the events.jsonl + replay.jsonl pair stays consistent.
-        let _ = self.ensure_live()?;
-        let dir = self.dir();
-        fs::create_dir_all(&dir)?;
-        let path = dir.join("replay.jsonl");
+        let writer = self.ensure_live()?;
         event.sequence = self.counters.replay_count.fetch_add(1, Ordering::Relaxed) + 1;
         let mut payload = to_json_vec(&event)?;
         if payload.len() > self.store.max_event_bytes {
@@ -1558,21 +2112,9 @@ impl SessionHandle {
             payload = to_json_vec(&event)?;
         }
         payload.push(b'\n');
-
-        let current_size = fs::metadata(&path).map_or(0, |metadata| metadata.len() as usize);
-        if current_size.saturating_add(payload.len()) > self.store.max_session_bytes {
-            self.update_metadata(|metadata| {
-                metadata.status = SessionStatus::Truncated;
-                metadata.resume_available = false;
-                metadata.resume_unavailable_reason =
-                    Some("replay trace exceeded max_session_bytes".to_string());
-            })?;
-            return Ok(());
-        }
-
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        file.write_all(&payload)?;
-        Ok(())
+        // Route through the same per-session writer thread as events.jsonl
+        // to serialise I/O and avoid per-write open/close churn on Windows.
+        writer.append_replay(SessionLogAppend { payload })
     }
 
     pub fn write_resume_state(&self, state: &SessionResumeState) -> Result<()> {
@@ -1801,6 +2343,22 @@ pub struct GlobalSessionIndexEntry {
     #[serde(default)]
     pub turn_count: u64,
     pub resume_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionIndexDiagnostics {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub indexed_sessions: usize,
+    pub schema_version: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionIndexRecord {
+    metadata: SessionMetadata,
+    modified_unix_nanos: u128,
 }
 
 impl GlobalSessionIndexEntry {
@@ -2669,13 +3227,15 @@ impl SessionQuery {
         }
         if let Some(query) = &self.query {
             let haystack = format!(
-                "{}\n{}\n{}\n{}\n{}\n{}",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
                 metadata.session_id,
                 metadata.cwd,
                 metadata.workspace_root,
                 metadata.repo_root.as_deref().unwrap_or(""),
                 metadata.first_user_task.as_deref().unwrap_or(""),
-                metadata.latest_summary.as_deref().unwrap_or("")
+                metadata.latest_summary.as_deref().unwrap_or(""),
+                metadata.display_name.as_deref().unwrap_or(""),
+                metadata.labels.join("\n")
             )
             .to_ascii_lowercase();
             return haystack.contains(&query.to_ascii_lowercase());
@@ -2777,22 +3337,114 @@ pub enum CleanupMode {
     Purge,
 }
 
-fn session_root(config: &AppConfig) -> PathBuf {
-    if let Some(path) = &config.session_logs.log_dir {
-        return resolve_workspace_path(&config.workspace_root, path);
+fn open_session_index(path: &Path) -> Result<Database> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
-    if let Some(root) = &config.cache.root {
-        return resolve_workspace_path(&config.workspace_root, root).join("sessions");
+    let initial = Database::create(path).map_err(crate::store_error)?;
+    match session_index_schema_version(&initial)? {
+        Some(SESSION_INDEX_SCHEMA_VERSION) => Ok(initial),
+        Some(on_disk_version) => {
+            drop(initial);
+            let backup = path.with_file_name(format!(
+                "session-index-schema-{on_disk_version}-{}.redb.bak",
+                now_ms()
+            ));
+            fs::rename(path, backup)?;
+            let database = Database::create(path).map_err(crate::store_error)?;
+            initialize_session_index(&database)?;
+            Ok(database)
+        }
+        None => {
+            initialize_session_index(&initial)?;
+            Ok(initial)
+        }
     }
-    config.workspace_root.join(".squeezy").join("sessions")
 }
 
-fn resolve_workspace_path(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
+fn initialize_session_index(database: &Database) -> Result<()> {
+    let write = database.begin_write().map_err(crate::store_error)?;
+    {
+        let mut meta = write
+            .open_table(SESSION_INDEX_META)
+            .map_err(crate::store_error)?;
+        let encoded = crate::encode(&SESSION_INDEX_SCHEMA_VERSION)?;
+        meta.insert("schema_version", encoded.as_slice())
+            .map_err(crate::store_error)?;
     }
+    write.commit().map_err(crate::store_error)
+}
+
+fn session_index_schema_version(database: &Database) -> Result<Option<u64>> {
+    let read = database.begin_read().map_err(crate::store_error)?;
+    let table = match read.open_table(SESSION_INDEX_META) {
+        Ok(table) => table,
+        Err(_) => return Ok(None),
+    };
+    read_session_index_json(&table, "schema_version")
+}
+
+fn session_index_root(database: &Database) -> Result<Option<String>> {
+    let read = database.begin_read().map_err(crate::store_error)?;
+    let table = match read.open_table(SESSION_INDEX_META) {
+        Ok(table) => table,
+        Err(_) => return Ok(None),
+    };
+    read_session_index_json(&table, "root")
+}
+
+fn session_index_records(database: &Database) -> Result<Vec<SessionIndexRecord>> {
+    let read = database.begin_read().map_err(crate::store_error)?;
+    let table = match read.open_table(SESSION_INDEX_METADATA) {
+        Ok(table) => table,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for entry in table.iter().map_err(crate::store_error)? {
+        let (_, value) = entry.map_err(crate::store_error)?;
+        out.push(crate::decode(value.value())?);
+    }
+    Ok(out)
+}
+
+fn count_session_dirs(root: &Path) -> Result<usize> {
+    if !root.exists() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && entry.file_name() != ARCHIVED_SUBDIR {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn session_metadata_modified_unix_nanos(path: &Path) -> Option<u128> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|ts| ts.as_nanos())
+}
+
+fn read_session_index_json<T: DeserializeOwned>(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+) -> Result<Option<T>> {
+    let Some(value) = table.get(key).map_err(crate::store_error)? else {
+        return Ok(None);
+    };
+    crate::decode(value.value()).map(Some)
+}
+
+fn session_root(config: &AppConfig) -> PathBuf {
+    session_dir_path(
+        &config.workspace_root,
+        config.cache.root.as_deref(),
+        config.session_logs.log_dir.as_deref(),
+    )
 }
 
 /// Return whether the file at `path` ends with a `\n` byte. Used by the
@@ -2812,45 +3464,29 @@ fn memory_file_ends_with_newline(path: &Path) -> Result<bool> {
 }
 
 /// Serialize `value` to `path` atomically: write to a sibling temp file,
-/// `sync_all`, then `fs::rename` over the target. A reader (and a crash)
-/// therefore only ever observes the previous complete file or the new
-/// complete file, never a truncated/torn one. This matters because
-/// `metadata.json` is rewritten on essentially every turn; a non-atomic
-/// in-place write left a torn metadata file that silently hid an
-/// otherwise-recoverable session from `list()`/`resume()`. Mirrors the
-/// tmp + `sync_all` + `rename` pattern in [`rewrite_global_index`].
+/// `sync_all`, `fs::rename` over the target, then fsync the parent
+/// directory. A reader (and a Linux crash) therefore only ever observes the
+/// previous complete file or the new complete file, never a truncated/torn
+/// one or an unsynced directory entry. This matters because `metadata.json`
+/// is rewritten on essentially every turn; a non-atomic in-place write left a
+/// torn metadata file that silently hid an otherwise-recoverable session from
+/// `list()`/`resume()`.
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let bytes = serde_json::to_vec_pretty(value).map_err(json_error)?;
-    // Per-pid temp name so concurrent writers to the same path don't
-    // clobber each other's in-flight temp file before the rename.
-    let tmp = match path.file_name().and_then(|name| name.to_str()) {
-        Some(name) => path.with_file_name(format!(".{}.{}.tmp", name, std::process::id())),
-        None => path.with_extension("tmp"),
-    };
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
-    if let Err(error) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(error.into());
-    }
+    write_json_bytes(path, &bytes)
+}
+
+/// Write `bytes` to `path` atomically through the shared tmp + rename helper.
+fn write_json_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_replace(path, bytes)?;
     Ok(())
 }
 
 /// Heuristic guard for [`SessionStore::record_global_index`].
 ///
 /// Returns `true` only when the workspace_root resolves under the system
-/// temp directory AND `HOME` does not. That combination is overwhelmingly
-/// a `cargo test` setup that created its session store via
+/// temp directory AND the user-global Squeezy directory does not. That
+/// combination is overwhelmingly a `cargo test` setup that created its session store via
 /// `temp_root(..)` but never redirected `HOME` to a test sandbox — i.e.
 /// the test is not exercising the global index and a write would pollute
 /// the developer's real `~/.squeezy/sessions/index.jsonl`.
@@ -2871,11 +3507,23 @@ fn skip_global_index_for_test_workspace(workspace_root: &str) -> bool {
     if !workspace_under_temp {
         return false;
     }
-    let home_under_temp = env::var_os("HOME")
+    // Check the active global index destination plus the legacy HOME path:
+    // if either resolves under temp, the destination is already sandboxed and
+    // the guard must not fire.
+    let active_global_under_temp = xdg_global_index_path()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .and_then(|path| path.canonicalize().ok())
+        .map(|canonical| canonical.starts_with(&temp_dir))
+        .unwrap_or(false);
+    let legacy_under_temp = env::var_os("HOME")
         .and_then(|home| Path::new(&home).canonicalize().ok())
         .map(|canonical| canonical.starts_with(&temp_dir))
         .unwrap_or(false);
-    !home_under_temp
+    let user_global_under_temp = fs_util::user_squeezy_dir()
+        .and_then(|path| path.canonicalize().ok())
+        .map(|canonical| canonical.starts_with(&temp_dir))
+        .unwrap_or(false);
+    !(active_global_under_temp || legacy_under_temp || user_global_under_temp)
 }
 
 fn global_index_cache() -> &'static StdMutex<Option<GlobalIndexCache>> {
@@ -2919,36 +3567,154 @@ fn cache_global_index(path: &Path, entries: &[GlobalSessionIndexEntry]) {
 }
 
 /// Replace the global session index file with the supplied entries via a
-/// tmp + rename so concurrent readers never see a half-written file. The
-/// caller chooses the iteration order; readers re-sort by
-/// `started_at_ms`.
+/// unique tmp + replace so concurrent readers never see a half-written
+/// file. The caller chooses the iteration order; readers re-sort by
+/// `started_at_ms`. Dedup + cap goes through
+/// [`compact_global_index_entries`] so the policy stays in lock-step with
+/// the reader path in `list_global_index`.
 fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
+    let mut bytes = Vec::new();
+    for entry in entries {
+        let mut payload = match serde_json::to_vec(entry) {
+            Ok(payload) => payload,
+            Err(_) => continue,
+        };
+        payload.push(b'\n');
+        bytes.extend_from_slice(&payload);
+    }
+    atomic_replace(path, &bytes)
+}
+
+/// Run `action` while holding an exclusive advisory `flock(2)` on a sibling
+/// lock file. The lock file is named `.{name}.compact.lock` and lives next
+/// to the data file; it is created on first use and intentionally left in
+/// place across runs (size 0) so concurrent processes can re-acquire the
+/// same OS-visible advisory lock without racing on the file's creation.
+fn with_global_index_lock<T>(
+    path: &Path,
+    action: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let lock = global_index_lock_path(path);
+    if let Some(parent) = lock.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("jsonl.tmp");
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        for entry in entries {
-            let mut payload = match serde_json::to_vec(entry) {
-                Ok(payload) => payload,
-                Err(_) => continue,
-            };
-            payload.push(b'\n');
-            file.write_all(&payload)?;
-        }
-        file.sync_all()?;
+    let lock_file = acquire_global_index_lock(&lock)?;
+    let result = action();
+    let unlock_result = lock_file.unlock();
+    match (result, unlock_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) => Err(error),
     }
-    fs::rename(&tmp, path)
+}
+
+fn log_global_index_lock_failure(path: &Path, operation: &str, error: &std::io::Error) {
+    tracing::debug!(
+        target: "squeezy::store",
+        path = %path.display(),
+        operation,
+        error = %error,
+        "global index lock unavailable after retry",
+    );
+}
+
+fn global_index_lock_path(path: &Path) -> PathBuf {
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => path.with_file_name(format!(".{name}.compact.lock")),
+        None => path.with_extension("lock"),
+    }
+}
+
+fn acquire_global_index_lock(path: &Path) -> std::io::Result<fs::File> {
+    let mut last_error = None;
+    for _ in 0..100 {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(file),
+            Err(error) if is_lock_contention(&error) => {
+                last_error = Some(error);
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| std::io::Error::other("global index lock unavailable")))
+}
+
+fn is_lock_contention(error: &std::io::Error) -> bool {
+    let contended = fs2::lock_contended_error();
+    error.kind() == contended.kind() || error.raw_os_error() == contended.raw_os_error()
+}
+
+/// Apply the dedup-by-`session_id` (keep the entry with the largest
+/// `last_event_at_ms`) and the `GLOBAL_INDEX_MAX_ENTRIES` cap to
+/// `entries`. Returns the compacted set sorted newest-first by
+/// `last_event_at_ms`; callers that need a different iteration order
+/// (e.g. oldest-first for on-disk layout) re-sort the returned vector.
+fn compact_global_index_entries(
+    entries: impl IntoIterator<Item = GlobalSessionIndexEntry>,
+) -> Vec<GlobalSessionIndexEntry> {
+    let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
+    for entry in entries {
+        match by_id.get(&entry.session_id) {
+            Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => continue,
+            _ => {
+                by_id.insert(entry.session_id.clone(), entry);
+            }
+        }
+    }
+    let mut compacted: Vec<GlobalSessionIndexEntry> = by_id.into_values().collect();
+    compacted.sort_by_key(|entry| std::cmp::Reverse(entry.last_event_at_ms));
+    compacted.truncate(GLOBAL_INDEX_MAX_ENTRIES);
+    compacted
+}
+
+fn read_global_index_entries(path: &Path) -> std::io::Result<Vec<GlobalSessionIndexEntry>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut entries = Vec::new();
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(trimmed) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let text = fs::read_to_string(path)?;
     serde_json::from_str(&text).map_err(json_error)
+}
+
+fn calibration_load_error_kind(error: &SqueezyError) -> &'static str {
+    match error {
+        SqueezyError::Io(error) => match error.kind() {
+            std::io::ErrorKind::PermissionDenied => "permission denied",
+            _ => "I/O error",
+        },
+        SqueezyError::Tool(_) => "malformed JSON",
+        _ => "unexpected error",
+    }
 }
 
 /// Serde default for [`SessionMetadata::schema_version`]. Returns 0 — the
@@ -3335,7 +4101,8 @@ fn now_ms() -> u64 {
 
 fn next_session_id() -> String {
     let counter = NEXT_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{}-{counter}", now_ms(), std::process::id())
+    let nonce = random_nonce_hex();
+    format!("{}-{}-{counter}-{nonce}", now_ms(), std::process::id())
 }
 
 fn contains_if_set(value: &str, needle: &Option<String>) -> bool {
@@ -3406,6 +4173,110 @@ fn serialize_event_payload(event: &SessionEvent, max_event_bytes: usize) -> Resu
 fn json_error(error: serde_json::Error) -> SqueezyError {
     SqueezyError::Tool(format!("session store JSON error: {error}"))
 }
+
+/// Translate a filesystem error that occurred while renaming or removing
+/// session directory `dir` into a user-actionable message when the error
+/// looks like a Windows file-lock.  On non-Windows the original error is
+/// returned unchanged.
+fn enrich_lock_error(error: std::io::Error, dir: &Path) -> SqueezyError {
+    #[cfg(target_os = "windows")]
+    {
+        let is_lock = error.kind() == std::io::ErrorKind::PermissionDenied
+            || matches!(error.raw_os_error(), Some(32) | Some(33));
+        if is_lock {
+            return SqueezyError::Tool(format!(
+                "session files in {} appear to be in use (os error: {}). \
+                 Close any other Squeezy window, terminal preview, editor, \
+                 or antivirus scan that may have the session open, then retry.",
+                dir.display(),
+                error.raw_os_error().unwrap_or(-1)
+            ));
+        }
+    }
+    let _ = dir;
+    SqueezyError::Io(error)
+}
+
+/// Returns `true` when the two path strings refer to the same filesystem
+/// location.
+///
+/// On Windows, first tries [`std::fs::canonicalize`] to resolve
+/// drive-letter case, UNC prefixes, junctions, and short-path spellings.
+/// Falls back to a case-insensitive trimmed comparison when
+/// canonicalization is unavailable (the directory may not exist yet).
+///
+/// On non-Windows, trims trailing `/` and compares bytes directly;
+/// case-sensitivity is a filesystem property on those platforms so we
+/// stay conservative and do not lower-case.
+pub fn paths_same(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    paths_same_platform(a, b)
+}
+
+#[cfg(target_os = "windows")]
+fn paths_same_platform(a: &str, b: &str) -> bool {
+    // Try canonical form first: resolves drive-letter case, UNC, junctions,
+    // short/long path spellings.
+    let a_canon = Path::new(a).canonicalize().ok();
+    let b_canon = Path::new(b).canonicalize().ok();
+    if let (Some(ac), Some(bc)) = (a_canon, b_canon) {
+        return ac == bc;
+    }
+    // Canonicalization failed (path may not exist yet). Normalise
+    // separators (Windows accepts both `/` and `\`) and compare
+    // case-insensitively after trimming trailing separators.
+    let norm = |s: &str| -> String {
+        s.trim_end_matches(['/', '\\'])
+            .replace('/', "\\")
+            .to_ascii_lowercase()
+    };
+    norm(a) == norm(b)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn paths_same_platform(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+/// Resolve the XDG-aware path for the global session index. When
+/// `XDG_STATE_HOME` is set to an absolute path it takes precedence (Linux XDG
+/// Base Dir Spec); otherwise falls back to the user-global Squeezy directory.
+fn xdg_global_index_path() -> Option<PathBuf> {
+    if let Some(xdg) = env::var_os("XDG_STATE_HOME") {
+        let path = PathBuf::from(xdg);
+        if path.is_absolute() {
+            return Some(path.join("squeezy").join("sessions").join("index.jsonl"));
+        }
+    }
+    Some(
+        fs_util::user_squeezy_dir()?
+            .join("sessions")
+            .join("index.jsonl"),
+    )
+}
+
+/// Generate 4 random bytes and encode them as an 8-character hex string.
+/// Falls back to a timestamp-derived value when the OS RNG is unavailable.
+fn random_nonce_hex() -> String {
+    use std::fmt::Write as _;
+    let mut buf = [0u8; 4];
+    if getrandom::fill(&mut buf).is_ok() {
+        let mut s = String::with_capacity(8);
+        for b in buf {
+            let _ = write!(s, "{b:02x}");
+        }
+        s
+    } else {
+        // Degenerate fallback: use the low bits of the current timestamp.
+        format!("{:08x}", now_ms() & 0xffff_ffff)
+    }
+}
+
+/// Threshold in milliseconds after which a `Running` session with no
+/// recent events is considered stale. Used to warn in session listing.
+pub const STALE_RUNNING_SESSION_THRESHOLD_MS: u64 = 24 * 60 * 60 * 1000;
 
 #[cfg(test)]
 #[path = "sessions_tests.rs"]

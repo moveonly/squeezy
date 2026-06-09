@@ -1,5 +1,6 @@
 //! On-disk DACL editing: add allow / deny-write / deny-read ACEs.
 
+use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
@@ -10,8 +11,9 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSID};
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_APPEND_DATA, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+    DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES,
+    FILE_WRITE_DATA, FILE_WRITE_EA,
 };
 
 use super::winutil::{OwnedSid, to_wide_path};
@@ -122,33 +124,122 @@ fn apply_ace(
     Ok(())
 }
 
-/// Grant `FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE`
-/// (inheritable) to `sid_str` on `path`.
+/// True for any entry whose attributes include `FILE_ATTRIBUTE_REPARSE_POINT`.
+///
+/// `std::fs::FileType::is_symlink` returns `false` for NTFS junctions
+/// (`mklink /J`), AppExec stubs, and OneDrive cloud reparse points: those
+/// surface as `is_dir() = true` to Rust even though following them takes us
+/// outside the workspace boundary. Granting capability ACEs through such an
+/// entry would be a sandbox escape, so the recursion must stop at every
+/// reparse point regardless of its specific tag.
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Grant read/write/execute/delete rights (inheritable) to `sid_str` on `path`.
+#[allow(dead_code)]
 pub(crate) fn add_allow_ace(path: &Path, sid_str: &str) -> crate::Result<()> {
-    let mask = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+    let mask =
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD;
     apply_ace(path, sid_str, mask, SET_ACCESS, true)
 }
 
-/// Add an inheritable deny ACE blocking all write operations.
+fn apply_ace_recursive(
+    path: &Path,
+    sid_str: &str,
+    access_mask: u32,
+    mode: ACCESS_MODE,
+) -> crate::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if is_reparse_point(&metadata) {
+        // Apply the ACE to the reparse point itself but never traverse into
+        // the target — the target may resolve to an arbitrary host path.
+        apply_ace(path, sid_str, access_mask, mode, false)?;
+        return Ok(());
+    }
+    apply_ace(
+        path,
+        sid_str,
+        access_mask,
+        mode,
+        metadata.file_type().is_dir(),
+    )?;
+
+    if !metadata.file_type().is_dir() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let child_metadata = entry.metadata()?;
+        if is_reparse_point(&child_metadata) {
+            continue;
+        }
+        apply_ace_recursive(&entry.path(), sid_str, access_mask, mode)?;
+    }
+    Ok(())
+}
+
+/// Grant read/write/execute on `path` and every existing non-symlink descendant.
+pub(crate) fn add_allow_ace_recursive(path: &Path, sid_str: &str) -> crate::Result<()> {
+    let mask =
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD;
+    apply_ace_recursive(path, sid_str, mask, SET_ACCESS)
+}
+
+/// Add an inheritable deny ACE blocking all write/delete operations.
 pub(crate) fn add_deny_write_ace(path: &Path, sid_str: &str) -> crate::Result<()> {
     let mask = FILE_GENERIC_WRITE
         | FILE_WRITE_DATA
         | FILE_APPEND_DATA
         | FILE_WRITE_EA
         | FILE_WRITE_ATTRIBUTES
-        | DELETE;
+        | DELETE
+        | FILE_DELETE_CHILD;
     apply_ace(path, sid_str, mask, DENY_ACCESS, true)
 }
 
+/// Add a deny-write ACE on `path` and every existing non-symlink descendant.
+pub(crate) fn add_deny_write_ace_recursive(path: &Path, sid_str: &str) -> crate::Result<()> {
+    let mask = FILE_GENERIC_WRITE
+        | FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | DELETE
+        | FILE_DELETE_CHILD;
+    apply_ace_recursive(path, sid_str, mask, DENY_ACCESS)
+}
+
+/// Add a deny ACE blocking writes to this object without inheriting to children.
+///
+/// The world-writable escape audit uses this for ancestor directories like
+/// `%TEMP%`: denying the directory object blocks new entries there without
+/// poisoning explicitly allowed writable roots beneath it through inheritance.
+pub(crate) fn add_deny_write_ace_no_inherit(path: &Path, sid_str: &str) -> crate::Result<()> {
+    let mask = FILE_GENERIC_WRITE
+        | FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | DELETE
+        | FILE_DELETE_CHILD;
+    apply_ace(path, sid_str, mask, DENY_ACCESS, false)
+}
+
 /// Add an inheritable deny ACE blocking all read operations.
+#[allow(dead_code)]
 pub(crate) fn add_deny_read_ace(path: &Path, sid_str: &str) -> crate::Result<()> {
     apply_ace(path, sid_str, FILE_GENERIC_READ, DENY_ACCESS, true)
 }
 
-/// Grant `FILE_GENERIC_READ | FILE_GENERIC_EXECUTE` (inheritable) to `sid_str`
-/// on `path`.  Used by the elevated tier to grant read-only access to
-/// `spec.read_roots`.
-pub(crate) fn add_allow_read_ace(path: &Path, sid_str: &str) -> crate::Result<()> {
+/// Add a deny-read ACE on `path` and every existing non-symlink descendant.
+pub(crate) fn add_deny_read_ace_recursive(path: &Path, sid_str: &str) -> crate::Result<()> {
+    apply_ace_recursive(path, sid_str, FILE_GENERIC_READ, DENY_ACCESS)
+}
+
+/// Grant read/execute on `path` and every existing non-symlink descendant.
+pub(crate) fn add_allow_read_ace_recursive(path: &Path, sid_str: &str) -> crate::Result<()> {
     let mask = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
-    apply_ace(path, sid_str, mask, SET_ACCESS, true)
+    apply_ace_recursive(path, sid_str, mask, SET_ACCESS)
 }

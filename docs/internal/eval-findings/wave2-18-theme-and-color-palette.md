@@ -70,7 +70,7 @@ flip the runtime palette on its own).
 - **Evidence:**
   `target/eval/wave2-18-theme-palette-openai-1780145642914/trace.jsonl`
   seq 7 records `status: "sent 12 keys · status=\"theme saved to
-  /Users/abbassabra/.squeezy/settings.toml\""`. After the run, the
+  $HOME/.squeezy/settings.toml\""`. After the run, the
   operator's real `~/.squeezy/settings.toml` contained
   `[tui] theme = "dark"` written by the harness.
 - **Why it matters:** every wave-2 scenario that drives `/theme`,

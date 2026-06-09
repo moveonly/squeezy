@@ -2,9 +2,10 @@
 //!
 //! A checkbox list of every [`StatusLineItem`], a "Use theme colors"
 //! toggle, an order-preserving reorder via Shift+↑/↓, a free-form
-//! search filter, and a live preview built with the same renderer the
-//! real status bar uses. Save persists the picker state to
-//! `[tui].status_line` + `[tui].status_line_use_colors` and applies the
+//! search filter, a Tab-toggled save scope (user vs project settings),
+//! and a live preview built with the same renderer the real status bar
+//! uses. Save persists the picker state to `[tui].status_line` +
+//! `[tui].status_line_use_colors` in the chosen scope and applies the
 //! change in-memory immediately.
 //!
 //! The view owns no app state of its own beyond what's needed to draw and
@@ -23,6 +24,33 @@ use ratatui::{
 use crate::TuiApp;
 use crate::status::{self, StatusLineAccent, StatusLineItem};
 
+/// Where the status-line configuration is persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveScope {
+    /// Write to the user-level settings file (`~/.squeezy/settings.toml`).
+    User,
+    /// Write to the project-level settings file (`squeezy.toml` in the
+    /// workspace root). Lets repo teams share a standard status-line layout
+    /// without requiring every contributor to hand-edit their user config.
+    Project,
+}
+
+impl SaveScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Project => "project",
+        }
+    }
+
+    fn toggle(self) -> Self {
+        match self {
+            Self::User => Self::Project,
+            Self::Project => Self::User,
+        }
+    }
+}
+
 /// Result of a key event on the picker — propagated up so the caller can
 /// close the overlay and (on Save) persist the configured values.
 #[derive(Debug, Clone)]
@@ -35,6 +63,7 @@ pub(crate) enum KeyOutcome {
     Save {
         items: Vec<StatusLineItem>,
         use_colors: bool,
+        scope: SaveScope,
     },
 }
 
@@ -50,6 +79,8 @@ pub(crate) struct StatusLineSetupState {
     cursor: usize,
     /// Free-form search filter typed by the user. Empty = show all.
     search: String,
+    /// Where to persist the configuration on save.
+    pub(crate) scope: SaveScope,
 }
 
 impl StatusLineSetupState {
@@ -79,6 +110,7 @@ impl StatusLineSetupState {
             use_colors,
             cursor: 0,
             search: String::new(),
+            scope: SaveScope::User,
         }
     }
 
@@ -167,7 +199,12 @@ impl StatusLineSetupState {
                 KeyOutcome::Save {
                     items,
                     use_colors: self.use_colors,
+                    scope: self.scope,
                 }
+            }
+            KeyCode::Tab => {
+                self.scope = self.scope.toggle();
+                KeyOutcome::Continue
             }
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.move_item(-1);
@@ -230,11 +267,15 @@ pub(crate) fn render(
     app: &TuiApp,
 ) {
     frame.render_widget(Clear, area);
+    // Surface the active save scope in the block title so a user who Tabs
+    // into project scope and presses Enter sees the destination tier at the
+    // moment of confirmation, not only in the bottom help row.
+    let title = format!(" Configure Status Line — save: {} ", state.scope.label());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(crate::render::theme::secondary()))
-        .title(" Configure Status Line ");
+        .title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -251,7 +292,7 @@ pub(crate) fn render(
     render_header(frame, chunks[0], state);
     render_list(frame, chunks[1], state);
     render_preview(frame, chunks[2], state, app);
-    render_help(frame, chunks[3]);
+    render_help(frame, chunks[3], state);
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, state: &StatusLineSetupState) {
@@ -339,9 +380,12 @@ fn render_preview(frame: &mut Frame<'_>, area: Rect, state: &StatusLineSetupStat
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn render_help(frame: &mut Frame<'_>, area: Rect) {
+fn render_help(frame: &mut Frame<'_>, area: Rect, state: &StatusLineSetupState) {
+    let scope_label = state.scope.label();
     let help = Line::from(Span::styled(
-        "↑/↓ move · Space toggle · Shift+↑/↓ reorder · type to filter · Enter save · Esc cancel",
+        format!(
+            "↑/↓ move · Space toggle · Shift+↑/↓ reorder · type to filter · Tab scope ({scope_label}) · Enter save · Esc cancel"
+        ),
         dim(),
     ));
     frame.render_widget(Paragraph::new(help), area);

@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.event.inputs.checkout_ref || github.ref }}
 
@@ -51,7 +51,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.event.inputs.checkout_ref || github.ref }}
 
@@ -78,7 +78,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ github.event.inputs.checkout_ref || github.ref }}
 
@@ -121,7 +121,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
           ref: ${{ github.event.inputs.checkout_ref || github.ref }}
@@ -189,17 +189,16 @@ jobs:
       - name: Test Rust
         shell: bash
         run: |
+          # Deepest async agent/harness tests overflow the default ~2 MiB
+          # libtest thread stack on every platform; nextest forwards this env
+          # to each test process.
+          export RUST_MIN_STACK=16777216
           if [[ "${{ matrix.platform }}" == "linux" ]]; then
             export CC_x86_64_unknown_linux_musl=musl-gcc
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
             scripts/test_clean_env.sh --workspace --all-targets --profile ci --target x86_64-unknown-linux-musl
           elif [[ "${{ matrix.platform }}" == "windows" ]]; then
-            # Windows' default test-thread stack (~1 MiB) overflows on the
-            # deepest async agent/harness tests; give libtest threads a
-            # generous stack so the whole class is covered, not one test at a
-            # time. (test_clean_env.sh execs nextest, which forwards this env
-            # to each test process.)
-            RUST_MIN_STACK=16777216 SQUEEZY_SHELL=gitbash scripts/test_clean_env.sh --workspace --all-targets --profile ci
+            SQUEEZY_SHELL=gitbash scripts/test_clean_env.sh --workspace --all-targets --profile ci
           else
             scripts/test_clean_env.sh --workspace --all-targets --profile ci
           fi
@@ -418,7 +417,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
           ref: ${{ github.event.inputs.checkout_ref || github.ref }}
@@ -507,7 +506,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
           ref: ${{ github.event.inputs.checkout_ref || github.ref }}

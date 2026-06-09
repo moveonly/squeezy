@@ -20,9 +20,9 @@ use super::{
     apply_thinking_extra_fields, bedrock_document_block, bedrock_effort_label,
     bedrock_idle_timeout, bedrock_request_metadata_map, bedrock_tool_choice, build_bedrock_client,
     classify_stream_sdk_error, compute_thinking_extra_fields, conversation_messages,
-    current_bearer_token, extract_echoed_model, handle_bedrock_event, hex_decode, hex_encode,
-    inference_configuration, json_to_document, region_prefix, sanitize_bedrock_document_name,
-    system_blocks, tool_configuration,
+    current_bearer_token, extract_echoed_model, extract_url_host, handle_bedrock_event, hex_decode,
+    hex_encode, inference_configuration, json_to_document, region_prefix,
+    sanitize_bedrock_document_name, system_blocks, tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{CacheRetention, LlmInputItem, LlmRequest, LlmToolSpec};
@@ -1889,4 +1889,99 @@ fn hex_encode_matches_fixed_two_char_lowercase_per_byte() {
         Some(payload),
         "hex_decode(hex_encode(bytes)) must return the original bytes",
     );
+}
+
+// ─── extract_url_host ────────────────────────────────────────────────────────
+
+#[test]
+fn extract_url_host_parses_simple_https_url() {
+    assert_eq!(
+        extract_url_host("https://api.example.com/v1/"),
+        Some("api.example.com".to_string())
+    );
+}
+
+#[test]
+fn extract_url_host_strips_port() {
+    assert_eq!(
+        extract_url_host("https://api.example.com:443/v1/"),
+        Some("api.example.com".to_string())
+    );
+}
+
+#[test]
+fn extract_url_host_handles_ipv4_metadata_address() {
+    assert_eq!(
+        extract_url_host("https://169.254.169.254/latest/meta-data/"),
+        Some("169.254.169.254".to_string())
+    );
+}
+
+#[test]
+fn extract_url_host_strips_ipv6_brackets() {
+    assert_eq!(
+        extract_url_host("http://[::1]:8080/"),
+        Some("::1".to_string())
+    );
+}
+
+#[test]
+fn extract_url_host_returns_none_for_malformed_ipv6_without_close_bracket() {
+    // A URL like "http://[/" has an authority "[" with no ']'.
+    // The old code would compute `unwrap_or(len - 1)` = 0 causing a panic
+    // on `&"["[1..0]`; now it returns None (empty host after stripping '[').
+    assert_eq!(
+        extract_url_host("http://[/path"),
+        None,
+        "malformed IPv6 URL must yield None, not panic"
+    );
+}
+
+#[test]
+fn extract_url_host_strips_userinfo() {
+    assert_eq!(
+        extract_url_host("https://user:pass@api.example.com/"),
+        Some("api.example.com".to_string())
+    );
+}
+
+// ─── BedrockProvider::from_config rejects metadata endpoints ────────────────
+
+fn bedrock_config_with_base_url(base_url: &str) -> BedrockConfig {
+    BedrockConfig {
+        region: "us-east-1".to_string(),
+        base_url: Some(base_url.to_string()),
+        bearer_token: None,
+        request_metadata: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+    }
+}
+
+#[test]
+fn from_config_rejects_imds_base_url() {
+    let config = bedrock_config_with_base_url("https://169.254.169.254/latest/");
+    let err = BedrockProvider::from_config(&config).expect_err("should reject metadata host");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("169.254.169.254"),
+        "error should name the offending host; got: {msg}"
+    );
+}
+
+#[test]
+fn from_config_rejects_google_metadata_host() {
+    let config =
+        bedrock_config_with_base_url("http://metadata.google.internal/computeMetadata/v1/");
+    let err = BedrockProvider::from_config(&config).expect_err("should reject metadata host");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("metadata.google.internal"),
+        "error should name the offending host; got: {msg}"
+    );
+}
+
+#[test]
+fn from_config_accepts_normal_base_url() {
+    let config = bedrock_config_with_base_url("https://bedrock.us-east-1.amazonaws.com/");
+    BedrockProvider::from_config(&config).expect("normal endpoint should be accepted");
 }

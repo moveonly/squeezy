@@ -231,12 +231,48 @@ impl KeybindingsFile {
 }
 
 /// Default location of the user-editable file:
-/// `~/.squeezy/keybindings.toml`. Returns `None` when `$HOME` is
-/// unset (CI sandboxes, some test harnesses), in which case the
+/// `~/.squeezy/keybindings.toml`. Returns `None` when neither `$HOME`
+/// nor a platform home directory (e.g. `USERPROFILE` on Windows) is
+/// resolvable — CI sandboxes, some test harnesses — in which case the
 /// loader degrades to "no user overrides".
+///
+/// The fast env path treats empty variables as unset and handles Windows
+/// `$USERPROFILE`; the fallback keeps the process-cached platform lookup
+/// from `squeezy_core::cached_home_dir()` for other platform home sources.
 pub(crate) fn default_keybindings_path() -> Option<PathBuf> {
-    let home = env::var_os("HOME").map(PathBuf::from)?;
+    let home = default_home_dir_from_env(|key| env::var_os(key))
+        .or_else(|| squeezy_core::cached_home_dir().filter(|home| !home.as_os_str().is_empty()))?;
     Some(home.join(".squeezy").join("keybindings.toml"))
+}
+
+#[cfg(test)]
+fn default_keybindings_path_from_env<F>(env_get: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    let home = default_home_dir_from_env(env_get)?;
+    Some(home.join(".squeezy").join("keybindings.toml"))
+}
+
+fn default_home_dir_from_env<F>(env_get: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    let home = match env_get("HOME").filter(|v| !v.is_empty()) {
+        Some(home) => home,
+        None => {
+            // On Windows, HOME is often unset; USERPROFILE is the canonical home.
+            #[cfg(windows)]
+            {
+                env_get("USERPROFILE").filter(|v| !v.is_empty())?
+            }
+            #[cfg(not(windows))]
+            {
+                return None;
+            }
+        }
+    };
+    Some(PathBuf::from(home))
 }
 
 /// Merge `~/.squeezy/keybindings.toml` (when present) on top of the

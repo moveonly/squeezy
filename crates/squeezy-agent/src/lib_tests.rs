@@ -29,6 +29,9 @@ use super::*;
 
 /// Agent turn + replay tests nest deep async state machines; debug builds on
 /// Windows' smaller default thread stacks can overflow without a larger pool.
+/// See `docs/internal/TEST_STACK_POSTURE.md` for the project posture and when
+/// to use this 8 MiB helper vs. the 32 MiB `run_high_stack_test` in
+/// `crates/squeezy-agent/tests/tool_loop.rs`.
 fn run_high_stack_async_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -1827,80 +1830,82 @@ async fn parallel_tool_calls_config_flows_into_dispatched_request() {
     }
 }
 
-#[tokio::test]
-async fn tool_loop_executes_fallback_tool_and_returns_observation() {
-    let root = temp_workspace("agent_tool_loop");
-    fs::write(root.join("sample.rs"), "fn needle() {}\n").expect("write sample");
-    let provider = Arc::new(MockProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "call_1".to_string(),
-                name: "grep".to_string(),
-                arguments: json!({"pattern": "needle", "include": ["*.rs"]}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_1".to_string()),
-                cost: CostSnapshot {
-                    input_tokens: Some(10),
-                    output_tokens: Some(1),
-                    reasoning_output_tokens: Some(2),
-                    cached_input_tokens: None,
-                    cache_write_input_tokens: None,
-                    estimated_usd_micros: None,
-                },
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("found it".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_2".to_string()),
-                cost: CostSnapshot {
-                    input_tokens: Some(4),
-                    output_tokens: Some(2),
-                    reasoning_output_tokens: Some(3),
-                    cached_input_tokens: None,
-                    cache_write_input_tokens: None,
-                    estimated_usd_micros: None,
-                },
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let config = AppConfig {
-        workspace_root: root.clone(),
-        ..Default::default()
-    };
-    let agent = Agent::new(config, provider.clone());
+#[test]
+fn tool_loop_executes_fallback_tool_and_returns_observation() {
+    run_high_stack_async_test(async {
+        let root = temp_workspace("agent_tool_loop");
+        fs::write(root.join("sample.rs"), "fn needle() {}\n").expect("write sample");
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "call_1".to_string(),
+                    name: "grep".to_string(),
+                    arguments: json!({"pattern": "needle", "include": ["*.rs"]}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_1".to_string()),
+                    cost: CostSnapshot {
+                        input_tokens: Some(10),
+                        output_tokens: Some(1),
+                        reasoning_output_tokens: Some(2),
+                        cached_input_tokens: None,
+                        cache_write_input_tokens: None,
+                        estimated_usd_micros: None,
+                    },
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("found it".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_2".to_string()),
+                    cost: CostSnapshot {
+                        input_tokens: Some(4),
+                        output_tokens: Some(2),
+                        reasoning_output_tokens: Some(3),
+                        cached_input_tokens: None,
+                        cache_write_input_tokens: None,
+                        estimated_usd_micros: None,
+                    },
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let config = AppConfig {
+            workspace_root: root.clone(),
+            ..Default::default()
+        };
+        let agent = Agent::new(config, provider.clone());
 
-    let mut rx = agent.start_turn("find needle".to_string(), CancellationToken::new());
-    let mut tool_result = None;
-    let mut completed = None;
-    while let Some(event) = rx.recv().await {
-        match event {
-            AgentEvent::ToolCallCompleted { result, .. } => tool_result = Some(result),
-            AgentEvent::Completed { message, cost, .. } => {
-                completed = Some((message.content, cost));
+        let mut rx = agent.start_turn("find needle".to_string(), CancellationToken::new());
+        let mut tool_result = None;
+        let mut completed = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::ToolCallCompleted { result, .. } => tool_result = Some(result),
+                AgentEvent::Completed { message, cost, .. } => {
+                    completed = Some((message.content, cost));
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
 
-    let tool_result = tool_result.expect("tool result");
-    assert_eq!(tool_result.status, ToolStatus::Success);
-    assert_eq!(tool_result.content["matches"][0]["path"], "sample.rs");
-    let (message, cost) = completed.expect("completed");
-    assert_eq!(message, "found it");
-    assert_eq!(cost.input_tokens, Some(14));
-    assert_eq!(cost.reasoning_output_tokens, Some(5));
-    assert_eq!(provider.requests().len(), 2);
-    assert!(!provider.requests()[0].tools.is_empty());
+        let tool_result = tool_result.expect("tool result");
+        assert_eq!(tool_result.status, ToolStatus::Success);
+        assert_eq!(tool_result.content["matches"][0]["path"], "sample.rs");
+        let (message, cost) = completed.expect("completed");
+        assert_eq!(message, "found it");
+        assert_eq!(cost.input_tokens, Some(14));
+        assert_eq!(cost.reasoning_output_tokens, Some(5));
+        assert_eq!(provider.requests().len(), 2);
+        assert!(!provider.requests()[0].tools.is_empty());
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[test]
@@ -4647,6 +4652,192 @@ fn shell_classifier_output_schema_mirrors_parse_target() {
     assert_eq!(ask.action, PermissionAction::Ask);
 }
 
+/// Regression: when `shell_classifier` is enabled and a shell command
+/// produces an `Ask` verdict, the out-of-band classifier LLM call's
+/// billable cost must be folded into persisted session accounting
+/// (`state.cost`, `state.metrics.provider`, and `state.metrics.model_ledger`)
+/// — mirroring the AI-reviewer fold. Without this assertion, a future
+/// refactor that drops the `merge_cost`/`record` lines in
+/// `permission_decision_for_request` would silently regress to the
+/// pre-PR behaviour where classifier spend went uncounted.
+#[tokio::test]
+async fn shell_classifier_cost_persists_to_session_accounting() {
+    let root = temp_workspace("agent_shell_classifier_cost_fold");
+    // Round 1: model emits an *ambiguous* non-mutating shell command
+    // (`printf hi` — same probe the AI-reviewer test uses). With
+    // `permissions.shell = Ask` and `shell_classifier = true`, the
+    // verdict path runs the classifier LLM call before reaching the
+    // user-approval prompt; the classifier returns `deny` so the tool
+    // call is denied without us having to wire up an approval responder.
+    // The command must (a) map to `PermissionCapability::Shell` and
+    // (b) pre-classify as `AskAi` — picking a read-only command like
+    // `ls -la` would auto-allow before the classifier ever runs.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_printf".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf hi",
+                    "description": "ambiguous non-mutating shell probe",
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_round_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Classifier round: provider streams a deny verdict + non-zero
+        // cost. This is what we expect to see folded into session
+        // accounting.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                r#"{"action":"deny","reason":"too risky"}"#.to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_classifier".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(72),
+                    output_tokens: Some(18),
+                    estimated_usd_micros: Some(45_300),
+                    ..CostSnapshot::default()
+                },
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Round 2: model receives the denied tool result and finishes.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("understood".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_round_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            shell: PermissionMode::Ask,
+            shell_classifier: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+    let mut rx = agent.start_turn("probe shell".to_string(), CancellationToken::new());
+    while let Some(event) = rx.recv().await {
+        if matches!(
+            event,
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. }
+        ) {
+            break;
+        }
+    }
+    let snapshot = agent.session_accounting_snapshot().await;
+    // Round 1 + round 2 of the parent stream both carried zeroed
+    // `CostSnapshot`s, so the only spend in `state.cost` after the turn
+    // is the classifier round's 45_300 µUSD / 72 input / 18 output.
+    assert_eq!(
+        snapshot.cost.estimated_usd_micros,
+        Some(45_300),
+        "classifier-round cost must be folded into session cost",
+    );
+    assert_eq!(
+        snapshot.cost.input_tokens,
+        Some(72),
+        "classifier-round input tokens must be folded into session cost",
+    );
+    assert_eq!(snapshot.cost.output_tokens, Some(18));
+    assert_eq!(
+        snapshot.metrics.provider.estimated_usd_micros,
+        Some(45_300),
+        "classifier-round cost must be folded into provider metrics",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Regression: the shell classifier returns `None` on `LlmEvent::Cancelled`,
+/// which is treated as "no classification reached" by the caller — the
+/// verdict therefore stays at the upstream `Ask`, and the permission path
+/// falls back to the user-approval prompt rather than auto-resolving.
+/// This locks in the cancellation contract documented on `ClassifierResult`.
+#[tokio::test]
+async fn shell_classifier_cancellation_falls_back_to_ask_verdict() {
+    let root = temp_workspace("agent_shell_classifier_cancel");
+    // `printf hi` so pre_classify_shell falls through to `AskAi` and the
+    // classifier actually runs; a read-only command would auto-allow
+    // before the classifier ever sees it.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_printf".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf hi",
+                    "description": "ambiguous non-mutating shell probe",
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_round_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Classifier round: mid-stream cancellation. Any partial cost is
+        // dropped (bounded gap documented on `ClassifierResult`).
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("{\"action\":".to_string())),
+            Ok(LlmEvent::Cancelled),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            shell: PermissionMode::Ask,
+            shell_classifier: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+    let mut rx = agent.start_turn("probe shell".to_string(), CancellationToken::new());
+    let mut approval_seen = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ApprovalRequested { decision_tx, .. } => {
+                approval_seen = true;
+                let _ = decision_tx.send(ToolApprovalDecision::Denied);
+            }
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        approval_seen,
+        "classifier cancellation must fall back to the upstream Ask verdict, \
+         which fires an ApprovalRequested event",
+    );
+    let snapshot = agent.session_accounting_snapshot().await;
+    assert_eq!(
+        snapshot.cost.estimated_usd_micros, None,
+        "cancelled classifier must not write a partial cost row",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn plan_mode_denies_repo_mutations_before_policy() {
     for capability in [
@@ -4755,7 +4946,7 @@ fn plan_mode_keeps_discovery_capabilities_on_normal_policy_path() {
     }
     for request in [
         shell_permission_request(
-            "sonar context list --json",
+            "rg --json pattern",
             PermissionCapability::Shell,
             PermissionRisk::Medium,
         ),
@@ -4785,7 +4976,7 @@ fn plan_mode_keeps_discovery_capabilities_on_normal_policy_path() {
 fn plan_mode_shell_requests_must_be_proven_read_only() {
     for (command, capability) in [
         (
-            "sonar context guidelines get --languages java 2>/dev/null",
+            "rg -l 'fn main' --type rust 2>/dev/null",
             PermissionCapability::Shell,
         ),
         (
@@ -4793,7 +4984,7 @@ fn plan_mode_shell_requests_must_be_proven_read_only() {
             PermissionCapability::Shell,
         ),
         (
-            "sonar context navigation search-signatures --pattern \".*\" --fields \"fqn,file_path,start_line\" --limit 20 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(x['fqn'],'->',x['file_path']) for x in d.get('results',[])]\" 2>/dev/null || true",
+            "rg -l 'fn main' 2>/dev/null | python3 -c \"import sys; [print(l.strip()) for l in sys.stdin]\" 2>/dev/null || true",
             PermissionCapability::Shell,
         ),
         ("cargo fmt --check", PermissionCapability::Compiler),
@@ -4889,6 +5080,35 @@ fn agent_session_mode_can_be_set_and_toggled() {
     assert!(!agent.set_session_mode(SessionMode::Build, "test"));
     assert_eq!(agent.toggle_session_mode("test"), SessionMode::Plan);
     assert_eq!(agent.session_mode(), SessionMode::Plan);
+}
+
+#[test]
+fn mode_state_snapshot_reports_live_mode_and_routing_overrides() {
+    let agent = Agent::new(
+        AppConfig {
+            session_mode: SessionMode::Plan,
+            ..Default::default()
+        },
+        Arc::new(MockProvider::new(Vec::new())),
+    );
+
+    assert_eq!(agent.mode_state_snapshot().session_mode, SessionMode::Plan);
+
+    assert!(agent.set_session_mode(SessionMode::Build, "test"));
+    agent.request_routing_force_cheap();
+    agent.set_routing_session_disabled(true);
+
+    let snapshot = agent.mode_state_snapshot();
+    assert_eq!(snapshot.session_mode, SessionMode::Build);
+    assert!(snapshot.routing_session_disabled);
+    assert!(snapshot.pending_force_cheap);
+    assert!(!snapshot.pending_force_parent);
+    assert_eq!(snapshot.sticky_turns_remaining, 0);
+
+    agent.request_routing_force_parent();
+    let snapshot = agent.mode_state_snapshot();
+    assert!(!snapshot.pending_force_cheap);
+    assert!(snapshot.pending_force_parent);
 }
 
 #[test]
@@ -5069,6 +5289,7 @@ fn warn_unknown_tool_schema_names_emits_warning_for_typo_and_skips_known() {
         ],
         discoverable: vec!["totally_made_up".to_string()],
         excluded: Vec::new(),
+        ..squeezy_core::ToolSchemaConfig::default()
     };
 
     tracing::subscriber::with_default(subscriber, || {
@@ -7423,6 +7644,7 @@ fn compaction_persists_checkpoint_and_stamps_replacement_id() {
         &mut state,
         &[],
         Some(&store),
+        None,
         &config,
         ContextCompactionTrigger::Manual,
         true,
@@ -7443,6 +7665,50 @@ fn compaction_persists_checkpoint_and_stamps_replacement_id() {
 }
 
 #[test]
+fn compaction_checkpoint_stores_session_id() {
+    use squeezy_store::SqueezyStore;
+
+    let root = temp_workspace("compact_checkpoint_sid");
+    let store = SqueezyStore::open(&root, None).expect("open store");
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            recent_items: 2,
+            min_items: 4,
+            fallback_window_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let report = super::compact_conversation(
+        &mut conversation,
+        &mut state,
+        &[],
+        Some(&store),
+        Some("test-session-abc"),
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+        0,
+    )
+    .expect("compaction");
+    let replacement_id = report
+        .record
+        .replacement_id
+        .clone()
+        .expect("replacement_id stamped");
+    let checkpoint = store
+        .get_compaction_checkpoint(&replacement_id)
+        .expect("get checkpoint")
+        .expect("checkpoint present");
+    assert_eq!(
+        checkpoint.session_id, "test-session-abc",
+        "checkpoint session_id must match the passed session id"
+    );
+}
+
+#[test]
 fn compaction_without_store_leaves_replacement_id_none() {
     let config = AppConfig {
         context_compaction: ContextCompactionConfig {
@@ -7459,6 +7725,7 @@ fn compaction_without_store_leaves_replacement_id_none() {
         &mut conversation,
         &mut state,
         &[],
+        None,
         None,
         &config,
         ContextCompactionTrigger::Manual,
@@ -7518,6 +7785,7 @@ fn compaction_drops_orphan_function_call_outputs_from_interleaved_parallel_calls
         &mut conversation,
         &mut state,
         &[],
+        None,
         None,
         &config,
         ContextCompactionTrigger::Manual,
@@ -9281,6 +9549,7 @@ async fn round_input_gate_compacts_then_proceeds_when_over_limit() {
         &mut probe_state,
         &[],
         None,
+        None,
         &probe_config,
         ContextCompactionTrigger::Auto,
         true,
@@ -9643,6 +9912,7 @@ async fn shell_sandbox_fallback_warns_tui_exactly_once_per_session() {
         turn_id,
         backend,
         fallback_count,
+        ..
     } = &events[0]
     else {
         panic!("expected AgentEvent::ShellSandboxBestEffortFallback");
@@ -11818,7 +12088,7 @@ fn conversation_shape_attributes_load_skill_outputs_to_skills_bucket() {
         LlmInputItem::FunctionCall {
             call_id: "call-skill".to_string(),
             name: "load_skill".to_string(),
-            arguments: json!({"name": "sonar"}),
+            arguments: json!({"name": "example-skill"}),
         },
         LlmInputItem::FunctionCallOutput {
             call_id: "call-skill".to_string(),
@@ -11966,4 +12236,474 @@ async fn mcp_background_queue_serves_issued_tickets_in_order() {
         .expect("second task should not panic");
 
     assert_eq!(&*events.lock().await, &["first", "second"]);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-surface redaction tests (Idea 3)
+// ---------------------------------------------------------------------------
+
+/// Synthetic secret used in cross-surface redaction tests. Uses the
+/// `sk-` prefix so it matches the built-in OpenAI-key pattern
+/// (`sk-[A-Za-z0-9]{48}`) regardless of how it appears in a field (raw
+/// value in metadata, embedded in a command string, etc.). It is also
+/// long enough to match regardless of exact length checks in the regex.
+/// The `redact_tool_call` test additionally wraps it in an
+/// `Authorization: Bearer` header to exercise the bearer-token pattern.
+const SYNTHETIC_SECRET: &str = "sk-testkey-abcdefghijklmnopqrstuvwxyz012345678901";
+
+fn test_redactor() -> Arc<Redactor> {
+    let config = squeezy_core::RedactionConfig::default();
+    Arc::new(config.redactor().expect("redactor"))
+}
+
+/// Build a minimal PermissionRequest that embeds the synthetic secret in
+/// metadata so we can verify `redact_permission_request` strips it.
+fn secret_permission_request() -> PermissionRequest {
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert(
+        "command".to_string(),
+        format!("OPENAI_API_KEY={SYNTHETIC_SECRET} cargo build"),
+    );
+    metadata.insert("description".to_string(), SYNTHETIC_SECRET.to_string());
+    PermissionRequest {
+        call_id: "test-redact".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: format!("shell:echo {SYNTHETIC_SECRET}"),
+        risk: PermissionRisk::High,
+        summary: format!("run shell with secret {SYNTHETIC_SECRET}"),
+        metadata,
+        suggested_rules: vec![],
+    }
+}
+
+#[test]
+fn redact_permission_request_strips_secret_from_metadata_target_and_summary() {
+    // Approval prompts are redacted before display to the user and before
+    // being emitted in session-log approval events. This test checks that
+    // the synthetic secret is absent from every surface the user or a log
+    // reader might see.
+    let redactor = test_redactor();
+    let request = secret_permission_request();
+
+    // Sanity: the raw request contains the secret.
+    assert!(
+        request.target.contains(SYNTHETIC_SECRET)
+            || request.summary.contains(SYNTHETIC_SECRET)
+            || request
+                .metadata
+                .values()
+                .any(|v| v.contains(SYNTHETIC_SECRET)),
+        "test precondition: secret must appear in raw request"
+    );
+
+    let redacted = redact_permission_request(request, &redactor);
+
+    assert!(
+        !redacted.target.contains(SYNTHETIC_SECRET),
+        "secret must be redacted from target"
+    );
+    assert!(
+        !redacted.summary.contains(SYNTHETIC_SECRET),
+        "secret must be redacted from summary"
+    );
+    for (key, value) in &redacted.metadata {
+        assert!(
+            !value.contains(SYNTHETIC_SECRET),
+            "secret must be redacted from metadata[{key}]"
+        );
+    }
+}
+
+#[test]
+fn redact_tool_call_arguments_strips_secret() {
+    // Tool-call arguments are redacted before being stored in the session log
+    // and before the model sees them as function-call outputs on re-reads.
+    let redactor = test_redactor();
+    let call = ToolCall {
+        call_id: "test-redact-call".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({
+            "command": format!("curl -H 'Authorization: Bearer {SYNTHETIC_SECRET}' https://api.example.com"),
+            "description": format!("authenticate with {SYNTHETIC_SECRET}")
+        }),
+    };
+
+    // Sanity: raw call contains secret.
+    let raw = call.arguments.to_string();
+    assert!(
+        raw.contains(SYNTHETIC_SECRET),
+        "test precondition: secret must appear in raw arguments"
+    );
+
+    let redacted = redact_tool_call(call, &redactor);
+    let redacted_str = redacted.arguments.to_string();
+    assert!(
+        !redacted_str.contains(SYNTHETIC_SECRET),
+        "secret must be absent from redacted tool-call arguments; got: {redacted_str:?}"
+    );
+}
+
+#[tokio::test]
+async fn agent_shutdown_renews_mcp_shutdown_token() {
+    let agent = Agent::new_ephemeral(AppConfig::default(), Arc::new(MockProvider::new(vec![])));
+    let old_child = agent.mcp_shutdown_child_token();
+
+    agent.shutdown().await;
+
+    assert!(
+        old_child.is_cancelled(),
+        "shutdown must cancel already-issued MCP background tokens"
+    );
+    assert!(
+        !agent.mcp_shutdown_child_token().is_cancelled(),
+        "Agent remains reusable after shutdown, so new MCP work must receive a live token"
+    );
+}
+
+/// Regression: subagent loop previously dropped `LlmEvent::Refusal` deltas,
+/// causing an empty summary when the provider stopped with `StopReason::Refusal`.
+/// After the fix the refusal prose should appear in the `SubagentFailed.error`,
+/// and the refusal round's billable cost must be folded into the subagent's
+/// metrics (so the parent's by-subagent ledger never silently reports zero
+/// for a refusal round).
+#[tokio::test]
+async fn subagent_refusal_surfaces_prose_in_failed_event() {
+    // Round 1: parent calls `delegate`.
+    // Round 2 (subagent): provider emits Refusal delta + Completed(Refusal).
+    // Round 3: parent receives SubagentFailed and completes the turn.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "del_refusal".to_string(),
+                name: "delegate".to_string(),
+                arguments: json!({"prompt": "do something unsafe"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::ToolUse),
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Subagent round: OpenAI-style refusal delta + Refusal stop reason
+        // with non-zero token counts so the cost-fold assertion below has
+        // something to bind to.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::Refusal {
+                content: "I cannot assist with that request.".to_string(),
+            }),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_sub_1".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(180),
+                    output_tokens: Some(40),
+                    estimated_usd_micros: Some(12_500),
+                    ..CostSnapshot::default()
+                },
+                stop_reason: Some(StopReason::Refusal),
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Parent: acknowledges the failed subagent and finishes.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("understood".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let agent = Agent::new(AppConfig::default(), provider);
+    let mut rx = agent.start_turn("delegate unsafe task".to_string(), CancellationToken::new());
+    let mut failed_error: Option<String> = None;
+    let mut failed_metrics: Option<TurnMetrics> = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::SubagentFailed { error, metrics, .. } => {
+                failed_error = Some(error);
+                failed_metrics = Some(metrics);
+            }
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+    let error = failed_error.expect("SubagentFailed must fire when subagent is refused");
+    assert!(
+        error.contains("refused") || error.contains("cannot"),
+        "SubagentFailed error must include refusal prose, got: {error}"
+    );
+    let metrics = failed_metrics.expect("SubagentFailed must carry the refusal round's metrics");
+    assert_eq!(
+        metrics.provider.input_tokens,
+        Some(180),
+        "refusal round's input tokens must be folded into subagent metrics",
+    );
+    assert_eq!(metrics.provider.output_tokens, Some(40));
+    assert_eq!(metrics.provider.estimated_usd_micros, Some(12_500));
+}
+
+/// Regression: Anthropic-style providers emit refusal text as ordinary
+/// `TextDelta` events rather than `LlmEvent::Refusal` deltas, then close the
+/// stream with `StopReason::Refusal` and no tool calls. The subagent loop
+/// must fall back to `assistant_message` so the parent's `SubagentFailed`
+/// still carries the refusal prose, never an empty error.
+#[tokio::test]
+async fn subagent_refusal_falls_back_to_text_delta_when_no_refusal_event() {
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "del_textdelta_refusal".to_string(),
+                name: "delegate".to_string(),
+                arguments: json!({"prompt": "do something unsafe"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::ToolUse),
+                reasoning_only_stop: false,
+            }),
+        ],
+        // Subagent round: prose arrives via TextDelta (no `Refusal` event),
+        // then the stream closes with StopReason::Refusal.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "I cannot help with that request.".to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_sub_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::Refusal),
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("understood".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let agent = Agent::new(AppConfig::default(), provider);
+    let mut rx = agent.start_turn(
+        "delegate text-delta refusal".to_string(),
+        CancellationToken::new(),
+    );
+    let mut failed_error: Option<String> = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::SubagentFailed { error, .. } => {
+                failed_error = Some(error);
+            }
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+    let error = failed_error.expect(
+        "SubagentFailed must fire when the subagent stops with Refusal even \
+         without a dedicated `LlmEvent::Refusal` event",
+    );
+    assert!(
+        error.contains("refused") && error.contains("cannot"),
+        "SubagentFailed error must propagate the TextDelta refusal prose, got: {error}",
+    );
+}
+
+/// Regression: the refusal early-return is gated on `tool_calls.is_empty()`.
+/// If a provider asks for one or more tool calls *and* signals
+/// `StopReason::Refusal`, that contradiction is resolved by executing the
+/// requested tools — not by abandoning the round with a refusal error. This
+/// test locks the gate in by ensuring the subagent runs to completion
+/// successfully when a refusal stop arrives alongside a queued tool call.
+///
+/// Wrapped in `run_high_stack_async_test` because the subagent's two-round
+/// loop nested inside the parent's `TurnRuntime::run` pushes the async
+/// state machine past the default thread stack on macOS/ARM64 debug
+/// builds. See `docs/internal/TEST_STACK_POSTURE.md`.
+#[test]
+fn subagent_refusal_does_not_fire_when_tool_calls_pending() {
+    run_high_stack_async_test(async {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "del_refusal_with_tools".to_string(),
+                    name: "delegate".to_string(),
+                    arguments: json!({"prompt": "search for foo"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_parent_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::ToolUse),
+                    reasoning_only_stop: false,
+                }),
+            ],
+            // Subagent round 1: provider emits a Refusal delta *and* a ToolCall,
+            // then closes with StopReason::Refusal. The loop must execute the
+            // pending tool call rather than early-returning a refusal.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::Refusal {
+                    content: "I cannot do that directly.".to_string(),
+                }),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "sub_grep".to_string(),
+                    name: "grep".to_string(),
+                    arguments: json!({"pattern": "foo", "include": ["*.rs"]}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_sub_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::Refusal),
+                    reasoning_only_stop: false,
+                }),
+            ],
+            // Subagent round 2: tool result returned, subagent emits a normal
+            // summary and finishes cleanly. This must produce SubagentCompleted,
+            // not SubagentFailed.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("searched the tree".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_sub_2".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::EndTurn),
+                    reasoning_only_stop: false,
+                }),
+            ],
+            // Parent acknowledges the completed subagent and finishes.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_parent_2".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: Some(StopReason::EndTurn),
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let agent = Agent::new(AppConfig::default(), provider);
+        let mut rx = agent.start_turn(
+            "delegate refusal-with-tools".to_string(),
+            CancellationToken::new(),
+        );
+        let mut subagent_failed = false;
+        let mut subagent_completed = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::SubagentFailed { .. } => subagent_failed = true,
+                AgentEvent::SubagentCompleted { .. } => subagent_completed = true,
+                AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            !subagent_failed,
+            "refusal early-return must NOT fire when tool calls are pending",
+        );
+        assert!(
+            subagent_completed,
+            "subagent should run its pending tool call to completion when a \
+             Refusal stop arrives alongside ToolCall events",
+        );
+    });
+}
+
+fn local_shell_failure_result(
+    command: &str,
+    exit_code: i64,
+    stderr: &str,
+) -> squeezy_tools::ToolResult {
+    squeezy_tools::ToolResult {
+        call_id: "shell-call".to_string(),
+        tool_name: "shell".to_string(),
+        status: ToolStatus::Error,
+        content: json!({
+            "command": command,
+            "stdout": "",
+            "stderr": stderr,
+            "exit_code": exit_code,
+            "error": format!("exit {exit_code}"),
+        }),
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: String::new(),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+        web_call_stats: None,
+    }
+}
+
+#[test]
+fn local_tool_completion_message_appends_shell_hint_on_nonempty_stderr() {
+    // stderr came back populated (the shell printed a syntax-error message,
+    // a `permission denied`, etc.). Surface the effective-shell hint so the
+    // user knows which shell to retarget via `SQUEEZY_SHELL`.
+    let result = local_shell_failure_result("echo $(", 1, "sh: 1: syntax error");
+    let message = super::local_tool_completion_message(Some(&result));
+    assert!(message.contains("sh: 1: syntax error"), "{message}");
+    assert!(
+        message.contains("set SQUEEZY_SHELL to change"),
+        "stderr-populated failure must include the shell hint: {message}",
+    );
+}
+
+#[test]
+fn local_tool_completion_message_appends_shell_hint_on_shellish_exit_codes() {
+    // 127 = command not found, 126 = not executable, 2 = bash/sh syntax
+    // error. All three are shell-attributable even when stderr happens to
+    // be empty (some shells emit to stdout, mocks may drop it), so the
+    // hint should still appear.
+    for exit_code in [2, 126, 127] {
+        let result = local_shell_failure_result("nope", exit_code, "");
+        let message = super::local_tool_completion_message(Some(&result));
+        assert!(
+            message.contains("set SQUEEZY_SHELL to change"),
+            "exit_code {exit_code} must surface the shell hint even with empty stderr: {message}",
+        );
+    }
+}
+
+#[test]
+fn local_tool_completion_message_omits_shell_hint_for_benign_failures() {
+    // A `grep` that finds nothing exits 1 with empty stderr — the failure
+    // is informational, not shell-attributable. Suggesting a shell change
+    // here would be noise.
+    let result = local_shell_failure_result("grep needle file", 1, "");
+    let message = super::local_tool_completion_message(Some(&result));
+    assert!(
+        !message.contains("set SQUEEZY_SHELL to change"),
+        "exit-1 with empty stderr must NOT spuriously suggest the shell: {message}",
+    );
+}
+
+#[test]
+fn local_tool_completion_message_omits_shell_hint_on_success() {
+    // Successful completions never carry the failure hint.
+    let mut result = local_shell_failure_result("ls", 0, "");
+    result.status = ToolStatus::Success;
+    result.content = json!({
+        "command": "ls",
+        "stdout": "foo bar",
+        "stderr": "",
+        "exit_code": 0,
+    });
+    let message = super::local_tool_completion_message(Some(&result));
+    assert!(
+        !message.contains("set SQUEEZY_SHELL to change"),
+        "success path must not surface the shell hint: {message}",
+    );
 }

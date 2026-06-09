@@ -18,7 +18,11 @@
 //! the POST URL up front vs. learns it from `event: endpoint`), so an SSE
 //! server cannot be driven by the streamable-HTTP client and vice versa.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use http::{HeaderName, HeaderValue};
@@ -30,13 +34,13 @@ use rmcp::{
 };
 use tracing::{debug, warn};
 
-/// Initial delay between automatic reconnect attempts when the SSE stream ends.
-const SSE_RECONNECT_DELAY_INITIAL: Duration = Duration::from_millis(1000);
-/// Maximum delay between reconnect attempts (exponential back-off ceiling).
-const SSE_RECONNECT_DELAY_MAX: Duration = Duration::from_secs(30);
-/// Number of consecutive reconnect failures before the worker gives up.
+/// Number of consecutive reconnect attempts before the worker gives up.
 /// A Windows service that closes immediately would otherwise spin forever.
 const SSE_RECONNECT_MAX_ATTEMPTS: u32 = 10;
+/// Base reconnect delay for the first SSE stream reconnect attempt.
+const SSE_RECONNECT_BASE_MS: u64 = 250;
+/// Maximum reconnect delay cap (after exponential growth with jitter).
+const SSE_RECONNECT_MAX_MS: u64 = 30_000;
 
 /// Errors raised by the SSE transport worker.
 #[derive(Debug, thiserror::Error)]
@@ -121,12 +125,10 @@ impl Worker for SseClientWorker {
             "established legacy MCP SSE session"
         );
 
-        // Reconnect state: exponential back-off starting at 1 s, capped at
-        // 30 s, with a hard limit on consecutive failures. The delay is
-        // computed from the attempt count so no separate mutable variable is
-        // needed. A successful reconnect (endpoint event received) resets the
-        // counter. This prevents a Windows local service that exits immediately
-        // from spinning indefinitely while the session is held open by the agent.
+        // Consecutive reconnect counter; reset to 0 after a successful message
+        // delivery or reconnect so the jittered backoff only grows during an
+        // unbroken failure streak. A hard cap prevents crashing local daemons
+        // from keeping the session alive forever.
         let mut reconnect_attempts: u32 = 0;
 
         loop {
@@ -151,6 +153,10 @@ impl Worker for SseClientWorker {
                                 );
                                 continue;
                             }
+                            // A successful message resets the back-off so a
+                            // healthy server that briefly drops never suffers
+                            // growing reconnect penalties.
+                            reconnect_attempts = 0;
                             let Some(payload) = data else {
                                 continue;
                             };
@@ -159,6 +165,10 @@ impl Worker for SseClientWorker {
                             }
                             match serde_json::from_str::<ServerJsonRpcMessage>(&payload) {
                                 Ok(message) => {
+                                    // Successful delivery — reset the backoff
+                                    // counter so intermittent disconnects don't
+                                    // accumulate into a long wait.
+                                    reconnect_attempts = 0;
                                     context.send_to_handler(message).await?;
                                 }
                                 Err(err) => {
@@ -172,40 +182,35 @@ impl Worker for SseClientWorker {
                             }
                         }
                         None => {
-                            // Stream ended; reopen after an exponentially
-                            // increasing back-off up to SSE_RECONNECT_DELAY_MAX.
-                            // Each new session re-advertises its POST endpoint, so
-                            // we replace the stale URL rather than reusing it.
-                            reconnect_attempts += 1;
-                            if reconnect_attempts > SSE_RECONNECT_MAX_ATTEMPTS {
+                            // Stream ended; reopen the GET after jittered
+                            // exponential backoff. Each new session
+                            // re-advertises its POST endpoint, so replace the
+                            // stale URL rather than reusing it.
+                            if reconnect_attempts >= SSE_RECONNECT_MAX_ATTEMPTS {
                                 return Err(WorkerQuitReason::fatal(
                                     SseTransportError::Closed,
                                     "SSE stream closed repeatedly; giving up after max reconnect attempts",
                                 ));
                             }
-                            // Compute back-off from attempt count: 1 s, 2 s,
-                            // 4 s, …, capped at SSE_RECONNECT_DELAY_MAX.
-                            let delay = {
-                                let exponent = reconnect_attempts.saturating_sub(1).min(5);
-                                (SSE_RECONNECT_DELAY_INITIAL * 2u32.pow(exponent))
-                                    .min(SSE_RECONNECT_DELAY_MAX)
-                            };
+                            let attempt = reconnect_attempts.saturating_add(1);
+                            let delay_ms = sse_reconnect_delay_ms(reconnect_attempts);
                             warn!(
                                 target: "squeezy::mcp::sse",
                                 sse_url = %self.sse_url,
-                                attempt = reconnect_attempts,
-                                delay_ms = delay.as_millis(),
+                                attempt,
+                                delay_ms,
                                 "SSE stream ended; reconnecting"
                             );
                             // Race the back-off sleep against cancellation so
                             // that session shutdown is not delayed by up to the
-                            // full SSE_RECONNECT_DELAY_MAX ceiling.
+                            // full SSE_RECONNECT_MAX_MS ceiling.
                             tokio::select! {
                                 _ = context.cancellation_token.cancelled() => {
                                     return Err(WorkerQuitReason::Cancelled);
                                 }
-                                _ = tokio::time::sleep(delay) => {}
+                                _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
                             }
+                            reconnect_attempts = reconnect_attempts.saturating_add(1);
                             let response = match self.open_stream().await {
                                 Ok(response) => response,
                                 Err(error) => {
@@ -219,12 +224,6 @@ impl Worker for SseClientWorker {
                             match read_endpoint(&self.sse_url, &mut frames).await {
                                 Ok(new_endpoint) => {
                                     endpoint_url = new_endpoint;
-                                    // The server is reachable again: reset the
-                                    // attempt counter so the next stream drop
-                                    // starts back-off from 1 s. Servers that
-                                    // never push proactively (only reply to
-                                    // tool calls) benefit from this reset too.
-                                    reconnect_attempts = 0;
                                 }
                                 Err(error) => {
                                     return Err(WorkerQuitReason::fatal(
@@ -239,6 +238,53 @@ impl Worker for SseClientWorker {
             }
         }
     }
+}
+
+/// Global call counter mixed into each reconnect delay. Ensures concurrent
+/// workers that reconnect at the same instant produce different delays even
+/// when the system clock resolution is coarser than their spacing.
+static SSE_JITTER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Compute the reconnect backoff delay in milliseconds for the given attempt
+/// number (0-indexed). Uses full-jitter exponential backoff:
+///
+/// ```text
+/// delay = rand(0 .. min(SSE_RECONNECT_MAX_MS, SSE_RECONNECT_BASE_MS * 2^attempt))
+/// ```
+///
+/// Full jitter spreads concurrent clients across the reconnect window and
+/// prevents the thundering-herd that a fixed or additive backoff produces
+/// when a local daemon crashes and many reconnects pile up simultaneously.
+///
+/// The jitter source mixes a process-global monotonic counter with the current
+/// nanosecond timestamp. The counter ensures callers in the same nanosecond —
+/// the failure mode of a pure time-based approach — still produce distinct
+/// delays.
+fn sse_reconnect_delay_ms(attempt: u32) -> u64 {
+    let shift = attempt.min(10); // cap the shift to avoid overflow
+    let cap = SSE_RECONNECT_BASE_MS
+        .saturating_mul(1u64 << shift)
+        .min(SSE_RECONNECT_MAX_MS);
+    if cap == 0 {
+        return 0;
+    }
+    // Mix a global counter (unique per call) with the current nanosecond
+    // timestamp (unique across restarts) for a low-cost, non-repeating seed.
+    let counter = SSE_JITTER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let time_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(counter.wrapping_mul(6364136223846793005));
+    // Splitmix64 finalizer to spread the bits.
+    let mut seed = counter
+        .wrapping_mul(0x9e3779b97f4a7c15)
+        .wrapping_add(time_ns);
+    seed ^= seed >> 30;
+    seed = seed.wrapping_mul(0xbf58476d1ce4e5b9);
+    seed ^= seed >> 27;
+    seed = seed.wrapping_mul(0x94d049bb133111eb);
+    seed ^= seed >> 31;
+    seed % cap
 }
 
 impl SseClientWorker {

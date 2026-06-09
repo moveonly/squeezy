@@ -27,7 +27,7 @@ Valid current-worktree `n=1` reruns before any scenario-tool changes:
 Important invalid attempts found along the way:
 
 - Initial sandboxed runs failed because the harness could not resolve GitHub.
-- Earlier harness runs silently used `/Users/abbassabra/esqueezy/new` rather
+- Earlier harness runs silently used `/Users/example/esqueezy/new` rather
   than the current worktree, due hardcoded paths in the vendored scripts.
 - The committed Go grader was stale and scored the old Cobra method-doc task,
   not the current Terraform `Meta` embedding scenario. This made both sides look
@@ -134,7 +134,7 @@ was rerun and replaced with a clean 6/6 `$0.0987` rep for the final CSV.
 ### Benchmark bugs fixed
 
 1. The vendored harness was not reproducible from the current checkout:
-   `hth.py` and `gen_inputs.py` hardcoded `/Users/abbassabra/esqueezy/new`, and
+   `hth.py` and `gen_inputs.py` hardcoded `/Users/example/esqueezy/new`, and
    `hth.py` imported `grade.py` from `/tmp/codex-runs/realworld`.
 2. `n3.py` hardcoded `/tmp/hth/hth.py`, so the vendored wrapper was not
    necessarily the code being exercised.

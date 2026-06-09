@@ -3117,14 +3117,17 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "squeezy-agent",
  "squeezy-core",
  "squeezy-llm",
+ "squeezy-parse",
  "squeezy-skills",
  "squeezy-store",
  "squeezy-telemetry",
  "squeezy-tools",
  "squeezy-tui",
+ "squeezy-workspace",
  "tokio",
  "tokio-util",
  "toml_edit",
@@ -3164,6 +3167,7 @@ dependencies = [
  "libc",
  "regex",
  "serde",
+ "serde_json",
  "thiserror",
  "toml",
  "toml_edit",
@@ -3319,6 +3323,7 @@ version = "0.1.0"
 name = "squeezy-skills"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "squeezy-core",
@@ -3332,6 +3337,8 @@ dependencies = [
 name = "squeezy-store"
 version = "0.1.0"
 dependencies = [
+ "fs2",
+ "getrandom 0.4.2",
  "redb",
  "serde",
  "serde_json",
@@ -3342,6 +3349,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

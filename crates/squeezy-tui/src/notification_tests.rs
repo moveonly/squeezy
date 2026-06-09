@@ -1,3 +1,5 @@
+use std::ffi::OsString;
+
 use super::*;
 
 // ---- DesktopNotifier byte-sequence acceptance ----------------------------
@@ -96,4 +98,121 @@ fn notification_method_parses_canonical_strings() {
         Some(NotificationMethod::Bel)
     );
     assert_eq!(NotificationMethod::parse("nonsense"), None);
+}
+
+#[test]
+fn osc9_auto_resolves_to_concrete_backend_in_test_env() {
+    // In the default test environment $TERM_PROGRAM and Linux signals are
+    // absent so Auto should fall back to Bel (not Osc9).
+    let notifier = DesktopNotifier::new(NotificationMethod::Auto);
+    let resolved = notifier
+        .resolved()
+        .expect("Auto must always resolve to a concrete backend");
+    assert!(
+        matches!(resolved, NotificationMethod::Bel | NotificationMethod::Osc9),
+        "Auto must resolve to Bel or Osc9, got {resolved:?}"
+    );
+}
+
+#[test]
+fn osc9_detects_term_program_signals() {
+    for program in &["iTerm.app", "Ghostty", "WezTerm", "kitty", "WarpTerminal"] {
+        let fixture: &[(&str, &str)] = &[("TERM_PROGRAM", program)];
+        let lookup = |key: &str| {
+            fixture
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| OsString::from(*v))
+        };
+        assert!(
+            detect_osc9_support_from_env(lookup),
+            "TERM_PROGRAM={program} should enable OSC9"
+        );
+    }
+}
+
+#[test]
+fn osc9_detects_linux_env_var_signals() {
+    let signals: &[(&str, &str)] = &[
+        ("KITTY_WINDOW_ID", "42"),
+        ("WEZTERM_PANE", "0"),
+        ("WEZTERM_EXECUTABLE", "/usr/local/bin/wezterm"),
+        ("GHOSTTY_RESOURCES_DIR", "/usr/share/ghostty"),
+    ];
+    for fixture in signals {
+        let signal = fixture.0;
+        let fixture_slice: &[(&str, &str)] = std::slice::from_ref(fixture);
+        let lookup = |key: &str| {
+            fixture_slice
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| OsString::from(*v))
+        };
+        assert!(
+            detect_osc9_support_from_env(lookup),
+            "{signal} should enable OSC9"
+        );
+    }
+}
+
+#[test]
+fn osc9_detects_linux_term_values() {
+    for term in &["xterm-kitty", "ghostty", "wezterm", "foot"] {
+        let fixture: &[(&str, &str)] = &[("TERM", term)];
+        let lookup = |key: &str| {
+            fixture
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| OsString::from(*v))
+        };
+        assert!(
+            detect_osc9_support_from_env(lookup),
+            "TERM={term} should enable OSC9"
+        );
+    }
+}
+
+#[test]
+fn osc9_off_for_unknown_terminals() {
+    let empty = |_: &str| -> Option<OsString> { None };
+    assert!(!detect_osc9_support_from_env(empty));
+
+    let dumb: &[(&str, &str)] = &[("TERM", "dumb")];
+    assert!(!detect_osc9_support_from_env(|key: &str| {
+        dumb.iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| OsString::from(*v))
+    }));
+
+    let screen: &[(&str, &str)] = &[("TERM", "screen-256color")];
+    assert!(!detect_osc9_support_from_env(|key: &str| {
+        screen
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| OsString::from(*v))
+    }));
+}
+
+#[test]
+fn osc9_off_when_tmux_is_outer_term_program_without_capability_signals() {
+    // Under tmux 3.3+ `$TERM_PROGRAM` is sometimes overwritten to "tmux".
+    // If the underlying emulator did not export any of the Linux capability
+    // signals (KITTY_WINDOW_ID / WEZTERM_* / GHOSTTY_RESOURCES_DIR) and
+    // $TERM is a plain screen/tmux value, OSC9 must NOT be auto-enabled —
+    // we can't prove the outer emulator honours it.
+    let fixture: &[(&str, &str)] = &[
+        ("TERM_PROGRAM", "tmux"),
+        ("TERM", "tmux-256color"),
+        ("TMUX", "/tmp/tmux-1000/default,1234,0"),
+    ];
+    let lookup = |key: &str| {
+        fixture
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| OsString::from(*v))
+    };
+    assert!(
+        !detect_osc9_support_from_env(lookup),
+        "TERM_PROGRAM=tmux without a capability signal must keep OSC9 off",
+    );
 }

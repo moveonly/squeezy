@@ -9,8 +9,9 @@
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use crate::{
-    AppConfig, CompactionStrategy, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL,
-    DEFAULT_BEDROCK_MODEL, DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS,
+    AppConfig, CacheDurability, CompactionStrategy, DEFAULT_ANTHROPIC_MODEL,
+    DEFAULT_AZURE_OPENAI_MODEL, DEFAULT_BEDROCK_MODEL,
+    DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS,
     DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES, DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS,
     DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS,
     DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS,
@@ -26,13 +27,14 @@ use crate::{
     DEFAULT_REPORT_ENDPOINT, DEFAULT_REPORT_MAX_BYTES, DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS,
     DEFAULT_SESSION_LOG_RETENTION_DAYS, DEFAULT_SESSION_MAX_EVENT_BYTES,
     DEFAULT_SESSION_MAX_SESSION_BYTES, DEFAULT_STREAM_IDLE_TIMEOUT_MS,
-    DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS, DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
-    DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS, DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL,
-    DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL, DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS,
-    DEFAULT_TUI_SPINNER_NAME, DEFAULT_TUI_THEME_NAME, DEFAULT_WEBSEARCH_PROVIDER,
-    OpenAiCompatiblePreset, PermissionMode, PermissionPolicyMode, ProviderConfig, ReasoningEffort,
-    ResponseVerbosity, SessionMode, SessionResumePicker, StatusVerbosity, ToolOutputVerbosity,
-    TranscriptDefault, TuiSynchronizedOutput, normalize_tui_spinner_name, normalize_tui_theme_name,
+    DEFAULT_SUBAGENT_MAX_CONCURRENT, DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
+    DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL, DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
+    DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
+    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_TUI_SPINNER_NAME,
+    DEFAULT_TUI_THEME_NAME, DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode,
+    PermissionPolicyMode, ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode,
+    SessionResumePicker, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault,
+    TuiSynchronizedOutput, normalize_tui_spinner_name, normalize_tui_theme_name,
 };
 
 /// When a save takes effect.
@@ -394,6 +396,8 @@ pub const PROVIDER_OPTIONS: &[&str] = &[
     "azure_openai",
     "bedrock",
     "ollama",
+    "openai_codex",
+    "github_copilot",
     "openrouter",
     "vercel",
     "portkey",
@@ -405,9 +409,13 @@ pub const PROVIDER_OPTIONS: &[&str] = &[
     "together",
     "fireworks",
     "cerebras",
+    "deepinfra",
+    "baseten",
     "lmstudio",
     "vllm",
     "llamacpp",
+    "cloudflare_workers_ai",
+    "cloudflare_ai_gateway",
     "openai_compatible",
 ];
 
@@ -417,6 +425,7 @@ pub const PROFILE_OPTIONS: &[&str] = &["cheap", "balanced", "strong"];
 pub const REASONING_EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh"];
 pub const SESSION_MODE_OPTIONS: &[&str] = &["build", "plan"];
 pub const SESSION_RESUME_PICKER_OPTIONS: &[&str] = &["ask", "never"];
+pub const CACHE_DURABILITY_OPTIONS: &[&str] = &["fast", "turn", "strict"];
 pub const STATUS_VERBOSITY_OPTIONS: &[&str] = &["compact", "verbose"];
 pub const RESPONSE_VERBOSITY_OPTIONS: &[&str] = &["concise", "normal", "verbose"];
 pub const TOOL_OUTPUT_VERBOSITY_OPTIONS: &[&str] = &["compact", "normal", "verbose"];
@@ -642,6 +651,19 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default: || FieldValue::Bool(false),
                 help: "(OpenAI/Azure only) Persist responses on the provider side for retrieval.",
                 env_override: Some("SQUEEZY_STORE_RESPONSES"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "ollama_keep_alive",
+                toml_path: &["providers", "ollama", "keep_alive"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_ollama_keep_alive,
+                set: set_ollama_keep_alive,
+                default_display: "5m (server default)",
+                default: || FieldValue::String(String::new()),
+                help: "(Ollama only) How long the server keeps the model loaded between turns. Accepts duration strings (\"5m\", \"24h\"), integer seconds, \"0\" to evict immediately, or \"-1\" to pin indefinitely. Empty = server default (5 minutes). Also via OLLAMA_KEEP_ALIVE env var.",
+                env_override: Some("OLLAMA_KEEP_ALIVE"),
                 secret: false,
             },
         ],
@@ -1922,6 +1944,23 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
+                label: "max_concurrent",
+                toml_path: &["subagents", "max_concurrent"],
+                kind: FieldKind::Integer {
+                    min: 1,
+                    max: 256,
+                    suffix: None,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_subagent_max_concurrent,
+                set: set_subagent_max_concurrent,
+                default_display: "20",
+                default: || FieldValue::Integer(DEFAULT_SUBAGENT_MAX_CONCURRENT as i64),
+                help: "Maximum number of subagents that may run concurrently per parent agent turn. The `/config` UI accepts 1–256; values set via TOML or `SQUEEZY_SUBAGENT_MAX_CONCURRENT` are not capped at the runtime but are clamped to ≥1.",
+                env_override: Some("SQUEEZY_SUBAGENT_MAX_CONCURRENT"),
+                secret: false,
+            },
+            FieldMeta {
                 label: "max_tool_calls_per_call",
                 toml_path: &["subagents", "max_tool_calls_per_call"],
                 kind: FieldKind::Integer {
@@ -2097,6 +2136,32 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 env_override: None,
                 secret: false,
             },
+            FieldMeta {
+                label: "include_classes",
+                toml_path: &["graph", "include_classes"],
+                kind: FieldKind::StringList { min: 0, max: 32 },
+                tier: ApplyTier::Restart,
+                get: get_graph_include_classes,
+                set: set_graph_include_classes,
+                default_display: "—",
+                default: || FieldValue::StringList(Vec::new()),
+                help: "Exclusion classes to force-include in the graph index.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "exclude_classes",
+                toml_path: &["graph", "exclude_classes"],
+                kind: FieldKind::StringList { min: 0, max: 32 },
+                tier: ApplyTier::Restart,
+                get: get_graph_exclude_classes,
+                set: set_graph_exclude_classes,
+                default_display: "—",
+                default: || FieldValue::StringList(Vec::new()),
+                help: "Exclusion classes to force-exclude from the graph index.",
+                env_override: None,
+                secret: false,
+            },
         ],
     },
     ConfigSectionMeta {
@@ -2133,6 +2198,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default_display: "<inherits cache.root>",
                 default: || FieldValue::Path(std::path::PathBuf::from("")),
                 help: "Directory for spilled tool-output blobs. Empty inherits cache.root.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "durability",
+                toml_path: &["cache", "durability"],
+                kind: FieldKind::Enum {
+                    options: CACHE_DURABILITY_OPTIONS,
+                },
+                tier: ApplyTier::Restart,
+                get: get_cache_durability,
+                set: set_cache_durability,
+                default_display: "fast",
+                default: || FieldValue::Enum("fast"),
+                help: "Session JSONL durability: fast avoids fsync, turn syncs on explicit session flushes, strict syncs each durable append.",
                 env_override: None,
                 secret: false,
             },
@@ -2424,6 +2504,7 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
                 base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
                 route_style: Default::default(),
                 transport,
+                ..Default::default()
             }),
             DEFAULT_OLLAMA_MODEL,
         ),
@@ -3755,6 +3836,26 @@ fn set_provider_expensive_models(
     Ok(())
 }
 
+fn get_ollama_keep_alive(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(
+        cfg.providers
+            .get("ollama")
+            .and_then(|p| p.keep_alive.clone())
+            .unwrap_or_default(),
+    )
+}
+fn set_ollama_keep_alive(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("expects string"),
+    };
+    cfg.providers
+        .entry("ollama".to_string())
+        .or_default()
+        .keep_alive = if s.trim().is_empty() { None } else { Some(s) };
+    Ok(())
+}
+
 fn get_telemetry_enabled(cfg: &AppConfig) -> FieldValue {
     FieldValue::Bool(cfg.telemetry.enabled)
 }
@@ -3957,6 +4058,24 @@ fn set_subagent_explore_model(cfg: &mut AppConfig, value: FieldValue) -> Result<
     Ok(())
 }
 
+fn get_subagent_max_concurrent(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.subagents.max_concurrent as i64)
+}
+fn set_subagent_max_concurrent(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let v = match value {
+        FieldValue::Integer(v) => v,
+        _ => return Err("expects integer"),
+    };
+    if v < 1 {
+        return Err("max_concurrent must be at least 1");
+    }
+    if v > 256 {
+        return Err("max_concurrent must be at most 256");
+    }
+    cfg.subagents.max_concurrent = v as usize;
+    Ok(())
+}
+
 fn get_subagent_max_tool_calls(cfg: &AppConfig) -> FieldValue {
     FieldValue::Integer(cfg.subagents.max_tool_calls_per_call as i64)
 }
@@ -4114,6 +4233,32 @@ fn set_graph_exclude(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'sta
     }
 }
 
+fn get_graph_include_classes(cfg: &AppConfig) -> FieldValue {
+    FieldValue::StringList(cfg.graph.include_classes.clone())
+}
+fn set_graph_include_classes(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::StringList(items) => {
+            cfg.graph.include_classes = items;
+            Ok(())
+        }
+        _ => Err("expects string list"),
+    }
+}
+
+fn get_graph_exclude_classes(cfg: &AppConfig) -> FieldValue {
+    FieldValue::StringList(cfg.graph.exclude_classes.clone())
+}
+fn set_graph_exclude_classes(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::StringList(items) => {
+            cfg.graph.exclude_classes = items;
+            Ok(())
+        }
+        _ => Err("expects string list"),
+    }
+}
+
 // ─── Cache ────────────────────────────────────────────────────────────────────
 
 fn get_cache_root(cfg: &AppConfig) -> FieldValue {
@@ -4147,6 +4292,22 @@ fn set_cache_tool_outputs(cfg: &mut AppConfig, value: FieldValue) -> Result<(), 
     } else {
         Some(p)
     };
+    Ok(())
+}
+
+fn get_cache_durability(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.cache.durability.as_str())
+}
+fn set_cache_durability(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let raw = match value {
+        FieldValue::Enum(s) => s,
+        FieldValue::String(s) => {
+            cfg.cache.durability = CacheDurability::parse(&s).ok_or("unknown durability")?;
+            return Ok(());
+        }
+        _ => return Err("expects enum"),
+    };
+    cfg.cache.durability = CacheDurability::parse(raw).ok_or("unknown durability")?;
     Ok(())
 }
 

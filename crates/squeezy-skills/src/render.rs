@@ -198,28 +198,54 @@ pub fn render_active_skills_metadata(
     skills: &[LoadedSkill],
     budget_chars: usize,
 ) -> Option<String> {
+    render_active_skills_metadata_with_metrics(skills, budget_chars).0
+}
+
+/// Metadata-only rendering variant that also returns accurate
+/// `SkillActivationMetrics`. The inline-mode path already has
+/// `render_active_skills_with_metrics`; this counterpart closes the
+/// parity gap so callers in `SkillCatalog::render_active_skills_with_metrics`
+/// can report correct `included` / `dropped` counts even when
+/// `[skills].inline = false`.
+pub fn render_active_skills_metadata_with_metrics(
+    skills: &[LoadedSkill],
+    budget_chars: usize,
+) -> (Option<String>, SkillActivationMetrics) {
+    let total = skills.len();
+    let mut metrics = SkillActivationMetrics {
+        total,
+        included: 0,
+        dropped: total,
+        body_truncated: 0,
+    };
     if skills.is_empty() || budget_chars == 0 {
-        return None;
+        return (None, metrics);
     }
 
     let mut survivors: Vec<&LoadedSkill> = skills.iter().collect();
     loop {
         if survivors.is_empty() {
-            return None;
+            return (None, metrics);
         }
         let blocks: Vec<String> = survivors
             .iter()
             .map(|skill| skill.metadata_block())
             .collect();
-        let rendered = wrap_blocks(&blocks)?;
+        let Some(rendered) = wrap_blocks(&blocks) else {
+            return (None, metrics);
+        };
         if char_count(&rendered) <= budget_chars {
-            return Some(rendered);
+            metrics.included = survivors.len();
+            metrics.dropped = total.saturating_sub(survivors.len());
+            return (Some(rendered), metrics);
         }
         // Drop the lowest-priority (last) skill and retry. This mirrors
         // the inline-mode drop fallback so the metadata bundle remains
         // bounded under a tight budget. The `?` is defensive — the
         // earlier `is_empty` check already guarantees `Some`.
-        let dropped = survivors.pop()?;
+        let Some(dropped) = survivors.pop() else {
+            return (None, metrics);
+        };
         warn!(
             target: "squeezy_skills",
             skill = %dropped.summary.name,

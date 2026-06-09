@@ -155,6 +155,21 @@ impl LlmProvider for DelegateFanoutProvider {
     }
 }
 
+/// Run the given future on a Tokio multi-thread runtime with an enlarged
+/// (32 MiB) worker thread stack. Used for tool-loop integration tests
+/// that drive `TurnRuntime::run` end-to-end, whose nested async state
+/// machines exceed the default OS thread stack on macOS/ARM64 debug
+/// builds. See `docs/internal/TEST_STACK_POSTURE.md` for the project
+/// posture and when to reuse this helper vs. the smaller
+/// `run_high_stack_async_test` in `crates/squeezy-agent/src/lib_tests.rs`.
+///
+/// The Windows MSVC default thread stack is 1 MiB; the full agent +
+/// scripted-provider + tool-registry chain instantiated by these tests
+/// blows past that and crashes with a stack overflow under
+/// `#[tokio::test]`. Sibling tests with the same ingredients (any test
+/// that drives `Agent::start_turn` on top of a `ScriptedProvider`)
+/// should reach for this wrapper if they ever start failing on Windows
+/// CI for the same reason.
 fn run_high_stack_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -197,56 +212,58 @@ async fn wait_for_persisted_graph_partition(root: &Path, file_id: &str) -> serde
     panic!("graph partition {file_id} was not persisted: {last_error}");
 }
 
-#[tokio::test]
-async fn parallel_read_and_search_outputs_return_to_model_by_call_id() {
-    let root = temp_workspace("parallel_read_search");
-    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "grep_call".to_string(),
-                name: "grep".to_string(),
-                arguments: serde_json::json!({"pattern": "needle", "include": ["*.rs"]}),
-            })),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "read_call".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "src.rs"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("done".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
+#[test]
+fn parallel_read_and_search_outputs_return_to_model_by_call_id() {
+    run_high_stack_async_test(async {
+        let root = temp_workspace("parallel_read_search");
+        fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "grep_call".to_string(),
+                    name: "grep".to_string(),
+                    arguments: serde_json::json!({"pattern": "needle", "include": ["*.rs"]}),
+                })),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "read_call".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "src.rs"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
 
-    drain_turn(agent.start_turn("inspect needle".to_string(), CancellationToken::new())).await;
+        drain_turn(agent.start_turn("inspect needle".to_string(), CancellationToken::new())).await;
 
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[0].tools.iter().all(|tool| !tool.strict));
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs.len(), 2);
-    assert_eq!(outputs[0].0, "grep_call");
-    assert_eq!(outputs[1].0, "read_call");
-    assert!(outputs[0].1["content"]["matches"][0]["path"] == "src.rs");
-    assert!(outputs[1].1["content"]["content"] == "1\tfn needle() {}\n");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].tools.iter().all(|tool| !tool.strict));
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].0, "grep_call");
+        assert_eq!(outputs[1].0, "read_call");
+        assert!(outputs[0].1["content"]["matches"][0]["path"] == "src.rs");
+        assert!(outputs[1].1["content"]["content"] == "1\tfn needle() {}\n");
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]
@@ -1632,61 +1649,63 @@ async fn parallel_read_batch_denies_remaining_calls_after_byte_budget() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn glob_and_count_search_outputs_return_to_model() {
-    let root = temp_workspace("glob_count");
-    fs::write(root.join("one.rs"), "fn needle() {}\n").expect("write one");
-    fs::write(root.join("two.rs"), "fn needle() {}\n").expect("write two");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "glob_call".to_string(),
-                name: "glob".to_string(),
-                arguments: serde_json::json!({"pattern": "*.rs"}),
-            })),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "count_call".to_string(),
-                name: "grep".to_string(),
-                arguments: serde_json::json!({
-                    "pattern": "needle",
-                    "include": ["*.rs"],
-                    "output_mode": "count",
+#[test]
+fn glob_and_count_search_outputs_return_to_model() {
+    run_high_stack_async_test(async {
+        let root = temp_workspace("glob_count");
+        fs::write(root.join("one.rs"), "fn needle() {}\n").expect("write one");
+        fs::write(root.join("two.rs"), "fn needle() {}\n").expect("write two");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "glob_call".to_string(),
+                    name: "glob".to_string(),
+                    arguments: serde_json::json!({"pattern": "*.rs"}),
+                })),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "count_call".to_string(),
+                    name: "grep".to_string(),
+                    arguments: serde_json::json!({
+                        "pattern": "needle",
+                        "include": ["*.rs"],
+                        "output_mode": "count",
+                    }),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
                 }),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("summarized".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("summarized".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
 
-    drain_turn(agent.start_turn("summarize files".to_string(), CancellationToken::new())).await;
+        drain_turn(agent.start_turn("summarize files".to_string(), CancellationToken::new())).await;
 
-    let requests = provider.requests();
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs[0].0, "glob_call");
-    assert_eq!(
-        outputs[0].1["content"]["paths"],
-        serde_json::json!(["one.rs", "two.rs"])
-    );
-    assert_eq!(outputs[1].0, "count_call");
-    assert_eq!(outputs[1].1["content"]["count"], 2);
+        let requests = provider.requests();
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs[0].0, "glob_call");
+        assert_eq!(
+            outputs[0].1["content"]["paths"],
+            serde_json::json!(["one.rs", "two.rs"])
+        );
+        assert_eq!(outputs[1].0, "count_call");
+        assert_eq!(outputs[1].1["content"]["count"], 2);
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]
@@ -2293,81 +2312,88 @@ async fn successful_read_result_persists_model_visible_snapshot() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn repeated_read_result_returns_receipt_stub_across_sessions() {
-    let root = temp_workspace("receipt_stub_cross_session");
-    fs::write(root.join("sample.txt"), "durable content\n").expect("write sample");
-    let first_provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "first_session_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "sample.txt"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_first_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("done".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_first_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let first_agent = Agent::new(config_for(root.clone()), first_provider);
-    drain_turn(first_agent.start_turn("read once".to_string(), CancellationToken::new())).await;
-    drop(first_agent);
+#[test]
+fn repeated_read_result_returns_receipt_stub_across_sessions() {
+    run_high_stack_test(async {
+        let root = temp_workspace("receipt_stub_cross_session");
+        fs::write(root.join("sample.txt"), "durable content\n").expect("write sample");
+        let first_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "first_session_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "sample.txt"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_first_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_first_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let first_agent = Agent::new(config_for(root.clone()), first_provider);
+        drain_turn(first_agent.start_turn("read once".to_string(), CancellationToken::new())).await;
+        first_agent.shutdown().await;
+        drop(first_agent);
 
-    let second_provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "second_session_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "sample.txt"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_second_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("deduped".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_second_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let second_agent = Agent::new(config_for(root.clone()), second_provider.clone());
-    drain_turn(second_agent.start_turn("read again".to_string(), CancellationToken::new())).await;
+        let second_provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "second_session_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "sample.txt"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_second_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("deduped".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_second_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let second_agent = Agent::new(config_for(root.clone()), second_provider.clone());
+        drain_turn(second_agent.start_turn("read again".to_string(), CancellationToken::new()))
+            .await;
 
-    let requests = second_provider.requests();
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0].0, "second_session_read");
-    assert_eq!(outputs[0].1["content"]["receipt_stub"], true);
-    assert_eq!(
-        outputs[0].1["content"]["same_as_call_id"],
-        "first_session_read"
-    );
-    assert!(outputs[0].1["content"]["content"].is_null());
+        let requests = second_provider.requests();
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].0, "second_session_read");
+        assert_eq!(outputs[0].1["content"]["receipt_stub"], true);
+        assert_eq!(
+            outputs[0].1["content"]["same_as_call_id"],
+            "first_session_read"
+        );
+        assert!(outputs[0].1["content"]["content"].is_null());
 
-    let _ = fs::remove_dir_all(root);
+        second_agent.shutdown().await;
+        drop(second_agent);
+
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]
@@ -3836,6 +3862,24 @@ async fn drain_turn(mut rx: tokio::sync::mpsc::Receiver<AgentEvent>) {
     while rx.recv().await.is_some() {}
 }
 
+fn run_high_stack_async_test(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    std::thread::Builder::new()
+        .name("squeezy-agent-high-stack-test".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(8 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .expect("build high-stack test runtime")
+                .block_on(future);
+        })
+        .expect("spawn high-stack test thread")
+        .join()
+        .expect("high-stack test thread panicked");
+}
+
 #[tokio::test]
 async fn session_cost_cap_blocks_further_calls_once_exceeded() {
     // Cap deliberately tiny - the first round's reported cost (60 micros)
@@ -3971,63 +4015,70 @@ async fn session_cost_warning_fires_once_at_threshold() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn cancelled_turn_persists_partial_cost_and_metrics() {
-    // The first round produces a real provider cost and a tool call, then
-    // the second round is cancelled by the provider before any further
-    // assistant text streams. The cancellation path must commit the
-    // already-paid cost and the tool counter into the session snapshot so
-    // `/cost` reflects what was actually spent.
-    let root = temp_workspace("cancel_persists_partial");
-    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "grep_call".to_string(),
-                name: "grep".to_string(),
-                arguments: serde_json::json!({"pattern": "needle", "include": ["*.rs"]}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_first".to_string()),
-                cost: CostSnapshot {
-                    input_tokens: Some(1_200),
-                    output_tokens: Some(340),
-                    estimated_usd_micros: Some(415_300),
-                    ..CostSnapshot::default()
-                },
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![Ok(LlmEvent::Started), Ok(LlmEvent::Cancelled)],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
+/// Cancelled-turn cost persistence test. Wrapped in `run_high_stack_test`
+/// (32 MiB thread stack) because the async state machines nested in
+/// `TurnRuntime::run` → `execute_tool_calls` → `flush_parallel_batch` can
+/// exceed the default OS thread stack on macOS/ARM64 debug builds. See
+/// `docs/internal/TEST_STACK_POSTURE.md` for the project posture.
+#[test]
+fn cancelled_turn_persists_partial_cost_and_metrics() {
+    run_high_stack_test(async {
+        // The first round produces a real provider cost and a tool call, then
+        // the second round is cancelled by the provider before any further
+        // assistant text streams. The cancellation path must commit the
+        // already-paid cost and the tool counter into the session snapshot so
+        // `/cost` reflects what was actually spent.
+        let root = temp_workspace("cancel_persists_partial");
+        fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "grep_call".to_string(),
+                    name: "grep".to_string(),
+                    arguments: serde_json::json!({"pattern": "needle", "include": ["*.rs"]}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_first".to_string()),
+                    cost: CostSnapshot {
+                        input_tokens: Some(1_200),
+                        output_tokens: Some(340),
+                        estimated_usd_micros: Some(415_300),
+                        ..CostSnapshot::default()
+                    },
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![Ok(LlmEvent::Started), Ok(LlmEvent::Cancelled)],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
 
-    let mut rx = agent.start_turn("locate needle".to_string(), CancellationToken::new());
-    let mut saw_cancelled = false;
-    while let Some(event) = rx.recv().await {
-        if matches!(event, AgentEvent::Cancelled { .. }) {
-            saw_cancelled = true;
+        let mut rx = agent.start_turn("locate needle".to_string(), CancellationToken::new());
+        let mut saw_cancelled = false;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::Cancelled { .. }) {
+                saw_cancelled = true;
+            }
         }
-    }
-    assert!(saw_cancelled, "expected an AgentEvent::Cancelled");
+        assert!(saw_cancelled, "expected an AgentEvent::Cancelled");
 
-    let snapshot = agent.session_accounting_snapshot().await;
-    assert_eq!(
-        snapshot.cost.estimated_usd_micros,
-        Some(415_300),
-        "cancelled turn must persist the provider-reported cost from the completed round",
-    );
-    assert_eq!(snapshot.cost.input_tokens, Some(1_200));
-    assert_eq!(snapshot.cost.output_tokens, Some(340));
-    assert!(
-        snapshot.metrics.tool_calls >= 1,
-        "expected at least the grep tool call to be persisted, got {}",
-        snapshot.metrics.tool_calls,
-    );
+        let snapshot = agent.session_accounting_snapshot().await;
+        assert_eq!(
+            snapshot.cost.estimated_usd_micros,
+            Some(415_300),
+            "cancelled turn must persist the provider-reported cost from the completed round",
+        );
+        assert_eq!(snapshot.cost.input_tokens, Some(1_200));
+        assert_eq!(snapshot.cost.output_tokens, Some(340));
+        assert!(
+            snapshot.metrics.tool_calls >= 1,
+            "expected at least the grep tool call to be persisted, got {}",
+            snapshot.metrics.tool_calls,
+        );
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]

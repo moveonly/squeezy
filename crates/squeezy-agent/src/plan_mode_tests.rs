@@ -5,8 +5,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use squeezy_core::SessionMode;
 
 use super::{
-    CURRENT_POINTER_FILE, PLAN_DIR, PLAN_MODE_INSTRUCTIONS, instructions_for_mode,
-    latest_plan_path, strip_proposed_plan_blocks,
+    CURRENT_POINTER_FILE, PLAN_DIR, PLAN_MODE_INSTRUCTIONS, canonicalize_active_plan_path,
+    instructions_for_mode, is_active_plan_path_with_canon, latest_plan_path,
+    strip_proposed_plan_blocks,
 };
 
 const TEST_SESSION_ID: &str = "test-sess-abc";
@@ -267,5 +268,88 @@ fn latest_plan_path_returns_none_without_session_id() {
     let plans_dir = session_plans_dir(&root, TEST_SESSION_ID);
     fs::write(plans_dir.join("plan-z.md"), "body").expect("write");
     assert!(latest_plan_path(&root, None).is_none());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn is_active_plan_path_returns_true_for_same_file() {
+    let root = empty_workspace("iap_same");
+    let plans_dir = session_plans_dir(&root, TEST_SESSION_ID);
+    let plan = plans_dir.join("plan-a.md");
+    fs::write(&plan, "body").expect("write");
+    assert!(
+        canonicalize_active_plan_path(&plan)
+            .is_some_and(|canon| is_active_plan_path_with_canon(&plan, &canon)),
+        "same path should match"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn is_active_plan_path_returns_false_for_different_file() {
+    let root = empty_workspace("iap_different");
+    let plans_dir = session_plans_dir(&root, TEST_SESSION_ID);
+    let plan_a = plans_dir.join("plan-a.md");
+    let plan_b = plans_dir.join("plan-b.md");
+    fs::write(&plan_a, "body").expect("write a");
+    fs::write(&plan_b, "body").expect("write b");
+    assert!(
+        !canonicalize_active_plan_path(&plan_b)
+            .is_some_and(|canon| { is_active_plan_path_with_canon(&plan_a, &canon) }),
+        "different files should not match"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn is_active_plan_path_returns_false_when_target_nonexistent() {
+    let root = empty_workspace("iap_nonexistent");
+    let plans_dir = session_plans_dir(&root, TEST_SESSION_ID);
+    let plan = plans_dir.join("plan-a.md");
+    fs::write(&plan, "body").expect("write");
+    let ghost = plans_dir.join("ghost.md");
+    assert!(
+        !canonicalize_active_plan_path(&plan)
+            .is_some_and(|canon| is_active_plan_path_with_canon(&ghost, &canon)),
+        "nonexistent target should return false"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn is_active_plan_path_resolves_dotdot_traversal() {
+    let root = empty_workspace("iap_dotdot");
+    let plans_dir = session_plans_dir(&root, TEST_SESSION_ID);
+    let plan = plans_dir.join("plan-a.md");
+    fs::write(&plan, "body").expect("write");
+    // `plans_dir/../<id>/plan-a.md` should resolve to the same file.
+    let traversal = plans_dir
+        .parent()
+        .unwrap()
+        .join(TEST_SESSION_ID)
+        .join("plan-a.md");
+    assert!(
+        canonicalize_active_plan_path(&plan)
+            .is_some_and(|canon| is_active_plan_path_with_canon(&traversal, &canon)),
+        "dotdot-resolved path should match"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn is_active_plan_path_case_insensitive_on_windows() {
+    // NTFS is case-insensitive; canonicalize should normalise both sides.
+    let root = empty_workspace("iap_case");
+    let plans_dir = session_plans_dir(&root, TEST_SESSION_ID);
+    let plan = plans_dir.join("Plan-A.md");
+    fs::write(&plan, "body").expect("write");
+    let lower = plans_dir.join("plan-a.md");
+    // Both spellings should canonicalize to the same path on NTFS.
+    assert!(
+        canonicalize_active_plan_path(&plan)
+            .is_some_and(|canon| is_active_plan_path_with_canon(&lower, &canon)),
+        "case-only difference should match on Windows"
+    );
     let _ = fs::remove_dir_all(&root);
 }

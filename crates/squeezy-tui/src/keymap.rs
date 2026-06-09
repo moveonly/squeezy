@@ -191,6 +191,64 @@ impl Action {
         Action::ALL.iter().copied().find(|a| a.slug() == slug)
     }
 
+    /// Short note surfaced by `/keymap` when the default binding is
+    /// known to be unreliable across Linux terminals, tmux, or SSH.
+    /// Returns `None` for bindings that are broadly portable.
+    ///
+    /// EXHAUSTIVENESS: enumerating every variant (rather than a `_ => None`
+    /// catch-all) means any new `Action` requires an explicit decision here
+    /// instead of silently inheriting a "portable" label.
+    pub(crate) fn terminal_compat_note(self) -> Option<&'static str> {
+        match self {
+            // F11 is often consumed by the desktop window manager or
+            // remapped by terminal emulators (fullscreen toggle).
+            Self::ToggleConfigScreen => Some("terminal-dependent"),
+            // Ctrl+T may collide with a custom tmux prefix (the default
+            // prefix is Ctrl+B, but Ctrl+T is a common user rebind);
+            // Ctrl+P is also a common editor binding. Both are Ctrl
+            // chords that the host terminal or tmux may intercept before
+            // Squeezy sees them.
+            Self::ToggleTranscriptOverlay => Some("terminal-dependent"),
+            Self::ToggleTaskPanel => Some("terminal-dependent"),
+            // PageUp/PageDown are intercepted by some terminal emulators
+            // for their own scrollback; also unreliable over SSH.
+            Self::ScrollTranscriptPageUp => Some("terminal-dependent"),
+            Self::ScrollTranscriptPageDown => Some("terminal-dependent"),
+            // Home/End, Ctrl+Y, and Ctrl+R are broadly portable across
+            // Linux terminals — no annotation needed.
+            // New copy / navigation / direct-manipulation actions added by the
+            // alt-screen renderer work. Alt-based chords, Ctrl+arrows, and
+            // Ctrl+Enter are the classically unreliable ones across Linux
+            // terminals, tmux, and SSH (Meta/Alt encoding, arrow modifiers, and
+            // the Ctrl+Enter vs Enter ambiguity that needs keyboard enhancement).
+            Self::CopyFocusedEntry
+            | Self::CopyCurrentToolOutput
+            | Self::CopyCodeBlock
+            | Self::CopyViewport
+            | Self::CopyFullTranscript
+            | Self::CopySelection
+            | Self::JumpPrevUserTurn
+            | Self::JumpNextUserTurn
+            | Self::JumpPrevAssistant
+            | Self::JumpNextAssistant
+            | Self::JumpPrevToolCall
+            | Self::JumpNextToolCall
+            | Self::JumpPrevError
+            | Self::JumpNextError
+            | Self::FocusPrevEntry
+            | Self::FocusNextEntry
+            | Self::OpenFocusedInDetail => Some("terminal-dependent"),
+            // Plain keys and broadly-portable Ctrl chords.
+            Self::OpenSearch
+            | Self::ToggleFocusedFold
+            | Self::QueueUndo
+            | Self::TranscriptHome
+            | Self::TranscriptEnd
+            | Self::CopyLastAssistant
+            | Self::RestoreCancelledPrompt => None,
+        }
+    }
+
     /// Compiled-in default keybinding for the action. Mirrors what
     /// `handle_key` previously hardcoded, so a fresh install behaves
     /// exactly like the pre-`/keymap` build.
@@ -254,7 +312,8 @@ impl Action {
 /// A normalised `(KeyCode, KeyModifiers)` pair. Modifiers are stored
 /// with `SHIFT` stripped from `KeyCode::Char` because the shift bit
 /// usually shows up on uppercase letters but not on punctuation
-/// (terminal-dependent). The eq compares on the canonical form.
+/// (terminal-dependent). Ctrl/Alt letters are lowercased to match
+/// `handle_key`'s event normalisation before lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct KeyBinding {
     pub(crate) code: KeyCode,
@@ -262,11 +321,16 @@ pub(crate) struct KeyBinding {
 }
 
 impl KeyBinding {
-    pub(crate) fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
-        Self {
-            code,
-            modifiers: normalise_modifiers(code, modifiers),
+    pub(crate) fn new(mut code: KeyCode, modifiers: KeyModifiers) -> Self {
+        let mut modifiers = normalise_modifiers(code, modifiers);
+        if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && let KeyCode::Char(ch) = code
+            && ch.is_ascii_alphabetic()
+        {
+            code = KeyCode::Char(ch.to_ascii_lowercase());
+            modifiers.remove(KeyModifiers::SHIFT);
         }
+        Self { code, modifiers }
     }
 
     /// Human-facing description: `"Ctrl+T"`, `"PageUp"`, `"Alt+k"`.
@@ -559,7 +623,7 @@ pub(crate) fn format_keymap_command(resolver: &KeymapResolver) -> String {
     lines.push("Key bindings".to_string());
     lines.push("(override in settings.toml under [tui.keymap])".to_string());
     lines.push(String::new());
-    let mut rows: Vec<(String, String, bool)> = Vec::new();
+    let mut rows: Vec<(String, String, bool, Option<&'static str>)> = Vec::new();
     for action in Action::ALL.iter().copied() {
         let binding = resolver.binding(action);
         let default = action.default_binding();
@@ -567,19 +631,28 @@ pub(crate) fn format_keymap_command(resolver: &KeymapResolver) -> String {
             action.slug().to_string(),
             binding.display(),
             binding != default,
+            action.terminal_compat_note(),
         ));
     }
-    let max_slug = rows.iter().map(|(s, _, _)| s.len()).max().unwrap_or(0);
-    for (slug, display, is_override) in &rows {
+    let max_slug = rows.iter().map(|(s, _, _, _)| s.len()).max().unwrap_or(0);
+    for (slug, display, is_override, note) in &rows {
         let marker = if *is_override { " (override)" } else { "" };
+        let note_str = note.map(|n| format!("  [{n}]")).unwrap_or_default();
         lines.push(format!(
-            "{:<width$}  {}{}",
+            "{:<width$}  {}{}{}",
             slug,
             display,
             marker,
+            note_str,
             width = max_slug
         ));
     }
+    lines.push(String::new());
+    lines.push(
+        "Bindings marked [terminal-dependent] may be intercepted by tmux, SSH, or the terminal"
+            .to_string(),
+    );
+    lines.push("emulator. Use [tui.keymap] in settings.toml to remap to alternatives.".to_string());
     let collisions = resolver.collisions();
     if !collisions.is_empty() {
         lines.push(String::new());

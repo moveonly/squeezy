@@ -196,6 +196,7 @@ pub(crate) fn compact_conversation(
     state: &mut ContextCompactionState,
     attachments: &[ContextAttachment],
     store: Option<&SqueezyStore>,
+    session_id: Option<&str>,
     config: &AppConfig,
     trigger: ContextCompactionTrigger,
     force: bool,
@@ -291,7 +292,7 @@ pub(crate) fn compact_conversation(
         let id = format!("ckpt-{generation}-{compacted_at_ms}");
         let checkpoint = squeezy_store::CompactionCheckpoint {
             replacement_id: id.clone(),
-            session_id: String::new(),
+            session_id: session_id.unwrap_or("").to_string(),
             generation,
             items: dropped.clone(),
             created_unix_millis: compacted_at_ms as u128,
@@ -715,6 +716,7 @@ pub(crate) async fn compact_conversation_with_strategy(
         state,
         attachments,
         store,
+        session.map(|s| s.session_id()),
         config,
         trigger,
         force,

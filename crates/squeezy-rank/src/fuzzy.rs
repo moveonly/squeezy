@@ -34,20 +34,30 @@ pub(crate) fn fuzzy_score_with_lowercase_needle(
         if needle_idx >= needle_lower.len() {
             break;
         }
-        let target = needle_lower[needle_idx];
-        let lower = ch.to_lowercase().next().unwrap_or(ch);
-        if lower == target {
-            if first_match.is_none() {
-                first_match = Some(byte_idx);
+        let ch_end = byte_idx + ch.len_utf8();
+        // Expand multi-char lowercase sequences (e.g. U+0130 İ → "i\u{307}")
+        // and match each expanded char against consecutive needle positions.
+        // Using `>` rather than `!=` for the contiguity check ensures that
+        // two expanded chars originating from the same source position
+        // (same byte_idx, both < ch_end) are not treated as a gap.
+        for lower in ch.to_lowercase() {
+            if needle_idx >= needle_lower.len() {
+                break;
             }
-            if let Some(prev) = prev_end
-                && byte_idx != prev
-            {
-                contiguous = false;
+            let target = needle_lower[needle_idx];
+            if lower == target {
+                if first_match.is_none() {
+                    first_match = Some(byte_idx);
+                }
+                if let Some(prev) = prev_end
+                    && byte_idx > prev
+                {
+                    contiguous = false;
+                }
+                last_match = byte_idx;
+                prev_end = Some(ch_end);
+                needle_idx += 1;
             }
-            last_match = byte_idx;
-            prev_end = Some(byte_idx + ch.len_utf8());
-            needle_idx += 1;
         }
     }
 

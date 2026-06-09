@@ -15,8 +15,8 @@ use squeezy_llm::{
     GitHubCopilotDeviceCodeResponse, GitHubCopilotLoginHooks, GitHubCopilotLoginOutcome,
     OpenAiCodexLoginOutcome, PersistedTokens, codex_auth_file_path, exchange_authorization_code,
     generate_pkce, github_copilot_auth_file_path, github_copilot_read_tokens,
-    login_github_copilot_interactive, login_openai_codex_interactive, normalize_github_domain,
-    parse_authorization_input,
+    login_github_copilot_interactive, login_openai_codex_manual,
+    login_openai_codex_with_auto_fallback, normalize_github_domain, parse_authorization_input,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -290,6 +290,17 @@ pub struct OpenAiCodexLoginArgs {
     /// waits for the callback — useful on headless hosts.
     #[arg(long, help = "Do not invoke a browser; print the URL only")]
     pub no_browser: bool,
+    /// Skip the localhost callback server entirely and accept the full
+    /// redirect URL or bare authorization code pasted from the browser.
+    /// Use this on locked-down Windows desktops where firewall rules,
+    /// browser isolation, or enterprise endpoint software blocks the
+    /// localhost callback, or in any environment where binding
+    /// 127.0.0.1:1455 is not possible.
+    #[arg(
+        long,
+        help = "Skip localhost callback; paste redirect URL or code instead (Windows/locked-down)"
+    )]
+    pub manual: bool,
 }
 
 #[derive(Debug, Args)]
@@ -347,20 +358,20 @@ pub async fn handle_auth_command(command: &AuthCommand) -> squeezy_core::Result<
         AuthCommand::Remove(args) => handle_auth_remove(args),
         AuthCommand::Status(args) => handle_auth_status(args),
         AuthCommand::Anthropic { command } => handle_anthropic_oauth(command).await,
-        AuthCommand::OpenAiCodex { command } => handle_openai_codex_command(command),
+        AuthCommand::OpenAiCodex { command } => handle_openai_codex_command(command).await,
         AuthCommand::GitHubCopilot { command } => handle_github_copilot_command(command),
     }
 }
 
-fn handle_openai_codex_command(command: &OpenAiCodexCommand) -> squeezy_core::Result<()> {
+async fn handle_openai_codex_command(command: &OpenAiCodexCommand) -> squeezy_core::Result<()> {
     match command {
-        OpenAiCodexCommand::Login(args) => handle_openai_codex_login(args),
+        OpenAiCodexCommand::Login(args) => handle_openai_codex_login(args).await,
         OpenAiCodexCommand::Logout => handle_openai_codex_logout(),
         OpenAiCodexCommand::Status => handle_openai_codex_status(),
     }
 }
 
-fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Result<()> {
+async fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Result<()> {
     let auth_path = codex_auth_file_path().ok_or_else(|| {
         SqueezyError::Config(
             "could not determine ~/.squeezy auth directory; \
@@ -373,47 +384,119 @@ fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Resul
         .clone()
         .unwrap_or_else(|| "squeezy".to_string());
     let no_browser = args.no_browser;
-
-    // Construct a runtime explicitly so this stays runnable from the
-    // non-async `handle_auth_command` entry point without changing
-    // the trait signature.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| SqueezyError::Config(format!("tokio runtime build failed: {err}")))?;
+    let manual = args.manual;
 
     let auth_path_for_login = auth_path.clone();
-    let outcome: OpenAiCodexLoginOutcome = runtime.block_on(async move {
-        login_openai_codex_interactive(&originator, &auth_path_for_login, |url| {
-            eprintln!("Open this URL in your browser to sign in to ChatGPT Plus/Pro:");
-            eprintln!();
-            eprintln!("    {url}");
-            eprintln!();
-            if no_browser {
-                eprintln!("(--no-browser: not launching a browser; waiting for callback…)");
-                return Ok(());
-            }
-            match open_browser(url) {
-                Ok(()) => {
+
+    // Shared paste-input reader: used by both the --manual path and the
+    // auto-fallback path inside login_openai_codex_with_auto_fallback.
+    let read_paste_input = || {
+        eprint!("Paste redirect URL or code: ");
+        let _ = io::stderr().flush();
+        let mut buf = String::new();
+        BufReader::new(io::stdin())
+            .read_line(&mut buf)
+            .map_err(|err| {
+                SqueezyError::Config(format!("failed to read authorization input: {err}"))
+            })?;
+        Ok(buf)
+    };
+
+    let outcome: OpenAiCodexLoginOutcome = if manual {
+        // --manual: skip the localhost listener entirely and accept a
+        // pasted redirect URL or bare code. Useful on Windows when the
+        // firewall or browser isolation blocks 127.0.0.1:1455.
+        login_openai_codex_manual(
+            &originator,
+            &auth_path_for_login,
+            |url| {
+                eprintln!("Open this URL in your browser to sign in to ChatGPT Plus/Pro:");
+                eprintln!();
+                eprintln!("    {url}");
+                eprintln!();
+                eprintln!("After approving the consent screen, paste the full redirect URL");
+                eprintln!("  (http://localhost:1455/auth/callback?code=…&state=…) or the");
+                eprintln!("  bare authorization code here:");
+                if !no_browser {
+                    if !try_open_browser(url) {
+                        eprintln!("Could not launch browser. Copy the URL above.");
+                    }
+                } else {
+                    eprintln!("(--no-browser: not launching a browser)");
+                }
+                Ok(())
+            },
+            read_paste_input,
+        )
+        .await?
+    } else {
+        // Interactive path with automatic in-session fallback:
+        // - Show the URL and try to open a browser.
+        // - Bind 127.0.0.1:1455 and wait for the OAuth callback.
+        // - On port bind failure or timeout, fall back to the paste flow
+        //   in the same invocation, reusing the same URL so the user
+        //   does not need to start over.
+        login_openai_codex_with_auto_fallback(
+            &originator,
+            &auth_path_for_login,
+            |url| {
+                eprintln!("Open this URL in your browser to sign in to ChatGPT Plus/Pro:");
+                eprintln!();
+                eprintln!("    {url}");
+                eprintln!();
+                eprintln!(
+                    "Squeezy is listening for the OAuth callback on \
+                     http://localhost:1455/auth/callback"
+                );
+                #[cfg(target_os = "windows")]
+                eprintln!(
+                    "(Windows: if your browser or firewall blocks localhost callbacks, \
+                     squeezy will automatically fall back to the paste flow)"
+                );
+                if no_browser {
+                    eprintln!("(--no-browser: not launching a browser; waiting for callback…)");
+                    return Ok(());
+                }
+                if !try_open_browser(url) {
+                    eprintln!("Could not launch browser. Open the URL above manually.");
+                    eprintln!(
+                        "Waiting for the callback on port 1455, or it will fall back \
+                         to the paste flow after {} seconds.",
+                        squeezy_llm::OPENAI_CODEX_INTERACTIVE_LOGIN_TIMEOUT_SECS
+                    );
+                } else {
                     eprintln!("Browser launched. Waiting for callback…");
                 }
-                Err(err) => {
-                    eprintln!("Could not launch browser ({err}). Open the URL manually.");
-                }
-            }
-            Ok(())
-        })
-        .await
-    })?;
+                Ok(())
+            },
+            |url, reason| {
+                eprintln!();
+                eprintln!(
+                    "Falling back to paste flow ({reason}). \
+                     Open this authorize URL in your browser if it is not already open:"
+                );
+                eprintln!("    {url}");
+                eprintln!();
+                eprintln!("After approving, paste the full redirect URL or bare code here:");
+            },
+            read_paste_input,
+        )
+        .await?
+    };
 
     let expires_in = expires_in_human(outcome.expires_at_unix_ms);
+    #[cfg(unix)]
+    let protection_note = " (mode 0600)";
+    #[cfg(not(unix))]
+    let protection_note = " (file-backed; verify ACLs on shared/enterprise profiles)";
     println!(
-        "signed in to ChatGPT (account {}); token saved to {}{}",
+        "signed in to ChatGPT (account {}); token saved to {}{}{}",
         outcome.account_id,
         outcome.auth_file.display(),
         expires_in
             .map(|s| format!("; access token valid for ~{s}"))
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        protection_note
     );
     Ok(())
 }
@@ -556,6 +639,13 @@ fn handle_github_copilot_login(args: &GitHubCopilotLoginArgs) -> squeezy_core::R
             eprintln!("--no-browser: not launching a browser; waiting for authorization…");
             return;
         }
+        if is_headless_linux() {
+            eprintln!(
+                "(headless Linux: no DISPLAY or WAYLAND_DISPLAY detected; \
+                 open the URL above in a browser on another machine and enter the device code)"
+            );
+            return;
+        }
         match open_browser(url) {
             Ok(()) => eprintln!("Browser launched. Waiting for authorization…"),
             Err(err) => eprintln!(
@@ -694,6 +784,13 @@ fn expires_in_human(expires_at_unix_ms: u64) -> Option<String> {
 /// `open` on macOS, `xdg-open` on Linux, `cmd /C start` on Windows.
 /// Falls back to an explicit error so the caller can print the URL
 /// for the user to open manually.
+///
+/// On Linux this delegates to [`try_open_browser`] so both code paths
+/// share the same fallback ladder (xdg-open → gio open →
+/// sensible-browser), stdio suppression, and exit-status check.
+/// The old single-launcher path silently returned `Ok(())` even when
+/// `xdg-open` exited with a non-zero status, which produced a
+/// misleading "Browser launched" message on headless/minimal systems.
 fn open_browser(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -702,8 +799,14 @@ fn open_browser(url: &str) -> std::io::Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        std::process::Command::new("xdg-open").arg(url).status()?;
-        Ok(())
+        if try_open_browser(url) {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no working browser launcher found (tried xdg-open, gio open, sensible-browser)",
+            ))
+        }
     }
     #[cfg(target_os = "windows")]
     {
@@ -719,6 +822,26 @@ fn open_browser(url: &str) -> std::io::Result<()> {
             std::io::ErrorKind::Unsupported,
             "no browser launcher for this platform",
         ))
+    }
+}
+
+/// Returns `true` on Linux when no display or browser environment is
+/// present — a reliable signal that the process is running in an SSH
+/// session, container, CI runner, or other headless environment where
+/// launching a desktop browser will silently fail.
+///
+/// Checks `$DISPLAY` (X11), `$WAYLAND_DISPLAY`, and `$BROWSER`
+/// (explicit override).  Always returns `false` on non-Linux platforms.
+fn is_headless_linux() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        env::var_os("DISPLAY").is_none()
+            && env::var_os("WAYLAND_DISPLAY").is_none()
+            && env::var_os("BROWSER").is_none()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }
 
@@ -1141,12 +1264,19 @@ struct StatusRow {
     env_set: bool,
     fallback_env_var: Option<&'static str>,
     fallback_env_set: bool,
+    /// Whether the inline key lives in a file-backed TOML tier (as
+    /// opposed to an env var). On Windows this is reported as
+    /// "file-backed" to distinguish it from a Credential Manager entry
+    /// that does not exist yet.
+    credentials_file_set: bool,
 }
 
 impl StatusRow {
     fn effective_source(&self) -> &'static str {
         if self.inline_tier.is_some() {
             "inline"
+        } else if self.credentials_file_set {
+            "credentials.json"
         } else if self.env_set {
             "env"
         } else if self.fallback_env_set {
@@ -1154,6 +1284,14 @@ impl StatusRow {
         } else {
             "missing"
         }
+    }
+
+    /// Whether the active key is file-backed rather than sourced from an
+    /// environment variable or a credential manager. On Windows this
+    /// distinction matters because file-backed keys are not protected by
+    /// DPAPI or Windows Credential Manager.
+    fn is_file_backed(&self) -> bool {
+        self.inline_tier.is_some() || self.credentials_file_set
     }
 
     fn to_json(&self) -> serde_json::Value {
@@ -1166,7 +1304,9 @@ impl StatusRow {
             "env_set": self.env_set,
             "fallback_env_var": self.fallback_env_var,
             "fallback_env_set": self.fallback_env_set,
+            "credentials_file_set": self.credentials_file_set,
             "effective_source": self.effective_source(),
+            "file_backed": self.is_file_backed(),
         })
     }
 }
@@ -1203,6 +1343,11 @@ fn compute_status_row(
         .and_then(env_lookup)
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
+    // Check if the provider key is available through credentials.json so
+    // `auth status` can distinguish "env-backed" from "file-backed" entries.
+    // We re-use the same env_var name the resolution chain uses.
+    let credentials_file_set =
+        squeezy_llm::resolve_api_key_from_credentials_file(provider.env).is_some();
     StatusRow {
         provider: provider.cli,
         section: provider.section,
@@ -1212,6 +1357,7 @@ fn compute_status_row(
         env_set,
         fallback_env_var: provider.fallback_env,
         fallback_env_set,
+        credentials_file_set,
     }
 }
 
@@ -1241,12 +1387,14 @@ fn print_status_table(rows: &[StatusRow]) {
             (Some(tier), Some(path)) => format!("{} ({})", tier.as_str(), path.display()),
             _ => "-".to_string(),
         };
-        grid.push([
-            row.provider.to_string(),
-            row.effective_source().to_string(),
-            env_cell,
-            inline_cell,
-        ]);
+        // On Windows, annotate file-backed sources so users know the key
+        // is not protected by Windows Credential Manager or DPAPI.
+        let source_cell = if cfg!(windows) && row.is_file_backed() {
+            format!("{} [file-backed]", row.effective_source())
+        } else {
+            row.effective_source().to_string()
+        };
+        grid.push([row.provider.to_string(), source_cell, env_cell, inline_cell]);
     }
     print_table_rows(&grid);
 }
@@ -1295,7 +1443,13 @@ async fn run_anthropic_oauth_login(args: &AnthropicLoginArgs) -> squeezy_core::R
     writeln!(stdout, "  Authorize URL:")?;
     writeln!(stdout, "    {authorize_url}")?;
     if !args.no_browser {
-        if try_open_browser(&authorize_url) {
+        if is_headless_linux() {
+            writeln!(
+                stdout,
+                "  (headless Linux: no DISPLAY or WAYLAND_DISPLAY detected; \
+                 open the URL above in a browser on another machine)"
+            )?;
+        } else if try_open_browser(&authorize_url) {
             writeln!(stdout, "  Opened the authorize URL in your browser.")?;
         } else {
             writeln!(
@@ -1339,8 +1493,15 @@ async fn run_anthropic_oauth_login(args: &AnthropicLoginArgs) -> squeezy_core::R
     let now_ms = current_unix_ms();
     let tokens = PersistedTokens::from_token_response(&response, now_ms);
     squeezy_llm::oauth_anthropic_write_tokens(&storage_path, &tokens)?;
+    #[cfg(unix)]
     println!(
         "Saved Anthropic OAuth tokens to {} (mode 0600).",
+        storage_path.display()
+    );
+    #[cfg(not(unix))]
+    println!(
+        "Saved Anthropic OAuth tokens to {} \
+         (file-backed; verify ACLs on shared or enterprise-managed profiles).",
         storage_path.display()
     );
     Ok(())

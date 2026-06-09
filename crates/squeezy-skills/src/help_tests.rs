@@ -403,7 +403,9 @@ fn slash_help_theme_answers_locally() {
     let body = answer.render_markdown();
     assert!(body.contains("## /theme"), "{body}");
     assert!(body.contains("Syntax:"), "{body}");
-    assert!(body.contains("starlight"), "{body}");
+    assert!(body.contains("catppuccin"), "{body}");
+    assert!(body.contains("high-contrast"), "{body}");
+    assert!(body.contains("Requires: [edit]"), "{body}");
 }
 
 #[test]
@@ -494,17 +496,46 @@ fn relevant_docs_for_input_scopes_corpus() {
         bundled_docs().len()
     );
 
-    // Unknown topic falls back to full corpus.
-    let unknown_docs = relevant_docs_for_input("/help quantum billing rules");
+    // Completely unknown topic (no lexical evidence) falls back to full corpus.
+    // Use terms that are guaranteed not to appear in any bundled doc so the
+    // zero-score fallback path is exercised.
+    let unknown_docs = relevant_docs_for_input("/help xylophone kazoo fluorescent");
     assert_eq!(
         unknown_docs.len(),
         bundled_docs().len(),
-        "unknown-topic corpus must be the full corpus so DocHelp has maximum coverage"
+        "truly unknown-topic corpus must be the full corpus so DocHelp has maximum coverage: \
+         got {} docs, full corpus is {}",
+        unknown_docs.len(),
+        bundled_docs().len()
     );
     assert!(
         unknown_docs
             .iter()
             .any(|d| d.path == "docs/external/AGENT_APPROACH.md"),
         "full corpus must contain AGENT_APPROACH.md"
+    );
+
+    // Lexically-matchable unknown topic (e.g. mentions "provider" or "model"
+    // keywords that appear in docs) should return fewer than the full corpus.
+    // This tests the top-K lexical scorer path.
+    let partial_docs = relevant_docs_for_input("/help provider model configuration");
+    assert!(
+        partial_docs
+            .iter()
+            .any(|d| d.path == "docs/external/README.md"),
+        "lexical fallback must always include anchor README.md"
+    );
+    assert!(
+        partial_docs
+            .iter()
+            .any(|d| d.path == "docs/external/AGENT_APPROACH.md"),
+        "lexical fallback must always include anchor AGENT_APPROACH.md"
+    );
+    assert!(
+        partial_docs.len() < bundled_docs().len(),
+        "lexical fallback for a topic with keyword evidence ({} docs) must be smaller than the \
+         full corpus ({} docs) — regression: scorer is returning the full corpus",
+        partial_docs.len(),
+        bundled_docs().len()
     );
 }
