@@ -1535,8 +1535,9 @@ pub fn plan_mode_shell_command_is_read_only(command: &str) -> bool {
 }
 
 pub(crate) fn is_read_only_shell_segment(segment: &str) -> bool {
-    matches!(
-        shell_command_prefix(segment).as_str(),
+    let prefix = shell_command_prefix(segment);
+    if matches!(
+        prefix.as_str(),
         "cat"
             | "du"
             | "echo"
@@ -1557,6 +1558,88 @@ pub(crate) fn is_read_only_shell_segment(segment: &str) -> bool {
             | "wc"
             | "which"
             | "whoami"
+    ) {
+        return true;
+    }
+    // Windows PowerShell and cmd.exe read-only commands. These appear when
+    // Squeezy runs on Windows or analyses commands submitted via the shell
+    // tool. Including them avoids unnecessary AI-reviewer round-trips for
+    // safe exploration commands.
+    //
+    // IMPORTANT: Only classify as read-only when the segment contains no
+    // output-redirect flags (-OutFile, -FilePath, -Encoding with -OutFile,
+    // etc.). Many PowerShell exploration cmdlets accept -OutFile which turns
+    // them into file-writing operations.
+    if windows_segment_has_output_flag(segment) {
+        return false;
+    }
+    is_read_only_windows_segment(&prefix)
+}
+
+/// True when the PowerShell segment contains a flag that redirects output
+/// to a file, making the command a writer rather than a pure reader.
+fn windows_segment_has_output_flag(segment: &str) -> bool {
+    let lower = segment.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    tokens.iter().any(|tok| {
+        matches!(
+            *tok,
+            "-outfile"
+                | "-filepath"
+                | "-literalpath"
+                | "-destination"
+                | "-destinationpath"
+                | "-append"
+        )
+    })
+}
+
+/// True when `prefix` is a PowerShell or cmd.exe command whose default
+/// behaviour is read-only exploration. Commands that accept an `-OutFile` or
+/// output-redirect variant are only accepted here when they have no such flag
+/// (callers pass the already-extracted prefix, not the full segment, so
+/// flag-level checking is not done here — the conservative default is that an
+/// unknown flag keeps the command out of this fast path).
+fn is_read_only_windows_segment(prefix: &str) -> bool {
+    matches!(
+        prefix.to_ascii_lowercase().as_str(),
+        // PowerShell exploration cmdlets and unambiguous built-in aliases.
+        "get-childitem"
+            | "gci"
+            // `dir` is a PowerShell alias for Get-ChildItem as well as the
+            // cmd.exe directory listing command; both are read-only.
+            | "dir"
+            | "get-content"
+            | "get-item"
+            | "get-location"
+            | "get-process"
+            | "get-service"
+            | "get-command"
+            | "get-help"
+            | "help"
+            | "get-member"
+            | "get-variable"
+            | "get-history"
+            | "get-alias"
+            | "select-string"
+            | "sls"
+            | "measure-object"
+            | "select-object"
+            | "where-object"
+            | "format-list"
+            | "fl"
+            | "format-table"
+            | "ft"
+            | "format-wide"
+            | "out-string"
+            | "test-path"
+            | "resolve-path"
+            // cmd.exe read-only commands not already in the POSIX list.
+            | "type"
+            | "ver"
+            | "vol"
+            | "ipconfig"
+            | "systeminfo"
     )
 }
 
@@ -1785,9 +1868,14 @@ fn is_valid_var_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Substitute `$VAR` / `${VAR}` from the process environment. An unresolved
-/// variable is left literal (with its `$`) so the caller can treat it as an
-/// unverifiable — and therefore out-of-workspace — target.
+/// Substitute `$VAR` / `${VAR}` / `$env:VAR` / `${env:VAR}` / `%VAR%` from
+/// the process environment. An unresolved variable is left literal (with its
+/// `$` or `%…%`) so the caller can treat it as an unverifiable — and
+/// therefore out-of-workspace — target.
+///
+/// Handles the PowerShell-specific `$env:VARNAME` and `${env:VARNAME}`
+/// provider syntax (Bug 3): these are lowercased to the environment variable
+/// name after the colon and resolved the same way as `$VARNAME`.
 fn expand_env_vars(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -1836,34 +1924,75 @@ fn expand_env_vars(input: &str) -> String {
                     }
                     name.push(nc);
                 }
-                match std::env::var(&name) {
-                    Ok(val) if closed && is_valid_var_name(&name) => out.push_str(&val),
-                    _ => {
-                        out.push_str("${");
-                        out.push_str(&name);
-                        if closed {
-                            out.push('}');
-                        }
+                if closed {
+                    // PowerShell `${env:VARNAME}` provider syntax.
+                    let resolved_name =
+                        powershell_env_provider_var(&name).unwrap_or_else(|| name.clone());
+                    if is_valid_var_name(&resolved_name)
+                        && let Ok(val) = std::env::var(&resolved_name)
+                    {
+                        out.push_str(&val);
+                        continue;
                     }
+                }
+                out.push_str("${");
+                out.push_str(&name);
+                if closed {
+                    out.push('}');
                 }
             }
             Some(c2) if c2.is_ascii_alphabetic() || c2 == '_' => {
                 let mut name = String::new();
                 while let Some(&nc) = chars.peek() {
-                    if nc.is_ascii_alphanumeric() || nc == '_' {
+                    if nc.is_ascii_alphanumeric() || nc == '_' || nc == ':' {
                         name.push(nc);
                         chars.next();
+                        // Stop after reading a single `:` in PowerShell
+                        // provider form (`$env:VAR`) — only one colon is
+                        // valid; anything after it is the variable name.
+                        if nc == ':' {
+                            break;
+                        }
                     } else {
                         break;
                     }
                 }
-                match std::env::var(&name) {
+                // Handle `$env:VARNAME` — consume the rest of the var name
+                // after the colon.
+                let env_var_name = if name.ends_with(':') {
+                    let mut rest = String::new();
+                    while let Some(&nc) = chars.peek() {
+                        if nc.is_ascii_alphanumeric() || nc == '_' {
+                            rest.push(nc);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    // For `$env:VARNAME` resolve VARNAME from environment.
+                    if name.eq_ignore_ascii_case("env:") && !rest.is_empty() {
+                        rest
+                    } else {
+                        // Unknown provider — leave literal.
+                        out.push('$');
+                        out.push_str(&name);
+                        out.push_str(&rest);
+                        continue;
+                    }
+                } else {
+                    name.clone()
+                };
+
+                match std::env::var(&env_var_name) {
                     Ok(val) => out.push_str(&val),
                     // Leave the literal `$NAME`; a remaining `$` signals an
                     // unverifiable target to the workspace-escape check.
                     Err(_) => {
                         out.push('$');
                         out.push_str(&name);
+                        if env_var_name != name {
+                            out.push_str(&env_var_name);
+                        }
                     }
                 }
             }
@@ -1871,6 +2000,29 @@ fn expand_env_vars(input: &str) -> String {
         }
     }
     out
+}
+
+/// Extract the variable name from a PowerShell `${env:VARNAME}` brace form.
+/// Returns `Some("VARNAME")` when the prefix is `env:` (case-insensitive).
+fn powershell_env_provider_var(brace_content: &str) -> Option<String> {
+    // "env:" is always 4 ASCII bytes regardless of case.
+    const ENV_PREFIX_LEN: usize = 4;
+    if brace_content.len() <= ENV_PREFIX_LEN {
+        return None;
+    }
+    let (prefix, var_name) = brace_content.split_at(ENV_PREFIX_LEN);
+    if !prefix.eq_ignore_ascii_case("env:") {
+        return None;
+    }
+    if !var_name.is_empty()
+        && var_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        Some(var_name.to_string())
+    } else {
+        None
+    }
 }
 
 /// True when `path` still contains an unresolved shell variable after

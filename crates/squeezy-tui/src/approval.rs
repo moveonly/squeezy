@@ -167,6 +167,38 @@ fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) 
     if let Some(binary) = permission.metadata.get("binary") {
         lines.push(dim(format!("binary {binary}")));
     }
+    // Show Windows sandbox posture when approval remains the boundary for
+    // reads/network or for all filesystem access.
+    let windows_posture = permission
+        .metadata
+        .get("windows_sandbox_posture")
+        .map(String::as_str)
+        .or_else(|| {
+            permission
+                .metadata
+                .get("windows_no_fs_sandbox")
+                .is_some_and(|v| v == "true")
+                .then_some("job-object-only")
+        });
+    if let Some(text) = match windows_posture {
+        Some("job-object-only") => {
+            Some("Windows: no filesystem/network sandbox; approval is the enforcement boundary")
+        }
+        Some("restricted-token-writes-only") => {
+            Some("Windows: write sandbox only; reads/network are not isolated")
+        }
+        _ => None,
+    } {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                text,
+                Style::default()
+                    .fg(crate::render::theme::red())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
 }
 
 fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {

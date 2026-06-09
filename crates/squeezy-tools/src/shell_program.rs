@@ -20,6 +20,12 @@ pub(crate) struct ShellProgram {
     pub display_name: String,
 }
 
+/// Cached Windows shell binary path resolved once per process. Stores just
+/// the resolved program path (not the command-specific args) because args
+/// always include the user command which differs per call.
+#[cfg(windows)]
+static WINDOWS_SHELL_BINARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 impl ShellProgram {
     /// Resolve the shell program + arguments to run `command`.
     ///
@@ -50,7 +56,7 @@ impl ShellProgram {
         }
         #[cfg(windows)]
         {
-            Self::windows_default(command)
+            Self::windows_default_cached(command)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -156,41 +162,61 @@ impl ShellProgram {
         }
     }
 
+    /// Cached version of `windows_default`: resolves the binary path once via
+    /// PATH probing and reuses it for subsequent calls in the same session.
     #[cfg(windows)]
-    fn windows_default(command: &str) -> Self {
-        // Resolve and cache the default shell binary per process.  `which`
-        // probes PATH on every call; caching the resolved path avoids repeated
-        // filesystem lookups in shell-heavy sessions while still picking up a
-        // newly installed shell after a restart.
-        static CACHED: OnceLock<(String, &'static str)> = OnceLock::new();
-        let (program, display_name) = CACHED.get_or_init(|| {
-            if let Ok(pwsh) = which::which("pwsh") {
-                return (pwsh.to_string_lossy().into_owned(), "pwsh");
+    fn windows_default_cached(command: &str) -> Self {
+        let binary = WINDOWS_SHELL_BINARY.get_or_init(Self::resolve_windows_shell_binary);
+        Self::windows_shell_with_binary(binary, command)
+    }
+
+    /// Probe PATH for the best available Windows shell binary.
+    #[cfg(windows)]
+    fn resolve_windows_shell_binary() -> String {
+        if let Ok(pwsh) = which::which("pwsh") {
+            return pwsh.to_string_lossy().into_owned();
+        }
+        if let Ok(powershell) = which::which("powershell") {
+            return powershell.to_string_lossy().into_owned();
+        }
+        "cmd.exe".to_string()
+    }
+
+    /// Build a `ShellProgram` for the given cached binary path and command.
+    #[cfg(windows)]
+    fn windows_shell_with_binary(binary: &str, command: &str) -> Self {
+        let lower = binary.to_ascii_lowercase();
+        let display_name = std::path::Path::new(binary)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(binary)
+            .to_string();
+        if lower == "pwsh"
+            || lower == "powershell"
+            || lower.ends_with("pwsh.exe")
+            || lower.ends_with("powershell.exe")
+        {
+            Self {
+                program: binary.to_string(),
+                args: vec![
+                    "-NoLogo".to_string(),
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    command.to_string(),
+                ],
+                display_name,
             }
-            if let Ok(powershell) = which::which("powershell") {
-                return (powershell.to_string_lossy().into_owned(), "powershell");
-            }
-            ("cmd.exe".to_string(), "cmd.exe")
-        });
-        let args = if display_name.starts_with("pwsh") || display_name.starts_with("powershell") {
-            vec![
-                "-NoLogo".to_string(),
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                command.to_string(),
-            ]
         } else {
-            vec![
-                "/D".to_string(),
-                "/S".to_string(),
-                "/C".to_string(),
-                command.to_string(),
-            ]
-        };
-        Self {
-            program: program.clone(),
-            args,
-            display_name: display_name.to_string(),
+            Self {
+                program: binary.to_string(),
+                args: vec![
+                    "/D".to_string(),
+                    "/S".to_string(),
+                    "/C".to_string(),
+                    command.to_string(),
+                ],
+                display_name,
+            }
         }
     }
 

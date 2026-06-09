@@ -7166,6 +7166,75 @@ fn approval_status_line_is_compact_single_line() {
     assert!(line.contains("target=shell:*"));
 }
 
+#[test]
+fn windows_restricted_token_posture_warns_without_claiming_no_fs_sandbox() {
+    let mut request = sample_approval_request();
+    request.permission.capability = PermissionCapability::Shell;
+    request.permission.target = "pwsh:*".to_string();
+    request
+        .permission
+        .metadata
+        .insert("shell_prefix".to_string(), "pwsh:*".to_string());
+    request.permission.metadata.insert(
+        "windows_sandbox_posture".to_string(),
+        "restricted-token-writes-only".to_string(),
+    );
+
+    let prompt = format_approval_prompt(&request);
+    assert!(
+        prompt.contains("Windows: write sandbox only; reads/network are not isolated"),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains("no filesystem/network sandbox"),
+        "{prompt}"
+    );
+
+    let line = format_approval_status_line(&request);
+    assert!(
+        line.contains("sandbox=restricted-token-writes-only"),
+        "{line}"
+    );
+
+    let labels = approval_options_for(&request)
+        .into_iter()
+        .map(|option| option.label.into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("Windows reads/network not isolated")),
+        "{labels:?}"
+    );
+}
+
+#[test]
+fn windows_broad_shell_warning_handles_resolved_binary_paths() {
+    let mut request = sample_approval_request();
+    request.permission.capability = PermissionCapability::Shell;
+    request.permission.target = "pwsh:*".to_string();
+    request.permission.metadata.insert(
+        "shell_prefix".to_string(),
+        r"C:\Program Files\PowerShell\7\pwsh.exe:*".to_string(),
+    );
+    request.permission.metadata.insert(
+        "windows_sandbox_posture".to_string(),
+        "job-object-only".to_string(),
+    );
+
+    let labels = approval_options_for(&request)
+        .into_iter()
+        .map(|option| option.label.into_owned())
+        .collect::<Vec<_>>();
+
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("job-object-only Windows shell")),
+        "{labels:?}"
+    );
+}
+
 #[tokio::test]
 async fn approval_menu_uses_arrows_and_enter_for_repo_rule() {
     let mut app = test_app(SessionMode::Build);

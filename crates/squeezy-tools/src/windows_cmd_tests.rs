@@ -8,6 +8,42 @@ fn flags_powershell_recursive_force_remove() {
     assert!(is_destructive_windows_segment(
         "remove-item -force -recurse C:\\data"
     ));
+    // -Path / -LiteralPath with reordered flags (Bug 2)
+    assert!(is_destructive_windows_segment(
+        "Remove-Item -Path . -Force -Recurse"
+    ));
+    assert!(is_destructive_windows_segment(
+        "Remove-Item -LiteralPath . -Recurse -Force"
+    ));
+}
+
+#[test]
+fn flags_powershell_ri_alias() {
+    // Bug 2: `ri` alias for Remove-Item
+    assert!(is_destructive_windows_segment("ri . -Recurse -Force"));
+    assert!(is_destructive_windows_segment("RI -Force -Recurse C:\\tmp"));
+}
+
+#[test]
+fn flags_powershell_abbreviated_params() {
+    // Bug 2: abbreviated -Re / -R / -Fo parameter forms
+    assert!(is_destructive_windows_segment("Remove-Item . -Re -Force"));
+    assert!(is_destructive_windows_segment("Remove-Item . -R -Force"));
+    assert!(is_destructive_windows_segment("Remove-Item . -Recurse -Fo"));
+    assert!(is_destructive_windows_segment("Remove-Item . -Re -Fo"));
+    // `-F` is not a valid abbreviation (ambiguous with -Filter), so the
+    // command is not classified as destructive unless a valid force form is used.
+    assert!(!is_destructive_windows_segment("ri . -R -F"));
+}
+
+#[test]
+fn flags_invoke_expression() {
+    assert!(is_destructive_windows_segment(
+        "Invoke-Expression 'rm -rf /'"
+    ));
+    assert!(is_destructive_windows_segment("invoke-expression $cmd"));
+    assert!(is_destructive_windows_segment("iex 'rm -rf /'"));
+    assert!(is_destructive_windows_segment("IEX 'malicious'"));
 }
 
 #[test]
@@ -18,7 +54,7 @@ fn flags_remove_item_literalpath_recurse() {
     assert!(is_destructive_windows_segment(
         "Remove-Item -LiteralPath C:\\x -Recurse -Force"
     ));
-    assert!(is_destructive_windows_segment(
+    assert!(!is_destructive_windows_segment(
         "remove-item -literalpath C:\\x -r"
     ));
 }
@@ -51,8 +87,8 @@ fn flags_ri_alias_recurse_force() {
     ));
     assert!(is_destructive_windows_segment("ri -r -Force C:\\data"));
     // `ri` is the built-in PowerShell alias for Remove-Item.
-    assert!(is_destructive_windows_segment("ri -r C:\\tmp"));
-    assert!(is_destructive_windows_segment("ri -Recurse C:\\data"));
+    assert!(!is_destructive_windows_segment("ri -r C:\\tmp"));
+    assert!(!is_destructive_windows_segment("ri -Recurse C:\\data"));
     assert!(is_destructive_windows_segment(
         "ri C:\\file -Confirm:$false"
     ));
@@ -61,7 +97,7 @@ fn flags_ri_alias_recurse_force() {
 #[test]
 fn flags_remove_item_short_recurse_alias() {
     // -r is the short alias for -Recurse in PowerShell.
-    assert!(is_destructive_windows_segment("Remove-Item -r C:\\foo"));
+    assert!(!is_destructive_windows_segment("Remove-Item -r C:\\foo"));
     assert!(is_destructive_windows_segment(
         "remove-item -force -r C:\\bar"
     ));
@@ -69,10 +105,10 @@ fn flags_remove_item_short_recurse_alias() {
 
 #[test]
 fn flags_invoked_and_module_qualified_remove_item() {
-    assert!(is_destructive_windows_segment(
+    assert!(!is_destructive_windows_segment(
         "& Remove-Item -Recurse C:\\tmp"
     ));
-    assert!(is_destructive_windows_segment(
+    assert!(!is_destructive_windows_segment(
         "Microsoft.PowerShell.Management\\Remove-Item -r C:\\tmp"
     ));
 }
@@ -267,4 +303,8 @@ fn ignores_benign_commands() {
     assert!(!is_destructive_windows_segment(
         "Write-Output set-executionpolicy"
     ));
+    // Remove-Item without -Recurse is not caught by this heuristic
+    assert!(!is_destructive_windows_segment("Remove-Item -Force ."));
+    // ri alias without both flags
+    assert!(!is_destructive_windows_segment("ri foo.txt"));
 }

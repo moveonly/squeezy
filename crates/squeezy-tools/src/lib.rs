@@ -2459,6 +2459,43 @@ impl ToolRegistry {
                     "sandbox_write_roots".to_string(),
                     path_list_metadata(&self.shell_sandbox.write_roots),
                 );
+                // Surface the effective Windows sandbox posture to the
+                // approval UI. The default restricted-token tier enforces
+                // workspace write boundaries, but it does not isolate reads or
+                // network. Disabled/off mode is only Job Object cleanup.
+                #[cfg(target_os = "windows")]
+                {
+                    use squeezy_core::WindowsSandboxLevel;
+                    let posture = match self.shell_sandbox.mode {
+                        ShellSandboxMode::External => None,
+                        ShellSandboxMode::Off => Some("job-object-only"),
+                        ShellSandboxMode::Required | ShellSandboxMode::BestEffort => {
+                            match self.shell_sandbox.windows_sandbox_level {
+                                WindowsSandboxLevel::Disabled => Some("job-object-only"),
+                                WindowsSandboxLevel::RestrictedToken => {
+                                    Some("restricted-token-writes-only")
+                                }
+                                WindowsSandboxLevel::Elevated
+                                    if squeezy_win_sandbox::elevated_setup_is_complete(
+                                        &crate::win_sandbox_spec::win_state_dir(),
+                                    ) =>
+                                {
+                                    None
+                                }
+                                WindowsSandboxLevel::Elevated => {
+                                    Some("restricted-token-writes-only")
+                                }
+                            }
+                        }
+                    };
+                    if let Some(posture) = posture {
+                        metadata.insert("windows_sandbox_posture".to_string(), posture.to_string());
+                        if posture == "job-object-only" {
+                            metadata
+                                .insert("windows_no_fs_sandbox".to_string(), "true".to_string());
+                        }
+                    }
+                }
                 if let Some(timeout_ms) = args.as_ref().and_then(|args| args.timeout_ms) {
                     metadata.insert("timeout_ms".to_string(), timeout_ms.to_string());
                 }

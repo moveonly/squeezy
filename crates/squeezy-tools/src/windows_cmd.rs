@@ -3,13 +3,14 @@
 //! Windows commands would otherwise be reported as `Shell` + `dynamic =
 //! true` (high risk, not destructive) which is too permissive for things
 //! like `Remove-Item -Recurse -Force` or `del /S /F /Q`. This module
-//! pattern-matches a short list of unambiguous destructive shapes so they
-//! escalate to `Destructive` + `Critical`. Unknown commands keep the
-//! conservative `Shell` + `dynamic = true` fallback.
+//! pattern-matches a known set of destructive shapes so they escalate to
+//! `Destructive` + `Critical`. Unknown commands keep the conservative
+//! `Shell` + `dynamic = true` fallback.
 
 /// True when `segment` is recognised as a destructive Windows shell
-/// command. The matching is intentionally narrow: a benign command must
-/// never trigger.
+/// command. The matching is intentionally conservative: a benign command must
+/// never trigger. The check covers PowerShell cmdlets (including aliases and
+/// unordered / abbreviated parameters) and cmd.exe destructive forms.
 pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     let lower = segment.to_ascii_lowercase();
     // Pre-tokenise once for both PowerShell and cmd.exe checks.
@@ -29,7 +30,7 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
 
     // Remove-Item / ri (PowerShell).
     // Destructive when any of:
-    //   - -Recurse or its short alias -r is present (any parameter position)
+    //   - valid recurse + force parameters are present (any order)
     //   - -Confirm:$false suppresses the safety prompt
     //
     // The `ri` check matches the built-in PowerShell alias; `rm` / `rmdir`
@@ -37,10 +38,15 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     // `destructive_shell_segment_reason`.
     let is_remove_item = command_name == "remove-item" || command_name == "ri";
     if is_remove_item {
-        let has_recurse = tokens.iter().any(|t| *t == "-recurse" || *t == "-r");
-        if has_recurse || lower.contains("-confirm:$false") {
+        if (powershell_has_recurse_flag(&tokens) && powershell_has_force_flag(&tokens))
+            || lower.contains("-confirm:$false")
+            || lower.contains("-confirm=false")
+        {
             return true;
         }
+    }
+    if command_name == "invoke-expression" || command_name == "iex" {
+        return true;
     }
 
     // Other unambiguously destructive PowerShell cmdlets.
@@ -108,6 +114,40 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
     }
 
     false
+}
+
+/// True when the token list contains a `-Recurse` flag or an unambiguous
+/// PowerShell abbreviation of it (`-r`, `-re`, `-rec`, …).
+fn powershell_has_recurse_flag(tokens: &[&str]) -> bool {
+    tokens.iter().skip(1).any(|tok| {
+        let t = tok.to_ascii_lowercase();
+        // Named-parameter-with-value forms: `-Recurse:$true`, `-Recurse:true`
+        if t.starts_with("-recurse") {
+            return true;
+        }
+        // Unambiguous prefix abbreviations of `-Recurse` that don't collide
+        // with other common Remove-Item parameters. `-r` alone maps only to
+        // Recurse in the Remove-Item parameter set.
+        matches!(
+            t.as_str(),
+            "-r" | "-re" | "-rec" | "-recu" | "-recur" | "-recurs"
+        )
+    })
+}
+
+/// True when the token list contains a `-Force` flag or an unambiguous
+/// PowerShell abbreviation of it. `-f` alone is intentionally excluded: in
+/// Remove-Item's parameter set, `-f` is ambiguous between `-Force` and
+/// `-Filter` and PowerShell itself would reject it with an ambiguity error.
+/// `-fo` is the first unambiguous prefix that resolves only to `-Force`.
+fn powershell_has_force_flag(tokens: &[&str]) -> bool {
+    tokens.iter().skip(1).any(|tok| {
+        let t = tok.to_ascii_lowercase();
+        if t.starts_with("-force") {
+            return true;
+        }
+        matches!(t.as_str(), "-fo" | "-for" | "-forc")
+    })
 }
 
 #[cfg(test)]
