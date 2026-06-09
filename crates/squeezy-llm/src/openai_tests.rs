@@ -483,6 +483,44 @@ fn request_body_emits_prompt_cache_retention_24h_for_long_retention() {
 }
 
 #[test]
+fn request_body_omits_prompt_cache_key_when_retention_none_but_key_set() {
+    // Regression guard for the CacheRetention::None bug: when the caller sets
+    // a key via the new CacheSpec.key field but leaves retention at None (the
+    // hard no-cache signal), OpenAI must NOT emit prompt_cache_key. Prior to
+    // the fix it leaked the key onto the wire because the guard only checked
+    // disable_prompt_cache, not effective_cache_retention().
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: crate::CacheSpec {
+            key: Some("should-be-suppressed".to_string()),
+            retention: crate::CacheRetention::None,
+        },
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    assert!(
+        body.get("prompt_cache_key").is_none(),
+        "CacheRetention::None must suppress prompt_cache_key even when a key is set; got: {:?}",
+        body.get("prompt_cache_key")
+    );
+    assert!(body.get("prompt_cache_retention").is_none());
+}
+
+#[test]
 fn request_body_clamps_prompt_cache_key_to_sixty_four_codepoints() {
     // F11 reproducer: a 100-codepoint session id (e.g. a namespaced UUID
     // chain) must clamp to 64 codepoints in the request body. OpenAI
@@ -746,6 +784,36 @@ fn affinity_headers_absent_when_no_cache_key() {
         previous_response_id: None,
         cache_key: None,
         cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+        ..LlmRequest::default()
+    };
+
+    assert!(OpenAiProvider::affinity_headers(&request).is_empty());
+}
+
+#[test]
+fn affinity_headers_absent_when_retention_none_even_with_cache_key() {
+    // CacheRetention::None is the hard no-cache signal. Suppressing the body
+    // prompt_cache_key is not enough; the affinity headers must also stay off
+    // the wire so the request does not carry a cache identity.
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: crate::CacheSpec {
+            key: Some("should-not-route-to-cache".to_string()),
+            retention: crate::CacheRetention::None,
+        },
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

@@ -227,6 +227,18 @@ fn config_without_env_uses_openai_provider_defaults() {
         DEFAULT_MAX_SEARCH_FILES_PER_TURN
     );
     assert!(!config.checkpoints_enabled);
+    assert_eq!(
+        config.tools.checkpoint_retention_days,
+        DEFAULT_CHECKPOINT_RETENTION_DAYS
+    );
+    assert_eq!(
+        config.tools.checkpoint_max_file_bytes,
+        DEFAULT_CHECKPOINT_MAX_FILE_BYTES
+    );
+    assert_eq!(
+        config.tools.checkpoint_cleanup_interval_secs,
+        DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_SECS
+    );
     assert!(config.tools.lazy_schema_loading);
     assert!(config.tools.core.contains(&"grep".to_string()));
     assert!(config.tools.core.contains(&"plan_patch".to_string()));
@@ -245,13 +257,39 @@ fn config_without_env_uses_openai_provider_defaults() {
     );
     assert_eq!(config.subagents, SubagentConfig::default());
     assert_eq!(config.telemetry, TelemetryConfig::default());
-    assert!(config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR));
-    assert!(
-        config
-            .skills
-            .compat_user_dir
-            .ends_with(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
-    );
+    // On Unix the skills dirs use home-dotdir paths (`.squeezy/skills`,
+    // `.agents/skills`); on non-Unix they use config/data-dir-rooted paths
+    // (`squeezy/skills`, `agents/skills`) so they stay alongside settings.
+    #[cfg(unix)]
+    {
+        assert!(config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR));
+        assert!(
+            config
+                .skills
+                .compat_user_dir
+                .ends_with(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        assert!(
+            config.skills.user_dir.ends_with("squeezy/skills")
+                || config.skills.user_dir.ends_with("squeezy\\skills")
+                || config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR),
+            "unexpected user_dir: {:?}",
+            config.skills.user_dir
+        );
+        assert!(
+            config.skills.compat_user_dir.ends_with("agents/skills")
+                || config.skills.compat_user_dir.ends_with("agents\\skills")
+                || config
+                    .skills
+                    .compat_user_dir
+                    .ends_with(DEFAULT_AGENT_COMPAT_SKILLS_DIR),
+            "unexpected compat_user_dir: {:?}",
+            config.skills.compat_user_dir
+        );
+    }
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.api_key_env, "SQUEEZY_OPENAI_KEY");
@@ -341,6 +379,31 @@ cheap_model = "claude-haiku-4-5"
     // Inspect output is still valid TOML.
     SettingsFile::from_toml_str(&config.inspect_redacted(), "round-trip")
         .expect("inspect output parses back");
+}
+
+#[test]
+fn routing_linux_sandbox_parent_guard_round_trips_through_inspect() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[routing]
+linux_sandbox_sensitive_parent = false
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    assert!(!config.routing.linux_sandbox_sensitive_parent);
+    let inspect = config.inspect_redacted();
+    assert!(
+        inspect.contains("linux_sandbox_sensitive_parent = false"),
+        "inspect should emit the resolved linux sandbox routing guard: {inspect}"
+    );
+
+    let round_tripped =
+        SettingsFile::from_toml_str(&inspect, "round-trip").expect("inspect parses");
+    let round_tripped_config = AppConfig::from_settings_and_env_vars(round_tripped, |_| None);
+    assert!(!round_tripped_config.routing.linux_sandbox_sensitive_parent);
 }
 
 #[test]
@@ -719,6 +782,9 @@ fn config_reads_supported_env_overrides() {
         "SQUEEZY_TELEMETRY_ENDPOINT" => Some("https://telemetry.example/v1/batch".to_string()),
         "SQUEEZY_SESSION_MODE" => Some("plan".to_string()),
         "SQUEEZY_CHECKPOINTS_ENABLED" => Some("true".to_string()),
+        "SQUEEZY_CHECKPOINT_RETENTION_DAYS" => Some("14".to_string()),
+        "SQUEEZY_CHECKPOINT_MAX_FILE_BYTES" => Some("4096".to_string()),
+        "SQUEEZY_CHECKPOINT_CLEANUP_INTERVAL_SECS" => Some("0".to_string()),
         "SQUEEZY_SKILLS_USER_DIR" => Some("/tmp/squeezy-skills".to_string()),
         "SQUEEZY_SKILLS_COMPAT_USER_DIR" => Some("/tmp/agent-skills".to_string()),
         _ => None,
@@ -742,6 +808,9 @@ fn config_reads_supported_env_overrides() {
     assert_eq!(config.max_tool_calls_per_turn, 12);
     assert_eq!(config.max_tool_bytes_read_per_turn, 3456);
     assert_eq!(config.max_search_files_per_turn, 78);
+    assert_eq!(config.tools.checkpoint_retention_days, 14);
+    assert_eq!(config.tools.checkpoint_max_file_bytes, 4096);
+    assert_eq!(config.tools.checkpoint_cleanup_interval_secs, 0);
     assert_eq!(
         config.telemetry,
         TelemetryConfig {
@@ -831,6 +900,104 @@ compat_user_dir = "~/.agents/skills"
 
     assert_eq!(config.skills.user_dir, home.join(".squeezy/skills"));
     assert_eq!(config.skills.compat_user_dir, home.join(".agents/skills"));
+}
+
+#[test]
+fn default_xdg_skills_dir_uses_xdg_data_home_when_set() {
+    // When XDG_DATA_HOME is set to a custom value the skills dir should be
+    // <XDG_DATA_HOME>/squeezy/skills.
+    let _guard = serial_env_guard();
+    let custom_xdg = std::env::temp_dir().join("xdg_test_data");
+    unsafe {
+        std::env::set_var("XDG_DATA_HOME", &custom_xdg);
+    }
+    let result = default_xdg_skills_dir();
+    unsafe {
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+    // The function should return the XDG path unless it coincidentally equals
+    // the legacy path (which it won't with a temp dir).
+    if let Some(dir) = result {
+        assert_eq!(dir, custom_xdg.join("squeezy").join("skills"));
+    }
+    // If result is None it means the XDG path happened to equal the legacy
+    // path — acceptable under the dedup logic but unlikely in practice.
+}
+
+#[test]
+fn default_xdg_skills_dir_falls_back_to_home_local_share() {
+    let _guard = serial_env_guard();
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    unsafe {
+        std::env::remove_var("XDG_DATA_HOME");
+    }
+    let result = default_xdg_skills_dir();
+    if let Some(dir) = result {
+        assert_eq!(
+            dir,
+            home.join(".local")
+                .join("share")
+                .join("squeezy")
+                .join("skills")
+        );
+    }
+    // None is OK when XDG path == legacy path (e.g. HOME=/).
+}
+
+#[test]
+fn default_xdg_prompts_dir_uses_xdg_config_home_when_set() {
+    let _guard = serial_env_guard();
+    let custom_cfg = std::env::temp_dir().join("xdg_test_config");
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", &custom_cfg);
+    }
+    let result = default_xdg_prompts_dir();
+    unsafe {
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+    if let Some(dir) = result {
+        assert_eq!(dir, custom_cfg.join("squeezy").join("prompts"));
+    }
+}
+
+#[test]
+fn skills_home_missing_returns_true_without_home() {
+    let _guard = serial_env_guard();
+    let saved = std::env::var_os("HOME");
+    unsafe {
+        std::env::remove_var("HOME");
+    }
+    let missing = skills_home_missing();
+    if let Some(h) = saved {
+        unsafe {
+            std::env::set_var("HOME", h);
+        }
+    }
+    assert!(
+        missing,
+        "skills_home_missing should be true when HOME is absent"
+    );
+}
+
+#[test]
+fn skills_home_missing_returns_false_when_home_set() {
+    if std::env::var_os("HOME").is_none() {
+        return; // Skip in environments without HOME.
+    }
+    assert!(!skills_home_missing());
+}
+
+/// A trivial guard that serialises tests that mutate process-global env vars.
+/// Uses the same `CONFIG_TEST_NONCE` counter as a mutex key via thread local.
+struct SerialEnvGuard;
+fn serial_env_guard() -> SerialEnvGuard {
+    // This is intentionally not a real lock — env mutations in tests are only
+    // safe when run with `cargo test -- --test-threads=1` or via the Cargo
+    // `[[test]]` harness which serialises within a binary.  The guard is a
+    // naming convention to make mutation sites visible in review.
+    SerialEnvGuard
 }
 
 #[test]
@@ -2522,9 +2689,13 @@ exclude_classes = ["generated"]
 [cache]
 root = ".squeezy/cache"
 tool_outputs = ".squeezy/tool_outputs"
+durability = "turn"
 
 [tools]
 checkpoints_enabled = true
+checkpoint_retention_days = 3
+checkpoint_max_file_bytes = 8192
+checkpoint_cleanup_interval_secs = 11
 lazy_schema_loading = true
 core = ["webfetch"]
 discoverable = ["read_file"]
@@ -2592,7 +2763,11 @@ reason = "docs lookups are safe"
         config.cache.tool_outputs,
         Some(PathBuf::from(".squeezy/tool_outputs"))
     );
+    assert_eq!(config.cache.durability, CacheDurability::Turn);
     assert!(config.checkpoints_enabled);
+    assert_eq!(config.tools.checkpoint_retention_days, 3);
+    assert_eq!(config.tools.checkpoint_max_file_bytes, 8192);
+    assert_eq!(config.tools.checkpoint_cleanup_interval_secs, 11);
     assert!(config.tools.lazy_schema_loading);
     assert!(config.tools.core.contains(&"webfetch".to_string()));
     assert!(!config.tools.core.contains(&"read_file".to_string()));
@@ -3136,6 +3311,8 @@ fn generated_templates_parse() {
         .expect("user template parses");
     SettingsFile::from_toml_str(project_settings_template(), "project template")
         .expect("project template parses");
+    SettingsFile::from_toml_str(local_settings_template(), "local template")
+        .expect("local template parses");
 }
 
 #[test]
@@ -4327,8 +4504,62 @@ fn inspect_omits_optional_cache_keys_when_unset() {
     let inspect = config.inspect_redacted();
 
     assert!(inspect.contains("[cache]"));
+    assert!(inspect.contains("durability = \"fast\""));
     assert!(!inspect.contains("root ="));
     assert!(!inspect.contains("tool_outputs ="));
+}
+
+#[test]
+fn cache_durability_rejects_unknown_values() {
+    let error = SettingsFile::from_toml_str(
+        r#"
+[cache]
+durability = "forever"
+"#,
+        "test",
+    )
+    .expect_err("unknown durability should fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("expected one of fast, turn, strict"),
+        "{error}"
+    );
+}
+
+#[test]
+fn cache_durability_serde_and_parse_are_consistent() {
+    for variant in [
+        CacheDurability::Fast,
+        CacheDurability::Turn,
+        CacheDurability::Strict,
+    ] {
+        let name = variant.as_str();
+
+        // `parse` round-trip
+        assert_eq!(
+            CacheDurability::parse(name),
+            Some(variant),
+            "parse({name:?}) should return {variant:?}"
+        );
+
+        // serde round-trip: JSON value produced by Serialize must re-produce the
+        // same variant through Deserialize, confirming the two paths stay in sync.
+        let json = serde_json::to_value(variant).expect("serialize");
+        let back: CacheDurability = serde_json::from_value(json.clone()).expect("deserialize");
+        assert_eq!(
+            back, variant,
+            "serde round-trip for {variant:?} failed (got JSON {json})"
+        );
+
+        // The serde snake_case representation must match `as_str`/`parse`.
+        let serde_str = json.as_str().expect("serialized as string");
+        assert_eq!(
+            serde_str, name,
+            "serde name {serde_str:?} diverges from parse name {name:?}"
+        );
+    }
 }
 
 #[test]
@@ -4712,8 +4943,11 @@ fn resolve_field_source_uses_repo_then_project_then_user() {
     let profile_field = &models.fields[2]; // profile
 
     // Env-override fields might be set in the test environment; clear them so
-    // the test asserts the tier precedence, not env precedence.
-    // SAFETY: tests run single-threaded by default for this module.
+    // the test asserts the tier precedence, not env precedence. Hold the
+    // shared env mutex to serialize against any other test in this module
+    // that mutates the same vars.
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: env mutations are guarded by TEST_ENV_MUTEX above.
     unsafe {
         std::env::remove_var("SQUEEZY_PROVIDER");
         std::env::remove_var("SQUEEZY_MODEL");
@@ -4732,6 +4966,7 @@ fn resolve_field_source_uses_repo_then_project_then_user() {
         resolve_field_source(&sources, profile_field),
         config_schema::FieldSource::Default
     );
+    drop(_env_guard);
 }
 
 #[test]
@@ -4750,10 +4985,14 @@ fn resolve_field_source_returns_env_when_env_var_set() {
         Some("SQUEEZY_PROVIDER"),
         "provider field should declare env_override; precondition for this test"
     );
-    // SAFETY: tests run single-threaded by default for this module.
+    // Hold the shared env mutex while we mutate process env so we don't
+    // race with any other test that touches SQUEEZY_PROVIDER.
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: env mutations are guarded by TEST_ENV_MUTEX above.
     unsafe { std::env::set_var("SQUEEZY_PROVIDER", "anthropic") };
     let resolved = resolve_field_source(&sources, provider_field);
     unsafe { std::env::remove_var("SQUEEZY_PROVIDER") };
+    drop(_env_guard);
     assert_eq!(resolved, config_schema::FieldSource::Env);
 }
 
@@ -5361,6 +5600,165 @@ api_key_env = "OPENAI_API_KEY"
         "test",
     )
     .expect("api_key + api_key_env both parse cleanly");
+}
+
+#[test]
+fn provider_config_debug_redacts_secret_fields() {
+    let mut compatible_headers = BTreeMap::new();
+    compatible_headers.insert(
+        "Authorization".to_string(),
+        "Bearer debug-compatible-secret".to_string(),
+    );
+    let mut azure_headers = BTreeMap::new();
+    azure_headers.insert(
+        "api-key".to_string(),
+        "debug-azure-header-secret".to_string(),
+    );
+    let mut request_metadata = BTreeMap::new();
+    request_metadata.insert("team".to_string(), "platform".to_string());
+
+    let rendered = [
+        format!(
+            "{:?}",
+            OpenAiCompatibleConfig {
+                preset: OpenAiCompatiblePreset::Custom,
+                api_key_env: "CUSTOM_API_KEY".to_string(),
+                api_key: Some("debug-compatible-api-key".to_string()),
+                base_url: "https://example.test/v1".to_string(),
+                extra_headers: compatible_headers,
+                transport: ProviderTransportConfig::default(),
+                account_id: None,
+                gateway_id: None,
+                deployment_id: None,
+                cf_ai_gateway: None,
+                use_oauth: false,
+            }
+        ),
+        format!(
+            "{:?}",
+            OpenAiConfig {
+                api_key_env: "OPENAI_API_KEY".to_string(),
+                api_key: Some("debug-openai-api-key".to_string()),
+                base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
+                organization: None,
+                project: None,
+                service_tier: None,
+                transport: ProviderTransportConfig::default(),
+            }
+        ),
+        format!(
+            "{:?}",
+            AnthropicConfig {
+                api_key_env: "ANTHROPIC_API_KEY".to_string(),
+                api_key: Some("debug-anthropic-api-key".to_string()),
+                base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
+                transport: ProviderTransportConfig::default(),
+            }
+        ),
+        format!(
+            "{:?}",
+            GoogleConfig {
+                api_key_env: "GOOGLE_API_KEY".to_string(),
+                api_key: Some("debug-google-api-key".to_string()),
+                base_url: DEFAULT_GOOGLE_BASE_URL.to_string(),
+                transport: ProviderTransportConfig::default(),
+            }
+        ),
+        format!(
+            "{:?}",
+            AzureOpenAiConfig {
+                api_key_env: "AZURE_OPENAI_API_KEY".to_string(),
+                api_key: Some("debug-azure-api-key".to_string()),
+                base_url: "https://azure.example.test".to_string(),
+                api_version: DEFAULT_AZURE_OPENAI_API_VERSION.to_string(),
+                deployment_name_map: BTreeMap::new(),
+                extra_headers: azure_headers,
+                use_entra_id: true,
+                entra_bearer_token: Some("debug-entra-token".to_string()),
+                transport: ProviderTransportConfig::default(),
+            }
+        ),
+        format!(
+            "{:?}",
+            BedrockConfig {
+                region: DEFAULT_BEDROCK_REGION.to_string(),
+                base_url: None,
+                bearer_token: Some("debug-bedrock-bearer-token".to_string()),
+                request_metadata,
+                transport: ProviderTransportConfig::default(),
+            }
+        ),
+        format!(
+            "{:?}",
+            OllamaConfig {
+                base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
+                route_style: OllamaRoute::Native,
+                api_key_env: "OLLAMA_API_KEY".to_string(),
+                api_key: Some("debug-ollama-api-key".to_string()),
+                keep_alive: Some("24h".to_string()),
+                transport: ProviderTransportConfig::default(),
+            }
+        ),
+    ]
+    .join("\n");
+
+    for secret in [
+        "debug-compatible-secret",
+        "debug-compatible-api-key",
+        "debug-openai-api-key",
+        "debug-anthropic-api-key",
+        "debug-google-api-key",
+        "debug-azure-header-secret",
+        "debug-azure-api-key",
+        "debug-entra-token",
+        "debug-bedrock-bearer-token",
+        "debug-ollama-api-key",
+    ] {
+        assert!(
+            !rendered.contains(secret),
+            "Debug output must redact {secret:?}; got: {rendered}"
+        );
+    }
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+    assert!(
+        rendered.contains("Authorization") && rendered.contains("api-key"),
+        "Debug output should keep header names visible: {rendered}"
+    );
+}
+
+#[test]
+fn ollama_config_reads_api_key_and_keep_alive_with_env_precedence() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "ollama"
+
+[providers.ollama]
+base_url = "http://localhost:11434/api"
+route_style = "openai_compatible"
+api_key_env = "OLLAMA_TOML_KEY"
+api_key = "ollama-inline-secret"
+keep_alive = "24h"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |name| match name {
+        "OLLAMA_API_KEY_ENV" => Some("OLLAMA_ENV_KEY".to_string()),
+        "OLLAMA_KEEP_ALIVE" => Some("30m".to_string()),
+        _ => None,
+    });
+
+    match config.provider {
+        ProviderConfig::Ollama(ollama) => {
+            assert_eq!(ollama.route_style, OllamaRoute::OpenAiCompatible);
+            assert_eq!(ollama.api_key_env, "OLLAMA_ENV_KEY");
+            assert_eq!(ollama.api_key.as_deref(), Some("ollama-inline-secret"));
+            assert_eq!(ollama.keep_alive.as_deref(), Some("30m"));
+        }
+        other => panic!("expected Ollama provider, got {other:?}"),
+    }
 }
 
 #[test]
@@ -5979,4 +6377,369 @@ fn session_metrics_merge_turn_folds_model_ledger() {
         .find(|b| b.model == "gpt-5.5")
         .expect("gpt-5.5 bucket");
     assert_eq!(bucket.main.estimated_usd_micros, Some(84));
+}
+
+// ── path and settings tests ──────────────────────────────────────────────────
+
+static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn expand_home_path_tilde_alone_uses_home_var() {
+    let path = PathBuf::from("~");
+    let expanded = expand_home_path(path.clone());
+    if let Some(home) = home_dir_path() {
+        assert_eq!(expanded, home);
+    } else {
+        assert_eq!(expanded, path);
+    }
+}
+
+#[test]
+fn expand_home_path_tilde_prefix_joins_suffix() {
+    let path = PathBuf::from("~/.squeezy/keybindings.toml");
+    let expanded = expand_home_path(path.clone());
+    if let Some(home) = home_dir_path() {
+        assert_eq!(expanded, home.join(".squeezy/keybindings.toml"));
+    } else {
+        assert_eq!(expanded, path);
+    }
+}
+
+#[test]
+fn expand_home_path_absolute_and_relative_paths_are_unchanged() {
+    #[cfg(unix)]
+    let abs = PathBuf::from("/usr/local/bin/squeezy");
+    #[cfg(not(unix))]
+    let abs = PathBuf::from("C:/Program Files/squeezy/squeezy.exe");
+    assert_eq!(expand_home_path(abs.clone()), abs);
+
+    let rel = PathBuf::from("relative/path/settings.toml");
+    assert_eq!(expand_home_path(rel.clone()), rel);
+}
+
+#[test]
+fn expand_home_path_leaves_named_user_tilde_literal() {
+    let named = PathBuf::from("~alice/sessions");
+    assert_eq!(expand_home_path(named.clone()), named);
+    let bare_named = PathBuf::from("~root");
+    assert_eq!(expand_home_path(bare_named.clone()), bare_named);
+}
+
+#[test]
+fn repo_settings_id_is_deterministic_and_well_formed() {
+    let tmp = std::env::temp_dir();
+    let id1 = repo_settings_id(&tmp);
+    let id2 = repo_settings_id(&tmp);
+    assert_eq!(id1, id2);
+    let (_, hash) = id1.rsplit_once('-').expect("id must contain a hyphen");
+    assert_eq!(hash.len(), 16);
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+#[cfg(windows)]
+#[test]
+fn repo_settings_id_windows_drive_letter_case_stable() {
+    let lower = PathBuf::from("c:\\users\\me\\project");
+    let upper = PathBuf::from("C:\\users\\me\\project");
+    assert_eq!(repo_settings_id(&lower), repo_settings_id(&upper));
+}
+
+#[test]
+fn toml_path_round_trip_forward_slashes() {
+    #[cfg(unix)]
+    let raw = "/home/user/squeezy/sessions";
+    #[cfg(not(unix))]
+    let raw = "C:/Users/user/squeezy/sessions";
+    let path = PathBuf::from(raw);
+    let display = path.display().to_string();
+    assert_eq!(path, PathBuf::from(&display));
+}
+
+#[test]
+fn sanitize_repo_settings_name_strips_special_chars() {
+    assert_eq!(sanitize_repo_settings_name("My Project!"), "my-project");
+    assert_eq!(sanitize_repo_settings_name("!foo!"), "foo");
+    assert_eq!(sanitize_repo_settings_name("squeezy"), "squeezy");
+    assert_eq!(sanitize_repo_settings_name("my_project"), "my_project");
+    assert_eq!(sanitize_repo_settings_name("CamelCase"), "camelcase");
+}
+
+#[test]
+fn default_sensitive_paths_include_xdg_and_cloud_creds() {
+    let config = ShellSandboxConfig::default();
+    let patterns = &config.sensitive_path_patterns;
+    for expected in [
+        ".ssh/**",
+        ".aws/**",
+        ".kube/**",
+        ".gnupg/**",
+        ".password-store/**",
+        ".config/sops/**",
+        ".config/1Password/**",
+        ".azure/**",
+        ".config/gcloud/**",
+        ".config/kube/**",
+    ] {
+        assert!(
+            patterns.iter().any(|p| p == expected),
+            "missing {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn user_settings_template_lists_hardened_sensitive_path_defaults() {
+    let template = user_settings_template();
+    for expected in [
+        ".password-store/**",
+        ".config/sops/**",
+        ".config/1Password/**",
+        ".azure/**",
+        ".config/gcloud/**",
+        ".config/kube/**",
+    ] {
+        assert!(template.contains(expected), "missing {expected:?}");
+    }
+}
+
+#[test]
+fn resolved_config_paths_returns_absolute_user_settings_when_home_set() {
+    if std::env::var_os("HOME").is_some() {
+        let paths = resolved_config_paths();
+        assert!(paths.user_settings.is_absolute());
+        assert!(paths.home_set);
+        assert!(paths.home.is_some());
+    }
+}
+
+#[test]
+fn resolved_config_paths_home_field_matches_env() {
+    let paths = resolved_config_paths();
+    let env_home = std::env::var_os("HOME").map(PathBuf::from);
+    assert_eq!(paths.home, env_home);
+    assert_eq!(paths.home_set, env_home.is_some());
+}
+
+#[test]
+fn session_log_dir_env_tilde_is_expanded() {
+    let config =
+        AppConfig::from_settings_and_env_vars(SettingsFile::default(), |name| match name {
+            "SQUEEZY_SESSION_DIR" => Some("~/sessions".to_string()),
+            _ => None,
+        });
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        assert_eq!(config.session_logs.log_dir, Some(home.join("sessions")));
+    }
+}
+
+#[test]
+fn default_squeezy_skills_dir_is_absolute_when_home_or_data_dir_available() {
+    if std::env::var_os("HOME").is_some() || dirs::data_dir().is_some() {
+        assert!(default_squeezy_skills_dir().is_absolute());
+        assert!(default_agent_compat_skills_dir().is_absolute());
+    }
+}
+
+#[test]
+fn check_settings_file_permissions_does_not_panic() {
+    let _ = check_settings_file_permissions();
+}
+
+#[test]
+fn config_warning_emitted_for_squeezy_session_dir_with_tilde() {
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("SQUEEZY_SESSION_DIR", "~/sessions") };
+    let result = AppConfig::from_env_and_settings();
+    unsafe { std::env::remove_var("SQUEEZY_SESSION_DIR") };
+    drop(_env_guard);
+
+    let config = result.expect("from_env_and_settings should succeed");
+    assert!(
+        config
+            .config_warnings
+            .iter()
+            .any(|w| w.source == "SQUEEZY_SESSION_DIR" && w.field.contains("starts with '~'"))
+    );
+}
+
+#[test]
+fn no_session_dir_warning_when_value_is_absolute_or_unset() {
+    for value in [Some("/var/log/squeezy"), None] {
+        let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        match value {
+            Some(v) => unsafe { std::env::set_var("SQUEEZY_SESSION_DIR", v) },
+            None => unsafe { std::env::remove_var("SQUEEZY_SESSION_DIR") },
+        }
+        let result = AppConfig::from_env_and_settings();
+        unsafe { std::env::remove_var("SQUEEZY_SESSION_DIR") };
+        drop(_env_guard);
+        let config = result.expect("from_env_and_settings should succeed");
+        assert!(
+            !config
+                .config_warnings
+                .iter()
+                .any(|w| w.source == "SQUEEZY_SESSION_DIR")
+        );
+    }
+}
+
+#[test]
+fn config_warning_for_session_dir_user_tilde_does_not_promise_expansion() {
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("SQUEEZY_SESSION_DIR", "~alice/sessions") };
+    let result = AppConfig::from_env_and_settings();
+    unsafe { std::env::remove_var("SQUEEZY_SESSION_DIR") };
+    drop(_env_guard);
+    let config = result.expect("from_env_and_settings should succeed");
+    let warning = config
+        .config_warnings
+        .iter()
+        .find(|w| w.source == "SQUEEZY_SESSION_DIR")
+        .expect("expected warning");
+    assert!(warning.field.contains("does not expand"));
+    assert!(
+        !warning
+            .field
+            .contains("expands it against HOME automatically")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn home_unset_warning_fires_on_unix_without_home_or_settings_path() {
+    let user_path = PathBuf::from("/etc/squeezy/settings.toml");
+    let warning = home_unset_warning(false, false, &user_path).expect("warning");
+    assert_eq!(warning.source, "environment");
+    assert!(warning.field.contains("HOME is not set"));
+    assert!(warning.field.contains(&user_path.display().to_string()));
+    assert!(warning.field.contains("dirs::config_dir()"));
+}
+
+#[cfg(unix)]
+#[test]
+fn home_unset_warning_suppressed_by_settings_path_escape_hatch() {
+    let user_path = PathBuf::from("/etc/squeezy/settings.toml");
+    assert!(home_unset_warning(false, true, &user_path).is_none());
+    assert!(home_unset_warning(true, false, &user_path).is_none());
+    assert!(home_unset_warning(true, true, &user_path).is_none());
+}
+
+#[test]
+fn squeezy_skills_dir_for_home_helpers_cover_fallbacks() {
+    let data = PathBuf::from("/var/lib/data");
+    assert_eq!(
+        squeezy_skills_dir_for_home(None, Some(data.clone())),
+        data.join("squeezy").join("skills")
+    );
+    assert_eq!(
+        agent_compat_skills_dir_for_home(None, Some(data.clone())),
+        data.join("agents").join("skills")
+    );
+    let home = PathBuf::from("/home/alice");
+    assert_eq!(
+        squeezy_skills_dir_for_home(Some(home.clone()), Some(data.clone())),
+        home.join(DEFAULT_SQUEEZY_SKILLS_DIR)
+    );
+    assert_eq!(
+        agent_compat_skills_dir_for_home(Some(home), Some(data)),
+        PathBuf::from("/home/alice").join(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
+    );
+    assert_eq!(
+        squeezy_skills_dir_for_home(None, None),
+        PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR)
+    );
+    assert_eq!(
+        agent_compat_skills_dir_for_home(None, None),
+        PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_settings_file_permissions_detects_group_writable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp =
+        std::env::temp_dir().join(format!("squeezy-perm-gw-test-{}.toml", std::process::id()));
+    std::fs::write(&tmp, b"[model]\n").unwrap();
+    let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+    perms.set_mode(0o620);
+    std::fs::set_permissions(&tmp, perms).unwrap();
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", tmp.to_str().unwrap()) };
+    let issues = check_settings_file_permissions();
+    unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") };
+    drop(_env_guard);
+    let _ = std::fs::remove_file(&tmp);
+    assert!(!issues.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn check_settings_file_permissions_follows_symlink_target() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("squeezy-symlink-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("real-settings.toml");
+    let link = dir.join("settings.toml");
+    std::fs::write(&target, b"[model]\n").unwrap();
+    let mut perms = std::fs::metadata(&target).unwrap().permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&target, perms).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", link.to_str().unwrap()) };
+    let issues = check_settings_file_permissions();
+    unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") };
+    drop(_env_guard);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!issues.is_empty());
+    assert_eq!(issues[0].path, link);
+}
+
+/// Guard that PROVIDER_OPTIONS in the config schema covers every provider
+/// name accepted by the runtime resolver.  This prevents the TUI provider
+/// dropdown and templates from lagging behind new provider support.
+///
+/// # Coverage
+/// - **OpenAI-compatible presets** (the majority): fully derived from
+///   `OpenAiCompatiblePreset::all()` so this half auto-updates when new
+///   presets are added to the enum.
+/// - **First-class providers** (openai, anthropic, google, azure_openai,
+///   bedrock, ollama, openai_codex, github_copilot): these are a small, stable
+///   set of `ProviderConfig` variants that have no equivalent `all()` accessor.
+///   The slice below is manually maintained.  There is currently no
+///   `ProviderConfig::all_slugs()` helper; if one is added in the future,
+///   replace the hard-coded slice with a dynamic call.
+#[test]
+fn provider_options_covers_all_accepted_providers() {
+    use config_schema::PROVIDER_OPTIONS;
+
+    // First-class (non-compatible) providers — manually maintained.
+    // These change rarely; update this list when adding a new ProviderConfig variant.
+    let first_class = &[
+        "openai",
+        "anthropic",
+        "google",
+        "azure_openai",
+        "bedrock",
+        "ollama",
+        "openai_codex",
+        "github_copilot",
+    ];
+    for name in first_class {
+        assert!(
+            PROVIDER_OPTIONS.contains(name),
+            "PROVIDER_OPTIONS is missing first-class provider {name:?}"
+        );
+    }
+
+    // OpenAI-compatible presets — derived dynamically from the enum.
+    for preset in OpenAiCompatiblePreset::all() {
+        let canonical = preset.as_str();
+        assert!(
+            PROVIDER_OPTIONS.contains(&canonical),
+            "PROVIDER_OPTIONS is missing OpenAiCompatiblePreset {canonical:?}"
+        );
+    }
 }

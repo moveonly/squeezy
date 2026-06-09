@@ -5,6 +5,7 @@ use std::{
     env, fmt, fs,
     path::{Path, PathBuf},
     process,
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -49,6 +50,9 @@ pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
 /// provider does not consult model registries during a request — this
 /// is purely a label that flows through cost/logging surfaces.
 pub const DEFAULT_FAUX_MODEL: &str = "faux-1";
+pub const DEFAULT_CHECKPOINT_RETENTION_DAYS: u64 = 7;
+pub const DEFAULT_CHECKPOINT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+pub const DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_SECS: u64 = 60 * 60;
 
 // Small-fast-model defaults per provider. Used for low-stakes background calls
 // (compaction summaries, classifier prompts, auto-approver) where flagship
@@ -429,6 +433,10 @@ pub const DEFAULT_ROUTING_LARGE_ATTACHMENT_BYPASS_BYTES: u32 = 4_096;
 /// this skip the slam-dunk path and fall through to the borderline
 /// judge (or `Parent`). Sized at ~400 tokens of English at 5 chars/tok.
 pub const DEFAULT_ROUTING_HEURISTIC_MAX_CHARS: u32 = 2_000;
+/// Default for `[routing].linux_sandbox_sensitive_parent`: route prompts
+/// mentioning Linux sandbox/container/kernel keywords to the parent model
+/// even when the heuristic or judge would choose cheap.
+pub const DEFAULT_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT: bool = true;
 /// Char-budget gate for the LLM judge. Prompts longer than this skip the
 /// judge call and route to `Parent` directly — long prompts almost
 /// always carry the kind of nuance the cheap tier struggles with, and a
@@ -702,10 +710,18 @@ pub struct AppConfig {
     /// Optional pre-flight ceiling on the estimated input tokens of a single
     /// LLM round. `None` (the default) disables the gate entirely, leaving
     /// every round dispatched exactly as before. When set, the agent
-    /// estimates the assembled request's input tokens before sending; if the
-    /// estimate exceeds this value it first attempts mid-turn compaction and,
-    /// if the round is still over, gates the dispatch with a clear status
-    /// instead of paying for an oversized round.
+    /// estimates the **conversation items** before sending; if the estimate
+    /// exceeds this value it first attempts mid-turn compaction and, if the
+    /// round is still over, gates the dispatch with a clear status instead of
+    /// paying for an oversized round.
+    ///
+    /// Note: fixed request overhead (system instructions and tool schemas) is
+    /// **not** counted against this limit. Overhead is constant per round and
+    /// cannot be reduced by compaction, so including it would gate legitimate
+    /// rounds on agents with large tool registries regardless of conversation
+    /// size. If you need a hard total-input ceiling that includes overhead,
+    /// use `max_session_cost_usd_micros` (which accounts for all billed tokens)
+    /// alongside a per-token cost estimate.
     pub max_round_input_tokens: Option<u64>,
     pub routing: RoutingConfig,
     pub telemetry: TelemetryConfig,
@@ -997,6 +1013,12 @@ impl AppConfig {
                     .as_deref()
                     .and_then(OllamaRoute::parse)
                     .unwrap_or_default(),
+                api_key_env: get_var("OLLAMA_API_KEY_ENV")
+                    .or_else(|| provider_setting(&providers, "ollama", "api_key_env"))
+                    .unwrap_or_else(|| "OLLAMA_API_KEY".to_string()),
+                api_key: provider_setting(&providers, "ollama", "api_key"),
+                keep_alive: get_var("OLLAMA_KEEP_ALIVE")
+                    .or_else(|| provider_setting(&providers, "ollama", "keep_alive")),
                 transport: provider_transport_settings(&providers, &["ollama"]),
             }),
             "openai" => ProviderConfig::OpenAi(OpenAiConfig {
@@ -1359,7 +1381,11 @@ impl AppConfig {
         if let Some(raw) = get_var("SQUEEZY_SESSION_DIR") {
             let trimmed = raw.trim();
             if !trimmed.is_empty() {
-                session_settings.log_dir = Some(PathBuf::from(trimmed));
+                // Expand `~` so that `SQUEEZY_SESSION_DIR=~/sessions` works
+                // like the equivalent TOML path value. Without this, shells
+                // that set the variable with a leading `~` produce a literal
+                // path component instead of resolving to HOME.
+                session_settings.log_dir = Some(expand_home_path(PathBuf::from(trimmed)));
             }
         }
         let mut skills = SkillsConfig::from_settings_and_env_vars(
@@ -1368,11 +1394,28 @@ impl AppConfig {
         );
         let graph = GraphConfig::from_settings(settings.graph.unwrap_or_default());
         let cache = CacheConfig::from_settings(settings.cache.unwrap_or_default());
-        let tool_settings = settings.tools.unwrap_or_default();
+        let mut tool_settings = settings.tools.unwrap_or_default();
         let checkpoints_enabled = get_var("SQUEEZY_CHECKPOINTS_ENABLED")
             .as_deref()
             .map(parse_enabled_bool)
             .unwrap_or(tool_settings.checkpoints_enabled.unwrap_or(false));
+        if let Some(value) = get_var("SQUEEZY_CHECKPOINT_RETENTION_DAYS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+        {
+            tool_settings.checkpoint_retention_days = Some(value);
+        }
+        if let Some(value) = get_var("SQUEEZY_CHECKPOINT_MAX_FILE_BYTES")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+        {
+            tool_settings.checkpoint_max_file_bytes = Some(value);
+        }
+        if let Some(value) = get_var("SQUEEZY_CHECKPOINT_CLEANUP_INTERVAL_SECS")
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            tool_settings.checkpoint_cleanup_interval_secs = Some(value);
+        }
         let tools = ToolSchemaConfig::from_settings(tool_settings)?;
         let session_resume_picker = session_settings.resume_picker.unwrap_or_default();
         let session_logs = SessionLogConfig::from_settings(&session_settings);
@@ -1910,13 +1953,17 @@ impl AppConfig {
             ));
         }
         if self.routing.extra_heuristic_verbs.is_empty() {
-            output.push_str("# extra_heuristic_verbs = []  # user-extended verb whitelist\n\n");
+            output.push_str("# extra_heuristic_verbs = []  # user-extended verb whitelist\n");
         } else {
             output.push_str(&format!(
-                "extra_heuristic_verbs = {}\n\n",
+                "extra_heuristic_verbs = {}\n",
                 toml_string_array(&self.routing.extra_heuristic_verbs)
             ));
         }
+        output.push_str(&format!(
+            "linux_sandbox_sensitive_parent = {}  # route Linux sandbox/container prompts to parent\n\n",
+            self.routing.linux_sandbox_sensitive_parent
+        ));
 
         output.push_str("[permissions]\n");
         output.push_str(&format!(
@@ -2230,12 +2277,28 @@ impl AppConfig {
                 toml_string(&tool_outputs.display().to_string())
             ));
         }
+        output.push_str(&format!(
+            "durability = {}\n",
+            toml_string(self.cache.durability.as_str())
+        ));
         output.push('\n');
 
         output.push_str("[tools]\n");
         output.push_str(&format!(
             "checkpoints_enabled = {}\n",
             self.checkpoints_enabled
+        ));
+        output.push_str(&format!(
+            "checkpoint_retention_days = {}\n",
+            self.tools.checkpoint_retention_days
+        ));
+        output.push_str(&format!(
+            "checkpoint_max_file_bytes = {}\n",
+            self.tools.checkpoint_max_file_bytes
+        ));
+        output.push_str(&format!(
+            "checkpoint_cleanup_interval_secs = {}\n",
+            self.tools.checkpoint_cleanup_interval_secs
         ));
         output.push_str(&format!(
             "lazy_schema_loading = {}\n",
@@ -2799,10 +2862,9 @@ pub enum ProviderConfig {
 /// auto-injected into every Vercel function runtime) flows in as
 /// `api_key_env` when no explicit `AI_GATEWAY_API_KEY` is set.
 ///
-/// M-63: redaction applies to the serde `Serialize` path only; the derived
-/// `Debug` prints the resolved `api_key` verbatim. Never `{:?}`-log an
-/// `OpenAiCompatibleConfig`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// M-63: custom `Debug` below redacts `api_key` and `extra_headers` values so
+/// logs and panic messages cannot leak credentials.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiCompatibleConfig {
     pub preset: OpenAiCompatiblePreset,
     pub api_key_env: String,
@@ -2857,6 +2919,24 @@ pub struct OpenAiCompatibleConfig {
     /// behavior.
     #[serde(default, skip_serializing_if = "is_default_bool")]
     pub use_oauth: bool,
+}
+
+impl fmt::Debug for OpenAiCompatibleConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAiCompatibleConfig")
+            .field("preset", &self.preset)
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("extra_headers", &RedactedMap(&self.extra_headers))
+            .field("transport", &self.transport)
+            .field("account_id", &self.account_id)
+            .field("gateway_id", &self.gateway_id)
+            .field("deployment_id", &self.deployment_id)
+            .field("cf_ai_gateway", &self.cf_ai_gateway)
+            .field("use_oauth", &self.use_oauth)
+            .finish()
+    }
 }
 
 /// Typed `cf-aig-*` knob surface for the Cloudflare AI Gateway preset.
@@ -3181,7 +3261,9 @@ impl OpenAiCompatiblePreset {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// M-63: derived `Debug` would print `api_key` verbatim; custom impl below
+/// redacts it so logs and panic messages cannot leak the credential.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiConfig {
     pub api_key_env: String,
     #[serde(serialize_with = "redact_secret_opt")]
@@ -3208,6 +3290,20 @@ pub struct OpenAiConfig {
     pub transport: ProviderTransportConfig,
 }
 
+impl fmt::Debug for OpenAiConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAiConfig")
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("organization", &self.organization)
+            .field("project", &self.project)
+            .field("service_tier", &self.service_tier)
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
 /// ChatGPT Plus/Pro subscription provider settings. The OAuth token
 /// itself lives outside the TOML (under `~/.squeezy/auth/openai-codex.json`
 /// with `chmod 600`); only the endpoint and the originator label are
@@ -3226,7 +3322,8 @@ pub struct GitHubCopilotConfig {
     pub transport: ProviderTransportConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// M-63: derived `Debug` would print `api_key` verbatim; custom impl below redacts it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnthropicConfig {
     pub api_key_env: String,
     #[serde(serialize_with = "redact_secret_opt")]
@@ -3235,7 +3332,19 @@ pub struct AnthropicConfig {
     pub transport: ProviderTransportConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for AnthropicConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnthropicConfig")
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+/// M-63: derived `Debug` would print `api_key` verbatim; custom impl below redacts it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoogleConfig {
     pub api_key_env: String,
     #[serde(serialize_with = "redact_secret_opt")]
@@ -3244,10 +3353,20 @@ pub struct GoogleConfig {
     pub transport: ProviderTransportConfig,
 }
 
-// M-63: redaction applies to the serde `Serialize` path only; the derived
-// `Debug` prints the resolved `api_key` verbatim. Never `{:?}`-log an
-// `AzureOpenAiConfig`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for GoogleConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GoogleConfig")
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+// M-63: custom `Debug` below redacts `api_key`, `entra_bearer_token`, and
+// `extra_headers` values so logs and panic messages cannot leak credentials.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AzureOpenAiConfig {
     pub api_key_env: String,
     #[serde(serialize_with = "redact_secret_opt")]
@@ -3299,7 +3418,25 @@ pub struct AzureOpenAiConfig {
     pub transport: ProviderTransportConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for AzureOpenAiConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AzureOpenAiConfig")
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("base_url", &self.base_url)
+            .field("api_version", &self.api_version)
+            .field("deployment_name_map", &self.deployment_name_map)
+            .field("extra_headers", &RedactedMap(&self.extra_headers))
+            .field("use_entra_id", &self.use_entra_id)
+            .field("entra_bearer_token", &RedactedOpt(&self.entra_bearer_token))
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+/// M-63: custom `Debug` below redacts `bearer_token` so logs and panic
+/// messages cannot leak the short-lived AWS bearer credential.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BedrockConfig {
     pub region: String,
     pub base_url: Option<String>,
@@ -3322,7 +3459,22 @@ pub struct BedrockConfig {
     pub transport: ProviderTransportConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for BedrockConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BedrockConfig")
+            .field("region", &self.region)
+            .field("base_url", &self.base_url)
+            .field("bearer_token", &RedactedOpt(&self.bearer_token))
+            .field("request_metadata", &self.request_metadata)
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+/// M-63: redaction applies to the serde `Serialize` path only; the derived
+/// `Debug` would print the resolved `api_key` verbatim. A custom `Debug`
+/// impl below masks it so accidental logs do not leak credentials.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OllamaConfig {
     pub base_url: String,
     /// Wire route for `POST <model>` traffic. `Native` keeps the proprietary
@@ -3331,7 +3483,63 @@ pub struct OllamaConfig {
     /// so users with portable tooling can pin Ollama to a uniform contract.
     #[serde(default)]
     pub route_style: OllamaRoute,
+    /// Name of the environment variable that holds the bearer token for
+    /// Ollama Cloud or a reverse-proxy-protected self-hosted deployment.
+    /// Defaults to `"OLLAMA_API_KEY"`. No-key local deployments still work —
+    /// the key is simply not attached when the env var is unset and no
+    /// inline `api_key` is provided.
+    #[serde(default = "default_ollama_api_key_env")]
+    pub api_key_env: String,
+    /// Inline plaintext bearer token for Ollama Cloud / protected
+    /// reverse-proxy Ollama. `None` falls back to `api_key_env` resolution
+    /// at request time. Never serialized in plain text — emits `"<redacted>"`
+    /// for accidental dumps.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "redact_secret_opt"
+    )]
+    pub api_key: Option<String>,
+    /// Optional `keep_alive` duration forwarded to every native `/api/chat`
+    /// request. Ollama's server default is 5 minutes; agent sessions that
+    /// idle longer than that pay a full model-reload cost on the next turn.
+    /// Accepts duration strings (`"5m"`, `"24h"`), integer seconds (`"30"`),
+    /// `"0"` for immediate eviction, or `"-1"` to pin the model indefinitely.
+    /// Reads `OLLAMA_KEEP_ALIVE` env var, then `providers.ollama.keep_alive`
+    /// TOML key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive: Option<String>,
     pub transport: ProviderTransportConfig,
+}
+
+fn default_ollama_api_key_env() -> String {
+    "OLLAMA_API_KEY".to_string()
+}
+
+impl fmt::Debug for OllamaConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OllamaConfig")
+            .field("base_url", &self.base_url)
+            .field("route_style", &self.route_style)
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &RedactedOpt(&self.api_key))
+            .field("keep_alive", &self.keep_alive)
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+impl Default for OllamaConfig {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
+            route_style: OllamaRoute::default(),
+            api_key_env: default_ollama_api_key_env(),
+            api_key: None,
+            keep_alive: None,
+            transport: ProviderTransportConfig::default(),
+        }
+    }
 }
 
 /// Configuration for the in-process faux provider used by tests and the
@@ -3866,6 +4074,20 @@ pub struct ProviderSettings {
     pub request_max_retries: Option<u8>,
     pub stream_max_retries: Option<u8>,
     pub stream_idle_timeout_ms: Option<u64>,
+    /// Idle timeout (ms) for TCP connections kept in the shared HTTP pool
+    /// for this provider. Overrides the global
+    /// [`ProviderTransportConfig::pool_idle_timeout_ms`] default. Useful
+    /// on Windows VPN/proxy environments where middleboxes silently reset
+    /// idle connections: lower values (e.g. `15000`) reduce the chance of
+    /// a stale socket being handed to the next request.
+    pub pool_idle_timeout_ms: Option<u64>,
+    /// Maximum number of idle TCP connections kept per origin for this
+    /// provider. Overrides the global
+    /// [`ProviderTransportConfig::pool_max_idle_per_host`] default.
+    pub pool_max_idle_per_host: Option<u32>,
+    /// Upper bound (ms) on inter-retry sleep for this provider. Overrides
+    /// the global [`ProviderTransportConfig::max_retry_delay_ms`] default.
+    pub max_retry_delay_ms: Option<u64>,
     /// `[providers.<section>.headers]` carries `extra_headers` that
     /// reach the upstream verbatim. The Custom-preset workaround for
     /// non-Bearer auth (LiteLLM `x-litellm-key`, PortKey
@@ -3892,6 +4114,13 @@ pub struct ProviderSettings {
     /// Ollama-only: `"native"` (default) or `"openai_compatible"` to pin the
     /// provider to `/v1/chat/completions` SSE instead of `/api/chat` NDJSON.
     pub route_style: Option<String>,
+    /// Ollama-only: `keep_alive` value forwarded on every native `/api/chat`
+    /// request to control how long the server retains the model between turns.
+    /// Accepts duration strings (`"5m"`, `"24h"`), integer seconds, `"0"` for
+    /// immediate eviction, or `"-1"` to pin the model indefinitely. Ignored by
+    /// every other provider. Can also be supplied via the `OLLAMA_KEEP_ALIVE`
+    /// env var (env var takes precedence over TOML).
+    pub keep_alive: Option<String>,
     /// Faux-only: path to a TOML script file consumed by the in-process
     /// faux provider. Other providers ignore this field.
     pub script: Option<String>,
@@ -3966,10 +4195,14 @@ impl ProviderSettings {
                 "request_max_retries",
                 "stream_max_retries",
                 "stream_idle_timeout_ms",
+                "pool_idle_timeout_ms",
+                "pool_max_idle_per_host",
+                "max_retry_delay_ms",
                 "headers",
                 "request_metadata",
                 "deployment_name_map",
                 "route_style",
+                "keep_alive",
                 "script",
                 "use_entra_id",
                 "organization",
@@ -4191,10 +4424,38 @@ impl ProviderSettings {
                 source,
                 &field(path, "stream_idle_timeout_ms"),
             )?,
+            pool_idle_timeout_ms: u64_nonnegative_value(
+                table,
+                "pool_idle_timeout_ms",
+                source,
+                &field(path, "pool_idle_timeout_ms"),
+            )?,
+            pool_max_idle_per_host: match u64_nonnegative_value(
+                table,
+                "pool_max_idle_per_host",
+                source,
+                &field(path, "pool_max_idle_per_host"),
+            )? {
+                None => None,
+                Some(v) if v <= u32::MAX as u64 => Some(v as u32),
+                Some(v) => {
+                    return Err(SqueezyError::Config(format!(
+                        "{source}: {}: expected an integer fitting in u32 (got {v})",
+                        field(path, "pool_max_idle_per_host"),
+                    )));
+                }
+            },
+            max_retry_delay_ms: u64_nonnegative_value(
+                table,
+                "max_retry_delay_ms",
+                source,
+                &field(path, "max_retry_delay_ms"),
+            )?,
             headers,
             request_metadata: None,
             deployment_name_map,
             route_style: string_value(table, "route_style", source, &field(path, "route_style"))?,
+            keep_alive: string_value(table, "keep_alive", source, &field(path, "keep_alive"))?,
             script: string_value(table, "script", source, &field(path, "script"))?,
             use_entra_id: bool_value(table, "use_entra_id", source, &field(path, "use_entra_id"))?,
             organization: string_value(
@@ -4253,8 +4514,15 @@ impl ProviderSettings {
             &mut self.stream_idle_timeout_ms,
             next.stream_idle_timeout_ms,
         );
+        replace_if_some(&mut self.pool_idle_timeout_ms, next.pool_idle_timeout_ms);
+        replace_if_some(
+            &mut self.pool_max_idle_per_host,
+            next.pool_max_idle_per_host,
+        );
+        replace_if_some(&mut self.max_retry_delay_ms, next.max_retry_delay_ms);
         replace_if_some(&mut self.headers, next.headers);
         replace_if_some(&mut self.route_style, next.route_style);
+        replace_if_some(&mut self.keep_alive, next.keep_alive);
         replace_if_some(&mut self.script, next.script);
         replace_if_some(&mut self.use_entra_id, next.use_entra_id);
         replace_if_some(&mut self.organization, next.organization);
@@ -4272,6 +4540,37 @@ impl ProviderSettings {
 
 /// Serde Serializer hook for `Option<String>` fields holding a secret.
 /// `None` round-trips as null/absent; `Some(_)` emits the literal
+/// Debug wrapper for `Option<String>` fields that may carry secrets (API keys,
+/// bearer tokens). Displays as `Some("<redacted>")` when the value is set and
+/// `None` otherwise, so `{:?}`-formatted log lines and panic messages cannot
+/// leak credentials. Used by manual `Debug` impls on secret-bearing config
+/// structs as the fix for M-63.
+struct RedactedOpt<'a>(&'a Option<String>);
+
+impl fmt::Debug for RedactedOpt<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(_) => write!(f, "Some(\"<redacted>\")"),
+            None => write!(f, "None"),
+        }
+    }
+}
+
+/// Debug wrapper for `BTreeMap<String, String>` fields whose values may carry
+/// secrets (e.g. `Authorization` header values in `extra_headers`). Displays
+/// keys verbatim and masks every value as `"<redacted>"`.
+struct RedactedMap<'a>(&'a BTreeMap<String, String>);
+
+impl fmt::Debug for RedactedMap<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut map = f.debug_map();
+        for key in self.0.keys() {
+            map.entry(key, &"<redacted>");
+        }
+        map.finish()
+    }
+}
+
 /// `"<redacted>"` so any path that serializes the struct (debug dumps,
 /// inspect output, accidental `to_string`) can't leak the plaintext.
 fn redact_secret_opt<S>(
@@ -4759,6 +5058,20 @@ pub struct RoutingConfig {
     /// `[routing].extra_heuristic_verbs = ["deploy", "tail"]` in TOML
     /// or `SQUEEZY_ROUTING_EXTRA_HEURISTIC_VERBS=deploy,tail` env.
     pub extra_heuristic_verbs: Vec<String>,
+    /// When `true` (the default), prompts containing Linux
+    /// sandbox/container/kernel keywords (`unshare`, `landlock`,
+    /// `seccomp`, `sudo`, `docker`, `podman`, `/proc`, `/sys`,
+    /// package-manager commands, and related terms) are routed to the
+    /// parent model rather than the cheap tier. `/cheap` overrides.
+    /// Disable with `[routing].linux_sandbox_sensitive_parent = false`
+    /// or `SQUEEZY_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT=false`.
+    ///
+    /// This guard applies on all platforms (macOS, Linux, Windows), not
+    /// only on Linux, because Docker, Podman, container runtimes, and
+    /// package managers require parent-model care regardless of the host
+    /// OS. The name reflects where the keywords originate, not where the
+    /// guard activates.
+    pub linux_sandbox_sensitive_parent: bool,
 }
 
 impl RoutingConfig {
@@ -4837,6 +5150,16 @@ impl RoutingConfig {
                 })
                 .or(settings.extra_heuristic_verbs)
                 .unwrap_or_default(),
+            linux_sandbox_sensitive_parent: get_var(
+                "SQUEEZY_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT",
+            )
+            .as_deref()
+            .map(parse_enabled_bool)
+            .unwrap_or(
+                settings
+                    .linux_sandbox_sensitive_parent
+                    .unwrap_or(DEFAULT_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT),
+            ),
         }
     }
 
@@ -4871,6 +5194,7 @@ pub struct RoutingSettings {
     pub judge_max_chars: Option<u32>,
     pub judge_model: Option<String>,
     pub extra_heuristic_verbs: Option<Vec<String>>,
+    pub linux_sandbox_sensitive_parent: Option<bool>,
 }
 
 impl RoutingSettings {
@@ -4893,6 +5217,7 @@ impl RoutingSettings {
                 "judge_max_chars",
                 "judge_model",
                 "extra_heuristic_verbs",
+                "linux_sandbox_sensitive_parent",
             ],
             source,
             path,
@@ -4968,6 +5293,12 @@ impl RoutingSettings {
                 source,
                 &field(path, "extra_heuristic_verbs"),
             )?,
+            linux_sandbox_sensitive_parent: bool_value(
+                table,
+                "linux_sandbox_sensitive_parent",
+                source,
+                &field(path, "linux_sandbox_sensitive_parent"),
+            )?,
         })
     }
 
@@ -4999,12 +5330,19 @@ impl RoutingSettings {
         replace_if_some(&mut self.judge_max_chars, next.judge_max_chars);
         replace_if_some(&mut self.judge_model, next.judge_model);
         merge_string_lists(&mut self.extra_heuristic_verbs, next.extra_heuristic_verbs);
+        replace_if_some(
+            &mut self.linux_sandbox_sensitive_parent,
+            next.linux_sandbox_sensitive_parent,
+        );
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSchemaConfig {
     pub lazy_schema_loading: bool,
+    pub checkpoint_retention_days: u64,
+    pub checkpoint_max_file_bytes: u64,
+    pub checkpoint_cleanup_interval_secs: u64,
     pub core: Vec<String>,
     pub discoverable: Vec<String>,
     /// Names that must be filtered out before tools are advertised to
@@ -5019,6 +5357,9 @@ impl Default for ToolSchemaConfig {
     fn default() -> Self {
         Self {
             lazy_schema_loading: true,
+            checkpoint_retention_days: DEFAULT_CHECKPOINT_RETENTION_DAYS,
+            checkpoint_max_file_bytes: DEFAULT_CHECKPOINT_MAX_FILE_BYTES,
+            checkpoint_cleanup_interval_secs: DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_SECS,
             core: DEFAULT_CORE_TOOL_NAMES
                 .iter()
                 .map(|name| (*name).to_string())
@@ -5050,6 +5391,15 @@ impl ToolSchemaConfig {
             lazy_schema_loading: settings
                 .lazy_schema_loading
                 .unwrap_or(defaults.lazy_schema_loading),
+            checkpoint_retention_days: settings
+                .checkpoint_retention_days
+                .unwrap_or(defaults.checkpoint_retention_days),
+            checkpoint_max_file_bytes: settings
+                .checkpoint_max_file_bytes
+                .unwrap_or(defaults.checkpoint_max_file_bytes),
+            checkpoint_cleanup_interval_secs: settings
+                .checkpoint_cleanup_interval_secs
+                .unwrap_or(defaults.checkpoint_cleanup_interval_secs),
             core,
             discoverable,
             excluded,
@@ -5073,6 +5423,9 @@ impl ToolSchemaConfig {
 pub struct ToolSchemaSettings {
     pub checkpoints_enabled: Option<bool>,
     pub lazy_schema_loading: Option<bool>,
+    pub checkpoint_retention_days: Option<u64>,
+    pub checkpoint_max_file_bytes: Option<u64>,
+    pub checkpoint_cleanup_interval_secs: Option<u64>,
     pub core: Option<Vec<String>>,
     pub discoverable: Option<Vec<String>>,
     pub excluded: Option<Vec<String>>,
@@ -5085,6 +5438,9 @@ impl ToolSchemaSettings {
             &[
                 "checkpoints_enabled",
                 "lazy_schema_loading",
+                "checkpoint_retention_days",
+                "checkpoint_max_file_bytes",
+                "checkpoint_cleanup_interval_secs",
                 "core",
                 "discoverable",
                 "excluded",
@@ -5105,6 +5461,24 @@ impl ToolSchemaSettings {
                 source,
                 &field(path, "lazy_schema_loading"),
             )?,
+            checkpoint_retention_days: u64_value(
+                table,
+                "checkpoint_retention_days",
+                source,
+                &field(path, "checkpoint_retention_days"),
+            )?,
+            checkpoint_max_file_bytes: u64_value(
+                table,
+                "checkpoint_max_file_bytes",
+                source,
+                &field(path, "checkpoint_max_file_bytes"),
+            )?,
+            checkpoint_cleanup_interval_secs: u64_value(
+                table,
+                "checkpoint_cleanup_interval_secs",
+                source,
+                &field(path, "checkpoint_cleanup_interval_secs"),
+            )?,
             core: string_array_value(table, "core", source, &field(path, "core"))?,
             discoverable: string_array_value(
                 table,
@@ -5119,6 +5493,18 @@ impl ToolSchemaSettings {
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.checkpoints_enabled, next.checkpoints_enabled);
         replace_if_some(&mut self.lazy_schema_loading, next.lazy_schema_loading);
+        replace_if_some(
+            &mut self.checkpoint_retention_days,
+            next.checkpoint_retention_days,
+        );
+        replace_if_some(
+            &mut self.checkpoint_max_file_bytes,
+            next.checkpoint_max_file_bytes,
+        );
+        replace_if_some(
+            &mut self.checkpoint_cleanup_interval_secs,
+            next.checkpoint_cleanup_interval_secs,
+        );
         merge_string_lists(&mut self.core, next.core);
         merge_string_lists(&mut self.discoverable, next.discoverable);
         merge_string_lists(&mut self.excluded, next.excluded);
@@ -5712,6 +6098,7 @@ pub struct SubagentSettings {
     pub max_summary_tokens: Option<u32>,
     pub max_runtime_secs: Option<u64>,
     pub include_transcript: Option<bool>,
+    pub help_strict_local: Option<bool>,
 }
 
 impl SubagentSettings {
@@ -5730,6 +6117,7 @@ impl SubagentSettings {
                 "max_summary_tokens",
                 "max_runtime_secs",
                 "include_transcript",
+                "help_strict_local",
             ],
             source,
             path,
@@ -5796,6 +6184,12 @@ impl SubagentSettings {
                 source,
                 &field(path, "include_transcript"),
             )?,
+            help_strict_local: bool_value(
+                table,
+                "help_strict_local",
+                source,
+                &field(path, "help_strict_local"),
+            )?,
         })
     }
 
@@ -5820,6 +6214,7 @@ impl SubagentSettings {
         replace_if_some(&mut self.max_summary_tokens, next.max_summary_tokens);
         replace_if_some(&mut self.max_runtime_secs, next.max_runtime_secs);
         replace_if_some(&mut self.include_transcript, next.include_transcript);
+        replace_if_some(&mut self.help_strict_local, next.help_strict_local);
     }
 }
 
@@ -5844,6 +6239,13 @@ pub struct SubagentConfig {
     /// (`summary`, `supporting_receipts`, `files_touched`), keeping the
     /// parent loop's context tight.
     pub include_transcript: bool,
+    /// When `true`, unknown `/help` topics that lack a curated local answer
+    /// are refused with a pointer to docs rather than escalated to the
+    /// DocHelp provider subagent. Useful for offline or cost-sensitive
+    /// sessions. Defaults to `false` (DocHelp escalation enabled when
+    /// `subagents.enabled = true`).
+    #[serde(default)]
+    pub help_strict_local: bool,
 }
 
 impl SubagentConfig {
@@ -5912,6 +6314,10 @@ impl SubagentConfig {
                 .as_deref()
                 .map(parse_enabled_bool)
                 .unwrap_or(settings.include_transcript.unwrap_or(false)),
+            help_strict_local: get_var("SQUEEZY_HELP_STRICT_LOCAL")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.help_strict_local.unwrap_or(false)),
         }
     }
 }
@@ -5930,6 +6336,7 @@ impl Default for SubagentConfig {
             max_summary_tokens: DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
             max_runtime_secs: None,
             include_transcript: false,
+            help_strict_local: false,
         }
     }
 }
@@ -6854,6 +7261,12 @@ pub struct ShellSandboxSettings {
     pub replace_sensitive_path_patterns: Option<bool>,
     /// Windows-only: `disabled`, `restricted_token` (default), or `elevated`.
     pub windows_sandbox_level: Option<String>,
+    /// macOS-only: AF_UNIX socket subpath allowlist used when network is
+    /// denied. Merged additively across config sources (same as `read_roots`).
+    pub macos_socket_domain_allowlist: Option<Vec<String>>,
+    /// Linux-only: absolute path to the shell binary used for sandboxed commands
+    /// (e.g. `"/bin/bash"`). Defaults to `/bin/sh`. Ignored on other platforms.
+    pub linux_shell: Option<String>,
 }
 
 impl ShellSandboxSettings {
@@ -6872,6 +7285,8 @@ impl ShellSandboxSettings {
                 "sensitive_path_patterns",
                 "replace_sensitive_path_patterns",
                 "windows_sandbox_level",
+                "macos_socket_domain_allowlist",
+                "linux_shell",
             ],
             source,
             path,
@@ -6928,6 +7343,13 @@ impl ShellSandboxSettings {
                 source,
                 &field(path, "windows_sandbox_level"),
             )?,
+            macos_socket_domain_allowlist: string_array_value(
+                table,
+                "macos_socket_domain_allowlist",
+                source,
+                &field(path, "macos_socket_domain_allowlist"),
+            )?,
+            linux_shell: string_value(table, "linux_shell", source, &field(path, "linux_shell"))?,
         })
     }
 
@@ -6952,6 +7374,11 @@ impl ShellSandboxSettings {
             next.replace_sensitive_path_patterns,
         );
         replace_if_some(&mut self.windows_sandbox_level, next.windows_sandbox_level);
+        merge_string_lists(
+            &mut self.macos_socket_domain_allowlist,
+            next.macos_socket_domain_allowlist,
+        );
+        replace_if_some(&mut self.linux_shell, next.linux_shell);
     }
 }
 
@@ -7059,6 +7486,19 @@ pub struct ShellSandboxConfig {
     /// Windows-only backend selection. Defaults to `RestrictedToken` so Windows
     /// shells get filesystem isolation with no configuration. Ignored elsewhere.
     pub windows_sandbox_level: WindowsSandboxLevel,
+    /// macOS-only: AF_UNIX socket subpath allowlist applied when the network
+    /// posture is `deny_by_default`. Each entry is a path prefix; any socket
+    /// whose path starts with that prefix is allowed. An empty list (the
+    /// default) means AF_UNIX is fully denied when network is denied — the
+    /// Seatbelt `(deny default)` rule blocks it. Add entries like
+    /// `/private/tmp/squeezy-` for local build-tool sockets that need to
+    /// reach the sandbox child (e.g. a custom approval daemon). Ignored
+    /// when `network = allow_when_approved` or on non-macOS platforms.
+    #[serde(default)]
+    pub macos_socket_domain_allowlist: Vec<String>,
+    /// Linux-only: absolute path to the shell used for sandboxed commands.
+    /// `None` means use `/bin/sh`. Ignored on other platforms.
+    pub linux_shell: Option<String>,
 }
 
 impl Default for ShellSandboxConfig {
@@ -7074,6 +7514,8 @@ impl Default for ShellSandboxConfig {
             protected_metadata_names: default_protected_metadata_names(),
             sensitive_path_patterns: default_sensitive_path_patterns(),
             windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
+            macos_socket_domain_allowlist: Vec::new(),
+            linux_shell: None,
         }
     }
 }
@@ -7196,6 +7638,43 @@ impl ShellSandboxConfig {
                     "{source}: permissions.shell_sandbox.windows_sandbox_level invalid value {level:?}; expected disabled, restricted_token, or elevated"
                 ))
             })?;
+        }
+        if let Some(allowlist) = settings.macos_socket_domain_allowlist {
+            // Validate: each entry must be an absolute path or start with /
+            // (on macOS, Unix sockets always live in the filesystem).
+            for entry in &allowlist {
+                if !entry.starts_with('/') {
+                    return Err(SqueezyError::Config(format!(
+                        "{source}: permissions.shell_sandbox.macos_socket_domain_allowlist entry {entry:?} must be an absolute path starting with /"
+                    )));
+                }
+            }
+            config.macos_socket_domain_allowlist = allowlist;
+        }
+        if let Some(shell_path) = settings.linux_shell {
+            if shell_path.trim().is_empty() {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.linux_shell must not be empty"
+                )));
+            }
+            if !shell_path.starts_with('/') {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.linux_shell {shell_path:?} must be an \
+                     absolute path (e.g. \"/bin/bash\" or \"/usr/bin/fish\")"
+                )));
+            }
+            // On Linux, validate that the shell binary exists at config load
+            // time so a misconfigured path produces a clear error at startup
+            // rather than a cryptic spawn failure when the first shell command
+            // runs. On other platforms this config is ignored, so skip the
+            // check to avoid spurious failures in cross-platform test configs.
+            #[cfg(target_os = "linux")]
+            if !std::path::Path::new(&shell_path).exists() {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: permissions.shell_sandbox.linux_shell {shell_path:?} does not exist"
+                )));
+            }
+            config.linux_shell = Some(shell_path);
         }
         reject_duplicate_shell_roots(source, &config.read_roots, &config.write_roots)?;
         Ok(config)
@@ -7441,6 +7920,7 @@ fn default_shell_env_allowlist() -> Vec<String> {
 
 fn default_sensitive_path_patterns() -> Vec<String> {
     [
+        // Unix / cross-platform credential and key stores.
         ".ssh/**",
         ".aws/**",
         ".config/gh/**",
@@ -7452,6 +7932,26 @@ fn default_sensitive_path_patterns() -> Vec<String> {
         ".npmrc",
         ".pypirc",
         ".env*",
+        // Windows-specific credential and token stores. On Windows these live
+        // under %USERPROFILE% and are matched relative to the home directory
+        // via the sensitive-path scanner's home-relative normalization. On
+        // non-Windows hosts they do not occur in practice, so the extra
+        // patterns are a no-op.
+        ".azure/**",
+        "AppData/Roaming/gcloud/**",
+        "AppData/Roaming/Microsoft/UserSecrets/**",
+        // PSReadLine stores history at %APPDATA%\Microsoft\Windows\PowerShell\
+        // PSReadLine\ConsoleHost_history.txt; %APPDATA% resolves to Roaming.
+        "AppData/Roaming/Microsoft/Windows/PowerShell/**",
+        ".nuget/credentials",
+        // XDG and cloud CLI credential locations not covered above.
+        // Added as part of the Linux-hardening pass.
+        ".password-store/**",
+        ".config/sops/**",
+        ".config/1Password/**",
+        ".azure/**",
+        ".config/gcloud/**",
+        ".config/kube/**",
     ]
     .into_iter()
     .map(str::to_string)
@@ -8849,6 +9349,16 @@ impl SkillsBudgetMode {
 pub struct SkillsConfig {
     pub user_dir: PathBuf,
     pub compat_user_dir: PathBuf,
+    /// Optional XDG-aware user skills directory.  On Linux this is
+    /// `$XDG_DATA_HOME/squeezy/skills` (or `$HOME/.local/share/squeezy/skills`
+    /// when `XDG_DATA_HOME` is unset but `HOME` is present).  When set it is
+    /// scanned alongside `user_dir` so users who follow XDG conventions are
+    /// covered without losing the legacy `~/.squeezy/skills` path.
+    ///
+    /// `None` on platforms or configurations where XDG is not applicable (e.g.
+    /// macOS with default settings, or any host where `HOME` is absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xdg_user_dir: Option<PathBuf>,
     /// Additional filesystem roots walked during skill discovery. Their
     /// skills live at [`SkillSource::ExtraRoot`] precedence, above the
     /// personal `user_dir` and below project-local skills, so a workspace
@@ -8924,19 +9434,25 @@ impl SkillsConfig {
                     .map(|chars| SkillsBudgetMode::Chars { chars })
             })
             .unwrap_or_default();
+        let user_dir = expand_home_path(
+            var("SQUEEZY_SKILLS_USER_DIR")
+                .map(PathBuf::from)
+                .or(settings.user_dir)
+                .unwrap_or_else(default_squeezy_skills_dir),
+        );
+        // Dedup XDG against the fully-resolved user_dir (not just the static
+        // default) so that operators who point SQUEEZY_SKILLS_USER_DIR at the
+        // XDG location don't get the directory scanned twice.
+        let xdg_user_dir = default_xdg_skills_dir().filter(|xdg| xdg != &user_dir);
         Self {
-            user_dir: expand_home_path(
-                var("SQUEEZY_SKILLS_USER_DIR")
-                    .map(PathBuf::from)
-                    .or(settings.user_dir)
-                    .unwrap_or_else(default_squeezy_skills_dir),
-            ),
+            user_dir,
             compat_user_dir: expand_home_path(
                 var("SQUEEZY_SKILLS_COMPAT_USER_DIR")
                     .map(PathBuf::from)
                     .or(settings.compat_user_dir)
                     .unwrap_or_else(default_agent_compat_skills_dir),
             ),
+            xdg_user_dir,
             extra_roots: settings
                 .extra_roots
                 .into_iter()
@@ -8991,6 +9507,7 @@ impl Default for SkillsConfig {
         Self {
             user_dir: default_squeezy_skills_dir(),
             compat_user_dir: default_agent_compat_skills_dir(),
+            xdg_user_dir: default_xdg_skills_dir(),
             extra_roots: Vec::new(),
             active_budget_chars: DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS,
             active_body_cap_chars: DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS,
@@ -9021,9 +9538,7 @@ pub struct GraphConfig {
 impl GraphConfig {
     fn from_settings(settings: GraphSettings) -> Self {
         Self {
-            languages: settings
-                .languages
-                .unwrap_or_else(|| vec!["rust".to_string(), "python".to_string()]),
+            languages: settings.languages.unwrap_or_default(),
             max_file_bytes: settings.max_file_bytes.unwrap_or(1_000_000),
             include_hidden: settings.include_hidden.unwrap_or(false),
             require_indexing_signal: settings.require_indexing_signal.unwrap_or(true),
@@ -9126,6 +9641,7 @@ impl GraphSettings {
 pub struct CacheConfig {
     pub root: Option<PathBuf>,
     pub tool_outputs: Option<PathBuf>,
+    pub durability: CacheDurability,
 }
 
 impl CacheConfig {
@@ -9133,6 +9649,7 @@ impl CacheConfig {
         Self {
             root: settings.root,
             tool_outputs: settings.tool_outputs,
+            durability: settings.durability.unwrap_or_default(),
         }
     }
 }
@@ -9141,20 +9658,51 @@ impl CacheConfig {
 pub struct CacheSettings {
     pub root: Option<PathBuf>,
     pub tool_outputs: Option<PathBuf>,
+    pub durability: Option<CacheDurability>,
 }
 
 impl CacheSettings {
     fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
-        reject_unknown_keys(table, &["root", "tool_outputs"], source, path)?;
+        reject_unknown_keys(table, &["root", "tool_outputs", "durability"], source, path)?;
         Ok(Self {
             root: path_value(table, "root", source, &field(path, "root"))?,
             tool_outputs: path_value(table, "tool_outputs", source, &field(path, "tool_outputs"))?,
+            durability: cache_durability_value(table, "durability", source, path)?,
         })
     }
 
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.root, next.root);
         replace_if_some(&mut self.tool_outputs, next.tool_outputs);
+        replace_if_some(&mut self.durability, next.durability);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheDurability {
+    #[default]
+    Fast,
+    Turn,
+    Strict,
+}
+
+impl CacheDurability {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fast" => Some(Self::Fast),
+            "turn" => Some(Self::Turn),
+            "strict" => Some(Self::Strict),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Turn => "turn",
+            Self::Strict => "strict",
+        }
     }
 }
 
@@ -9701,11 +10249,13 @@ pub fn default_settings_path() -> PathBuf {
 
 /// Path of the on-disk prompt-recall ring backing `[tui]
 /// .persist_prompt_history`. Prefers `$HOME/.squeezy/prompt_history`
-/// for parity with `default_settings_path`; falls back to
-/// `dirs::data_dir()/squeezy/prompt_history` (XDG-compatible:
-/// `$XDG_DATA_HOME/squeezy/prompt_history` on Linux,
-/// `%APPDATA%\squeezy\prompt_history` on Windows). Overridable with
-/// `SQUEEZY_PROMPT_HISTORY_PATH` for tests and power users who keep
+/// when `HOME` is set (same dotdir convention as `default_settings_path`);
+/// falls back to `dirs::data_dir()/squeezy/prompt_history`
+/// (`$XDG_DATA_HOME/squeezy/prompt_history` on Linux when `HOME` is unset,
+/// `%APPDATA%\squeezy\prompt_history` on Windows). Note: the primary
+/// default on Linux is the `~/.squeezy` dotdir, not the XDG state/data
+/// hierarchy; set `SQUEEZY_PROMPT_HISTORY_PATH` to override. Overridable
+/// with `SQUEEZY_PROMPT_HISTORY_PATH` for tests and power users who keep
 /// their dotfiles elsewhere.
 pub fn default_prompt_history_path() -> PathBuf {
     if let Some(custom) = env::var_os("SQUEEZY_PROMPT_HISTORY_PATH") {
@@ -9772,6 +10322,13 @@ pub fn repo_settings_id(root: impl AsRef<Path>) -> String {
     let root = root.as_ref();
     let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let display = canonical.display().to_string();
+    // On Windows, drive-letter casing (e.g. `C:\` vs `c:\`) and UNC
+    // normalisation can vary between callers, producing different hashes
+    // for the same root. Lowercase the whole display string before hashing
+    // so per-repo settings are stable regardless of how the drive letter is
+    // spelled. On non-Windows the string is case-sensitive and unchanged.
+    #[cfg(windows)]
+    let display = display.to_lowercase();
     let name = canonical
         .file_name()
         .and_then(|name| name.to_str())
@@ -9811,17 +10368,100 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 pub fn default_squeezy_skills_dir() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(DEFAULT_SQUEEZY_SKILLS_DIR))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR))
+    squeezy_skills_dir_for_home(env::var_os("HOME").map(PathBuf::from), dirs::data_dir())
 }
 
 pub fn default_agent_compat_skills_dir() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
+    agent_compat_skills_dir_for_home(env::var_os("HOME").map(PathBuf::from), dirs::data_dir())
+}
+
+/// Pure helper for `default_squeezy_skills_dir`. Factored out so the
+/// HOME-unset fallback (containers, systemd units) can be unit tested
+/// without mutating process env, which races with any other test that
+/// reads `HOME` without taking the env mutex.
+fn squeezy_skills_dir_for_home(home: Option<PathBuf>, data: Option<PathBuf>) -> PathBuf {
+    if let Some(home) = home {
+        return home.join(DEFAULT_SQUEEZY_SKILLS_DIR);
+    }
+    if let Some(data) = data {
+        return data.join("squeezy").join("skills");
+    }
+    PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR)
+}
+
+/// Pure helper for `default_agent_compat_skills_dir`. See
+/// `squeezy_skills_dir_for_home` for the rationale on the explicit
+/// `home` / `data` parameters.
+fn agent_compat_skills_dir_for_home(home: Option<PathBuf>, data: Option<PathBuf>) -> PathBuf {
+    if let Some(home) = home {
+        return home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR);
+    }
+    if let Some(data) = data {
+        return data.join("agents").join("skills");
+    }
+    PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
+}
+
+/// Returns `true` when `HOME` is absent **and** a skills/prompts default would
+/// resolve to a bare relative path.  Callers (doctor, `skills install`) should
+/// surface a warning in this case because relative defaults are process-cwd
+/// relative and almost certainly wrong in a service/container context.
+pub fn skills_home_missing() -> bool {
+    env::var_os("HOME").is_none()
+}
+
+/// XDG-aware user skills directory.  Returns `Some` only when both `HOME` is
+/// present *and* the resolved XDG path differs from the legacy `user_dir`.
+///
+/// Resolution order:
+///   1. `$XDG_DATA_HOME/squeezy/skills` when `XDG_DATA_HOME` is set.
+///   2. `$HOME/.local/share/squeezy/skills` when `HOME` is set.
+///   3. `None` otherwise (no HOME → the caller will already warn).
+///
+/// When the resolved path equals `default_squeezy_skills_dir()` (i.e. the
+/// user has `XDG_DATA_HOME` pointed at `~/.squeezy`) there is no point
+/// scanning it twice, so `None` is returned in that case too.
+pub fn default_xdg_skills_dir() -> Option<PathBuf> {
+    let xdg = if let Some(xdg_data) = env::var_os("XDG_DATA_HOME") {
+        PathBuf::from(xdg_data).join("squeezy").join("skills")
+    } else {
+        let home = PathBuf::from(env::var_os("HOME")?);
+        home.join(".local")
+            .join("share")
+            .join("squeezy")
+            .join("skills")
+    };
+    // Avoid scanning the same directory twice when XDG_DATA_HOME happens to
+    // point at the same place as the legacy ~/.squeezy/skills default.
+    if xdg == default_squeezy_skills_dir() {
+        return None;
+    }
+    Some(xdg)
+}
+
+/// XDG-aware user prompts directory.  Returns `Some` only when `HOME` is
+/// present and the resolved XDG path differs from the legacy prompts path.
+///
+/// Resolution order:
+///   1. `$XDG_CONFIG_HOME/squeezy/prompts` when `XDG_CONFIG_HOME` is set.
+///   2. `$HOME/.config/squeezy/prompts` when `HOME` is set.
+///   3. `None` otherwise.
+pub fn default_xdg_prompts_dir() -> Option<PathBuf> {
+    let xdg = if let Some(xdg_cfg) = env::var_os("XDG_CONFIG_HOME") {
+        PathBuf::from(xdg_cfg).join("squeezy").join("prompts")
+    } else {
+        let home = PathBuf::from(env::var_os("HOME")?);
+        home.join(".config").join("squeezy").join("prompts")
+    };
+    // Avoid duplicates: if XDG resolved to the same path as the legacy
+    // ~/.squeezy/prompts, return None so we don't scan it twice.
+    let legacy = PathBuf::from(env::var_os("HOME").unwrap_or_default())
+        .join(".squeezy")
+        .join("prompts");
+    if xdg == legacy {
+        return None;
+    }
+    Some(xdg)
 }
 
 fn expand_home_path(path: PathBuf) -> PathBuf {
@@ -9829,15 +10469,52 @@ fn expand_home_path(path: PathBuf) -> PathBuf {
         return path;
     };
     if path_str == "~" {
-        return env::var_os("HOME").map(PathBuf::from).unwrap_or(path);
+        return home_dir_path().unwrap_or(path);
     }
     if let Some(rest) = path_str.strip_prefix("~/") {
-        return env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join(rest))
-            .unwrap_or(path);
+        return home_dir_path().map(|home| home.join(rest)).unwrap_or(path);
+    }
+    // On Windows, TOML authors may write `~\subdir` (backslash separator).
+    // `PathBuf::to_str` on Windows preserves the separator as `\\` in the
+    // string representation, so we also check for that prefix.
+    #[cfg(windows)]
+    if let Some(rest) = path_str.strip_prefix("~\\") {
+        return home_dir_path().map(|home| home.join(rest)).unwrap_or(path);
     }
     path
+}
+
+/// Returns the current user's home directory, preferring `$HOME` for
+/// Unix compatibility and falling back to `dirs::home_dir()` so that
+/// Windows processes without `HOME` set (but with `USERPROFILE` /
+/// `HOMEDRIVE`+`HOMEPATH` or a known-folder registry entry) still
+/// resolve `~` correctly.
+///
+/// The result is cached in a process-global `OnceLock`. On Windows,
+/// profile and redirected-folder lookups can be noticeably slower than
+/// a simple env-var read; caching removes the per-call overhead and
+/// avoids repeated Win32 `GetUserProfileDirectory` calls during
+/// config-screen rendering.
+///
+/// **Testing note**: because this function caches on first call, the
+/// `dirs::home_dir()` fallback cannot be exercised in a test that runs in
+/// a process where `$HOME` is already set. Coverage of the Windows-without-
+/// `$HOME` path requires a separate process invocation (e.g. an integration
+/// test that unsets `HOME` and calls the binary directly).
+pub fn cached_home_dir() -> Option<PathBuf> {
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .or_else(dirs::home_dir)
+        })
+        .as_deref()
+        .map(PathBuf::from)
+}
+
+fn home_dir_path() -> Option<PathBuf> {
+    cached_home_dir()
 }
 
 /// Walks up the directory tree from `start` looking for `squeezy.toml`.
@@ -9871,6 +10548,30 @@ pub fn find_project_settings_path(start: impl AsRef<Path>) -> Option<PathBuf> {
 pub fn user_settings_template() -> &'static str {
     r#"# User-level Squeezy settings. Uncomment any key you want to override.
 # Commented values are examples or defaults that apply when the key is absent.
+# On Windows this file is at %APPDATA%\squeezy\settings.toml
+# (or wherever SQUEEZY_SETTINGS_PATH points).
+# PowerShell: $env:SQUEEZY_SETTINGS_PATH = "C:\Users\me\squeezy\settings.toml"
+# Path values in TOML require backslash-escaping or forward slashes:
+#   "C:\\Users\\me\\squeezy\\sessions"   or   "C:/Users/me/squeezy/sessions"
+#
+# PATH CONVENTIONS (Linux / Unix)
+# ─────────────────────────────────────────────────────────────────────────────
+# Squeezy uses `~/.squeezy` as the primary user directory rather than XDG.
+# When HOME is set (the normal case):
+#   • User settings:       ~/.squeezy/settings.toml  (this file)
+#   • Repo-local settings: ~/.squeezy/projects/<hash>/settings.toml
+#   • Session logs:        (default: set [session].log_dir or SQUEEZY_SESSION_DIR)
+#   • Skills:              ~/.squeezy/skills  and  ~/.agents/skills
+#   • Prompt history:      ~/.squeezy/prompt_history
+#
+# When HOME is NOT set (containers, systemd services, sudo-stripped envs):
+#   Squeezy falls back to the platform config/data directories
+#   ($XDG_CONFIG_HOME, $XDG_DATA_HOME on Linux) and warns on startup.
+#   Use SQUEEZY_SETTINGS_PATH and SQUEEZY_SESSION_DIR to pin explicit paths.
+#
+# The `~` in TOML values is expanded against HOME. In environment variables
+# such as SQUEEZY_SESSION_DIR, `~` is also expanded automatically.
+# ─────────────────────────────────────────────────────────────────────────────
 
 [model]
 # provider = "openai"          # openai | anthropic | google | azure_openai | bedrock | ollama
@@ -9895,6 +10596,8 @@ pub fn user_settings_template() -> &'static str {
 # mode = "build"              # build | plan
 # resume_picker = "ask"       # ask | never
 # log_dir = ".squeezy/sessions"
+# Windows path examples: log_dir = "C:\\Users\\me\\squeezy\\sessions"
+#                     or log_dir = "C:/Users/me/squeezy/sessions"
 # log_retention_days = 30
 # log_retention_archive_days = 30  # archived sessions deleted after this many days; 0 disables the archive sweep
 # max_event_bytes = 65536
@@ -10046,7 +10749,7 @@ pub fn user_settings_template() -> &'static str {
 # read_roots = []                  # extra absolute directories shell may read
 # write_roots = []                 # extra absolute directories shell may read/write
 # protected_metadata_names = [".git", ".squeezy", ".agents"]
-# sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*"]
+# sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*", ".password-store/**", ".config/sops/**", ".config/1Password/**", ".azure/**", ".config/gcloud/**", ".config/kube/**"]
 
 [hardening]
 # disable_core_dumps = true
@@ -10075,6 +10778,9 @@ pub fn user_settings_template() -> &'static str {
 # [skills]
 # user_dir = "~/.squeezy/skills"
 # compat_user_dir = "~/.agents/skills"
+# Windows: TOML path values require backslash-escaping or forward slashes:
+#   user_dir = "C:\\Users\\me\\.squeezy\\skills"   # escaped backslashes
+#   user_dir = "C:/Users/me/.squeezy/skills"        # forward slashes work too
 # active_budget_chars = 4000          # legacy absolute cap; used only when active_budget_mode is unset
 # active_body_cap_chars = 16000
 # preamble_enabled = true
@@ -10090,6 +10796,9 @@ pub fn user_settings_template() -> &'static str {
 
 # [tools]
 # checkpoints_enabled = false
+# checkpoint_retention_days = 7
+# checkpoint_max_file_bytes = 2097152
+# checkpoint_cleanup_interval_secs = 3600
 # lazy_schema_loading = true
 # `update_task_state` and `load_tool_schema` are always-core control tools
 # and do not need to appear in `core`. See `DEFAULT_CORE_TOOL_NAMES` in
@@ -10246,7 +10955,8 @@ pub fn project_settings_template() -> &'static str {
 # external MCP tools that are discovered before each agent turn.
 
 # [graph]
-# languages = ["rust", "python"]
+# languages = []  # all supported languages (the default); set
+#                 # e.g. ["rust", "python"] to restrict to those
 # max_file_bytes = 1000000
 # include_hidden = false
 # require_indexing_signal = true
@@ -10258,10 +10968,15 @@ pub fn project_settings_template() -> &'static str {
 [cache]
 # Relative paths are resolved against the project root (the directory
 # containing this squeezy.toml).
+# root = ".squeezy/cache"          # or "xdg" on Linux for XDG cache storage
 # tool_outputs = ".squeezy/tool_outputs"
+# durability = "fast"             # fast | turn | strict
 
 # [tools]
 # checkpoints_enabled = false
+# checkpoint_retention_days = 7
+# checkpoint_max_file_bytes = 2097152
+# checkpoint_cleanup_interval_secs = 3600
 # lazy_schema_loading = true
 # `update_task_state` and `load_tool_schema` are always-core control tools
 # and do not need to appear in `core`. See `DEFAULT_CORE_TOOL_NAMES` in
@@ -10291,6 +11006,42 @@ pub fn project_settings_template() -> &'static str {
 "#
 }
 
+/// Template for the per-machine repo-local settings tier
+/// (`~/.squeezy/projects/<hash>/settings.toml`).
+///
+/// This file is **not** committed; it holds machine-specific overrides that
+/// should not affect other contributors.  Common uses: provider credentials,
+/// local base-URL overrides, and personal model preferences for this project.
+pub fn local_settings_template() -> &'static str {
+    r#"# Per-machine repo-local Squeezy settings.
+# This file lives in ~/.squeezy/projects/<project-hash>/settings.toml and is
+# NOT committed.  Use it for machine-specific overrides that should not affect
+# other contributors: provider credentials, local base-URL overrides, personal
+# model preferences for this project, and sandbox tuning.
+# Uncomment any key you want to override.
+
+[model]
+# provider = "openai"          # openai | anthropic | google | azure_openai | bedrock | ollama
+# profile = "balanced"         # cheap | balanced | strong
+# model = "gpt-5.5"            # provider-specific model id; leave unset to use the provider default
+# reasoning_effort = "medium"  # low | medium | high | xhigh; only sent to capable providers
+
+# [providers.openai]
+# api_key_env = "OPENAI_API_KEY"
+# base_url = "https://api.openai.com/v1"
+
+# [providers.anthropic]
+# api_key_env = "ANTHROPIC_API_KEY"
+
+[permissions]
+# mode = "auto_review"           # default | auto_review | full_access | custom
+
+# [permissions.shell_sandbox]
+# mode = "best_effort"              # best_effort | required | off | external
+# network = "allow_when_approved"   # deny_by_default | allow_when_approved
+"#
+}
+
 fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>, Vec<ConfigWarning>)> {
     let user_path = default_settings_path();
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -10301,11 +11052,105 @@ fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>, Vec<Con
         .map(Path::to_path_buf)
         .unwrap_or(cwd);
     let repo_path = per_repo_settings_path(repo_root);
-    load_settings_from_paths(
+    let (settings, sources, mut warnings) = load_settings_from_paths(
         Some(user_path.as_path()),
         project_path.as_deref(),
         Some(repo_path.as_path()),
-    )
+    )?;
+    // Warn when the user-settings path is relative (meaning neither HOME nor
+    // dirs::config_dir resolved a concrete directory). On Windows this most
+    // often means APPDATA and USERPROFILE are both absent, which causes
+    // settings reads/writes to chase the current working directory instead of
+    // a stable per-user location.
+    if user_path.is_relative() {
+        warnings.push(ConfigWarning {
+            source: "config".to_string(),
+            field: format!(
+                "user settings path resolved to a relative path ({}) — \
+                 set SQUEEZY_SETTINGS_PATH to an absolute path to ensure \
+                 a stable, per-user config location",
+                user_path.display()
+            ),
+        });
+    }
+    // Warn when HOME is unset so user/project/skills paths that fell back to
+    // process-relative locations do not silently misbehave in containers,
+    // systemd units, or CI environments. Skip the warning when the operator
+    // already set SQUEEZY_SETTINGS_PATH, which is the documented escape hatch
+    // for HOME-less environments — warning in that case is a false positive.
+    if let Some(warning) = home_unset_warning(
+        env::var_os("HOME").is_some(),
+        env::var_os("SQUEEZY_SETTINGS_PATH").is_some(),
+        &user_path,
+    ) {
+        warnings.push(warning);
+    }
+    // Warn when SQUEEZY_SESSION_DIR is set with a leading '~'. The
+    // expansion helper recognises only `~` and `~/...`; `~user/...`
+    // is left as a literal relative path under cwd, which is almost
+    // never what the operator wanted. Split the warning so each case
+    // promises only what `expand_home_path` actually delivers.
+    if let Ok(raw) = env::var("SQUEEZY_SESSION_DIR") {
+        let trimmed = raw.trim();
+        if trimmed == "~" || trimmed.starts_with("~/") {
+            warnings.push(ConfigWarning {
+                source: "SQUEEZY_SESSION_DIR".to_string(),
+                field: format!(
+                    "SQUEEZY_SESSION_DIR value '{trimmed}' starts with '~'; \
+                     Squeezy expands it against HOME automatically."
+                ),
+            });
+        } else if trimmed.starts_with('~') {
+            warnings.push(ConfigWarning {
+                source: "SQUEEZY_SESSION_DIR".to_string(),
+                field: format!(
+                    "SQUEEZY_SESSION_DIR value '{trimmed}' starts with '~user/...'; \
+                     Squeezy does not expand `~user/...` and the value will be \
+                     treated as a literal relative path. Use an absolute path \
+                     (e.g. /home/user/sessions) instead."
+                ),
+            });
+        }
+    }
+    Ok((settings, sources, warnings))
+}
+
+/// Pure version of the HOME-unset warning. Factored out so it can be
+/// unit tested without mutating the process environment, which races
+/// any other test that reads `HOME` without taking the env mutex.
+///
+/// Returns `Some(ConfigWarning)` only on Unix when `home_set` is false
+/// and `settings_path_set` is false (`SQUEEZY_SETTINGS_PATH` is the
+/// documented escape hatch for HOME-less environments). The warning
+/// surfaces the resolved fallback path to make it easy for an operator
+/// to see where Squeezy is actually looking.
+fn home_unset_warning(
+    home_set: bool,
+    settings_path_set: bool,
+    user_path: &Path,
+) -> Option<ConfigWarning> {
+    #[cfg(unix)]
+    {
+        if !home_set && !settings_path_set {
+            return Some(ConfigWarning {
+                source: "environment".to_string(),
+                field: format!(
+                    "HOME is not set; user settings, skills, and session paths fall back to \
+                     the platform config/data directories (dirs::config_dir() / \
+                     dirs::data_dir(); on Linux these honour $XDG_CONFIG_HOME / \
+                     $XDG_DATA_HOME) or, when those are unavailable, process-relative \
+                     locations ({user_path}). Set HOME or use SQUEEZY_SETTINGS_PATH / \
+                     SQUEEZY_SESSION_DIR to override.",
+                    user_path = user_path.display()
+                ),
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (home_set, settings_path_set, user_path);
+    }
+    None
 }
 
 /// A single tier's settings file as both its parsed form and its raw
@@ -10406,6 +11251,12 @@ fn load_tier_source(path: &Path) -> Result<Option<TierSource>> {
 /// precedence. Env wins because env-var overrides are applied after the merged
 /// settings in `from_settings_and_env_vars`; repo wins next because it's the
 /// last tier merged in `load_settings_from_paths`.
+///
+/// Environment variable lookup via `std::env::var` delegates to the OS: on
+/// Windows the lookup is case-insensitive (the Windows API normalises env var
+/// names), so `OPENAI_API_KEY` and `openai_api_key` both resolve correctly
+/// even when a user sets them in PowerShell with unusual casing. On Unix the
+/// lookup is case-sensitive, matching the POSIX convention.
 pub fn resolve_field_source(
     sources: &SeparatedSources,
     field: &config_schema::FieldMeta,
@@ -10432,6 +11283,182 @@ pub fn resolve_field_source(
         return config_schema::FieldSource::User;
     }
     config_schema::FieldSource::Default
+}
+
+/// Resolved paths for all user-facing Squeezy config, state, and cache
+/// locations, together with the source that determined each value.
+///
+/// Callers such as `squeezy config paths` or `squeezy doctor config` can
+/// display these to help users understand where files live and how each
+/// value was chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigPaths {
+    /// Primary user settings file (`~/.squeezy/settings.toml` or, when HOME
+    /// is absent, the platform config dir from `dirs::config_dir()`:
+    /// `$XDG_CONFIG_HOME/squeezy/settings.toml` on Linux,
+    /// `~/Library/Application Support/squeezy/settings.toml` on macOS,
+    /// `%APPDATA%\squeezy\settings.toml` on Windows).
+    pub user_settings: PathBuf,
+    /// Source that determined `user_settings`. One of:
+    /// - `"env"`            — `SQUEEZY_SETTINGS_PATH` is set.
+    /// - `"home"`           — Unix HOME-based dotdir (`~/.squeezy/settings.toml`).
+    /// - `"platform_config"` — `dirs::config_dir()` (XDG on Linux,
+    ///   `Application Support` on macOS, `%APPDATA%` on Windows).
+    /// - `"default"`        — process-relative fallback `.squeezy/settings.toml`.
+    pub user_settings_source: &'static str,
+    /// Committed project settings (nearest `squeezy.toml` above cwd), if found.
+    pub project_settings: Option<PathBuf>,
+    /// Per-machine repo-local settings (`~/.squeezy/projects/<hash>/settings.toml`).
+    pub repo_settings: PathBuf,
+    /// Session log directory as overridden by `SQUEEZY_SESSION_DIR`. `None` when
+    /// the env var is not set; **`[session].log_dir` from TOML is not reflected
+    /// here** (this struct is computed without reading any TOML). The field is
+    /// named `_env` to make the env-only nature explicit; for the fully resolved
+    /// log directory after TOML and CLI flags are applied, see
+    /// `AppConfig.session_logs.log_dir`.
+    pub session_log_dir_env: Option<PathBuf>,
+    /// Default user skills directory (HOME-based or platform data dir).
+    /// Does not reflect `SQUEEZY_SKILLS_USER_DIR` or `[skills].user_dir` TOML overrides.
+    /// For the effective runtime value, see `AppConfig.skills`.
+    pub squeezy_skills_dir: PathBuf,
+    /// Default agent-compat skills directory (HOME-based or platform data dir).
+    /// Does not reflect `SQUEEZY_SKILLS_COMPAT_USER_DIR` overrides.
+    /// For the effective runtime value, see `AppConfig.skills`.
+    pub agent_compat_skills_dir: PathBuf,
+    /// Prompt-history ring file.
+    pub prompt_history: PathBuf,
+    /// Projects index directory (parent of per-repo subdirs).
+    pub projects_dir: PathBuf,
+    /// Whether `HOME` is set in the current environment.
+    pub home_set: bool,
+    /// Raw `HOME` value as read from the environment, if set. Not canonicalized:
+    /// trailing slashes, `..` segments, and unresolved symlinks pass through
+    /// untouched. Suitable for display in `squeezy doctor`-style output where
+    /// the user benefits from seeing the literal env value.
+    pub home: Option<PathBuf>,
+}
+
+/// Resolve all Squeezy config, state, and cache paths for the current
+/// environment without reading or writing any file. Suitable for
+/// `squeezy config paths` and doctor output.
+pub fn resolved_config_paths() -> ConfigPaths {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let home_set = home.is_some();
+
+    let user_settings = default_settings_path();
+    // Mirror the branch order in default_settings_path() so the source tag is
+    // accurate. On non-Unix, home_squeezy_subpath() always returns None, so
+    // HOME being set does not actually steer the path to the dotdir branch.
+    // The string `"platform_config"` is used (rather than `"xdg"`) because
+    // `dirs::config_dir()` resolves to `Application Support` on macOS and
+    // `%APPDATA%` on Windows — neither of which is XDG.
+    let user_settings_source = if env::var_os("SQUEEZY_SETTINGS_PATH").is_some() {
+        "env"
+    } else if cfg!(unix) && home_set {
+        "home"
+    } else if dirs::config_dir().is_some() {
+        "platform_config"
+    } else {
+        "default"
+    };
+
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_settings = find_project_settings_path(&cwd);
+    let repo_root = project_settings
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cwd.clone());
+    let repo_settings = per_repo_settings_path(&repo_root);
+
+    let session_log_dir_env = env::var("SQUEEZY_SESSION_DIR")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(|v| expand_home_path(PathBuf::from(v)));
+
+    ConfigPaths {
+        user_settings,
+        user_settings_source,
+        project_settings,
+        repo_settings,
+        session_log_dir_env,
+        squeezy_skills_dir: default_squeezy_skills_dir(),
+        agent_compat_skills_dir: default_agent_compat_skills_dir(),
+        prompt_history: default_prompt_history_path(),
+        projects_dir: default_projects_dir(),
+        home_set,
+        home,
+    }
+}
+
+/// Outcome of a settings file permission check for a single path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsPermissionIssue {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+/// Wrap `value` in POSIX single quotes so it can be safely pasted into a
+/// shell. Embedded single quotes are escaped using the standard
+/// `'\''` close-reopen idiom so paths containing `'` (or any other
+/// metacharacter) round-trip correctly when piped to a future
+/// `squeezy doctor --apply` command.
+#[cfg(unix)]
+fn shell_quote_single(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Check existing settings files for overly permissive Unix permissions.
+///
+/// Returns a (possibly empty) list of issues. Each issue describes a file
+/// whose mode has group- or world-readable or group/world-writable bits set.
+/// Callers should surface these to the user at startup or in doctor output
+/// because settings files may contain provider API keys and MCP secrets.
+///
+/// Does nothing and returns an empty list on non-Unix platforms.
+pub fn check_settings_file_permissions() -> Vec<SettingsPermissionIssue> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let paths = resolved_config_paths();
+        let candidates = [&paths.user_settings, &paths.repo_settings];
+        let mut issues = Vec::new();
+        for path in candidates {
+            let Ok(meta) = fs::metadata(path) else {
+                continue;
+            };
+            let mode = meta.mode();
+            // Flag any bits other than owner read/write (0o600).
+            // Group or world readable/writable on a file holding secrets is a risk.
+            if mode & 0o177 != 0 {
+                issues.push(SettingsPermissionIssue {
+                    path: path.clone(),
+                    message: format!(
+                        "settings file has loose permissions ({:#o}); expected 0o600 \
+                         (owner read/write only). Run: chmod 600 {}",
+                        mode & 0o777,
+                        shell_quote_single(&path.display().to_string())
+                    ),
+                });
+            }
+        }
+        issues
+    }
+    #[cfg(not(unix))]
+    {
+        Vec::new()
+    }
 }
 
 fn load_settings_from_paths(
@@ -10478,6 +11505,7 @@ fn provider_setting(
         "vertex_project" => settings.vertex_project.as_ref(),
         "vertex_location" => settings.vertex_location.as_ref(),
         "route_style" => settings.route_style.as_ref(),
+        "keep_alive" => settings.keep_alive.as_ref(),
         "cloudflare_account_id" => settings.cloudflare_account_id.as_ref(),
         "cloudflare_gateway_id" => settings.cloudflare_gateway_id.as_ref(),
         "script" => settings.script.as_ref(),
@@ -11002,6 +12030,8 @@ fn provider_u64_setting_any(
         let settings = providers.get(*provider)?;
         let value = match key {
             "stream_idle_timeout_ms" => settings.stream_idle_timeout_ms,
+            "pool_idle_timeout_ms" => settings.pool_idle_timeout_ms,
+            "max_retry_delay_ms" => settings.max_retry_delay_ms,
             _ => None,
         }?;
         Some(value.to_string())
@@ -11025,6 +12055,15 @@ fn provider_transport_settings(
         }
         if let Some(value) = settings.stream_idle_timeout_ms {
             transport.stream_idle_timeout_ms = value;
+        }
+        if let Some(value) = settings.pool_idle_timeout_ms {
+            transport.pool_idle_timeout_ms = value;
+        }
+        if let Some(value) = settings.pool_max_idle_per_host {
+            transport.pool_max_idle_per_host = value;
+        }
+        if let Some(value) = settings.max_retry_delay_ms {
+            transport.max_retry_delay_ms = value;
         }
     }
     transport
@@ -11695,6 +12734,23 @@ fn path_value(
     path: &str,
 ) -> Result<Option<PathBuf>> {
     Ok(string_value(table, key, source, path)?.map(PathBuf::from))
+}
+
+fn cache_durability_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<CacheDurability>> {
+    let Some(value) = string_value(table, key, source, &field(path, key))? else {
+        return Ok(None);
+    };
+    CacheDurability::parse(&value).map(Some).ok_or_else(|| {
+        SqueezyError::Config(format!(
+            "{source}: {}: expected one of fast, turn, strict",
+            field(path, key)
+        ))
+    })
 }
 
 fn path_array_value(
@@ -13208,6 +14264,11 @@ impl SubagentKindBucket {
 pub enum CostOrigin {
     Main,
     Subagent,
+    /// Spend from the AI reviewer or shell classifier LLM calls that run
+    /// on the permission path rather than as part of the main turn round.
+    /// Using a dedicated origin keeps reviewer spend separate from main-turn
+    /// spend in the by-model cost drill-down.
+    AiReviewer,
 }
 
 /// Per-`(provider, model)` cost bucket, split by [`CostOrigin`] so `/cost`
@@ -13225,20 +14286,29 @@ pub struct ModelCostBucket {
     pub main: CostSnapshot,
     #[serde(default)]
     pub subagent: CostSnapshot,
+    /// LLM spend attributed to the AI reviewer or shell classifier running
+    /// on the permission path. Stored separately so the `/cost --by-model`
+    /// drill-down can distinguish main-turn spend from permission-gate spend.
+    #[serde(default)]
+    pub reviewer: CostSnapshot,
 }
 
 impl ModelCostBucket {
     pub fn merge(&mut self, other: &ModelCostBucket) {
         merge_cost_snapshot(&mut self.main, &other.main);
         merge_cost_snapshot(&mut self.subagent, &other.subagent);
+        merge_cost_snapshot(&mut self.reviewer, &other.reviewer);
     }
 
-    /// Combined estimated USD across both origins (`None` only when neither
+    /// Combined estimated USD across all origins (`None` only when no
     /// slot carries a priced round).
     pub fn total_usd_micros(&self) -> Option<u64> {
         add_optional_u64(
-            self.main.estimated_usd_micros,
-            self.subagent.estimated_usd_micros,
+            add_optional_u64(
+                self.main.estimated_usd_micros,
+                self.subagent.estimated_usd_micros,
+            ),
+            self.reviewer.estimated_usd_micros,
         )
     }
 }
@@ -13274,6 +14344,7 @@ impl ModelLedger {
         let slot = match origin {
             CostOrigin::Main => &mut bucket.main,
             CostOrigin::Subagent => &mut bucket.subagent,
+            CostOrigin::AiReviewer => &mut bucket.reviewer,
         };
         merge_cost_snapshot(slot, cost);
     }
@@ -13308,6 +14379,7 @@ impl ModelLedger {
         for bucket in self.0.values() {
             merge_cost_snapshot(&mut total, &bucket.main);
             merge_cost_snapshot(&mut total, &bucket.subagent);
+            merge_cost_snapshot(&mut total, &bucket.reviewer);
         }
         total
     }

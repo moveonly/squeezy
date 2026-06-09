@@ -35,13 +35,13 @@ fn pre_classify_shell_auto_allows_read_only_pipeline() {
 fn pre_classify_shell_auto_denies_rm_rf() {
     let result = pre_classify_shell("rm -rf /tmp/work", &sandbox());
     match result {
-        ShellPreClassification::AutoDeny { reason } => {
+        ShellPreClassification::RequiresApproval { reason } => {
             assert!(
                 reason.contains("destructive verb") && reason.contains("rm"),
                 "reason did not mention rm: {reason}"
             );
         }
-        other => panic!("expected AutoDeny, got {other:?}"),
+        other => panic!("expected RequiresApproval, got {other:?}"),
     }
 }
 
@@ -52,37 +52,43 @@ fn pre_classify_shell_auto_denies_python_dash_c() {
         &sandbox(),
     );
     match result {
-        ShellPreClassification::AutoDeny { reason } => {
+        ShellPreClassification::RequiresApproval { reason } => {
             assert!(
                 reason.contains("dangerous interpreter") && reason.contains("python3"),
                 "reason did not mention python3: {reason}"
             );
         }
-        other => panic!("expected AutoDeny, got {other:?}"),
+        other => panic!("expected RequiresApproval, got {other:?}"),
     }
 }
 
 #[test]
 fn pre_classify_shell_auto_denies_node_dash_e() {
     let result = pre_classify_shell("node -e 'console.log(1)'", &sandbox());
-    assert!(matches!(result, ShellPreClassification::AutoDeny { .. }));
+    assert!(matches!(
+        result,
+        ShellPreClassification::RequiresApproval { .. }
+    ));
 }
 
 #[test]
 fn pre_classify_shell_auto_denies_sudo() {
     let result = pre_classify_shell("sudo apt-get install foo", &sandbox());
     match result {
-        ShellPreClassification::AutoDeny { reason } => {
+        ShellPreClassification::RequiresApproval { reason } => {
             assert!(reason.contains("sudo") || reason.contains("destructive"));
         }
-        other => panic!("expected AutoDeny, got {other:?}"),
+        other => panic!("expected RequiresApproval, got {other:?}"),
     }
 }
 
 #[test]
 fn pre_classify_shell_auto_denies_eval() {
     let result = pre_classify_shell("eval \"$INPUT\"", &sandbox());
-    assert!(matches!(result, ShellPreClassification::AutoDeny { .. }));
+    assert!(matches!(
+        result,
+        ShellPreClassification::RequiresApproval { .. }
+    ));
 }
 
 #[test]
@@ -98,25 +104,25 @@ fn pre_classify_shell_falls_through_on_cargo() {
 }
 
 #[test]
-fn pre_classify_shell_falls_through_on_sonar_cli() {
-    let result = pre_classify_shell("sonar context list --json", &sandbox());
+fn pre_classify_shell_falls_through_on_unknown_cli() {
+    let result = pre_classify_shell("acme-nav list --json", &sandbox());
     assert_eq!(result, ShellPreClassification::AskAi);
 }
 
 #[test]
-fn pre_classify_shell_falls_through_on_sonar_cli_with_dev_null_redirect() {
-    let result = pre_classify_shell("sonar context list --json 2>/dev/null", &sandbox());
+fn pre_classify_shell_falls_through_on_unknown_cli_with_dev_null_redirect() {
+    let result = pre_classify_shell("acme-nav list --json 2>/dev/null", &sandbox());
     assert_eq!(result, ShellPreClassification::AskAi);
 }
 
 #[test]
 fn pre_classify_shell_names_redirect_instead_of_first_token() {
-    let result = pre_classify_shell("sonar context list > report.json", &sandbox());
+    let result = pre_classify_shell("acme-nav list > report.json", &sandbox());
     match result {
-        ShellPreClassification::AutoDeny { reason } => {
+        ShellPreClassification::RequiresApproval { reason } => {
             assert_eq!(reason, "destructive redirect");
         }
-        other => panic!("expected AutoDeny, got {other:?}"),
+        other => panic!("expected RequiresApproval, got {other:?}"),
     }
 }
 
@@ -126,13 +132,13 @@ fn pre_classify_shell_auto_denies_sensitive_path() {
     // (see `default_sensitive_path_patterns` in squeezy-core).
     let result = pre_classify_shell("cat ~/.ssh/id_rsa", &sandbox());
     match result {
-        ShellPreClassification::AutoDeny { reason } => {
+        ShellPreClassification::RequiresApproval { reason } => {
             assert!(
                 reason.contains("sensitive path"),
                 "reason did not mention sensitive path: {reason}"
             );
         }
-        other => panic!("expected AutoDeny, got {other:?}"),
+        other => panic!("expected RequiresApproval, got {other:?}"),
     }
 }
 
@@ -140,8 +146,8 @@ fn pre_classify_shell_auto_denies_sensitive_path() {
 fn pre_classify_shell_unwraps_sh_dash_c() {
     let result = pre_classify_shell("sh -c 'rm -rf /tmp/work'", &sandbox());
     assert!(
-        matches!(result, ShellPreClassification::AutoDeny { .. }),
-        "expected AutoDeny via wrapper, got {result:?}"
+        matches!(result, ShellPreClassification::RequiresApproval { .. }),
+        "expected RequiresApproval via wrapper, got {result:?}"
     );
 }
 

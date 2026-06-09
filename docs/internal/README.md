@@ -35,6 +35,10 @@ development conventions.
   deferred long-term-memory surfaces.
 - [Test layout](TEST_LAYOUT.md): source/test file conventions enforced by
   `scripts/check_test_layout.py`.
+- [Test stack posture](TEST_STACK_POSTURE.md): why agent turn-loop tests
+  use the `run_high_stack_test` / `run_high_stack_async_test` wrappers
+  instead of the stock `#[tokio::test]` attribute, and when to reuse
+  them.
 - [Telemetry worker](TELEMETRY_WORKER.md): Cloudflare Worker deployment and
   PostHog forwarding details.
 - [Keybindings](KEYBINDINGS.md): action namespace, layered override surface

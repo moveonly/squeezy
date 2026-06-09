@@ -7,9 +7,11 @@
 //! that schedule from an [`ImportGraph`] of `Local`-resolved import
 //! edges.
 //!
-//! Pure data; no consumer yet wires this into the resolver. The flip
-//! lands when the phased pipeline replaces the single-pass
-//! [`crate::resolution::SemanticGraph::resolve_call`].
+//! The schedule is computed and the data structures are ready. The flip
+//! that makes the phased resolver consume this schedule (replacing the
+//! single-pass [`crate::resolution::SemanticGraph::resolve_call`]) is the
+//! next planned step. Until then, this module is pure data with no active
+//! call-resolution consumer.
 
 use std::collections::{HashMap, HashSet};
 

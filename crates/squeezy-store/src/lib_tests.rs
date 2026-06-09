@@ -1,4 +1,25 @@
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Serialises tests that mutate `XDG_CACHE_HOME` to avoid data races in
+/// parallel test threads (Rust 2024: `env::set_var` is `unsafe`).
+static XDG_LOCK: Mutex<()> = Mutex::new(());
+
+fn with_xdg_cache_home<R>(xdg: &Path, body: impl FnOnce() -> R) -> R {
+    let _guard = XDG_LOCK.lock().expect("XDG_CACHE_HOME lock");
+    let previous = std::env::var_os("XDG_CACHE_HOME");
+    // SAFETY: XDG_LOCK above serialises mutations of XDG_CACHE_HOME across
+    // all tests in this module.
+    unsafe { std::env::set_var("XDG_CACHE_HOME", xdg) };
+    let result = body();
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+    }
+    result
+}
 
 use redb::{Database, TableDefinition};
 use serde_json::json;
@@ -6,8 +27,9 @@ use squeezy_core::AppConfig;
 use squeezy_core::FileId;
 
 use crate::{
-    CompactionCheckpoint, GRAPH_FILE_NAME, GraphStore, GraphWriteBatch, STATE_FILE_NAME,
-    SqueezyStore, graph_path, sessions::ResumeItem, state_path,
+    CompactionCheckpoint, GRAPH_FILE_NAME, GraphStore, GraphStoreMetadata, GraphWriteBatch,
+    STATE_FILE_NAME, SqueezyStore, cache_dir_path, fs_util, graph_path, sessions::ResumeItem,
+    state_path,
 };
 
 fn temp_root(label: &str) -> PathBuf {
@@ -38,6 +60,45 @@ fn open_graph_store(label: &str) -> (PathBuf, GraphStore) {
     let root = temp_root(label);
     let store = GraphStore::open(&root, None).expect("open graph store");
     (root, store)
+}
+
+#[test]
+fn atomic_write_replaces_existing_file() {
+    let root = temp_root("atomic-replace-existing");
+    let path = root.join("metadata.json");
+    fs_util::write_bytes_atomically(&path, br#"{"value":"first"}"#).expect("first write");
+    fs_util::write_bytes_atomically(&path, br#"{"value":"second"}"#).expect("replace write");
+    let body = std::fs::read_to_string(&path).expect("read replaced file");
+    assert_eq!(body, r#"{"value":"second"}"#);
+    let leftovers: Vec<_> = std::fs::read_dir(&root)
+        .expect("read temp root")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".tmp"))
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn squeezy_store_reuses_lazy_graph_store_handle() {
+    let (root, store) = open_store("lazy-graph-handle");
+    let file_id = FileId("src/lib.rs".to_string());
+    store
+        .put_graph_partition(&file_id, &json!({ "symbols": ["one"] }))
+        .expect("first graph write");
+    store
+        .put_graph_partition(&file_id, &json!({ "symbols": ["two"] }))
+        .expect("second graph write through cached handle");
+    let stored: serde_json::Value = store
+        .graph_partition(&file_id)
+        .expect("read graph partition")
+        .expect("partition exists");
+    assert_eq!(stored["symbols"][0], "two");
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 fn sample_checkpoint(replacement_id: &str, created: u128) -> CompactionCheckpoint {
@@ -177,6 +238,66 @@ fn oversized_state_file_rotates_without_redb_open() {
 }
 
 #[test]
+fn xdg_cache_root_resolves_under_xdg_cache_home_with_repo_id() {
+    let root = temp_root("xdg-cache-root");
+    let xdg = temp_root("xdg-cache-home");
+
+    let resolved = with_xdg_cache_home(&xdg, || cache_dir_path(&root, Some(Path::new("xdg"))));
+
+    assert!(
+        resolved.starts_with(&xdg),
+        "resolved={}",
+        resolved.display()
+    );
+    let expected_parent = xdg.join("squeezy");
+    assert_eq!(resolved.parent(), Some(expected_parent.as_path()));
+    assert!(
+        resolved
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("xdg-cache-root")),
+        "repo id should preserve a readable workspace prefix: {}",
+        resolved.display()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_mountinfo_classifies_network_and_virtual_filesystems() {
+    let entries = super::parse_linux_mountinfo(
+        "31 23 0:27 / / rw,relatime - ext4 /dev/sda1 rw\n\
+         32 23 0:28 / /mnt/share rw,relatime - nfs4 server:/share rw\n\
+         33 23 0:29 / /work rw,relatime - overlay overlay rw\n\
+         34 23 0:30 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n",
+    );
+
+    let nfs = entries
+        .iter()
+        .find(|entry| entry.mount_point == Path::new("/mnt/share"))
+        .expect("nfs mount");
+    assert_eq!(
+        super::classify_filesystem(&nfs.fs_type),
+        crate::StorageMountClassification::Network
+    );
+    let overlay = entries
+        .iter()
+        .find(|entry| entry.mount_point == Path::new("/work"))
+        .expect("overlay mount");
+    assert_eq!(
+        super::classify_filesystem(&overlay.fs_type),
+        crate::StorageMountClassification::Virtual
+    );
+    let procfs = entries
+        .iter()
+        .find(|entry| entry.mount_point == Path::new("/proc"))
+        .expect("proc mount");
+    assert_eq!(
+        super::classify_filesystem(&procfs.fs_type),
+        crate::StorageMountClassification::Virtual
+    );
+}
+
+#[test]
 fn graph_write_batch_applies_resolver_cache_changes() {
     let (_root, store) = open_graph_store("resolver-batch");
     let first = FileId::new("src/first.rs");
@@ -189,7 +310,10 @@ fn graph_write_batch_applies_resolver_cache_changes() {
     batch
         .upsert_resolver_entry(&second, &json!({"exports": ["Second"]}))
         .expect("encode second resolver entry");
-    assert_eq!(batch.len(), 2);
+    batch
+        .set_import_graph(&json!({"imports_by_file": {"src/first.rs": ["src/second.rs"]}}))
+        .expect("encode import graph");
+    assert_eq!(batch.len(), 3);
     store
         .apply_graph_batch(&batch)
         .expect("apply resolver batch");
@@ -204,6 +328,14 @@ fn graph_write_batch_applies_resolver_cache_changes() {
         .expect("load second")
         .expect("second present");
     assert_eq!(second_entry["exports"][0], "Second");
+    let import_graph: serde_json::Value = store
+        .import_graph()
+        .expect("load import graph")
+        .expect("import graph present");
+    assert_eq!(
+        import_graph["imports_by_file"]["src/first.rs"][0],
+        "src/second.rs"
+    );
 
     let mut update = GraphWriteBatch::new();
     update.remove_resolver_entry(&first);
@@ -230,7 +362,7 @@ fn graph_write_batch_applies_resolver_cache_changes() {
 
 #[test]
 fn state_open_creates_state_only_store() {
-    let (root, _store) = open_store("state-only");
+    let (root, store) = open_store("state-only");
     assert!(
         state_path(&root, None).exists(),
         "{STATE_FILE_NAME} should be created by SqueezyStore::open"
@@ -238,6 +370,20 @@ fn state_open_creates_state_only_store() {
     assert!(
         !graph_path(&root, None).exists(),
         "{GRAPH_FILE_NAME} should remain unopened until graph persistence is needed"
+    );
+
+    let metadata = GraphStoreMetadata {
+        workspace_root: root.display().to_string(),
+        crawl_options_hash: "crawl".to_string(),
+        language_registry_version: "langs".to_string(),
+        graph_format_version: 1,
+    };
+    store
+        .set_graph_metadata(&metadata)
+        .expect("lazy graph metadata write");
+    assert_eq!(
+        store.graph_metadata().expect("lazy graph metadata read"),
+        Some(metadata)
     );
 }
 

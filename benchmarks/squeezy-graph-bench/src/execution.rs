@@ -27,6 +27,7 @@ pub(crate) struct GraphBuildOutput {
     pub(crate) snapshot: WorkspaceSnapshot,
 }
 
+#[allow(deprecated, reason = "benchmark scaffolding; external callers should use try_new")]
 pub(crate) fn build_graph(root: &Path) -> Result<GraphBuildOutput> {
     let total_started = Instant::now();
     let crawl_started = Instant::now();

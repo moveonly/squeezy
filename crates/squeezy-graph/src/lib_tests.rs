@@ -1,13 +1,15 @@
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use squeezy_core::{ContentHash, FileId, LanguageKind};
+use squeezy_core::{ContentHash, FileId, LanguageKind, SqueezyError};
 use squeezy_parse::{LanguageParser, ParsedFile, ReferenceKind, RustParser};
-use squeezy_workspace::{CrawlOptions, FileRecord, stable_content_hash};
+use squeezy_workspace::{
+    CrawlOptions, FileRecord, IndexingPolicy, filesystem_paths_match, stable_content_hash,
+};
 
 use super::*;
 
@@ -91,6 +93,18 @@ fn signature_span_survives_graph_and_excludes_body() {
         !header.contains("total"),
         "header {header:?} must exclude the body"
     );
+}
+
+#[test]
+fn filesystem_paths_match_deleted_windows_event_spelling_without_canonicalize() {
+    assert!(filesystem_paths_match(
+        Path::new(r"C:\Users\Alice\repo\src\Lib.rs"),
+        Path::new(r"c:/users/alice/repo/src/lib.rs")
+    ));
+    assert!(filesystem_paths_match(
+        Path::new(r"\\?\C:\Users\Alice\repo\src\Lib.rs"),
+        Path::new(r"c:/users/alice/repo/src/lib.rs")
+    ));
 }
 
 #[test]
@@ -787,12 +801,130 @@ fn persistent_graph_warm_start_skips_unchanged_parsing() {
     .unwrap();
     assert_eq!(second.build_report().parsed_files, 0);
     assert!(second.build_report().persisted_files_loaded > 0);
+    assert!(second.build_report().resolver_entries_loaded > 0);
+    assert!(second.build_report().resolver_import_graph_loaded);
     assert!(
         second
             .graph()
             .find_symbol_by_name("hello")
             .iter()
             .any(|symbol| symbol.name == "hello")
+    );
+}
+
+#[test]
+fn resolver_cache_partial_miss_skips_stale_entries() {
+    let root = temp_root("resolver-cache-partial-miss");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='demo'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn stable() {}\n").unwrap();
+    fs::write(root.join("src/other.rs"), "pub fn other() {}\n").unwrap();
+
+    // First open: cold build, should write resolver cache entries for both files.
+    let first = GraphManager::open_persistent_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+        None,
+    )
+    .unwrap();
+    assert!(first.build_report().parsed_files > 0);
+    assert_eq!(first.build_report().resolver_entries_loaded, 0);
+    drop(first);
+
+    // Second open: warm start — both files unchanged, resolver cache should load.
+    let second = GraphManager::open_persistent_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+        None,
+    )
+    .unwrap();
+    assert!(second.build_report().resolver_entries_loaded > 0);
+    assert_eq!(second.build_report().resolver_entries_missed, 0);
+    drop(second);
+
+    // Modify one file to trigger a fingerprint mismatch.
+    thread::sleep(Duration::from_millis(10));
+    fs::write(root.join("src/other.rs"), "pub fn other_v2() {}\n").unwrap();
+
+    // Third open: one file changed; the whole resolver cache should be skipped
+    // (no stale entries inserted) and `resolver_entries_missed > 0`.
+    let third = GraphManager::open_persistent_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(third.build_report().resolver_entries_loaded, 0);
+    assert!(third.build_report().resolver_entries_missed > 0);
+    assert!(!third.build_report().resolver_import_graph_loaded);
+    // Graph is still correct — rebuilt from ASTs.
+    assert!(
+        third
+            .graph()
+            .find_symbol_by_name("stable")
+            .iter()
+            .any(|s| s.name == "stable")
+    );
+    assert!(
+        third
+            .graph()
+            .find_symbol_by_name("other_v2")
+            .iter()
+            .any(|s| s.name == "other_v2")
+    );
+}
+
+#[test]
+fn resolver_cache_cold_build_persisted_and_consumed_on_warm_start() {
+    // Explicitly verify that a cold build (no graph.redb) writes resolver
+    // entries that are then consumed on the next open.
+    let root = temp_root("resolver-cache-cold-warm");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='demo'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn alpha() {}\n").unwrap();
+
+    // Cold build.
+    let cold = GraphManager::open_persistent_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+        None,
+    )
+    .unwrap();
+    assert!(cold.build_report().parsed_files > 0);
+    assert_eq!(cold.build_report().persisted_files_loaded, 0);
+    assert_eq!(cold.build_report().resolver_entries_loaded, 0);
+    drop(cold);
+
+    // Warm start: resolver entries from the cold build should be loaded.
+    let warm = GraphManager::open_persistent_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(warm.build_report().parsed_files, 0);
+    assert!(warm.build_report().persisted_files_loaded > 0);
+    assert!(warm.build_report().resolver_entries_loaded > 0);
+    assert!(warm.build_report().resolver_import_graph_loaded);
+    assert_eq!(warm.build_report().resolver_entries_missed, 0);
+    assert!(
+        warm.graph()
+            .find_symbol_by_name("alpha")
+            .iter()
+            .any(|s| s.name == "alpha")
     );
 }
 
@@ -1805,6 +1937,156 @@ fn graph_manager_refresh_keeps_pending_when_budget_exhausted() {
     }
 }
 
+#[test]
+fn graph_manager_open_watching_records_active_watcher_status() {
+    let root = temp_root("graph-manager-watching-status");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src").join("lib.rs"), "pub fn ready() {}\n").unwrap();
+
+    let manager = GraphManager::open_watching(
+        &root,
+        RefreshConfig {
+            debounce: Duration::from_millis(0),
+            idle_refresh_interval: Duration::from_secs(30),
+            per_tool_refresh_budget: Duration::from_secs(5),
+        },
+        CrawlOptions::default(),
+        None,
+        watcher::WatcherConfig {
+            src_dirs: vec![root.clone()],
+            debounce_ms: 50,
+        },
+    )
+    .unwrap();
+
+    let status = manager.watcher_status();
+    assert!(
+        matches!(
+            status.mode,
+            WatcherMode::Native | WatcherMode::PollingFallback
+        ),
+        "expected native or polling fallback watcher mode, got {:?}",
+        status.mode,
+    );
+    assert!(
+        !status.backend.is_empty() && status.backend != "none",
+        "expected a non-empty, non-disabled backend name, got {:?}",
+        status.backend,
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn resolve_watcher_attachment_uses_native_when_it_succeeds() {
+    // Drive a real native watcher against a temp directory; this is the
+    // single platform-touching unit test for the attachment helper. The
+    // other two arms below are pure logic and unit-tested with synthetic
+    // results, which keeps them deterministic across OSes.
+    let root = temp_root("resolve-watcher-attachment-native");
+    let started = watcher::FileWatcher::start(
+        watcher::WatcherConfig {
+            src_dirs: vec![root.clone()],
+            debounce_ms: 50,
+        },
+        |_batch| {},
+    );
+    let polling_start = || {
+        panic!("polling fallback must not be invoked when native succeeds");
+        #[allow(unreachable_code)]
+        Err(SqueezyError::Tool("unused".to_string()))
+    };
+    let (slot, status) = resolve_watcher_attachment(started, polling_start);
+    assert!(slot.is_some(), "native success must populate the slot");
+    assert_eq!(status.mode, WatcherMode::Native);
+    assert_eq!(status.backend, watcher::native_backend_name());
+    assert!(status.fallback_reason.is_none());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn resolve_watcher_attachment_falls_back_to_polling_when_native_fails() {
+    let native_err: Result<watcher::FileWatcher> =
+        Err(SqueezyError::Tool("inotify watches exhausted".to_string()));
+    // Build a real PollWatcher against a temp dir for the polling-success
+    // arm so the slot type is real and dropping it tears down cleanly.
+    let root = temp_root("resolve-watcher-attachment-polling-fallback");
+    let polling_start = || {
+        watcher::FileWatcher::start_polling(
+            watcher::WatcherConfig {
+                src_dirs: vec![root.clone()],
+                debounce_ms: 50,
+            },
+            |_batch| {},
+        )
+    };
+    let (slot, status) = resolve_watcher_attachment(native_err, polling_start);
+    assert!(slot.is_some(), "polling success must populate the slot");
+    assert_eq!(status.mode, WatcherMode::PollingFallback);
+    assert_eq!(status.backend, watcher::polling_backend_name());
+    let reason = status
+        .fallback_reason
+        .as_deref()
+        .expect("polling fallback must surface the native error");
+    assert!(
+        reason.contains("inotify watches exhausted"),
+        "fallback_reason must surface the native error, got {reason:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn resolve_watcher_attachment_degrades_to_disabled_when_both_backends_fail() {
+    // Regression for PR #366 review B1: a dual native+polling failure must
+    // NOT propagate out of `open_watching`. The pre-watcher constructor
+    // (`open_with_store`) never touched the filesystem watcher, so a flaky
+    // watcher could never take down the whole graph. If `open_watching`
+    // propagated the dual-failure error, the live registry path
+    // (`squeezy-tools/src/lib.rs`) would collapse the graph slot to `None`
+    // for the rest of the session and every graph tool would return
+    // `graph_unavailable`.
+    let native_err: Result<watcher::FileWatcher> =
+        Err(SqueezyError::Tool("inotify watches exhausted".to_string()));
+    let polling_start = || -> Result<watcher::FileWatcher> {
+        Err(SqueezyError::Tool(
+            "FUSE mount refuses recursive watch".to_string(),
+        ))
+    };
+    let (slot, status) = resolve_watcher_attachment(native_err, polling_start);
+    assert!(
+        slot.is_none(),
+        "dual-failure must leave the watcher slot empty"
+    );
+    assert_eq!(
+        status.mode,
+        WatcherMode::Disabled,
+        "dual-failure must degrade to Disabled, not propagate the error"
+    );
+    assert_eq!(status.backend, "none");
+    let reason = status
+        .fallback_reason
+        .as_deref()
+        .expect("dual-failure must record a fallback_reason for operators");
+    assert!(
+        reason.starts_with("native: "),
+        "fallback_reason must lead with the native failure, got {reason:?}"
+    );
+    assert!(
+        reason.contains("inotify watches exhausted"),
+        "fallback_reason must surface the native error, got {reason:?}"
+    );
+    assert!(
+        reason.contains("; polling: "),
+        "fallback_reason must separate native and polling failures, got {reason:?}"
+    );
+    assert!(
+        reason.contains("FUSE mount refuses recursive watch"),
+        "fallback_reason must surface the polling error, got {reason:?}"
+    );
+}
+
 /// `call_chain` must honor the same `max_depth` bound as the BFS call-graph
 /// listing (`bfs_call_packets` in squeezy-tools): a target reachable in exactly
 /// `d` call edges is found iff `max_depth >= d`, never one edge further. Locks
@@ -1970,7 +2252,11 @@ fn graph_manager_refresh_converges_for_csharp_changes_and_ignores_unsupported_on
     assert!(!unsupported.refreshed);
     assert_eq!(unsupported.reparsed_files, 0);
     assert_eq!(unsupported.changed_paths_from_events, 0);
-    assert_eq!(unsupported.unchanged_event_paths, 1);
+    // notes.txt changed and its event path matched the changed unsupported record,
+    // so it is NOT reported as an unmatched event path. An unchanged_event_paths > 0
+    // signals a genuine path-spelling or symlink mismatch, not a changed-but-
+    // non-supported file.
+    assert_eq!(unsupported.unchanged_event_paths, 0);
 
     thread::sleep(Duration::from_millis(2));
     fs::write(
@@ -2124,6 +2410,55 @@ fn graph_reports_indexing_policy_coverage() {
             .reasons
             .contains_key("lockfile")
     );
+}
+
+#[test]
+fn graph_manager_returns_config_error_for_invalid_policy_glob() {
+    let root = temp_root("graph-invalid-policy-glob");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src").join("lib.rs"), "pub fn indexed() {}\n").unwrap();
+
+    let err = match GraphManager::open_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions {
+            policy: IndexingPolicy {
+                include: vec!["[".to_string()],
+                ..IndexingPolicy::default()
+            },
+            ..CrawlOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("invalid policy should not open a graph"),
+        Err(err) => err,
+    };
+
+    assert!(matches!(err, SqueezyError::Config(_)), "{err:?}");
+}
+
+#[test]
+fn watcher_paths_skip_vcs_and_squeezy_cache_only() {
+    let root = PathBuf::from("/workspace/project");
+
+    assert!(watcher_path_should_enqueue(&root, &root.join("src/lib.rs")));
+    assert!(watcher_path_should_enqueue(
+        &root,
+        &root.join("vendor/allowed/lib.rs")
+    ));
+    assert!(watcher_path_should_enqueue(
+        &root,
+        &root.join("target/generated.rs")
+    ));
+    for path in [
+        root.join(".squeezy/cache/graph.redb"),
+        root.join(".git/index"),
+    ] {
+        assert!(
+            !watcher_path_should_enqueue(&root, &path),
+            "{} should not enqueue a graph refresh",
+            path.display()
+        );
+    }
 }
 
 #[test]
@@ -8030,6 +8365,65 @@ internal class TraceJsonReader : JsonReader, IJsonLineInfo
 }
 
 #[test]
+fn graph_exposes_inheritance_api_for_ancestors_and_direct_subtypes() {
+    let mut parser = LanguageParser::new().unwrap();
+    let reader = csharp_record(
+        "src/JsonReader.cs",
+        r#"
+namespace App;
+
+public abstract class JsonReader
+{
+    public virtual bool Read() { return false; }
+}
+"#,
+    );
+    let trace = csharp_record(
+        "src/TraceJsonReader.cs",
+        r#"
+namespace App;
+
+internal class TraceJsonReader : JsonReader
+{
+    public override bool Read() { return true; }
+}
+"#,
+    );
+    let parsed = [reader, trace]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let reader_class = graph
+        .find_symbol_by_name("JsonReader")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("JsonReader class symbol");
+    let trace_class = graph
+        .find_symbol_by_name("TraceJsonReader")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("TraceJsonReader class symbol");
+
+    let ancestors = graph.inheritance_ancestors(&trace_class.id);
+    assert!(
+        ancestors.iter().any(|symbol| symbol.id == reader_class.id),
+        "TraceJsonReader should report JsonReader as an ancestor"
+    );
+    let direct_subtypes = graph.inheritance_direct_subtypes(&reader_class.id);
+    assert!(
+        direct_subtypes
+            .iter()
+            .any(|symbol| symbol.id == trace_class.id),
+        "JsonReader should report TraceJsonReader as a direct subtype"
+    );
+}
+
+#[test]
 fn graph_records_js_ts_class_heritage_as_base_and_iface_attributes() {
     // The JS/TS extractor records inheritance as queryable `base:`/`iface:`
     // attributes (not only type-reference edges), and the graph build carries
@@ -8839,5 +9233,305 @@ void main() {
             .map(|importers| importers.contains(&app))
             .unwrap_or(false),
         "app.dart must NOT attach to the unrelated c/d/thing.dart that only shares the leaf",
+    );
+}
+
+#[test]
+fn detect_case_collisions_empty_when_no_collisions() {
+    // Use the graph record helper to build minimal FileRecord values.
+    let files = vec![
+        record("src/lib.rs", ""),
+        record("src/main.rs", ""),
+        record("README.md", ""),
+    ];
+    let collisions = detect_case_collisions(&files);
+    assert!(
+        collisions.is_empty(),
+        "no case collisions expected, got: {collisions:?}"
+    );
+}
+
+#[test]
+fn detect_case_collisions_finds_pair() {
+    let files = vec![record("src/Lib.rs", ""), record("src/lib.rs", "")];
+    let collisions = detect_case_collisions(&files);
+    assert_eq!(collisions.len(), 1);
+    let pair = &collisions[0];
+    assert!(
+        (pair[0] == "src/Lib.rs" && pair[1] == "src/lib.rs")
+            || (pair[0] == "src/lib.rs" && pair[1] == "src/Lib.rs"),
+        "unexpected pair: {pair:?}"
+    );
+}
+
+// ── Windows path identity tests ──────────────────────────────────────────────
+
+#[test]
+fn graph_files_by_normalized_id_enables_case_insensitive_lookup() {
+    let source = "pub fn a() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let rec = record("src/Lib.rs", source);
+    let parsed = parser.parse_source(&rec, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    // Exact lookup works.
+    assert!(graph.files.contains_key(&FileId::new("src/Lib.rs")));
+    // Case-insensitive lookup via normalized index finds the record.
+    assert!(
+        graph.find_file_case_insensitive("src/lib.rs").is_some(),
+        "find_file_case_insensitive must resolve lowercase query to src/Lib.rs"
+    );
+    // Backslash normalization is applied before the lookup.
+    assert!(
+        graph.find_file_case_insensitive("src\\Lib.rs").is_some(),
+        "find_file_case_insensitive must accept backslash path separators"
+    );
+    // A query with no match returns None.
+    assert!(
+        graph.find_file_case_insensitive("src/missing.rs").is_none(),
+        "find_file_case_insensitive must return None for absent paths"
+    );
+}
+
+#[test]
+fn detect_case_collisions_finds_all_pairs_for_three_way_collision() {
+    // Three files that all fold to "src/lib.rs": must yield C(3,2) = 3 pairs.
+    let files = vec![
+        record("src/lib.rs", ""),
+        record("src/Lib.rs", ""),
+        record("src/LIB.rs", ""),
+    ];
+    let collisions = detect_case_collisions(&files);
+    assert_eq!(
+        collisions.len(),
+        3,
+        "three-way collision must yield 3 pairs, got: {collisions:?}"
+    );
+}
+
+#[test]
+fn graph_case_insensitive_hint_returns_canonical_spelling() {
+    let source = "fn x() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let rec = record("src/MyModule.rs", source);
+    let parsed = parser.parse_source(&rec, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    assert_eq!(
+        graph.case_insensitive_match_hint("src/mymodule.rs"),
+        Some("src/MyModule.rs")
+    );
+    assert_eq!(
+        graph.case_insensitive_match_hint("SRC/MYMODULE.RS"),
+        Some("src/MyModule.rs")
+    );
+    assert_eq!(
+        graph.case_insensitive_match_hint("src/MyModule.rs"),
+        Some("src/MyModule.rs")
+    );
+    assert!(graph.case_insensitive_match_hint("src/other.rs").is_none());
+}
+
+#[test]
+fn graph_case_collision_detected_in_rebuild_indexes() {
+    let source_a = "pub fn a() {}\n";
+    let source_b = "pub fn b() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let rec_a = record("src/lib.rs", source_a);
+    let mut rec_b = record("src/lib.rs", source_b);
+    rec_b.id = FileId::new("src/Lib.rs");
+    rec_b.relative_path = "src/Lib.rs".to_string();
+
+    let parsed_a = parser.parse_source(&rec_a, source_a.to_string()).unwrap();
+    let parsed_b = parser.parse_source(&rec_b, source_b.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed_a, parsed_b]);
+
+    assert_eq!(
+        graph.case_collisions.len(),
+        1,
+        "expected exactly one case collision for src/lib.rs vs src/Lib.rs"
+    );
+    let (a, b) = &graph.case_collisions[0];
+    let pair = [a.as_str(), b.as_str()];
+    assert!(
+        pair.contains(&"src/lib.rs") && pair.contains(&"src/Lib.rs"),
+        "collision must name both spellings, got {a:?} and {b:?}"
+    );
+}
+
+/// Absolute path tests use Unix-style paths so are only run on Unix.
+#[cfg(unix)]
+#[test]
+fn normalize_cargo_file_id_strips_workspace_prefix() {
+    let root = std::path::Path::new("/workspace/myproject");
+    assert_eq!(
+        normalize_cargo_file_id(root, None, "/workspace/myproject/src/main.rs"),
+        Some("src/main.rs".to_string()),
+    );
+}
+
+#[test]
+fn normalize_cargo_file_id_passes_through_relative_path() {
+    let root = std::path::Path::new("myproject");
+    assert_eq!(
+        normalize_cargo_file_id(root, None, "src/main.rs"),
+        Some("src/main.rs".to_string()),
+    );
+}
+
+#[test]
+fn normalize_cargo_file_id_returns_none_for_angle_bracket_paths() {
+    let root = std::path::Path::new("myproject");
+    assert_eq!(normalize_cargo_file_id(root, None, "<anon>"), None);
+    assert_eq!(
+        normalize_cargo_file_id(root, None, "<macro expansion>"),
+        None
+    );
+}
+
+/// Absolute path test: an absolute path outside the workspace root should
+/// return None. Only meaningful on Unix where the test paths are valid
+/// absolute paths.
+#[cfg(unix)]
+#[test]
+fn normalize_cargo_file_id_returns_none_for_path_outside_workspace() {
+    let root = std::path::Path::new("/workspace/myproject");
+    assert_eq!(
+        normalize_cargo_file_id(root, None, "/other/repo/src/lib.rs"),
+        None,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn normalize_cargo_file_id_fallback_via_symlink() {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    // Set up a real workspace dir and a symlink root that points to it.
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let real_root = std::env::temp_dir().join(format!("squeezy-cargo-norm-real-{nonce}"));
+    let sym_root = std::env::temp_dir().join(format!("squeezy-cargo-norm-sym-{nonce}"));
+    fs::create_dir_all(real_root.join("src")).unwrap();
+    fs::write(real_root.join("src").join("main.rs"), "fn main() {}").unwrap();
+    std::os::unix::fs::symlink(&real_root, &sym_root).unwrap();
+
+    // cargo emits the path under the symlinked root; squeezy was opened
+    // with the real root. The exact prefix check fails; the canonical
+    // fallback must succeed.
+    let canonical_real = std::fs::canonicalize(&real_root).ok();
+    let result = normalize_cargo_file_id(
+        &real_root,
+        canonical_real.as_deref(),
+        &sym_root.join("src/main.rs").to_string_lossy(),
+    );
+    assert_eq!(
+        result,
+        Some("src/main.rs".to_string()),
+        "canonical fallback must resolve symlinked cargo path"
+    );
+
+    // Cleanup
+    let _ = fs::remove_dir_all(&real_root);
+    let _ = fs::remove_file(&sym_root);
+}
+
+#[test]
+fn normalize_cargo_file_id_case_insensitive_fallback() {
+    // Build a root path from the temp directory and construct a path that
+    // differs from the root prefix only in casing (simulating a Windows
+    // drive-letter or directory-case mismatch). The *relative* portion retains
+    // its original casing so we can assert it is preserved in the output.
+    let root = temp_root("cargo-norm-case");
+    let root_norm = root.to_string_lossy().replace('\\', "/");
+
+    // Exact-case path with a mixed-case relative portion.
+    let exact_path = format!("{root_norm}/src/MyModule.cs");
+    assert_eq!(
+        normalize_cargo_file_id(&root, None, &exact_path),
+        Some("src/MyModule.cs".to_string()),
+        "exact case must return the relative path with its original casing"
+    );
+
+    // Construct a path where the root prefix differs in casing but the
+    // relative portion stays at original casing. This simulates the Windows
+    // scenario where the diagnostic reports `C:\work\src\MyModule.cs` while
+    // the workspace root is `c:\work`.
+    let upper_root = root_norm.to_ascii_uppercase();
+    if upper_root != root_norm {
+        let case_mismatch_path = format!("{upper_root}/src/MyModule.cs");
+        assert_eq!(
+            super::case_insensitive_relative_path(&root, std::path::Path::new(&case_mismatch_path)),
+            Some(std::path::PathBuf::from("src/MyModule.cs")),
+            "case-insensitive helper must preserve the relative path's original casing"
+        );
+        let expected = if cfg!(windows) {
+            Some("src/MyModule.cs".to_string())
+        } else {
+            None
+        };
+        assert_eq!(
+            normalize_cargo_file_id(&root, None, &case_mismatch_path),
+            expected,
+            "case-insensitive absolute-prefix fallback must be Windows-only"
+        );
+    }
+}
+
+#[test]
+fn graph_compute_impact_uses_reverse_import_reachability() {
+    let mut parser = LanguageParser::new().unwrap();
+    let wanted = dart_record("lib/a/b/thing.dart", "class Thing {\n  void run() {}\n}\n");
+    let unrelated = dart_record("lib/c/d/thing.dart", "class Thing {\n  void run() {}\n}\n");
+    let importer = dart_record(
+        "lib/app.dart",
+        r#"import 'package:fixture/a/b/thing.dart';
+
+void main() {
+  Thing().run();
+}
+"#,
+    );
+    let parsed = [wanted, unrelated, importer]
+        .iter()
+        .map(|rec| {
+            parser
+                .parse_source(rec, fs::read_to_string(&rec.path).unwrap())
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let changed = HashSet::from([FileId::new("lib/a/b/thing.dart")]);
+    let propagating = changed.clone();
+    let removed = HashSet::new();
+    let impact = graph.compute_impact(&changed, &propagating, &removed);
+
+    assert!(
+        impact
+            .affected_files
+            .contains(&FileId::new("lib/a/b/thing.dart")),
+        "changed file should be included in its own impact set"
+    );
+    assert!(
+        impact.affected_files.contains(&FileId::new("lib/app.dart")),
+        "reverse importer should be included in impact set"
+    );
+    assert!(
+        !impact
+            .affected_files
+            .contains(&FileId::new("lib/c/d/thing.dart")),
+        "unrelated same-leaf file should not be included in impact set"
+    );
+    assert!(
+        impact
+            .affected_symbols
+            .iter()
+            .any(|symbol| symbol.file_id == FileId::new("lib/app.dart")),
+        "affected symbols should include symbols from reverse importers"
     );
 }

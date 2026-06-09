@@ -35,6 +35,20 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use squeezy_vcs::{DiffSnapshot as VcsDiffSnapshot, RollbackResult as VcsRollbackResult};
 
+/// Subcommand for `/compact`. Exactly one of these variants is active at a
+/// time, eliminating the invalid two-bool state (`undo: true, history: true`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompactSubcommand {
+    /// Trigger a new compaction pass (default).
+    #[default]
+    Run,
+    /// Restore the most recent compaction checkpoint.
+    Undo,
+    /// Display the per-session compaction timeline.
+    History,
+}
+
 /// Typed slash command parsed from a slash-prefixed input string. Each
 /// variant matches exactly one entry in `SLASH_COMMANDS` (with `/jobs`,
 /// `/job`, `/job-cancel` kept as documented aliases of `/tasks`,
@@ -77,7 +91,7 @@ pub enum DispatchCommand {
     },
     Attachments,
     Compact {
-        undo: bool,
+        subcommand: CompactSubcommand,
     },
     /// `/clear` — drop the live conversation and start a clean slate.
     /// The outgoing session stays resumable on disk; the next turn
@@ -132,6 +146,7 @@ pub enum DispatchCommand {
         path: Option<String>,
     },
     Checkpoints,
+    CheckpointsDoctor,
     Checkpoint {
         id: String,
     },
@@ -164,6 +179,11 @@ pub enum DispatchCommand {
     Router {
         value: Option<String>,
     },
+    /// `/terminal` — show a compact terminal diagnostic table:
+    /// TTY status, $TERM, $COLORTERM, tmux/screen presence,
+    /// synchronized-output policy, mouse capture, clipboard method,
+    /// notification method, and effective shell.
+    Terminal,
 }
 
 impl DispatchCommand {
@@ -205,6 +225,7 @@ impl DispatchCommand {
             Self::SessionExport { .. } => "/session-export",
             Self::SessionExportHtml { .. } => "/session-export-html",
             Self::Checkpoints => "/checkpoints",
+            Self::CheckpointsDoctor => "/checkpoints",
             Self::Checkpoint { .. } => "/checkpoint",
             Self::Undo => "/undo",
             Self::RevertTurn { .. } => "/revert-turn",
@@ -217,6 +238,7 @@ impl DispatchCommand {
             Self::Cheap => "/cheap",
             Self::Parent => "/parent",
             Self::Router { .. } => "/router",
+            Self::Terminal => "/terminal",
         }
     }
 
@@ -275,10 +297,14 @@ impl DispatchCommand {
             }
             "/attachments" => Self::Attachments,
             "/compact" => {
-                let mut tokens = rest.split_whitespace();
-                let undo =
-                    matches!(tokens.next(), Some(token) if token.eq_ignore_ascii_case("undo"));
-                Self::Compact { undo }
+                let subcommand = match rest.split_whitespace().next() {
+                    Some(token) if token.eq_ignore_ascii_case("undo") => CompactSubcommand::Undo,
+                    Some(token) if token.eq_ignore_ascii_case("history") => {
+                        CompactSubcommand::History
+                    }
+                    _ => CompactSubcommand::Run,
+                };
+                Self::Compact { subcommand }
             }
             "/clear" => Self::Clear,
             "/diff" => Self::Diff,
@@ -355,7 +381,13 @@ impl DispatchCommand {
                 let path = tokens.next().map(str::to_string);
                 Self::SessionExportHtml { id, path }
             }
-            "/checkpoints" => Self::Checkpoints,
+            "/checkpoints" => {
+                if rest.eq_ignore_ascii_case("doctor") {
+                    Self::CheckpointsDoctor
+                } else {
+                    Self::Checkpoints
+                }
+            }
             "/checkpoint" => Self::Checkpoint {
                 id: require_id(head, rest, "<checkpoint_id>")?,
             },
@@ -382,6 +414,7 @@ impl DispatchCommand {
             "/router" => Self::Router {
                 value: first_token(rest),
             },
+            "/terminal" => Self::Terminal,
             unknown => {
                 return Err(DispatchCommandParseError::Unknown {
                     command: unknown.to_string(),

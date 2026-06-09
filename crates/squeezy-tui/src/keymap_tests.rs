@@ -12,11 +12,17 @@ fn binding_for(spec: &str) -> KeyBinding {
 fn parses_modifier_combinations() {
     assert_eq!(
         binding_for("Ctrl+T"),
-        KeyBinding::new(KeyCode::Char('T'), KeyModifiers::CONTROL),
+        KeyBinding {
+            code: KeyCode::Char('t'),
+            modifiers: KeyModifiers::CONTROL,
+        },
     );
     assert_eq!(
-        binding_for("alt+k"),
-        KeyBinding::new(KeyCode::Char('k'), KeyModifiers::ALT),
+        binding_for("Alt+K"),
+        KeyBinding {
+            code: KeyCode::Char('k'),
+            modifiers: KeyModifiers::ALT,
+        },
     );
     assert_eq!(
         binding_for("Ctrl+Alt+Delete"),
@@ -29,6 +35,22 @@ fn parses_modifier_combinations() {
     assert_eq!(
         binding_for("F11"),
         KeyBinding::new(KeyCode::F(11), KeyModifiers::NONE),
+    );
+}
+
+#[test]
+fn uppercase_override_specs_match_normalised_key_events() {
+    let mut overrides = BTreeMap::new();
+    overrides.insert("transcript_overlay".to_string(), "Ctrl+O".to_string());
+    let resolver = KeymapResolver::from_overrides(&overrides);
+
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        Some(Action::ToggleTranscriptOverlay),
+    );
+    assert_eq!(
+        resolver.binding(Action::ToggleTranscriptOverlay).display(),
+        "Ctrl+O",
     );
 }
 

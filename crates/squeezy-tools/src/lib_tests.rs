@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
@@ -18,6 +18,11 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 
 static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
+/// Process-wide lock for tests that mutate environment variables. Rust's test
+/// harness runs tests concurrently; without serialization, `set_var`/`remove_var`
+/// calls in one test can corrupt `env::var` reads in another. Acquire this guard
+/// for the entire duration of any test that calls `env::set_var` or `env::remove_var`.
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn registry_with_shell_sandbox_off(root: &Path) -> ToolRegistry {
     registry_with_shell_sandbox_off_and_output_config(root, ToolOutputConfig::default())
@@ -282,6 +287,35 @@ fn plan_parallel_batches_serializes_unsafe_calls_between_safe_runs() {
 }
 
 #[test]
+fn shell_permission_metadata_populates_filesystem_posture_for_approval_prompt() {
+    // Regression test: the approval prompt's `filesystem` warn-line arms
+    // (squeezy-tui::approval::append_shell) only render when this key is
+    // populated at permission-request time. Mode = Off → plan is direct,
+    // so `filesystem` is "not_enforced" — deterministic across platforms.
+    let root = temp_workspace("permission_filesystem_posture");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let request = registry.permission_request(&ToolCall {
+        call_id: "filesystem-posture".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "echo hello",
+            "description": "trivial echo"
+        }),
+    });
+
+    assert!(
+        request.metadata.contains_key("filesystem"),
+        "permission_request must populate the `filesystem` metadata key so the \
+         approval prompt's posture warn-line can render: keys = {:?}",
+        request.metadata.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(request.metadata["filesystem"], "not_enforced");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     let root = temp_workspace("permission_metadata");
     let registry = registry_with_shell_sandbox_off(&root);
@@ -299,6 +333,8 @@ fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     assert_eq!(destructive.target, "rm:*");
     assert_eq!(destructive.metadata["cwd"], ".");
     assert_eq!(destructive.metadata["destructive"], "true");
+    assert_eq!(destructive.metadata["sandbox_backend"], "none");
+    assert_eq!(destructive.metadata["sandbox_filesystem"], "not_enforced");
 
     let compiler = registry.permission_request(&ToolCall {
         call_id: "test".to_string(),
@@ -319,6 +355,40 @@ fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     assert_eq!(refresh.capability, PermissionCapability::Compiler);
     assert_eq!(refresh.target, "cargo facts+check:*");
     assert_eq!(refresh.metadata["diagnostics"], "true");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg(windows)]
+fn shell_permission_metadata_matches_windows_disabled_sandbox_level() {
+    let root = temp_workspace("permission_windows_disabled_sandbox");
+    let registry = registry_with_runtime_config(
+        &root,
+        ToolRuntimeConfig {
+            shell_sandbox: squeezy_core::ShellSandboxConfig {
+                mode: squeezy_core::ShellSandboxMode::BestEffort,
+                windows_sandbox_level: squeezy_core::WindowsSandboxLevel::Disabled,
+                ..squeezy_core::ShellSandboxConfig::default()
+            },
+            ..ToolRuntimeConfig::default()
+        },
+    );
+
+    let request = registry.permission_request(&ToolCall {
+        call_id: "echo".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "echo hi",
+            "description": "smoke"
+        }),
+    });
+
+    assert_eq!(request.metadata["sandbox_backend"], "windows-job-object");
+    assert_eq!(
+        request.metadata["sandbox_filesystem"],
+        "best_effort_unavailable"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -970,6 +1040,191 @@ async fn glob_lists_paths_without_reading_content_and_respects_ignore() {
     paths.sort();
     assert_eq!(paths, vec!["ignored.rs", "visible.rs"]);
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn required_glob_normalizes_windows_separators() {
+    let glob = build_required_glob(r"src\**\*.rs").expect("glob");
+
+    assert!(glob.is_match("src/bin/main.rs"));
+    assert!(!glob.is_match("tests/bin/main.rs"));
+}
+
+#[test]
+fn include_set_normalizes_windows_separators() {
+    let patterns = vec![r"src\**\*.rs".to_string(), "README.md".to_string()];
+    let include = build_include_set(Some(&patterns))
+        .expect("include set")
+        .expect("include set present");
+
+    assert!(include.is_match("src/bin/main.rs"));
+    assert!(include.is_match("docs/README.md"));
+    assert!(!include.is_match("tests/bin/main.rs"));
+}
+
+#[test]
+fn detect_line_endings_classifies_common_shapes() {
+    assert_eq!(detect_line_endings(b"one\r\ntwo\r\n"), "crlf");
+    assert_eq!(detect_line_endings(b"one\ntwo\n"), "lf");
+    assert_eq!(detect_line_endings(b"one\r\ntwo\n"), "mixed");
+    assert_eq!(detect_line_endings(b"one two"), "none");
+}
+
+/// Verify that `follow_symlinks=true` with a symlink pointing outside the
+/// workspace does NOT return the out-of-workspace file in glob results.
+/// Also verifies that in-workspace files are still returned.
+#[cfg(unix)]
+#[tokio::test]
+async fn glob_follow_symlinks_respects_workspace_containment() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_workspace("glob_symlink_containment");
+    // A real in-workspace file.
+    fs::write(root.join("inside.rs"), "// inside\n").expect("write inside");
+
+    // Create a file outside the workspace.
+    let outside_dir = temp_workspace("glob_symlink_outside");
+    fs::write(outside_dir.join("secret.rs"), "// secret\n").expect("write secret");
+
+    // Symlink inside the workspace pointing to the outside directory.
+    symlink(&outside_dir, root.join("link_to_outside")).expect("create symlink");
+
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "glob-symlink-1".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "**/*.rs", "follow_symlinks": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let paths = result.content["paths"]
+        .as_array()
+        .expect("paths array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect::<Vec<_>>();
+
+    // in-workspace file must appear
+    assert!(
+        paths.contains(&"inside.rs".to_string()),
+        "inside.rs must be in results; got: {paths:?}"
+    );
+    // out-of-workspace file via symlink must NOT appear
+    assert!(
+        !paths.iter().any(|p| p.contains("secret")),
+        "secret.rs from outside workspace must not appear; got: {paths:?}"
+    );
+    // symlink_skipped_count must be non-zero (the outside dir was rejected)
+    let skipped = result.content["metadata"]["symlink_skipped_count"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        skipped > 0,
+        "symlink_skipped_count must be > 0 when out-of-workspace symlinks were rejected"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn glob_default_skips_symlink_file_that_escapes_workspace() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_workspace("glob_symlink_file_escape");
+    fs::write(root.join("inside.rs"), "// inside\n").expect("write inside");
+    let outside_dir = temp_workspace("glob_symlink_file_outside");
+    fs::write(outside_dir.join("secret.rs"), "// secret\n").expect("write secret");
+    symlink(outside_dir.join("secret.rs"), root.join("leaked.rs")).expect("create symlink");
+
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "glob-symlink-file-escape".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "*.rs"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["paths"], json!(["inside.rs"]));
+    assert_eq!(
+        result.content["metadata"]["symlink_skipped_count"],
+        json!(1)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn grep_default_skips_symlink_file_that_escapes_workspace() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_workspace("grep_symlink_file_escape");
+    fs::write(root.join("inside.rs"), "needle inside\n").expect("write inside");
+    let outside_dir = temp_workspace("grep_symlink_file_outside");
+    fs::write(outside_dir.join("secret.rs"), "needle secret\n").expect("write secret");
+    symlink(outside_dir.join("secret.rs"), root.join("leaked.rs")).expect("create symlink");
+
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "grep-symlink-file-escape".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(match_paths(&result), vec!["inside.rs"]);
+    assert_eq!(
+        result.content["metadata"]["symlink_skipped_count"],
+        json!(1)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&outside_dir);
+}
+
+/// Verify that `follow_symlinks=false` (default) reports `symlinks_not_followed: true`.
+#[tokio::test]
+async fn glob_default_reports_symlinks_not_followed() {
+    let root = temp_workspace("glob_symlink_meta");
+    fs::write(root.join("file.rs"), "// file\n").expect("write file");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "glob-meta-1".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "*.rs"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(
+        result.content["metadata"]["symlinks_not_followed"],
+        json!(true)
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -2743,8 +2998,8 @@ fn diff_verify_command_uses_nested_manifest_when_root_has_no_cargo() {
 fn cargo_setup_failure_reason_separates_environment_from_code_failures() {
     // The exact failure shape that keeps surfacing: a private git dependency
     // cargo can't fetch/authenticate, with a pinned revision that is gone.
-    let dep_failure = "Updating git repository `https://github.com/SonarSource/semsitter.git`\n\
-         error: failed to get `udg-gen` as a dependency of package `sonar-context-augmentation`\n\
+    let dep_failure = "Updating git repository `https://github.com/acme-corp/private-lib.git`\n\
+         error: failed to get `udg-gen` as a dependency of package `widget-graph`\n\
          Caused by:\n  failed to load source for dependency `udg-gen`\n\
          Caused by:\n  revision 0a910a90 not found\n\
          Caused by:\n  failed to authenticate when downloading repository\n";
@@ -6787,6 +7042,21 @@ async fn shell_timeout_returns_structured_error_and_kills_process() {
             .contains("timed out")
     );
     assert_eq!(result.content["truncated"], true);
+    #[cfg(unix)]
+    {
+        let kill_meta = result.content["kill_meta"]
+            .as_object()
+            .expect("timeout result must include Unix kill metadata");
+        assert!(
+            kill_meta["pgid"].as_u64().is_some_and(|pgid| pgid > 0),
+            "kill metadata must report the signaled process group: {kill_meta:?}"
+        );
+        assert_eq!(kill_meta["sigterm_ok"], true);
+        assert_eq!(kill_meta["sigkill_sent"], false);
+        assert_eq!(kill_meta["direct_child_fallback"], false);
+    }
+    #[cfg(not(unix))]
+    assert!(result.content.get("kill_meta").is_none());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -6885,9 +7155,15 @@ async fn shell_tty_attaches_stdout_to_terminal() {
         .await;
     assert_eq!(tty.status, ToolStatus::Success);
     // Windows does not yet wire up ConPTY for the shell tool, so `tty: true`
-    // is documented to degrade to pipe-backed stdio on that platform.
-    let expected_tty_output = if cfg!(windows) { "pipe" } else { "tty" };
-    assert_eq!(tty.content["stdout"], expected_tty_output);
+    // degrades to pipe-backed stdio. The output is prefixed with a notice
+    // so the model knows it is running in non-interactive pipe mode.
+    #[cfg(windows)]
+    assert_eq!(
+        tty.content["stdout"],
+        "[ConPTY unavailable; running non-interactive pipes]\npipe"
+    );
+    #[cfg(not(windows))]
+    assert_eq!(tty.content["stdout"], "tty");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -9010,6 +9286,11 @@ fn tool_specs_are_sorted_by_name() {
         names,
         vec![
             "apply_patch",
+            // checkpoint_list is always advertised so the model and UI can
+            // discover the disabled state rather than treating checkpoint
+            // tools as entirely absent. The other three are gated on a
+            // live checkpoint provider.
+            "checkpoint_list",
             "decl_search",
             "definition_search",
             "diff_context",
@@ -9017,6 +9298,8 @@ fn tool_specs_are_sorted_by_name() {
             "glob",
             "grep",
             "hierarchy",
+            "impact",
+            "inheritance_hierarchy",
             "list_skills",
             "load_skill",
             "notebook_edit",
@@ -9049,7 +9332,10 @@ fn tool_specs_are_sorted_by_name() {
     assert_eq!(
         checkpoint_names,
         vec![
+            "checkpoint_check",
+            "checkpoint_doctor",
             "checkpoint_list",
+            "checkpoint_restore_file",
             "checkpoint_revert",
             "checkpoint_show",
             "checkpoint_undo"
@@ -9101,6 +9387,21 @@ async fn tool_registry_specs_returns_same_arc_until_refresh() {
         !Arc::ptr_eq(&first, &third),
         "specs() reused stale Arc after refresh_mcp_tools"
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn mcp_tool_list_changed_notify_reuses_registry_signal() {
+    let root = temp_workspace("mcp_tool_list_changed_notify");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let observed = registry.mcp_tool_list_changed_notify();
+    registry.mcp_tool_list_changed_notify().notify_one();
+
+    tokio::time::timeout(Duration::from_millis(50), observed.notified())
+        .await
+        .expect("tool_list_changed signal should be shared");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -10240,6 +10541,44 @@ pub fn unrelated() {}
 }
 
 #[tokio::test]
+async fn decl_search_fuzzy_falls_back_when_seed_hits_do_not_rank() {
+    let root = temp_workspace("graph_fuzzy_seed_fallback");
+    write_rust_crate(
+        &root,
+        r#"
+pub struct GraphManager;
+pub struct Bogmanoise;
+pub fn unrelated() {}
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "fuzzy_seed_fallback".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "gmanagr"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let packets = result.content["packets"]
+        .as_array()
+        .expect("decl_search packets array");
+    let graph_manager = packets
+        .iter()
+        .find(|packet| packet["symbol"]["name"].as_str() == Some("GraphManager"))
+        .unwrap_or_else(|| {
+            panic!("full fuzzy fallback must recover `GraphManager`, got {packets:?}")
+        });
+    assert_eq!(graph_manager["symbol"]["rank"].as_str(), Some("fuzzy"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn decl_search_path_filter_accepts_fuzzy_path_token() {
     let root = temp_workspace("graph_fuzzy_path");
     write_rust_crate(&root, "pub fn entry() {}\n");
@@ -10352,6 +10691,115 @@ async fn decl_search_zero_hit_no_path_scope() {
 // `fallback.suggested_tools` was trimmed from the wire payload. The dropped
 // field was the only consumer of the regex-escape path; the reason code stays
 // and the model picks its own retry tool.
+
+#[tokio::test]
+async fn decl_search_zero_hit_path_unknown_emits_case_near_match() {
+    // Linux case-sensitivity: when the exact path is not found but a
+    // case-insensitive candidate exists, the fallback includes `case_near_match`
+    // so the model can correct the typo without a second graph traversal.
+    let root = temp_workspace("graph_zero_hit_case_near");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Query with an incorrect case for the path component (`Lib.rs` vs `lib.rs`).
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "case_near".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({
+                    "query": "no_such_symbol",
+                    "path": "src/Lib.rs",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let fallback = &result.content["fallback"];
+    assert_eq!(fallback["status"].as_str(), Some("no_graph_evidence"));
+    if cfg!(windows) {
+        assert_eq!(
+            fallback["reason"].as_str(),
+            Some("supported_language_no_match")
+        );
+        assert_eq!(
+            fallback["path"].as_str(),
+            Some("src/lib.rs"),
+            "Windows resolves case-insensitive paths to the indexed spelling; fallback={fallback}"
+        );
+        assert!(fallback.get("case_near_match").is_none());
+    } else {
+        assert_eq!(fallback["reason"].as_str(), Some("path_unknown"));
+        // The path field must echo the unresolved query path, not null and not
+        // the actual file path (which was not found by exact/suffix match).
+        assert_eq!(
+            fallback["path"].as_str(),
+            Some("src/Lib.rs"),
+            "path field must echo the unresolved query path; fallback={fallback}"
+        );
+        // The fallback must include the case-insensitive near-match hint.
+        assert_eq!(
+            fallback["case_near_match"].as_str(),
+            Some("src/lib.rs"),
+            "expected case_near_match to point to src/lib.rs; fallback={fallback}"
+        );
+    }
+    assert!(
+        fallback.get("suggested_tools").is_none(),
+        "suggested_tools must be trimmed from the wire payload"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_zero_hit_backslash_path_reports_normalization_hint() {
+    // When the model supplies a Windows-style backslash path on Linux the
+    // fallback should include `path_normalized_from` showing the original
+    // backslash filter alongside the normalised forward-slash path used for
+    // matching.
+    let root = temp_workspace("graph_zero_hit_backslash");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "backslash_hint".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({
+                    "query": "no_such_symbol",
+                    "path": "src\\lib.rs",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let fallback = &result.content["fallback"];
+    assert_eq!(fallback["status"].as_str(), Some("no_graph_evidence"));
+    // The normalized path should match the indexed file.
+    assert_eq!(
+        fallback["reason"].as_str(),
+        Some("supported_language_no_match"),
+        "normalized backslash path should resolve to the indexed file; fallback={fallback}"
+    );
+    // The path field must show the slash-normalized resolved path.
+    assert_eq!(
+        fallback["path"].as_str(),
+        Some("src/lib.rs"),
+        "path field must show the slash-normalized resolved path; fallback={fallback}"
+    );
+    // A normalization hint must be present showing the original backslash filter.
+    assert_eq!(
+        fallback["path_normalized_from"].as_str(),
+        Some("src\\lib.rs"),
+        "path_normalized_from must preserve the original backslash filter; fallback={fallback}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
 
 #[tokio::test]
 async fn decl_search_non_empty_packets_keeps_null_fallback() {
@@ -11156,9 +11604,9 @@ fn destructive_redirect_detection_ignores_fd_duplication_and_quotes() {
 
     // Redirecting noise to /dev/null is stderr/stdout suppression, not a
     // destructive filesystem write.
-    let sonar_stderr_null = analyze_shell_command("sonar context list --json 2>/dev/null");
-    assert_eq!(sonar_stderr_null.capability, PermissionCapability::Shell);
-    assert!(!sonar_stderr_null.destructive);
+    let stderr_null_redirect = analyze_shell_command("acme-nav list --json 2>/dev/null");
+    assert_eq!(stderr_null_redirect.capability, PermissionCapability::Shell);
+    assert!(!stderr_null_redirect.destructive);
 
     let cargo_stdout_null = analyze_shell_command("cargo test >/dev/null");
     assert_eq!(cargo_stdout_null.capability, PermissionCapability::Compiler);
@@ -11189,13 +11637,13 @@ fn destructive_redirect_detection_ignores_fd_duplication_and_quotes() {
 #[test]
 fn plan_mode_shell_read_only_classifier_blocks_repo_mutators() {
     assert!(plan_mode_shell_command_is_read_only(
-        "sonar context guidelines get --languages java 2>/dev/null"
+        "rg -l 'fn main' --type rust 2>/dev/null"
     ));
     assert!(plan_mode_shell_command_is_read_only(
         "find . -name \"*.java\" -not -path \"*/target/*\" | head -60"
     ));
     assert!(plan_mode_shell_command_is_read_only(
-        "sonar context navigation search-signatures --pattern \".*\" --fields \"fqn,file_path,start_line\" --limit 20 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(x['fqn'],'->',x['file_path']) for x in d.get('results',[])]\" 2>/dev/null || true"
+        "rg -l 'fn main' 2>/dev/null | python3 -c \"import sys; [print(l.strip()) for l in sys.stdin]\" 2>/dev/null || true"
     ));
     assert!(plan_mode_shell_command_is_read_only("cargo fmt --check"));
     assert!(plan_mode_shell_command_is_read_only(
@@ -11273,6 +11721,9 @@ fn sensitive_path_matcher_ignores_substring_false_positives() {
 
 #[test]
 fn sensitive_path_matcher_catches_quoted_and_expanded_bypasses() {
+    // Honour the file-wide ENV_MUTEX so this test serialises with the
+    // newer USERPROFILE / APPDATA tests that mutate sibling vars.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let patterns = squeezy_core::ShellSandboxConfig::default().sensitive_path_patterns;
     assert!(shell_command_references_sensitive_path("cat .env", &patterns).is_some());
     assert!(shell_command_references_sensitive_path("cat ./.env.production", &patterns).is_some());
@@ -11425,6 +11876,7 @@ fn fake_sandbox_plan(backend: &'static str, required: bool) -> ShellSandboxPlan 
         filesystem_write_roots: Vec::new(),
         fallback_reason: None,
         best_effort_fallback: None,
+        selected_shell: None,
     }
 }
 
@@ -11435,11 +11887,13 @@ fn prepare_sandbox_plan_with_probes(
     linux_available: bool,
 ) -> std::result::Result<ShellSandboxPlan, String> {
     let analysis = analyze_shell_command(command);
+    let health = ShellSandboxHealth::default();
     prepare_shell_sandbox_plan_with_probe(
         command,
         &analysis,
         Path::new("/tmp"),
         config,
+        &health,
         macos_available,
         linux_available,
         true,
@@ -11573,9 +12027,38 @@ fn shell_sandbox_plan_best_effort_when_sandbox_exec_absent() {
     assert!(
         plan.fallback_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("sandbox unavailable")),
+            .is_some_and(|reason| reason.contains("sandbox-exec unavailable")),
         "{:?}",
         plan.fallback_reason
+    );
+}
+
+/// Regression: macOS best_effort fallback reason must not say "required". The
+/// same confusion fix as the Linux path — both now use mode-neutral wording.
+#[test]
+#[cfg(target_os = "macos")]
+fn shell_sandbox_macos_best_effort_fallback_reason_does_not_say_required() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::BestEffort,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        false,
+        true,
+    )
+    .expect("best effort falls back gracefully");
+
+    let reason = plan
+        .fallback_reason
+        .expect("best_effort fallback must carry a reason");
+    assert!(
+        !reason.contains("required"),
+        "macOS best_effort fallback reason must not say 'required'; got: {reason:?}"
+    );
+    assert!(
+        reason.contains("best_effort"),
+        "macOS best_effort fallback reason should mention the mode; got: {reason:?}"
     );
 }
 
@@ -11619,6 +12102,129 @@ fn shell_sandbox_plan_best_effort_when_userns_unavailable() {
         "{:?}",
         plan.fallback_reason
     );
+}
+
+/// Regression: best_effort fallback reason must describe the actual mode, not
+/// mislead users into thinking the sandbox was "required". Previously the
+/// message read "required shell sandbox unavailable: linux unshare failed"
+/// even when mode = best_effort.
+#[test]
+#[cfg(target_os = "linux")]
+fn shell_sandbox_best_effort_fallback_reason_does_not_say_required() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::BestEffort,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        true,
+        false,
+    )
+    .expect("best effort falls back gracefully");
+
+    let reason = plan
+        .fallback_reason
+        .expect("best_effort fallback must carry a reason");
+    assert!(
+        !reason.contains("required"),
+        "best_effort fallback reason must not say 'required'; got: {reason:?}"
+    );
+    assert!(
+        reason.contains("best_effort"),
+        "best_effort fallback reason should mention the mode; got: {reason:?}"
+    );
+}
+
+/// Regression: required mode must fail closed when the unshare probe says no.
+/// This covers the "preflight false negative" case where the sysctl / ns file
+/// reports unavailable (or a container policy blocks it). The planner must
+/// return `Err` so the permission gate surfaces a user-visible denial before
+/// any spawn attempt.
+#[test]
+#[cfg(target_os = "linux")]
+fn shell_sandbox_required_mode_fails_closed_when_unshare_probe_says_no() {
+    let err = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::Required,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        false,
+        false,
+    )
+    .expect_err("required mode must fail closed before spawn");
+
+    assert!(
+        err.contains("required shell sandbox unavailable"),
+        "required-mode denial must be user-visible; got: {err:?}"
+    );
+    assert!(
+        !err.contains("best_effort"),
+        "required-mode error must not mention best_effort; got: {err:?}"
+    );
+}
+
+/// Regression: when static probes pass but `pre_exec` unshare/Landlock fails
+/// at runtime (preflight false-positive), `shell_sandbox_runtime_unavailable`
+/// must detect the failure so the agent can surface a sandbox-unavailable
+/// denial rather than silently accepting an unsandboxed exit-1.
+#[test]
+#[cfg(target_os = "linux")]
+fn shell_sandbox_runtime_unavailable_detects_preflight_false_positive() {
+    // Static probes said yes (plan was created), but after spawn the
+    // kernel denied unshare: child exits 1 with empty stderr. Re-probing
+    // the parent at that point returns false → runtime-unavailable.
+    let plan = fake_sandbox_plan("linux-direct-syscalls", true);
+    assert!(
+        shell_sandbox_runtime_unavailable_with_probe(&plan, Some(1), "", false),
+        "exit-1 + empty stderr + userns-gone must be detected as runtime unavailable"
+    );
+    // If stderr is non-empty the failure is the user's command, not the sandbox.
+    assert!(
+        !shell_sandbox_runtime_unavailable_with_probe(&plan, Some(1), "error text", false),
+        "non-empty stderr must not be treated as sandbox unavailability"
+    );
+    // If the re-probe still says userns is available, this exit-1 is ambiguous.
+    assert!(
+        !shell_sandbox_runtime_unavailable_with_probe(&plan, Some(1), "", true),
+        "exit-1 with userns still available must not be treated as sandbox unavailability"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn shell_sandbox_plan_linux_direct_uses_configured_shell() {
+    let mut config = sandbox_config(
+        ShellSandboxMode::Required,
+        ShellSandboxNetworkPolicy::DenyByDefault,
+    );
+    config.linux_shell = Some("/custom/bash".to_string());
+
+    let plan = prepare_sandbox_plan_with_probes("printf ok", &config, true, true)
+        .expect("linux direct-syscalls plan");
+
+    assert_eq!(plan.backend, "linux-direct-syscalls");
+    assert_eq!(plan.program, "/custom/bash");
+    assert_eq!(plan.args, ["-lc", "printf ok"]);
+    assert_eq!(plan.metadata()["shell"], "/custom/bash");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn shell_sandbox_plan_linux_fallback_keeps_configured_shell_in_metadata() {
+    let mut config = sandbox_config(
+        ShellSandboxMode::BestEffort,
+        ShellSandboxNetworkPolicy::DenyByDefault,
+    );
+    config.linux_shell = Some("/custom/bash".to_string());
+
+    let plan = prepare_sandbox_plan_with_probes("printf ok", &config, true, false)
+        .expect("best effort falls back");
+
+    assert_eq!(plan.backend, "none");
+    assert_eq!(plan.program, "/custom/bash");
+    assert_eq!(plan.args, ["-lc", "printf ok"]);
+    assert_eq!(plan.metadata()["shell"], "/custom/bash");
 }
 
 #[test]
@@ -11690,7 +12296,7 @@ fn shell_sandbox_plan_network_posture_denied_non_network() {
 
 #[test]
 #[cfg(unix)]
-fn shell_best_effort_falls_back_when_sandbox_dies_without_output() {
+fn shell_best_effort_does_not_retry_signal_exit_without_output() {
     use std::os::unix::process::ExitStatusExt;
 
     let plan = fake_sandbox_plan("macos-sandbox-exec", false);
@@ -11702,13 +12308,21 @@ fn shell_best_effort_falls_back_when_sandbox_dies_without_output() {
         stderr_bytes: Vec::new(),
         stderr_truncated: false,
         raw_spillover: None,
+        win_job_object_status: None,
+        tty_degraded: false,
+        tty_downgraded: false,
+        windows_job_assigned: None,
+        windows_timeout_job_cleanup_ok: None,
+        kill_meta: None,
+        ask_server_start_error: None,
     };
 
-    let reason =
-        shell_sandbox_direct_fallback_reason(&plan, &run).expect("best effort fallback reason");
+    let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run);
 
-    assert!(reason.contains("signal 6"), "{reason}");
-    assert!(reason.contains("best_effort"), "{reason}");
+    assert!(
+        reason.is_none(),
+        "a signal-only command result must not be retried outside the sandbox: {reason:?}"
+    );
 }
 
 #[test]
@@ -11854,6 +12468,13 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
         stderr_bytes: b"sandbox_apply: Operation not permitted".to_vec(),
         stderr_truncated: false,
         raw_spillover: None,
+        win_job_object_status: None,
+        tty_degraded: false,
+        tty_downgraded: false,
+        windows_job_assigned: None,
+        windows_timeout_job_cleanup_ok: None,
+        kill_meta: None,
+        ask_server_start_error: None,
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run)
@@ -12080,6 +12701,17 @@ fn linux_seccomp_plan_does_not_export_ask_socket() {
     let seccomp_plan = fake_sandbox_plan("linux-direct-syscalls", true);
     assert!(!seccomp_plan.exports_ask_socket());
 
+    // The Windows sandbox backends spawn via raw Win32 with a scrubbed env
+    // and have no AF_UNIX `squeezy ask` transport; they must NOT export the
+    // socket so we don't advertise an unusable capability.
+    for backend in ["windows-restricted-token", "windows-elevated"] {
+        let plan = fake_sandbox_plan(backend, false);
+        assert!(
+            !plan.exports_ask_socket(),
+            "backend {backend} must not export the ask socket (no AF_UNIX transport)",
+        );
+    }
+
     // Backends without the AF_UNIX deny still advertise the ask socket.
     for backend in [
         "none",
@@ -12091,6 +12723,51 @@ fn linux_seccomp_plan_does_not_export_ask_socket() {
         assert!(
             plan.exports_ask_socket(),
             "backend {backend} should export the ask socket",
+        );
+    }
+}
+
+#[test]
+fn nested_ask_disabled_reason_is_set_for_suppressing_backends() {
+    // Backends that suppress AF_UNIX sockets must provide a human-readable
+    // reason so the model and user get a clear explanation rather than seeing
+    // a missing SQUEEZY_ASK_SOCKET as a mysterious misconfiguration.
+    // Each backend gets a differentiated message explaining the actual
+    // mechanism (seccomp deny vs. missing Win32 transport).
+    let linux_plan = fake_sandbox_plan("linux-direct-syscalls", false);
+    let linux_reason = linux_plan
+        .nested_ask_disabled_reason()
+        .expect("linux-direct-syscalls must report a disabled reason");
+    assert!(
+        linux_reason.contains("seccomp"),
+        "linux reason must mention seccomp filter: {linux_reason}"
+    );
+    assert!(
+        linux_reason.contains("nested ask disabled"),
+        "linux reason must describe the constraint: {linux_reason}"
+    );
+
+    for backend in ["windows-restricted-token", "windows-elevated"] {
+        let plan = fake_sandbox_plan(backend, false);
+        let reason = plan
+            .nested_ask_disabled_reason()
+            .unwrap_or_else(|| panic!("backend {backend} must report a disabled reason"));
+        assert!(
+            reason.contains("Win32"),
+            "windows reason for {backend} must mention Win32: {reason}"
+        );
+        assert!(
+            reason.contains("nested ask disabled"),
+            "reason for {backend} must describe the constraint: {reason}"
+        );
+    }
+
+    // Backends that allow ask must return None.
+    for backend in ["none", "external", "macos-sandbox-exec"] {
+        let plan = fake_sandbox_plan(backend, false);
+        assert!(
+            plan.nested_ask_disabled_reason().is_none(),
+            "backend {backend} must not report a disabled reason"
         );
     }
 }
@@ -12789,7 +13466,11 @@ fn core_tool_prefix_stays_within_byte_baseline() {
     // the `transitive` boolean schema property) buys one-call retrieval of the
     // whole transitive subtype closure, replacing the N follow-up `decl_search`
     // calls a model would otherwise issue to walk a deep hierarchy by hand.
-    const PREFIX_BYTES_BASELINE: usize = 25_230;
+    // 25_230 -> 27_000: deliberate bump for schema/impl drift fixes,
+    // `follow_symlinks` on `grep` and `glob`, and first-class `impact` /
+    // `inheritance_hierarchy` specs. These additions expose implemented
+    // behavior that providers with strict schemas could not otherwise call.
+    const PREFIX_BYTES_BASELINE: usize = 27_000;
 
     // Every first-party spec advertised in the always-core path, paired
     // with the required params the model must still see to call it. Tools
@@ -12804,6 +13485,8 @@ fn core_tool_prefix_stays_within_byte_baseline() {
         (glob_spec(), &["pattern"]),
         (grep_spec(), &["pattern"]),
         (hierarchy_spec(), &[]),
+        (impact_spec(), &[]),
+        (inheritance_hierarchy_spec(), &[]),
         (notebook_edit_spec(), &["path", "expected_sha256"]),
         (plan_patch_spec(), &["objective"]),
         (read_file_spec(), &["path"]),
@@ -12856,6 +13539,77 @@ fn core_tool_prefix_stays_within_byte_baseline() {
         "core tool prefix grew to {total} bytes, above the {PREFIX_BYTES_BASELINE}-byte baseline; \
          trim descriptions/schemas or bump the baseline deliberately",
     );
+}
+
+/// Schema/serde drift test: verify that every field accepted by the `Args`
+/// structs for first-party tools is also declared in the advertised `ToolSpec`
+/// schema. This catches the class of bug where an implementation accepts a
+/// parameter but the schema omits it, so provider-side schema validation
+/// silently rejects valid model calls.
+#[test]
+fn first_party_args_schemas_cover_all_accepted_fields() {
+    type SpecDriftCase = (fn() -> ToolSpec, &'static [&'static str]);
+    // (spec_fn, fields accepted by the Args struct that the schema must declare)
+    let cases: &[SpecDriftCase] = &[
+        (
+            read_file_spec,
+            &[
+                "path",
+                "offset",
+                "limit",
+                "diff_only",
+                "start_line",
+                "end_line",
+            ],
+        ),
+        (
+            grep_spec,
+            &[
+                "pattern",
+                "path",
+                "include",
+                "exclude",
+                "include_ignored",
+                "diff_only",
+                "output_mode",
+                "max_files",
+                "max_bytes_per_file",
+                "max_matches",
+                "output_byte_cap",
+                "offset",
+                "context",
+            ],
+        ),
+        (
+            glob_spec,
+            &[
+                "pattern",
+                "path",
+                "include_ignored",
+                "diff_only",
+                "max_paths",
+                "offset",
+            ],
+        ),
+        (
+            read_tool_output_spec,
+            &["handle", "path", "offset", "limit"],
+        ),
+    ];
+
+    for (spec_fn, fields) in cases {
+        let spec = spec_fn();
+        let params = serde_json::to_string(&spec.parameters)
+            .unwrap_or_else(|_| panic!("{} schema serialize failed", spec.name));
+        for field in *fields {
+            assert!(
+                params.contains(&format!("\"{field}\"")),
+                "{} schema must declare field `{field}` (accepted by the Args struct but not advertised); \
+                 got: {params}",
+                spec.name
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -13166,6 +13920,98 @@ fn detect_inheritance_grep_negatives() {
 }
 
 #[test]
+fn tool_spec_capability_matches_permission_request_baseline() {
+    // For every non-MCP first-party spec whose ToolSpec.capability is not
+    // Read, a baseline ToolCall must produce a PermissionRequest whose
+    // capability is also not Read. This catches drift where a tool is added
+    // with a non-Read spec capability but has no explicit branch in
+    // permission_request, causing it to fall through to the
+    // `_ => (PermissionCapability::Read, "tool:<name>", Medium)` default.
+    //
+    // That default would let a shell/edit/network tool run in read-only
+    // sessions when it should be gated. The `shell` tool is excluded
+    // because it intentionally classifies individual commands to precise
+    // per-command capabilities (some read-only commands get Search/Read),
+    // so the per-command runtime level can legitimately be lower than the
+    // advertised Shell capability.
+    let tmp = std::env::temp_dir().join(format!(
+        "sqz_cap_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let registry = registry_with_shell_sandbox_off(&tmp);
+    let specs = registry.specs();
+    // Only test first-party tools (not MCP server tools whose names begin
+    // with "mcp__" — those are dynamically discovered and use the Mcp branch).
+    let first_party: Vec<_> = specs
+        .iter()
+        .filter(|s| !s.name.starts_with("mcp__"))
+        .collect();
+    assert!(
+        !first_party.is_empty(),
+        "registry must expose at least one first-party spec"
+    );
+    // Provide minimal valid arguments for tools whose permission_request
+    // branch requires argument parsing to reach the correct capability.
+    // Tools not listed here get an empty object; if that causes a false
+    // pass (early Read escape before classification), the test comment
+    // below explains why that is still safe for the current set.
+    let arguments_for = |name: &str| -> serde_json::Value {
+        match name {
+            "apply_patch" => json!({"patch": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n+line\n"}),
+            "write_file" | "notebook_edit" => json!({"path": "src/foo.rs", "content": ""}),
+            "checkpoint_undo" | "checkpoint_revert" => json!({}),
+            "verify" => json!({}),
+            "refresh_compiler_facts" => json!({}),
+            "webfetch" => json!({"url": "https://example.com/"}),
+            "websearch" => json!({"query": "test"}),
+            "mcp_read_resource" => json!({"server": "test", "uri": "test://resource"}),
+            "grep" => json!({"pattern": "test"}),
+            "glob" => json!({"pattern": "*.rs"}),
+            "decl_search" | "definition_search" | "reference_search" => {
+                json!({"query": "MyType"})
+            }
+            _ => json!({}),
+        }
+    };
+    let mut failures: Vec<String> = Vec::new();
+    for spec in &first_party {
+        // Shell is intentionally command-per-command; a safe echo command
+        // legitimately classifies as Search. Skip it here.
+        if spec.name == "shell" {
+            continue;
+        }
+        // Only check tools where the spec advertises above Read — those must
+        // have explicit branches, not fall through to the Read default.
+        if spec.capability == PermissionCapability::Read {
+            continue;
+        }
+        let call = ToolCall {
+            call_id: "test-consistency".to_string(),
+            name: spec.name.clone(),
+            arguments: arguments_for(&spec.name),
+        };
+        let request = registry.permission_request(&call);
+        if request.capability == PermissionCapability::Read && request.target.starts_with("tool:") {
+            failures.push(format!(
+                "tool {:?}: spec.capability={:?} but permission_request fell through to the \
+                 default Read branch (target={:?}); add an explicit branch in permission_request",
+                spec.name, spec.capability, request.target
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "tool spec / permission_request capability mismatch(es):\n{}",
+        failures.join("\n")
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn detect_inheritance_grep_extraction() {
     // Generic args stripped.
     let g = detect_inheritance_grep("class X extends TypeAdapter<T>").expect("qualifies");
@@ -13180,4 +14026,138 @@ fn detect_inheritance_grep_extraction() {
     let colon = detect_inheritance_grep("struct Foo : Bar").expect("colon qualifies");
     assert_eq!(colon.base_names, vec!["Bar"]);
     assert_eq!(colon.decl_kw, "struct");
+}
+
+#[test]
+fn detect_newline_style_lf() {
+    assert_eq!(detect_newline_style(b"hello\nworld\n"), "lf");
+}
+
+#[test]
+fn detect_newline_style_crlf() {
+    assert_eq!(detect_newline_style(b"hello\r\nworld\r\n"), "crlf");
+}
+
+#[test]
+fn detect_newline_style_none() {
+    assert_eq!(detect_newline_style(b"no newlines here"), "none");
+}
+
+#[test]
+fn detect_newline_style_empty() {
+    assert_eq!(detect_newline_style(b""), "none");
+}
+
+#[test]
+fn detect_newline_style_lf_before_crlf() {
+    // A bare \n before any \r\n → reported as lf.
+    assert_eq!(detect_newline_style(b"a\nb\r\nc"), "lf");
+}
+
+#[test]
+fn detect_newline_style_crlf_straddles_probe_boundary() {
+    // \r at byte 8191 and \n at byte 8192: must detect crlf, not "none".
+    let mut buf = vec![b'x'; 8191];
+    buf.push(b'\r');
+    buf.push(b'\n');
+    assert_eq!(detect_newline_style(&buf), "crlf");
+}
+
+#[tokio::test]
+async fn write_file_includes_newline_style() {
+    let root = temp_workspace("write_file_newline_style");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    // Write a new file with LF content.
+    let call = ToolCall {
+        call_id: "newline-write-1".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": "newline_test.txt",
+            "content": "line1\nline2\n",
+        }),
+    };
+    let result = registry.execute(call, CancellationToken::new()).await;
+    assert_eq!(result.status, ToolStatus::Success);
+    // Before: no file existed → "none"
+    assert_eq!(result.content["newline_style_before"], json!("none"));
+    assert_eq!(result.content["newline_style_after"], json!("lf"));
+
+    // Overwrite with CRLF content.
+    let before_sha = result.content["after_sha256"].as_str().unwrap().to_string();
+    let call2 = ToolCall {
+        call_id: "newline-write-2".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": "newline_test.txt",
+            "content": "line1\r\nline2\r\n",
+            "expected_sha256": before_sha,
+        }),
+    };
+    let result2 = registry.execute(call2, CancellationToken::new()).await;
+    assert_eq!(result2.status, ToolStatus::Success);
+    assert_eq!(result2.content["newline_style_before"], json!("lf"));
+    assert_eq!(result2.content["newline_style_after"], json!("crlf"));
+}
+
+#[test]
+fn sensitive_path_matcher_expands_windows_userprofile() {
+    // Simulate a Windows-like environment with USERPROFILE set.
+    // The default sensitive-path patterns include `.ssh/**` which covers
+    // %USERPROFILE%\.ssh\id_rsa.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let patterns = squeezy_core::ShellSandboxConfig::default().sensitive_path_patterns;
+    let previous = env::var_os("USERPROFILE");
+    unsafe {
+        env::set_var("USERPROFILE", "C:/Users/testuser");
+    }
+    let result_cmd =
+        shell_command_references_sensitive_path("type %USERPROFILE%/.ssh/id_rsa", &patterns);
+    let result_ps = shell_command_references_sensitive_path(
+        "Get-Content $env:USERPROFILE/.ssh/id_rsa",
+        &patterns,
+    );
+    unsafe {
+        match previous {
+            Some(v) => env::set_var("USERPROFILE", v),
+            None => env::remove_var("USERPROFILE"),
+        }
+    }
+    assert!(
+        result_cmd.is_some(),
+        "%USERPROFILE% prefix should be expanded and .ssh/id_rsa detected"
+    );
+    assert!(
+        result_ps.is_some(),
+        "$env:USERPROFILE prefix should be expanded and .ssh/id_rsa detected"
+    );
+}
+
+#[test]
+fn sensitive_path_matcher_expands_windows_appdata() {
+    // The pattern "sqzapptest" is a single path segment that appears inside
+    // the APPDATA value we configure but NEVER in the literal command token
+    // "%APPDATA%/.aws/credentials". After expansion the token becomes
+    // "C:/Users/sqzapptest/AppData/Roaming/.aws/credentials", and
+    // token_contains_sensitive_base will find the "sqzapptest" segment.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let custom_patterns = vec!["sqzapptest".to_string()];
+    let previous = env::var_os("APPDATA");
+    unsafe {
+        env::set_var("APPDATA", "C:/Users/sqzapptest/AppData/Roaming");
+    }
+    let result = shell_command_references_sensitive_path(
+        "type %APPDATA%/.aws/credentials",
+        &custom_patterns,
+    );
+    unsafe {
+        match previous {
+            Some(v) => env::set_var("APPDATA", v),
+            None => env::remove_var("APPDATA"),
+        }
+    }
+    assert!(
+        result.is_some(),
+        "%APPDATA% expansion should expose the sqzapptest segment"
+    );
 }

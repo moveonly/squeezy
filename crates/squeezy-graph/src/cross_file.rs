@@ -1,12 +1,15 @@
 //! Foundation types for the phased cross-file resolver.
 //!
-//! Squeezy's call resolver runs a single pass over every parsed file. The
-//! work in this module sets up the structures the phased pipeline needs —
-//! per-file [`ExportTable`] / [`ImportList`] / [`SupertypeList`] plus a
-//! [`PathResolver`] trait per language — without flipping any existing call
-//! site to consume them. The single-pass [`crate::resolution::SemanticGraph::resolve_call`]
-//! continues to drive resolution; the types below are populated and ready
-//! for the per-language flips that follow.
+//! Squeezy's call resolver currently runs a single pass over every parsed
+//! file. This module provides the per-file [`ExportTable`] / [`ImportList`] /
+//! [`SupertypeList`] structures and the [`PathResolver`] trait that the phased
+//! pipeline will consume. The single-pass
+//! [`crate::resolution::SemanticGraph::resolve_call`] still drives resolution;
+//! the types are populated during every rebuild and persisted through the
+//! resolver-cache so that per-language flips can read a ready table on the
+//! first refresh without a one-time backfill. Moving the actual resolver onto
+//! these structures to eliminate whole-workspace scans is the next planned
+//! step.
 
 pub mod scheduler;
 

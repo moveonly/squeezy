@@ -201,8 +201,84 @@ fn load_codex_token_returns_none_when_missing() {
 fn load_codex_token_errors_on_malformed_json() {
     let path = tmp_path("malformed");
     std::fs::write(&path, "{ this is not json").expect("write");
+    // Ensure the file has strict permissions so the mode check passes
+    // and the malformed-JSON error is the one surfaced.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+    }
     let err = load_codex_token(&path).expect_err("malformed");
     assert!(err.to_string().contains("not valid JSON"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn load_codex_token_rejects_group_readable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = tmp_path("group-readable");
+    std::fs::write(&path, "{}").expect("write placeholder");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod 640");
+    let err = load_codex_token(&path).expect_err("group-readable file should be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("640") || msg.contains("permissions"),
+        "error should mention the mode; got: {msg}"
+    );
+}
+
+// ─── wait_for_callback_code timeout ─────────────────────────────────────────
+
+#[tokio::test]
+async fn wait_for_callback_code_times_out_when_no_browser_connects() {
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let cancel = CancellationToken::new();
+    let err = wait_for_callback_code_with_timeout(
+        listener,
+        "irrelevant-state",
+        &cancel,
+        Duration::from_millis(50),
+    )
+    .await
+    .expect_err("should time out");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("timed out"),
+        "error should say 'timed out'; got: {msg}"
+    );
+    assert!(
+        msg.contains("squeezy auth openai-codex login"),
+        "timeout recovery hint should use the real CLI subcommand; got: {msg}"
+    );
+    assert!(
+        msg.contains("--manual"),
+        "timeout recovery hint should mention manual fallback; got: {msg}"
+    );
+}
+
+#[test]
+fn save_codex_token_replaces_existing_file() {
+    let path = tmp_path("replace-existing");
+    std::fs::write(&path, "stale-token").expect("seed existing file");
+    let token = OpenAiCodexTokenSet {
+        access_token: make_jwt_with_account("acct_replace"),
+        refresh_token: "refresh-replace".to_string(),
+        expires_at_unix_ms: 1_700_000_000_000,
+        account_id: "acct_replace".to_string(),
+    };
+
+    save_codex_token(&path, &token).expect("save replacement");
+
+    let loaded = load_codex_token(&path)
+        .expect("load replacement")
+        .expect("present");
+    assert_eq!(loaded.account_id, "acct_replace");
+    assert_eq!(loaded.refresh_token, "refresh-replace");
 }
 
 // ─── refresh + ApiKeySource interactions ───────────────────────────────────

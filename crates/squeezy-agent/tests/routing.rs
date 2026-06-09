@@ -531,3 +531,83 @@ async fn cheap_provider_error_retries_once_on_parent() {
 fn _enforce_test_timeout() -> Duration {
     Duration::from_secs(30)
 }
+
+// -- Linux sandbox-sensitive routing ----------------------------------------
+
+#[tokio::test]
+async fn linux_sandbox_sensitive_prompt_stays_on_parent() {
+    // A prompt that would normally slam-dunk to cheap ("run docker build .")
+    // must stay on parent when linux_sandbox_sensitive_parent is true (the default).
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("done")]));
+    let mut config = config_with_routing();
+    config.routing.linux_sandbox_sensitive_parent = true;
+    config.routing.heuristic = true;
+    let agent = Agent::new(config, provider.clone());
+    let events = drain_until_terminal(
+        agent.start_turn("run docker build .".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "linux-sensitive prompt must not call judge"
+    );
+    assert_eq!(
+        &*requests[0].model, PARENT_MODEL,
+        "linux-sensitive prompt must stay on parent model"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnRouted { .. })),
+        "linux-sensitive parent bias must not emit cheap-route event"
+    );
+}
+
+#[tokio::test]
+async fn linux_sandbox_sensitive_guard_disabled_allows_cheap_route() {
+    // When linux_sandbox_sensitive_parent = false, a Docker prompt falls
+    // through to the heuristic which can still cheap-route it.
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("done")]));
+    let mut config = config_with_routing();
+    config.routing.linux_sandbox_sensitive_parent = false;
+    config.routing.heuristic = true;
+    config.routing.llm_judge = false;
+    let agent = Agent::new(config, provider.clone());
+    let _events = drain_until_terminal(
+        agent.start_turn("run docker build .".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    // With the guard off, "run" slam-dunks to cheap
+    assert_eq!(
+        &*requests[0].model, CHEAP_MODEL,
+        "disabled linux guard must allow heuristic cheap route for 'run' verb"
+    );
+}
+
+#[tokio::test]
+async fn explicit_cheap_override_beats_linux_sandbox_guard() {
+    // An explicit `/cheap` flag must win even over the linux sandbox guard.
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("done")]));
+    let mut config = config_with_routing();
+    config.routing.linux_sandbox_sensitive_parent = true;
+    config.routing.heuristic = true;
+    let agent = Agent::new(config, provider.clone());
+    agent.request_routing_force_cheap();
+    let _events = drain_until_terminal(
+        agent.start_turn("run docker build .".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        &*requests[0].model, CHEAP_MODEL,
+        "/cheap override must beat the linux sandbox guard"
+    );
+}

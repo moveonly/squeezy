@@ -24,9 +24,13 @@ pub enum ShellPreClassification {
     AutoAllow { reason: &'static str },
     /// At least one segment is a destructive verb, a dangerous interpreter
     /// (`python -c`, `node -e`, `eval`, `sudo`, …), or references a
-    /// sensitive path. The LLM reviewer cannot be trusted to override this
-    /// structural denial.
-    AutoDeny { reason: String },
+    /// sensitive path. The runtime uses this classification to *raise
+    /// permissive verdicts to an Ask floor* so the command cannot run
+    /// silently; an existing Ask or Deny verdict is left unchanged.
+    /// The LLM reviewer may still run after this classification and can
+    /// override the resulting Ask, which keeps false-positive cases
+    /// recoverable by approval rather than causing unrecoverable denial.
+    RequiresApproval { reason: String },
     /// Ambiguous shape; fall through to the AI reviewer (or to the user
     /// prompt when the reviewer is disabled).
     AskAi,
@@ -43,7 +47,7 @@ pub fn pre_classify_shell(
     if let Some(pattern) =
         shell_command_references_sensitive_path(trimmed, &shell_sandbox.sensitive_path_patterns)
     {
-        return ShellPreClassification::AutoDeny {
+        return ShellPreClassification::RequiresApproval {
             reason: format!("references sensitive path pattern {pattern:?}"),
         };
     }
@@ -54,10 +58,10 @@ pub fn pre_classify_shell(
     let segments = expand_wrapper_segments(raw_segments);
     for segment in &segments {
         if let Some(reason) = destructive_shell_segment_reason(segment) {
-            return ShellPreClassification::AutoDeny { reason };
+            return ShellPreClassification::RequiresApproval { reason };
         }
         if let Some(interpreter) = dangerous_interpreter(segment) {
-            return ShellPreClassification::AutoDeny {
+            return ShellPreClassification::RequiresApproval {
                 reason: format!("dangerous interpreter {interpreter:?}"),
             };
         }

@@ -1,4 +1,4 @@
-//! Affected-set computation for incremental refresh (Item 3).
+//! Affected-set computation for incremental refresh.
 //!
 //! Today's `refresh_now` rebuilds every semantic edge after any change.
 //! With the per-file reverse-import index [`crate::SemanticGraph::importers_by_file`]
@@ -8,9 +8,10 @@
 //! edges from a "propagating" change (one that altered the file's
 //! [`crate::cross_file::ExportTable`] or removed the file).
 //!
-//! This module hosts the pure computation. Wiring it through
-//! `refresh_now` so the resolver only re-runs over the affected set
-//! lands in Item 3 PR-3 — the read here has no consumer yet.
+//! [`compute_affected`] is also consumed by [`crate::SemanticGraph::compute_impact`]
+//! to drive the first-class impact API. Wiring it into `refresh_now` so
+//! the resolver only re-runs over the affected set (replacing the current
+//! full rebuild) is the next planned optimisation.
 
 use std::collections::{HashMap, HashSet};
 

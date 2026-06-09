@@ -99,17 +99,17 @@ pub(crate) fn plan_edit_allowed_in_workspace(
     mode == SessionMode::Plan && latest_plan_path(workspace_root, session_id).is_some()
 }
 
-/// Exact-match check used by the runtime permission gate to grant Plan
-/// mode the right to edit *the* active plan file but nothing else.
-/// Both paths are canonicalised so `..` traversal and symlink trickery
-/// cannot smuggle a different file past the check. Returns `false` on
-/// any canonicalisation failure (e.g. the target does not exist on disk
-/// yet) — the safe default in a deny-by-default permission gate.
-pub(crate) fn is_active_plan_path(target: &Path, active: &Path) -> bool {
+/// Pre-canonicalize the active plan path so the result can be stored and
+/// reused across multiple checks in the same request. Returns `None`
+/// when `canonicalize` fails (the file was removed mid-turn).
+pub(crate) fn canonicalize_active_plan_path(active: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(active).ok()
+}
+
+/// Exact-match active-plan check that accepts a pre-canonicalized active
+/// plan path, avoiding a redundant `canonicalize` call on the active side.
+pub(crate) fn is_active_plan_path_with_canon(target: &Path, active_canon: &Path) -> bool {
     let Ok(target_canon) = std::fs::canonicalize(target) else {
-        return false;
-    };
-    let Ok(active_canon) = std::fs::canonicalize(active) else {
         return false;
     };
     target_canon == active_canon

@@ -412,3 +412,46 @@ fn repo_scope_writes_mode_0600() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+#[cfg(unix)]
+#[test]
+fn write_settings_atomic_does_not_panic_on_loose_parent_permissions() {
+    // Verify that write_settings_atomic succeeds (no panic, no error) even
+    // when the parent directory has loose permissions. warn_if_parent_writable
+    // emits a tracing::warn! but must not block the write.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_path("loose-parent");
+    fs::create_dir_all(&dir).unwrap();
+    // Set group-writable (0o775) to trigger the warning path.
+    let mut perms = fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o775);
+    fs::set_permissions(&dir, perms).unwrap();
+
+    let target = dir.join("settings.toml");
+    let result = write_settings_atomic(&target, b"[model]\n");
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        result.is_ok(),
+        "write_settings_atomic should succeed even with loose parent dir: {result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_settings_atomic_succeeds_with_private_parent() {
+    // Complement to the loose-parent test: 0o700 parent must also work.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_path("private-parent");
+    fs::create_dir_all(&dir).unwrap();
+    let mut perms = fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o700);
+    fs::set_permissions(&dir, perms).unwrap();
+
+    let target = dir.join("settings.toml");
+    let result = write_settings_atomic(&target, b"[model]\n");
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        result.is_ok(),
+        "write_settings_atomic should succeed with 0o700 parent: {result:?}"
+    );
+}

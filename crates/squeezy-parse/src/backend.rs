@@ -11,9 +11,6 @@ pub trait LanguageBackend: Sync {
     fn tree_sitter_language(&self, kind: LanguageKind) -> Option<tree_sitter::Language>;
     fn extract(&self, file: FileRecord, source: &str, tree: &Tree) -> ParsedFile;
     fn file_extensions(&self) -> &'static [&'static str];
-    fn filename_hints(&self) -> &'static [&'static str] {
-        &[]
-    }
 
     fn parser(&self, kind: LanguageKind) -> Result<Parser> {
         parser_for_language_kind(kind)

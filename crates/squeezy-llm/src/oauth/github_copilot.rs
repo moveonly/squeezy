@@ -229,7 +229,35 @@ pub fn default_auth_path() -> Option<PathBuf> {
 /// hard error on every other parse / I/O failure so the caller can
 /// distinguish "never logged in" from "logged in but stored file is
 /// corrupt".
+///
+/// On Unix, refuses to read files with group or world read permission.
+/// GitHub Copilot persists a long-lived GitHub OAuth token alongside
+/// the short-lived Copilot token, so a permissive token file is
+/// especially high-impact.
 pub fn read_tokens(path: &Path) -> Result<Option<PersistedGitHubCopilotTokens>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(meta) => {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    return Err(SqueezyError::ProviderNotConfigured(format!(
+                        "github-copilot auth file {} has permissions {mode:03o}; \
+                         refusing to read (chmod 600 to enable)",
+                        path.display()
+                    )));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(SqueezyError::ProviderNotConfigured(format!(
+                    "could not check permissions of {}: {err}",
+                    path.display()
+                )));
+            }
+        }
+    }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -299,6 +327,19 @@ pub fn write_tokens(path: &Path, tokens: &PersistedGitHubCopilotTokens) -> Resul
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "GitHub Copilot OAuth token saved without Windows ACL hardening; \
+                 the file's access permissions depend on your profile directory's default ACLs. \
+                 Restrict it manually if your profile directory is shared, synced, or \
+                 enterprise-managed."
+            );
+        }
     }
     Ok(())
 }

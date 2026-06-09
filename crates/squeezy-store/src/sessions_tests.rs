@@ -60,6 +60,127 @@ fn session_store_lists_filters_and_exports_sessions() {
 }
 
 #[test]
+fn session_store_indexes_metadata_for_later_lists() {
+    let root = temp_root("session-index-list");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+
+    let first = store.list(&SessionQuery::default()).expect("first list");
+    assert_eq!(first.len(), 1);
+
+    let diagnostics = store.session_index_diagnostics();
+    assert!(
+        diagnostics.exists,
+        "list should create {}",
+        SESSION_INDEX_FILE_NAME
+    );
+    assert_eq!(diagnostics.indexed_sessions, 1);
+    assert_eq!(
+        diagnostics.schema_version,
+        Some(SESSION_INDEX_SCHEMA_VERSION)
+    );
+
+    handle
+        .update_metadata_and_index(|metadata| {
+            metadata.branch = Some("category10".to_string());
+            metadata.labels = vec!["storage".to_string()];
+        })
+        .expect("update metadata");
+    let filtered = store
+        .list(&SessionQuery {
+            branch: Some("category10".to_string()),
+            query: Some("storage".to_string()),
+            ..SessionQuery::default()
+        })
+        .expect("filtered index list");
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].session_id, handle.session_id());
+}
+
+#[test]
+fn session_store_rebuilds_partial_metadata_index_without_hiding_legacy_sessions() {
+    let root = temp_root("session-index-legacy-rebuild");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let legacy = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start legacy session");
+    fs::remove_file(store.session_index_path()).expect("remove index to simulate pre-index disk");
+
+    let current = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start indexed session");
+    let sessions = store.list(&SessionQuery::default()).expect("list sessions");
+    let ids = sessions
+        .iter()
+        .map(|session| session.session_id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(ids.contains(legacy.session_id()));
+    assert!(ids.contains(current.session_id()));
+    assert_eq!(store.session_index_diagnostics().indexed_sessions, 2);
+}
+
+#[test]
+fn session_store_index_tracks_archive_and_purge() {
+    let root = temp_root("session-index-archive");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let session_id = handle.session_id().to_string();
+    store.list(&SessionQuery::default()).expect("prime index");
+
+    store.archive_session(&session_id).expect("archive session");
+    assert!(
+        store
+            .list(&SessionQuery::default())
+            .expect("default list")
+            .is_empty(),
+        "archived sessions should remain hidden in indexed default list"
+    );
+    let archived = store
+        .list(&SessionQuery {
+            include_archived: true,
+            status: Some(SessionStatus::Archived),
+            ..SessionQuery::default()
+        })
+        .expect("archived list");
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].session_id, session_id);
+
+    let report = store
+        .cleanup_with(std::slice::from_ref(&session_id), None, CleanupMode::Purge)
+        .expect("purge archived session");
+    assert_eq!(report.removed, vec![session_id]);
+    assert_eq!(store.session_index_diagnostics().indexed_sessions, 0);
+}
+
+#[test]
 fn fork_creates_child_with_parent_id() {
     let root = temp_root("fork-creates-child");
     let config = AppConfig {
@@ -268,6 +389,9 @@ fn replay_tape_round_trips_and_exports() {
         ))
         .expect("append completion");
 
+    // Replay events now go through the writer thread; flush before reading.
+    handle.flush_events().expect("flush replay");
+
     let tape = store.replay_tape(handle.session_id()).expect("read replay");
     assert_eq!(tape.schema_version, SESSION_REPLAY_SCHEMA_VERSION);
     assert_eq!(tape.session_id, handle.session_id());
@@ -310,6 +434,9 @@ fn open_session_seeds_replay_sequence_from_existing_jsonl() {
         .expect("append start");
 
     let session_id = handle.session_id().to_string();
+    // Flush the first handle so its replay events are on disk before the
+    // second open reads the count.
+    handle.flush_events().expect("flush initial replay");
     let reopened = store.open_session(session_id.clone());
     reopened
         .append_replay_event(SessionReplayEvent::new(
@@ -318,6 +445,8 @@ fn open_session_seeds_replay_sequence_from_existing_jsonl() {
             json!({"response_id": "resp_1", "cost": CostSnapshot::default()}),
         ))
         .expect("append completion after open");
+    // Flush the reopened handle before reading back.
+    reopened.flush_events().expect("flush reopened replay");
 
     let tape = store.replay_tape(&session_id).expect("read replay");
     let sequences: Vec<u64> = tape.events.iter().map(|event| event.sequence).collect();
@@ -369,6 +498,7 @@ fn bug_report_redacts_replay_tape() {
             json!({"text": "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456"}),
         ))
         .expect("append replay");
+    handle.flush_events().expect("flush replay");
 
     let bundle = store
         .build_bug_report(
@@ -1149,6 +1279,75 @@ fn token_calibration_round_trips_through_metadata_and_global_file() {
     drop(handle);
     let record = store.show(&session_id).expect("show session");
     assert_eq!(record.metadata.token_calibration, calibration);
+}
+
+#[test]
+fn load_global_calibration_with_source_hint_absent_file_returns_none_hint() {
+    let root = temp_root("calibration-source-absent");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let (cal, hint) = store.load_global_calibration_with_source_hint();
+    assert!(
+        cal.providers.is_empty(),
+        "absent file must return default calibration"
+    );
+    assert_eq!(hint, None, "absent file must return hint=None");
+}
+
+#[test]
+fn load_global_calibration_with_source_hint_valid_file_returns_some_true() {
+    let root = temp_root("calibration-source-valid");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let mut calibration = squeezy_llm::TokenCalibration::default();
+    calibration.record_sample("openai", 4500, 1000);
+    store
+        .save_global_calibration(&calibration)
+        .expect("save calibration");
+    let (cal, hint) = store.load_global_calibration_with_source_hint();
+    assert_eq!(
+        cal, calibration,
+        "valid file must return the saved calibration"
+    );
+    assert_eq!(hint, Some(true), "valid file must return hint=Some(true)");
+}
+
+#[test]
+fn load_global_calibration_with_source_hint_corrupt_file_returns_some_false() {
+    let root = temp_root("calibration-source-corrupt");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    // The calibration file lives under the session root, not workspace_root.
+    // Ensure the directory exists, then write invalid JSON directly.
+    let cal_path = store.root().join("calibration.json");
+    fs::create_dir_all(store.root()).expect("create session root");
+    fs::write(&cal_path, b"not valid json {{{").expect("write corrupt calibration");
+    let (cal, hint) = store.load_global_calibration_with_source_hint();
+    assert!(
+        cal.providers.is_empty(),
+        "corrupt file must fall back to default calibration"
+    );
+    assert_eq!(
+        hint,
+        Some(false),
+        "corrupt file must return hint=Some(false)"
+    );
+}
+
+#[test]
+fn calibration_load_error_kind_does_not_echo_error_payload() {
+    let error =
+        SqueezyError::Tool("session store JSON error: OPENROUTER_API_KEY=secret".to_string());
+    assert_eq!(calibration_load_error_kind(&error), "malformed JSON");
 }
 
 #[test]
@@ -2589,6 +2788,7 @@ fn bundle_rollout_trace_emits_replay_when_no_events() {
             json!({"response_id": "resp_1"}),
         ))
         .expect("append model completed");
+    handle.flush_events().expect("flush replay");
 
     let bundle = store
         .bundle_rollout_trace(handle.session_id())
@@ -2744,17 +2944,21 @@ fn hash_payload(payload: &serde_json::Value) -> String {
         .collect()
 }
 
-// `HOME` is process-global; the memory tests below mutate it to point at a
-// temp dir so the user's real `~/.squeezy/memory.md` is never touched. The
-// lock keeps parallel test runners from racing on the env mutation.
-static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn with_home<R>(home: &Path, body: impl FnOnce() -> R) -> R {
-    let _guard = HOME_LOCK.lock().expect("HOME lock");
+    with_home_and_xdg(home, None, body)
+}
+
+fn with_home_and_xdg<R>(home: &Path, xdg_state_home: Option<&Path>, body: impl FnOnce() -> R) -> R {
+    let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock");
     let previous = std::env::var_os("HOME");
-    // SAFETY: the lock above serialises HOME mutations across the suite.
+    let previous_xdg = std::env::var_os("XDG_STATE_HOME");
+    // SAFETY: the lock above serialises HOME/XDG_STATE_HOME mutations across the suite.
     unsafe {
         std::env::set_var("HOME", home);
+        match xdg_state_home {
+            Some(path) => std::env::set_var("XDG_STATE_HOME", path),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
     }
     let result = body();
     unsafe {
@@ -2762,8 +2966,27 @@ fn with_home<R>(home: &Path, body: impl FnOnce() -> R) -> R {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
+        match previous_xdg {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
     }
     result
+}
+
+fn global_index_entry_for_test(id: &str, started_at_ms: u64) -> GlobalSessionIndexEntry {
+    GlobalSessionIndexEntry {
+        session_id: id.to_string(),
+        cwd: format!("/Users/dev/projects/{id}"),
+        workspace_root: format!("/Users/dev/projects/{id}"),
+        repo_root: None,
+        title: Some(id.to_string()),
+        display_name: None,
+        started_at_ms,
+        last_event_at_ms: started_at_ms,
+        turn_count: 1,
+        resume_available: true,
+    }
 }
 
 #[test]
@@ -2889,28 +3112,99 @@ fn recall_returns_none_when_max_bytes_zero_or_missing() {
     });
 }
 
+#[cfg(not(windows))]
 #[test]
 fn memory_path_is_none_when_home_unset() {
-    let _guard = HOME_LOCK.lock().expect("HOME lock");
-    let previous = std::env::var_os("HOME");
+    let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock");
+    let previous_home = std::env::var_os("HOME");
+    let previous_userprofile = std::env::var_os("USERPROFILE");
     unsafe {
         std::env::remove_var("HOME");
+        std::env::remove_var("USERPROFILE");
     }
     let path = SessionStore::memory_path();
     let recall = SessionStore::recall(8_192);
     let remember = SessionStore::remember("unused");
     unsafe {
-        match previous {
+        match previous_home {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
+        match previous_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
     }
-    assert!(path.is_none(), "HOME unset means no memory path");
-    assert!(recall.is_none(), "HOME unset means no recall body");
+    assert!(path.is_none(), "no home variables means no memory path");
+    assert!(recall.is_none(), "no home variables means no recall body");
     assert!(
         remember.is_err(),
-        "remember fails loudly when HOME is unset"
+        "remember fails loudly when no home directory is available"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn memory_path_uses_windows_profile_fallback_when_home_unset() {
+    let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock");
+    let home_previous = std::env::var_os("HOME");
+    let appdata_previous = std::env::var_os("APPDATA");
+    let profile_previous = std::env::var_os("USERPROFILE");
+    let appdata = temp_root("windows-appdata-memory");
+    unsafe {
+        std::env::remove_var("HOME");
+        std::env::set_var("APPDATA", &appdata);
+        std::env::remove_var("USERPROFILE");
+    }
+    let path = SessionStore::memory_path();
+    unsafe {
+        match home_previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match appdata_previous {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        match profile_previous {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+    assert_eq!(path, Some(appdata.join("Squeezy").join("memory.md")));
+    let _ = fs::remove_dir_all(&appdata);
+}
+
+#[cfg(windows)]
+#[test]
+fn memory_path_uses_windows_userprofile_fallback_when_home_and_appdata_unset() {
+    let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock");
+    let home_previous = std::env::var_os("HOME");
+    let appdata_previous = std::env::var_os("APPDATA");
+    let profile_previous = std::env::var_os("USERPROFILE");
+    let profile = temp_root("windows-userprofile-memory");
+    unsafe {
+        std::env::remove_var("HOME");
+        std::env::remove_var("APPDATA");
+        std::env::set_var("USERPROFILE", &profile);
+    }
+    let path = SessionStore::memory_path();
+    unsafe {
+        match home_previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match appdata_previous {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        match profile_previous {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+    assert_eq!(path, Some(profile.join(".squeezy").join("memory.md")));
+    let _ = fs::remove_dir_all(&profile);
 }
 
 fn raw_event(
@@ -3616,8 +3910,9 @@ fn write_json_is_atomic_no_stale_tmp_and_preserves_original() {
 
     // A pre-existing stale temp sibling (e.g. from a crashed prior write)
     // does not corrupt or block the next write: the good target survives
-    // and is replaced atomically.
-    let stale_tmp = root.join(format!(".metadata.json.{}.tmp", std::process::id()));
+    // and is replaced atomically. Use a high seq value to avoid colliding
+    // with the live WRITE_UNIQUE_COUNTER in this process.
+    let stale_tmp = root.join(format!(".metadata.json.{}.999999.tmp", std::process::id()));
     fs::write(&stale_tmp, b"{ this is not valid json").expect("seed stale tmp");
     write_json(&path, &json!({ "k": "third" })).expect("rewrite over stale tmp");
     let value: serde_json::Value =
@@ -3658,7 +3953,7 @@ fn global_index_caps_to_most_recent_and_compacts_oversized_file() {
         );
 
         // Invariants asserted rather than exact ids: other suite tests create
-        // sessions without taking `HOME_LOCK`, so a concurrent real append can
+        // sessions without taking `TEST_ENV_LOCK`, so a concurrent real append can
         // land in this temp index. The cap, compaction, and ordering hold
         // regardless of such interlopers.
         let listed = SessionStore::list_global_index();
@@ -3743,6 +4038,150 @@ fn global_index_cache_invalidates_when_append_changes_file() {
         assert!(
             second_pos < first_pos,
             "local entries should preserve newest-first order after cache invalidation: {listed:?}"
+        );
+    });
+}
+
+#[test]
+fn paths_same_exact_match() {
+    assert!(paths_same("/home/user/repo", "/home/user/repo"));
+    assert!(paths_same("C:\\Users\\dev\\repo", "C:\\Users\\dev\\repo"));
+}
+
+#[test]
+fn paths_same_trailing_separator() {
+    assert!(paths_same("/home/user/repo", "/home/user/repo/"));
+    assert!(paths_same("/home/user/repo/", "/home/user/repo"));
+}
+
+#[test]
+fn paths_same_different_paths() {
+    assert!(!paths_same("/home/user/repo", "/home/user/other"));
+    assert!(!paths_same("/a/b", "/a/c"));
+}
+
+#[test]
+fn paths_same_empty_strings() {
+    assert!(paths_same("", ""));
+    assert!(!paths_same("", "/some/path"));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn paths_same_windows_drive_case() {
+    // Drive-letter case variants should be treated as equal on Windows.
+    assert!(paths_same("C:\\Users\\dev\\repo", "c:\\users\\dev\\repo"));
+    assert!(paths_same("C:\\Repo", "c:\\repo"));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn paths_same_windows_slash_variants() {
+    // Forward and back slashes are interchangeable on Windows.
+    assert!(paths_same("C:\\Users\\dev", "C:/Users/dev"));
+}
+
+#[test]
+fn global_index_prefers_absolute_xdg_and_merges_legacy_home_index() {
+    let home = temp_root("global-index-xdg-home");
+    let xdg = temp_root("global-index-xdg-state");
+    with_home_and_xdg(&home, Some(&xdg), || {
+        let active = SessionStore::global_index_path().expect("XDG path");
+        assert_eq!(
+            active,
+            xdg.join("squeezy").join("sessions").join("index.jsonl")
+        );
+
+        let legacy_path = SessionStore::legacy_global_index_path().expect("legacy path");
+        fs::create_dir_all(legacy_path.parent().expect("legacy parent")).expect("mkdir legacy");
+        let legacy = global_index_entry_for_test("legacy-session", 1);
+        fs::write(
+            &legacy_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&legacy).expect("serialize legacy")
+            ),
+        )
+        .expect("write legacy index");
+
+        let xdg_entry = global_index_entry_for_test("xdg-session", 2);
+        SessionStore::append_global_index_entry(&xdg_entry);
+
+        let listed = SessionStore::list_global_index();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["xdg-session", "legacy-session"],
+            "XDG and legacy entries should both be visible newest-first"
+        );
+        assert!(active.exists(), "new appends should land in the XDG index");
+    });
+}
+
+#[test]
+fn global_index_ignores_relative_xdg_state_home() {
+    let home = temp_root("global-index-relative-xdg");
+    let relative_xdg = PathBuf::from("relative-state");
+    with_home_and_xdg(&home, Some(&relative_xdg), || {
+        let active = SessionStore::global_index_path().expect("fallback path");
+        let legacy = SessionStore::legacy_global_index_path().expect("legacy path");
+        assert_eq!(
+            active, legacy,
+            "relative XDG_STATE_HOME values are invalid and must not redirect state"
+        );
+
+        let entry = global_index_entry_for_test("home-session", 1);
+        SessionStore::append_global_index_entry(&entry);
+        assert!(legacy.exists(), "append should use HOME fallback");
+    });
+}
+
+#[test]
+fn rewrite_global_index_uses_pid_temp_name_not_fixed_suffix() {
+    // Guard: the temp file used by rewrite_global_index must include the
+    // process id so concurrent compactors cannot clobber each other's
+    // in-flight file (the earlier `jsonl.tmp` fixed-name bug).
+    let home = temp_root("rewrite-global-index-pid-temp");
+    with_home(&home, || {
+        let Some(path) = SessionStore::global_index_path() else {
+            panic!("HOME not set");
+        };
+        let forbidden_tmp = path.with_extension("jsonl.tmp");
+        // Write a dummy entry so the index is non-empty and compaction fires.
+        let entry = GlobalSessionIndexEntry {
+            session_id: "session-x".to_string(),
+            cwd: "/tmp/x".to_string(),
+            workspace_root: "/tmp/x".to_string(),
+            repo_root: None,
+            title: None,
+            display_name: None,
+            started_at_ms: 1,
+            last_event_at_ms: 1,
+            turn_count: 1,
+            resume_available: false,
+        };
+        // Append enough duplicates to trigger compaction (exceeds the byte
+        // threshold after enough repeated rows).
+        for _ in 0..10_000 {
+            SessionStore::append_global_index_entry(&entry);
+        }
+        // Call list_global_index which triggers rewrite_global_index.
+        let entries = SessionStore::list_global_index();
+        // Positive assertion: compaction must have deduped the 10 000 identical
+        // appends down to 1 entry, confirming rewrite_global_index actually ran.
+        assert_eq!(
+            entries.len(),
+            1,
+            "compaction must deduplicate 10_000 appends of the same session to 1 entry"
+        );
+        // Negative assertion: the fixed-suffix temp file must NOT exist after
+        // compaction — if it does, the old broken code path is still in use.
+        assert!(
+            !forbidden_tmp.exists(),
+            "rewrite_global_index must not leave a fixed-suffix .jsonl.tmp temp file; \
+             it should use a pid-scoped name to prevent cross-process clobbering"
         );
     });
 }

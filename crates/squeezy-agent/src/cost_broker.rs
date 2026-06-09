@@ -385,6 +385,32 @@ impl CostBroker {
             .unwrap_or(PROJECTED_OUTPUT_TOKEN_FALLBACK)
     }
 
+    /// Fold out-of-band LLM spend (e.g. the AI reviewer) into the broker's
+    /// live session-cost total so cap checks and status-line snapshots within
+    /// the current turn reflect the spend immediately.
+    ///
+    /// Only advances `session_cost_usd_micros` (the authoritative cap-basis
+    /// total used by `session_cost_snapshot`, `session_cap_reached`, and
+    /// `projected_session_cap_overrun`). The token distribution and model
+    /// ledger are already correct because the reviewer path records directly
+    /// to `state.cost` and `state.metrics.model_ledger`. Calling this keeps
+    /// the cap-basis total in sync for the duration of the turn without
+    /// double-counting in the model ledger.
+    ///
+    /// Note: does not check the warning threshold. If out-of-band spend
+    /// pushes the session past `cost_warn_percent`, the `CostWarning` event
+    /// fires at the next `record_provider_cost` call (typically the next
+    /// main-turn round). This one-round lag is acceptable given the small
+    /// reviewer/classifier budgets.
+    ///
+    /// A `usd_micros` of zero is a no-op.
+    pub(crate) fn record_out_of_band_session_cost(&mut self, usd_micros: u64) {
+        if usd_micros == 0 {
+            return;
+        }
+        self.session_cost_usd_micros = self.session_cost_usd_micros.saturating_add(usd_micros);
+    }
+
     pub(crate) fn reserve_call(&mut self) -> Result<u64, (u64, String)> {
         self.metrics.tool_calls += 1;
         let tool_sequence = self.metrics.tool_calls;

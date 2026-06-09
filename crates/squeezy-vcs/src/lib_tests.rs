@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Write,
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -106,6 +107,80 @@ fn preview_patch_stream_supports_legacy_patches_array() {
 fn preview_patch_stream_rejects_non_json() {
     let outcome = preview_patch_stream("{not valid", |_| {});
     assert!(outcome.is_err());
+}
+
+#[test]
+fn restore_tempfile_creation_skips_existing_sibling_path() {
+    let root = temp_repo("restore_temp_collision");
+    let collision = root.join(".sample.txt.squeezy-restore-collision.tmp");
+    let next = root.join(".sample.txt.squeezy-restore-next.tmp");
+    fs::write(&collision, "user temp\n").expect("write collision");
+
+    let (tmp, mut file) =
+        create_sibling_tempfile_from_candidates([collision.clone(), next.clone()])
+            .expect("create restore tempfile");
+    file.write_all(b"restore\n").expect("write restore temp");
+    drop(file);
+
+    assert_eq!(tmp, next);
+    assert_eq!(
+        fs::read_to_string(&collision).expect("collision preserved"),
+        "user temp\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&next).expect("next created"),
+        "restore\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_symlink_creation_skips_existing_sibling_path() {
+    use std::{ffi::OsString, os::unix::fs::symlink};
+
+    let root = temp_repo("restore_symlink_temp_collision");
+    let collision = root.join(".link.txt.squeezy-restore-collision.tmp");
+    let next = root.join(".link.txt.squeezy-restore-next.tmp");
+    fs::write(&collision, "user temp\n").expect("write collision");
+
+    let tmp = create_sibling_symlink_from_candidates(
+        [collision.clone(), next.clone()],
+        OsString::from("target.txt"),
+    )
+    .expect("create restore symlink");
+
+    assert_eq!(tmp, next);
+    assert_eq!(
+        fs::read_to_string(&collision).expect("collision preserved"),
+        "user temp\n"
+    );
+    assert_eq!(
+        fs::read_link(&next).expect("next symlink target"),
+        PathBuf::from("target.txt")
+    );
+
+    let target = root.join("real-target.txt");
+    fs::write(&target, "real\n").expect("write real target");
+    let symlink_collision = root.join(".link.txt.squeezy-restore-symlink.tmp");
+    symlink(&target, &symlink_collision).expect("create symlink collision");
+    let err = create_sibling_symlink_from_candidates(
+        [symlink_collision.clone()],
+        OsString::from("replacement.txt"),
+    )
+    .expect_err("existing symlink candidate must not be removed");
+    assert!(format!("{err}").contains("exhausted checkpoint restore symlink candidates"));
+    assert_eq!(
+        fs::read_link(&symlink_collision).expect("symlink collision preserved"),
+        target
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("real-target.txt")).unwrap(),
+        "real\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -252,6 +327,86 @@ fn checkpoint_rollback_restores_modified_added_and_deleted_files() {
 }
 
 #[test]
+fn repeated_latest_rollback_skips_checkpoint_after_successful_undo() {
+    let root = temp_repo("checkpoint_repeated_undo");
+    fs::write(root.join("a.txt"), "A\n").expect("write a");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(root.join("a.txt"), "agent\n").expect("agent edit");
+    store
+        .create_checkpoint(
+            &before,
+            "write_file",
+            "call",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint");
+
+    let first = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("first rollback");
+    assert!(first.applied);
+    assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A\n");
+
+    let second = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("second rollback");
+    assert!(
+        second.skipped,
+        "second undo should find no unreverted checkpoint"
+    );
+    assert!(!second.applied);
+    assert!(second.conflicts.is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn checkpoint_restore_file_only_restores_selected_file() {
+    let root = temp_repo("checkpoint_restore_file");
+    fs::write(root.join("a.txt"), "A\n").expect("write a");
+    fs::write(root.join("b.txt"), "B\n").expect("write b");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(root.join("a.txt"), "agent-a\n").expect("modify a");
+    fs::write(root.join("b.txt"), "agent-b\n").expect("modify b");
+    let record = store
+        .create_checkpoint(
+            &before,
+            "write_file",
+            "call",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint");
+
+    let restored = store
+        .restore_checkpoint_file(&record.id, "a.txt", RollbackMode::Atomic)
+        .expect("restore file");
+    assert!(restored.applied);
+    assert_eq!(restored.restored_files, vec!["a.txt"]);
+    assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "A\n");
+    assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "agent-b\n");
+
+    let latest = store
+        .rollback(RollbackTarget::Latest, RollbackMode::BestEffort)
+        .expect("latest rollback still available");
+    assert!(
+        latest.checkpoint_ids.contains(&record.id),
+        "per-file restore must not consume the checkpoint for latest undo"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn checkpoint_tracking_skips_ignored_large_files_without_failing() {
     let root = temp_repo("checkpoint_ignored_large_files");
     fs::write(root.join(".gitignore"), "target\n").expect("write gitignore");
@@ -370,9 +525,137 @@ fn checkpoint_rollback_reports_conflicts_without_overwriting_user_changes() {
         .expect("rollback latest");
 
     assert_eq!(rollback.conflicts.len(), 1);
+    assert_eq!(
+        rollback.conflicts[0].reason_code,
+        Some(RollbackConflictReason::WorktreeChanged)
+    );
+    assert_eq!(
+        rollback.conflicts[0].expected_hash_basis.as_deref(),
+        Some("checkpoint worktree byte hash")
+    );
+    assert_eq!(
+        rollback.conflicts[0].current_hash_basis.as_deref(),
+        Some("current worktree byte hash")
+    );
     assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "user\n");
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn checkpoint_rollback_restores_raw_crlf_worktree_bytes_despite_gitattributes() {
+    let root = temp_repo("checkpoint_crlf_gitattributes");
+    fs::write(root.join(".gitattributes"), "*.txt text eol=lf\n").expect("write attributes");
+    fs::write(root.join("a.txt"), b"before\r\n").expect("write crlf before");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(root.join("a.txt"), b"agent\r\n").expect("agent edit crlf");
+    let record = store
+        .create_checkpoint(
+            &before,
+            "write_file",
+            "call",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint");
+
+    let file = &record.files[0];
+    assert_ne!(
+        file.after_sha256, file.after_worktree_sha256,
+        "Git blob hash should be normalized while the worktree hash keeps CRLF bytes"
+    );
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("rollback latest");
+
+    assert!(rollback.applied);
+    assert!(rollback.conflicts.is_empty());
+    assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"before\r\n");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_capture_skips_symlinked_workspace_entries() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("checkpoint_skip_symlinks");
+    let outside = temp_repo("checkpoint_skip_symlinks_outside");
+    fs::write(root.join("real.txt"), "real\n").expect("write real file");
+    fs::write(outside.join("outside.txt"), "outside\n").expect("write outside file");
+    fs::create_dir(outside.join("dir")).expect("create outside dir");
+    fs::write(outside.join("dir").join("nested.txt"), "nested\n").expect("write nested file");
+    symlink(outside.join("outside.txt"), root.join("linked.txt")).expect("symlink file");
+    symlink(outside.join("dir"), root.join("linked-dir")).expect("symlink dir");
+
+    let mut entries = Vec::new();
+    collect_workspace_file_entries(&root, &root, &mut entries).expect("collect workspace files");
+    let paths = entries
+        .iter()
+        .map(|entry| entry.rel.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(paths, vec!["real.txt"]);
+
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rollback_conflicts_on_symlink_replacement_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("checkpoint_rollback_symlink_replacement");
+    let outside = temp_repo("checkpoint_rollback_symlink_outside");
+    fs::write(root.join("a.txt"), "before\n").expect("write a");
+    fs::write(outside.join("target.txt"), "agent\n").expect("write outside target");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(root.join("a.txt"), "agent\n").expect("agent edit");
+    store
+        .create_checkpoint(
+            &before,
+            "write_file",
+            "call",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    fs::remove_file(root.join("a.txt")).expect("remove a");
+    symlink(outside.join("target.txt"), root.join("a.txt")).expect("replace with symlink");
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::BestEffort)
+        .expect("rollback latest");
+
+    assert!(!rollback.applied);
+    assert_eq!(rollback.conflicts.len(), 1);
+    assert_eq!(
+        rollback.conflicts[0].reason_code,
+        Some(RollbackConflictReason::ReparsePoint)
+    );
+    assert_eq!(
+        fs::read_to_string(outside.join("target.txt")).unwrap(),
+        "agent\n"
+    );
+    assert_eq!(
+        fs::read_link(root.join("a.txt")).expect("a remains symlink"),
+        outside.join("target.txt")
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside);
 }
 
 #[test]
@@ -443,6 +726,13 @@ fn best_effort_rollback_restores_clean_files_and_skips_conflicts() {
     assert_eq!(rollback.conflicts.len(), 1);
     assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "user-a\n");
     assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "B\n");
+    let latest = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("latest remains selected after partial rollback");
+    assert!(
+        !latest.skipped,
+        "partial best-effort rollback must not consume the checkpoint"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -493,6 +783,91 @@ fn group_atomic_rollback_preflights_reverse_checkpoint_order() {
 }
 
 #[test]
+fn group_atomic_rollback_preflights_edit_then_rename_without_false_conflict() {
+    let root = temp_repo("checkpoint_group_edit_then_rename");
+    fs::write(root.join("alpha.txt"), "one").expect("write alpha");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+
+    let before = store.track_tree().expect("track one");
+    fs::write(root.join("alpha.txt"), "two").expect("edit alpha");
+    store
+        .create_checkpoint(
+            &before,
+            "write_file",
+            "call-1",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create edit checkpoint")
+        .expect("edit checkpoint");
+
+    let before = store.track_tree().expect("track two");
+    fs::rename(root.join("alpha.txt"), root.join("beta.txt")).expect("rename alpha to beta");
+    store
+        .create_checkpoint(
+            &before,
+            "apply_patch",
+            "call-2",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create rename checkpoint")
+        .expect("rename checkpoint");
+
+    let rollback = store
+        .rollback(RollbackTarget::Group("turn-1"), RollbackMode::Atomic)
+        .expect("rollback group");
+
+    assert!(
+        rollback.conflicts.is_empty(),
+        "edit-then-rename should not false-conflict: {:?}",
+        rollback.conflicts
+    );
+    assert!(rollback.applied);
+    assert!(!root.join("beta.txt").exists());
+    assert_eq!(fs::read_to_string(root.join("alpha.txt")).unwrap(), "one");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn best_effort_rename_rollback_preserves_recreated_source_path() {
+    let root = temp_repo("checkpoint_rename_source_conflict");
+    fs::write(root.join("alpha.txt"), "one").expect("write alpha");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+
+    let before = store.track_tree().expect("track one");
+    fs::rename(root.join("alpha.txt"), root.join("beta.txt")).expect("rename alpha to beta");
+    store
+        .create_checkpoint(
+            &before,
+            "apply_patch",
+            "call-1",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create rename checkpoint")
+        .expect("rename checkpoint");
+    fs::write(root.join("alpha.txt"), "user").expect("recreate alpha");
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::BestEffort)
+        .expect("rollback latest");
+
+    assert!(!rollback.applied);
+    assert_eq!(rollback.conflicts.len(), 1);
+    assert_eq!(rollback.conflicts[0].path, "alpha.txt");
+    assert_eq!(rollback.conflicts[0].expected_sha256, None);
+    assert_eq!(fs::read_to_string(root.join("alpha.txt")).unwrap(), "user");
+    assert_eq!(fs::read_to_string(root.join("beta.txt")).unwrap(), "one");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn large_files_are_reported_as_skipped_and_not_restored() {
     let root = temp_repo("checkpoint_large");
     let store = CheckpointStore::open(&root).expect("checkpoint store");
@@ -517,6 +892,45 @@ fn large_files_are_reported_as_skipped_and_not_restored() {
         .expect("rollback latest");
     assert!(!rollback.applied);
     assert_eq!(fs::read(root.join("huge.bin")).unwrap(), b"user");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn repeated_latest_rollback_skips_after_all_files_are_large_skipped() {
+    let root = temp_repo("checkpoint_large_consumed");
+    let store = CheckpointStore::open_with_options(
+        &root,
+        CheckpointStoreOptions {
+            max_file_bytes: 4,
+            cleanup_interval_secs: 0,
+            ..CheckpointStoreOptions::default()
+        },
+    )
+    .expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+    fs::write(root.join("big.txt"), "12345").expect("write over custom limit");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    assert!(record.files.is_empty(), "all files should be skipped");
+
+    // First rollback: nothing to restore, applied=false
+    let first = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("first rollback");
+    assert!(!first.applied);
+    assert!(first.conflicts.is_empty());
+
+    // Second rollback: checkpoint is now consumed, returns nothing-to-undo
+    let second = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("second rollback");
+    assert!(
+        second.skipped,
+        "second undo should find no unreverted checkpoint after all-skipped attempt"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -551,6 +965,389 @@ fn binary_files_restore_without_patch_text() {
         fs::read(root.join("image.bin")).unwrap(),
         [0, 159, 146, 150]
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rollback_restores_symlink_as_symlink_without_following_target() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_repo("checkpoint_symlink_restore");
+    fs::write(root.join("outside.txt"), "outside\n").expect("write outside");
+    fs::write(root.join("target.txt"), "target\n").expect("write target");
+    symlink("target.txt", root.join("link.txt")).expect("create symlink");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::remove_file(root.join("link.txt")).expect("remove symlink");
+    symlink("outside.txt", root.join("link.txt")).expect("retarget symlink");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    assert_eq!(
+        record.files[0].before_file_type,
+        Some(CheckpointFileType::Symlink)
+    );
+    assert_eq!(record.files[0].before_mode.as_deref(), Some("120000"));
+    assert_eq!(
+        record.files[0].before_symlink_target.as_deref(),
+        Some("target.txt")
+    );
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("rollback symlink");
+
+    assert!(rollback.applied);
+    assert_eq!(
+        fs::read_link(root.join("link.txt")).unwrap(),
+        PathBuf::from("target.txt")
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("outside.txt")).unwrap(),
+        "outside\n"
+    );
+    assert!(rollback.file_actions.iter().any(|action| {
+        action.path == "link.txt"
+            && action.action == RollbackFileActionKind::RestoreSymlink
+            && action.verified_after_rollback
+    }));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rollback_recreates_deleted_executable_with_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_repo("checkpoint_executable_mode");
+    let script = root.join("run.sh");
+    fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod script");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::remove_file(&script).expect("delete script");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    assert_eq!(record.files[0].before_mode.as_deref(), Some("100755"));
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("rollback executable");
+
+    assert!(rollback.applied);
+    assert_eq!(
+        fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert!(rollback.file_actions.iter().any(|action| {
+        action.path == "run.sh"
+            && action.action == RollbackFileActionKind::RestoreRegular
+            && action.mode.as_deref() == Some("100755")
+            && action.verified_after_rollback
+    }));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rollback_preserves_hardlinked_regular_files() {
+    let root = temp_repo("checkpoint_hardlink_restore");
+    let alpha = root.join("alpha.txt");
+    let beta = root.join("beta.txt");
+    fs::write(&alpha, "before\n").expect("write alpha");
+    fs::hard_link(&alpha, &beta).expect("hardlink beta");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(&alpha, "after\n").expect("write through hardlink");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    let expected_group = vec!["alpha.txt".to_string(), "beta.txt".to_string()];
+    assert!(
+        record
+            .files
+            .iter()
+            .any(|file| file.before_hardlink_paths.as_ref() == Some(&expected_group))
+    );
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("rollback hardlink");
+
+    assert!(rollback.applied);
+    assert!(rollback.conflicts.is_empty());
+    assert_eq!(fs::read_to_string(&alpha).unwrap(), "before\n");
+    assert_eq!(fs::read_to_string(&beta).unwrap(), "before\n");
+    assert!(same_inode(&alpha, &beta).expect("same inode"));
+    assert!(rollback.file_actions.iter().any(|action| {
+        action.action == RollbackFileActionKind::RestoreHardlink
+            && action.path == "beta.txt"
+            && action.verified_after_rollback
+    }));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+// Covers review N2: `rollback_paths` must surface every hardlink peer so
+// the tool-layer sandbox preflight sees every workspace path the
+// rollback can mutate.
+#[cfg(unix)]
+#[test]
+fn rollback_paths_includes_hardlink_peers() {
+    let root = temp_repo("checkpoint_hardlink_rollback_paths");
+    let alpha = root.join("alpha.txt");
+    let beta = root.join("beta.txt");
+    fs::write(&alpha, "before\n").expect("write alpha");
+    fs::hard_link(&alpha, &beta).expect("hardlink beta");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(&alpha, "after\n").expect("agent write alpha");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    assert!(
+        record
+            .files
+            .iter()
+            .any(|file| file.before_hardlink_paths.is_some()),
+        "checkpoint should record the hardlink group"
+    );
+
+    let paths = store
+        .rollback_paths(RollbackTarget::Latest)
+        .expect("rollback paths");
+    assert!(
+        paths.iter().any(|path| path == "alpha.txt"),
+        "alpha.txt should be in rollback paths: {:?}",
+        paths
+    );
+    assert!(
+        paths.iter().any(|path| path == "beta.txt"),
+        "hardlink peer beta.txt should also be surfaced for the sandbox preflight: {:?}",
+        paths
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+// Covers review N1: a best-effort rollback whose hardlink group has a
+// conflicted peer must not let the per-group restore loop overwrite that
+// peer's user-modified content.
+#[cfg(unix)]
+#[test]
+fn checkpoint_best_effort_hardlink_group_respects_per_peer_conflict() {
+    let root = temp_repo("checkpoint_hardlink_best_effort_conflict");
+    let alpha = root.join("alpha.txt");
+    let beta = root.join("beta.txt");
+    fs::write(&alpha, "before\n").expect("write alpha");
+    fs::hard_link(&alpha, &beta).expect("hardlink beta");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(&alpha, "after\n").expect("agent write alpha");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    assert!(
+        record
+            .files
+            .iter()
+            .any(|file| file.before_hardlink_paths.is_some()),
+        "checkpoint should record the hardlink group: {:?}",
+        record
+    );
+
+    fs::remove_file(&alpha).expect("user unlink alpha");
+    fs::write(&alpha, "user-a\n").expect("user rewrite alpha");
+    assert_eq!(fs::read_to_string(&alpha).unwrap(), "user-a\n");
+    assert_eq!(fs::read_to_string(&beta).unwrap(), "after\n");
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::BestEffort)
+        .expect("rollback hardlink best-effort");
+
+    assert!(
+        rollback.applied,
+        "best-effort rollback should still report applied"
+    );
+    assert!(
+        rollback
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.path == "alpha.txt"),
+        "alpha should be flagged as a conflict: {:?}",
+        rollback.conflicts
+    );
+    assert_eq!(
+        fs::read_to_string(&alpha).unwrap(),
+        "user-a\n",
+        "conflicted peer alpha must not be overwritten"
+    );
+    assert!(
+        !rollback
+            .file_actions
+            .iter()
+            .any(|action| action.path == "alpha.txt"),
+        "no rollback action should target alpha: {:?}",
+        rollback.file_actions
+    );
+    assert!(
+        !rollback
+            .file_actions
+            .iter()
+            .any(|action| action.action == RollbackFileActionKind::RestoreHardlink),
+        "the hardlink group must be skipped when any peer is conflicted: {:?}",
+        rollback.file_actions
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rollback_restores_chmod_only_change() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_repo("checkpoint_chmod_only");
+    let script = root.join("run.sh");
+    fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).expect("chmod before");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod after");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    assert_eq!(record.files[0].before_sha256, record.files[0].after_sha256);
+    assert_eq!(record.files[0].before_mode.as_deref(), Some("100644"));
+    assert_eq!(record.files[0].after_mode.as_deref(), Some("100755"));
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("rollback chmod");
+
+    assert!(rollback.applied);
+    assert_eq!(
+        fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rollback_conflicts_on_user_chmod_after_checkpoint() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_repo("checkpoint_chmod_conflict");
+    let script = root.join("run.sh");
+    fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).expect("chmod before");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod after");
+    store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o600)).expect("user chmod");
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("rollback chmod conflict");
+
+    assert!(!rollback.applied);
+    assert_eq!(rollback.conflicts.len(), 1);
+    assert!(
+        rollback.conflicts[0].reason.contains("file mode changed"),
+        "{:?}",
+        rollback.conflicts
+    );
+    assert_eq!(
+        fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+// Scoped to Linux rather than all of Unix because macOS APFS/HFS+ volumes
+// are case-insensitive by default and cannot hold both `Foo.rs` and `foo.rs`.
+#[cfg(target_os = "linux")]
+#[test]
+fn checkpoint_rollback_keeps_case_sensitive_paths_distinct() {
+    let root = temp_repo("checkpoint_case_sensitive");
+    fs::write(root.join("Foo.rs"), "upper\n").expect("write upper");
+    fs::write(root.join("foo.rs"), "lower\n").expect("write lower");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(root.join("Foo.rs"), "upper changed\n").expect("change upper");
+    fs::write(root.join("foo.rs"), "lower changed\n").expect("change lower");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    assert_eq!(
+        record
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Foo.rs", "foo.rs"]
+    );
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("rollback case paths");
+
+    assert!(rollback.applied);
+    assert_eq!(fs::read_to_string(root.join("Foo.rs")).unwrap(), "upper\n");
+    assert_eq!(fs::read_to_string(root.join("foo.rs")).unwrap(), "lower\n");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn checkpoint_rollback_handles_filename_with_newline() {
+    let root = temp_repo("checkpoint_newline_path");
+    let rel = "line\nbreak.txt";
+    fs::write(root.join(rel), "before\n").expect("write newline path");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::write(root.join(rel), "after\n").expect("modify newline path");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    assert_eq!(record.files[0].path, rel);
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::Atomic)
+        .expect("rollback newline path");
+
+    assert!(rollback.applied);
+    assert_eq!(fs::read_to_string(root.join(rel)).unwrap(), "before\n");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -774,6 +1571,130 @@ fn checkpoint_records_rename_as_single_renamed_entry() {
 }
 
 #[test]
+fn checkpoint_rollback_conflicts_when_rename_source_was_recreated() {
+    let root = temp_repo("checkpoint_rename_source_conflict");
+    fs::write(
+        root.join("alpha.txt"),
+        "alpha contents
+",
+    )
+    .expect("seed alpha");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::rename(root.join("alpha.txt"), root.join("beta.txt")).expect("rename");
+    store
+        .create_checkpoint(
+            &before,
+            "apply_patch",
+            "call",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint");
+    fs::write(
+        root.join("alpha.txt"),
+        "user recreated
+",
+    )
+    .expect("user recreated source");
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::BestEffort)
+        .expect("rollback");
+
+    assert!(!rollback.applied);
+    assert_eq!(rollback.conflicts.len(), 1);
+    assert_eq!(rollback.conflicts[0].path, "alpha.txt");
+    assert!(
+        rollback.conflicts[0]
+            .reason
+            .contains("rename source path changed"),
+        "{:?}",
+        rollback.conflicts
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("alpha.txt")).expect("alpha preserved"),
+        "user recreated
+"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("beta.txt")).expect("beta preserved"),
+        "alpha contents
+"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn rollback_paths_include_rename_source_and_destination() {
+    let root = temp_repo("checkpoint_rename_paths");
+    fs::write(
+        root.join("alpha.txt"),
+        "alpha contents
+",
+    )
+    .expect("seed alpha");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::rename(root.join("alpha.txt"), root.join("beta.txt")).expect("rename");
+    store
+        .create_checkpoint(
+            &before,
+            "apply_patch",
+            "call",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint");
+
+    let paths = store
+        .rollback_paths(RollbackTarget::Latest)
+        .expect("rollback paths");
+    assert_eq!(paths, vec!["alpha.txt".to_string(), "beta.txt".to_string()]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn custom_checkpoint_max_file_bytes_marks_smaller_files_as_skipped() {
+    let root = temp_repo("checkpoint_custom_large_limit");
+    let store = CheckpointStore::open_with_options(
+        &root,
+        CheckpointStoreOptions {
+            max_file_bytes: 4,
+            cleanup_interval_secs: 0,
+            ..CheckpointStoreOptions::default()
+        },
+    )
+    .expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+    fs::write(root.join("small.txt"), "12345").expect("write over custom limit");
+
+    let record = store
+        .create_checkpoint(
+            &before,
+            "write_file",
+            "call",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint");
+
+    assert!(record.files.is_empty());
+    assert_eq!(record.skipped_files[0].path, "small.txt");
+
+    let _ = fs::remove_dir_all(root);
+}
+#[test]
 fn shadow_repo_ignores_user_hooks() {
     let root = temp_repo("shadow_repo_hooks");
     init_repo(&root);
@@ -866,6 +1787,21 @@ fn shadow_repo_open_rejects_concurrent_process_lock() {
         message.contains("shadow-repo lock"),
         "expected lock-held error, got: {message}"
     );
+    // On Unix, the lock-file body is readable while the advisory lock is held,
+    // so we expect the pid/timestamp diagnostics written by the lock holder.
+    // On Windows, the lock holder's second open for writing the diagnostics
+    // body may fail due to the initial handle's file-sharing flags, so the
+    // implementation gracefully falls back to "holder details unavailable".
+    #[cfg(unix)]
+    assert!(
+        message.contains("holder pid=") && message.contains("locked_at_ms="),
+        "expected lock-held error to include Unix diagnostics, got: {message}"
+    );
+    #[cfg(windows)]
+    assert!(
+        message.contains("holder details unavailable"),
+        "expected Windows lock-held fallback message, got: {message}"
+    );
 
     drop(first);
     let second = CheckpointStore::open(&root).expect("re-open after lock released");
@@ -888,6 +1824,9 @@ fn shadow_repo_open_cleans_stale_orphan_dirs() {
     fs::write(stale_dir.join("payload"), b"old").expect("write orphan payload");
     let stale_lock = checkpoints_dir.join("crashed-process.lock");
     fs::write(&stale_lock, b"99999\n").expect("write stale lock");
+    let raw_blobs = checkpoints_dir.join("raw-blobs");
+    fs::create_dir_all(raw_blobs.join("aa")).expect("create raw blobs dir");
+    fs::write(raw_blobs.join("aa").join("payload"), b"raw").expect("write raw blob");
     let recent_dir = checkpoints_dir.join("recent-scratch");
     fs::create_dir_all(&recent_dir).expect("create recent orphan dir");
 
@@ -923,6 +1862,10 @@ fn shadow_repo_open_cleans_stale_orphan_dirs() {
     assert!(
         checkpoints_dir.join("git").exists(),
         "shadow `git/` directory must survive cleanup"
+    );
+    assert!(
+        raw_blobs.exists(),
+        "raw worktree byte blobs are checkpoint data and must survive cleanup"
     );
     drop(store);
 

@@ -75,6 +75,155 @@ fn helper() {}
 }
 
 #[test]
+fn parse_error_diagnostics_include_language_span_excerpt_and_partial_summary() {
+    let source = "fn broken( {\n    let value = ;\n}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/broken.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let diagnostic = parsed
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.partial_parse.is_some())
+        .expect("malformed Rust should emit a partial-parse diagnostic");
+    assert_eq!(diagnostic.language, Some(LanguageKind::Rust));
+    assert!(
+        diagnostic.message.contains("Rust parse has")
+            || diagnostic.message.contains("Rust parse is missing"),
+        "diagnostic should name the language and parse state: {diagnostic:?}"
+    );
+    assert!(diagnostic.span.is_some());
+    assert!(
+        diagnostic
+            .node_kind
+            .as_deref()
+            .is_some_and(|kind| !kind.is_empty()),
+        "diagnostic should include the smallest tree-sitter node kind"
+    );
+    assert!(
+        diagnostic
+            .excerpt
+            .as_deref()
+            .is_some_and(|excerpt| !excerpt.is_empty()),
+        "diagnostic should include a compact source excerpt"
+    );
+    let partial = diagnostic.partial_parse.as_ref().unwrap();
+    assert_eq!(partial.confidence, Confidence::Partial);
+    assert!(partial.partially_trusted);
+    assert!(partial.parse_error_count >= 1);
+}
+
+#[test]
+fn parse_error_diagnostics_are_capped_and_non_duplicating_per_span() {
+    // Build a Rust source with many independent malformed sites so the
+    // smallest-error walker has lots of leaf candidates. The helper caps its
+    // emission at `MAX_PARSE_DIAGNOSTICS_PER_FILE` and the per-language
+    // visitor owns missing-node reporting separately, so every emitted
+    // diagnostic should:
+    //   * stay within `MAX_PARSE_DIAGNOSTICS_PER_FILE` from the parse-error
+    //     helper (the visitor's missing-node path is capped under the same
+    //     constant via `ExtractContext::missing_node_diagnostics_emitted`), and
+    //   * remain unique across (span, message) so the file-level diagnostic
+    //     list never repeats the same finding at the same location.
+    let mut source = String::new();
+    for index in 0..(MAX_PARSE_DIAGNOSTICS_PER_FILE * 4) {
+        source.push_str(&format!("fn broken_{index}( {{\n    let v = ;\n}}\n"));
+    }
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/many_broken.rs", &source);
+    let parsed = parser
+        .parse_source(&record, source.clone())
+        .expect("parse should succeed for many-broken fixture");
+
+    let parse_error_diagnostics = parsed
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("tree-sitter parse error"))
+        .count();
+    assert!(
+        parse_error_diagnostics > 0,
+        "expected at least one parse-error diagnostic for the many-broken fixture: {parsed:?}"
+    );
+    assert!(
+        parse_error_diagnostics <= MAX_PARSE_DIAGNOSTICS_PER_FILE,
+        "parse-error diagnostics ({parse_error_diagnostics}) exceed cap of \
+         {MAX_PARSE_DIAGNOSTICS_PER_FILE}: {parsed:?}"
+    );
+
+    let missing_diagnostics = parsed
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("is missing"))
+        .count();
+    assert!(
+        missing_diagnostics <= MAX_PARSE_DIAGNOSTICS_PER_FILE,
+        "missing-node diagnostics ({missing_diagnostics}) exceed cap of \
+         {MAX_PARSE_DIAGNOSTICS_PER_FILE}: {parsed:?}"
+    );
+
+    let mut seen = std::collections::HashSet::new();
+    for diagnostic in &parsed.diagnostics {
+        let key = (diagnostic.span, diagnostic.message.clone());
+        assert!(
+            seen.insert(key),
+            "duplicate diagnostic span/message in many-broken fixture: {:?}",
+            parsed.diagnostics
+        );
+    }
+}
+
+#[test]
+fn parser_feature_coverage_report_groups_emitted_facts_by_language() {
+    let source = r#"
+use crate::service::Service;
+
+pub struct Runner;
+
+impl Runner {
+    pub fn run(&self, service: Service) {
+        service.execute();
+        helper();
+    }
+}
+
+fn helper() {}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let report = parser_feature_coverage_report(&[parsed]);
+    let rust = report
+        .languages
+        .iter()
+        .find(|coverage| coverage.language == LanguageKind::Rust)
+        .expect("Rust coverage missing");
+
+    assert_eq!(rust.files, 1);
+    assert_eq!(rust.declaration_kinds.get("struct"), Some(&1));
+    assert!(
+        rust.declaration_kinds.get("method").copied().unwrap_or(0) >= 1,
+        "method declarations should be counted: {rust:?}"
+    );
+    assert_eq!(rust.import_kinds.get("named"), Some(&1));
+    assert!(
+        rust.call_kinds.get("direct").copied().unwrap_or(0) >= 1,
+        "direct calls should be counted: {rust:?}"
+    );
+    assert!(
+        rust.reference_kinds.get("type").copied().unwrap_or(0) >= 1,
+        "type references should be counted: {rust:?}"
+    );
+    assert!(
+        rust.confidence_distribution
+            .get(Confidence::ExactSyntax.id())
+            .copied()
+            .unwrap_or(0)
+            >= 1,
+        "confidence distribution should include emitted exact-syntax facts: {rust:?}"
+    );
+}
+
+#[test]
 fn language_parser_initializes_parsers_on_demand() {
     let mut parser = LanguageParser::new().unwrap();
     assert!(parser.parsers.parsers.is_empty());
@@ -194,20 +343,14 @@ def test_runner():
             .iter()
             .any(|import| import.path == "Runner" && import.is_reexport)
     );
-    assert!(
-        parsed
-            .imports
-            .iter()
-            .any(|import| import.path == "Runner"
-                && import.alias.as_deref() == Some("RunnerAlias"))
-    );
-    assert!(
-        parsed
-            .imports
-            .iter()
-            .any(|import| import.path == "RunnerAlias"
-                && import.alias.as_deref() == Some("runner"))
-    );
+    assert!(parsed
+        .imports
+        .iter()
+        .any(|import| import.path == "Runner" && import.alias.as_deref() == Some("RunnerAlias")));
+    assert!(parsed
+        .imports
+        .iter()
+        .any(|import| import.path == "RunnerAlias" && import.alias.as_deref() == Some("runner")));
     assert!(
         parsed
             .calls
@@ -1130,17 +1273,7 @@ fn extract_python_module_exports_requires_word_boundary() {
     fn run_exports(source: &str) -> Vec<String> {
         let mut record_py = record("src/mod.py", source);
         record_py.language = LanguageKind::Python;
-        let mut ctx = ExtractContext {
-            file: record_py,
-            source,
-            symbols: Vec::new(),
-            imports: Vec::new(),
-            calls: Vec::new(),
-            references: Vec::new(),
-            body_hits: Vec::new(),
-            diagnostics: Vec::new(),
-            go_type_index: std::collections::HashMap::new(),
-        };
+        let mut ctx = ExtractContext::new(record_py, source);
         extract_python_module_exports(&mut ctx);
         ctx.imports
             .into_iter()
@@ -1598,6 +1731,247 @@ fn parser_treats_non_utf8_rust_files_as_unsupported() {
 
     assert!(parsed.unsupported.is_some());
     assert!(parsed.symbols.is_empty());
+}
+
+#[test]
+fn parse_record_utf16_le_returns_encoding_hint() {
+    let mut parser = LanguageParser::new().unwrap();
+    let mut record = record("src/lib.rs", "");
+    let bytes: &[u8] = b"\xFF\xFE\x66\x00\x6E\x00";
+    fs::write(&record.path, bytes).unwrap();
+    record.hash = ContentHash::new(stable_content_hash(bytes));
+    record.size_bytes = bytes.len() as u64;
+
+    let parsed = parser.parse_record(&record).unwrap();
+
+    assert!(parsed.unsupported.is_some());
+    let reason = &parsed.unsupported.unwrap().reason;
+    assert!(reason.contains("UTF-16LE"), "got: {reason:?}");
+}
+
+#[test]
+fn parse_record_utf16_be_returns_encoding_hint() {
+    let mut parser = LanguageParser::new().unwrap();
+    let mut record = record("src/lib.rs", "");
+    let bytes: &[u8] = b"\xFE\xFF\x00\x66\x00\x6E";
+    fs::write(&record.path, bytes).unwrap();
+    record.hash = ContentHash::new(stable_content_hash(bytes));
+    record.size_bytes = bytes.len() as u64;
+
+    let parsed = parser.parse_record(&record).unwrap();
+
+    assert!(parsed.unsupported.is_some());
+    let reason = &parsed.unsupported.unwrap().reason;
+    assert!(reason.contains("UTF-16BE"), "got: {reason:?}");
+}
+
+#[test]
+fn parse_source_strips_utf8_bom_and_adds_diagnostic() {
+    const BOM: &str = "\u{FEFF}";
+    let source_with_bom = format!("{BOM}fn hello() {{}}\n");
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", &source_with_bom);
+
+    let parsed = parser
+        .parse_source(&record, source_with_bom.clone())
+        .unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(parsed.symbols.iter().any(|s| s.name == "hello"));
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("bom:"))
+    );
+}
+
+#[test]
+fn parse_source_utf8_bom_cache_hit_retains_diagnostic() {
+    const BOM: &str = "\u{FEFF}";
+    let source_with_bom = format!("{BOM}fn hello() {{}}\n");
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", &source_with_bom);
+
+    parser
+        .parse_source(&record, source_with_bom.clone())
+        .unwrap();
+    let parsed = parser
+        .parse_source(&record, source_with_bom.clone())
+        .unwrap();
+
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("bom:"))
+    );
+}
+
+#[test]
+fn input_edit_crlf_multiline_points_match_reference() {
+    let old = "fn one() {\r\n    alpha();\r\n}\r\n";
+    let new = "fn one() {\r\n    beta();\r\n    gamma();\r\n}\r\n";
+    let edit = input_edit(old, new);
+
+    assert_eq!(
+        edit.start_position,
+        slow_point_for_byte(old, edit.start_byte)
+    );
+    assert_eq!(
+        edit.old_end_position,
+        slow_point_for_byte(old, edit.old_end_byte)
+    );
+    assert_eq!(
+        edit.new_end_position,
+        slow_point_for_byte(new, edit.new_end_byte)
+    );
+}
+
+#[test]
+fn parse_source_crlf_produces_stable_symbols_and_diagnostic() {
+    let source = "pub fn foo() {}\r\npub fn bar() {}\r\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(parsed.symbols.iter().any(|s| s.name == "foo"));
+    let bar = parsed.symbols.iter().find(|s| s.name == "bar").unwrap();
+    assert_eq!(bar.span.start.line, 1);
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("crlf:"))
+    );
+}
+
+#[test]
+fn incremental_parse_crlf_produces_changed_ranges_and_diagnostic() {
+    let first = "pub fn foo() {}\r\npub fn bar() {}\r\n";
+    let second = "pub fn foo() { let x = 1; }\r\npub fn bar() {}\r\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let mut record = record("src/lib.rs", first);
+
+    parser.parse_source(&record, first.to_string()).unwrap();
+    record.hash = ContentHash::new(stable_content_hash(second.as_bytes()));
+    let updated = parser.parse_source(&record, second.to_string()).unwrap();
+
+    assert!(!updated.changed_ranges.is_empty());
+    assert!(
+        updated
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("crlf:"))
+    );
+}
+
+#[test]
+fn parser_emits_crlf_and_bom_diagnostic_for_csharp_with_bom() {
+    let source = "\u{FEFF}class A {\r\n    public void M() {}\r\n}\r\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = csharp_record("src/Program.cs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("bom:"))
+    );
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("crlf:"))
+    );
+}
+
+#[test]
+fn parse_source_strips_utf8_bom_for_typescript() {
+    const BOM: &str = "\u{FEFF}";
+    let source_with_bom = format!("{BOM}const x: number = 1;\n");
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ts_record("src/app.ts", &source_with_bom);
+
+    let parsed = parser
+        .parse_source(&record, source_with_bom.clone())
+        .unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("bom:"))
+    );
+}
+
+#[test]
+fn parse_source_strips_utf8_bom_for_python() {
+    const BOM: &str = "\u{FEFF}";
+    let source_with_bom = format!("{BOM}def hello():\n    pass\n");
+    let mut parser = LanguageParser::new().unwrap();
+    let record = python_record("src/app.py", &source_with_bom);
+
+    let parsed = parser
+        .parse_source(&record, source_with_bom.clone())
+        .unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(parsed.symbols.iter().any(|s| s.name == "hello"));
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .any(|d| d.message.starts_with("bom:"))
+    );
+}
+
+#[test]
+fn parallel_parse_utf16_le_returns_encoding_hint() {
+    let mut records: Vec<FileRecord> = (0..7)
+        .map(|i| record(&format!("src/file{i}.rs"), "pub fn f() {}\n"))
+        .collect();
+    let mut utf16_record = record("src/utf16.rs", "");
+    let utf16_bytes: &[u8] = b"\xFF\xFE\x66\x00\x6E\x00";
+    fs::write(&utf16_record.path, utf16_bytes).unwrap();
+    utf16_record.hash = ContentHash::new(stable_content_hash(utf16_bytes));
+    utf16_record.size_bytes = utf16_bytes.len() as u64;
+    records.push(utf16_record);
+
+    let mut parser = LanguageParser::new().unwrap();
+    let (parsed, _summary) = parser.parse_records(&records).unwrap();
+
+    let utf16_result = parsed
+        .iter()
+        .find(|p| p.file.relative_path == "src/utf16.rs")
+        .unwrap();
+    assert!(utf16_result.unsupported.is_some());
+    let reason = &utf16_result.unsupported.as_ref().unwrap().reason;
+    assert!(reason.contains("UTF-16LE"), "got: {reason:?}");
+}
+
+#[test]
+fn parse_summary_tracks_crlf_and_bom_counts() {
+    let crlf_source = "fn a() {}\r\nfn b() {}\r\n";
+    let bom_source = "\u{FEFF}fn c() {}\n";
+    let plain_source = "fn d() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let crlf_record = record("src/crlf.rs", crlf_source);
+    let bom_record = record("src/bom.rs", bom_source);
+    let plain_record = record("src/plain.rs", plain_source);
+
+    let (_, summary) = parser
+        .parse_records(&[crlf_record, bom_record, plain_record])
+        .unwrap();
+
+    assert_eq!(summary.crlf_files, 1);
+    assert_eq!(summary.bom_files, 1);
+    assert_eq!(summary.parsed_files, 3);
 }
 
 #[test]

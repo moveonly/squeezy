@@ -3,8 +3,12 @@
 //! the shapes declared here. The graph layer owns the types because the
 //! store layer does not depend on parsed-file or cross-file structures.
 //!
-//! No consumer yet writes through these tables; the read consumer in
-//! [`crate::GraphManager::open_with_optional_store`] lands in Item 2 PR-2.
+//! [`crate::GraphManager::open_with_optional_store`] reads these snapshots
+//! after graph partitions are warm-started, and refresh/cold-build persistence
+//! writes them best-effort after in-memory graph state is rebuilt. Per-file
+//! entries and the import adjacency graph are batched into a single redb
+//! transaction; fingerprint matches (modified-time + size) gate reuse so stale
+//! entries are never applied.
 
 use std::collections::BTreeMap;
 

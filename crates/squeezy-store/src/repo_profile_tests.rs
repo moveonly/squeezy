@@ -9,6 +9,67 @@ use squeezy_core::{GraphConfig, repo_settings_id};
 use super::*;
 
 #[test]
+fn default_repo_registry_path_honors_explicit_override() {
+    let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("repo_registry_override");
+    let override_path = root.join("custom-repos.toml");
+    let previous = std::env::var_os("SQUEEZY_REPOS_PATH");
+
+    unsafe {
+        std::env::set_var("SQUEEZY_REPOS_PATH", &override_path);
+    }
+    let actual = default_repo_registry_path();
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("SQUEEZY_REPOS_PATH", value),
+            None => std::env::remove_var("SQUEEZY_REPOS_PATH"),
+        }
+    }
+
+    assert_eq!(actual, override_path);
+}
+
+#[test]
+#[cfg(windows)]
+fn default_repo_registry_path_uses_appdata_when_home_is_unset() {
+    let _guard = crate::TEST_ENV_LOCK.lock().unwrap();
+    let root = temp_root("repo_registry_appdata");
+    let appdata = root.join("AppData").join("Roaming");
+    let home_previous = std::env::var_os("HOME");
+    let appdata_previous = std::env::var_os("APPDATA");
+    let profile_previous = std::env::var_os("USERPROFILE");
+    let override_previous = std::env::var_os("SQUEEZY_REPOS_PATH");
+
+    unsafe {
+        std::env::remove_var("SQUEEZY_REPOS_PATH");
+        std::env::remove_var("HOME");
+        std::env::set_var("APPDATA", &appdata);
+        std::env::remove_var("USERPROFILE");
+    }
+    let actual = default_repo_registry_path();
+    unsafe {
+        match override_previous {
+            Some(value) => std::env::set_var("SQUEEZY_REPOS_PATH", value),
+            None => std::env::remove_var("SQUEEZY_REPOS_PATH"),
+        }
+        match home_previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match appdata_previous {
+            Some(value) => std::env::set_var("APPDATA", value),
+            None => std::env::remove_var("APPDATA"),
+        }
+        match profile_previous {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+
+    assert_eq!(actual, appdata.join("Squeezy").join("repos.toml"));
+}
+
+#[test]
 fn repo_profile_detects_mixed_language_repo_and_commands() {
     let root = temp_root("mixed_language_profile");
     fs::create_dir_all(root.join("src")).unwrap();
@@ -29,7 +90,15 @@ fn repo_profile_detects_mixed_language_repo_and_commands() {
     )
     .unwrap();
 
-    let profile = RepoProfile::detect(&root, &GraphConfig::default()).unwrap();
+    let graph = GraphConfig {
+        languages: vec![
+            "rust".to_string(),
+            "python".to_string(),
+            "typescript".to_string(),
+        ],
+        ..GraphConfig::default()
+    };
+    let profile = RepoProfile::detect(&root, &graph).unwrap();
 
     assert!(
         profile
@@ -60,6 +129,29 @@ fn repo_profile_detects_mixed_language_repo_and_commands() {
             .commands
             .iter()
             .any(|command| command.kind == "test" && command.ambiguous)
+    );
+}
+
+#[test]
+fn repo_profile_reports_disabled_supported_languages() {
+    let root = temp_root("disabled_supported_languages");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+    fs::write(root.join("src/app.py"), "def ok():\n    pass\n").unwrap();
+
+    let graph = GraphConfig {
+        languages: vec!["rust".to_string()],
+        ..GraphConfig::default()
+    };
+    let profile = RepoProfile::detect(&root, &graph).unwrap();
+
+    assert!(
+        profile
+            .languages
+            .iter()
+            .any(|language| language.name == "Python" && language.files == 1),
+        "disabled supported languages should remain visible in repo diagnostics: {:?}",
+        profile.languages
     );
 }
 

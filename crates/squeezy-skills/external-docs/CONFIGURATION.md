@@ -132,10 +132,15 @@ commented examples so that built-in defaults can evolve over time:
 
 [context]
 # compaction_enabled = true
-# compaction_estimated_tokens = 60000
 # compaction_min_items = 16
 # compaction_recent_items = 10
 # compaction_max_summary_bytes = 12000
+# model_context_window = 200000          # override auto-detected window size
+# effective_context_window_percent = 95  # usable fraction of the window
+# max_context_tokens = 60000             # hard economy cap (optional)
+# trim_at_percent = 70                   # micro-compaction fires at this % of window
+# micro_compaction_enabled = true
+# micro_compaction_keep_recent = 4
 
 [subagents]
 # enabled = true
@@ -147,6 +152,8 @@ commented examples so that built-in defaults can evolve over time:
 # max_search_files_per_call = 1000000
 # max_model_rounds = 1000
 # max_summary_tokens = 64000
+# help_strict_local = false   # when true, /help refuses unknown topics instead of calling the
+                               # DocHelp subagent; env: SQUEEZY_HELP_STRICT_LOCAL
 
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
@@ -263,10 +270,15 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 
 [context]
 # compaction_enabled = true
-# compaction_estimated_tokens = 60000
 # compaction_min_items = 16
 # compaction_recent_items = 10
 # compaction_max_summary_bytes = 12000
+# model_context_window = 200000          # override auto-detected window size
+# effective_context_window_percent = 95  # usable fraction of the window
+# max_context_tokens = 60000             # hard economy cap (optional)
+# trim_at_percent = 70                   # micro-compaction fires at this % of window
+# micro_compaction_enabled = true
+# micro_compaction_keep_recent = 4
 
 # [redaction]
 # Add project-specific Rust regex patterns for secrets Squeezy should redact
@@ -274,7 +286,9 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 # custom_patterns = []
 
 [cache]
+# root = ".squeezy/cache"     # or "xdg" on Linux for XDG cache storage
 # tool_outputs = ".squeezy/tool_outputs"
+# durability = "fast"         # fast | turn | strict
 
 # [tools]
 # lazy_schema_loading = true
@@ -327,18 +341,24 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   approvals are evaluated. `log_dir`, `log_retention_days`, `max_event_bytes`,
   and `max_session_bytes` control redacted local session history and resume
   state. When `log_dir` is unset, sessions are written to `<cache.root>/sessions`
-  if `[cache].root` is set, otherwise `.squeezy/sessions`. In the TUI,
+  if `[cache].root` is set, otherwise `.squeezy/sessions`. With
+  `[cache].root = "xdg"` on Linux, cache and session files resolve under
+  `$XDG_CACHE_HOME/squeezy/<repo-id>` or `$HOME/.cache/squeezy/<repo-id>`.
+  When neither `$XDG_CACHE_HOME` nor `$HOME` is set, the resolver falls back
+  to `<workspace>/.squeezy/cache/squeezy/<repo-id>`. In the TUI,
   `Shift+Tab` toggles modes; `/plan` and `/build` force a specific mode.
 - `[context]`: deterministic context compaction controls. Squeezy estimates
   model-visible prompt tokens locally and, when enabled, replaces stale raw
   conversation/tool output with a compact summary while preserving recent
   turns, pinned context, active attachments, and seen-output receipts. The TUI
-  also supports `/compact`, `/pin`, `/pins`, and `/unpin`. The
-  `compaction_estimated_tokens` threshold is a local heuristic — Squeezy
-  counts byte length of redacted prompt items and divides by 4 to estimate
-  tokens, so pick a value that maps to your provider's real prompt budget
-  (e.g. set it well below the provider's context window since the heuristic
-  is a lower bound).
+  also supports `/compact`, `/pin`, `/pins`, and `/unpin`. Compaction thresholds
+  are derived from the model's effective context window: `model_context_window`
+  overrides auto-detection, `effective_context_window_percent` sets the usable
+  fraction (default 95%), `max_context_tokens` applies an optional hard economy
+  cap, `trim_at_percent` controls when the cheap micro-compaction trim fires,
+  and `micro_compaction_enabled` / `micro_compaction_keep_recent` tune the trim
+  tier. The legacy `compaction_estimated_tokens` field still accepted for
+  backwards compatibility but is superseded by the window-relative thresholds.
 - `[subagents]`: isolated research-agent controls. `delegate` uses the main
   model for broad natural-language research; `explore` uses
   `explore_model` when set, otherwise the provider's cheap default model, and
@@ -520,25 +540,41 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 - `[redaction]`: `custom_patterns`, an optional list of Rust regex patterns
   that extend Squeezy's built-in secret redaction.
 - `[web]`: `exa_mcp_url` and `exa_api_key_env`.
-- `[graph]`: workspace indexing controls. `languages`, `max_file_bytes`,
-  and `require_indexing_signal` follow the usual semantics. `include_hidden`
-  is `false` by default and only walks hidden paths the policy recognizes
-  (`.git`, `.venv`, `.next`, etc.); set it to `true` to also walk
-  unclassified hidden paths like `.idea/` or `.config/`. `include` and
-  `exclude` are glob patterns relative to the workspace root. `exclude` adds
-  user-level exclusions on top of the defaults. `include` re-enables a
-  default-excluded path (e.g. `include = ["vendor/allowed/**"]`); when an
-  `include` glob can match files below a directory, the crawler walks into
-  that directory rather than pruning it. `include_classes = ["lockfile"]`
-  whitelists an entire class. `exclude_classes = ["vendor"]` keeps a class
-  pruned even when an `include` glob would otherwise re-enable it; the
-  exclusion is reported with its normal class reason, not `user_exclude`.
+- `[graph]`: workspace indexing controls. `languages` is an allow-list for
+  parser-backed graph indexing; files in disabled supported languages are kept
+  as structured fallback records instead of being parsed. `max_file_bytes` and
+  `require_indexing_signal` follow the usual semantics. `include_hidden` is
+  `false` by default and only walks hidden paths the policy recognizes (`.git`,
+  `.venv`, `.next`, etc.); set it to `true` to also walk unclassified hidden
+  paths like `.idea/` or `.config/`. `include` and `exclude` are glob patterns
+  relative to the workspace root. `exclude` adds user-level exclusions on top
+  of the defaults. `include` re-enables a default-excluded path (e.g.
+  `include = ["vendor/allowed/**"]`); when an `include` glob can match files
+  below a directory, the crawler walks into that directory rather than pruning
+  it. `include_classes = ["lockfile"]` whitelists an entire class.
+  `exclude_classes = ["vendor"]` keeps a class pruned even when an `include`
+  glob would otherwise re-enable it; the exclusion is reported with its normal
+  class reason, not `user_exclude`.
   Canonical supported-language families and recognized extensions are listed in
-  [`LANGUAGES.md`](LANGUAGES.md).
-- `[cache]`: `root` and `tool_outputs`. Relative paths resolve against the
+  [`LANGUAGES.md`](LANGUAGES.md). Family ids (e.g. `c-family`, `js-ts`,
+  `c-sharp`) match every kind in the family, while singleton ids like `cpp`,
+  `jsx`, `tsx` match only one kind. `javascript`/`js` matches `JavaScript`
+  plus `Jsx` only — use the `js-ts` family id (or `typescript`/`ts`) when you
+  want to index JS/JSX together with TS/TSX.
+- `[cache]`: `root`, `tool_outputs`, and `durability`. Relative paths resolve against the
   workspace root, not the process working directory. Graph warm-start state,
-  cross-session receipt metadata, and internal observations are stored in
-  `state.redb` under `root` or `.squeezy/cache` when `root` is unset.
+  cross-session receipt metadata, and internal observations are stored under
+  `root` or `.squeezy/cache` when `root` is unset. On Linux,
+  `root = "xdg"` stores large cache files under
+  `$XDG_CACHE_HOME/squeezy/<repo-id>` or `$HOME/.cache/squeezy/<repo-id>`,
+  falling back to `<workspace>/.squeezy/cache/squeezy/<repo-id>` when neither
+  environment variable is set (typically only in sandboxed runs).
+  Cross-session receipt metadata, read snapshots, observations, and small
+  session-side cache state are stored in `state.redb`; semantic graph
+  partitions and resolver-cache snapshots are stored in `graph.redb`.
+  `durability = "fast"` keeps session JSONL appends unsynced for speed,
+  `"turn"` syncs them on explicit session flush/shutdown boundaries, and
+  `"strict"` syncs every durable JSONL append.
 - `[tools]`: lazy schema loading controls. With
   `lazy_schema_loading = true` (default), Squeezy sends full JSON schemas for
   the core tool list plus `load_tool_schema`; other tools are listed in a

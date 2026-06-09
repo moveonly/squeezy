@@ -41,6 +41,10 @@ impl OracleExclusions {
     }
 }
 
+// Benchmark scaffolding deliberately keeps using `WorkspaceCrawler::new`
+// so the bench harness stays a single-line constructor. External callers
+// should adopt `try_new` instead.
+#[allow(deprecated)]
 pub(crate) fn default_oracle_exclusions(root: &Path) -> Result<OracleExclusions> {
     let snapshot = WorkspaceCrawler::new(CrawlOptions::default()).crawl(root)?;
     let mut files = BTreeSet::new();

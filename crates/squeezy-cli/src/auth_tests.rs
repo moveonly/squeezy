@@ -6,6 +6,7 @@ use squeezy_core::{SeparatedSources, TierSource};
 use super::{
     AuthListArgs, AuthRemoveArgs, AuthSetArgs, AuthStatusArgs, collect_inline_keys,
     handle_auth_remove_at_path, handle_auth_set_at_path, handle_auth_status_with_env,
+    is_headless_linux,
 };
 
 static NONCE: AtomicU64 = AtomicU64::new(0);
@@ -481,4 +482,113 @@ fn auth_set_resolves_deepinfra_to_canonical_section_name() {
     use super::provider_section_for;
     let section = provider_section_for("deepinfra").expect("known");
     assert_eq!(section, "deepinfra");
+}
+
+// ─── is_headless_linux ───────────────────────────────────────────────────────
+
+/// Guard serialising tests that modify the process-level environment.
+/// The function itself has no side effects, but reading env vars while
+/// another thread is modifying them is undefined behaviour in Rust's
+/// stdlib API.
+#[cfg(target_os = "linux")]
+static HEADLESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(target_os = "linux")]
+#[test]
+fn is_headless_linux_true_when_all_display_vars_absent() {
+    let _guard = HEADLESS_ENV_LOCK.lock().unwrap();
+    let saved_display = std::env::var("DISPLAY").ok();
+    let saved_wayland = std::env::var("WAYLAND_DISPLAY").ok();
+    let saved_browser = std::env::var("BROWSER").ok();
+    unsafe {
+        std::env::remove_var("DISPLAY");
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::remove_var("BROWSER");
+    }
+    let result = is_headless_linux();
+    // Restore
+    match saved_display {
+        Some(v) => unsafe { std::env::set_var("DISPLAY", v) },
+        None => unsafe { std::env::remove_var("DISPLAY") },
+    }
+    match saved_wayland {
+        Some(v) => unsafe { std::env::set_var("WAYLAND_DISPLAY", v) },
+        None => unsafe { std::env::remove_var("WAYLAND_DISPLAY") },
+    }
+    match saved_browser {
+        Some(v) => unsafe { std::env::set_var("BROWSER", v) },
+        None => unsafe { std::env::remove_var("BROWSER") },
+    }
+    assert!(
+        result,
+        "should be headless when DISPLAY, WAYLAND_DISPLAY, and BROWSER are all absent"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn is_headless_linux_false_when_display_set() {
+    let _guard = HEADLESS_ENV_LOCK.lock().unwrap();
+    let saved_display = std::env::var("DISPLAY").ok();
+    let saved_wayland = std::env::var("WAYLAND_DISPLAY").ok();
+    let saved_browser = std::env::var("BROWSER").ok();
+    unsafe {
+        std::env::set_var("DISPLAY", ":0");
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::remove_var("BROWSER");
+    }
+    let result = is_headless_linux();
+    match saved_display {
+        Some(v) => unsafe { std::env::set_var("DISPLAY", v) },
+        None => unsafe { std::env::remove_var("DISPLAY") },
+    }
+    match saved_wayland {
+        Some(v) => unsafe { std::env::set_var("WAYLAND_DISPLAY", v) },
+        None => unsafe { std::env::remove_var("WAYLAND_DISPLAY") },
+    }
+    match saved_browser {
+        Some(v) => unsafe { std::env::set_var("BROWSER", v) },
+        None => unsafe { std::env::remove_var("BROWSER") },
+    }
+    assert!(!result, "should not be headless when DISPLAY is set");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn is_headless_linux_false_when_browser_override_set() {
+    let _guard = HEADLESS_ENV_LOCK.lock().unwrap();
+    let saved_display = std::env::var("DISPLAY").ok();
+    let saved_wayland = std::env::var("WAYLAND_DISPLAY").ok();
+    let saved_browser = std::env::var("BROWSER").ok();
+    unsafe {
+        std::env::remove_var("DISPLAY");
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::set_var("BROWSER", "firefox");
+    }
+    let result = is_headless_linux();
+    match saved_display {
+        Some(v) => unsafe { std::env::set_var("DISPLAY", v) },
+        None => unsafe { std::env::remove_var("DISPLAY") },
+    }
+    match saved_wayland {
+        Some(v) => unsafe { std::env::set_var("WAYLAND_DISPLAY", v) },
+        None => unsafe { std::env::remove_var("WAYLAND_DISPLAY") },
+    }
+    match saved_browser {
+        Some(v) => unsafe { std::env::set_var("BROWSER", v) },
+        None => unsafe { std::env::remove_var("BROWSER") },
+    }
+    assert!(
+        !result,
+        "BROWSER override should mark the session as non-headless"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn is_headless_linux_always_false_on_non_linux() {
+    assert!(
+        !is_headless_linux(),
+        "is_headless_linux must always return false on non-Linux platforms"
+    );
 }

@@ -2105,6 +2105,33 @@ async fn slash_command_queues_mid_turn() {
 }
 
 #[tokio::test]
+async fn slash_cheap_fallback_notice_says_next_turn() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    apply_dispatch_command(&mut app, &mut agent, DispatchCommand::Cheap).await;
+
+    assert_eq!(app.status, "routing: forced cheap next turn");
+    assert!(
+        agent.mode_state_snapshot().pending_force_cheap,
+        "/cheap should arm the one-shot override"
+    );
+    let notice = last_message_content(&app).expect("/cheap notice");
+    assert!(
+        notice.contains("next turn forced to the cheap model (one-shot)"),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("the next turn will fall back to the parent model"),
+        "{notice}"
+    );
+    assert!(
+        !notice.contains("this turn will"),
+        "fallback notice must not imply the current turn changes: {notice}"
+    );
+}
+
+#[tokio::test]
 async fn queued_slash_clear_executes_after_running_turn_finishes() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -3076,6 +3103,212 @@ async fn statusline_save_closes_picker_and_paints_detail_row() {
     assert!(
         row1.contains("scripted:gpt-test"),
         "row 1 should reflect saved items; got: {row1}"
+    );
+}
+
+#[test]
+fn statusline_picker_tab_toggles_scope() {
+    // Open the picker and verify the default scope is user. Tab should
+    // switch to project. A second Tab should switch back to user. Finally,
+    // Enter should hand the active scope through KeyOutcome::Save so a
+    // future rename of SaveScope::Project is caught by this test alone.
+    use crate::status_line_setup;
+    let mut state = status_line_setup::StatusLineSetupState::new(None, true);
+    assert_eq!(
+        state.scope,
+        status_line_setup::SaveScope::User,
+        "default scope should be User"
+    );
+    let outcome = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(
+        matches!(outcome, status_line_setup::KeyOutcome::Continue),
+        "Tab should return Continue"
+    );
+    assert_eq!(
+        state.scope,
+        status_line_setup::SaveScope::Project,
+        "after one Tab scope should be Project"
+    );
+    // Enter at project scope must hand the project scope through Save.
+    let save_outcome = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        matches!(
+            save_outcome,
+            status_line_setup::KeyOutcome::Save {
+                scope: status_line_setup::SaveScope::Project,
+                ..
+            }
+        ),
+        "Enter at project scope should yield Save {{ scope: Project, .. }}"
+    );
+    let outcome2 = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(matches!(outcome2, status_line_setup::KeyOutcome::Continue));
+    assert_eq!(
+        state.scope,
+        status_line_setup::SaveScope::User,
+        "after two Tabs scope should wrap back to User"
+    );
+}
+
+#[tokio::test]
+async fn statusline_picker_project_scope_save_writes_project_note() {
+    // Open the picker, Tab to project scope, Space-toggle the "Use theme
+    // colors" row off, then save. The transcript summary must explain the
+    // actual precedence (project beats user; the per-machine repo tier still
+    // overrides project) and must NOT tell the user that their user-level
+    // setting overrides project. The project squeezy.toml must persist both
+    // the list and the toggled-off color flag, and the user settings file
+    // must NOT be touched by a project-scope save.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("statusline_project_scope");
+    let settings_path = dir.join("settings.toml");
+    let _guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path.clone()));
+    // Override workspace_root so find_project_settings_path can locate a
+    // squeezy.toml inside the temp dir.
+    let project_settings = dir.join("squeezy.toml");
+    std::fs::write(&project_settings, "").expect("create squeezy.toml");
+    app.workspace_root = dir.clone();
+
+    set_input(&mut app, "/statusline".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("open picker");
+    assert!(app.status_line_setup.is_some());
+
+    // Tab switches to project scope.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    )
+    .await
+    .expect("tab scope");
+    assert_eq!(
+        app.status_line_setup.as_ref().expect("picker open").scope,
+        crate::status_line_setup::SaveScope::Project,
+        "scope should be Project after Tab"
+    );
+
+    // Cursor starts on row 0 ("Use theme colors"). Space toggles it off so
+    // the persisted color flag exercises a non-default value rather than
+    // just round-tripping the constructor's `true`.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    )
+    .await
+    .expect("toggle use_colors");
+
+    // Enter saves.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("save");
+    assert!(app.status_line_setup.is_none(), "picker should close");
+
+    let content = last_message_content(&app).expect("save transcript");
+    assert!(
+        content.contains("squeezy.toml"),
+        "summary should mention the project file; got: {content}"
+    );
+    assert!(
+        content.contains("Note:"),
+        "project-scope save should include precedence note; got: {content}"
+    );
+    // The note must describe Squeezy's actual precedence (project beats
+    // user; per-machine repo tier overrides project), and must not claim
+    // that ~/.squeezy/settings.toml takes precedence over the project tier.
+    assert!(
+        content.contains("`~/.squeezy/projects/<repo-id>/settings.toml`"),
+        "note should call out the per-machine repo tier as the only override; got: {content}"
+    );
+    assert!(
+        !content.contains("~/.squeezy/settings.toml) takes precedence")
+            && !content.contains("user settings (~/.squeezy/settings.toml) takes precedence")
+            && !content.contains("user settings takes precedence"),
+        "note must not claim the user tier overrides project; got: {content}"
+    );
+    let saved = std::fs::read_to_string(&project_settings).expect("project settings written");
+    assert!(
+        saved.contains("status_line = ["),
+        "project settings should persist the status line list; got: {saved}"
+    );
+    assert!(
+        saved.contains("status_line_use_colors = false"),
+        "project settings should persist the toggled-off color flag; got: {saved}"
+    );
+    // A project-scope save must not write the user tier.
+    let user_untouched = std::fs::read_to_string(&settings_path)
+        .map(|s| !s.contains("status_line"))
+        .unwrap_or(true);
+    assert!(
+        user_untouched,
+        "project-scope save must not write status_line into the user settings file"
+    );
+}
+
+#[tokio::test]
+async fn statusline_project_scope_save_walks_up_to_ancestor_squeezy_toml() {
+    // When the user runs Squeezy inside a subdirectory of a repo whose
+    // squeezy.toml lives at the repo root, a project-scope save must write
+    // to that ancestor file, not create a new squeezy.toml in the
+    // workspace_root subdirectory.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let parent = temp_workspace("statusline_project_scope_walk_up");
+    let settings_path = parent.join("settings.toml");
+    let _guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path));
+    let ancestor_project_settings = parent.join("squeezy.toml");
+    std::fs::write(&ancestor_project_settings, "").expect("create ancestor squeezy.toml");
+    let child = parent.join("child");
+    std::fs::create_dir_all(&child).expect("create child dir");
+    app.workspace_root = child.clone();
+
+    set_input(&mut app, "/statusline".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("open picker");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    )
+    .await
+    .expect("tab scope");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("save");
+
+    let ancestor =
+        std::fs::read_to_string(&ancestor_project_settings).expect("ancestor settings written");
+    assert!(
+        ancestor.contains("status_line = ["),
+        "ancestor squeezy.toml should have been the save target; got: {ancestor}"
+    );
+    let child_candidate = child.join("squeezy.toml");
+    assert!(
+        !child_candidate.exists(),
+        "project-scope save must not create a new squeezy.toml inside workspace_root when an \
+         ancestor squeezy.toml exists"
     );
 }
 
@@ -4065,7 +4298,7 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
 }
 
 #[test]
-fn slash_menu_filters_checkpoint_commands_from_disabled_config() {
+fn slash_menu_surfaces_checkpoint_commands_when_disabled_for_discovery() {
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/".to_string());
     let names = input::slash_suggestions_for_app(&app)
@@ -4074,8 +4307,8 @@ fn slash_menu_filters_checkpoint_commands_from_disabled_config() {
         .collect::<Vec<_>>();
     for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
         assert!(
-            !names.contains(&checkpoint_command),
-            "{checkpoint_command} should not be suggested while checkpointing is disabled"
+            names.contains(&checkpoint_command),
+            "{checkpoint_command} should remain discoverable while checkpointing is disabled"
         );
     }
 
@@ -4134,8 +4367,8 @@ fn slash_menu_surfaces_capability_badges_for_world_touching_commands() {
 #[test]
 fn slash_suggestion_line_contents_match_command_capabilities() {
     // Build the menu lines directly and assert the badge follows the
-    // declared capabilities — covers both presence (`/help` → `net`) and
-    // absence (`/cost` → no badge).
+    // declared capabilities — covers both absence (`/help` → no badge after
+    // moving curated topics local) and absence (`/cost` → no badge).
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/help".to_string());
     let lines = slash_suggestion_lines(&app, 120);
@@ -4147,7 +4380,11 @@ fn slash_suggestion_line_contents_match_command_capabilities() {
         .iter()
         .find(|line| line.contains("/help"))
         .expect("rendered /help line");
-    assert!(help_line.contains("[net]"), "{help_line}");
+    // `/help` no longer has a `[net]` badge — curated topics are local.
+    assert!(
+        !help_line.contains("[net]"),
+        "/help should not render a [net] capability badge: {help_line}"
+    );
 
     set_input(&mut app, "/cost".to_string());
     let lines = slash_suggestion_lines(&app, 120);
@@ -4294,8 +4531,8 @@ fn format_reviewer_command_handles_empty_buffer() {
 #[test]
 fn format_cost_command_renders_active_buckets() {
     use squeezy_agent::{
-        AttachmentShape, ConversationShape, McpAccounting, SessionAccountingSnapshot,
-        SkillsAccounting, TranscriptShape,
+        AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
+        SessionAccountingSnapshot, SkillsAccounting, TranscriptShape,
     };
     use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
     use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
@@ -4358,6 +4595,8 @@ fn format_cost_command_renders_active_buckets() {
         full_history_request: estimate,
         skills: SkillsAccounting::default(),
         mcp: McpAccounting::default(),
+        calibration_source: squeezy_agent::CalibrationSource::GlobalFile,
+        budget_policy: BudgetPolicySnapshot::default(),
     };
 
     let raw = commands::format_cost_command(&snapshot);
@@ -4387,8 +4626,8 @@ fn format_cost_command_renders_active_buckets() {
 #[test]
 fn format_cost_command_renders_by_model_drill() {
     use squeezy_agent::{
-        AttachmentShape, ConversationShape, McpAccounting, SessionAccountingSnapshot,
-        SkillsAccounting, TranscriptShape,
+        AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
+        SessionAccountingSnapshot, SkillsAccounting, TranscriptShape,
     };
     use squeezy_core::{CostOrigin, CostSnapshot, ModelLedger, SessionMetrics, SessionMode};
     use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
@@ -4482,6 +4721,8 @@ fn format_cost_command_renders_by_model_drill() {
         full_history_request: estimate,
         skills: SkillsAccounting::default(),
         mcp: McpAccounting::default(),
+        calibration_source: squeezy_agent::CalibrationSource::GlobalFile,
+        budget_policy: BudgetPolicySnapshot::default(),
     };
 
     let output = strip_ansi_escape_sequences(&commands::format_cost_command(&snapshot));
@@ -4493,8 +4734,8 @@ fn format_cost_command_renders_by_model_drill() {
     assert!(output.contains("anthropic:claude-haiku-4-5"), "{output}");
     assert!(output.contains("main usd="), "{output}");
     assert!(output.contains("subagent usd="), "{output}");
-    assert!(output.contains("cache_r=210000"), "{output}");
-    assert!(output.contains("cache_w=90000"), "{output}");
+    assert!(output.contains("cache_read=210000"), "{output}");
+    assert!(output.contains("cache_write=90000"), "{output}");
     // Σ total == cost.estimated_usd (910000) + subagent_provider (48000) == 958000
     // == sum of every ledger bucket. This invariant keeps the drill honest.
     assert!(output.contains("total usd=$0.958000"), "{output}");
@@ -4613,9 +4854,9 @@ fn context_recommendations_flag_largest_and_secondary_sources() {
 #[test]
 fn context_breaks_out_skills_and_mcp_sources() {
     use squeezy_agent::{
-        AttachmentShape, ConversationShape, McpAccounting, McpServerAccounting,
-        McpToolAccountingEntry, SessionAccountingSnapshot, SkillAccountingEntry, SkillsAccounting,
-        TranscriptShape,
+        AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
+        McpServerAccounting, McpToolAccountingEntry, SessionAccountingSnapshot,
+        SkillAccountingEntry, SkillsAccounting, TranscriptShape,
     };
     use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
     use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
@@ -4656,7 +4897,7 @@ fn context_breaks_out_skills_and_mcp_sources() {
         loaded: 1,
         entries: vec![
             SkillAccountingEntry {
-                name: "sonar-context-augmentation".to_string(),
+                name: "code-navigation".to_string(),
                 description: "always invoke".to_string(),
                 loaded: true,
                 metadata_bytes: 400,
@@ -4724,6 +4965,8 @@ fn context_breaks_out_skills_and_mcp_sources() {
         full_history_request: estimate,
         skills,
         mcp,
+        calibration_source: squeezy_agent::CalibrationSource::HardCodedDefault,
+        budget_policy: BudgetPolicySnapshot::default(),
     };
 
     let output = strip_ansi_escape_sequences(&commands::format_context_command(&snapshot));
@@ -5068,10 +5311,10 @@ async fn slash_attach_surfaces_unsupported_label_only_images() {
 }
 
 /// Drift test: every entry in `SLASH_COMMAND_HELP_TABLE` must correspond to a real
-/// slash command in the live `SLASH_COMMANDS` registry, so stale or invented names
-/// are caught at compile time.  Adding a new command to the registry does NOT
-/// automatically fail this test; add a help entry to `SLASH_COMMAND_HELP_TABLE` to
-/// cover it.
+/// slash command in the live `SLASH_COMMANDS` registry (no stale names), and every
+/// slash command in the registry must have a help entry (no uncovered commands).
+/// Adding a new slash command without a matching `SLASH_COMMAND_HELP_TABLE` entry
+/// fails this test until help is added.
 #[test]
 fn slash_help_table_entries_exist_in_registry() {
     use squeezy_skills::slash_command_help_names;
@@ -5079,12 +5322,45 @@ fn slash_help_table_entries_exist_in_registry() {
     // SLASH_COMMANDS is re-exported as pub(crate) from lib.rs via `use super::*`
     let registry_names: std::collections::HashSet<&str> =
         SLASH_COMMANDS.iter().map(|c| c.name).collect();
+    let help_names: std::collections::HashSet<&str> = slash_command_help_names().collect();
 
-    for help_name in slash_command_help_names() {
+    for help_name in &help_names {
         assert!(
             registry_names.contains(help_name),
             "SLASH_COMMAND_HELP_TABLE entry {help_name:?} does not exist in SLASH_COMMANDS; \
              either the command was removed/renamed or the help entry was mis-typed"
+        );
+    }
+    for registry_name in &registry_names {
+        assert!(
+            help_names.contains(registry_name),
+            "SLASH_COMMANDS entry {registry_name:?} has no entry in SLASH_COMMAND_HELP_TABLE; \
+             add a help entry before shipping this command"
+        );
+    }
+}
+
+/// Bidirectional drift test for the high-value routing and mode command set.
+///
+/// These commands are part of the core routing/mode control surface and are
+/// especially likely to confuse users if they lack help entries.  The original
+/// drift test only checks the reverse direction (help entries must exist in the
+/// registry); this test checks that every routing/mode command has a curated
+/// help entry so `/help /parent`, `/help /cheap`, etc. resolve locally instead
+/// of falling through to unsupported/generic help.
+#[test]
+fn routing_and_mode_commands_have_help_entries() {
+    use squeezy_skills::slash_command_help_names;
+
+    const ROUTING_MODE_COMMANDS: &[&str] = &["/plan", "/build", "/cheap", "/parent", "/router"];
+
+    let help_names: std::collections::HashSet<&str> = slash_command_help_names().collect();
+
+    for cmd in ROUTING_MODE_COMMANDS {
+        assert!(
+            help_names.contains(cmd),
+            "routing/mode command {cmd:?} has no entry in SLASH_COMMAND_HELP_TABLE; \
+             add a help entry so `/help {cmd}` resolves locally"
         );
     }
 }
@@ -5096,14 +5372,14 @@ async fn slash_help_lists_topics() {
 
     assert!(handle_slash_command(&mut app, &mut agent, "/help").await);
 
-    wait_for_turn_completion(&mut app).await;
+    // Local help answers are rendered immediately without starting a model turn.
     let content = last_message_content(&app).expect("help transcript");
-    assert!(
-        transcript_message_contents(&app).contains(&"/help"),
-        "user prompt should remain in the transcript"
-    );
     assert!(content.contains("Available `/help` topics"), "{content}");
     assert!(content.contains("`providers`"), "{content}");
+    assert!(
+        app.turn_rx.is_none(),
+        "locally answered /help must not start a model turn"
+    );
 }
 
 #[tokio::test]
@@ -5113,15 +5389,15 @@ async fn slash_help_config_renders_citations_and_config() {
 
     assert!(handle_slash_command(&mut app, &mut agent, "/help providers").await);
 
-    wait_for_turn_completion(&mut app).await;
+    // Local help answers are rendered immediately without starting a model turn.
     let content = last_message_content(&app).expect("help transcript");
-    assert!(
-        transcript_message_contents(&app).contains(&"/help providers"),
-        "user prompt should remain in the transcript"
-    );
     assert!(content.contains("docs/external/PROVIDERS.md"), "{content}");
     assert!(content.contains("[model]"), "{content}");
     assert!(!content.contains("--api-key"), "{content}");
+    assert!(
+        app.turn_rx.is_none(),
+        "locally answered /help must not start a model turn"
+    );
 }
 
 #[tokio::test]
@@ -5138,14 +5414,17 @@ async fn inline_slash_help_dispatches_from_prompt_body() {
     .await
     .expect("handle key");
 
-    wait_for_turn_completion(&mut app).await;
+    // Local help answers are rendered immediately; input is cleared.
     assert!(app.input.is_empty());
-    assert!(
-        transcript_message_contents(&app).contains(&"/help providers"),
-        "inline /help should dispatch the command from its inline position"
-    );
     let content = last_message_content(&app).expect("help transcript");
-    assert!(content.contains("docs/external/PROVIDERS.md"), "{content}");
+    assert!(
+        content.contains("docs/external/PROVIDERS.md"),
+        "inline /help should dispatch from its position and render local answer: {content}"
+    );
+    assert!(
+        app.turn_rx.is_none(),
+        "locally answered inline /help must not start a model turn"
+    );
 }
 
 #[tokio::test]
@@ -6104,13 +6383,13 @@ fn tool_call_label_flattens_multiline_shell_commands() {
         call_id: "s-1".to_string(),
         name: "shell".to_string(),
         arguments: serde_json::json!({
-            "command": "sonar context navigation get-source\n  | python3 -c \"print('signature')\"",
+            "command": "rg -l 'fn main'\n  | python3 -c \"print('signature')\"",
         }),
     };
 
     assert_eq!(
         tool_call_label(&call),
-        "sonar context navigation get-source | python3 -c \"print('signature')\""
+        "rg -l 'fn main' | python3 -c \"print('signature')\""
     );
 }
 
@@ -7148,6 +7427,75 @@ fn approval_status_line_is_compact_single_line() {
     assert!(line.contains("target=shell:*"));
 }
 
+#[test]
+fn windows_restricted_token_posture_warns_without_claiming_no_fs_sandbox() {
+    let mut request = sample_approval_request();
+    request.permission.capability = PermissionCapability::Shell;
+    request.permission.target = "pwsh:*".to_string();
+    request
+        .permission
+        .metadata
+        .insert("shell_prefix".to_string(), "pwsh:*".to_string());
+    request.permission.metadata.insert(
+        "windows_sandbox_posture".to_string(),
+        "restricted-token-writes-only".to_string(),
+    );
+
+    let prompt = format_approval_prompt(&request);
+    assert!(
+        prompt.contains("Windows: write sandbox only; reads/network are not isolated"),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains("no filesystem/network sandbox"),
+        "{prompt}"
+    );
+
+    let line = format_approval_status_line(&request);
+    assert!(
+        line.contains("sandbox=restricted-token-writes-only"),
+        "{line}"
+    );
+
+    let labels = approval_options_for(&request)
+        .into_iter()
+        .map(|option| option.label.into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("Windows reads/network not isolated")),
+        "{labels:?}"
+    );
+}
+
+#[test]
+fn windows_broad_shell_warning_handles_resolved_binary_paths() {
+    let mut request = sample_approval_request();
+    request.permission.capability = PermissionCapability::Shell;
+    request.permission.target = "pwsh:*".to_string();
+    request.permission.metadata.insert(
+        "shell_prefix".to_string(),
+        r"C:\Program Files\PowerShell\7\pwsh.exe:*".to_string(),
+    );
+    request.permission.metadata.insert(
+        "windows_sandbox_posture".to_string(),
+        "job-object-only".to_string(),
+    );
+
+    let labels = approval_options_for(&request)
+        .into_iter()
+        .map(|option| option.label.into_owned())
+        .collect::<Vec<_>>();
+
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("job-object-only Windows shell")),
+        "{labels:?}"
+    );
+}
+
 #[tokio::test]
 async fn approval_menu_uses_arrows_and_enter_for_repo_rule() {
     let mut app = test_app(SessionMode::Build);
@@ -7712,8 +8060,8 @@ fn inline_history_flush_wraps_long_shell_cards_on_the_rail() {
     let command = concat!(
         "echo \"=== .mcp.json ===\"; cat .mcp.json; echo; ",
         "echo \"=== .codex/hooks.json ===\"; cat .codex/hooks.json; echo; ",
-        "echo \"=== sonar on PATH? ===\";\n",
-        "command -v sonar || echo \"no sonar binary\"; echo; ",
+        "echo \"=== squeezy on PATH? ===\";\n",
+        "command -v squeezy || echo \"no squeezy binary\"; echo; ",
         "echo \"=== docker? ===\"; command -v docker || echo \"no docker\""
     );
     let call = ToolCall {
@@ -8314,7 +8662,7 @@ fn assistant_message_never_uses_collapsed_summary() {
 #[test]
 fn assistant_message_tables_do_not_abbreviate_cells() {
     let body = "\
-| Dimension | repo_map | sonar context |
+| Dimension | repo_map | semantic graph |
 |---|---|---|
 | Module names | Directory names from the repository tree | Artifact IDs from Maven module dependencies |
 | Symbol-level detail | Classes, fields, methods, and package-level structure | Stopped at module dependency analysis |
@@ -8482,8 +8830,8 @@ fn accounting_block_dispatch_skips_unrelated_system_messages() {
 #[test]
 fn context_snapshot_stays_expanded_in_compact_transcript() {
     use squeezy_agent::{
-        AttachmentShape, ConversationShape, McpAccounting, SessionAccountingSnapshot,
-        SkillsAccounting, TranscriptShape,
+        AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
+        SessionAccountingSnapshot, SkillsAccounting, TranscriptShape,
     };
     use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
     use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
@@ -8526,6 +8874,8 @@ fn context_snapshot_stays_expanded_in_compact_transcript() {
         full_history_request: estimate,
         skills: SkillsAccounting::default(),
         mcp: McpAccounting::default(),
+        calibration_source: squeezy_agent::CalibrationSource::HardCodedDefault,
+        budget_policy: BudgetPolicySnapshot::default(),
     };
     let body = commands::format_context_command(&snapshot);
 
@@ -9576,7 +9926,7 @@ async fn ctrl_y_copies_last_assistant_message() {
 
     assert_eq!(writes.lock().unwrap().as_slice(), ["answer"]);
     assert!(
-        app.status.contains("copied assistant message"),
+        app.status.contains("OSC52 clipboard sequence written"),
         "{}",
         app.status
     );
@@ -11897,6 +12247,132 @@ async fn slash_keymap_surfaces_overrides_and_diagnostics() {
     assert!(body.contains("PageUp"), "default binding lost: {body}");
 }
 
+#[tokio::test]
+async fn slash_terminal_reports_diagnostics() {
+    let mut config = test_config(SessionMode::Build);
+    // Lock the synchronized-output policy so the diagnostic row prints a
+    // deterministic value regardless of the CI runner's env.
+    config.tui.synchronized_output = TuiSynchronizedOutput::Never;
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/terminal").await;
+    assert!(ran);
+    assert_eq!(app.status, "terminal diagnostics");
+
+    let body = last_message_content(&app)
+        .expect("terminal diagnostics transcript entry")
+        .to_string();
+    for expected in [
+        "Terminal diagnostics",
+        "stdout tty",
+        "$TERM",
+        "clipboard",
+        "effective shell",
+        "synchronized output",
+        "Never",
+        "Remedies:",
+    ] {
+        assert!(body.contains(expected), "missing {expected:?}: {body}");
+    }
+}
+
+#[test]
+fn precheck_terminal_environment_refuses_when_stdout_not_tty() {
+    // `TerminalGuard::enter` must short-circuit when stdout is not a TTY so
+    // a `squeezy > out.txt` invocation never pollutes the redirected file
+    // with raw VT bytes. The pure helper carries the contract; the
+    // production caller wires it into `io::stdout().is_terminal()`.
+    let env = |_: &str| -> Option<std::ffi::OsString> { None };
+    let message = super::precheck_terminal_environment(|| false, env)
+        .expect("non-tty stdout must produce a refusal");
+    assert!(
+        message.contains("stdout is not a terminal"),
+        "unexpected refusal: {message}",
+    );
+    assert!(
+        message.contains("--prompt"),
+        "refusal must point to --prompt: {message}",
+    );
+}
+
+#[test]
+fn precheck_terminal_environment_refuses_term_dumb() {
+    // TERM=dumb signals a sink that can't render ANSI. Refuse before
+    // `enable_raw_mode()` ever runs so the session terminator stays clean.
+    let env = |key: &str| -> Option<std::ffi::OsString> {
+        (key == "TERM").then(|| std::ffi::OsString::from("dumb"))
+    };
+    let message = super::precheck_terminal_environment(|| true, env)
+        .expect("TERM=dumb must produce a refusal");
+    assert!(
+        message.contains("TERM=dumb"),
+        "unexpected refusal: {message}",
+    );
+
+    // Case-insensitive — `DUMB` / `Dumb` must trip the same gate.
+    let env_upper = |key: &str| -> Option<std::ffi::OsString> {
+        (key == "TERM").then(|| std::ffi::OsString::from("DUMB"))
+    };
+    assert!(
+        super::precheck_terminal_environment(|| true, env_upper).is_some(),
+        "TERM=DUMB must refuse like TERM=dumb",
+    );
+}
+
+#[test]
+fn precheck_terminal_environment_accepts_capable_terminal() {
+    let env = |key: &str| -> Option<std::ffi::OsString> {
+        (key == "TERM").then(|| std::ffi::OsString::from("xterm-256color"))
+    };
+    assert!(
+        super::precheck_terminal_environment(|| true, env).is_none(),
+        "capable terminal must not refuse startup",
+    );
+
+    // No $TERM at all is fine — only the literal "dumb" value refuses.
+    let env_empty = |_: &str| -> Option<std::ffi::OsString> { None };
+    assert!(
+        super::precheck_terminal_environment(|| true, env_empty).is_none(),
+        "unset TERM must not refuse",
+    );
+}
+
+#[test]
+fn precheck_terminal_environment_tty_check_wins_over_term_dumb() {
+    // The stdout-not-TTY arm runs first; even with TERM=dumb the message
+    // should point at stdout so the user fixes the right thing.
+    let env = |key: &str| -> Option<std::ffi::OsString> {
+        (key == "TERM").then(|| std::ffi::OsString::from("dumb"))
+    };
+    let message = super::precheck_terminal_environment(|| false, env)
+        .expect("non-tty stdout must short-circuit even when TERM=dumb");
+    assert!(
+        message.contains("stdout is not a terminal"),
+        "tty check should win over TERM=dumb: {message}",
+    );
+}
+
+#[test]
+fn osc52_sequence_is_bare_with_no_tmux_dcs_wrap() {
+    // Today's behaviour is intentional: OSC52 emits a bare
+    // `ESC ] 52 ; c ; <base64> BEL`, with no DCS wrapping for tmux/screen.
+    // Inside tmux without `allow-passthrough on` the sequence is consumed
+    // by the multiplexer; the `/terminal` Remedies line documents the
+    // workaround. Locking the shape so a future tmux-aware wrap PR is
+    // intentional rather than accidental.
+    let sequence = super::build_osc52_sequence("hello").expect("encode hello");
+    assert_eq!(sequence, "\x1b]52;c;aGVsbG8=\x07");
+    assert!(
+        !sequence.starts_with("\x1bPtmux;"),
+        "OSC52 must not currently DCS-wrap; see /terminal Remedies for the user-side fix",
+    );
+    assert!(
+        !sequence.starts_with("\x1bP"),
+        "no DCS framing of any kind today: {sequence:?}",
+    );
+}
+
 /// Serializes `/theme` tests so the process-global palette override and the
 /// `SQUEEZY_SETTINGS_PATH` env var don't race between concurrent tests.
 static THEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -12510,7 +12986,7 @@ fn status_details_render_via_segments_match_legacy_format() {
 #[test]
 fn cost_segment_renders_cap_and_percent_when_configured() {
     // When `max_session_cost_usd_micros` is set, the cost segment must show
-    // the spend, the cap, and the integer percent so the user can see where
+    // the spend, the cap, and one-decimal percent so the user can see where
     // they stand without opening the /cost overlay.
     let mut config = test_config(SessionMode::Build);
     config.max_session_cost_usd_micros = Some(500_000); // $0.50 cap
@@ -12519,7 +12995,7 @@ fn cost_segment_renders_cap_and_percent_when_configured() {
 
     let details = format_status_details(&app);
     assert!(
-        details.contains("cost $0.125000 / $0.50 (25%)"),
+        details.contains("cost $0.125000 / $0.50 (25.0%)"),
         "unexpected status: {details}"
     );
 }
@@ -12848,6 +13324,7 @@ async fn shell_sandbox_best_effort_fallback_warns_user_once_per_session() {
         turn_id: TurnId::new(3),
         backend: "macos-sandbox-exec".to_string(),
         fallback_count: 1,
+        fallback_reason: None,
     })
     .await
     .expect("send fallback warning");
@@ -14871,6 +15348,26 @@ fn status_line_item_round_trips_through_slug() {
 }
 
 #[test]
+fn status_line_narrow_linux_preset_expands_to_compact_items() {
+    use crate::status::{NARROW_LINUX_STATUS_LINE_ITEMS, StatusLineItem};
+
+    let raw = ["narrow-linux".to_string()];
+    let parsed = parse_status_line_items(Some(&raw)).expect("preset should parse");
+
+    assert_eq!(parsed.as_slice(), NARROW_LINUX_STATUS_LINE_ITEMS);
+    assert_eq!(
+        parsed,
+        vec![
+            StatusLineItem::ProviderAndModel,
+            StatusLineItem::Cost,
+            StatusLineItem::ContextRemaining,
+            StatusLineItem::Tools,
+            StatusLineItem::Budget,
+        ]
+    );
+}
+
+#[test]
 fn status_line_codex_aliases_parse() {
     use crate::status::StatusLineItem;
     assert_eq!(
@@ -15129,6 +15626,7 @@ fn synchronized_output_auto_detects_known_capable_terminals() {
         &[("ALACRITTY_LOG", "/tmp/alacritty.log")],
         &[("ALACRITTY_WINDOW_ID", "1")],
         &[("ITERM_SESSION_ID", "w0t0p0")],
+        &[("WT_SESSION", "{11111111-2222-3333-4444-555555555555}")],
         &[("TERM_PROGRAM", "iTerm.app")],
         &[("TERM_PROGRAM", "WezTerm")],
         &[("TERM_PROGRAM", "ghostty")],
@@ -15187,6 +15685,114 @@ fn synchronized_output_auto_stays_off_for_unknown_terminals() {
         !super::detect_synchronized_output_support_from_env(only_dumb),
         "dumb terminal must not auto-enable BSU"
     );
+
+    // tmux without other capability signals should not enable passthrough.
+    let tmux_only = |key: &str| -> Option<std::ffi::OsString> {
+        match key {
+            "TMUX" => Some(std::ffi::OsString::from("/tmp/tmux-1000/default,1234,0")),
+            "TERM" => Some(std::ffi::OsString::from("tmux-256color")),
+            _ => None,
+        }
+    };
+    assert!(
+        !super::detect_synchronized_output_support_from_env(tmux_only),
+        "tmux alone (without capability signals from the outer terminal) must not auto-enable BSU"
+    );
+}
+
+#[test]
+fn compact_path_with_home_uses_tilde_and_normalized_separators() {
+    let home = PathBuf::from("/home/alice");
+    let path = home.join("projects").join("squeezy");
+
+    assert_eq!(
+        super::compact_path_with_home(&path, &home).as_deref(),
+        Some("~/projects/squeezy")
+    );
+    assert_eq!(
+        super::compact_path_with_home(&home, &home).as_deref(),
+        Some("~")
+    );
+}
+
+#[test]
+fn compact_path_with_home_normalizes_backslashes_in_stripped_portion() {
+    // Force the stripped portion to contain backslash bytes regardless
+    // of platform. On Unix `\` is a regular byte in a single filename;
+    // on Windows it is the native separator and naturally appears in
+    // nested paths. Either way the unconditional `replace('\\', "/")`
+    // must rewrite it so the display surface (terminal title, status
+    // line, plan paths) stays consistent on both platforms.
+    let home = PathBuf::from("/home/alice");
+    let mut path = home.clone();
+    path.push("projects\\squeezy");
+
+    assert_eq!(
+        super::compact_path_with_home(&path, &home).as_deref(),
+        Some("~/projects/squeezy")
+    );
+}
+
+#[test]
+fn compact_path_home_env_uses_home() {
+    let home = super::home_path_from_env(|key| {
+        (key == "HOME").then(|| std::ffi::OsString::from("/home/alice"))
+    });
+
+    assert_eq!(home, Some(PathBuf::from("/home/alice")));
+}
+
+#[test]
+fn compact_path_home_env_treats_empty_home_as_unset() {
+    // An empty `HOME` (`HOME=""`) used to slip through as
+    // `Some(PathBuf::from(""))`, which `strip_prefix("")` accepts as a
+    // prefix of every path — so `compact_path_with_home` would format
+    // the entire path as `~/...`. Guard against that regression on Unix
+    // (where `USERPROFILE` is ignored) by asserting we resolve to `None`.
+    #[cfg(not(windows))]
+    {
+        let home =
+            super::home_path_from_env(|key| (key == "HOME").then(|| std::ffi::OsString::from("")));
+        assert_eq!(home, None);
+    }
+    // On Windows, empty `HOME` should also be ignored, and we should
+    // fall back to `USERPROFILE` (or `None` when it is missing/empty).
+    #[cfg(windows)]
+    {
+        let home = super::home_path_from_env(|key| match key {
+            "HOME" => Some(std::ffi::OsString::from("")),
+            "USERPROFILE" => Some(std::ffi::OsString::from("")),
+            _ => None,
+        });
+        assert_eq!(home, None);
+
+        let userprofile = super::home_path_from_env(|key| match key {
+            "HOME" => Some(std::ffi::OsString::from("")),
+            "USERPROFILE" => Some(std::ffi::OsString::from(r"C:\Users\Alice")),
+            _ => None,
+        });
+        assert_eq!(userprofile, Some(PathBuf::from(r"C:\Users\Alice")));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn compact_path_home_env_falls_back_to_userprofile_on_windows() {
+    let home = super::home_path_from_env(|key| {
+        (key == "USERPROFILE").then(|| std::ffi::OsString::from(r"C:\Users\Alice"))
+    });
+
+    assert_eq!(home, Some(PathBuf::from(r"C:\Users\Alice")));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn compact_path_home_env_ignores_userprofile_off_windows() {
+    let home = super::home_path_from_env(|key| {
+        (key == "USERPROFILE").then(|| std::ffi::OsString::from("/Users/Alice"))
+    });
+
+    assert_eq!(home, None);
 }
 
 #[tokio::test]
@@ -15639,7 +16245,7 @@ fn rail_wrap_flattens_embedded_line_breaks_before_measuring() {
         Span::raw("   ├─"),
         Span::styled("✔ ", Style::default().fg(crate::render::theme::green())),
         Span::raw("Ran "),
-        Span::raw("sonar context\nnavigation get-source"),
+        Span::raw("rg --json pattern\n| head -5"),
     ])];
 
     let rows = wrap_transcript_overlay_rows(&lines, 80);
@@ -15647,10 +16253,7 @@ fn rail_wrap_flattens_embedded_line_breaks_before_measuring() {
 
     assert_eq!(rows.len(), 1, "{text}");
     assert!(!text.contains('\n') || text.lines().count() == 1, "{text}");
-    assert!(
-        text.contains("Ran sonar context navigation get-source"),
-        "{text}"
-    );
+    assert!(text.contains("Ran rg --json pattern | head -5"), "{text}");
 }
 
 #[test]

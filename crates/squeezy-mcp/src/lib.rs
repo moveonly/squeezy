@@ -35,7 +35,7 @@ use squeezy_core::{McpServerConfig, McpTransport, PermissionMode};
 use squeezy_store::SqueezyStore;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    sync::{Mutex as TokioMutex, watch},
+    sync::{Mutex as TokioMutex, Notify, watch},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -68,6 +68,12 @@ const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
 const HASH_SUFFIX_BYTES: usize = 12;
 const RESOURCE_READ_CACHE_TTL: Duration = Duration::from_secs(300);
 const RESOURCE_DECLARATION_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Maximum number of stderr lines kept per stdio MCP session.
+const STDERR_RING_CAPACITY: usize = 20;
+/// Maximum bytes per stderr line before truncation. Lines from an untrusted
+/// child process are capped before logging or surfacing to avoid log injection
+/// and unbounded memory growth from long unterminated writes.
+const STDERR_LINE_MAX_BYTES: usize = 256;
 /// Cap on retained resource-read cache entries. The registry lives for the
 /// whole session, so without a bound a server (or agent loop) that reads many
 /// distinct URIs would accumulate their full bodies indefinitely. Mirrors the
@@ -301,6 +307,16 @@ pub struct McpClientRegistry {
     servers: Arc<std::sync::RwLock<Arc<BTreeMap<String, McpServerConfig>>>>,
     cache: Arc<Mutex<BTreeMap<String, ExternalMcpTool>>>,
     sessions: Arc<TokioMutex<BTreeMap<String, Arc<SessionEntry>>>>,
+    /// Per-server async mutex that serializes concurrent `session_for` calls
+    /// for the same server name. Prevents duplicate stdio child processes when
+    /// multiple callers race to bring up the same server for the first time.
+    /// The inner `Arc<TokioMutex<()>>` is held for the entire startup duration;
+    /// subsequent callers find the session already populated after the gate.
+    startup_gates: Arc<Mutex<BTreeMap<String, Arc<TokioMutex<()>>>>>,
+    /// Last-seen stderr lines for each stdio server, preserved after session
+    /// invalidation so `stderr_tail` returns useful output for failed/crashed
+    /// servers whose session has already been removed from `sessions`.
+    stderr_excerpts: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
     store: Option<Arc<SqueezyStore>>,
     status_tx: watch::Sender<McpStatusSnapshot>,
     elicitation_handler: Arc<Mutex<Option<McpElicitationHandler>>>,
@@ -314,6 +330,11 @@ pub struct McpClientRegistry {
     pause_state: ElicitationPauseState,
     resource_reads: Arc<Mutex<BTreeMap<(String, String), CachedResourceRead>>>,
     resource_declarations: Arc<Mutex<BTreeMap<String, CachedResourceDeclarations>>>,
+    /// Fired whenever any connected MCP server sends a `tools/list_changed`
+    /// notification.  External components (e.g. the agent turn loop) can
+    /// `await` this to learn that a server's tool palette may have changed
+    /// and schedule a targeted re-discovery via `refresh_one_server_tools`.
+    tool_list_changed: Arc<Notify>,
 }
 
 impl Default for McpClientRegistry {
@@ -336,6 +357,8 @@ impl McpClientRegistry {
             servers: Arc::new(std::sync::RwLock::new(Arc::new(servers))),
             cache: Arc::new(Mutex::new(BTreeMap::new())),
             sessions: Arc::new(TokioMutex::new(BTreeMap::new())),
+            startup_gates: Arc::new(Mutex::new(BTreeMap::new())),
+            stderr_excerpts: Arc::new(Mutex::new(BTreeMap::new())),
             store,
             status_tx,
             elicitation_handler: Arc::new(Mutex::new(None)),
@@ -346,6 +369,7 @@ impl McpClientRegistry {
             pause_state: ElicitationPauseState::default(),
             resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
             resource_declarations: Arc::new(Mutex::new(BTreeMap::new())),
+            tool_list_changed: Arc::new(Notify::new()),
         };
         registry.load_cached_tools();
         registry
@@ -440,6 +464,94 @@ impl McpClientRegistry {
 
     pub fn status_watch(&self) -> watch::Receiver<McpStatusSnapshot> {
         self.status_tx.subscribe()
+    }
+
+    /// Returns the `Notify` that is signalled whenever **any** connected
+    /// server sends a `tools/list_changed` notification.  The notification
+    /// carries no server identity; callers that need a precise refresh should
+    /// maintain their own server mapping, otherwise run a full discovery pass.
+    /// `notify_one()` is used so the signal survives a brief gap between
+    /// `notified()` calls; at most one permit is queued at a time.
+    pub fn tool_list_changed_notify(&self) -> Arc<Notify> {
+        self.tool_list_changed.clone()
+    }
+
+    /// Re-discover tools for a single named server and merge the result into
+    /// the shared cache and status snapshot.  Intended for handling
+    /// `tools/list_changed` notifications: call this instead of the full
+    /// `refresh_tools` to avoid unnecessary work on unchanged servers.
+    /// Because `tool_list_changed_notify()` carries no server identity, this
+    /// helper is only useful to callers that learned the changed server from
+    /// another source.
+    ///
+    /// If the server is not configured or is disabled the call is a no-op.
+    /// On discovery failure the server entry is moved to `Stale` using the
+    /// existing cached tools (consistent with `refresh_tools` behaviour).
+    pub async fn refresh_one_server_tools(&self, server_name: &str, cancel: CancellationToken) {
+        let servers = self.servers_snapshot();
+        let Some(server) = servers.get(server_name) else {
+            return;
+        };
+        if !server.enabled {
+            return;
+        }
+        let result = self.discover_one(server_name, server, cancel).await;
+        match result {
+            Ok(tools) => {
+                self.write_tool_cache(server_name, &tools);
+                let tools_count = tools.len();
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.retain(|_, t| t.server != server_name);
+                    cache.extend(normalize_palette(tools));
+                }
+                let mut snapshot = self.status_snapshot();
+                snapshot.per_server.insert(
+                    server_name.to_string(),
+                    McpServerStatus::Ready {
+                        tools_count,
+                        cached: false,
+                    },
+                );
+                snapshot.generated_unix_millis = unix_millis();
+                self.publish_status(snapshot);
+                tracing::info!(
+                    target: "squeezy::mcp",
+                    server = %server_name,
+                    tools_count,
+                    "re-discovered tools after tool_list_changed notification"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "squeezy::mcp",
+                    server = %server_name,
+                    error = %error,
+                    "failed to re-discover tools after tool_list_changed notification; retaining stale cache"
+                );
+                let stale_count = self
+                    .cache
+                    .lock()
+                    .map(|c| c.values().filter(|t| t.server == server_name).count())
+                    .unwrap_or(0);
+                let outcome = if matches!(error, McpError::Cancelled { .. }) {
+                    McpStaleOutcome::Cancelled
+                } else {
+                    McpStaleOutcome::Failed {
+                        error: error.to_string(),
+                    }
+                };
+                let mut snapshot = self.status_snapshot();
+                snapshot.per_server.insert(
+                    server_name.to_string(),
+                    McpServerStatus::Stale {
+                        tools_count: stale_count,
+                        outcome,
+                    },
+                );
+                snapshot.generated_unix_millis = unix_millis();
+                self.publish_status(snapshot);
+            }
+        }
     }
 
     pub async fn refresh_tools(&self, cancel: CancellationToken) -> McpRefreshOutcome {
@@ -820,10 +932,20 @@ impl McpClientRegistry {
         }
 
         let server = self.server_config(server_name)?;
-        if !self
+        let is_declared = match self
             .resource_uri_is_declared(server_name, &server, uri, cancel.clone())
-            .await?
+            .await
         {
+            Ok(v) => v,
+            Err(error) => {
+                // A transport error from the declaration check means the
+                // session is broken; invalidate it so the next call triggers
+                // a fresh startup.
+                self.invalidate_session(server_name).await;
+                return Err(error);
+            }
+        };
+        if !is_declared {
             return Err(McpError::UndeclaredResource {
                 server: server_name.to_string(),
                 uri: uri.to_string(),
@@ -853,19 +975,27 @@ impl McpClientRegistry {
                 })
             },
         )
-        .await?;
-        let result = strip_untrusted_meta(result);
-        if let Ok(mut cache) = self.resource_reads.lock() {
-            insert_resource_read(
-                &mut cache,
-                key,
-                CachedResourceRead {
-                    value: result.clone(),
-                    fetched_at: Instant::now(),
-                },
-            );
+        .await;
+        match result {
+            Err(error) => {
+                self.invalidate_session(server_name).await;
+                Err(error)
+            }
+            Ok(result) => {
+                let result = strip_untrusted_meta(result);
+                if let Ok(mut cache) = self.resource_reads.lock() {
+                    insert_resource_read(
+                        &mut cache,
+                        key,
+                        CachedResourceRead {
+                            value: result.clone(),
+                            fetched_at: Instant::now(),
+                        },
+                    );
+                }
+                Ok(result)
+            }
         }
-        Ok(result)
     }
 
     async fn discover_one(
@@ -979,6 +1109,29 @@ impl McpClientRegistry {
         server_name: &str,
         server: &McpServerConfig,
     ) -> McpResult<Arc<McpService>> {
+        // Fast path: session already exists.
+        {
+            let sessions = self.sessions.lock().await;
+            if let Some(entry) = sessions.get(server_name) {
+                return Ok(entry.service.clone());
+            }
+        }
+
+        // Serialise concurrent first-use for the same server name so that at
+        // most one stdio child process is ever started per server. The gate is
+        // a per-server async mutex stored in a sync map; we only hold the sync
+        // lock long enough to clone the Arc.
+        let gate = {
+            let mut gates = self.startup_gates.lock().unwrap_or_else(|p| p.into_inner());
+            gates
+                .entry(server_name.to_string())
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone()
+        };
+        let _gate_guard = gate.lock().await;
+
+        // Re-check after acquiring the gate: a concurrent caller may have
+        // already started the session while we were waiting.
         {
             let sessions = self.sessions.lock().await;
             if let Some(entry) = sessions.get(server_name) {
@@ -994,35 +1147,84 @@ impl McpClientRegistry {
             pause_state: self.pause_state.clone(),
             resource_reads: self.resource_reads.clone(),
             resource_declarations: self.resource_declarations.clone(),
+            tool_list_changed: self.tool_list_changed.clone(),
         };
         let entry = match server.transport {
-            McpTransport::Stdio => start_stdio_service(server_name, server, handler).await?,
+            McpTransport::Stdio => {
+                start_stdio_service(server_name, server, handler, self.stderr_excerpts.clone())
+                    .await?
+            }
             McpTransport::Http => start_http_service(server_name, server, handler).await?,
             McpTransport::Sse => start_sse_service(server_name, server, handler).await?,
         };
         let arc = Arc::new(entry);
-        let mut sessions = self.sessions.lock().await;
-        if let Some(existing) = sessions.get(server_name) {
-            return Ok(existing.service.clone());
+        if let Ok(mut excerpts) = self.stderr_excerpts.lock() {
+            excerpts.remove(server_name);
         }
+        let mut sessions = self.sessions.lock().await;
         sessions.insert(server_name.to_string(), arc.clone());
         Ok(arc.service.clone())
     }
 
     async fn invalidate_session(&self, server_name: &str) {
-        let mut sessions = self.sessions.lock().await;
-        sessions.remove(server_name);
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(server_name)
+        };
+        // Preserve the last stderr lines so they survive session teardown and
+        // remain available to `stderr_tail` for diagnostics (e.g. doctor --probe).
+        if let Some(entry) = removed {
+            if let Some(ring) = &entry.stderr_ring {
+                preserve_stderr_excerpt(
+                    &self.stderr_excerpts,
+                    server_name,
+                    stderr_ring_snapshot(ring),
+                );
+            } else if let Ok(mut excerpts) = self.stderr_excerpts.lock() {
+                excerpts.remove(server_name);
+            }
+        }
         if let Ok(mut cache) = self.resource_declarations.lock() {
             cache.remove(server_name);
         }
     }
 
     pub async fn shutdown(&self) {
+        if let Ok(mut gates) = self.startup_gates.lock() {
+            gates.clear();
+        }
         let mut sessions = self.sessions.lock().await;
         sessions.clear();
         if let Ok(mut cache) = self.resource_declarations.lock() {
             cache.clear();
         }
+        if let Ok(mut excerpts) = self.stderr_excerpts.lock() {
+            excerpts.clear();
+        }
+    }
+
+    /// Return a snapshot of the recent stderr lines for the named stdio MCP
+    /// server. If the server has an active session, the live ring buffer is
+    /// returned. If the session was already invalidated (e.g., after a failed
+    /// discovery), the last preserved excerpt is returned instead so
+    /// diagnostics (e.g., `doctor --probe`) still see the output.
+    pub async fn stderr_tail(&self, server_name: &str) -> Vec<String> {
+        {
+            let sessions = self.sessions.lock().await;
+            if let Some(entry) = sessions.get(server_name) {
+                return entry
+                    .stderr_ring
+                    .as_ref()
+                    .and_then(|ring| ring.lock().ok())
+                    .map(|r| r.iter().cloned().collect())
+                    .unwrap_or_default();
+            }
+        }
+        // Session gone (invalidated); return any preserved excerpt.
+        self.stderr_excerpts
+            .lock()
+            .map(|ex| ex.get(server_name).cloned().unwrap_or_default())
+            .unwrap_or_default()
     }
 
     /// Server-advertised capabilities captured during `initialize`, or `None`
@@ -1131,6 +1333,7 @@ impl McpClientRegistry {
             pause_state: self.pause_state.clone(),
             resource_reads: self.resource_reads.clone(),
             resource_declarations: self.resource_declarations.clone(),
+            tool_list_changed: self.tool_list_changed.clone(),
         }
     }
 
@@ -1330,25 +1533,43 @@ impl McpClientRegistry {
             return Ok(cached);
         }
 
-        let resources_result = self
+        // Propagate transport-level errors so a broken session is surfaced to
+        // the caller (which then calls `invalidate_session`) rather than being
+        // silently swallowed and leaving the stale session cached indefinitely.
+        let resources = match self
             .all_resources(server_name, server, cancel.clone())
-            .await;
-        let resources = resources_result.as_ref().map(Vec::as_slice).unwrap_or(&[]);
-        if let Ok(resources) = &resources_result {
-            self.store_resource_declarations_partial(server_name, Some(resources), None);
-            if resources.iter().any(|resource| resource.raw.uri == uri) {
-                return Ok(true);
+            .await
+        {
+            Ok(r) => {
+                self.store_resource_declarations_partial(server_name, Some(&r), None);
+                if r.iter().any(|resource| resource.raw.uri == uri) {
+                    return Ok(true);
+                }
+                r
             }
-        }
+            Err(
+                e @ (McpError::Transport { .. }
+                | McpError::Timeout { .. }
+                | McpError::Cancelled { .. }),
+            ) => return Err(e),
+            Err(_) => Vec::new(),
+        };
 
-        let templates_result = self
+        let templates = match self
             .all_resource_templates(server_name, server, cancel)
-            .await;
-        let templates = templates_result.as_ref().map(Vec::as_slice).unwrap_or(&[]);
-
-        if let Ok(templates) = &templates_result {
-            self.store_resource_declarations_partial(server_name, None, Some(templates));
-        }
+            .await
+        {
+            Ok(t) => {
+                self.store_resource_declarations_partial(server_name, None, Some(&t));
+                t
+            }
+            Err(
+                e @ (McpError::Transport { .. }
+                | McpError::Timeout { .. }
+                | McpError::Cancelled { .. }),
+            ) => return Err(e),
+            Err(_) => Vec::new(),
+        };
 
         Ok(resources.iter().any(|resource| resource.raw.uri == uri)
             || templates
@@ -1422,6 +1643,10 @@ struct SessionEntry {
     /// returns. `None` only if the peer never delivered an `initialize` result,
     /// which would have failed the bring-up before this `SessionEntry` exists.
     server_capabilities: Option<ServerCapabilities>,
+    /// Ring buffer of recent stderr lines from the stdio child process.
+    /// Bounded to `STDERR_RING_CAPACITY` lines; each line is truncated to
+    /// `STDERR_LINE_MAX_BYTES` bytes. `None` for non-stdio transports.
+    stderr_ring: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
 }
 
 #[derive(Debug)]
@@ -1459,6 +1684,10 @@ struct SqueezyMcpClientHandler {
     /// Shared with `McpClientRegistry` so resource-list changes invalidate the
     /// declaration gate cache alongside cached reads.
     resource_declarations: Arc<Mutex<BTreeMap<String, CachedResourceDeclarations>>>,
+    /// Shared with `McpClientRegistry`; notified when the server signals that
+    /// its tool list has changed so the registry (or an observing agent layer)
+    /// can schedule a targeted re-discovery via `refresh_one_server_tools`.
+    tool_list_changed: Arc<Notify>,
 }
 
 impl SqueezyMcpClientHandler {
@@ -1665,8 +1894,12 @@ impl ClientHandler for SqueezyMcpClientHandler {
         tracing::info!(
             target: "squeezy::mcp",
             server = %self.server_name,
-            "MCP server tool list changed"
+            "MCP server tool list changed; signalling registry for re-discovery"
         );
+        // `notify_one()` stores a permit so the signal survives a brief gap
+        // between poll cycles (unlike `notify_waiters()` which drops the
+        // event if no waiter is currently blocked).
+        self.tool_list_changed.notify_one();
     }
 
     async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {
@@ -1873,6 +2106,7 @@ async fn start_stdio_service(
     server_name: &str,
     server: &McpServerConfig,
     handler: SqueezyMcpClientHandler,
+    stderr_excerpts: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
 ) -> McpResult<SessionEntry> {
     let command = server
         .command
@@ -1929,18 +2163,45 @@ async fn start_stdio_service(
         });
         pid.map(|pid| StdioProcessHandle::new(pid, job))
     };
-    if let Some(stderr) = stderr {
+    let stderr_ring: Arc<Mutex<std::collections::VecDeque<String>>> = Arc::new(Mutex::new(
+        std::collections::VecDeque::with_capacity(STDERR_RING_CAPACITY),
+    ));
+    let stderr_reader = if let Some(stderr) = stderr {
         let server_name = server_name.to_string();
-        tokio::spawn(async move {
+        let ring = stderr_ring.clone();
+        Some(tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             loop {
                 match lines.next_line().await {
-                    Ok(Some(line)) => tracing::info!(
-                        target: "squeezy::mcp",
-                        server = %server_name,
-                        stderr = %line,
-                        "MCP server stderr"
-                    ),
+                    Ok(Some(raw_line)) => {
+                        // Truncate untrusted child output before logging or
+                        // storing to avoid log injection and memory growth.
+                        // Find the largest UTF-8 char boundary ≤ the byte
+                        // cap so we never slice mid-codepoint and panic.
+                        let line = if raw_line.len() > STDERR_LINE_MAX_BYTES {
+                            let end = (0..=STDERR_LINE_MAX_BYTES)
+                                .rev()
+                                .find(|&i| raw_line.is_char_boundary(i))
+                                .unwrap_or(0);
+                            let mut s = raw_line[..end].to_string();
+                            s.push_str(" [truncated]");
+                            s
+                        } else {
+                            raw_line
+                        };
+                        tracing::info!(
+                            target: "squeezy::mcp",
+                            server = %server_name,
+                            stderr = %line,
+                            "MCP server stderr"
+                        );
+                        if let Ok(mut ring) = ring.lock() {
+                            if ring.len() >= STDERR_RING_CAPACITY {
+                                ring.pop_front();
+                            }
+                            ring.push_back(line);
+                        }
+                    }
                     Ok(None) => break,
                     Err(error) => {
                         tracing::warn!(
@@ -1953,21 +2214,54 @@ async fn start_stdio_service(
                     }
                 }
             }
-        });
-    }
-    let service = handler
-        .serve(transport)
-        .await
-        .map_err(|err| McpError::Transport {
-            server: server_name.to_string(),
-            message: err.to_string(),
-        })?;
+        }))
+    } else {
+        None
+    };
+    let service = match handler.serve(transport).await {
+        Ok(service) => service,
+        Err(err) => {
+            if let Some(reader) = stderr_reader {
+                let _ = tokio::time::timeout(Duration::from_millis(50), reader).await;
+            }
+            preserve_stderr_excerpt(
+                &stderr_excerpts,
+                server_name,
+                stderr_ring_snapshot(&stderr_ring),
+            );
+            return Err(McpError::Transport {
+                server: server_name.to_string(),
+                message: err.to_string(),
+            });
+        }
+    };
     let server_capabilities = service.peer_info().map(|info| info.capabilities.clone());
     Ok(SessionEntry {
         service: Arc::new(service),
         _process: process_handle,
         server_capabilities,
+        stderr_ring: Some(stderr_ring),
     })
+}
+
+fn stderr_ring_snapshot(ring: &Arc<Mutex<std::collections::VecDeque<String>>>) -> Vec<String> {
+    ring.lock()
+        .map(|ring| ring.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn preserve_stderr_excerpt(
+    excerpts: &Arc<Mutex<BTreeMap<String, Vec<String>>>>,
+    server_name: &str,
+    lines: Vec<String>,
+) {
+    if let Ok(mut excerpts) = excerpts.lock() {
+        if lines.is_empty() {
+            excerpts.remove(server_name);
+        } else {
+            excerpts.insert(server_name.to_string(), lines);
+        }
+    }
 }
 
 async fn start_http_service(
@@ -1999,6 +2293,7 @@ async fn start_http_service(
         service: Arc::new(service),
         _process: None,
         server_capabilities,
+        stderr_ring: None,
     })
 }
 
@@ -2040,6 +2335,7 @@ async fn start_sse_service(
         service: Arc::new(service),
         _process: None,
         server_capabilities,
+        stderr_ring: None,
     })
 }
 
@@ -2757,6 +3053,37 @@ fn uri_template_placeholder_allows_slashes(placeholder: &str) -> bool {
 }
 
 fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {
+    // Hash secret values before including them in the fingerprint so the key
+    // is safe to store in the on-disk DB while still invalidating when a
+    // credential rotates.  We include enough signal to detect any auth/header
+    // change without embedding the raw secrets:
+    //   - env key → SHA-256-prefix(value) — env values are runtime secrets.
+    //   - static header key → SHA-256-prefix(value) — header values may be
+    //     tokens; hashed so the key is safe to persist.
+    //   - bearer_token_env_var name — static config, safe to store as-is.
+    //   - env_http_headers key → env-var-name pairs — both the HTTP header
+    //     name and the env-var name that backs it are static config. If an
+    //     operator changes `{ "X-Auth" = "OLD_TOKEN_VAR" }` to
+    //     `{ "X-Auth" = "NEW_TOKEN_VAR" }`, the fingerprint must change.
+    let env_value_hashes: Vec<(&str, String)> = server
+        .env
+        .iter()
+        .map(|(k, v)| (k.as_str(), sha256_hex_prefix(v.as_bytes(), 16)))
+        .collect();
+    let header_value_hashes: Vec<(&str, String)> = server
+        .http_headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), sha256_hex_prefix(v.as_bytes(), 16)))
+        .collect();
+    // `env_http_headers` maps HTTP-header-name → env-var-name.  Both parts
+    // are static config that affect which credential is loaded at session
+    // start; include both so renaming either the header or the env-var
+    // triggers cache eviction.
+    let env_http_headers_pairs: Vec<(&str, &str)> = server
+        .env_http_headers
+        .iter()
+        .map(|(header, env_var)| (header.as_str(), env_var.as_str()))
+        .collect();
     let fingerprint = json!({
         "schema": MCP_TOOL_CACHE_SCHEMA_VERSION,
         "server": server_name,
@@ -2768,9 +3095,12 @@ fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {
         "timeout_ms": server.timeout_ms,
         "discovery_timeout_ms": server.discovery_timeout_ms,
         "tool_call_timeout_ms": server.tool_call_timeout_ms,
-        "env_keys": server.env.keys().collect::<Vec<_>>(),
+        "env_value_hashes": env_value_hashes,
         "enabled_tools": &server.enabled_tools,
         "disabled_tools": &server.disabled_tools,
+        "bearer_token_env_var": &server.bearer_token_env_var,
+        "header_value_hashes": header_value_hashes,
+        "env_http_headers": env_http_headers_pairs,
     });
     format!(
         "{server_name}\0{}",

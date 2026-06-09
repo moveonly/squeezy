@@ -311,7 +311,9 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::AiReviewerTripped { reason, .. } => {
                     app.status = "approval review paused".to_string();
-                    app.push_log(format!("AI approval reviewer paused: {reason}"));
+                    app.push_log(format!(
+                        "AI reviewer unavailable ({reason}); asking you directly."
+                    ));
                 }
                 AgentEvent::ApprovalRequested {
                     request,
@@ -371,6 +373,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::Completed {
                     message,
+                    cost,
                     metrics,
                     context_estimate,
                     session_cost,
@@ -396,6 +399,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // last known value rather than blanking.
                     if let Some(session_cost) = session_cost {
                         app.cost = session_cost;
+                    }
+                    // Emit a compact turn-level cost footer so users can
+                    // connect a completed turn to its marginal cost without
+                    // needing to open /cost.
+                    if cost.input_tokens.is_some() || cost.estimated_usd_micros.is_some() {
+                        let delta = format_turn_cost_delta(&cost);
+                        app.push_log(delta);
                     }
                     app.metrics = metrics;
                     app.status = "ready".to_string();
@@ -424,19 +434,54 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 } => {
                     let notice = format_cap_unenforceable_notice(&provider, &model);
                     app.push_transcript_item(TranscriptItem::system(notice));
+                    // Persist flag so the status-line cost segment shows a
+                    // reminder until a priced cost update proves the cap is
+                    // enforceable again.
+                    app.cap_unenforceable = true;
                 }
                 AgentEvent::ShellSandboxBestEffortFallback {
                     backend,
                     fallback_count,
+                    fallback_reason,
                     ..
                 } => {
                     // Fires at most once per session — the agent's
                     // `maybe_emit_shell_sandbox_fallback_warning` gates on
                     // the tool-layer one-shot latch. Land a durable warning
                     // in the transcript so users notice mid-turn AND keep a
-                    // record.
+                    // record. Include the fallback reason when available so
+                    // users can tell whether the degradation was a probe
+                    // timeout, spawn/pre-exec blocked, or a cached failure.
+                    let reason_suffix = fallback_reason
+                        .as_deref()
+                        .map(|r| format!(": {r}"))
+                        .unwrap_or_default();
                     let notice = format!(
-                        "shell sandbox degraded: backend `{backend}` unavailable; subsequent shell calls run without OS isolation under mode=best_effort (fallback #{fallback_count})"
+                        "shell sandbox degraded: backend `{backend}` unavailable{reason_suffix}; subsequent shell calls run without OS isolation under mode=best_effort (fallback #{fallback_count})"
+                    );
+                    app.push_warn(notice);
+                }
+                AgentEvent::WindowsSandboxActive { .. } => {
+                    // Fires exactly once, at the start of the first turn on
+                    // Windows. The Windows Job-Object backend provides
+                    // process-tree cleanup only; it is not a runtime
+                    // fallback — it is the intentional Windows design.
+                    // Surface a durable session-level banner so users see
+                    // the isolation caveat before running any shell command.
+                    app.push_warn(
+                        "Windows shell sandbox: Job Objects provide process-tree cleanup only. \
+                         Filesystem and network isolation are unavailable. \
+                         Review and approve shell commands carefully."
+                            .to_string(),
+                    );
+                }
+                AgentEvent::ShellWindowsDegraded { backend, .. } => {
+                    // Fires at most once per session on Windows. Unlike
+                    // ShellSandboxBestEffortFallback this is not a runtime
+                    // failure — the Windows sandbox posture is always
+                    // degraded when running with windows-job-object.
+                    let notice = format!(
+                        "shell sandbox: running on Windows with backend `{backend}`; no filesystem or network isolation is enforced. Shell commands run with process-tree cleanup only."
                     );
                     app.push_warn(notice);
                 }
@@ -457,6 +502,11 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     if let Some(session_cost) = session_cost {
                         app.cost = session_cost;
                     }
+                    // A non-zero micro_usd means the active model has known pricing;
+                    // clear the persistent unpriced-cap marker.
+                    if micro_usd > 0 {
+                        app.cap_unenforceable = false;
+                    }
                 }
                 AgentEvent::ToolProgress {
                     tool_name,
@@ -468,12 +518,20 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // one append per second drowns the actual output.
                     app.note_active_tool_progress(&tool_name, elapsed_ms);
                 }
-                AgentEvent::Cancelled { session_cost, .. } => {
+                AgentEvent::Cancelled {
+                    cost, session_cost, ..
+                } => {
                     // Keep the session-cumulative cost on the status line after
                     // a mid-turn cancel (the partial round was already billed),
                     // instead of letting it go stale / blank.
                     if let Some(session_cost) = session_cost {
                         app.cost = session_cost;
+                    }
+                    // Emit the partial turn cost even on cancel — cancelled
+                    // rounds are billed for completed work.
+                    if cost.input_tokens.is_some() || cost.estimated_usd_micros.is_some() {
+                        let delta = format_turn_cost_delta(&cost);
+                        app.push_log(format!("cancelled · {delta}"));
                     }
                     app.clear_status_context_request_tokens();
                     let mut message = "cancelled; edit prompt or retry".to_string();
@@ -551,7 +609,17 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // than a System transcript item, which rendered the off-rail
                     // `• Noted ↪ routed …` line that severed the gutter.
                     app.push_note(format!("routed `{from}` → `{to}` ({reason})"));
+                    // Do not clear cap_unenforceable here: the new model may also
+                    // be unpriced, and the broker's latch won't re-fire within this
+                    // same turn. The flag is cleared only when we observe an actual
+                    // priced round (CostUpdate with micro_usd > 0).
                 }
+                // Citation annotations from provider streams: surfaced for future
+                // TUI rendering (source attribution panel); ignored for now.
+                AgentEvent::Citation { .. } => {}
+                // Control-tool trace events: useful for debugging and eval replay;
+                // not rendered in the TUI at this time.
+                AgentEvent::ControlToolTrace { .. } => {}
             }
         }
         if keep_rx {
@@ -780,7 +848,7 @@ pub(crate) fn drain_pending_mention_walk(app: &mut TuiApp) {
 
 fn edit_recovery_hint(app: &TuiApp) -> &'static str {
     if app.checkpoints_enabled {
-        "/diff to inspect changes · /undo to revert this turn"
+        "/diff to inspect changes · /undo latest checkpoint · /revert-turn <group_id> for a full turn"
     } else {
         "/diff to inspect changes"
     }
@@ -814,6 +882,38 @@ fn prune_tui_jobs(jobs: &mut BTreeMap<JobId, JobSnapshot>) {
         jobs.remove(&id);
         to_remove -= 1;
     }
+}
+
+/// Compact per-turn cost/token footer shown in the transcript log at turn
+/// completion. Connects a visible turn to its marginal provider cost without
+/// requiring the user to open `/cost`.
+fn format_turn_cost_delta(cost: &squeezy_core::CostSnapshot) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    if let Some(usd) = cost.estimated_usd_micros {
+        parts.push(format!("${:.6}", usd as f64 / 1_000_000.0));
+    }
+    // Emit both input and output independently so neither is dropped when only
+    // one is present (some providers stream partial usage with only one field).
+    if let Some(inp) = cost.input_tokens {
+        if let Some(out) = cost.output_tokens {
+            parts.push(format!("in {inp} out {out}"));
+        } else {
+            parts.push(format!("in {inp}"));
+        }
+    } else if let Some(out) = cost.output_tokens {
+        parts.push(format!("out {out}"));
+    }
+    if let Some(r) = cost.cached_input_tokens
+        && r > 0
+    {
+        parts.push(format!("cached {r}"));
+    }
+    if let Some(w) = cost.cache_write_input_tokens
+        && w > 0
+    {
+        parts.push(format!("cache_write {w}"));
+    }
+    format!("turn: {}", parts.join(" · "))
 }
 
 pub(crate) fn apply_job_notification(app: &mut TuiApp, notification: JobNotification) {

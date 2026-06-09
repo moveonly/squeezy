@@ -32,6 +32,23 @@ fn section_lookup_is_consistent() {
 }
 
 #[test]
+fn graph_section_exposes_all_policy_arrays() {
+    let graph = section(SectionId::Graph).expect("graph section");
+    let labels = graph
+        .fields
+        .iter()
+        .map(|field| field.label)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for label in ["include", "exclude", "include_classes", "exclude_classes"] {
+        assert!(
+            labels.contains(label),
+            "graph config schema should expose {label}"
+        );
+    }
+}
+
+#[test]
 fn absent_field_values_render_as_dash() {
     assert_eq!(FieldValue::OptionalInteger(None).as_display(), "—");
     assert_eq!(FieldValue::OptionalFloat(None).as_display(), "—");
@@ -215,6 +232,10 @@ fn subagent_integer_schema_defaults_match_runtime_constants() {
         runtime_default: i64,
     }
     let cases = [
+        Case {
+            label: "max_concurrent",
+            runtime_default: crate::DEFAULT_SUBAGENT_MAX_CONCURRENT as i64,
+        },
         Case {
             label: "max_tool_calls_per_call",
             runtime_default: crate::DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL as i64,

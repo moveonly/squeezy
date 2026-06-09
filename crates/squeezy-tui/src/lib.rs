@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env, fmt,
     hash::{Hash, Hasher},
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -36,21 +36,22 @@ use serde::Deserialize;
 #[cfg(test)]
 use squeezy_agent::RequestUserInputChoice;
 use squeezy_agent::{
-    Agent, AgentEvent, DispatchCommand, DispatchCommandParseError, JobEvent, JobId,
-    JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS, PendingConfigSwap,
+    Agent, AgentEvent, CompactSubcommand, DispatchCommand, DispatchCommandParseError, JobEvent,
+    JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS, PendingConfigSwap,
     RequestUserInputRequest, RequestUserInputResponse, SessionAccountingSnapshot, SubagentId,
     ToolApprovalDecision, ToolApprovalRequest,
 };
 use squeezy_core::{
     AppConfig, ConfigWarning, ContextAttachment, ContextAttachmentKind, ContextCompactionRecord,
     ContextCompactionState, ContextEstimate, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES,
-    PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
-    ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig,
-    ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiSynchronizedOutput, TurnMetrics,
-    context_attachment_storage_text, detect_context_attachment_kind, detect_image_mime,
+    PermissionCapability, PermissionPolicy, PermissionRequest, ResponseVerbosity, Result, Role,
+    SessionMode, ShellDiffInline, SqueezyError, StatusVerbosity, TaskStateSnapshot,
+    TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem, TuiSynchronizedOutput,
+    TurnMetrics, context_attachment_storage_text, detect_context_attachment_kind,
+    detect_image_mime,
 };
 use squeezy_llm::{LlmInputItem, LlmProvider};
-use squeezy_skills::PromptTemplateCatalog;
+use squeezy_skills::{HelpStatus, PromptTemplateCatalog, SqueezyHelp};
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
 use squeezy_telemetry::{
     ConfigApplyTier, ConfigChangeKind, ConfigChangeReport, ConfigScopeKind, PreparedFeedback,
@@ -331,6 +332,8 @@ where
         || env_get("ALACRITTY_LOG").is_some()
         || env_get("ALACRITTY_WINDOW_ID").is_some()
         || env_get("ITERM_SESSION_ID").is_some()
+        // Windows Terminal sets WT_SESSION per-tab; it supports DEC 2026.
+        || env_get("WT_SESSION").is_some()
     {
         return true;
     }
@@ -1065,11 +1068,9 @@ fn maybe_pick_resume_session(
     .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
     match choice {
         resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
-        // `branch_tip` is captured by the picker but not yet wired through
-        // the resume flow — the agent restarts at the most recent event in
-        // the session log. Branch-aware resume is a follow-up; the
-        // schema/picker landing first lets future producers populate
-        // `parent_event_sequence` without churn here.
+        // The picker only emits linear entries (branch-tip rows are collapsed
+        // until branch-aware resume is implemented), so `branch_tip` is always
+        // `None` here. The field is preserved in the enum for future use.
         resume_picker::ResumeChoice::Resume {
             session_id,
             branch_tip: _,
@@ -1742,7 +1743,13 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             };
             app.status = format!("resumed session {session_id}");
         }
-        Err(error) => app.status = format!("resume failed: {error}"),
+        Err(error) => {
+            set_status_with_notice(
+                app,
+                format!("resume failed: {error}"),
+                format!("Resume failed: {error}\nCheck that the session exists and is resumable."),
+            );
+        }
     }
 }
 
@@ -2548,9 +2555,13 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 app.status_line_setup = None;
                 app.status = "/statusline cancelled".to_string();
             }
-            status_line_setup::KeyOutcome::Save { items, use_colors } => {
+            status_line_setup::KeyOutcome::Save {
+                items,
+                use_colors,
+                scope,
+            } => {
                 app.status_line_setup = None;
-                save_status_line(app, agent, items, use_colors);
+                save_status_line(app, agent, items, use_colors, scope);
             }
         }
         return Ok(false);
@@ -3451,18 +3462,28 @@ fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: String) {
 }
 
 /// Persist the picker's selection to `[tui].status_line` /
-/// `[tui].status_line_use_colors` in the user-scope settings file and
-/// apply it in-memory immediately.
+/// `[tui].status_line_use_colors` in the chosen scope (user or project
+/// settings file) and apply it in-memory immediately.
 fn save_status_line(
     app: &mut TuiApp,
     agent: &mut Agent,
     items: Vec<status::StatusLineItem>,
     use_colors: bool,
+    scope: status_line_setup::SaveScope,
 ) {
     use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
 
-    let target_path = app.user_settings_path();
-    let scope_target = SettingsScope::user(&target_path);
+    let scope_target = match scope {
+        status_line_setup::SaveScope::User => {
+            let p = app.user_settings_path();
+            SettingsScope::user(&p)
+        }
+        status_line_setup::SaveScope::Project => {
+            let p = squeezy_core::find_project_settings_path(&app.workspace_root)
+                .unwrap_or_else(|| app.workspace_root.join(squeezy_core::PROJECT_SETTINGS_FILE));
+            SettingsScope::project(&p)
+        }
+    };
     let slug_list: Vec<String> = items.iter().map(|i| i.slug().to_string()).collect();
     let edits = [
         SettingsEdit {
@@ -3487,19 +3508,31 @@ fn save_status_line(
             agent.replace_config(cfg);
             app.status_line_items = Some(items);
             app.status_line_use_colors = use_colors;
-            app.status = format!("status line saved to {}", target_path.display());
+            let target_display = scope_target.path.display();
+            app.status = format!("status line saved to {target_display}");
+            // Squeezy's settings tiers merge in the order defaults → user →
+            // project → repo, with later tiers overriding earlier ones (see
+            // squeezy_core::load_settings_from_paths and TuiSettings::merge).
+            // So a project-scope save already wins over the user tier on
+            // restart; the only thing that would override it is a per-machine
+            // entry in ~/.squeezy/projects/<repo-id>/settings.toml.
+            let project_note = if matches!(scope, status_line_setup::SaveScope::Project) {
+                "\n\nNote: this project layout takes precedence over user settings on restart. \
+                 A per-machine entry in `~/.squeezy/projects/<repo-id>/settings.toml` would \
+                 still override it."
+            } else {
+                ""
+            };
             let summary = if slug_list.is_empty() {
                 format!(
-                    "status line cleared (colors {}); written to {}",
+                    "status line cleared (colors {}); written to {target_display}{project_note}",
                     if use_colors { "on" } else { "off" },
-                    target_path.display(),
                 )
             } else {
                 format!(
-                    "status line saved: {} (colors {}); written to {}",
+                    "status line saved: {} (colors {}); written to {target_display}{project_note}",
                     slug_list.join(", "),
                     if use_colors { "on" } else { "off" },
-                    target_path.display(),
                 )
             };
             app.push_transcript_item(TranscriptItem::system(summary));
@@ -3515,12 +3548,12 @@ fn save_status_line(
 /// Whether the transcript should show a styled banner for this slash
 /// command's invocation. Commands that open their own UI overlay
 /// (`/config`, `/statusline`, …) are silenced — the overlay is the
-/// affordance. Commands that route through `start_user_turn` and
-/// already produce a user-message bubble (`/help`) are also silenced
-/// to avoid duplication. `/tool-verbosity` reports when called bare but
-/// silently applies a value when given an arg — echo only the second form.
-/// Unrecognized commands are not echoed: they fall through to be sent as
-/// regular user prompts.
+/// affordance. `/help` is silenced: for answered topics it pushes a system
+/// transcript card directly; for unknown topics the `start_user_turn` fallback
+/// produces a user-message bubble — echo in either case would duplicate output.
+/// `/tool-verbosity` reports when called bare but silently applies a value when
+/// given an arg — echo only the second form. Unrecognized commands are not
+/// echoed: they fall through to be sent as regular user prompts.
 fn should_echo_slash_command(command: &str, rest: &str) -> bool {
     if !SLASH_COMMANDS.iter().any(|spec| spec.name == command) {
         return false;
@@ -3683,7 +3716,9 @@ fn telemetry_tui_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         | DispatchCommand::Statusline
         | DispatchCommand::Keymap
         | DispatchCommand::Cheap
-        | DispatchCommand::Parent => SlashArgShape::None,
+        | DispatchCommand::Parent
+        | DispatchCommand::Terminal => SlashArgShape::None,
+        DispatchCommand::CheckpointsDoctor => SlashArgShape::FixedSubcommand,
         DispatchCommand::Attach { .. } => SlashArgShape::Path,
         DispatchCommand::Plan { prompt } | DispatchCommand::Build { prompt } => {
             slash_option_shape(prompt.as_ref(), SlashArgShape::FreeText)
@@ -3702,13 +3737,10 @@ fn telemetry_tui_slash_arg_shape(cmd: &DispatchCommand) -> SlashArgShape {
         DispatchCommand::Config { section } => {
             slash_option_shape(section.as_ref(), SlashArgShape::FixedSubcommand)
         }
-        DispatchCommand::Compact { undo } => {
-            if *undo {
-                SlashArgShape::FixedSubcommand
-            } else {
-                SlashArgShape::None
-            }
-        }
+        DispatchCommand::Compact { subcommand } => match subcommand {
+            CompactSubcommand::Undo | CompactSubcommand::History => SlashArgShape::FixedSubcommand,
+            CompactSubcommand::Run => SlashArgShape::None,
+        },
         DispatchCommand::Plans { args }
         | DispatchCommand::Feedback { args }
         | DispatchCommand::Report { args } => {
@@ -4096,8 +4128,47 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 );
             }
         },
-        DispatchCommand::Compact { undo } => {
-            if undo {
+        DispatchCommand::Compact { subcommand } => {
+            if matches!(subcommand, CompactSubcommand::History) {
+                app.context_compaction = agent.context_compaction_snapshot().await;
+                let compaction = &app.context_compaction;
+                if compaction.history.is_empty() {
+                    set_status_with_notice(
+                        app,
+                        "no compaction history",
+                        "No compaction events recorded for this session yet.",
+                    );
+                } else {
+                    app.status = format!(
+                        "compaction history: {} generation(s)",
+                        compaction.history.len()
+                    );
+                    let lines: Vec<String> = compaction
+                        .history
+                        .iter()
+                        .map(|record| {
+                            let undo_mark = if record.replacement_id.is_some() {
+                                " [undoable]"
+                            } else {
+                                ""
+                            };
+                            format!(
+                                "gen={} trigger={} {before}→{after} tok dropped={dropped}{undo_mark}",
+                                record.generation,
+                                record.trigger.as_str(),
+                                before = record.before.estimated_tokens,
+                                after = record.after.estimated_tokens,
+                                dropped = record.dropped_items,
+                            )
+                        })
+                        .collect();
+                    app.push_transcript_item(TranscriptItem::system(format!(
+                        "Compaction history ({} generation(s)):\n{}",
+                        compaction.history.len(),
+                        lines.join("\n"),
+                    )));
+                }
+            } else if matches!(subcommand, CompactSubcommand::Undo) {
                 match agent.compact_context_undo().await {
                     Ok(Some(record)) => {
                         app.context_compaction = agent.context_compaction_snapshot().await;
@@ -4137,9 +4208,13 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                             report.record.before.estimated_tokens,
                             report.record.after.estimated_tokens
                         ));
+                        let undo_hint = if report.record.replacement_id.is_some() {
+                            " Run `/compact undo` to restore."
+                        } else {
+                            ""
+                        };
                         app.push_transcript_item(TranscriptItem::system(format!(
-                            "/compact discarded {dropped} item(s); context {before}→{after} tokens. \
-                             Run `/compact undo` to restore.",
+                            "/compact discarded {dropped} item(s); context {before}→{after} tokens.{undo_hint}",
                             dropped = report.record.dropped_items,
                             before = report.record.before.estimated_tokens,
                             after = report.record.after.estimated_tokens,
@@ -4226,9 +4301,26 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         DispatchCommand::Diff => handle_slash_diff(app),
         DispatchCommand::Cheap => {
             agent.request_routing_force_cheap();
-            app.push_transcript_item(TranscriptItem::system(
-                "next turn forced to the cheap model (one-shot)".to_string(),
-            ));
+            let cheap = agent.cheap_model();
+            let provider = agent.provider_name();
+            let raw_parent = agent.config().model.as_str();
+            let parent_model =
+                squeezy_core::resolve_model_alias(provider, raw_parent).unwrap_or(raw_parent);
+            const FALLBACK_NOTE_SUFFIX: &str = "the next turn will fall back to the parent model.";
+            let note = match cheap.as_deref() {
+                Some(c) if c == parent_model => format!(
+                    "\nNote: the cheap model resolves to the same model as the parent; \
+                     {FALLBACK_NOTE_SUFFIX}"
+                ),
+                None => format!(
+                    "\nNote: no distinct cheap model is configured for this provider; \
+                     {FALLBACK_NOTE_SUFFIX}"
+                ),
+                Some(_) => String::new(),
+            };
+            app.push_transcript_item(TranscriptItem::system(format!(
+                "next turn forced to the cheap model (one-shot){note}"
+            )));
             app.status = "routing: forced cheap next turn".to_string();
         }
         DispatchCommand::Parent => {
@@ -4286,6 +4378,12 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             } else {
                 format!("keymap ({overrides} override(s))")
             };
+            app.push_transcript_item(TranscriptItem::system(body));
+        }
+        DispatchCommand::Terminal => {
+            let sync_policy = agent.config().tui.synchronized_output;
+            let body = build_terminal_diagnostic(app, sync_policy);
+            app.status = "terminal diagnostics".to_string();
             app.push_transcript_item(TranscriptItem::system(body));
         }
         DispatchCommand::Tasks => {
@@ -4510,6 +4608,9 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
         }
         DispatchCommand::Checkpoints => {
             start_local_checkpoint_job(app, agent, "checkpoint_list", serde_json::json!({}))
+        }
+        DispatchCommand::CheckpointsDoctor => {
+            start_local_checkpoint_job(app, agent, "checkpoint_doctor", serde_json::json!({}))
         }
         DispatchCommand::Undo => {
             start_local_checkpoint_job(app, agent, "checkpoint_undo", serde_json::json!({}))
@@ -4848,6 +4949,25 @@ fn handle_help_command(app: &mut TuiApp, agent: &mut Agent, rest: &str) {
     } else {
         format!("/help {}", rest.trim())
     };
+    // Attempt to answer locally from the bundled skills knowledge base before
+    // sending the turn to the model. Pass the redacted config inspect so the
+    // local answer can include relevant config sections, matching the quality
+    // of the agent-level `resolve_help_turn` path.
+    //
+    // `answer_for_input` always returns `Some` for `/help`-prefixed input
+    // (parse_help_command always matches). A `None` result or `Unsupported`
+    // status means the topic isn't covered locally; both fall through to the
+    // model turn so the agent's doc-help subagent can handle broader questions.
+    let config_inspect = agent.config_snapshot().inspect_redacted();
+    let help = SqueezyHelp::new(config_inspect);
+    if let Some(answer) = help.answer_for_input(&prompt)
+        && answer.status == HelpStatus::Answered
+    {
+        app.push_transcript_item(TranscriptItem::system(answer.render_markdown()));
+        app.status = format!("help: {}", answer.topic);
+        return;
+    }
+    // Topic not covered locally — fall back to a model turn (network).
     start_user_turn(app, agent, prompt);
 }
 
@@ -5226,7 +5346,13 @@ fn copy_last_assistant_to_clipboard(app: &mut TuiApp) {
     };
     match app.clipboard.copy_text(&text) {
         Ok(()) => {
-            app.status = format!("copied assistant message ({} chars)", text.chars().count());
+            // Report what was actually done: the OSC52 sequence was written
+            // to stdout. Whether the terminal (or tmux/SSH relay) accepted
+            // it cannot be verified from this side.
+            app.status = format!(
+                "OSC52 clipboard sequence written ({} chars)",
+                text.chars().count()
+            );
         }
         Err(error) => {
             app.status = format!("copy failed: {error}");
@@ -5242,6 +5368,119 @@ fn last_assistant_clipboard_text(app: &TuiApp) -> Option<String> {
         .iter()
         .rev()
         .find_map(TranscriptEntry::assistant_content)
+}
+
+/// Build a compact terminal diagnostic string for the `/terminal` command.
+/// Reports the key capabilities and environment settings that affect TUI
+/// behaviour, especially on Linux where terminal variety is high.
+fn build_terminal_diagnostic(app: &TuiApp, sync_policy: TuiSynchronizedOutput) -> String {
+    let mut rows: Vec<(&'static str, String)> = Vec::new();
+
+    // TTY status
+    let stdout_tty = if io::stdout().is_terminal() {
+        "yes"
+    } else {
+        "no (redirected)"
+    };
+    let stdin_tty = if io::stdin().is_terminal() {
+        "yes"
+    } else {
+        "no (piped)"
+    };
+    rows.push(("stdout tty", stdout_tty.to_string()));
+    rows.push(("stdin tty", stdin_tty.to_string()));
+
+    // Terminal identity. Use `env::var_os` + `to_string_lossy` so a
+    // set-but-non-UTF-8 $TERM / $COLORTERM is reported (lossily) rather
+    // than silently misclassified as "(unset)".
+    rows.push(("$TERM", env_var_label("TERM")));
+    rows.push(("$COLORTERM", env_var_label("COLORTERM")));
+
+    // Multiplexer
+    let in_tmux = env::var_os("TMUX").is_some();
+    let in_screen = env::var_os("STY").is_some();
+    let mux = match (in_tmux, in_screen) {
+        (true, _) => "tmux".to_string(),
+        (_, true) => "screen".to_string(),
+        _ => "none".to_string(),
+    };
+    rows.push(("multiplexer", mux));
+
+    // Synchronized output — report the configured policy and, for Auto, the
+    // heuristic result so the user can see what was actually decided. ASCII
+    // arrow stays consistent with the rest of the table.
+    let sync_out = match sync_policy {
+        TuiSynchronizedOutput::Always => "Always".to_string(),
+        TuiSynchronizedOutput::Never => "Never".to_string(),
+        TuiSynchronizedOutput::Auto => {
+            let detected = detect_synchronized_output_support_from_env(|k| env::var_os(k));
+            format!("Auto -> {}", if detected { "enabled" } else { "disabled" })
+        }
+    };
+    rows.push(("synchronized output", sync_out));
+
+    // Mouse capture
+    let mouse = if env::var_os("SQUEEZY_MOUSE_CAPTURE")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+    {
+        "enabled (SQUEEZY_MOUSE_CAPTURE=1)"
+    } else {
+        "disabled (set SQUEEZY_MOUSE_CAPTURE=1 to enable)"
+    };
+    rows.push(("mouse capture", mouse.to_string()));
+
+    // Clipboard method
+    rows.push((
+        "clipboard",
+        format!(
+            "OSC52 (cap {} bytes; terminal acceptance not verifiable)",
+            OSC52_MAX_PAYLOAD_BYTES
+        ),
+    ));
+
+    // Notifications — use the resolved backend from the live notifier.
+    // `resolved()` only returns None, Some(Bel), or Some(Osc9); Auto and
+    // Off are consumed internally before returning. Enumerate the impossible
+    // arms explicitly so a new `NotificationMethod` variant trips this match
+    // at compile time instead of silently surfacing a `Debug`-formatted
+    // value to users.
+    let notif = match app.desktop_notifier.resolved() {
+        None => "off".to_string(),
+        Some(squeezy_core::NotificationMethod::Bel) => "BEL".to_string(),
+        Some(squeezy_core::NotificationMethod::Osc9) => "OSC9".to_string(),
+        Some(squeezy_core::NotificationMethod::Off)
+        | Some(squeezy_core::NotificationMethod::Auto) => {
+            unreachable!("DesktopNotifier::resolved() never returns Off or Auto")
+        }
+    };
+    rows.push(("notifications", notif));
+
+    // Effective shell — shared with the agent's `[shell: ...]` failure hint
+    // so the two surfaces always print the same value.
+    rows.push(("effective shell", squeezy_tools::effective_shell_label()));
+
+    // Format as a two-column table
+    let label_width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let mut lines = vec!["Terminal diagnostics".to_string(), String::new()];
+    for (key, val) in &rows {
+        lines.push(format!("  {:<width$}  {}", key, val, width = label_width));
+    }
+    lines.push(String::new());
+    lines.push("Remedies:".to_string());
+    lines.push("  - tmux OSC52: `set-option -g allow-passthrough on`".to_string());
+    lines.push("  - mouse: set SQUEEZY_MOUSE_CAPTURE=1".to_string());
+    lines.push("  - shell: set SQUEEZY_SHELL (e.g. SQUEEZY_SHELL=/bin/bash)".to_string());
+    lines.join("\n")
+}
+
+/// Read an environment variable as a user-facing label, using `env::var_os`
+/// and lossy decoding so a set-but-non-UTF-8 value still shows up in the
+/// `/terminal` diagnostic rather than being misclassified as `(unset)`.
+fn env_var_label(key: &str) -> String {
+    env::var_os(key)
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "(unset)".to_string())
 }
 
 fn parse_tool_output_verbosity(value: &str) -> Option<ToolOutputVerbosity> {
@@ -5306,8 +5545,9 @@ fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
 /// `/router [on|off]`. Bare opens the Routing config page (like `/model`),
 /// where the global toggles and the per-provider reroute/judge models live.
 /// `on` re-enables session-wide auto-routing to the cheap tier; `off` disables
-/// it (explicit `/cheap` still works). The toggle is one-shot at the override
-/// level — the user's persisted `[routing].enabled` config is not touched.
+/// it (explicit `/cheap` still works). The toggle is session-scoped (persists
+/// for the rest of the session and across `resume`) — the user's persisted
+/// `[routing].enabled` config is not touched.
 fn handle_slash_router(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
     let Some(raw) = value else {
         toggle_config_screen(
@@ -5329,10 +5569,13 @@ fn handle_slash_router(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>)
         }
     };
     agent.set_routing_session_disabled(disabled);
-    app.status = format!(
-        "routing → {}",
-        if disabled { "disabled" } else { "enabled" }
-    );
+    let label = if disabled { "disabled" } else { "enabled" };
+    app.status = format!("routing → {label} (session only)");
+    app.push_transcript_item(TranscriptItem::system(format!(
+        "Cheap-model routing {label} for this session.\n\
+         This is a session-only toggle and does not change `[routing].enabled` in your config.\n\
+         To persist the change, run `/config` and edit the Routing section.",
+    )));
 }
 
 /// `/tool-verbosity [compact|normal|verbose]`. Bare prints + usage hint;
@@ -6293,18 +6536,69 @@ fn capability_project_label(
         | PermissionCapability::Compiler
         | PermissionCapability::Destructive => unreachable!(),
     };
+    // On Windows, warn when the shell prefix being persisted is broad
+    // (covers all commands run via pwsh, cmd, etc.) because the lower sandbox
+    // tiers leave approval as the boundary for reads and/or network.
+    let windows_broad_warning = if permission.capability == PermissionCapability::Shell
+        && is_broad_windows_shell_prefix(&scope)
+    {
+        match windows_sandbox_posture(permission) {
+            Some("job-object-only") => " [broad rule on job-object-only Windows shell]",
+            Some("restricted-token-writes-only") => {
+                " [broad rule; Windows reads/network not isolated]"
+            }
+            _ => "",
+        }
+    } else {
+        ""
+    };
     (
-        Cow::Owned(format!("Always allow {kind} {scope_display}")),
+        Cow::Owned(format!(
+            "Always allow {kind} {scope_display}{windows_broad_warning}"
+        )),
         Cow::Owned(format!("save a project {hint_kind} rule")),
     )
+}
+
+/// True when a shell prefix target covers a broad class of Windows shell
+/// commands (pwsh, powershell, cmd, gitbash with no further narrowing).
+/// Handles both bare names and `.exe` suffixes since the cached binary path
+/// from `which::which` always stores the full name (e.g. `pwsh.exe`).
+fn is_broad_windows_shell_prefix(prefix: &str) -> bool {
+    let lower = prefix.to_ascii_lowercase();
+    // Strip rule-target suffix (`:*`) and any `.exe` extension so the match
+    // covers both `pwsh:*` and `pwsh.exe:*` rule forms.
+    let target = lower.trim_end_matches(":*").trim();
+    let file_name = target.rsplit(['\\', '/']).next().unwrap_or(target);
+    let bare = file_name.trim_end_matches(".exe");
+    matches!(bare, "pwsh" | "powershell" | "cmd" | "gitbash" | "shell")
+}
+
+fn windows_sandbox_posture(permission: &PermissionRequest) -> Option<&str> {
+    permission
+        .metadata
+        .get("windows_sandbox_posture")
+        .map(String::as_str)
+        .or_else(|| {
+            permission
+                .metadata
+                .get("windows_no_fs_sandbox")
+                .is_some_and(|v| v == "true")
+                .then_some("job-object-only")
+        })
 }
 
 /// Single-line status banner shown in the 1-line status bar. Compact by
 /// design so the status bar remains useful for non-approval traffic.
 pub(crate) fn format_approval_status_line(request: &ToolApprovalRequest) -> String {
     let permission = &request.permission;
+    let windows_suffix = match windows_sandbox_posture(permission) {
+        Some("job-object-only") => " sandbox=job-object-only",
+        Some("restricted-token-writes-only") => " sandbox=restricted-token-writes-only",
+        _ => "",
+    };
     format!(
-        "approval needed: {tool} risk={risk} target={target}",
+        "approval needed: {tool} risk={risk} target={target}{windows_suffix}",
         tool = request.tool_name,
         risk = permission.risk.as_str(),
         target = permission.target,
@@ -11269,6 +11563,12 @@ fn tool_result_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
         "diff_context" => diff_context_summary_spans(tool),
         "plan_patch" => plan_patch_summary_spans(tool),
         "apply_patch" | "write_file" => edit_summary_spans(tool),
+        "checkpoint_list"
+        | "checkpoint_show"
+        | "checkpoint_undo"
+        | "checkpoint_revert"
+        | "checkpoint_restore_file"
+        | "checkpoint_check" => checkpoint_summary_spans(tool),
         "webfetch" | "websearch" => web_summary_spans(tool),
         _ => vec![Span::styled(
             result.tool_name.clone(),
@@ -12001,6 +12301,115 @@ fn web_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
     )]
 }
 
+fn checkpoint_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        checkpoint_label(tool),
+        Style::default().fg(palette::muted_fg()),
+    )];
+    let detail = match tool.result.tool_name.as_str() {
+        "checkpoint_list" => {
+            if tool.result.content["enabled"].as_bool() == Some(false) {
+                string_arg(&tool.result.content, "message")
+            } else {
+                let count = tool.result.content["checkpoints"]
+                    .as_array()
+                    .map(|items| items.len())
+                    .unwrap_or(0);
+                Some(format!("{count} checkpoints"))
+            }
+        }
+        "checkpoint_show" => tool.result.content["checkpoint"]["group_id"]
+            .as_str()
+            .map(|group_id| format!("/revert-turn {group_id}")),
+        "checkpoint_check" => {
+            if tool.result.content["enabled"].as_bool() == Some(false) {
+                string_arg(&tool.result.content, "message")
+            } else {
+                let integrity = &tool.result.content["integrity"];
+                if integrity["ok"].as_bool() == Some(true) {
+                    Some("integrity ok".to_string())
+                } else {
+                    let refs = integrity["missing_refs"]
+                        .as_array()
+                        .map(|items| items.len())
+                        .unwrap_or(0);
+                    let objects = integrity["missing_objects"]
+                        .as_array()
+                        .map(|items| items.len())
+                        .unwrap_or(0);
+                    Some(format!("{refs} missing refs · {objects} missing objects"))
+                }
+            }
+        }
+        "checkpoint_undo" | "checkpoint_revert" | "checkpoint_restore_file" => {
+            if tool.result.content["enabled"].as_bool() == Some(false) {
+                string_arg(&tool.result.content, "message")
+            } else {
+                checkpoint_rollback_detail(&tool.result.content["rollback"])
+            }
+        }
+        _ => None,
+    };
+    if let Some(detail) = detail.filter(|detail| !detail.is_empty()) {
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+        spans.push(Span::styled(
+            compact_text(&detail, 120),
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+    }
+    spans
+}
+
+fn checkpoint_label(tool: &ToolTranscript) -> String {
+    match tool.result.tool_name.as_str() {
+        "checkpoint_list" => "checkpoints".to_string(),
+        "checkpoint_show" => tool
+            .result
+            .content
+            .get("checkpoint")
+            .and_then(|value| value.get("id"))
+            .and_then(|value| value.as_str())
+            .map(|id| format!("checkpoint {id}"))
+            .unwrap_or_else(|| tool_call_label_or_name(tool)),
+        "checkpoint_undo" => "undo checkpoint".to_string(),
+        "checkpoint_revert" => "revert checkpoint".to_string(),
+        "checkpoint_restore_file" => "restore checkpoint file".to_string(),
+        "checkpoint_check" => "checkpoint check".to_string(),
+        _ => tool_call_label_or_name(tool),
+    }
+}
+
+fn checkpoint_rollback_detail(rollback: &serde_json::Value) -> Option<String> {
+    if rollback["skipped"].as_bool() == Some(true) && rollback["applied"].as_bool() != Some(true) {
+        return Some("nothing to undo".to_string());
+    }
+    let conflicts = rollback["conflicts"]
+        .as_array()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let restored = rollback["restored_files"]
+        .as_array()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let deleted = rollback["deleted_files"]
+        .as_array()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let applied = rollback["applied"].as_bool().unwrap_or(false);
+    if conflicts > 0 && !applied {
+        return Some("conflict, no files changed".to_string());
+    }
+    if conflicts > 0 {
+        return Some(format!(
+            "best-effort partial restore · {restored} restored · {deleted} deleted · {conflicts} conflicts"
+        ));
+    }
+    Some(format!("{restored} restored · {deleted} deleted"))
+}
+
 fn tool_call_label_or_name(tool: &ToolTranscript) -> String {
     tool.call
         .as_ref()
@@ -12076,6 +12485,22 @@ pub(crate) fn tool_call_label(call: &ToolCall) -> String {
         "write_file" => string_arg(&call.arguments, "path")
             .map(|path| format!("write {path}"))
             .unwrap_or_else(|| "write file".to_string()),
+        "checkpoint_list" => "checkpoints".to_string(),
+        "checkpoint_show" => string_arg(&call.arguments, "checkpoint_id")
+            .map(|id| format!("checkpoint {id}"))
+            .unwrap_or_else(|| "checkpoint".to_string()),
+        "checkpoint_undo" => "undo checkpoint".to_string(),
+        "checkpoint_revert" => string_arg(&call.arguments, "group_id")
+            .map(|group_id| format!("revert turn {group_id}"))
+            .or_else(|| {
+                string_arg(&call.arguments, "checkpoint_id")
+                    .map(|id| format!("revert checkpoint {id}"))
+            })
+            .unwrap_or_else(|| "revert checkpoint".to_string()),
+        "checkpoint_restore_file" => string_arg(&call.arguments, "path")
+            .map(|path| format!("restore {path}"))
+            .unwrap_or_else(|| "restore checkpoint file".to_string()),
+        "checkpoint_check" => "checkpoint check".to_string(),
         "webfetch" => string_arg(&call.arguments, "url")
             .map(|url| format!("fetch {url}"))
             .unwrap_or_else(|| "web fetch".to_string()),
@@ -12179,6 +12604,11 @@ fn active_tool_args(call: &ToolCall) -> String {
         "read_file" | "read_slice" | "write_file" => {
             string_arg(&call.arguments, "path").unwrap_or_default()
         }
+        "checkpoint_show" => string_arg(&call.arguments, "checkpoint_id").unwrap_or_default(),
+        "checkpoint_revert" => string_arg(&call.arguments, "group_id")
+            .or_else(|| string_arg(&call.arguments, "checkpoint_id"))
+            .unwrap_or_default(),
+        "checkpoint_restore_file" => string_arg(&call.arguments, "path").unwrap_or_default(),
         "plan_patch" => string_arg(&call.arguments, "objective").unwrap_or_default(),
         "webfetch" => string_arg(&call.arguments, "url").unwrap_or_default(),
         _ => String::new(),
@@ -14631,7 +15061,7 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .map(|(index, path)| {
             let selected = index == popup.selected;
             let marker = if selected { "› " } else { "  " };
-            let display = path.display().to_string();
+            let display = mention::path_display_normalized(path);
             let style = if selected {
                 Style::default()
                     .fg(crate::render::theme::secondary())
@@ -15233,8 +15663,15 @@ fn configured_status_line_items(app: &TuiApp) -> Option<Vec<status::StatusLineIt
 
 /// Parse the TOML-side `[tui].status_line` list into typed items, dropping
 /// unknown identifiers. Returns `None` when the TOML key was unset.
+///
+/// The single-element list `["narrow-linux"]` is a named preset that expands
+/// to [`status::NARROW_LINUX_STATUS_LINE_ITEMS`], optimised for SSH / tmux /
+/// narrow terminal environments where spend and budget must stay visible.
 fn parse_status_line_items(raw: Option<&[String]>) -> Option<Vec<status::StatusLineItem>> {
     let raw = raw?;
+    if raw.len() == 1 && raw[0] == "narrow-linux" {
+        return Some(status::NARROW_LINUX_STATUS_LINE_ITEMS.to_vec());
+    }
     Some(
         raw.iter()
             .filter_map(|s| s.parse::<status::StatusLineItem>().ok())
@@ -15460,10 +15897,24 @@ pub(crate) fn format_mcp_status_snapshot(snapshot: &McpStatusSnapshot) -> String
         parts.push(format!("{cached} cached"));
     }
     if stale > 0 {
-        parts.push(format!("{stale} stale"));
+        let names: Vec<&str> = snapshot
+            .per_server
+            .iter()
+            .filter_map(|(name, s)| {
+                matches!(s, McpServerStatus::Stale { .. }).then_some(name.as_str())
+            })
+            .collect();
+        parts.push(format!("{stale} stale ({})", names.join(",")));
     }
     if failed > 0 {
-        parts.push(format!("{failed} failed"));
+        let names: Vec<&str> = snapshot
+            .per_server
+            .iter()
+            .filter_map(|(name, s)| {
+                matches!(s, McpServerStatus::Failed { .. }).then_some(name.as_str())
+            })
+            .collect();
+        parts.push(format!("{failed} failed ({})", names.join(",")));
     }
     if cancelled > 0 {
         parts.push(format!("{cancelled} cancelled"));
@@ -15538,20 +15989,33 @@ pub(crate) const OSC52_MAX_PAYLOAD_BYTES: usize = 8 * 1024;
 
 impl Clipboard for Osc52Clipboard {
     fn copy_text(&mut self, text: &str) -> std::result::Result<(), String> {
-        if text.len() > OSC52_MAX_PAYLOAD_BYTES {
-            return Err(format!(
-                "payload {} bytes exceeds terminal clipboard cap of {} bytes",
-                text.len(),
-                OSC52_MAX_PAYLOAD_BYTES,
-            ));
-        }
-        let sequence = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+        let sequence = build_osc52_sequence(text)?;
         let mut stdout = io::stdout();
         stdout
             .write_all(sequence.as_bytes())
             .and_then(|()| stdout.flush())
             .map_err(|err| format!("terminal clipboard write failed: {err}"))
     }
+}
+
+/// Build the OSC52 clipboard escape for `text` (or refuse when the payload
+/// exceeds [`OSC52_MAX_PAYLOAD_BYTES`]).
+///
+/// Today's behaviour is intentionally bare — `ESC ] 52 ; c ; <b64> BEL` with
+/// no DCS wrapping for tmux/screen. Inside tmux without `allow-passthrough
+/// on` the sequence is consumed by tmux and never reaches the outer
+/// emulator; the `/terminal` Remedies line documents the workaround. Adding
+/// a tmux-aware DCS wrap is a separate change and would need to update the
+/// regression test that locks the current bare shape.
+pub(crate) fn build_osc52_sequence(text: &str) -> std::result::Result<String, String> {
+    if text.len() > OSC52_MAX_PAYLOAD_BYTES {
+        return Err(format!(
+            "payload {} bytes exceeds terminal clipboard cap of {} bytes",
+            text.len(),
+            OSC52_MAX_PAYLOAD_BYTES,
+        ));
+    }
+    Ok(format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes())))
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -15750,18 +16214,47 @@ fn parse_shortstat(text: &str) -> Option<(u32, u32)> {
 }
 
 fn compact_path(path: &std::path::Path) -> String {
-    let display = path.display().to_string();
-    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
-        return display;
+    let fallback = mention::path_display_normalized(path);
+    let Some(home) = home_path_from_env(|key| env::var_os(key)) else {
+        return fallback;
     };
-    if let Ok(stripped) = path.strip_prefix(&home) {
-        if stripped.as_os_str().is_empty() {
+    compact_path_with_home(path, &home).unwrap_or(fallback)
+}
+
+fn home_path_from_env<F>(env_get: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    let home = match env_get("HOME").filter(|v| !v.is_empty()) {
+        Some(home) => home,
+        None => {
+            // On Windows, HOME is often unset; USERPROFILE is the canonical home.
+            #[cfg(windows)]
+            {
+                env_get("USERPROFILE").filter(|v| !v.is_empty())?
+            }
+            #[cfg(not(windows))]
+            {
+                return None;
+            }
+        }
+    };
+    Some(PathBuf::from(home))
+}
+
+fn compact_path_with_home(path: &Path, home: &Path) -> Option<String> {
+    if let Ok(stripped) = path.strip_prefix(home) {
+        // Normalize to forward slashes for consistent display across
+        // platforms. On Windows, `stripped.display()` would produce
+        // backslashes, yielding a mixed `~/projects\foo` form.
+        let normalized = stripped.to_string_lossy().replace('\\', "/");
+        Some(if normalized.is_empty() {
             "~".to_string()
         } else {
-            format!("~/{}", stripped.display())
-        }
+            format!("~/{normalized}")
+        })
     } else {
-        display
+        None
     }
 }
 
@@ -15825,7 +16318,17 @@ impl PermissionStatus {
     }
 
     fn compact(&self) -> String {
-        format!("perm={}", self.mode)
+        // Extract just the mode portion of the sandbox string (e.g.
+        // "best_effort" from "best_effort/net=deny_by_default").  When the
+        // sandbox is in a risky state (off or best_effort) we append it to
+        // the compact permission badge so users see the degradation without
+        // having to add a separate `sandbox` status-line item.
+        let sb_mode = self.sandbox.split('/').next().unwrap_or(&self.sandbox);
+        if matches!(sb_mode, "best_effort" | "off") {
+            format!("perm={} sb={sb_mode}", self.mode)
+        } else {
+            format!("perm={}", self.mode)
+        }
     }
 }
 
@@ -16169,6 +16672,11 @@ pub(crate) struct TuiApp {
     /// means the status bar renders the legacy `cost $X` segment
     /// unchanged.
     pub(crate) cost_cap_usd_micros: Option<u64>,
+    /// Set when the active (provider, model) has no pricing data and a session
+    /// cap is configured, so the cap cannot be enforced. Surfaces a persistent
+    /// `unpriced` marker in the cost status-line segment until a priced cost
+    /// update proves the cap is enforceable again.
+    pub(crate) cap_unenforceable: bool,
     pub(crate) metrics: squeezy_core::TurnMetrics,
     pub(crate) turn_rx: Option<mpsc::Receiver<AgentEvent>>,
     pub(crate) job_rx: Option<broadcast::Receiver<JobEvent>>,
@@ -16311,10 +16819,12 @@ pub(crate) struct PendingDiffResult {
 
 /// Build the runtime [`keymap::KeymapResolver`] by layering the optional
 /// user-editable `~/.squeezy/keybindings.toml` on top of the
-/// `[tui.keymap]` overrides from `settings.toml`. Failures (missing
-/// `$HOME`, unreadable file, malformed TOML, reserved-key violation)
-/// emit a warning and fall back to the base overrides so a broken
-/// keybindings file never prevents the TUI from starting.
+/// `[tui.keymap]` overrides from `settings.toml`. The home directory is
+/// resolved from `$HOME`, falling back to `$USERPROFILE` on Windows
+/// where `$HOME` is typically unset. Failures (no home env var,
+/// unreadable file, malformed TOML, reserved-key violation) emit a
+/// warning and fall back to the base overrides so a broken keybindings
+/// file never prevents the TUI from starting.
 fn build_keymap_resolver(base: &BTreeMap<String, String>) -> keymap::KeymapResolver {
     let user_path = keymap_config::default_keybindings_path();
     match keymap_config::merge_user_overrides(base.clone(), user_path.as_deref()) {
@@ -16570,6 +17080,7 @@ impl TuiApp {
             recent_edit_failures: HashMap::new(),
             cost: squeezy_core::CostSnapshot::default(),
             cost_cap_usd_micros: config.max_session_cost_usd_micros.filter(|cap| *cap > 0),
+            cap_unenforceable: false,
             metrics: squeezy_core::TurnMetrics::default(),
             turn_rx: None,
             job_rx: None,
@@ -17992,8 +18503,54 @@ impl TerminalGuard {
     }
 }
 
+/// Pre-flight check for the conditions [`TerminalGuard::enter`] refuses on:
+/// stdout not being a TTY, or `TERM=dumb`. Returns the message to surface in
+/// the typed [`SqueezyError::Terminal`] when the environment is not
+/// interactive-capable, `None` when startup may proceed.
+///
+/// Factored out from `TerminalGuard::enter` so the refusal contract is
+/// testable without race-prone process-global env mutation or a real TTY —
+/// tests pass an `is_terminal` closure and an env-reader closure, the same
+/// shape used by `detect_synchronized_output_support_from_env` and
+/// `detect_osc9_support_from_env`.
+pub(crate) fn precheck_terminal_environment<F, G>(is_terminal: F, env_get: G) -> Option<String>
+where
+    F: FnOnce() -> bool,
+    G: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    if !is_terminal() {
+        return Some(
+            "stdout is not a terminal; use --prompt for non-interactive output \
+             or run in a real terminal"
+                .to_string(),
+        );
+    }
+    if env_get("TERM")
+        .as_deref()
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| v.eq_ignore_ascii_case("dumb"))
+    {
+        return Some(
+            "TERM=dumb: interactive TUI requires a capable terminal; \
+             use --prompt for non-interactive output"
+                .to_string(),
+        );
+    }
+    None
+}
+
 impl TerminalGuard {
     fn enter(synchronized_output: TuiSynchronizedOutput) -> Result<Self> {
+        // Refuse interactive TUI startup when stdout is not a real terminal
+        // or when $TERM signals a minimal sink (CI, serial, dumb). Runs
+        // before `enable_raw_mode()` and any ANSI byte so a redirected
+        // stdout never gets raw VT bytes written into it.
+        if let Some(message) = precheck_terminal_environment(
+            || io::stdout().is_terminal(),
+            |key: &str| env::var_os(key),
+        ) {
+            return Err(SqueezyError::Terminal(message));
+        }
         let synchronized_output = resolve_synchronized_output(synchronized_output);
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         // Wrap stdout in the env-gated debug-tap writer so every
@@ -18002,11 +18559,19 @@ impl TerminalGuard {
         // `SQUEEZY_TUI_WRITE_LOG` is set. When unset the wrapper is a
         // thin pass-through.
         let mut writer = TerminalWriter::from_env(io::stdout());
-        let _ = execute!(
+        if let Err(err) = execute!(
             writer,
             DisableModifyOtherKeys,
             PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
-        );
+        ) {
+            // Keyboard enhancement is unavailable on this terminal (older
+            // xterm, tmux without passthrough, SSH, VTE). Log at debug so
+            // `RUST_LOG=debug` can surface it; the TUI still works but
+            // Ctrl/Alt chords may not distinguish all key combinations.
+            tracing::debug!(
+                "keyboard enhancement setup unavailable (terminal may not support it): {err}"
+            );
+        }
         // Mouse capture is opt-in: it hijacks native text selection
         // and terminal scrollback (Shift+drag / Shift+wheel become the
         // escape hatch, which is friction users shouldn't pay by

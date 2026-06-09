@@ -18,7 +18,7 @@ use std::fs;
 use std::os::fd::FromRawFd;
 
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use squeezy_core::{
     PermissionCapability, PermissionRisk, Redactor, ShellSandboxConfig, ShellSandboxMode,
     StreamRedactor, sensitive_pattern_base,
@@ -40,6 +40,7 @@ use crate::shell_parse::{
     analyze_shell_command, dequote_token, expand_wrapper_segments, is_destructive_shell_segment,
     parse_shell_command, shell_coverage_warnings, shell_segments, tokenize_shell_segment,
 };
+use crate::shell_program::ShellProgram;
 use crate::shell_sandbox::{
     ShellSandboxPlan, configure_linux_shell_sandbox, configure_shell_process_group,
     shell_sandbox_best_effort_fallback_reason, shell_sandbox_runtime_unavailable,
@@ -69,6 +70,78 @@ pub(crate) struct ShellRunOutcome {
     /// sidecar when the hard byte cap dropped bytes the in-memory capture
     /// could not keep. `None` when output stayed under the cap.
     pub(crate) raw_spillover: Option<ShellSpilloverInfo>,
+    /// Windows-only: status of the Win32 Job Object created for
+    /// process-tree cleanup on the non-sandboxed path. Surfaced in audit
+    /// rows so process-tree containment is independently observable even
+    /// when FS/network isolation is unavailable. `None` on all other
+    /// platforms.
+    pub(crate) win_job_object_status: Option<&'static str>,
+    /// True when `tty = true` was requested but the platform degraded to
+    /// non-TTY pipes (Windows without ConPTY). The caller surfaces this as a
+    /// note in the tool result.
+    pub(crate) tty_degraded: bool,
+    /// Set when `tty: true` was requested but the platform does not support
+    /// ConPTY and the run fell back to piped stdin/stdout/stderr. The model
+    /// should be informed so it can adjust output-parsing expectations.
+    pub(crate) tty_downgraded: bool,
+    /// Windows Job Object assignment status. `None` means no Job Object was
+    /// attempted (Unix, or a Windows sandbox tier that manages its own job).
+    /// `Some(true)` means the process was successfully assigned; `Some(false)`
+    /// means creation or assignment failed and process-tree cleanup is
+    /// best-effort only.
+    pub(crate) windows_job_assigned: Option<bool>,
+    /// Result of `TerminateJobObject` called during a timeout cleanup.
+    /// `None` when not on Windows, not timed out, or no job object was held.
+    /// `Some(false)` means descendants may survive the timeout.
+    pub(crate) windows_timeout_job_cleanup_ok: Option<bool>,
+    /// Present when the child was killed via Unix signals (timeout or
+    /// cancellation). Records pgid targeted, whether each signal syscall
+    /// succeeded, whether the grace period expired, and whether a
+    /// direct-child fallback kill was also issued.
+    pub(crate) kill_meta: Option<ShellKillMeta>,
+    /// Set when `ShellAskServer::start` failed even though the sandbox backend
+    /// supports AF_UNIX ask sockets.  The string is a human-readable reason
+    /// suitable for the `nested_ask.reason` field in the JSON result.
+    pub(crate) ask_server_start_error: Option<String>,
+}
+
+/// Termination mechanics recorded when a Unix shell child was killed by
+/// signal (on timeout or cancellation). Surfaces process-group signal
+/// outcomes so that Linux users can see whether pgid-based cleanup
+/// succeeded and whether detached descendants may have survived.
+pub(crate) struct ShellKillMeta {
+    /// Process group id we *targeted* with `kill(-pgid, …)`. This is the
+    /// child's pid, since `configure_shell_process_group` arranges a child-side
+    /// `setpgid(0, 0)` at exec time so the freshly-spawned process is its own
+    /// pgid leader. `pgid` may not match `getpgid(child)` if the child later
+    /// re-set its process group via `setpgid(0, X)` with `X != pid`; in that
+    /// case `sigterm_ok` / `sigkill_ok` will surface the kernel's `ESRCH`
+    /// response (the targeted pgid no longer points at the child).
+    pub(crate) pgid: u32,
+    /// Whether `kill(-pgid, SIGTERM)` returned without error.
+    pub(crate) sigterm_ok: bool,
+    /// Whether the grace period expired before the child exited
+    /// (i.e. SIGKILL escalation was required).
+    pub(crate) grace_expired: bool,
+    /// Whether `kill(-pgid, SIGKILL)` was sent.
+    pub(crate) sigkill_sent: bool,
+    /// Whether `kill(-pgid, SIGKILL)` returned without error.
+    pub(crate) sigkill_ok: bool,
+    /// Whether `child.kill()` was also called as a direct-child fallback.
+    /// This is `true` only when SIGKILL escalation was required (grace period
+    /// expired) and `child.kill()` was issued as a supplemental direct-child
+    /// signal after the process-group SIGKILL. It is `false` when the child
+    /// exited during the SIGTERM grace period, in which case no SIGKILL or
+    /// direct-child kill was needed.
+    pub(crate) direct_child_fallback: bool,
+    /// Whether the supplemental `child.kill()` direct-child fallback returned
+    /// `Ok(())`. Only meaningful when [`direct_child_fallback`] is `true`. A
+    /// `false` value here usually means the kernel had already reaped the
+    /// direct child via the prior pgid `SIGKILL`, in which case tokio reports
+    /// `InvalidInput`. The companion field exists so a troubleshooter can tell
+    /// whether *any* of the three signal attempts (pgid SIGTERM, pgid SIGKILL,
+    /// direct-child kill) reached a live process.
+    pub(crate) direct_child_kill_ok: bool,
 }
 
 struct ShellRunRequest<'a> {
@@ -89,9 +162,46 @@ pub(crate) struct ShellExecutionGuard {
 }
 
 enum ShellRunError {
-    Cancelled,
+    /// Shell was cancelled. Carries Unix process-group kill metadata and the
+    /// Windows Job Object cleanup result (`None` = no job object was active;
+    /// `Some(true)` = job terminated successfully; `Some(false)` = terminate
+    /// failed and descendants may survive) so callers can include both in audit
+    /// and result payloads.
+    Cancelled {
+        kill_meta: Option<ShellKillMeta>,
+        windows_job_cleanup_ok: Option<bool>,
+    },
     SandboxStartDenied(String),
+    /// Spawn failure on a non-required sandboxed backend where the OS or
+    /// container environment blocked the spawn/pre-exec path (e.g. the
+    /// Linux `pre_exec` hook was denied by the parent's seccomp policy).
+    /// Unlike `Io`, this is treated as a best_effort degradation — the
+    /// caller records the failure and retries on the unsandboxed direct
+    /// path instead of surfacing a hard tool error.
+    SpawnFallback(String),
     Io(std::io::Error),
+}
+
+/// Decide whether to call `TerminateJobObject` and report the resulting
+/// cleanup state. Shared by the cancel and timeout cleanup paths because
+/// both observe the same three states:
+///
+/// - `assigned == Some(true)`: the process is in the job, so termination
+///   should propagate to the full process tree; report the terminate
+///   result.
+/// - `assigned == Some(false)`: the job was created but the process never
+///   landed in it, so `TerminateJobObject` on an empty job would silently
+///   return `Ok` while descendants survive — report `Some(false)` and skip
+///   the call so callers can surface the leak.
+/// - `assigned == None`: the sandbox tier owns its own job (or this is a
+///   non-Windows path), so there is nothing to clean up at this layer.
+#[cfg(windows)]
+fn windows_job_cleanup_status(job: Option<&ShellJob>, assigned: Option<bool>) -> Option<bool> {
+    match assigned {
+        Some(true) => job.map(|j| j.terminate(1).is_ok()),
+        Some(false) => Some(false),
+        None => None,
+    }
 }
 
 impl ToolRegistry {
@@ -230,6 +340,27 @@ impl ToolRegistry {
             return shell_policy_denied(call, &analysis, reason);
         }
 
+        // Validate the SQUEEZY_SHELL override before constructing any plan so
+        // that a missing Git Bash (or similar unresolvable shell) produces a
+        // clear tool error even for the direct_user_shell TUI fast path.
+        if let Err(reason) = ShellProgram::validate_override() {
+            self.audit_shell(
+                call,
+                &args,
+                &workdir,
+                &analysis,
+                shell_sandbox_status_metadata(&self.shell_sandbox, "denied"),
+                timeout_ms,
+                output_cap,
+                "denied",
+                Some(&reason),
+                None,
+                &[],
+                &[],
+            );
+            return shell_policy_denied(call, &analysis, reason);
+        }
+
         let mut sandbox_plan = if direct_user_shell {
             ShellSandboxPlan::direct(&args.command, ShellSandboxMode::Off, &self.shell_sandbox)
         } else {
@@ -270,7 +401,11 @@ impl ToolRegistry {
             .await
         {
             Ok(run) => run,
-            Err(ShellRunError::Cancelled) => {
+            Err(ShellRunError::Cancelled {
+                kill_meta,
+                windows_job_cleanup_ok,
+            }) => {
+                let error_msg = shell_cancelled_error_msg(kill_meta.as_ref());
                 self.audit_shell(
                     call,
                     &args,
@@ -280,12 +415,12 @@ impl ToolRegistry {
                     timeout_ms,
                     output_cap,
                     "cancelled",
-                    Some("shell command cancelled"),
+                    Some(&error_msg),
                     None,
                     &[],
                     &[],
                 );
-                return ToolResult::cancelled(call);
+                return shell_cancelled_result(call, windows_job_cleanup_ok, kill_meta);
             }
             Err(ShellRunError::SandboxStartDenied(reason)) => {
                 self.audit_shell(
@@ -304,6 +439,100 @@ impl ToolRegistry {
                 );
                 return shell_policy_denied(call, &analysis, reason);
             }
+            Err(ShellRunError::SpawnFallback(reason)) => {
+                // The sandbox spawn/pre-exec was blocked by the host environment
+                // (e.g. the container's seccomp policy denied unshare in the
+                // Linux pre_exec hook). Treat as a best_effort degradation:
+                // record the failure, mark the backend unavailable, and retry
+                // on the unsandboxed direct path below.
+                let degraded_backend = sandbox_plan.backend;
+                let record = self.shell_sandbox_health.record_best_effort_fallback();
+                self.audit_shell(
+                    call,
+                    &args,
+                    &workdir,
+                    &analysis,
+                    sandbox_plan.metadata_with_best_effort_fallback(
+                        degraded_backend,
+                        &record,
+                        Some(&reason),
+                    ),
+                    timeout_ms,
+                    output_cap,
+                    "fallback",
+                    Some(&reason),
+                    None,
+                    &[],
+                    &[],
+                );
+                self.shell_sandbox_health
+                    .mark_unavailable(sandbox_plan.backend, reason.clone());
+                sandbox_plan = ShellSandboxPlan::direct_with_fallback_record(
+                    &args.command,
+                    self.shell_sandbox.mode,
+                    &self.shell_sandbox,
+                    Some(reason),
+                    Some((degraded_backend, record)),
+                );
+                match self
+                    .run_shell_plan(ShellRunRequest {
+                        sandbox_plan: &sandbox_plan,
+                        workdir: &workdir,
+                        timeout_ms,
+                        output_cap,
+                        tty: args.tty,
+                        cancel: &cancel,
+                        call,
+                        command_text: &args.command,
+                        shell_ask_approver: shell_ask_approver.clone(),
+                    })
+                    .await
+                {
+                    Ok(run) => run,
+                    Err(ShellRunError::Cancelled {
+                        kill_meta,
+                        windows_job_cleanup_ok,
+                    }) => {
+                        let error_msg = shell_cancelled_error_msg(kill_meta.as_ref());
+                        self.audit_shell(
+                            call,
+                            &args,
+                            &workdir,
+                            &analysis,
+                            sandbox_plan.metadata(),
+                            timeout_ms,
+                            output_cap,
+                            "cancelled",
+                            Some(&error_msg),
+                            None,
+                            &[],
+                            &[],
+                        );
+                        return shell_cancelled_result(call, windows_job_cleanup_ok, kill_meta);
+                    }
+                    Err(ShellRunError::SandboxStartDenied(reason)) => {
+                        self.audit_shell(
+                            call,
+                            &args,
+                            &workdir,
+                            &analysis,
+                            sandbox_plan.metadata(),
+                            timeout_ms,
+                            output_cap,
+                            "denied",
+                            Some(&reason),
+                            None,
+                            &[],
+                            &[],
+                        );
+                        return shell_policy_denied(call, &analysis, reason);
+                    }
+                    Err(ShellRunError::SpawnFallback(reason)) => {
+                        return tool_error(call, std::io::Error::other(reason));
+                    }
+                    Err(ShellRunError::Io(err)) => return tool_error(call, err),
+                }
+            }
             Err(ShellRunError::Io(err)) => return tool_error(call, err),
         };
         if let Some(reason) = shell_sandbox_best_effort_fallback_reason(&sandbox_plan, &run) {
@@ -319,7 +548,11 @@ impl ToolRegistry {
                 &args,
                 &workdir,
                 &analysis,
-                sandbox_plan.metadata_with_best_effort_fallback(degraded_backend, &record),
+                sandbox_plan.metadata_with_best_effort_fallback(
+                    degraded_backend,
+                    &record,
+                    Some(&reason),
+                ),
                 timeout_ms,
                 output_cap,
                 "fallback",
@@ -352,7 +585,11 @@ impl ToolRegistry {
                 .await
             {
                 Ok(run) => run,
-                Err(ShellRunError::Cancelled) => {
+                Err(ShellRunError::Cancelled {
+                    kill_meta,
+                    windows_job_cleanup_ok,
+                }) => {
+                    let error_msg = shell_cancelled_error_msg(kill_meta.as_ref());
                     self.audit_shell(
                         call,
                         &args,
@@ -362,12 +599,12 @@ impl ToolRegistry {
                         timeout_ms,
                         output_cap,
                         "cancelled",
-                        Some("shell command cancelled"),
+                        Some(&error_msg),
                         None,
                         &[],
                         &[],
                     );
-                    return ToolResult::cancelled(call);
+                    return shell_cancelled_result(call, windows_job_cleanup_ok, kill_meta);
                 }
                 Err(ShellRunError::SandboxStartDenied(reason)) => {
                     self.audit_shell(
@@ -386,6 +623,9 @@ impl ToolRegistry {
                     );
                     return shell_policy_denied(call, &analysis, reason);
                 }
+                Err(ShellRunError::SpawnFallback(reason)) => {
+                    return tool_error(call, std::io::Error::other(reason));
+                }
                 Err(ShellRunError::Io(err)) => return tool_error(call, err),
             };
         }
@@ -398,12 +638,34 @@ impl ToolRegistry {
             stderr_bytes,
             stderr_truncated,
             raw_spillover,
+            win_job_object_status,
+            tty_degraded,
+            tty_downgraded,
+            windows_job_assigned,
+            windows_timeout_job_cleanup_ok,
+            kill_meta,
+            ask_server_start_error,
         } = run;
 
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
         let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
         let redacted_stdout = self.redactor.redact(&stdout);
         let redacted_stderr = self.redactor.redact(&stderr);
+        let stdout_redactions = redacted_stdout.redactions;
+        let stderr_redactions = redacted_stderr.redactions;
+        // On Windows, TTY requests degrade to non-TTY pipes because ConPTY is
+        // not yet wired up. Prepend a brief notice so the model and user are
+        // aware that interactive prompts may not work as expected (Bug 7).
+        #[cfg(not(unix))]
+        let stdout = if args.tty {
+            let mut prefixed =
+                String::from("[ConPTY unavailable; running non-interactive pipes]\n");
+            prefixed.push_str(&redacted_stdout.text);
+            prefixed
+        } else {
+            redacted_stdout.text
+        };
+        #[cfg(unix)]
         let stdout = redacted_stdout.text;
         let stderr = redacted_stderr.text;
         let truncated = stdout_truncated || stderr_truncated || timed_out;
@@ -420,12 +682,27 @@ impl ToolRegistry {
         };
         let cost = ToolCostHint {
             output_bytes: (stdout.len() + stderr.len()) as u64,
-            redactions: redacted_stdout.redactions + redacted_stderr.redactions,
+            redactions: stdout_redactions + stderr_redactions,
             truncated,
             ..ToolCostHint::default()
         };
         let exit_code = exit_status.as_ref().and_then(|status| status.code());
         let exit_signal = shell_exit_signal(exit_status.as_ref());
+        // Augment the sandbox metadata with the Windows Job Object outcome so
+        // the audit row independently shows whether process-tree cleanup is
+        // active, even when filesystem/network isolation is unavailable.
+        let sandbox_metadata = {
+            let mut meta = sandbox_plan.metadata();
+            if let Some(status) = win_job_object_status
+                && let Some(obj) = meta.as_object_mut()
+            {
+                obj.insert(
+                    "win_job_object_status".to_string(),
+                    Value::String(status.to_string()),
+                );
+            }
+            meta
+        };
         if sandbox_plan.required
             && shell_sandbox_runtime_unavailable(&sandbox_plan, exit_code, &stderr)
         {
@@ -440,7 +717,7 @@ impl ToolRegistry {
                 &args,
                 &workdir,
                 &analysis,
-                sandbox_plan.metadata(),
+                sandbox_metadata,
                 timeout_ms,
                 output_cap,
                 "denied",
@@ -463,7 +740,7 @@ impl ToolRegistry {
             &args,
             &workdir,
             &analysis,
-            sandbox_plan.metadata(),
+            sandbox_metadata.clone(),
             timeout_ms,
             output_cap,
             if timed_out {
@@ -480,9 +757,43 @@ impl ToolRegistry {
         );
         self.invalidate_diff_cache();
 
+        // The `command_wrapper` shows the actual process spawned (e.g.
+        // `sh -lc` on Linux/macOS) so POSIX-shell vs Bash behavior is explicit.
+        // For the macOS `sandbox-exec` backend the `-p <profile>` argument
+        // contains a multi-KB policy string; we summarize it as `<sandbox-profile>`
+        // so the field stays concise and readable.
+        let command_wrapper = {
+            // Collect args up to (but not including) the user command literal,
+            // which is always the last element on Unix shell plans.
+            let display_args: Vec<String> = sandbox_plan.args
+                [..sandbox_plan.args.len().saturating_sub(1)]
+                .iter()
+                .enumerate()
+                .map(|(i, arg)| {
+                    // When the previous arg was `-p`, this arg is the sandbox-exec
+                    // profile text which can be many KB; replace it with a placeholder.
+                    let prev = if i > 0 {
+                        sandbox_plan.args.get(i - 1).map(|s| s.as_str())
+                    } else {
+                        None
+                    };
+                    if prev == Some("-p") {
+                        "<sandbox-profile>".to_string()
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect();
+            if display_args.is_empty() {
+                sandbox_plan.program.clone()
+            } else {
+                format!("{} {}", sandbox_plan.program, display_args.join(" "))
+            }
+        };
         let mut raw_content = json!({
             "command": args.command,
             "workdir": self.relative(&workdir).to_string_lossy(),
+            "command_wrapper": command_wrapper,
             "exit_code": exit_code,
             "signal": exit_signal,
             "termination": termination,
@@ -491,11 +802,175 @@ impl ToolRegistry {
             "error": error,
             "truncated": truncated,
         });
-        if let Some(fallback) = sandbox_plan.metadata().get("best_effort_fallback").cloned() {
+        // Always surface sandbox status fields so the model can detect
+        // Linux-specific constraints (ask socket suppressed, Landlock active)
+        // without parsing the backend string.
+        {
+            let mut sandbox_info = serde_json::Map::new();
+            sandbox_info.insert("backend".to_string(), sandbox_metadata["backend"].clone());
+            sandbox_info.insert("network".to_string(), sandbox_metadata["network"].clone());
+            sandbox_info.insert(
+                "filesystem".to_string(),
+                sandbox_metadata["filesystem"].clone(),
+            );
+            sandbox_info.insert(
+                "ask_socket_suppressed".to_string(),
+                sandbox_metadata["ask_socket_suppressed"].clone(),
+            );
+            sandbox_info.insert(
+                "landlock_active".to_string(),
+                sandbox_metadata["landlock_active"].clone(),
+            );
+            if let Some(fallback) = sandbox_metadata.get("best_effort_fallback").cloned() {
+                sandbox_info.insert("best_effort_fallback".to_string(), fallback);
+            }
+            insert_content_field(&mut raw_content, "sandbox", Value::Object(sandbox_info));
+        }
+        // Expose Windows Job Object process-tree cleanup status so the audit
+        // and the model can distinguish genuine cleanup from a degraded state.
+        // "assigned" = process covered; "not_assigned" = assignment failed
+        // (process may have raced to exit before assignment); "creation_failed"
+        // = Job Object could not be created at all.
+        if let Some(job_status) = win_job_object_status {
+            insert_content_field(
+                &mut raw_content,
+                "windows_process_tree",
+                json!({ "job_object": job_status }),
+            );
+        }
+        // Surface a note when tty=true was requested but the platform degraded
+        // to non-TTY pipe-backed stdio (Windows without ConPTY wired up).
+        if tty_degraded {
+            insert_content_field(
+                &mut raw_content,
+                "tty_note",
+                json!(
+                    "tty=true requested; ConPTY unavailable on this platform; ran with pipe-backed stdio"
+                ),
+            );
+        }
+        // Windows: surface the degraded sandbox state and Job Object assignment
+        // so the agent layer can emit the once-per-session TUI banner and
+        // callers can detect missing process-tree cleanup guarantees.
+        if sandbox_plan.backend == "windows-job-object"
+            || sandbox_plan.filesystem == "best_effort_unavailable"
+        {
+            // The Unix `best_effort_fallback` writer above and this Windows
+            // writer both target the same `sandbox` key, and
+            // `insert_content_field` overwrites rather than merges. The two
+            // paths are mutually exclusive today (a best-effort fallback
+            // rewrites the plan to `backend: "none"`, `filesystem:
+            // "not_enforced"`, neither of which satisfies the predicate
+            // above), so this assertion locks the invariant in debug builds
+            // — any future plan-shape change that lets both fire would
+            // otherwise silently drop the Unix payload.
+            debug_assert!(
+                raw_content
+                    .as_object()
+                    .and_then(|obj| obj.get("sandbox"))
+                    .and_then(|s| s.as_object())
+                    .map(|s| !s.contains_key("best_effort_fallback"))
+                    .unwrap_or(true),
+                "sandbox.best_effort_fallback and sandbox.windows_degraded must be mutually exclusive",
+            );
+            let first_in_session = self.shell_sandbox_health.record_windows_degraded();
+            // Include the resolved shell so approval prompts and model context
+            // show which shell interpreted the command.
+            let resolved_shell = std::path::Path::new(&sandbox_plan.program)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&sandbox_plan.program)
+                .to_string();
             insert_content_field(
                 &mut raw_content,
                 "sandbox",
-                json!({ "best_effort_fallback": fallback }),
+                json!({
+                    "windows_degraded": {
+                        "first_in_session": first_in_session,
+                        "backend": sandbox_plan.backend,
+                        "filesystem": sandbox_plan.filesystem,
+                        "resolved_shell": resolved_shell,
+                    }
+                }),
+            );
+        }
+        if windows_job_assigned.is_some() || windows_timeout_job_cleanup_ok.is_some() {
+            let mut windows_info = serde_json::Map::new();
+            if let Some(assigned) = windows_job_assigned {
+                windows_info.insert("job_object_assigned".to_string(), json!(assigned));
+                windows_info.insert(
+                    "cleanup_note".to_string(),
+                    json!(if assigned {
+                        "process tree will be terminated with the job"
+                    } else {
+                        "Job Object assignment failed; only direct child is covered by kill_on_drop"
+                    }),
+                );
+            }
+            if let Some(cleanup_ok) = windows_timeout_job_cleanup_ok {
+                windows_info.insert("timeout_job_cleanup".to_string(), json!(cleanup_ok));
+                if !cleanup_ok {
+                    windows_info.insert(
+                        "timeout_cleanup_note".to_string(),
+                        json!("TerminateJobObject failed on timeout; descendant processes may still be running"),
+                    );
+                }
+            }
+            insert_content_field(
+                &mut raw_content,
+                "windows",
+                serde_json::Value::Object(windows_info),
+            );
+        }
+        if tty_downgraded {
+            insert_content_field(
+                &mut raw_content,
+                "tty_downgraded",
+                json!("TTY requested but ConPTY is not available; ran with pipes"),
+            );
+        }
+        // Always inform the model and user about whether nested `squeezy ask`
+        // approvals are usable for this shell call. Emitting the field
+        // unconditionally with an explicit `available: true|false` removes the
+        // earlier "absence implies available" ambiguity, which masked at least
+        // three real cases: (a) sandbox policy forbids AF_UNIX sockets (e.g.
+        // linux-direct-syscalls), (b) ShellAskServer::start failed at runtime
+        // even though the backend supports AF_UNIX sockets, and (c) the caller
+        // did not pass a `shell_ask_approver`, so no ask socket would have been
+        // exported even if the sandbox allowed it. Without this field the
+        // child shell sees a missing SQUEEZY_ASK_SOCKET env var, which looks
+        // like a misconfiguration rather than an intentional policy.
+        let nested_ask_block = if let Some(reason) = sandbox_plan
+            .nested_ask_disabled_reason()
+            .or(ask_server_start_error)
+        {
+            json!({ "available": false, "reason": reason })
+        } else if shell_ask_approver.is_some() {
+            json!({ "available": true })
+        } else {
+            json!({
+                "available": false,
+                "reason": "nested ask disabled: no approver wired to this shell call",
+            })
+        };
+        insert_content_field(&mut raw_content, "nested_ask", nested_ask_block);
+        // When the child was killed via Unix signals, surface the kill
+        // mechanics so users can see whether pgid-based cleanup succeeded
+        // and whether detached descendants (setsid / daemonized) may survive.
+        if let Some(km) = kill_meta {
+            insert_content_field(
+                &mut raw_content,
+                "kill_meta",
+                json!({
+                    "pgid": km.pgid,
+                    "sigterm_ok": km.sigterm_ok,
+                    "grace_expired": km.grace_expired,
+                    "sigkill_sent": km.sigkill_sent,
+                    "sigkill_ok": km.sigkill_ok,
+                    "direct_child_fallback": km.direct_child_fallback,
+                    "direct_child_kill_ok": km.direct_child_kill_ok,
+                    "caveat_text": "process-group signals cannot reach setsid/daemonized descendants; detached processes may survive until cgroup-backed cleanup is available",
+                }),
             );
         }
         if let Some(summary) = implicit_skill {
@@ -605,19 +1080,36 @@ impl ToolRegistry {
         let pty_master: Option<std::fs::File>;
         let ask_server: Option<ShellAskServer>;
         let mut child: ShellChild;
+        // Tracking vars set by platform-gated cfg blocks below; `mut` is
+        // needed only on the relevant platform but must compile on all targets.
+        #[allow(unused_mut)]
+        let mut tty_degraded = false;
+        #[allow(unused_mut)]
+        let mut tty_downgraded = false;
+        // Set to Some(reason) when ShellAskServer::start fails on a backend
+        // that otherwise supports AF_UNIX ask sockets, so the failure can be
+        // surfaced in the shell result JSON as nested_ask: { available: false }.
+        #[allow(unused_mut)]
+        let mut ask_server_start_error: Option<String> = None;
 
         if win_sandbox_backend {
             #[cfg(windows)]
             {
                 // The Windows sandbox owns its own pipes + scrubbed env; the PTY
                 // and `squeezy ask` socket paths do not apply on this backend.
+                // ConPTY is not wired for the sandbox path either, so record
+                // the same tty_degraded signal as the non-sandbox tokio path.
+                if tty {
+                    tty_degraded = true;
+                    tty_downgraded = true;
+                }
                 let _ = tty;
                 drop(shell_ask_approver);
                 let spec = build_win_spec(&self.shell_sandbox, &self.root, sandbox_plan);
                 let mut argv = Vec::with_capacity(1 + sandbox_plan.args.len());
                 argv.push(sandbox_plan.program.clone());
                 argv.extend(sandbox_plan.args.iter().cloned());
-                let env = preserved_env_string_map(&self.shell_sandbox);
+                let env = preserved_env_string_map(&self.shell_sandbox, &self.shell_sandbox_health);
                 let spawned = if sandbox_plan.backend == "windows-elevated" {
                     squeezy_win_sandbox::spawn_elevated(&spec, &argv, workdir, &env, false)
                 } else {
@@ -632,7 +1124,13 @@ impl ToolRegistry {
                         )));
                     }
                     Err(err) => {
-                        return Err(ShellRunError::Io(std::io::Error::other(err.to_string())));
+                        // Non-required Windows sandbox spawn failure: degrade
+                        // the same way as the Linux pre_exec path so the
+                        // caller can retry on the unsandboxed direct path.
+                        return Err(ShellRunError::SpawnFallback(format!(
+                            "shell sandbox backend {} spawn failed: {err}",
+                            sandbox_plan.backend
+                        )));
                     }
                 };
                 pty_master = None;
@@ -668,6 +1166,10 @@ impl ToolRegistry {
                     // Windows non-sandbox path: ConPTY is not yet wired up;
                     // degrade to non-TTY pipes. The shell still runs with the
                     // requested backend, just without a controlling terminal.
+                    // The outcome records `tty_degraded = true` so the caller
+                    // can surface a note to the user.
+                    tty_degraded = true;
+                    tty_downgraded = true;
                     command
                         .stdin(Stdio::null())
                         .stdout(Stdio::piped())
@@ -681,9 +1183,23 @@ impl ToolRegistry {
                     .stderr(Stdio::piped());
                 None
             };
+            // On non-Unix platforms, tty=true degrades to pipes because
+            // ConPTY is not yet wired. Record this so the caller can surface
+            // a user-visible note.
+            if tty {
+                #[cfg(not(unix))]
+                {
+                    tty_degraded = true;
+                    tty_downgraded = true;
+                }
+            }
             configure_shell_process_group(&mut command);
             configure_linux_shell_sandbox(&mut command, sandbox_plan);
-            apply_shell_environment_policy(&mut command, &self.shell_sandbox);
+            apply_shell_environment_policy(
+                &mut command,
+                &self.shell_sandbox,
+                &self.shell_sandbox_health,
+            );
             // Only export the `squeezy ask` socket when the active backend
             // permits the child's `socket(AF_UNIX, …)` connect. The
             // linux-direct-syscalls seccomp filter denies AF_UNIX sockets, so
@@ -707,7 +1223,18 @@ impl ToolRegistry {
                         command.env(SQUEEZY_ASK_CALL_ID_ENV, &call.call_id);
                         Some(server)
                     }
-                    Err(_err) => None,
+                    Err(err) => {
+                        // Record the startup failure so it can be surfaced in
+                        // the shell result JSON as `nested_ask: { available:
+                        // false, reason: "…" }`.  The child will not have
+                        // SQUEEZY_ASK_SOCKET set even though the backend
+                        // supports AF_UNIX, so the model and user must know
+                        // that nested approvals are unavailable for this call.
+                        ask_server_start_error = Some(format!(
+                            "nested ask disabled: ask server failed to start: {err}"
+                        ));
+                        None
+                    }
                 }
             } else {
                 None
@@ -717,6 +1244,18 @@ impl ToolRegistry {
                 Err(err) if sandbox_plan.required => {
                     return Err(ShellRunError::SandboxStartDenied(format!(
                         "shell sandbox backend {} failed to start: {err}",
+                        sandbox_plan.backend
+                    )));
+                }
+                Err(err) if sandbox_plan.backend != "none" => {
+                    // Non-required sandboxed spawn failure — the pre-exec hook
+                    // or the process setup was blocked (most commonly the Linux
+                    // `unshare`/seccomp pre_exec path blocked by the container's
+                    // own seccomp policy). Treat this as a best_effort fallback
+                    // rather than a hard I/O error so the caller can retry on
+                    // the unsandboxed direct path.
+                    return Err(ShellRunError::SpawnFallback(format!(
+                        "shell sandbox backend {} spawn failed: {err}",
                         sandbox_plan.backend
                     )));
                 }
@@ -735,20 +1274,37 @@ impl ToolRegistry {
         // job down via `WinSandboxChild::kill`. So we only need a `ShellJob`
         // here for the non-sandboxed tokio path (e.g. windows_sandbox_level =
         // "disabled"); assigning one to a sandbox child would be redundant.
+        //
+        // Record creation/assignment status for audit: even when Windows
+        // filesystem/network isolation is unavailable, process-tree cleanup
+        // should be independently observable — a failed job means
+        // timeout/cancel may not kill all descendants.
         #[cfg(windows)]
-        let shell_job: Option<ShellJob> = if win_sandbox_backend {
-            None
+        let (shell_job, win_job_object_status, windows_job_assigned): (
+            Option<ShellJob>,
+            &'static str,
+            Option<bool>,
+        ) = if win_sandbox_backend {
+            (None, "sandbox_managed", None)
         } else {
             match ShellJob::new() {
                 Ok(job) => {
                     if let Some(pid) = child.id() {
-                        let _ = job.assign_process(pid);
+                        match job.assign_process(pid) {
+                            Ok(()) => (Some(job), "assigned", Some(true)),
+                            Err(_) => (Some(job), "assign_failed", Some(false)),
+                        }
+                    } else {
+                        (Some(job), "pid_unavailable", Some(false))
                     }
-                    Some(job)
                 }
-                Err(_) => None,
+                Err(_) => (None, "create_failed", Some(false)),
             }
         };
+        #[cfg(not(windows))]
+        let _win_job_object_status: &'static str = "not_windows";
+        #[cfg(not(windows))]
+        let windows_job_assigned: Option<bool> = None;
 
         let stdout_capture = ShellStreamCapture::default();
         let stderr_capture = ShellStreamCapture::default();
@@ -788,27 +1344,40 @@ impl ToolRegistry {
 
         let status = tokio::select! {
             _ = cancel.cancelled() => {
-                terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                let cancel_kill_meta =
+                    terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
                 #[cfg(windows)]
-                if let Some(job) = shell_job.as_ref() {
-                    let _ = job.terminate(1);
-                }
+                let cancel_job_cleanup_ok =
+                    windows_job_cleanup_status(shell_job.as_ref(), windows_job_assigned);
+                #[cfg(not(windows))]
+                let cancel_job_cleanup_ok: Option<bool> = None;
                 stdout_task.abort();
                 stderr_task.abort();
                 drop(ask_server);
-                return Err(ShellRunError::Cancelled);
+                return Err(ShellRunError::Cancelled {
+                    kill_meta: cancel_kill_meta,
+                    windows_job_cleanup_ok: cancel_job_cleanup_ok,
+                });
             }
             result = time::timeout(Duration::from_millis(timeout_ms), child.wait()) => result,
         };
 
         let timed_out = status.is_err();
+        #[cfg(windows)]
+        let mut windows_timeout_job_cleanup_ok: Option<bool> = None;
+        #[cfg(not(windows))]
+        let windows_timeout_job_cleanup_ok: Option<bool> = None;
+        #[allow(unused_mut)]
+        let mut kill_meta: Option<ShellKillMeta> = None;
         let exit_status = match status {
             Ok(Ok(status)) => Some(status),
             Err(_) => {
-                terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                kill_meta =
+                    terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
                 #[cfg(windows)]
-                if let Some(job) = shell_job.as_ref() {
-                    let _ = job.terminate(1);
+                {
+                    windows_timeout_job_cleanup_ok =
+                        windows_job_cleanup_status(shell_job.as_ref(), windows_job_assigned);
                 }
                 None
             }
@@ -848,6 +1417,16 @@ impl ToolRegistry {
             stderr_bytes,
             stderr_truncated,
             raw_spillover,
+            #[cfg(windows)]
+            win_job_object_status: Some(win_job_object_status),
+            #[cfg(not(windows))]
+            win_job_object_status: None,
+            tty_degraded,
+            tty_downgraded,
+            windows_job_assigned,
+            windows_timeout_job_cleanup_ok,
+            kill_meta,
+            ask_server_start_error,
         })
     }
 }
@@ -1001,6 +1580,30 @@ pub(crate) fn shell_termination_reason(
         .or_else(|| Some("shell command ended without an exit code".to_string()))
 }
 
+/// Build the error message string for a cancelled shell audit row.
+/// When kill metadata is available (Unix only), the message includes the
+/// process group id and key signal outcomes so the audit record captures
+/// whether pgid-based cleanup reached the child group. `grace_expired` is
+/// included for symmetry with the JSON `kill_meta.grace_expired` field so a
+/// reader of the audit row can distinguish "child exited inside the SIGTERM
+/// grace window" from "grace expired and SIGKILL was needed".
+pub(crate) fn shell_cancelled_error_msg(kill_meta: Option<&ShellKillMeta>) -> String {
+    match kill_meta {
+        None => "shell command cancelled".to_string(),
+        Some(km) => {
+            let sigkill = if km.sigkill_sent {
+                format!(", sigkill_ok={}", km.sigkill_ok)
+            } else {
+                String::new()
+            };
+            format!(
+                "shell command cancelled: pgid={}, sigterm_ok={}, grace_expired={}{}",
+                km.pgid, km.sigterm_ok, km.grace_expired, sigkill,
+            )
+        }
+    }
+}
+
 pub(crate) fn shell_command_needs_checkpoint(
     direct_user_shell: bool,
     analysis: &ShellPermissionAnalysis,
@@ -1020,6 +1623,52 @@ pub(crate) fn shell_command_needs_checkpoint(
         }
         _ => true,
     }
+}
+
+/// Build a cancelled `ToolResult` for a shell call. When `windows_job_cleanup_ok`
+/// is `Some(false)` the Job Object cleanup failed and descendants may survive,
+/// so a degraded-cleanup note is included in the result to avoid silent
+/// process leakage.
+pub(crate) fn shell_cancelled_result(
+    call: &ToolCall,
+    windows_job_cleanup_ok: Option<bool>,
+    kill_meta: Option<ShellKillMeta>,
+) -> ToolResult {
+    if windows_job_cleanup_ok == Some(false) || kill_meta.is_some() {
+        let mut content = serde_json::Map::new();
+        content.insert("error".to_string(), json!("tool call cancelled"));
+        if let Some(km) = kill_meta {
+            content.insert(
+                "kill_meta".to_string(),
+                json!({
+                    "pgid": km.pgid,
+                    "sigterm_ok": km.sigterm_ok,
+                    "grace_expired": km.grace_expired,
+                    "sigkill_sent": km.sigkill_sent,
+                    "sigkill_ok": km.sigkill_ok,
+                    "direct_child_fallback": km.direct_child_fallback,
+                    "direct_child_kill_ok": km.direct_child_kill_ok,
+                }),
+            );
+        }
+        if windows_job_cleanup_ok == Some(false) {
+            content.insert(
+                "windows".to_string(),
+                json!({
+                    "job_object_cleanup": "failed",
+                    "note": "process tree cleanup not guaranteed; descendant processes may still be running"
+                }),
+            );
+        }
+        return make_result(
+            call,
+            ToolStatus::Cancelled,
+            serde_json::Value::Object(content),
+            ToolCostHint::default(),
+            None,
+        );
+    }
+    ToolResult::cancelled(call)
 }
 
 pub(crate) fn shell_policy_denied(
@@ -1160,9 +1809,14 @@ pub(crate) fn shell_segment_writes_filesystem(segment: &str) -> bool {
 /// Normalises a path-like token for sensitive-path matching:
 ///   - replaces backslashes with `/`,
 ///   - expands a leading `~/` or `~` against `$HOME`,
-///   - expands a leading `$HOME` or `${HOME}` against `$HOME`.
+///   - expands a leading `$HOME` or `${HOME}` against `$HOME`,
+///   - expands Windows `%VAR%` and PowerShell `$env:VAR` forms for
+///     `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, and `HOME`.
 fn normalize_path_token(token: &str, home: Option<&str>) -> String {
+    // Normalise path separators first so all comparisons use `/`.
     let token = token.replace('\\', "/");
+
+    // Expand Unix-style $HOME / ${HOME} / ~/
     if let Some(home) = home {
         if let Some(rest) = token.strip_prefix("$HOME/") {
             return format!("{home}/{rest}");
@@ -1183,6 +1837,42 @@ fn normalize_path_token(token: &str, home: Option<&str>) -> String {
             return home.to_string();
         }
     }
+
+    // Expand Windows cmd-style `%VAR%` and PowerShell `$env:VAR` prefixes.
+    // We only expand the three most security-sensitive Windows path roots so
+    // the pattern list stays specific. The result is normalised to `/`
+    // separators so the subsequent token_contains_sensitive_base check works
+    // identically on all platforms.
+    for (cmd_var, ps_var, env_key) in [
+        ("%USERPROFILE%", "$env:USERPROFILE", "USERPROFILE"),
+        ("%APPDATA%", "$env:APPDATA", "APPDATA"),
+        ("%LOCALAPPDATA%", "$env:LOCALAPPDATA", "LOCALAPPDATA"),
+        ("%HOME%", "$env:HOME", "HOME"),
+    ] {
+        let value = env::var_os(env_key)
+            .map(|v| v.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if value.is_empty() {
+            continue;
+        }
+        for prefix in [cmd_var, ps_var] {
+            // Both cmd.exe (`%USERPROFILE%`) and PowerShell (`$env:USERPROFILE`)
+            // treat env-var names case-insensitively, so match case-insensitively
+            // for both the bare form and the path form (e.g. `%userprofile%\...`).
+            let prefix_lower = prefix.to_ascii_lowercase();
+            let token_lower = token.to_ascii_lowercase();
+            let prefix_slash_lower = format!("{prefix_lower}/");
+            if let Some(rest) = token_lower.strip_prefix(&prefix_slash_lower) {
+                // Preserve original-case suffix from the real token.
+                let rest_start = token.len() - rest.len();
+                return format!("{value}/{}", &token[rest_start..]);
+            }
+            if token_lower == prefix_lower {
+                return value.clone();
+            }
+        }
+    }
+
     token
 }
 
@@ -1485,19 +2175,55 @@ impl ShellChild {
     }
 }
 
-async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) {
+async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) -> Option<ShellKillMeta> {
     match child {
         ShellChild::Tokio(child) => {
             #[cfg(unix)]
             if let Some(pid) = child.id() {
-                kill_process_group(pid, libc::SIGTERM);
-                if time::timeout(Duration::from_millis(grace_ms), child.wait())
-                    .await
-                    .is_ok()
-                {
-                    return;
+                // `configure_shell_process_group` creates a dedicated process
+                // group whose pgid is the child pid. Keep reporting the same
+                // pgid we signal so metadata reflects the actual target.
+                let pgid = pid;
+                let sigterm_ok = kill_process_group(pgid, libc::SIGTERM);
+                // Treat the grace-period wait as "not expired" only when the
+                // outer timeout returned Ok(Ok(_)) — meaning the child actually
+                // exited.  Ok(Err(_)) means child.wait() returned an IO error
+                // (e.g. ECHILD if the child was already reaped by a signal
+                // handler). In that case we conservatively treat the grace as
+                // expired and escalate to SIGKILL; the kill may be a no-op if
+                // the child is already gone, but that is safe.
+                let grace_wait = time::timeout(Duration::from_millis(grace_ms), child.wait()).await;
+                let grace_expired = !matches!(grace_wait, Ok(Ok(_)));
+                if !grace_expired {
+                    // Child exited cleanly within the grace period; no SIGKILL
+                    // or direct-child fallback is needed.
+                    return Some(ShellKillMeta {
+                        pgid,
+                        sigterm_ok,
+                        grace_expired: false,
+                        sigkill_sent: false,
+                        sigkill_ok: false,
+                        direct_child_fallback: false,
+                        direct_child_kill_ok: false,
+                    });
                 }
-                kill_process_group(pid, libc::SIGKILL);
+                let sigkill_ok = kill_process_group(pgid, libc::SIGKILL);
+                // Capture the supplemental direct-child kill result so the
+                // metadata can distinguish "we attempted the fallback" from
+                // "the fallback reached a live process". A common `false`
+                // outcome is tokio returning `InvalidInput` because the prior
+                // pgid SIGKILL already reaped the direct child.
+                let direct_child_kill_ok = child.kill().await.is_ok();
+                let _ = child.wait().await;
+                return Some(ShellKillMeta {
+                    pgid,
+                    sigterm_ok,
+                    grace_expired: true,
+                    sigkill_sent: true,
+                    sigkill_ok,
+                    direct_child_fallback: true,
+                    direct_child_kill_ok,
+                });
             }
             #[cfg(not(unix))]
             let _ = grace_ms;
@@ -1511,34 +2237,55 @@ async fn terminate_shell_child(child: &mut ShellChild, grace_ms: u64) {
             let _ = child.wait().await;
         }
     }
+    None
 }
 
+/// Send `signal` to the process group identified by `pgid`.
+/// Returns `true` when the `kill(2)` syscall succeeded (return value ≥ 0).
+/// A `false` return means the pgid was not reachable — the process may have
+/// already exited, changed its process group via `setsid`, or the caller
+/// lacked permission. The caller should treat `false` as a best-effort
+/// signal attempt, not a hard error; `child.kill()` follows as a fallback.
 #[cfg(unix)]
-fn kill_process_group(pid: u32, signal: libc::c_int) {
-    unsafe {
-        let _ = libc::kill(-(pid as libc::pid_t), signal);
-    }
+fn kill_process_group(pgid: u32, signal: libc::c_int) -> bool {
+    unsafe { libc::kill(-(pgid as libc::pid_t), signal) >= 0 }
 }
 
 /// Compute the env-allowlist-filtered environment that a sandboxed shell child
 /// should inherit. Shared by the tokio command path
 /// ([`apply_shell_environment_policy`]) and the Windows sandbox spawn path
 /// ([`preserved_env_string_map`]) so both apply identical env scrubbing.
-fn compute_preserved_env(config: &ShellSandboxConfig) -> BTreeMap<String, OsString> {
-    let mut preserved = BTreeMap::<String, OsString>::new();
-    for (name, value) in env::vars_os() {
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if shell_env_should_preserve(name, &config.env_allowlist) {
-            preserved.insert(name.to_string(), value);
-        }
-    }
-    preserved
+/// When a `health` cache is provided the result is memoised on the first call
+/// and cloned on subsequent calls, avoiding a full `vars_os()` scan per shell
+/// invocation (the allowlist and process environment are both stable per
+/// session).
+fn compute_preserved_env(
+    config: &ShellSandboxConfig,
+    health: &crate::shell_sandbox::ShellSandboxHealth,
+) -> BTreeMap<String, OsString> {
+    health
+        .preserved_env_cache
+        .get_or_init(|| {
+            let mut preserved = BTreeMap::<String, OsString>::new();
+            for (name, value) in env::vars_os() {
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if shell_env_should_preserve(name, &config.env_allowlist) {
+                    preserved.insert(name.to_string(), value);
+                }
+            }
+            preserved
+        })
+        .clone()
 }
 
-fn apply_shell_environment_policy(command: &mut Command, config: &ShellSandboxConfig) {
-    let preserved = compute_preserved_env(config);
+fn apply_shell_environment_policy(
+    command: &mut Command,
+    config: &ShellSandboxConfig,
+    health: &crate::shell_sandbox::ShellSandboxHealth,
+) {
+    let preserved = compute_preserved_env(config, health);
     command.env_clear();
     for (name, value) in &preserved {
         command.env(name, value);
@@ -1552,8 +2299,9 @@ fn apply_shell_environment_policy(command: &mut Command, config: &ShellSandboxCo
 #[cfg(windows)]
 fn preserved_env_string_map(
     config: &ShellSandboxConfig,
+    health: &crate::shell_sandbox::ShellSandboxHealth,
 ) -> std::collections::HashMap<String, String> {
-    compute_preserved_env(config)
+    compute_preserved_env(config, health)
         .into_iter()
         .map(|(name, value)| (name, value.to_string_lossy().into_owned()))
         .collect()

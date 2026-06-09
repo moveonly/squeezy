@@ -13,6 +13,8 @@ categories.workspace = true
 publish.workspace = true
 
 [dependencies]
+fs2.workspace = true
+getrandom.workspace = true
 redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,6 +24,9 @@ squeezy-llm.workspace = true
 squeezy-workspace.workspace = true
 toml.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tokio.workspace = true

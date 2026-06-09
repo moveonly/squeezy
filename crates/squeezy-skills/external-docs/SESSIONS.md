@@ -3,9 +3,22 @@
 Squeezy writes redacted local session history so prior work can be found and
 resumed without remembering a provider response id.
 
-By default, session state lives under `.squeezy/sessions/` in the workspace.
+By default, session state lives under `.squeezy/sessions/` in the workspace —
+this is workspace-local state that is safe to delete or move per-project.
 If `[cache].root` is set and `[session].log_dir` is unset, sessions live under
-`<cache.root>/sessions`. `[session].log_retention_days` defaults to 30 days.
+`<cache.root>/sessions`. With `[cache].root = "xdg"` on Linux, that resolves
+under `$XDG_CACHE_HOME/squeezy/<repo-id>` or `$HOME/.cache/squeezy/<repo-id>`,
+falling back to `<workspace>/.squeezy/cache/squeezy/<repo-id>` when neither
+environment variable is set (typically only in sandboxed runs).
+`[session].log_retention_days` defaults to 30 days.
+
+A separate user-global cross-project session index lives under
+`$HOME/.squeezy/sessions/index.jsonl` (or `$XDG_STATE_HOME/squeezy/sessions/index.jsonl`
+when `XDG_STATE_HOME` is set on Linux). This index is an append-only cache used
+by the resume picker to surface sessions from sibling repos; the authoritative
+source is the per-project session directory. The global index is safe to delete —
+it will be repopulated on next use. Run `squeezy doctor` to see the resolved paths
+for both stores, the memory file, and whether XDG variables are honoured.
 
 Each session directory contains:
 
@@ -21,6 +34,11 @@ Each session directory contains:
 - `replay.jsonl`: append-only versioned redacted replay tape with model
   requests, model stream events, tool calls/results, cost decisions, timestamps,
   and stable hashes used to detect replay divergence.
+
+`[cache].durability` controls how aggressively `events.jsonl` and
+`replay.jsonl` are synced. The default `fast` mode keeps appends cheap; `turn`
+syncs at explicit session flush/shutdown boundaries; `strict` syncs every
+durable JSONL append.
 
 Use CLI discovery commands:
 
@@ -43,6 +61,17 @@ squeezy sessions report <session_id> --preview
 squeezy sessions report <session_id> --send
 squeezy sessions cleanup
 ```
+
+CLI surfaces (`sessions list`, `sessions show`, `sessions list --json`,
+`sessions show --json`, and `sessions replay --json`) publish session
+identifiers as opaque
+`sess_<16hex>` public handles. Every command that consumes a
+`<session_id>` accepts that public handle directly, so the
+`sessions list → sessions resume/fork/show/replay/export/report/archive`
+workflow round-trips without exposing the raw on-disk
+`<timestamp_ms>-<pid>-<counter>` form. The same commands continue to
+accept the raw id and short raw-id prefixes for compatibility with
+scripts that already capture them from `.squeezy/sessions/<id>/`.
 
 The TUI also supports `/sessions`, `/session <session_id>`, `/resume
 <session_id>`, `/session rename <title>`, `/session label <label>`,
@@ -123,7 +152,11 @@ so subsequent turns add to the running totals rather than replacing them.
 `archived/<id>/`, recoverable with `squeezy sessions unarchive <id>`); pass
 `--purge` to hard-delete instead. The retention sweep
 skips sessions that are still `running` (only explicit ids can remove a
-Running session, in case it was orphaned by a crash).
+Running session, in case it was orphaned by a crash). `squeezy sessions list`
+marks sessions that have been in the `running` state for more than 24 hours with
+`[stale-running]`; these are likely orphaned by a SIGKILL, power loss, or
+terminal teardown before finalization. `squeezy sessions show <id>` additionally
+warns on stderr when displaying a stale-running session.
 
 Routine per-turn events (tool calls, tool results, approvals, deltas) append
 to `events.jsonl` without rewriting `metadata.json`; the on-disk metadata is

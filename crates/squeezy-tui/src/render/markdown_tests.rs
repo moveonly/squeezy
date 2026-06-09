@@ -108,7 +108,7 @@ fn markdown_caps_table_column_width_for_narrow_terminals() {
 #[test]
 fn markdown_full_preserves_table_cell_text() {
     let source = "\
-| Dimension | repo_map | sonar context |
+| Dimension | repo_map | semantic graph |
 |---|---|---|
 | Module names | Directory names from the repository tree | Artifact IDs from Maven module dependencies |
 | Symbol-level detail | Classes, fields, methods, and package-level structure | Stopped at module dependency analysis |

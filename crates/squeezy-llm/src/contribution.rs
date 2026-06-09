@@ -20,6 +20,7 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -382,14 +383,40 @@ impl ProviderContribution for GoogleContribution {
 /// `route_style` is accepted as a lowercase string (`"native"`,
 /// `"openai_compatible"`, …) and parsed via [`OllamaRoute::parse`] so the
 /// user-facing TOML matches the existing settings.toml dialect.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `api_key_env` / `api_key` / `keep_alive` map 1:1 to `OllamaConfig` and
+/// let users configure Ollama Cloud / reverse-proxy auth and the idle model
+/// retention window through the same contribution surface.
+///
+/// M-63: custom `Debug` impl below redacts `api_key` so it matches the
+/// redaction contract applied to `OllamaConfig` and other key-bearing types.
+#[derive(Clone, Deserialize)]
 pub struct OllamaContributionConfig {
     #[serde(default = "default_ollama_base_url")]
     pub base_url: String,
     #[serde(default)]
     pub route_style: Option<String>,
     #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub keep_alive: Option<String>,
+    #[serde(default)]
     pub transport: ProviderTransportConfig,
+}
+
+impl fmt::Debug for OllamaContributionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OllamaContributionConfig")
+            .field("base_url", &self.base_url)
+            .field("route_style", &self.route_style)
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key", &self.api_key.as_deref().map(|_| "<redacted>"))
+            .field("keep_alive", &self.keep_alive)
+            .field("transport", &self.transport)
+            .finish()
+    }
 }
 
 fn default_ollama_base_url() -> String {
@@ -422,6 +449,11 @@ impl ProviderContribution for OllamaContribution {
         let core = OllamaConfig {
             base_url: config.base_url,
             route_style,
+            api_key_env: config
+                .api_key_env
+                .unwrap_or_else(|| "OLLAMA_API_KEY".to_string()),
+            api_key: config.api_key,
+            keep_alive: config.keep_alive,
             transport: config.transport,
         };
         Ok(Box::new(OllamaProvider::from_config(&core)))

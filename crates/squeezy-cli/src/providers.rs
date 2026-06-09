@@ -153,28 +153,59 @@ fn handle_info(
     );
     println!("  models      {}", entry.model_count);
     for model in models_for_provider(canonical) {
+        let caps = &model.capabilities;
+        let ctx = model
+            .limits
+            .map(|l| l.context_window_tokens.to_string())
+            .unwrap_or_else(|| "?".into());
+        let cap_flags: Vec<&str> = [
+            caps.tool_calling.then_some("tools"),
+            caps.vision.then_some("vision"),
+            caps.reasoning_tokens.then_some("reasoning"),
+            caps.reasoning_effort.then_some("effort"),
+            caps.prompt_caching.then_some("cache"),
+            caps.json_mode.then_some("json"),
+            caps.response_state.then_some("state"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         println!(
-            "    {} (profile={:?}, tools={}, ctx={})",
+            "    {} (profile={:?}, ctx={}, caps=[{}])",
             model.id,
             model.profile,
-            model.capabilities.tool_calling,
-            model
-                .limits
-                .map(|limits| limits.context_window_tokens)
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "?".into()),
+            ctx,
+            cap_flags.join(","),
         );
     }
     Ok(())
 }
 
 fn model_json(model: &ModelInfo) -> Value {
+    let caps = &model.capabilities;
     json!({
         "id": model.id,
         "profile": format!("{:?}", model.profile),
-        "tool_calling": model.capabilities.tool_calling,
-        "context_window": model.limits.map(|l| l.context_window_tokens),
         "lifecycle": model.lifecycle.as_str(),
+        "context_window": model.limits.map(|l| l.context_window_tokens),
+        "max_output_tokens": model.limits.map(|l| l.max_output_tokens),
+        "pricing": model.pricing.map(|p| json!({
+            "input_usd_micros_per_mtok": p.input_usd_micros_per_mtok,
+            "output_usd_micros_per_mtok": p.output_usd_micros_per_mtok,
+            "cache_read_usd_micros_per_mtok": p.cache_read_usd_micros_per_mtok,
+            "cache_write_usd_micros_per_mtok": p.cache_write_usd_micros_per_mtok,
+        })),
+        "capabilities": {
+            "streaming": caps.streaming,
+            "tool_calling": caps.tool_calling,
+            "json_mode": caps.json_mode,
+            "vision": caps.vision,
+            "response_state": caps.response_state,
+            "reasoning_tokens": caps.reasoning_tokens,
+            "reasoning_effort": caps.reasoning_effort,
+            "text_verbosity": caps.text_verbosity,
+            "prompt_caching": caps.prompt_caching,
+        },
     })
 }
 
@@ -206,6 +237,18 @@ pub(crate) fn registry_entries(env_lookup: &dyn Fn(&str) -> Option<String>) -> V
         api_key_env: entry.api_key_env,
         configured: if entry.name == "github_copilot" {
             github_copilot_auth_file_path().is_some_and(|path| path.exists())
+        } else if entry.name == "bedrock" {
+            // Bedrock uses the full AWS credential chain. Accept static access
+            // keys, named profiles, IRSA/OIDC web-identity tokens, or a
+            // dedicated bearer token. Any of these env vars signals a configured
+            // deployment; profile-based and IAM-instance-role auth have no env
+            // var at all — `squeezy doctor --probe` gives a live verdict.
+            bedrock_configured(env_lookup)
+        } else if entry.name == "ollama" {
+            // Ollama operates without auth by default; treat it as always
+            // configured. Users who set OLLAMA_API_KEY get a bearer token
+            // attached, but the absence of a key does not block usage.
+            true
         } else {
             env_set(env_lookup, entry.api_key_env)
         },
@@ -233,6 +276,25 @@ fn env_set(env_lookup: &dyn Fn(&str) -> Option<String>, name: &str) -> bool {
     env_lookup(name)
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
+}
+
+/// Check whether any common AWS credential signal is present in the environment.
+/// The full AWS credential chain (profile files, IMDSv2, IRSA, SSO) cannot be
+/// probed with env vars alone — this is a best-effort check that covers the
+/// most common CI and developer workstation cases. `squeezy doctor --probe`
+/// gives a definitive live verdict.
+fn bedrock_configured(env_lookup: &dyn Fn(&str) -> Option<String>) -> bool {
+    const AWS_CRED_VARS: &[&str] = &[
+        "AWS_ACCESS_KEY_ID",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_ROLE_ARN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    ];
+    AWS_CRED_VARS.iter().any(|var| env_set(env_lookup, var))
 }
 
 struct BaseProvider {
@@ -279,16 +341,25 @@ const BASE_PROVIDERS: &[BaseProvider] = &[
         // Bedrock's "base URL" is a region; surface it under the same column
         // so the table stays uniform.
         base_url: DEFAULT_BEDROCK_REGION,
-        api_key_env: "AWS_ACCESS_KEY_ID",
+        // Bedrock uses the full AWS credential chain: access keys, named
+        // profiles, IAM instance roles, IRSA, and SSO/bearer tokens are all
+        // valid — `AWS_ACCESS_KEY_ID` is just the key-id half of static
+        // access-key auth and is absent in profile/IAM/IRSA deployments.
+        // Report `BEDROCK_CONFIGURED` as an always-present placeholder so the
+        // table does not mislead profile/IAM users into thinking Bedrock is
+        // unconfigured. Use `squeezy doctor --probe` for a live credential check.
+        api_key_env: "",
         aliases: &["bedrock", "aws_bedrock", "aws"],
     },
     BaseProvider {
         name: "ollama",
         display_name: "Ollama",
         base_url: DEFAULT_OLLAMA_BASE_URL,
-        // Ollama doesn't require auth by default; show the documented env var
-        // for users running behind a reverse proxy.
-        api_key_env: "OLLAMA_API_KEY",
+        // Ollama runs locally without auth by default; treat it as always
+        // configured so it doesn't appear unconfigured just because
+        // OLLAMA_API_KEY is absent. Users running behind a reverse proxy
+        // can set OLLAMA_API_KEY or providers.ollama.api_key in TOML.
+        api_key_env: "",
         aliases: &["ollama"],
     },
     BaseProvider {

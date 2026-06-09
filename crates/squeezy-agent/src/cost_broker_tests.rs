@@ -531,6 +531,47 @@ fn record_provider_cost_populates_per_model_ledger_without_drift() {
 }
 
 #[test]
+fn record_out_of_band_session_cost_advances_cap_basis_and_snapshot() {
+    // Verifies that reviewer cost folded in via record_out_of_band_session_cost
+    // is reflected in both the cap-basis total (used by cap checks) and the
+    // session_cost_snapshot (used by the live status line), without affecting
+    // the model ledger or turn metrics (those are already correct from the
+    // direct state.cost update on the permission path).
+    let config = squeezy_core::AppConfig {
+        max_session_cost_usd_micros: Some(1_000_000),
+        ..Default::default()
+    };
+    let mut broker = CostBroker::new(&config);
+    let prior_cost = squeezy_core::CostSnapshot {
+        estimated_usd_micros: Some(200_000),
+        ..Default::default()
+    };
+    broker.seed_session(&prior_cost, squeezy_llm::TokenCalibration::default());
+
+    // Simulate a reviewer call costing 5_000 micros.
+    broker.record_out_of_band_session_cost(5_000);
+
+    // The cap-basis total (used by session_cap_reached / projected_session_cap_overrun
+    // / session_cost_snapshot) must advance.
+    assert_eq!(broker.session_cost_usd_micros, 205_000);
+    // session_cost_snapshot unconditionally returns session_cost_usd_micros as
+    // the dollar field, so the snapshot also reflects the new total.
+    assert_eq!(
+        broker.session_cost_snapshot().estimated_usd_micros,
+        Some(205_000)
+    );
+
+    // The model ledger and turn metrics must not be affected (they are
+    // managed separately by the permission path's direct state.cost update).
+    assert!(broker.metrics.model_ledger.is_empty());
+    assert_eq!(broker.metrics.provider.estimated_usd_micros, None);
+
+    // A zero-micros call is a safe no-op.
+    broker.record_out_of_band_session_cost(0);
+    assert_eq!(broker.session_cost_usd_micros, 205_000);
+}
+
+#[test]
 fn session_metrics_without_model_ledger_field_deserializes_empty() {
     // A session persisted before `model_ledger` existed (field absent) must
     // deserialize with an empty ledger and never error — the resume-safety

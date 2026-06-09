@@ -95,7 +95,7 @@ detect_target() {
       esac
       ;;
     *)
-      err "unsupported OS: $os (squeezy publishes macOS and Linux only)"
+      err "unsupported OS: $os (this install.sh supports macOS and Linux release archives)"
       ;;
   esac
 }

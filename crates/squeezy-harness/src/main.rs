@@ -35,8 +35,18 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> squeezy_core::Result<()> {
+fn main() -> squeezy_core::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .map_err(|err| {
+            squeezy_core::SqueezyError::Agent(format!("failed to build harness runtime: {err}"))
+        })?
+        .block_on(async_main())
+}
+
+async fn async_main() -> squeezy_core::Result<()> {
     squeezy_core::pre_main_hardening(squeezy_core::HardeningConfig::default());
     let cli = Cli::parse();
     match cli.command {

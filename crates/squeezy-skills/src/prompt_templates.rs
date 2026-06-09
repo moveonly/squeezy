@@ -113,12 +113,28 @@ impl PromptTemplateCatalog {
     }
 
     /// Discover templates from the standard locations: `~/.squeezy/prompts/`
-    /// (user scope) and `<workspace_root>/.squeezy/prompts/` (project
-    /// scope). Project entries override same-stem user entries.
+    /// (user scope, legacy) and, when available,
+    /// `$XDG_CONFIG_HOME/squeezy/prompts/` or
+    /// `~/.config/squeezy/prompts/` (user scope, XDG-aware).  Project
+    /// entries from `<workspace_root>/.squeezy/prompts/` shadow all
+    /// user-scope entries.
     pub fn discover(workspace_root: &Path) -> Self {
         let user_dir = home_prompts_dir();
+        // Delegate XDG resolution to squeezy-core to avoid duplicate logic.
+        // The core function already deduplicates against the legacy path.
+        let xdg_dir = squeezy_core::default_xdg_prompts_dir();
         let project_dir = workspace_root.join(PROJECT_PROMPTS_DIR);
-        Self::from_dirs(user_dir.as_deref(), Some(project_dir.as_path()))
+        let mut catalog = Self::default();
+        // Legacy path first so it is the lower-priority source.
+        if let Some(dir) = user_dir.as_deref() {
+            catalog.discover_dir(dir, PromptTemplateSource::User);
+        }
+        // XDG path: only scanned when it differs from the legacy path.
+        if let Some(dir) = xdg_dir.as_deref() {
+            catalog.discover_dir(dir, PromptTemplateSource::User);
+        }
+        catalog.discover_dir(project_dir.as_path(), PromptTemplateSource::Project);
+        catalog
     }
 
     /// Discover templates from explicit `(user, project)` directories.

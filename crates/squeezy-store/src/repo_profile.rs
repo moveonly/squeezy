@@ -10,8 +10,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use squeezy_core::{GraphConfig, LanguageKind, Result, SqueezyError, repo_settings_id};
 use squeezy_workspace::{
-    CrawlOptions, ExclusionReason, IndexingPolicy, WorkspaceCrawler, WorkspaceSnapshot,
+    CrawlOptions, ExclusionReason, IndexingPolicy, UnsupportedReason, WorkspaceCrawler,
+    WorkspaceSnapshot, classify_language,
 };
+
+use crate::fs_util;
 
 pub const REPO_REGISTRY_VERSION: u32 = 1;
 
@@ -106,15 +109,11 @@ impl RepoRegistry {
         {
             fs::create_dir_all(parent)?;
         }
-        let temp_path = path.with_file_name(format!(
-            ".{}.{}.tmp",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("repos.toml"),
-            std::process::id()
-        ));
-        fs::write(&temp_path, self.to_toml())?;
-        fs::rename(&temp_path, path)?;
+        // Atomicity: writes go through `fs_util::write_bytes_atomically`,
+        // which produces a fresh tmp + `sync_all` + atomic replace (see
+        // `fs_util.rs`). Concurrent readers therefore see either the prior
+        // complete `repos.toml` or the new one, never a half-written file.
+        fs_util::write_bytes_atomically(path, self.to_toml().as_bytes())?;
         Ok(())
     }
 
@@ -622,11 +621,7 @@ pub struct RepoRecommendation {
 pub fn default_repo_registry_path() -> PathBuf {
     env::var_os("SQUEEZY_REPOS_PATH")
         .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".squeezy/repos.toml"))
-        })
+        .or_else(|| fs_util::user_squeezy_dir().map(|dir| dir.join("repos.toml")))
         .unwrap_or_else(|| PathBuf::from(".squeezy/repos.toml"))
 }
 
@@ -710,6 +705,7 @@ fn crawl_options_from_graph_config(config: &GraphConfig) -> CrawlOptions {
         include_hidden: config.include_hidden,
         max_file_bytes: config.max_file_bytes,
         require_indexing_signal: config.require_indexing_signal,
+        languages: config.languages.clone(),
         policy: IndexingPolicy {
             include: config.include.clone(),
             exclude: config.exclude.clone(),
@@ -777,6 +773,11 @@ fn detect_languages(snapshot: &WorkspaceSnapshot) -> Vec<DetectedLanguage> {
     let mut counts = HashMap::<LanguageKind, usize>::new();
     for file in &snapshot.files {
         *counts.entry(file.language).or_default() += 1;
+    }
+    for file in &snapshot.unsupported {
+        if file.reason == UnsupportedReason::LanguageDisabled {
+            *counts.entry(classify_language(&file.path)).or_default() += 1;
+        }
     }
     let mut languages = counts
         .into_iter()

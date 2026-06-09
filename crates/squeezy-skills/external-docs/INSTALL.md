@@ -93,7 +93,27 @@ Tagged releases publish prebuilt archives and SHA-256 checksum files:
 
 Download the archive for your platform from
 `https://github.com/esqueezy/squeezy/releases`, verify the checksum, then put
-the `squeezy` binary on your `PATH`:
+the `squeezy` binary on your `PATH`.
+
+**Linux x86_64:**
+
+```sh
+sha256sum -c squeezy-x86_64-unknown-linux-musl.tar.gz.sha256
+tar -xzf squeezy-x86_64-unknown-linux-musl.tar.gz
+install -m 0755 squeezy /usr/local/bin/squeezy
+squeezy doctor
+```
+
+**Linux ARM64:**
+
+```sh
+sha256sum -c squeezy-aarch64-unknown-linux-musl.tar.gz.sha256
+tar -xzf squeezy-aarch64-unknown-linux-musl.tar.gz
+install -m 0755 squeezy /usr/local/bin/squeezy
+squeezy doctor
+```
+
+**macOS (Apple Silicon):**
 
 ```sh
 shasum -a 256 -c squeezy-aarch64-apple-darwin.tar.gz.sha256
@@ -102,8 +122,14 @@ install -m 0755 squeezy /usr/local/bin/squeezy
 squeezy doctor
 ```
 
-Replace the archive name with the Intel macOS, Linux x86_64, or Linux ARM64
-archive when needed.
+**macOS (Intel):**
+
+```sh
+shasum -a 256 -c squeezy-x86_64-apple-darwin.tar.gz.sha256
+tar -xzf squeezy-x86_64-apple-darwin.tar.gz
+install -m 0755 squeezy /usr/local/bin/squeezy
+squeezy doctor
+```
 
 On Windows, expand the zip and add the install location to `PATH`:
 
@@ -145,6 +171,28 @@ squeezy
 Provider and model choices can be changed with `SQUEEZY_PROVIDER`,
 `SQUEEZY_MODEL`, CLI flags, or `~/.squeezy/settings.toml`. See
 [`PROVIDERS.md`](PROVIDERS.md) and [`CONFIGURATION.md`](CONFIGURATION.md).
+
+## Headless / package CI
+
+Distro packagers and post-install smoke tests can run `squeezy doctor` in a
+network-isolated, repo-less environment by combining the `--json`,
+`--no-update-check`, and `--no-repo-profile` flags:
+
+```sh
+squeezy doctor --json --no-update-check --no-repo-profile
+```
+
+- `--json` emits a stable, machine-readable report (consumers can `jq` for
+  fields like `.checks[] | select(.name=="sandbox") | .backend`).
+- `--no-update-check` skips the GitHub update-availability probe, so the
+  command does not contact the network.
+- `--no-repo-profile` skips the repo-profile load, so the command does not
+  require a Squeezy workspace and stays fixed-cost on bare runners.
+
+Both flags preserve the row name in `--json` output (`update` and
+`repo_profile` respectively) with `status: "ok"` and a `detail` of
+`"skipped (--no-update-check)"` / `"skipped (--no-repo-profile)"`, so
+existing consumers keyed on those rows continue to work.
 
 ## Upgrade
 
@@ -191,10 +239,13 @@ rm /usr/local/bin/squeezy
 Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\squeezy"
 ```
 
-Squeezy stores user settings and local runtime state under `~/.squeezy` on
-Unix and `%APPDATA%\squeezy` on Windows. Remove that directory only if you
-also want to delete settings, sessions, caches, reports, and local repo
-profiles:
+Squeezy stores user settings and global indexes under `~/.squeezy` on Unix and
+`%APPDATA%\squeezy` on Windows. Workspace-local sessions and caches default to
+`.squeezy/sessions` and `.squeezy/cache` unless `[session].log_dir` or
+`[cache].root` overrides them. On Linux, `squeezy doctor --storage` reports
+cache/session paths, mount types, redb backup age, and network or virtual
+filesystem warnings. Remove `~/.squeezy` only if you also want to delete
+settings, global indexes, reports, and local repo profiles:
 
 ```sh
 rm -rf ~/.squeezy

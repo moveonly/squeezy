@@ -1,16 +1,28 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read as _,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use squeezy_core::{Result, SkillConfigEntry, SkillsConfig, SqueezyError};
-use squeezy_hooks::{HookContext, HookEvent, HookHandler, HookRegistry, HookResult};
+use squeezy_hooks::{HookContext, HookEvent, HookHandler, HookPayload, HookRegistry, HookResult};
 use tracing::warn;
+
+/// Default number of seconds to wait for a skill hook command before
+/// killing it and returning a deny result. Avoids blocking the agent
+/// turn on a hook that hangs (e.g. `sleep infinity`, blocked I/O).
+pub const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 
 pub mod help;
 pub mod implicit;
@@ -18,8 +30,8 @@ pub mod prompt_templates;
 pub mod render;
 
 pub use help::{
-    APPROVAL_POLICY_DOC_PATH, BundledDoc, HelpAnswer, HelpCitation, HelpStatus, SqueezyHelp,
-    bundled_doc, bundled_doc_paths, bundled_docs, matches_squeezy_help_input,
+    APPROVAL_POLICY_DOC_PATH, BundledDoc, HelpAnswer, HelpAnswerSource, HelpCitation, HelpStatus,
+    SqueezyHelp, bundled_doc, bundled_doc_paths, bundled_docs, matches_squeezy_help_input,
     relevant_docs_for_input, slash_command_help_names,
 };
 pub use prompt_templates::{
@@ -205,7 +217,7 @@ pub enum SkillContextMode {
 }
 
 impl SkillContextMode {
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Inline => "inline",
             Self::Fork => "fork",
@@ -272,6 +284,17 @@ pub struct SkillHookMatcher {
     pub hooks: Vec<SkillHookSpec>,
 }
 
+/// What to do when a skill hook command fails to spawn (e.g. missing `sh` on
+/// Windows). Defaults to `Allow` to preserve existing behavior, but operators
+/// can set `Deny` for policy-enforcement hooks where a spawn failure must not
+/// silently become permissive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HookFailurePolicy {
+    #[default]
+    Allow,
+    Deny,
+}
+
 /// One concrete hook handler declaration.
 ///
 /// Today only the `command` kind is implemented: it shells out to the
@@ -279,10 +302,37 @@ pub struct SkillHookMatcher {
 /// when the path is relative. `once: true` semantics live in the handler
 /// (self-skipped after the first *successful* run) so the registry stays
 /// agnostic; a failed first run is retried on the next dispatch.
+///
+/// `kind_valid` is `false` when the spec's `type:` field was set to an
+/// unsupported value. Such specs are dropped before handler registration
+/// so a frontmatter block with `type: webhook` + `command: ...` does
+/// not silently execute as a shell command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillHookSpec {
     pub command: String,
     pub once: bool,
+    /// Maximum seconds to wait for the hook command before killing it
+    /// and returning a deny result. Defaults to
+    /// [`DEFAULT_HOOK_TIMEOUT_SECS`] when `None`.
+    pub timeout_secs: Option<u64>,
+    /// When `false` (fail-closed), a spawn error or `wait()` error returns
+    /// a deny result instead of silently allowing execution. Defaults to
+    /// `true` for backward-compatibility with the original fail-open
+    /// behaviour; set `fail_open = false` in the frontmatter for enforcement
+    /// hooks that must not silently pass when the interpreter is missing.
+    ///
+    /// **Note**: a hook that exceeds `timeout_secs` always returns deny
+    /// regardless of `fail_open`, because a hung hook is an anomaly that
+    /// should not silently pass in either audit or enforcement configurations.
+    pub fail_open: bool,
+    /// `false` when an unsupported `type:` was declared; prevents
+    /// execution even if a `command:` line was also present.
+    pub kind_valid: bool,
+    /// Policy applied when the hook command fails to spawn (e.g. shell not in
+    /// `PATH`). `Allow` (default) preserves backward compatibility. `Deny`
+    /// makes spawn failures behave like a non-zero exit, preventing a missing
+    /// shell from silently neutralizing a policy hook.
+    pub failure_policy: HookFailurePolicy,
 }
 
 impl LoadedSkill {
@@ -414,6 +464,16 @@ pub struct SkillCatalog {
     ambiguous_triggers: BTreeSet<String>,
     implicit_by_scripts_dir: BTreeMap<PathBuf, String>,
     implicit_by_doc_path: BTreeMap<PathBuf, String>,
+    /// Lowercase basenames of all indexed doc paths, kept in sync with
+    /// `implicit_by_doc_path`. Used as an O(log n) prefilter in
+    /// `doc_token_may_match_indexed_path` so we avoid a full key scan on
+    /// every reader token — especially helpful on Windows with large or
+    /// slow-mount catalogs.
+    implicit_doc_filenames: BTreeSet<String>,
+    /// All root directories that were probed during the last [`Self::discover`]
+    /// call, in discovery order. Stored so callers (e.g. `squeezy skills list`)
+    /// can display the scanned roots without triggering a second ancestor walk.
+    scanned_roots: Vec<PathBuf>,
     active_budget_chars: usize,
     active_body_cap_chars: usize,
     preamble_enabled: bool,
@@ -435,6 +495,8 @@ impl Default for SkillCatalog {
             ambiguous_triggers: BTreeSet::new(),
             implicit_by_scripts_dir: BTreeMap::new(),
             implicit_by_doc_path: BTreeMap::new(),
+            implicit_doc_filenames: BTreeSet::new(),
+            scanned_roots: Vec::new(),
             active_budget_chars: defaults.active_budget_effective_chars(),
             active_body_cap_chars: defaults.active_body_cap_chars,
             preamble_enabled: defaults.preamble_enabled,
@@ -462,8 +524,32 @@ impl SkillCatalog {
             inline: config.inline,
             ..Self::default()
         };
+        // Populate scanned_roots eagerly so callers (e.g. `squeezy skills list`)
+        // can display the probed roots without a second ancestor walk.
+        catalog.scanned_roots.push(config.compat_user_dir.clone());
+        catalog.scanned_roots.push(config.user_dir.clone());
+        catalog
+            .scanned_roots
+            .extend(config.extra_roots.iter().cloned());
+        catalog
+            .scanned_roots
+            .push(workspace_root.join(COMPAT_PROJECT_SKILLS_DIR));
+        catalog
+            .scanned_roots
+            .push(workspace_root.join(PROJECT_SKILLS_DIR));
         catalog.discover_dir(&config.compat_user_dir, SkillSource::CompatUser);
         catalog.discover_dir(&config.user_dir, SkillSource::User);
+        // XDG-aware user directory scanned right after the legacy user dir so
+        // that skills placed in `$XDG_DATA_HOME/squeezy/skills` are
+        // discoverable on Linux without requiring the user to set
+        // `SQUEEZY_SKILLS_USER_DIR`.  All skills already present at this point
+        // (from both `compat_user_dir` and `user_dir`) shadow same-name
+        // entries from the XDG path so higher-priority legacy directories
+        // always take precedence on a name collision.
+        if let Some(xdg_dir) = &config.xdg_user_dir {
+            let shadow_set: BTreeSet<String> = catalog.skills.keys().cloned().collect();
+            catalog.discover_dir_filtered(xdg_dir, SkillSource::User, Some(&shadow_set));
+        }
         catalog.discover_extra_roots(&config.extra_roots);
         catalog.discover_dir(
             &workspace_root.join(COMPAT_PROJECT_SKILLS_DIR),
@@ -483,6 +569,14 @@ impl SkillCatalog {
         // new skills so closer ancestors always win over farther ones.
         let mut shadow_set: BTreeSet<String> = catalog.skills.keys().cloned().collect();
         for ancestor in ancestor_project_roots(workspace_root) {
+            // Track ancestor roots for `scanned_roots()` so callers see the
+            // full set without a second ancestor walk.
+            catalog
+                .scanned_roots
+                .push(ancestor.join(COMPAT_PROJECT_SKILLS_DIR));
+            catalog
+                .scanned_roots
+                .push(ancestor.join(PROJECT_SKILLS_DIR));
             let before: BTreeSet<String> = catalog.skills.keys().cloned().collect();
             catalog.discover_dir_filtered(
                 &ancestor.join(COMPAT_PROJECT_SKILLS_DIR),
@@ -504,6 +598,14 @@ impl SkillCatalog {
         catalog.collect_trigger_collisions();
         catalog.rebuild_implicit_indexes();
         catalog
+    }
+
+    /// Returns all root directories that were probed during the last
+    /// [`Self::discover`] call, in discovery order. Callers can display
+    /// this list (e.g. `squeezy skills list`) without performing a
+    /// second ancestor walk.
+    pub fn scanned_roots(&self) -> &[PathBuf] {
+        &self.scanned_roots
     }
 
     pub fn summaries(&self) -> Vec<SkillSummary> {
@@ -711,19 +813,15 @@ impl SkillCatalog {
                 self.active_body_cap_chars,
             )
         } else {
-            // Metadata-only mode: all included, none body-truncated.
-            let rendered = render::render_active_skills_metadata(skills, self.active_budget_chars);
-            let included = if rendered.is_some() { skills.len() } else { 0 };
-            let dropped = skills.len().saturating_sub(included);
-            (
-                rendered,
-                render::SkillActivationMetrics {
-                    total: skills.len(),
-                    included,
-                    dropped,
-                    body_truncated: 0,
-                },
-            )
+            // Metadata-only mode: body_truncated is always 0, but included/dropped
+            // must come from the actual rendering pass because low-priority skills
+            // can be dropped when the metadata block exceeds the budget.
+            let (rendered, mut metrics) = render::render_active_skills_metadata_with_metrics(
+                skills,
+                self.active_budget_chars,
+            );
+            metrics.body_truncated = 0;
+            (rendered, metrics)
         }
     }
 
@@ -813,6 +911,7 @@ impl SkillCatalog {
             workdir,
             &self.implicit_by_scripts_dir,
             &self.implicit_by_doc_path,
+            &self.implicit_doc_filenames,
             &self.skills,
         )
     }
@@ -1110,14 +1209,18 @@ impl SkillCatalog {
     fn rebuild_implicit_indexes(&mut self) {
         self.implicit_by_scripts_dir.clear();
         self.implicit_by_doc_path.clear();
+        self.implicit_doc_filenames.clear();
         for entry in self.skills.values() {
             if entry.summary.disabled {
                 continue;
             }
-            self.implicit_by_doc_path.insert(
-                implicit::normalize_path(&entry.summary.location),
-                entry.summary.name.clone(),
-            );
+            let doc_path = implicit::normalize_path(&entry.summary.location);
+            if let Some(fname) = doc_path.file_name().and_then(|n| n.to_str()) {
+                self.implicit_doc_filenames
+                    .insert(fname.to_ascii_lowercase());
+            }
+            self.implicit_by_doc_path
+                .insert(doc_path, entry.summary.name.clone());
             self.implicit_by_scripts_dir.insert(
                 implicit::normalize_path(&entry.base_dir.join("scripts")),
                 entry.summary.name.clone(),
@@ -1140,6 +1243,8 @@ impl Clone for SkillCatalog {
             ambiguous_triggers: self.ambiguous_triggers.clone(),
             implicit_by_scripts_dir: self.implicit_by_scripts_dir.clone(),
             implicit_by_doc_path: self.implicit_by_doc_path.clone(),
+            implicit_doc_filenames: self.implicit_doc_filenames.clone(),
+            scanned_roots: self.scanned_roots.clone(),
             active_budget_chars: self.active_budget_chars,
             active_body_cap_chars: self.active_body_cap_chars,
             preamble_enabled: self.preamble_enabled,
@@ -1203,7 +1308,7 @@ pub struct SkillDiscoverySummary {
     pub ambiguous: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SkillMetadata {
     name: String,
     description: String,
@@ -1229,6 +1334,88 @@ fn parse_explicit_skill_command(input: &str) -> Option<(&str, &str)> {
     }
     let task = parts.next().unwrap_or("").trim_start();
     Some((name, task))
+}
+
+/// Return the trigger phrases declared in a `SKILL.md` file (normalised to
+/// lowercase), or an empty vec on parse error. Used by `squeezy skills show`
+/// to show only the triggers belonging to a specific skill.
+pub fn parse_skill_triggers(content: &str) -> Vec<String> {
+    parse_skill_file(content)
+        .map(|(meta, _)| {
+            meta.triggers
+                .into_iter()
+                .map(|t| t.trim().to_ascii_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extended authoring lint for a single `SKILL.md` file.
+///
+/// Returns a list of `(severity, message)` pairs where severity is either
+/// `"error"` or `"warning"`. Callers pass the file content, the skill's
+/// parent directory (for script-existence checks), and the set of trigger
+/// phrases that are ambiguous across the catalog.
+///
+/// This is a best-effort scan: the first parse error terminates the lint
+/// early. An empty return means no issues were found.
+pub fn lint_skill_extended(
+    content: &str,
+    skill_dir: &std::path::Path,
+    ambiguous_triggers: &std::collections::BTreeSet<String>,
+    body_warn_bytes: usize,
+) -> Vec<(&'static str, String)> {
+    let Ok((meta, body)) = parse_skill_file(content) else {
+        return Vec::new();
+    };
+    let mut issues: Vec<(&'static str, String)> = Vec::new();
+
+    // Oversized body.
+    if body.len() > body_warn_bytes {
+        issues.push((
+            "warning",
+            format!(
+                "body is {} bytes (>{} bytes); consider splitting or summarising to reduce context cost",
+                body.len(),
+                body_warn_bytes
+            ),
+        ));
+    }
+
+    // Ambiguous trigger phrases.
+    for trigger in &meta.triggers {
+        let normalised = trigger.trim().to_ascii_lowercase();
+        if ambiguous_triggers.contains(&normalised) {
+            issues.push((
+                "warning",
+                format!(
+                    "trigger `{trigger}` is declared by more than one skill; \
+                     auto-activation skipped for this phrase"
+                ),
+            ));
+        }
+    }
+
+    // Missing hook scripts (hooks referencing relative script paths).
+    for matchers in meta.hooks.values() {
+        for matcher in matchers {
+            for hook in &matcher.hooks {
+                let cmd = hook.command.trim();
+                if cmd.starts_with("scripts/") || cmd.starts_with("./scripts/") {
+                    let script_path = skill_dir.join(cmd);
+                    if !script_path.exists() {
+                        issues.push((
+                            "warning",
+                            format!("hook command `{cmd}` references a script that does not exist"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    issues
 }
 
 fn parse_skill_file(content: &str) -> std::result::Result<(SkillMetadata, String), String> {
@@ -1429,26 +1616,42 @@ fn parse_hooks_block(rest: &[&str], out: &mut BTreeMap<HookEvent, Vec<SkillHookM
             continue;
         }
 
-        // A `- matcher: ...` clause opens a new matcher under the
-        // current event. The matcher indent is locked on first sight
-        // so later `command:`/`once:` lines can be told apart from a
-        // sibling matcher reliably.
+        // A matcher item opens a new hook group under the current
+        // event. `- matcher: ...` installs a tool-name filter;
+        // `- hooks:` is the documented shorthand for an omitted matcher
+        // and therefore matches every payload for the event. The
+        // matcher indent is locked on first sight so later
+        // `command:`/`once:` lines can be told apart from a sibling
+        // matcher reliably.
         if let Some(item) = trimmed.strip_prefix("- ")
             && let Some((key, value)) = item.split_once(':')
-            && key.trim() == "matcher"
+            && matcher_indent.is_none_or(|m| indent <= m)
         {
-            matcher_indent = Some(indent);
-            let raw_match = unquote(value.trim()).to_string();
-            let matcher = if raw_match.is_empty() || raw_match == "*" {
-                None
-            } else {
-                Some(raw_match)
-            };
-            current_matchers.push(SkillHookMatcher {
-                matcher,
-                hooks: Vec::new(),
-            });
-            continue;
+            match key.trim() {
+                "matcher" => {
+                    matcher_indent = Some(indent);
+                    let raw_match = unquote(value.trim()).to_string();
+                    let matcher = if raw_match.is_empty() || raw_match == "*" {
+                        None
+                    } else {
+                        Some(raw_match)
+                    };
+                    current_matchers.push(SkillHookMatcher {
+                        matcher,
+                        hooks: Vec::new(),
+                    });
+                    continue;
+                }
+                "hooks" if value.trim().is_empty() => {
+                    matcher_indent = Some(indent);
+                    current_matchers.push(SkillHookMatcher {
+                        matcher: None,
+                        hooks: Vec::new(),
+                    });
+                    continue;
+                }
+                _ => {}
+            }
         }
 
         // A `- type: command` (or any `- key: value`) at indent
@@ -1462,6 +1665,10 @@ fn parse_hooks_block(rest: &[&str], out: &mut BTreeMap<HookEvent, Vec<SkillHookM
             matcher.hooks.push(SkillHookSpec {
                 command: String::new(),
                 once: false,
+                timeout_secs: None,
+                fail_open: true,
+                kind_valid: true,
+                failure_policy: HookFailurePolicy::Allow,
             });
             if let Some(spec) = matcher.hooks.last_mut() {
                 apply_spec_kv(spec, item);
@@ -1491,12 +1698,42 @@ fn apply_spec_kv(spec: &mut SkillHookSpec, line: &str) {
     match key.trim() {
         "command" => spec.command = value.to_string(),
         "once" => spec.once = matches!(value, "true" | "yes" | "1"),
-        "type" if value != "command" => {
+        "timeout" => {
+            if let Ok(secs) = value.parse::<u64>() {
+                spec.timeout_secs = Some(secs);
+            } else {
+                warn!(
+                    target: "squeezy_skills",
+                    value = %value,
+                    "ignoring invalid hook timeout value; expected integer seconds"
+                );
+            }
+        }
+        "fail_open" => spec.fail_open = matches!(value, "true" | "yes" | "1"),
+        "failure_policy" => {
+            spec.failure_policy = match value {
+                "deny" => HookFailurePolicy::Deny,
+                "allow" => HookFailurePolicy::Allow,
+                other => {
+                    warn!(
+                        target: "squeezy_skills",
+                        value = %other,
+                        "unrecognized failure_policy value; expected \"allow\" or \"deny\", defaulting to allow"
+                    );
+                    HookFailurePolicy::Allow
+                }
+            };
+        }
+        "type" if value == "command" => {
+            // Explicit `type: command` — already the default, no-op.
+        }
+        "type" => {
             warn!(
                 target: "squeezy_skills",
                 kind = %value,
-                "ignoring unsupported skill hook kind"
+                "ignoring unsupported skill hook kind; spec will be dropped"
             );
+            spec.kind_valid = false;
         }
         _ => {}
     }
@@ -1510,11 +1747,18 @@ fn parse_hook_event(name: &str) -> Option<HookEvent> {
         "PreTurn" | "pre_turn" => Some(HookEvent::PreTurn),
         "PreToolUse" | "pre_tool_use" => Some(HookEvent::PreToolUse),
         "PostToolUse" | "post_tool_use" => Some(HookEvent::PostToolUse),
+        "PostToolUseFailure" | "post_tool_use_failure" => Some(HookEvent::PostToolUseFailure),
         "PostTool" | "post_tool" => Some(HookEvent::PostTool),
         "PreCompact" | "pre_compact" => Some(HookEvent::PreCompact),
         "PostCompact" | "post_compact" => Some(HookEvent::PostCompact),
         "SubagentStart" | "subagent_start" => Some(HookEvent::SubagentStart),
+        "SubagentStop" | "subagent_stop" => Some(HookEvent::SubagentStop),
         "PermissionRequest" | "permission_request" => Some(HookEvent::PermissionRequest),
+        "PermissionDenied" | "permission_denied" => Some(HookEvent::PermissionDenied),
+        "UserPromptSubmit" | "user_prompt_submit" => Some(HookEvent::UserPromptSubmit),
+        "SessionStart" | "session_start" => Some(HookEvent::SessionStart),
+        "Stop" | "stop" => Some(HookEvent::Stop),
+        "Setup" | "setup" => Some(HookEvent::Setup),
         _ => None,
     }
 }
@@ -1924,7 +2168,7 @@ pub struct SkillValidationResult {
 /// scan for a given `(workspace_root, config)` pair, in the same order
 /// `discover` uses. This includes:
 ///
-/// - User-level roots (`compat_user_dir`, `user_dir`).
+/// - User-level roots (`compat_user_dir`, `user_dir`, optional XDG user dir).
 /// - `extra_roots` from config.
 /// - The current workspace's project roots (`.agents/skills`,
 ///   `.squeezy/skills`).
@@ -1937,6 +2181,9 @@ pub fn skill_scan_dirs(workspace_root: &Path, config: &squeezy_core::SkillsConfi
     let mut dirs = Vec::new();
     dirs.push(config.compat_user_dir.clone());
     dirs.push(config.user_dir.clone());
+    if let Some(xdg_dir) = &config.xdg_user_dir {
+        dirs.push(xdg_dir.clone());
+    }
     dirs.extend(config.extra_roots.iter().cloned());
     dirs.push(workspace_root.join(COMPAT_PROJECT_SKILLS_DIR));
     dirs.push(workspace_root.join(PROJECT_SKILLS_DIR));
@@ -2005,6 +2252,56 @@ pub(crate) fn parse_skill_manifest(content: &str) -> std::result::Result<SkillMa
     toml::from_str::<SkillManifest>(content).map_err(|error| error.to_string())
 }
 
+/// JSON payload byte length above which the payload is written to a
+/// temporary file instead of the environment variable.
+///
+/// Windows process environment blocks have practical size limits; large
+/// payloads (e.g. prompts or full tool metadata) can push past them.
+/// When the threshold is exceeded the handler writes the payload to a
+/// temp file and sets `SQUEEZY_HOOK_PAYLOAD_FILE`; `SQUEEZY_HOOK_PAYLOAD`
+/// is left unset so that the large JSON is never placed in the env block.
+const PAYLOAD_INLINE_THRESHOLD: usize = 8 * 1024;
+
+/// Per-process dispatch sequence number used to generate unique temp-file
+/// names. A plain counter is enough: file names only need to be unique
+/// within a single process, not globally.
+static HOOK_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Resolve the shell program and arguments used to run a hook command
+/// string on the current platform.
+///
+/// On Unix, returns `("/bin/sh", ["-c"])`. On Windows, walks the candidates
+/// `pwsh`, `powershell`, and `cmd` in that order, returning the first
+/// one found on `PATH`. Returns `None` only when every candidate is
+/// absent — callers treat that as a spawn error and allow the action
+/// (fail-open) with a clear diagnostic.
+fn resolve_hook_shell_program() -> Option<(String, Vec<String>)> {
+    #[cfg(windows)]
+    {
+        let candidates: &[(&str, &[&str])] = &[
+            ("pwsh", &["-NoProfile", "-Command"]),
+            ("powershell", &["-NoProfile", "-Command"]),
+            ("cmd", &["/C"]),
+        ];
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        for &(shell, args) in candidates {
+            let found = std::env::split_paths(&path_var)
+                .any(|dir| dir.join(format!("{shell}.exe")).exists() || dir.join(shell).exists());
+            if found {
+                return Some((
+                    shell.to_string(),
+                    args.iter().map(|s| s.to_string()).collect(),
+                ));
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        Some(("/bin/sh".to_string(), vec!["-c".to_string()]))
+    }
+}
+
 /// [`HookHandler`] implementation that fires a skill's declared shell
 /// command when its event matches.
 ///
@@ -2023,11 +2320,18 @@ pub struct SkillHookHandler {
     matcher: Option<String>,
     spec: SkillHookSpec,
     base_dir: PathBuf,
-    /// Tracks whether a `once: true` hook has already succeeded in this
-    /// session. Set only after a successful exit so a failed first run is
-    /// retried. Held behind a `Mutex` so the trait method stays `&self`
-    /// while still allowing in-place mutation across dispatches.
-    fired: Mutex<bool>,
+    /// Tracks whether a `once: true` hook is already claimed or has succeeded
+    /// in this session. A failed claimed run resets the flag so it can be
+    /// retried. `AtomicBool` with `AcqRel` / `Acquire` ordering is used rather
+    /// than `Mutex<bool>` to close the TOCTOU gap where two concurrent
+    /// dispatches could both read `false` before either writes `true`, and to
+    /// avoid the silent-pass risk of a poisoned mutex.
+    fired: AtomicBool,
+    /// Cached shell program and arguments for this handler, populated on
+    /// the first dispatch. Avoids re-walking PATH on every hook invocation
+    /// and makes the resolution cost visible (one OnceLock init per handler
+    /// rather than one per dispatch).
+    resolved_shell: OnceLock<Option<(String, Vec<String>)>>,
 }
 
 impl SkillHookHandler {
@@ -2044,7 +2348,8 @@ impl SkillHookHandler {
             matcher,
             spec,
             base_dir,
-            fired: Mutex::new(false),
+            fired: AtomicBool::new(false),
+            resolved_shell: OnceLock::new(),
         }
     }
 }
@@ -2054,27 +2359,25 @@ impl HookHandler for SkillHookHandler {
         if ctx.event != self.event {
             return HookResult::allow();
         }
-        let payload_json = ctx.payload_json();
+
+        // Match tool_name directly from the typed payload before
+        // projecting to JSON, so unrelated tool dispatches pay no
+        // serialization cost.
         if let Some(needle) = self.matcher.as_deref() {
-            let tool = payload_json
-                .get("tool_name")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            if tool != needle {
+            let tool_name = match &ctx.payload {
+                HookPayload::PreToolUse { tool_name, .. }
+                | HookPayload::PostToolUse { tool_name, .. }
+                | HookPayload::PostToolUseFailure { tool_name, .. }
+                | HookPayload::PostTool { tool_name, .. }
+                | HookPayload::PermissionRequest { tool_name, .. }
+                | HookPayload::PermissionDenied { tool_name, .. } => tool_name.as_str(),
+                _ => "",
+            };
+            if tool_name != needle {
                 return HookResult::allow();
             }
         }
-        if self.spec.once
-            && let Ok(fired) = self.fired.lock()
-            && *fired
-        {
-            return HookResult::allow();
-        }
 
-        // Resolve the command path against the skill's base_dir when
-        // relative. The payload is piped through `SQUEEZY_HOOK_PAYLOAD`
-        // as JSON projected from the typed `HookPayload`, matching the
-        // hook-engine contract documented on `HookContext`.
         let trimmed = self.spec.command.trim();
         if trimmed.is_empty() {
             warn!(
@@ -2084,46 +2387,233 @@ impl HookHandler for SkillHookHandler {
             );
             return HookResult::allow();
         }
-        let payload = payload_json.to_string();
-        let mut command = Command::new("sh");
+
+        let once_claimed = if self.spec.once {
+            if self
+                .fired
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return HookResult::allow();
+            }
+            true
+        } else {
+            false
+        };
+
+        let shell_info = self.resolved_shell.get_or_init(resolve_hook_shell_program);
+        let (shell, shell_args) = match shell_info {
+            Some(pair) => (&pair.0, &pair.1),
+            None => {
+                warn!(
+                    target: "squeezy_skills",
+                    skill = %self.skill_name,
+                    "skill hook failed to spawn: no suitable hook shell found on PATH"
+                );
+                if once_claimed {
+                    self.fired.store(false, Ordering::Release);
+                }
+                return if self.spec.fail_open
+                    && self.spec.failure_policy == HookFailurePolicy::Allow
+                {
+                    HookResult::allow()
+                } else {
+                    HookResult::deny(format!("skill `{}` hook shell not found", self.skill_name))
+                };
+            }
+        };
+
+        let payload = ctx.payload_json().to_string();
+        let seq = HOOK_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let payload_file_path = if payload.len() > PAYLOAD_INLINE_THRESHOLD {
+            let path = std::env::temp_dir()
+                .join(format!("squeezy_hook_{}_{seq}.json", std::process::id()));
+            match fs::write(&path, &payload) {
+                Ok(()) => Some(path),
+                Err(error) => {
+                    warn!(
+                        target: "squeezy_skills",
+                        skill = %self.skill_name,
+                        error = %error,
+                        "failed to write hook payload temp file; falling back to env-only delivery"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let cleanup = |path: Option<&Path>| {
+            if let Some(path) = path {
+                let _ = fs::remove_file(path);
+            }
+        };
+
+        let mut command = Command::new(shell);
+        for arg in shell_args {
+            command.arg(arg);
+        }
+
+        // Put the child in its own process group so a timeout signal reaches
+        // grandchildren spawned by the hook shell script, not just the shell.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
         command
-            .arg("-c")
             .arg(trimmed)
             .current_dir(&self.base_dir)
             .env("SQUEEZY_SKILL_DIR", &self.base_dir)
             .env("SQUEEZY_SKILL_NAME", &self.skill_name)
-            .env("SQUEEZY_HOOK_PAYLOAD", payload);
-        match command.status() {
-            Ok(status) if status.success() => {
-                // Only mark a `once: true` hook as fired once it has
-                // actually succeeded, so a failed first run can retry.
-                if self.spec.once
-                    && let Ok(mut fired) = self.fired.lock()
-                {
-                    *fired = true;
-                }
-                HookResult::allow()
-            }
-            Ok(status) => {
-                warn!(
-                    target: "squeezy_skills",
-                    skill = %self.skill_name,
-                    code = ?status.code(),
-                    "skill hook exited non-zero"
-                );
-                HookResult::deny(format!(
-                    "skill `{}` hook denied the action",
-                    self.skill_name
-                ))
-            }
+            // Redirect subprocess stdio to /dev/null so hook scripts cannot
+            // corrupt the TUI or write to the agent's streams.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        // Deliver payload via file for large payloads and via env var for
+        // small ones. Explicitly clear the alternate variable so stale
+        // inherited values cannot confuse hook scripts.
+        if let Some(ref path) = payload_file_path {
+            command
+                .env("SQUEEZY_HOOK_PAYLOAD_FILE", path)
+                .env_remove("SQUEEZY_HOOK_PAYLOAD");
+        } else {
+            command
+                .env("SQUEEZY_HOOK_PAYLOAD", &payload)
+                .env_remove("SQUEEZY_HOOK_PAYLOAD_FILE");
+        }
+
+        let child = match command.spawn() {
+            Ok(child) => child,
             Err(error) => {
                 warn!(
                     target: "squeezy_skills",
                     skill = %self.skill_name,
+                    shell = %shell,
                     error = %error,
                     "skill hook failed to spawn"
                 );
+                cleanup(payload_file_path.as_deref());
+                if once_claimed {
+                    self.fired.store(false, Ordering::Release);
+                }
+                return if self.spec.fail_open
+                    && self.spec.failure_policy == HookFailurePolicy::Allow
+                {
+                    HookResult::allow()
+                } else {
+                    HookResult::deny(format!(
+                        "skill `{}` hook failed to spawn: {}",
+                        self.skill_name, error
+                    ))
+                };
+            }
+        };
+
+        // Capture PID before wrapping child in Arc. On Unix, used to send
+        // SIGKILL to the process group on timeout so all grandchildren are
+        // terminated; elided on non-Unix to avoid an unused-variable warning.
+        #[cfg(unix)]
+        let child_pid = child.id();
+
+        // Wrap child in Arc<Mutex<Option<...>>> so the main thread can call
+        // `kill()` on timeout without a blocking wait-for-lock: the wait
+        // thread takes the child out of the Option before calling `wait()`.
+        let child_arc = Arc::new(Mutex::new(Some(child)));
+        let child_for_thread = Arc::clone(&child_arc);
+
+        let timeout =
+            Duration::from_secs(self.spec.timeout_secs.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS));
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = child_for_thread
+                .lock()
+                .ok()
+                .and_then(|mut guard| guard.take())
+                .map(|mut child| child.wait());
+            if let Some(result) = result {
+                let _ = tx.send(result);
+            }
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(status)) if status.success() => {
+                cleanup(payload_file_path.as_deref());
                 HookResult::allow()
+            }
+            Ok(Ok(status)) => {
+                cleanup(payload_file_path.as_deref());
+                let code = status.code();
+                let detail = match code {
+                    Some(126) => format!(
+                        "skill `{}` hook: command not executable (exit 126)",
+                        self.skill_name
+                    ),
+                    Some(127) => format!(
+                        "skill `{}` hook: interpreter or command not found (exit 127)",
+                        self.skill_name
+                    ),
+                    _ => format!("skill `{}` hook denied the action", self.skill_name),
+                };
+                warn!(
+                    target: "squeezy_skills",
+                    skill = %self.skill_name,
+                    code = ?code,
+                    "skill hook exited non-zero"
+                );
+                if once_claimed {
+                    self.fired.store(false, Ordering::Release);
+                }
+                HookResult::deny(detail)
+            }
+            Ok(Err(error)) => {
+                cleanup(payload_file_path.as_deref());
+                warn!(
+                    target: "squeezy_skills",
+                    skill = %self.skill_name,
+                    error = %error,
+                    "skill hook wait() error"
+                );
+                if once_claimed {
+                    self.fired.store(false, Ordering::Release);
+                }
+                if self.spec.fail_open && self.spec.failure_policy == HookFailurePolicy::Allow {
+                    HookResult::allow()
+                } else {
+                    HookResult::deny(format!(
+                        "skill `{}` hook wait failed: {}",
+                        self.skill_name, error
+                    ))
+                }
+            }
+            Err(_timeout_expired) => {
+                cleanup(payload_file_path.as_deref());
+                if let Ok(mut guard) = child_arc.lock()
+                    && let Some(child) = guard.as_mut()
+                {
+                    let _ = child.kill();
+                }
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(child_pid as libc::pid_t), libc::SIGKILL);
+                }
+                warn!(
+                    target: "squeezy_skills",
+                    skill = %self.skill_name,
+                    timeout_secs = self.spec.timeout_secs.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS),
+                    "skill hook timed out"
+                );
+                if once_claimed {
+                    self.fired.store(false, Ordering::Release);
+                }
+                HookResult::deny(format!(
+                    "skill `{}` hook timed out after {}s",
+                    self.skill_name,
+                    self.spec.timeout_secs.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS)
+                ))
             }
         }
     }
@@ -2132,24 +2622,31 @@ impl HookHandler for SkillHookHandler {
 /// Register every hook declared in a [`LoadedSkill`]'s frontmatter
 /// against the given [`HookRegistry`].
 ///
-/// Returns the number of [`SkillHookHandler`]s installed so callers can
-/// log the activation count alongside the skill name. The registry takes
-/// ownership of each handler; deregistering individual skill hooks is
-/// not yet implemented because the registry stores erased boxed
-/// handlers — that surface is left to a follow-up when the agent loop
-/// learns to drop hooks on skill deactivation.
+/// Specs with `kind_valid = false` (unsupported `type:` in frontmatter)
+/// are silently dropped so they cannot execute as shell commands.
+///
+/// Handlers are registered via [`HookRegistry::register_for_event`] so
+/// the registry can dispatch in O(matching handlers) rather than
+/// O(total handlers). Returns the number of handlers installed so
+/// callers can log the activation count alongside the skill name.
 pub fn register_skill_hooks(skill: &LoadedSkill, registry: &mut HookRegistry) -> usize {
     let mut installed = 0;
     for (event, matchers) in &skill.hooks {
         for matcher in matchers {
             for spec in &matcher.hooks {
-                registry.register(Box::new(SkillHookHandler::new(
-                    skill.summary.name.clone(),
+                if !spec.kind_valid {
+                    continue;
+                }
+                registry.register_for_event(
                     *event,
-                    matcher.matcher.clone(),
-                    spec.clone(),
-                    skill.base_dir.clone(),
-                )));
+                    Box::new(SkillHookHandler::new(
+                        skill.summary.name.clone(),
+                        *event,
+                        matcher.matcher.clone(),
+                        spec.clone(),
+                        skill.base_dir.clone(),
+                    )),
+                );
                 installed += 1;
             }
         }
@@ -2158,11 +2655,168 @@ pub fn register_skill_hooks(skill: &LoadedSkill, registry: &mut HookRegistry) ->
         tracing::info!(
             target: "squeezy_skills",
             skill = %skill.summary.name,
+            source = %skill.base_dir.display(),
             installed,
             "registered skill frontmatter hooks"
         );
+        // Emit a per-handler snapshot at DEBUG level so session logs
+        // include the full hook registry for trusted local debugging.
+        for (event, matchers) in &skill.hooks {
+            for matcher_spec in matchers {
+                for spec in &matcher_spec.hooks {
+                    if !spec.kind_valid {
+                        continue;
+                    }
+                    tracing::debug!(
+                        target: "squeezy_skills",
+                        skill = %skill.summary.name,
+                        event = ?event,
+                        matcher = ?matcher_spec.matcher,
+                        command_path = %spec.command,
+                        once = spec.once,
+                        source = %skill.base_dir.display(),
+                        "hook handler registered"
+                    );
+                }
+            }
+        }
     }
     installed
+}
+
+/// A single diagnostic finding from [`catalog_hook_issues`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookDoctorIssue {
+    /// Skill name the issue belongs to.
+    pub skill: String,
+    /// Human-readable description of the problem.
+    pub message: String,
+    /// Whether this is a hard error (`true`) or an advisory note (`false`).
+    pub is_error: bool,
+}
+
+/// Inspect every non-disabled skill's hook declarations and return
+/// diagnostic issues without registering handlers or running commands.
+///
+/// Checks performed:
+/// - Missing script files for path-like commands (relative to the skill's
+///   `base_dir`).
+/// - Non-executable script files on Unix (exit 126 at runtime).
+/// - Missing shebang line in script files (may cause interpreter errors).
+/// - Commands that are inline shell snippets — noted as advisory because
+///   snippet behaviour depends on distro shell semantics.
+///
+/// This is the static analysis pass used by `squeezy doctor` to surface
+/// hook problems before a session starts. It does **not** spawn any
+/// processes; all checks are pure filesystem/metadata operations.
+pub fn catalog_hook_issues(catalog: &SkillCatalog) -> Vec<HookDoctorIssue> {
+    let mut issues = Vec::new();
+    for summary in catalog.summaries() {
+        if summary.disabled {
+            continue;
+        }
+        let loaded = match catalog.load(&summary.name) {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        for matchers in loaded.hooks.values() {
+            for matcher in matchers {
+                for spec in &matcher.hooks {
+                    let trimmed = spec.command.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    // Classify the command: inline snippet vs file path.
+                    let is_inline_snippet = trimmed.contains(['|', ';', '>', '<', '&', '(', ')'])
+                        || trimmed.contains('\n');
+                    if is_inline_snippet {
+                        issues.push(HookDoctorIssue {
+                            skill: summary.name.clone(),
+                            message: format!(
+                                "hook command is an inline shell snippet; behaviour depends on \
+                                 the distro shell (`/bin/sh`): {trimmed:.80}"
+                            ),
+                            is_error: false,
+                        });
+                        continue;
+                    }
+                    // The first whitespace-delimited token is the executable;
+                    // skip argv-style commands with arguments (e.g. `python3 hook.py`).
+                    let executable = trimmed.split_whitespace().next().unwrap_or(trimmed);
+                    // Only validate path-like executables (contains '/' or starts with '.').
+                    if !executable.contains('/') && !executable.starts_with('.') {
+                        continue;
+                    }
+                    let script_path = if Path::new(executable).is_absolute() {
+                        PathBuf::from(executable)
+                    } else {
+                        loaded.base_dir.join(executable)
+                    };
+                    match fs::metadata(&script_path) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            issues.push(HookDoctorIssue {
+                                skill: summary.name.clone(),
+                                message: format!(
+                                    "hook script not found: {}",
+                                    script_path.display()
+                                ),
+                                is_error: true,
+                            });
+                        }
+                        Ok(meta) => {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                if meta.permissions().mode() & 0o111 == 0 {
+                                    issues.push(HookDoctorIssue {
+                                        skill: summary.name.clone(),
+                                        message: format!(
+                                            "hook script not executable (chmod +x): {}",
+                                            script_path.display()
+                                        ),
+                                        is_error: true,
+                                    });
+                                }
+                            }
+                            // Check for shebang line to catch missing interpreter errors.
+                            // Only read the first 2 bytes to avoid slurping large scripts.
+                            if meta.is_file() {
+                                let has_shebang = fs::File::open(&script_path)
+                                    .and_then(|mut f| {
+                                        let mut buf = [0u8; 2];
+                                        f.read_exact(&mut buf).map(|_| buf)
+                                    })
+                                    .map(|buf| buf[0] == b'#' && buf[1] == b'!')
+                                    .unwrap_or(true); // on read error, don't produce a false note
+                                if !has_shebang {
+                                    issues.push(HookDoctorIssue {
+                                        skill: summary.name.clone(),
+                                        message: format!(
+                                            "hook script missing shebang line: {}",
+                                            script_path.display()
+                                        ),
+                                        is_error: false,
+                                    });
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            issues.push(HookDoctorIssue {
+                                skill: summary.name.clone(),
+                                message: format!(
+                                    "hook script not accessible ({}): {}",
+                                    e,
+                                    script_path.display()
+                                ),
+                                is_error: true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    issues
 }
 
 #[cfg(test)]

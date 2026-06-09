@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::Read,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -563,10 +562,17 @@ fn write_checksum(field: &mut [u8], value: u64) {
 
 fn random_uuid_like() -> String {
     let mut bytes = [0u8; 16];
-    if fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .is_err()
-    {
+    if let Err(error) = getrandom::fill(&mut bytes) {
+        // Fallback collision resistance is much weaker than `getrandom` (8
+        // low bytes of the current millisecond, zeros elsewhere). `getrandom`
+        // ~never fails on modern macOS / Linux / Windows, so a warn here is
+        // a loud signal that the entropy source is misconfigured rather than
+        // a silent quality downgrade for bug-report IDs.
+        tracing::warn!(
+            target: "squeezy::reports",
+            %error,
+            "getrandom failed; falling back to truncated timestamp for report id (collision resistance reduced)",
+        );
         let fallback = now_ms().to_le_bytes();
         bytes[..fallback.len()].copy_from_slice(&fallback);
     }

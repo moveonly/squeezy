@@ -59,6 +59,13 @@ Inside each session dir, four files are load-bearing:
   `write_resume_state` after each compaction and on session end.
 - `replay.jsonl` — pre-parsed projection of `events.jsonl` for the TUI.
 
+The session root also owns `index.redb`, a compact metadata index keyed by
+session id. It mirrors the current `metadata.json` fields needed for fast
+filtering by cwd, repo, branch, status, labels, start time, and resume
+availability. The JSON files remain the source of truth: if the redb index is
+missing, stale, or unreadable, `SessionStore::list` falls back to scanning
+session directories and rebuilds the index opportunistically.
+
 `start_session` (`sessions.rs:315-332`) allocates the id and timestamps
 but never touches disk — the handle returns in `InnerState::Pending`
 and only materialises on the first substantive append. `open_session`

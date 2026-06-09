@@ -252,6 +252,10 @@ pub(crate) fn path_hint() -> Color {
     color(token::PATH_HINT)
 }
 
+pub(crate) fn warn() -> Color {
+    color(token::STATUS_WARN)
+}
+
 pub(crate) fn inline_code() -> Color {
     color(token::INLINE_CODE)
 }

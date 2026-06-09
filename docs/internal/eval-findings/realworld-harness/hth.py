@@ -94,7 +94,7 @@ def run_squeezy(lang, tier, variant):
         toml = HAIKU_TOML / f"{lang}-{variant}.toml"
     cap = 1500 if lang == "dart" else 700
     cmd = ["bash", "-lc",
-           f"source /Users/abbassabra/.env.sh; cd {NEW} && timeout -k 30 {cap} "
+           f"source \"$HOME/.env.sh\"; cd {NEW} && timeout -k 30 {cap} "
            f"{BIN} run --quiet --out target/eval {toml}"]
     rundir = None
     for attempt in range(3):
@@ -144,7 +144,7 @@ def run_codex(lang, repodir, rep):
         with open(ev, "w") as f:
             p = subprocess.run(
                 ["bash", "-lc",
-                 f"source /Users/abbassabra/.env.sh; timeout -k 30 {cap} codex exec --json "
+                 f"source \"$HOME/.env.sh\"; timeout -k 30 {cap} codex exec --json "
                  f"--ignore-user-config --ephemeral --skip-git-repo-check "
                  f"-C {repodir} -m gpt-5.4-mini {json_q(prompt)} </dev/null"],
                 stdout=f, stderr=subprocess.PIPE, text=True)

@@ -188,13 +188,48 @@ impl SubagentCatalog {
     }
 }
 
-/// Default user agents directory, derived from `$HOME` on Unix-like
-/// systems. Returns `None` when `HOME` is unset (Windows callers should
-/// pass an explicit `user_dir` until cross-platform support lands).
+/// Default user agents directory.
+///
+/// On Windows, the search order is:
+///   1. `$HOME/.squeezy/agents` — honours an explicit `HOME` override
+///      (e.g. Git Bash, Cygwin, CI scripts that set HOME for portability),
+///   2. `%APPDATA%\squeezy\agents` — the conventional Windows per-user
+///      application-data location,
+///   3. `%USERPROFILE%\.squeezy\agents` — fallback when `APPDATA` is unset.
+///
+/// On Unix-like systems, only `$HOME/.squeezy/agents` is checked.
+///
+/// Returns `None` only when no suitable base directory can be determined
+/// from the process environment. When no default can be derived, a warning is
+/// emitted so Linux services, sudo shells, CI jobs, and containers do not
+/// silently skip user subagent discovery.
 fn default_user_subagents_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(USER_SUBAGENTS_DIR))
+    // On all platforms, an explicit $HOME is honoured first so that CI
+    // scripts, Git Bash users, and test code can override the default
+    // location predictably without platform-specific logic.
+    if let Some(home) = std::env::var_os("HOME") {
+        return Some(PathBuf::from(home).join(USER_SUBAGENTS_DIR));
+    }
+
+    // On Windows, fall through to native per-user directories when HOME
+    // is not set (the common case for stock PowerShell / cmd.exe sessions).
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return Some(PathBuf::from(appdata).join("squeezy").join("agents"));
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            return Some(PathBuf::from(profile).join(".squeezy").join("agents"));
+        }
+    }
+
+    warn!(
+        target: "squeezy_agent::subagent_catalog",
+        "HOME is not set; user subagents from ~/.squeezy/agents will not be loaded. \
+         Pass an explicit user_dir to SubagentCatalog::discover, or set HOME, to \
+         suppress this warning."
+    );
+    None
 }
 
 fn load_dir(dir: &Path, source: SubagentSource, out: &mut Vec<SubagentDefinition>) {

@@ -62,6 +62,7 @@ fn crawler_marks_large_and_binary_files_as_excluded() {
         include_hidden: false,
         max_file_bytes: 8,
         require_indexing_signal: true,
+        languages: Vec::new(),
         policy: IndexingPolicy::default(),
     })
     .crawl(&root)
@@ -110,6 +111,117 @@ fn crawler_does_not_read_large_files_into_memory() {
             .iter()
             .any(|file| file.relative_path == "small.rs")
     );
+}
+
+#[test]
+fn language_allowlist_moves_disabled_languages_to_unsupported() {
+    let root = temp_root("language_allowlist_moves_disabled_languages_to_unsupported");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "fn rust() {}\n").unwrap();
+    fs::write(root.join("src/app.py"), "def python():\n    pass\n").unwrap();
+    fs::write(root.join("src/native.h"), "void native(void);\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::try_new(CrawlOptions {
+        languages: vec!["rust".to_string()],
+        ..CrawlOptions::default()
+    })
+    .unwrap()
+    .crawl(&root)
+    .unwrap();
+
+    // Allowed language stays in files.
+    let rust = snapshot
+        .files
+        .iter()
+        .find(|file| file.relative_path == "src/lib.rs")
+        .expect("rust file indexed");
+    assert_eq!(rust.language, LanguageKind::Rust);
+
+    // Disabled files must NOT appear in snapshot.files at all.
+    assert!(
+        snapshot
+            .files
+            .iter()
+            .all(|file| file.relative_path != "src/app.py"),
+        "disabled python file must not be in snapshot.files"
+    );
+    assert!(
+        snapshot
+            .files
+            .iter()
+            .all(|file| file.relative_path != "src/native.h"),
+        "disabled C header must not be in snapshot.files"
+    );
+
+    // Disabled files must appear exactly once in snapshot.unsupported.
+    assert!(snapshot.unsupported.iter().any(|file| {
+        file.relative_path == "src/app.py" && file.reason == UnsupportedReason::LanguageDisabled
+    }));
+    assert!(snapshot.unsupported.iter().any(|file| {
+        file.relative_path == "src/native.h" && file.reason == UnsupportedReason::LanguageDisabled
+    }));
+}
+
+#[test]
+fn language_allowlist_refines_c_headers_before_disabling_languages() {
+    let root = temp_root("language_allowlist_refines_c_headers_before_disabling_languages");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/native.c"), "#include \"native.h\"\n").unwrap();
+    fs::write(root.join("src/native.h"), "void native(void);\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::try_new(CrawlOptions {
+        languages: vec!["c".to_string()],
+        ..CrawlOptions::default()
+    })
+    .unwrap()
+    .crawl(&root)
+    .unwrap();
+
+    let header = snapshot
+        .files
+        .iter()
+        .find(|file| file.relative_path == "src/native.h")
+        .expect("C header indexed");
+    assert_eq!(header.language, LanguageKind::C);
+    assert!(!snapshot.unsupported.iter().any(|file| {
+        file.relative_path == "src/native.h" && file.reason == UnsupportedReason::LanguageDisabled
+    }));
+}
+
+#[test]
+fn language_allowlist_accepts_csharp_family_alias() {
+    let root = temp_root("language_allowlist_accepts_csharp_family_alias");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/Program.cs"), "class Program {}\n").unwrap();
+    fs::write(root.join("src/lib.rs"), "fn rust() {}\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::try_new(CrawlOptions {
+        languages: vec!["c-sharp".to_string()],
+        ..CrawlOptions::default()
+    })
+    .unwrap()
+    .crawl(&root)
+    .unwrap();
+
+    let csharp = snapshot
+        .files
+        .iter()
+        .find(|file| file.relative_path == "src/Program.cs")
+        .expect("C# file indexed");
+    assert_eq!(csharp.language, LanguageKind::CSharp);
+    assert!(snapshot.unsupported.iter().any(|file| {
+        file.relative_path == "src/lib.rs" && file.reason == UnsupportedReason::LanguageDisabled
+    }));
+}
+
+#[test]
+fn invalid_language_allowlist_is_a_config_error() {
+    let err = WorkspaceCrawler::try_new(CrawlOptions {
+        languages: vec!["brainfuck".to_string()],
+        ..CrawlOptions::default()
+    })
+    .expect_err("unknown language should fail");
+    assert!(matches!(err, SqueezyError::Config(_)), "{err:?}");
 }
 
 #[test]
@@ -334,6 +446,46 @@ fn invalid_glob_in_policy_surfaces_as_config_error() {
 }
 
 #[test]
+fn classify_language_handles_uppercase_and_mixed_case_extensions() {
+    use squeezy_core::LanguageFamily;
+
+    // `classify_language` must fold ASCII-uppercase extensions to lowercase
+    // before dispatching to `LanguageKind::from_extension`.  This is the
+    // Windows code path: editors on Windows often save files with extensions
+    // like `.RS`, `.CS`, `.TSX`, etc.
+    for family in LanguageFamily::all() {
+        for &ext in family.file_extensions() {
+            // Fully uppercase variant, e.g. ".RS", ".CS".
+            let uppercase_path = PathBuf::from(format!("TESTFILE.{}", ext.to_ascii_uppercase()));
+            let kind = classify_language(&uppercase_path);
+            assert_eq!(
+                kind.family(),
+                Some(*family),
+                "uppercase extension .{} should classify as {:?}, got {:?}",
+                ext.to_ascii_uppercase(),
+                family,
+                kind
+            );
+
+            // Mixed-case variant capitalises just the first character,
+            // e.g. ".Rs", ".Cs".
+            if ext.len() > 1 {
+                let mixed = format!("{}{}", ext[..1].to_ascii_uppercase(), &ext[1..]);
+                let mixed_path = PathBuf::from(format!("TESTFILE.{mixed}"));
+                let kind = classify_language(&mixed_path);
+                assert_eq!(
+                    kind.family(),
+                    Some(*family),
+                    "mixed-case extension .{mixed} should classify as {:?}, got {:?}",
+                    family,
+                    kind
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn path_normalization_preserves_slash_compatibility() {
     assert_eq!(normalize_path("./src/lib.rs", false), "src/lib.rs");
     assert_eq!(normalize_path(".\\src\\lib.rs", false), "src/lib.rs");
@@ -350,6 +502,126 @@ fn path_normalization_preserves_slash_compatibility() {
     assert_eq!(
         relative_path(root, Path::new("/workspace/src\\lib.rs")).unwrap(),
         "src/lib.rs"
+    );
+}
+
+#[test]
+fn filesystem_path_identity_normalizes_windows_spellings() {
+    assert_eq!(
+        normalized_filesystem_path(Path::new(r"\\?\C:\Users\Alice\repo\")),
+        "c:/Users/Alice/repo"
+    );
+    assert_eq!(
+        normalized_filesystem_path(Path::new(r"\\?\UNC\server\share")),
+        "//server/share"
+    );
+    assert_eq!(
+        filesystem_path_key(Path::new(r"C:\Users\Alice\repo\src\Lib.rs")),
+        "c:/users/alice/repo/src/lib.rs"
+    );
+    assert!(filesystem_paths_match(
+        Path::new(r"C:\Users\Alice\repo\src\Lib.rs"),
+        Path::new(r"c:/users/alice/repo/src/lib.rs")
+    ));
+}
+
+#[test]
+fn windows_root_profiles_classify_broad_roots() {
+    assert_eq!(
+        WorkspaceRootProfile::from_path(Path::new(r"C:\")).kind,
+        WorkspaceRootKind::WindowsDriveRoot
+    );
+    assert_eq!(
+        WorkspaceRootProfile::from_path(Path::new(r"C:\Windows")).kind,
+        WorkspaceRootKind::WindowsSystemRoot
+    );
+    assert_eq!(
+        WorkspaceRootProfile::from_path(Path::new(r"C:\Users")).kind,
+        WorkspaceRootKind::WindowsProfileRoot
+    );
+    assert_eq!(
+        WorkspaceRootProfile::from_path(Path::new(r"\\server\share")).kind,
+        WorkspaceRootKind::WindowsUncShareRoot
+    );
+    assert_eq!(
+        WorkspaceRootProfile::from_path(Path::new(r"\\server\share\repo")).kind,
+        WorkspaceRootKind::Other
+    );
+    assert_eq!(
+        WorkspaceRootProfile::from_path(Path::new(r"C:\Users\Alice\OneDrive - Org")).kind,
+        WorkspaceRootKind::WindowsCloudRoot
+    );
+}
+
+#[test]
+fn cloud_folder_names_only_block_when_path_is_windows_shaped() {
+    let root = Path::new("/tmp/OneDrive");
+    let profile = WorkspaceRootProfile::from_path(root);
+    assert_eq!(profile.kind, WorkspaceRootKind::Other);
+
+    let decision = decide_indexing(root, true);
+    assert!(
+        !decision
+            .negative_signals
+            .iter()
+            .any(|signal| signal.contains("cloud-synced Windows folder")),
+        "{:?}",
+        decision.negative_signals
+    );
+}
+
+#[test]
+fn windows_broad_roots_block_indexing_even_with_positive_markers() {
+    let decision = decide_indexing(Path::new(r"C:\Users"), true);
+    assert!(!decision.should_index);
+    assert!(
+        decision
+            .negative_signals
+            .iter()
+            .any(|signal| signal.contains("broad Windows profile container")),
+        "{:?}",
+        decision.negative_signals
+    );
+
+    let cloud_decision = decide_indexing(Path::new(r"C:\Users\Alice\OneDrive"), true);
+    assert!(!cloud_decision.should_index);
+    assert!(
+        cloud_decision
+            .reason
+            .contains("cloud-synced Windows folder"),
+        "{}",
+        cloud_decision.reason
+    );
+}
+
+#[test]
+fn windows_home_candidates_include_native_environment_names() {
+    let mut homes = Vec::new();
+    push_home_candidate(&mut homes, Some(PathBuf::from(r"C:\Users\Alice")));
+    push_home_candidate(&mut homes, Some(PathBuf::from(r"c:/users/alice/")));
+    homes.sort_by_key(|path| filesystem_path_key(path));
+    homes.dedup_by(|left, right| filesystem_paths_match(left, right));
+
+    assert_eq!(homes.len(), 1);
+    assert!(filesystem_paths_match(
+        &homes[0],
+        Path::new(r"C:\Users\Alice")
+    ));
+}
+
+#[test]
+fn crawler_reports_windows_case_path_conflicts() {
+    let conflicts = detect_path_conflicts(&[
+        file_record_for_path("src/Foo.rs"),
+        file_record_for_path("src/foo.rs"),
+        file_record_for_path("src/bar.rs"),
+    ]);
+
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].normalized_relative_path, "src/foo.rs");
+    assert_eq!(
+        conflicts[0].relative_paths,
+        vec!["src/Foo.rs".to_string(), "src/foo.rs".to_string()]
     );
 }
 
@@ -663,6 +935,78 @@ fn crawler_prefers_c_header_sibling_over_cpp_project_majority() {
     );
 }
 
+/// On Linux the filesystem is case-sensitive, so `Foo.H` and `foo.h` are
+/// distinct files.  The sibling-refinement logic keys on the raw relative-path
+/// stem, so a header whose stem differs only in case from the sibling C source
+/// is not matched by the exact-sibling path and falls back to project majority.
+/// This test documents (and pins) that exact-case-only behavior so any future
+/// case-folded refinement is a deliberate, reviewed change.
+#[test]
+fn crawler_mixed_case_c_header_falls_back_to_project_majority() {
+    let root = temp_root("crawler_mixed_case_c_header_project_majority");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src").join("foo.c"),
+        "int foo(void) { return 0; }\n",
+    )
+    .unwrap();
+    // Mixed-case stem: header is "Foo.h", source sibling is "foo.c"
+    fs::write(root.join("src").join("Foo.h"), "int foo(void);\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    let header = snapshot
+        .files
+        .iter()
+        .find(|f| f.relative_path.ends_with("Foo.h"))
+        .unwrap();
+    // Exact-stem sibling not found → project majority wins → C (one .c file)
+    assert_eq!(
+        header.language,
+        LanguageKind::C,
+        "mixed-case header should fall back to project majority (C)"
+    );
+}
+
+/// Verify that uppercase extensions are normalised to the correct language
+/// across all parser families on a case-sensitive filesystem (Linux).
+#[cfg(unix)]
+#[test]
+fn classify_language_normalises_uppercase_extensions_on_linux() {
+    use std::path::Path;
+    let cases: &[(&str, LanguageKind)] = &[
+        ("MAIN.RS", LanguageKind::Rust),
+        ("lib.PY", LanguageKind::Python),
+        ("App.JAVA", LanguageKind::Java),
+        ("Program.CS", LanguageKind::CSharp),
+        ("main.GO", LanguageKind::Go),
+        ("runner.C", LanguageKind::C),
+        ("widget.CPP", LanguageKind::Cpp),
+        // .H goes through header-refinement; in isolation (no sibling .c or .cpp)
+        // it defaults to Cpp per project-majority (no C files → default Cpp).
+        ("api.H", LanguageKind::Cpp),
+        ("index.JS", LanguageKind::JavaScript),
+        ("view.TS", LanguageKind::TypeScript),
+        ("View.TSX", LanguageKind::Tsx),
+        ("item.JSX", LanguageKind::Jsx),
+        ("helper.RB", LanguageKind::Ruby),
+        ("page.PHP", LanguageKind::Php),
+        ("Greeter.KT", LanguageKind::Kotlin),
+        ("Model.SWIFT", LanguageKind::Swift),
+        ("Main.SCALA", LanguageKind::Scala),
+        ("widget.DART", LanguageKind::Dart),
+    ];
+    for (filename, expected) in cases {
+        let got = classify_language(Path::new(filename));
+        assert_eq!(
+            got, *expected,
+            "uppercase filename {filename:?}: expected {expected:?}, got {got:?}"
+        );
+    }
+}
+
 #[test]
 fn crawler_classifies_go_files() {
     let root = temp_root("crawler_classifies_go_files");
@@ -680,6 +1024,48 @@ fn crawler_classifies_go_files() {
             .unwrap()
             .language,
         LanguageKind::Go
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn crawler_reports_external_symlink_in_coverage() {
+    // Create a source file outside the workspace root and symlink it in.
+    let root = temp_root("crawler_reports_external_symlink_in_coverage");
+    let outside_dir = temp_root("crawler_reports_external_symlink_outside");
+    fs::write(outside_dir.join("external.go"), "package ext\n").unwrap();
+    // Need a Cargo.toml so the indexing decision is positive.
+    fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+    std::os::unix::fs::symlink(outside_dir.join("external.go"), root.join("external.go")).unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    // The file must NOT appear in indexed files.
+    assert!(
+        !snapshot
+            .files
+            .iter()
+            .any(|f| f.relative_path == "external.go"),
+        "external symlink should not be indexed"
+    );
+    // It MUST appear in the excluded list with ExternalSymlink reason.
+    assert!(
+        snapshot
+            .excluded
+            .iter()
+            .any(|e| e.relative_path == "external.go"
+                && e.reason == ExclusionReason::ExternalSymlink),
+        "external symlink should be in excluded coverage"
+    );
+    // Coverage counters must reflect it.
+    assert!(
+        snapshot
+            .coverage
+            .reasons
+            .contains_key(ExclusionReason::ExternalSymlink.as_str()),
+        "external_symlink coverage reason must be tracked"
     );
 }
 
@@ -703,6 +1089,28 @@ fn crawler_indexes_internal_symlinked_source_files() {
     assert!(snapshot.files.iter().any(|file| {
         file.relative_path == "linked/example.go" && file.language == LanguageKind::Go
     }));
+}
+
+#[cfg(unix)]
+#[test]
+fn crawler_records_dangling_symlink_as_walk_error_without_failing() {
+    let root = temp_root("crawler_records_dangling_symlink_as_walk_error");
+    fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+    std::os::unix::fs::symlink(root.join("missing.rs"), root.join("dangling.rs")).unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert!(snapshot.indexing_decision.should_index);
+    assert!(
+        snapshot
+            .walk_errors
+            .iter()
+            .any(|error| error.contains("dangling.rs")),
+        "expected dangling symlink to be recorded as a walk error, got {:?}",
+        snapshot.walk_errors
+    );
 }
 
 #[test]
@@ -886,7 +1294,7 @@ fn ancestor_vcs_scan_stops_at_cached_home_boundary() {
     let home = fs::canonicalize(home).unwrap();
     let project = fs::canonicalize(project).unwrap();
     let context = IndexingDecisionContext {
-        canonical_home: Some(home),
+        canonical_homes: vec![home],
     };
 
     assert_eq!(vcs_marker_signal(&project, &context), None);
@@ -896,6 +1304,16 @@ fn ancestor_vcs_scan_stops_at_cached_home_boundary() {
         vcs_marker_signal(&project, &context),
         Some("VCS marker .git at workspace root".to_string())
     );
+}
+
+#[test]
+fn linux_pseudo_filesystem_roots_are_protected_but_package_roots_are_not() {
+    for root in ["/proc", "/sys", "/run", "/boot", "/snap"] {
+        assert!(is_protected_root(Path::new(root)), "{root}");
+    }
+    for root in ["/opt", "/usr", "/var"] {
+        assert!(!is_protected_root(Path::new(root)), "{root}");
+    }
 }
 
 #[test]
@@ -930,6 +1348,65 @@ fn common_project_config_is_an_indexing_signal() {
             .positive_signals
             .contains(&"project marker package.json".to_string())
     );
+}
+
+#[test]
+fn mis_cased_project_marker_is_reported_as_case_sensitive_near_miss() {
+    let root = temp_root("mis_cased_project_marker_is_reported");
+    fs::write(root.join("cargo.toml"), "[package]\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    // The behavior splits cleanly on filesystem case sensitivity. On a
+    // case-insensitive volume (default macOS APFS, default Windows NTFS)
+    // `cargo.toml` already satisfies the `Cargo.toml` marker via
+    // `Path::exists`, so the diagnostic must NOT also fire as a misleading
+    // negative signal alongside the positive one. On a case-sensitive
+    // volume (typical Linux ext4) the marker does not resolve, and the
+    // diagnostic is the actionable near-miss signal the model needs.
+    if snapshot.indexing_decision.should_index {
+        assert!(
+            snapshot
+                .indexing_decision
+                .positive_signals
+                .contains(&"project marker Cargo.toml".to_string()),
+            "case-insensitive filesystem must accept the marker: {:?}",
+            snapshot.indexing_decision.positive_signals
+        );
+        assert!(
+            !snapshot
+                .indexing_decision
+                .negative_signals
+                .iter()
+                .any(|signal| signal.contains("project marker case differs")),
+            "case-insensitive filesystem must not emit a misleading near-miss alongside the resolved marker: {:?}",
+            snapshot.indexing_decision.negative_signals
+        );
+    } else {
+        assert!(
+            snapshot
+                .indexing_decision
+                .negative_signals
+                .iter()
+                .any(|signal| {
+                    signal.contains("project marker case differs")
+                        && signal.contains("Cargo.toml")
+                        && signal.contains("cargo.toml")
+                }),
+            "case-sensitive filesystem must emit the near-miss diagnostic: {:?}",
+            snapshot.indexing_decision.negative_signals
+        );
+        assert!(
+            snapshot
+                .indexing_decision
+                .reason
+                .starts_with("indexing skipped: no exact project marker or shallow source file"),
+            "case-sensitive filesystem must pin the case-mismatch decision reason: {:?}",
+            snapshot.indexing_decision.reason,
+        );
+    }
 }
 
 #[test]
@@ -1026,4 +1503,17 @@ fn temp_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("squeezy-{name}-{nonce}"));
     fs::create_dir_all(&root).unwrap();
     root
+}
+
+fn file_record_for_path(relative_path: &str) -> FileRecord {
+    FileRecord {
+        id: FileId::new(relative_path.to_string()),
+        path: PathBuf::from(relative_path),
+        relative_path: relative_path.to_string(),
+        hash: ContentHash::new("hash".to_string()),
+        size_bytes: 0,
+        modified_unix_millis: 0,
+        language: LanguageKind::Rust,
+        freshness: Freshness::Fresh,
+    }
 }

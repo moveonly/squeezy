@@ -560,6 +560,13 @@ pub fn write_settings_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()>
         && !parent.as_os_str().is_empty()
     {
         create_dir_all_private(parent)?;
+        // After creating/confirming the parent directory, warn if it is
+        // group- or world-writable. A writable parent lets other users
+        // swap the settings file under us — a TOCTOU risk when secrets
+        // are present. We do not refuse to write (the directory was often
+        // created by the user themselves and tightening it would be
+        // surprising), but the tracing event will surface to the operator.
+        warn_if_parent_writable(parent);
     }
     let tmp = sibling_tempfile(target);
     {
@@ -593,6 +600,33 @@ fn create_dir_all_private(path: &Path) -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
         fs::create_dir_all(path)
+    }
+}
+
+/// Emit a `tracing::warn!` when `dir` is group- or world-writable on Unix.
+/// A writable parent directory means another process on the same host
+/// could replace the settings file between our write and a subsequent
+/// read, potentially injecting provider keys or MCP secrets.
+fn warn_if_parent_writable(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = fs::metadata(dir) {
+            let mode = meta.mode();
+            if mode & 0o022 != 0 {
+                tracing::warn!(
+                    path = %dir.display(),
+                    mode = format!("{:#o}", mode & 0o777),
+                    "settings parent directory is group- or world-writable; \
+                     consider `chmod 700 '{}'` to prevent TOCTOU races on secrets",
+                    dir.display(),
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
     }
 }
 

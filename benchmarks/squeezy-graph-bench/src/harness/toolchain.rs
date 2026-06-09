@@ -134,6 +134,7 @@ pub(crate) fn collect_dotnet_build_targets(
     }
 }
 
+#[allow(deprecated, reason = "benchmark scaffolding; external callers should use try_new")]
 pub(crate) fn time_clang_syntax(
     fixture: &Path,
     compiler: &str,

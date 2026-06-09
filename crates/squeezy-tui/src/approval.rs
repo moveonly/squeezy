@@ -167,6 +167,89 @@ fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) 
     if let Some(binary) = permission.metadata.get("binary") {
         lines.push(dim(format!("binary {binary}")));
     }
+    // Show sandbox posture so the user can see isolation level at approval time.
+    let backend = permission
+        .metadata
+        .get("sandbox_backend")
+        .map(String::as_str);
+    let mode = permission.metadata.get("sandbox").map(String::as_str);
+    let network = permission
+        .metadata
+        .get("sandbox_network")
+        .map(String::as_str);
+    let filesystem = permission
+        .metadata
+        .get("sandbox_filesystem")
+        .map(String::as_str);
+    if let (Some(b), Some(m)) = (backend, mode)
+        && b != "none"
+    {
+        let mut posture = format!("sandbox {b}  mode {m}");
+        if let Some(fs) = filesystem {
+            posture.push_str(&format!("  filesystem {fs}"));
+        }
+        if let Some(net) = network {
+            posture.push_str(&format!("  network-policy {net}"));
+        }
+        lines.push(dim(posture));
+    }
+    // Show Windows sandbox posture when approval remains the boundary for
+    // reads/network or for all filesystem access.
+    let windows_posture = permission
+        .metadata
+        .get("windows_sandbox_posture")
+        .map(String::as_str)
+        .or_else(|| {
+            permission
+                .metadata
+                .get("windows_no_fs_sandbox")
+                .is_some_and(|v| v == "true")
+                .then_some("job-object-only")
+        });
+    if let Some(text) = match windows_posture {
+        Some("job-object-only") => {
+            Some("Windows: no filesystem/network sandbox; approval is the enforcement boundary")
+        }
+        Some("restricted-token-writes-only") => {
+            Some("Windows: write sandbox only; reads/network are not isolated")
+        }
+        _ => None,
+    } {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                text,
+                Style::default()
+                    .fg(crate::render::theme::red())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    // On linux-direct-syscalls the seccomp filter blocks AF_UNIX, so
+    // `squeezy ask` cannot be used from inside this sandboxed shell child.
+    if let Some(hint) = permission.metadata.get("ask_socket_unavailable") {
+        lines.push(dim(format!("note: {hint}")));
+    }
+    // Warn about Windows sandbox posture when the metadata reveals the active
+    // tier. The two non-full-isolation cases get distinct messages:
+    // - "best_effort_unavailable": Job-Object backend (disabled tier) — no
+    //   filesystem or network isolation at all.
+    // - "enforced_writes_only": restricted-token tier — filesystem *writes*
+    //   are blocked by ACLs, but reads and network are not isolated.
+    match permission.metadata.get("filesystem").map(String::as_str) {
+        Some("best_effort_unavailable") => {
+            lines.push(warn_line(
+                "Windows: no filesystem/network isolation; process tree will be killed on timeout/cancel".to_string(),
+            ));
+        }
+        Some("enforced_writes_only") => {
+            lines.push(warn_line(
+                "Windows: filesystem write isolation enforced; reads and network are not isolated"
+                    .to_string(),
+            ));
+        }
+        _ => {}
+    }
 }
 
 fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
@@ -315,6 +398,18 @@ fn dim(text: String) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
         Span::styled(text, Style::default().fg(crate::render::theme::quiet())),
+    ])
+}
+
+fn warn_line(text: String) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            text,
+            Style::default()
+                .fg(crate::render::theme::cyan())
+                .add_modifier(Modifier::BOLD),
+        ),
     ])
 }
 

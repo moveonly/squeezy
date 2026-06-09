@@ -172,6 +172,7 @@ fn summary_at(id: &str, cwd: &str) -> SessionSummary {
         display_name: None,
         labels: Vec::new(),
         branches: Vec::new(),
+        branch_load_failed: false,
     }
 }
 
@@ -347,6 +348,7 @@ fn session_summary_label_keeps_long_prompts_for_wrapping() {
         display_name: None,
         labels: Vec::new(),
         branches: Vec::new(),
+        branch_load_failed: false,
     };
     let label = summary.label();
     assert_eq!(label.chars().count(), 200);
@@ -453,6 +455,7 @@ fn project_hint_prefers_repo_root_basename() {
         display_name: None,
         labels: Vec::new(),
         branches: Vec::new(),
+        branch_load_failed: false,
     };
     assert_eq!(s.project_hint(), "other");
 }
@@ -470,6 +473,7 @@ fn project_hint_falls_back_to_cwd_tail() {
         display_name: None,
         labels: Vec::new(),
         branches: Vec::new(),
+        branch_load_failed: false,
     };
     assert_eq!(s.project_hint(), "sibling");
 }
@@ -500,44 +504,39 @@ fn tip(tip_sequence: u64, branched_from: u64, ts: u64, message: &str) -> EventBr
 }
 
 #[test]
-fn picker_expands_branched_sessions_into_one_row_per_branch_tip() {
-    // Synthesised summary: a single session with two branches (the user
-    // re-prompted from an earlier turn). The picker should surface both
-    // paths as independent rows so each is selectable.
+fn picker_collapses_branched_sessions_to_single_linear_row() {
+    // Branched sessions should collapse to a single linear entry rather than
+    // emitting one row per branch tip. Branch-aware resume is not yet
+    // implemented; showing multiple rows and then silently ignoring the
+    // selected tip would resume the wrong branch.
     let mut branched = summary("branched");
     branched.branches = vec![
         tip(5, 1, 200, "path B prompt"),
         tip(3, 1, 100, "path A prompt"),
     ];
     let state = ResumePickerState::new(vec![branched.clone()], cwd());
-    assert_eq!(state.candidates.len(), 2);
-    let session_ids: Vec<&str> = state
-        .candidates
-        .iter()
-        .map(|entry| entry.session_id())
-        .collect();
-    assert_eq!(session_ids, vec!["branched", "branched"]);
-    let branch_tips: Vec<Option<u64>> = state
-        .candidates
-        .iter()
-        .map(|entry| entry.branch_tip.as_ref().map(|t| t.tip_sequence))
-        .collect();
-    assert_eq!(branch_tips, vec![Some(5), Some(3)]);
+    assert_eq!(state.candidates.len(), 1);
+    assert_eq!(state.candidates[0].session_id(), "branched");
+    assert!(
+        state.candidates[0].branch_tip.is_none(),
+        "branched session must collapse to a linear row (no branch_tip)"
+    );
 }
 
 #[test]
-fn picker_enter_on_branch_row_returns_branch_tip_in_resume_choice() {
+fn picker_enter_on_branched_session_row_resumes_without_branch_tip() {
+    // Branched sessions collapse to a single linear row. Selecting the row
+    // must return a `Resume` choice with `branch_tip: None` (latest state).
     let mut branched = summary("branched");
     branched.branches = vec![tip(5, 1, 200, "path B"), tip(3, 1, 100, "path A")];
     let mut state = ResumePickerState::new(vec![branched], cwd());
-    // [start_fresh, branch tip 5, branch tip 3]. Down twice lands on tip 3.
-    state.dispatch(press(KeyCode::Down));
+    // [start_fresh, the single collapsed row]. One Down lands on the row.
     state.dispatch(press(KeyCode::Down));
     assert_eq!(
         state.dispatch(press(KeyCode::Enter)),
         Some(ResumeChoice::Resume {
             session_id: "branched".to_string(),
-            branch_tip: Some(3),
+            branch_tip: None,
         })
     );
 }
@@ -563,23 +562,45 @@ fn picker_handles_single_branch_tip_as_linear() {
 }
 
 #[test]
-fn picker_expands_branches_after_tab_toggle() {
+fn picker_shows_branched_cross_project_session_as_single_row_after_tab_toggle() {
+    // Cross-project branched sessions also collapse to a single linear row.
     let mut sibling = summary_at("sibling", "/work/other");
     sibling.branches = vec![tip(4, 1, 90, "branch B"), tip(2, 1, 70, "branch A")];
     let state = ResumePickerState::new(vec![sibling], cwd());
     assert!(
         state.candidates.is_empty(),
-        "scoped view hides cross-project branches by default",
+        "scoped view hides cross-project session by default",
     );
     let mut state = state;
     state.dispatch(press(KeyCode::Tab));
-    assert_eq!(state.candidates.len(), 2);
-    // Cross-project branched rows must still surface as CrossProject so
-    // the user gets the chdir hint rather than an in-process resume that
-    // would silently jump cwds.
+    assert_eq!(state.candidates.len(), 1);
+    // Cross-project rows must surface as CrossProject so the user gets the
+    // chdir hint rather than an in-process resume that would silently jump cwds.
     state.dispatch(press(KeyCode::Down));
     let choice = state.dispatch(press(KeyCode::Enter));
     assert!(matches!(choice, Some(ResumeChoice::CrossProject { .. })));
+}
+
+#[test]
+fn picker_select_treats_trailing_slash_mismatch_as_same_project() {
+    // A session stored with a trailing separator and a cwd without one
+    // should be treated as the same directory. select_at_cursor must use
+    // paths_same (not ==) so the session resolves as Resume, not CrossProject.
+    let same_dir_with_slash = summary_at("s", "/work/repo/");
+    let mut state = ResumePickerState::new(vec![same_dir_with_slash], cwd());
+    // By default the scoped view should show this session because
+    // paths_same("/work/repo/", "/work/repo") == true.
+    assert_eq!(
+        state.candidates.len(),
+        1,
+        "session should be in scoped view"
+    );
+    state.dispatch(press(KeyCode::Down));
+    let choice = state.dispatch(press(KeyCode::Enter));
+    assert!(
+        matches!(choice, Some(ResumeChoice::Resume { .. })),
+        "trailing-slash mismatch must not dispatch as CrossProject; got: {choice:?}"
+    );
 }
 
 #[test]

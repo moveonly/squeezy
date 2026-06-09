@@ -48,10 +48,9 @@ fn find_command(name: &str) -> &'static SlashCommand {
 fn slash_commands_declare_expected_capabilities() {
     // Anchors the audited capability mapping so future edits to the catalog
     // stay deliberate rather than accidentally silent.
-    assert_eq!(
-        find_command("/help").capabilities,
-        &[PermissionCapability::Network]
-    );
+    // `/help` is answered locally for curated topics; no capability badge.
+    // Unknown topics can still fall back to the model, but the common path is local.
+    assert_eq!(find_command("/help").capabilities, &[]);
     assert_eq!(
         find_command("/compact").capabilities,
         &[PermissionCapability::Network]
@@ -149,7 +148,7 @@ fn copy_is_hidden_from_slash_menu() {
 }
 
 #[test]
-fn checkpoint_commands_hide_when_checkpointing_is_disabled() {
+fn slash_menu_surfaces_checkpoint_commands_when_disabled_for_discovery() {
     let names = slash_suggestions("/")
         .into_iter()
         .filter(|cmd| cmd.visible_with_checkpoints(false))
@@ -158,8 +157,8 @@ fn checkpoint_commands_hide_when_checkpointing_is_disabled() {
 
     for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
         assert!(
-            !names.contains(&checkpoint_command),
-            "{checkpoint_command} should be hidden when checkpointing is disabled"
+            names.contains(&checkpoint_command),
+            "{checkpoint_command} should remain discoverable when checkpointing is disabled"
         );
     }
 }
@@ -185,7 +184,12 @@ fn capability_badges_match_capability_as_str() {
     let cmd = find_command("/diff");
     assert_eq!(cmd.capability_badges(), vec!["git", "read"]);
     let cmd = find_command("/help");
-    assert_eq!(cmd.capability_badges(), vec!["net"]);
+    // `/help` has no capability badges (curated topics are local).
+    assert!(
+        cmd.capability_badges().is_empty(),
+        "expected /help to have no capability badges, got {:?}",
+        cmd.capability_badges()
+    );
     let cmd = find_command("/undo");
     assert_eq!(cmd.capability_badges(), vec!["edit", "destructive"]);
 }

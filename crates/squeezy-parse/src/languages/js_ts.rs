@@ -1,29 +1,11 @@
-use std::collections::HashMap;
-
 use crate::languages::python::{normalize_python_import_module, split_python_alias};
 use crate::languages::rust::*;
 use crate::*;
 
 pub(crate) fn extract_js_ts(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
-    let mut ctx = ExtractContext {
-        file: file.clone(),
-        source,
-        symbols: Vec::new(),
-        imports: Vec::new(),
-        calls: Vec::new(),
-        references: Vec::new(),
-        body_hits: Vec::new(),
-        diagnostics: Vec::new(),
-        go_type_index: HashMap::new(),
-    };
+    let mut ctx = ExtractContext::new(file.clone(), source);
     let root = tree.root_node();
-    if root.has_error() {
-        ctx.diagnostics.push(ParseDiagnostic {
-            message: "tree-sitter reported parse errors".to_string(),
-            span: Some(span_from_node(root)),
-            confidence: Confidence::Partial,
-        });
-    }
+    record_parse_error_diagnostics(root, &mut ctx);
 
     visit_js_ts_node(root, &mut ctx, None, None);
     extract_js_ts_commonjs_facts(&mut ctx);
@@ -50,11 +32,7 @@ pub(crate) fn visit_js_ts_node(
     owner_symbol: Option<SymbolId>,
 ) {
     if node.is_missing() {
-        ctx.diagnostics.push(ParseDiagnostic {
-            message: format!("missing {}", node.kind()),
-            span: Some(span_from_node(node)),
-            confidence: Confidence::Partial,
-        });
+        record_missing_node_diagnostic(node, ctx);
         return;
     }
 

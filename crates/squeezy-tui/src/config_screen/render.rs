@@ -9,6 +9,7 @@ use squeezy_core::{
     config_schema::{ApplyTier, CONFIG_SECTIONS, FieldSource, FieldValue, SectionId},
     is_builtin_tui_theme_name,
 };
+use std::path::{Path, PathBuf};
 
 use super::RESET_ACTIONS;
 use super::{
@@ -20,19 +21,60 @@ use crate::render::palette::{footer_fg, muted_fg};
 
 const MCP_STATUS_COLUMN_WIDTH: usize = 36;
 
-/// Pretty-print an absolute config path: replace `$HOME` with `~` so the
-/// tab subtitle stays compact, while still surfacing the per-machine
+/// Pretty-print an absolute config path: replace the home directory with `~`
+/// so the tab subtitle stays compact, while still surfacing the per-machine
 /// project hash for the Local tier so the user can grep `~/.squeezy/projects/`
 /// for the exact directory.
-fn display_path(path: &std::path::Path) -> String {
+///
+/// Uses `squeezy_core::cached_home_dir()` (process-global cached result) so
+/// the Windows profile-directory lookup happens at most once regardless of how
+/// many times this function is called per frame. Windows paths are compared
+/// case-insensitively by component, avoiding false mismatches when drive
+/// letters or usernames differ in casing between the resolved home path and a
+/// config-file path built from a separate source.
+fn display_path(path: &Path) -> String {
     let full = path.display().to_string();
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
-        && let Some(rest) = full.strip_prefix(&home)
+    if let Some(home) = squeezy_core::cached_home_dir()
+        && !home.as_os_str().is_empty()
+        && let Some(relative) = home_relative_display_path(path, &home)
     {
-        return format!("~{rest}");
+        return relative;
     }
     full
+}
+
+fn home_relative_display_path(path: &Path, home: &Path) -> Option<String> {
+    let rest = strip_home_prefix(path, home)?;
+    let rest = rest.display().to_string();
+    Some(if rest.is_empty() {
+        "~".to_string()
+    } else {
+        format!("~{}{rest}", std::path::MAIN_SEPARATOR)
+    })
+}
+
+#[cfg(not(windows))]
+fn strip_home_prefix(path: &Path, home: &Path) -> Option<PathBuf> {
+    path.strip_prefix(home).ok().map(Path::to_path_buf)
+}
+
+#[cfg(windows)]
+fn strip_home_prefix(path: &Path, home: &Path) -> Option<PathBuf> {
+    let mut path_components = path.components();
+    for home_component in home.components() {
+        let path_component = path_components.next()?;
+        let path_component = path_component.as_os_str().to_string_lossy().to_lowercase();
+        let home_component = home_component.as_os_str().to_string_lossy().to_lowercase();
+        if path_component != home_component {
+            return None;
+        }
+    }
+
+    let mut rest = PathBuf::new();
+    for component in path_components {
+        rest.push(component.as_os_str());
+    }
+    Some(rest)
 }
 
 /// Shrink `s` to at most `max` display columns with a middle ellipsis,

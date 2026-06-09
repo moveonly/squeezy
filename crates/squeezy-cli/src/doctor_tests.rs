@@ -1,6 +1,7 @@
 use super::*;
 use squeezy_core::{McpPermissionConfig, McpServerConfig, McpTransport, ProviderSettings};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 // env::set_var/remove_var is process-global; serialize these tests so a parallel
@@ -20,6 +21,60 @@ fn isolate_credentials_file() {
     }
 }
 
+fn with_session_env<R>(
+    home: Option<&Path>,
+    xdg_state_home: Option<&Path>,
+    body: impl FnOnce() -> R,
+) -> R {
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    let previous_home = env::var_os("HOME");
+    let previous_xdg = env::var_os("XDG_STATE_HOME");
+    #[cfg(windows)]
+    let previous_userprofile = env::var_os("USERPROFILE");
+    #[cfg(windows)]
+    let previous_appdata = env::var_os("APPDATA");
+    unsafe {
+        match home {
+            Some(path) => env::set_var("HOME", path),
+            None => {
+                env::remove_var("HOME");
+                #[cfg(windows)]
+                {
+                    env::remove_var("USERPROFILE");
+                    env::remove_var("APPDATA");
+                }
+            }
+        }
+        match xdg_state_home {
+            Some(path) => env::set_var("XDG_STATE_HOME", path),
+            None => env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+    let result = body();
+    unsafe {
+        match previous_home {
+            Some(value) => env::set_var("HOME", value),
+            None => env::remove_var("HOME"),
+        }
+        match previous_xdg {
+            Some(value) => env::set_var("XDG_STATE_HOME", value),
+            None => env::remove_var("XDG_STATE_HOME"),
+        }
+        #[cfg(windows)]
+        {
+            match previous_userprofile {
+                Some(value) => env::set_var("USERPROFILE", value),
+                None => env::remove_var("USERPROFILE"),
+            }
+            match previous_appdata {
+                Some(value) => env::set_var("APPDATA", value),
+                None => env::remove_var("APPDATA"),
+            }
+        }
+    }
+    result
+}
+
 #[test]
 fn credential_check_reports_ok_when_env_set() {
     let _guard = ENV_LOCK.lock().expect("env lock");
@@ -34,6 +89,128 @@ fn credential_check_reports_ok_when_env_set() {
     }
     assert_eq!(status, Status::Ok);
     assert!(detail.contains("SQUEEZY_DOCTOR_TEST_KEY"));
+}
+
+#[test]
+fn status_filter_does_not_make_hidden_failures_exit_zero() {
+    let mut args = DoctorArgs::default();
+    args.status.push(DoctorStatusFilter::Ok);
+    let checks = vec![
+        Check {
+            name: "config".to_string(),
+            status: Status::Fail,
+            detail: "broken".to_string(),
+            extra: None,
+        },
+        Check {
+            name: "sandbox".to_string(),
+            status: Status::Ok,
+            detail: "available".to_string(),
+            extra: None,
+        },
+    ];
+
+    assert_eq!(exit_code_for_checks(&checks), 1);
+    let visible = filter_checks(&args, checks);
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].name, "sandbox");
+}
+
+#[test]
+fn json_summary_counts_full_result_even_when_rows_are_filtered() {
+    let report = DoctorReport {
+        exit_code: 1,
+        warnings: 0,
+        failures: 1,
+        checks: vec![Check {
+            name: "sandbox".to_string(),
+            status: Status::Ok,
+            detail: "available".to_string(),
+            extra: None,
+        }],
+        version: "test",
+        target: "test-target",
+        json: true,
+        paths: DoctorPaths::default(),
+    };
+
+    let body = report.json_body();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["failures"], 1);
+    assert_eq!(body["checks"].as_array().expect("checks").len(), 1);
+    assert_eq!(body["checks"][0]["name"], "sandbox");
+}
+
+#[test]
+fn unmatched_only_selector_becomes_visible_failure() {
+    // Mimics the surfacing-after-status-filter contract that the
+    // `run()` post-pass enforces: an unknown selector must remain
+    // visible regardless of what `--status` allows through. We
+    // exercise `unmatched_selector_checks` directly because that is
+    // the unit producing the Fail row; the unconditional re-include
+    // step in `run()` consumes its output.
+    let mut args = DoctorArgs::default();
+    args.only.push("sesion_store".to_string());
+    let checks = vec![Check {
+        name: "session_store".to_string(),
+        status: Status::Ok,
+        detail: "ok".to_string(),
+        extra: None,
+    }];
+
+    let selector_failures = unmatched_selector_checks(&args, &checks, false);
+    assert_eq!(selector_failures.len(), 1);
+    assert_eq!(selector_failures[0].name, "selector");
+    assert_eq!(selector_failures[0].status, Status::Fail);
+    assert!(selector_failures[0].detail.contains("sesion_store"));
+}
+
+#[test]
+fn unmatched_selector_when_config_failed_warns_instead_of_silently_dropping() {
+    // Regression for the "config failed → selector silently dropped"
+    // behavior: when the user asks `--only providers session_store`
+    // against a broken config we still need to surface that those
+    // checks did not run, so the user knows to fix configuration
+    // rather than wonder where their selectors went.
+    let mut args = DoctorArgs::default();
+    args.only.push("providers".to_string());
+    args.only.push("session_store".to_string());
+    let checks: Vec<Check> = Vec::new();
+
+    let selector_failures = unmatched_selector_checks(&args, &checks, true);
+    assert_eq!(
+        selector_failures.len(),
+        1,
+        "expected a single warn row, got {selector_failures:?}"
+    );
+    assert_eq!(selector_failures[0].name, "selector:skipped");
+    assert_eq!(selector_failures[0].status, Status::Warn);
+    assert!(selector_failures[0].detail.contains("providers"));
+    assert!(selector_failures[0].detail.contains("session_store"));
+    assert!(selector_failures[0].detail.contains("config"));
+}
+
+#[test]
+fn unmatched_selector_after_config_load_passes_still_fails_on_typo() {
+    // With `config_failed = false` (the normal path) a misspelled
+    // selector still goes to the hard-fail bucket regardless of which
+    // checks list it would have matched. This is the half of the
+    // contract that the `config_failed` warn-only fork must not
+    // weaken.
+    let mut args = DoctorArgs::default();
+    args.only.push("sandbx".to_string());
+    let checks = vec![Check {
+        name: "sandbox".to_string(),
+        status: Status::Ok,
+        detail: "ok".to_string(),
+        extra: None,
+    }];
+
+    let selector_failures = unmatched_selector_checks(&args, &checks, false);
+    assert_eq!(selector_failures.len(), 1);
+    assert_eq!(selector_failures[0].name, "selector");
+    assert_eq!(selector_failures[0].status, Status::Fail);
+    assert!(selector_failures[0].detail.contains("sandbx"));
 }
 
 #[test]
@@ -86,6 +263,104 @@ fn probe_writable_round_trips_in_tempdir() {
     // probe file should have been cleaned up
     assert!(!dir.join(".squeezy-doctor-probe").exists());
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_paths_check_reports_absolute_xdg_without_home() {
+    let root = skills_doctor_workspace("session_paths_xdg_no_home");
+    let xdg = root.join("xdg-state");
+    std::fs::create_dir_all(&xdg).expect("mkdir xdg");
+    with_session_env(None, Some(&xdg), || {
+        let config = AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        };
+        let checks = session_paths_checks(&config);
+        let home = checks
+            .iter()
+            .find(|check| check.name == "session_home")
+            .expect("HOME warning");
+        assert_eq!(home.status, Status::Warn);
+        assert!(
+            home.detail.contains("global index uses XDG_STATE_HOME"),
+            "{home:?}"
+        );
+        let paths = checks
+            .iter()
+            .find(|check| check.name == "session_paths")
+            .expect("session paths row");
+        assert!(
+            paths.detail.contains("XDG_STATE_HOME honored")
+                && paths.detail.contains("memory=unavailable"),
+            "{paths:?}"
+        );
+    });
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn session_paths_check_warns_on_relative_xdg_state_home() {
+    let root = skills_doctor_workspace("session_paths_relative_xdg");
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).expect("mkdir home");
+    let relative_xdg = Path::new("relative-state");
+    with_session_env(Some(&home), Some(relative_xdg), || {
+        let config = AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        };
+        let checks = session_paths_checks(&config);
+        let xdg = checks
+            .iter()
+            .find(|check| check.name == "session_xdg_state_home")
+            .expect("XDG warning");
+        assert_eq!(xdg.status, Status::Warn);
+        assert!(xdg.detail.contains("not absolute"), "{xdg:?}");
+        let paths = checks
+            .iter()
+            .find(|check| check.name == "session_paths")
+            .expect("session paths row");
+        assert!(
+            paths.detail.contains(
+                &home
+                    .join(".squeezy")
+                    .join("sessions")
+                    .join("index.jsonl")
+                    .display()
+                    .to_string()
+            ),
+            "{paths:?}"
+        );
+        assert!(
+            !paths.detail.contains("XDG_STATE_HOME honored"),
+            "relative XDG_STATE_HOME must not be reported as honored: {paths:?}"
+        );
+    });
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn settings_path_is_repo_local_detects_workspace_child() {
+    assert!(settings_path_is_repo_local(
+        Path::new("/tmp/repo/.squeezy/settings.toml"),
+        Path::new("/tmp/repo"),
+    ));
+}
+
+#[test]
+fn settings_path_is_repo_local_rejects_sibling_prefix() {
+    assert!(!settings_path_is_repo_local(
+        Path::new("/tmp/repo-other/.squeezy/settings.toml"),
+        Path::new("/tmp/repo"),
+    ));
+}
+
+#[test]
+fn settings_path_is_repo_local_detects_relative_fallback() {
+    assert!(settings_path_is_repo_local(
+        Path::new("./.squeezy/settings.toml"),
+        Path::new("/tmp/repo"),
+    ));
 }
 
 fn mcp_fixture(enabled: bool, transport: McpTransport) -> McpServerConfig {
@@ -158,7 +433,7 @@ async fn probe_mcp_reports_unreachable_stdio_server_as_fail() {
     // A disabled server must be skipped entirely: no probe row.
     servers.insert("idle".to_string(), mcp_fixture(false, McpTransport::Stdio));
 
-    let checks = probe_mcp_servers(&servers).await;
+    let checks = probe_mcp_servers(&servers, &DoctorArgs::default()).await;
 
     let broken_row = checks
         .iter()
@@ -198,8 +473,9 @@ fn skills_doctor_config(root: &std::path::Path) -> AppConfig {
 fn skills_check_with_no_skills_is_ok() {
     let root = skills_doctor_workspace("skills_empty");
     let config = skills_doctor_config(&root);
+    let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
 
-    let check = skills_check(&config);
+    let check = skills_check(&config, &catalog);
     assert_eq!(check.status, Status::Ok);
     assert!(check.detail.contains("no skills discovered"), "{check:?}");
 
@@ -218,8 +494,9 @@ fn skills_check_reports_enabled_count() {
     .expect("write skill");
 
     let config = skills_doctor_config(&root);
+    let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
 
-    let check = skills_check(&config);
+    let check = skills_check(&config, &catalog);
     assert_eq!(check.status, Status::Ok);
     assert!(
         check.detail.contains("enabled=1") && check.detail.contains("disabled=0"),
@@ -248,8 +525,9 @@ fn skills_check_warns_on_ambiguous_same_precedence_names() {
     .expect("write second dup");
 
     let config = skills_doctor_config(&root);
+    let catalog = squeezy_skills::SkillCatalog::discover(&config.workspace_root, &config.skills);
 
-    let check = skills_check(&config);
+    let check = skills_check(&config, &catalog);
     assert_eq!(check.status, Status::Warn);
     assert!(check.detail.contains("ambiguous"), "{check:?}");
     assert!(check.detail.contains("dup"), "{check:?}");
@@ -261,14 +539,134 @@ fn skills_check_warns_on_ambiguous_same_precedence_names() {
 fn mcp_check_is_ok_when_fields_match_transport() {
     let mut servers = BTreeMap::new();
     let mut stdio = mcp_fixture(true, McpTransport::Stdio);
-    stdio.command = Some("/usr/bin/example-server".to_string());
+    // Use the running test binary itself — guaranteed to exist and be
+    // executable on every CI platform, so the PATH/exec-bit check passes.
+    let test_exe = std::env::current_exe()
+        .expect("current_exe")
+        .to_string_lossy()
+        .into_owned();
+    stdio.command = Some(test_exe);
     servers.insert("local".to_string(), stdio);
     let mut http = mcp_fixture(true, McpTransport::Sse);
     http.url = Some("https://example.test/mcp".to_string());
     servers.insert("remote".to_string(), http);
     let check = mcp_check(&servers);
-    assert_eq!(check.status, Status::Ok);
+    assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
     assert!(check.detail.contains("enabled=2"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_sandbox_detail_fails_when_required_backend_unavailable() {
+    let check = linux_sandbox_check_from_report(squeezy_tools::ShellSandboxDoctor {
+        backend: "linux-direct-syscalls",
+        available: false,
+        detail: "user namespaces disabled".to_string(),
+        linux_user_namespaces: Some(false),
+        linux_landlock_abi: Some(0),
+        linux_seccomp_available: Some(false),
+        linux_ask_socket_blocked: Some(false),
+        userns: Some(false),
+        landlock: Some(false),
+        fallback_reason: Some("user namespaces disabled".to_string()),
+    });
+
+    assert_eq!(check.name, "linux-sandbox");
+    assert_eq!(check.status, Status::Fail);
+    assert!(check.detail.contains("linux-direct-syscalls"));
+    assert!(check.detail.contains("available=false"));
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn linux_sandbox_detail_warns_on_non_linux_platforms() {
+    let check = linux_sandbox_check_from_report(squeezy_tools::ShellSandboxDoctor {
+        backend: "test-backend",
+        available: true,
+        detail: "active backend detail".to_string(),
+        linux_user_namespaces: None,
+        linux_landlock_abi: None,
+        linux_seccomp_available: None,
+        linux_ask_socket_blocked: None,
+        userns: None,
+        landlock: None,
+        fallback_reason: None,
+    });
+
+    assert_eq!(check.name, "linux-sandbox");
+    assert_eq!(check.status, Status::Warn);
+    assert!(check.detail.contains("only available on Linux"));
+    assert!(check.detail.contains("active backend=test-backend"));
+}
+
+#[test]
+fn mcp_check_warns_when_stdio_command_not_on_path() {
+    let mut servers = BTreeMap::new();
+    let mut server = mcp_fixture(true, McpTransport::Stdio);
+    server.command = Some("squeezy-doctor-no-such-mcp-binary-xyzzy-abc".to_string());
+    servers.insert("missing".to_string(), server);
+    let check = mcp_check(&servers);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("not found on PATH"),
+        "detail: {}",
+        check.detail
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_check_warns_when_stdio_command_not_executable() {
+    let dir = std::env::temp_dir().join(format!(
+        "squeezy-mcp-check-noexec-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&dir).expect("create dir");
+    let noexec = dir.join("noexec-server");
+    fs::write(&noexec, b"#!/bin/sh\nexit 0\n").expect("write script");
+    // Leave execute bit unset.
+    let mut servers = BTreeMap::new();
+    let mut server = mcp_fixture(true, McpTransport::Stdio);
+    server.command = Some(noexec.to_string_lossy().into_owned());
+    servers.insert("noexec".to_string(), server);
+    let check = mcp_check(&servers);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("not executable"),
+        "detail: {}",
+        check.detail
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_check_warns_when_stdio_command_is_directory() {
+    let dir = std::env::temp_dir().join(format!(
+        "squeezy-mcp-check-directory-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&dir).expect("create dir");
+    let mut servers = BTreeMap::new();
+    let mut server = mcp_fixture(true, McpTransport::Stdio);
+    server.command = Some(dir.to_string_lossy().into_owned());
+    servers.insert("directory".to_string(), server);
+    let check = mcp_check(&servers);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("not a file"),
+        "detail: {}",
+        check.detail
+    );
 }
 
 #[test]
@@ -360,6 +758,124 @@ fn state_store_check_opens_redb_in_tempdir() {
 }
 
 #[test]
+fn graph_store_check_reports_absent_without_creating_redb() {
+    let workspace = std::env::temp_dir().join(format!(
+        "squeezy-doctor-graph-absent-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+    let check = graph_store_check(&config);
+    let graph = squeezy_store::graph_path(&workspace, None);
+    let _ = fs::remove_dir_all(&workspace);
+    assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
+    assert!(check.detail.contains("absent"));
+    assert!(
+        !graph.exists(),
+        "doctor graph probe must not create graph.redb"
+    );
+}
+
+#[test]
+fn storage_error_hint_classifies_common_failures() {
+    assert_eq!(
+        storage_error_hint("database lock would block"),
+        "likely lock contention"
+    );
+    assert_eq!(
+        storage_error_hint("permission denied"),
+        "likely permission problem"
+    );
+    assert_eq!(
+        storage_error_hint("No space left on device"),
+        "likely disk full"
+    );
+    assert_eq!(
+        storage_error_hint("invalid database checksum"),
+        "possible redb corruption"
+    );
+    assert_eq!(
+        storage_error_hint("operation not supported"),
+        "possible unsupported filesystem behavior"
+    );
+}
+
+#[test]
+fn graph_store_check_opens_existing_redb_in_tempdir() {
+    let workspace = std::env::temp_dir().join(format!(
+        "squeezy-doctor-graph-existing-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let store = squeezy_store::GraphStore::open(&workspace, None).expect("seed graph store");
+    drop(store);
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+    let check = graph_store_check(&config);
+    let _ = fs::remove_dir_all(&workspace);
+    assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
+    assert!(check.detail.contains("readable"));
+}
+
+#[test]
+fn user_global_storage_warns_for_synced_workspace_with_default_cache() {
+    let mut config = AppConfig::from_env();
+    // Use forward slashes so the path parses into multiple components on
+    // both Windows and Unix; `workspace_looks_synced` is component-based
+    // and the substring `onedrive` matches case-insensitively either way.
+    config.workspace_root = PathBuf::from("/home/dev/OneDrive/repo");
+    config.cache.root = None;
+    let check = user_global_storage_check(&config);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(check.detail.contains("synced folder"));
+    assert!(check.detail.contains("[cache].root"));
+}
+
+#[test]
+fn workspace_looks_synced_matches_known_cloud_clients() {
+    let positive = [
+        "/home/dev/OneDrive/repo",
+        "/home/dev/Dropbox/work/repo",
+        "/Users/dev/Library/CloudStorage/GoogleDrive-me/repo",
+        "/Users/dev/Library/CloudStorage/iCloud Drive/repo",
+        "/home/dev/Nextcloud/code",
+        "/home/dev/Syncthing/repo",
+        "/home/dev/pCloud Drive/repo",
+    ];
+    for path in positive {
+        assert!(
+            workspace_looks_synced(std::path::Path::new(path)),
+            "expected sync detection for {path}",
+        );
+    }
+    let negative = [
+        "/home/dev/code/squeezy",
+        "/Users/dev/Documents/repo",
+        "/tmp/sandbox",
+        "/home/dev/toolbox",
+    ];
+    for path in negative {
+        assert!(
+            !workspace_looks_synced(std::path::Path::new(path)),
+            "did not expect sync detection for {path}",
+        );
+    }
+}
+
+#[test]
 fn cache_check_warns_about_redb_backups() {
     let workspace = std::env::temp_dir().join(format!(
         "squeezy-doctor-cache-warn-{}-{}",
@@ -376,7 +892,7 @@ fn cache_check_warns_about_redb_backups() {
     config.workspace_root = workspace.clone();
     config.cache.root = None;
 
-    let check = cache_check(&config, false);
+    let check = cache_check(&config, false, false);
 
     let _ = fs::remove_dir_all(&workspace);
     assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
@@ -402,12 +918,94 @@ fn cache_check_prunes_redb_backups() {
     config.workspace_root = workspace.clone();
     config.cache.root = None;
 
-    let check = cache_check(&config, true);
+    let check = cache_check(&config, true, false);
 
     assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
     assert!(check.detail.contains("pruned 1 backups"));
     assert!(!backup.exists(), "backup should be removed");
     let _ = fs::remove_dir_all(&workspace);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cache_check_prune_preserves_storage_warning() {
+    let workspace = std::env::temp_dir().join(format!(
+        "squeezy-doctor-cache-prune-storage-warn-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let cache_dir = workspace.join(".squeezy").join("cache");
+    fs::create_dir_all(&cache_dir).expect("create cache dir");
+    let backup = cache_dir.join("schema-2-test.redb.bak");
+    fs::write(&backup, b"old").expect("write backup");
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+    config.session_logs.log_dir = Some(std::path::PathBuf::from("/proc/squeezy-sessions"));
+
+    let check = cache_check(&config, true, true);
+
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check
+            .detail
+            .contains("storage warning: sessions=proc(virtual)"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(check.detail.contains("pruned 1 backups"));
+    assert!(!backup.exists(), "backup should be removed");
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn cache_check_storage_reports_paths_and_backup_age() {
+    let workspace = std::env::temp_dir().join(format!(
+        "squeezy-doctor-cache-storage-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let cache_dir = workspace.join(".squeezy").join("cache");
+    fs::create_dir_all(&cache_dir).expect("create cache dir");
+    let backup = cache_dir.join("schema-2-test.redb.bak");
+    fs::write(&backup, b"old").expect("write backup");
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+
+    let check = cache_check(&config, false, true);
+
+    let _ = fs::remove_dir_all(&workspace);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("storage:"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(
+        check.detail.contains("state.redb"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(check.detail.contains("probes:"), "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("graph.redb"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(
+        check
+            .detail
+            .contains("prune command: squeezy doctor --prune-cache"),
+        "detail: {}",
+        check.detail
+    );
 }
 
 #[cfg(unix)]
@@ -419,4 +1017,75 @@ fn state_store_check_fails_when_path_unwritable() {
     config.cache.root = Some(PathBuf::from("/dev/null/nope"));
     let check = state_store_check(&config);
     assert_eq!(check.status, Status::Fail, "detail: {}", check.detail);
+}
+
+#[test]
+fn skills_roots_check_shows_resolved_paths() {
+    // Skip when HOME is absent; the warn path is covered by the next test.
+    if std::env::var_os("HOME").is_none() {
+        return;
+    }
+    let root = skills_doctor_workspace("skills_roots_paths");
+    let config = skills_doctor_config(&root);
+    let check = skills_roots_check(&config);
+    assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("user="),
+        "expected resolved user path in detail: {check:?}"
+    );
+    assert!(
+        check.detail.contains("project="),
+        "expected resolved project path in detail: {check:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn skills_roots_check_warns_when_roots_are_relative() {
+    // Simulate the condition that arises when HOME is unset and skill roots
+    // default to relative paths: construct a config with relative user_dir /
+    // compat_user_dir and verify the check emits a warning.
+    let root = skills_doctor_workspace("skills_roots_relative_warn");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        skills: squeezy_core::SkillsConfig {
+            // Relative paths — as would result from HOME being absent at
+            // config-load time.
+            user_dir: std::path::PathBuf::from(".squeezy/skills"),
+            compat_user_dir: std::path::PathBuf::from(".agents/skills"),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let check = skills_roots_check(&config);
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("relative"),
+        "expected 'relative' in detail: {check:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn sandbox_check_includes_structured_extra() {
+    let check = sandbox_check(None);
+    let extra = check.extra.as_ref().expect("sandbox check must have extra");
+    let backend = extra.get("backend").expect("extra must have backend field");
+    assert!(backend.is_string(), "backend must be a string");
+    assert!(
+        extra.get("required_mode_supported").is_some(),
+        "extra must have required_mode_supported"
+    );
+}
+
+#[test]
+fn sandbox_check_extra_backend_matches_detail() {
+    let check = sandbox_check(None);
+    let extra = check.extra.as_ref().expect("sandbox check must have extra");
+    let backend = extra["backend"].as_str().expect("backend is a string");
+    assert!(
+        check.detail.contains(backend),
+        "detail should mention the backend; detail={:?} backend={backend:?}",
+        check.detail
+    );
 }

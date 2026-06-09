@@ -1,7 +1,9 @@
 use std::collections::HashSet;
+use std::path::Path;
 
-use squeezy_core::{LanguageFamily, LanguageKind};
+use squeezy_core::{ContentHash, FileId, Freshness, LanguageFamily, LanguageKind};
 use squeezy_parse::backend;
+use squeezy_workspace::{FileRecord, classify_language, stable_content_hash};
 
 #[test]
 fn every_language_family_has_one_backend() {
@@ -45,6 +47,29 @@ fn every_supported_language_kind_maps_to_a_backend() {
                 "backend {:?} does not expose a tree-sitter language for {kind:?}",
                 backend.family()
             );
+            let mut parser = backend.parser(kind).unwrap_or_else(|err| {
+                panic!(
+                    "backend {:?} could not instantiate parser for {kind:?}: {err}",
+                    backend.family()
+                )
+            });
+            let source = minimal_source(kind);
+            let tree = parser.parse(source, None).unwrap_or_else(|| {
+                panic!(
+                    "backend {:?} returned no tree for {kind:?}",
+                    backend.family()
+                )
+            });
+            assert!(
+                !tree.root_node().has_error(),
+                "minimal {kind:?} fixture should parse without tree-sitter errors"
+            );
+            let parsed = backend.extract(fixture_record(kind, source), source, &tree);
+            assert!(
+                parsed.unsupported.is_none(),
+                "backend {:?} should extract supported {kind:?} fixtures",
+                backend.family()
+            );
         }
     }
 
@@ -68,6 +93,158 @@ fn every_family_file_extension_classifies_to_that_family() {
                 backend::backend_for_kind(kind).is_some(),
                 "no backend for {kind:?} (extension {extension:?})"
             );
+        }
+    }
+}
+
+#[test]
+fn uppercase_extensions_classify_to_correct_family() {
+    use std::path::PathBuf;
+    // `classify_language` in squeezy-workspace lowers ASCII uppercase before
+    // dispatching to `LanguageKind::from_extension`, so Windows-style
+    // extensions such as `.RS`, `.CS`, `.TSX` must round-trip through the
+    // same family as their lowercase counterparts.
+    for family in LanguageFamily::all() {
+        for &ext in family.file_extensions() {
+            let uppercase_ext = ext.to_ascii_uppercase();
+            let path = PathBuf::from(format!("TESTFILE.{uppercase_ext}"));
+            let kind = classify_language(&path);
+            assert_eq!(
+                kind.family(),
+                Some(*family),
+                "uppercase extension .{uppercase_ext} (from .{ext}) should classify as \
+                 {family:?}, got {kind:?}"
+            );
+        }
+    }
+}
+
+fn minimal_source(kind: LanguageKind) -> &'static str {
+    match kind {
+        LanguageKind::C => "int main(void) { return 0; }\n",
+        LanguageKind::CSharp => "class Main { void Run() {} }\n",
+        LanguageKind::Cpp => "int main() { return 0; }\n",
+        LanguageKind::Dart => "void main() {}\n",
+        LanguageKind::Go => "package main\nfunc main() {}\n",
+        LanguageKind::Java => "class Main { void run() {} }\n",
+        LanguageKind::JavaScript => "function run() {}\n",
+        LanguageKind::Jsx => "const element = <div />;\n",
+        LanguageKind::Kotlin => "fun main() {}\n",
+        LanguageKind::Php => "<?php function run() {}\n",
+        LanguageKind::Python => "def run():\n    pass\n",
+        LanguageKind::Ruby => "def run\nend\n",
+        LanguageKind::Rust => "fn main() {}\n",
+        LanguageKind::Scala => "object Main { def run(): Unit = {} }\n",
+        LanguageKind::Swift => "func run() {}\n",
+        LanguageKind::TypeScript => "function run(): void {}\n",
+        LanguageKind::Tsx => "const element = <div />;\n",
+        LanguageKind::Unsupported | LanguageKind::Unknown => {
+            unreachable!("Unsupported and Unknown are not in any LanguageFamily::kinds() iteration")
+        }
+    }
+}
+
+/// Pin uppercase-extension classification through the workspace layer so a
+/// regression in `classify_language`'s normalization path is caught before it
+/// silently excludes Linux repos with mixed-case filenames.
+#[test]
+fn classify_language_handles_uppercase_extensions_for_all_families() {
+    let cases: &[(&str, LanguageFamily)] = &[
+        ("MAIN.RS", LanguageFamily::Rust),
+        ("lib.PY", LanguageFamily::Python),
+        ("App.JAVA", LanguageFamily::Java),
+        ("Program.CS", LanguageFamily::CSharp),
+        ("main.GO", LanguageFamily::Go),
+        ("runner.C", LanguageFamily::CFamily),
+        ("widget.CPP", LanguageFamily::CFamily),
+        ("api.H", LanguageFamily::CFamily),
+        ("index.JS", LanguageFamily::JsTs),
+        ("view.TS", LanguageFamily::JsTs),
+        ("component.TSX", LanguageFamily::JsTs),
+        ("item.JSX", LanguageFamily::JsTs),
+        ("helper.RB", LanguageFamily::Ruby),
+        ("page.PHP", LanguageFamily::Php),
+        ("Greeter.KT", LanguageFamily::Kotlin),
+        ("Model.SWIFT", LanguageFamily::Swift),
+        ("Main.SCALA", LanguageFamily::Scala),
+        ("widget.DART", LanguageFamily::Dart),
+    ];
+    for (filename, expected_family) in cases {
+        let kind = classify_language(Path::new(filename));
+        assert_eq!(
+            kind.family(),
+            Some(*expected_family),
+            "uppercase filename {filename:?} classified as {kind:?}, expected {expected_family:?}"
+        );
+        assert!(
+            backend::backend_for_kind(kind).is_some(),
+            "no backend for {kind:?} (file {filename:?})"
+        );
+    }
+}
+
+#[test]
+fn every_supported_kind_parses_a_minimal_fixture() {
+    // Regression guard: instantiating a parser for each grammar exercises the
+    // grammar crate's FFI boundary. A Windows/MSVC-only link or ABI mismatch
+    // would surface here rather than being silently skipped.
+    for family in LanguageFamily::all() {
+        for &kind in family.kinds() {
+            let backend = backend::backend_for_kind(kind)
+                .unwrap_or_else(|| panic!("missing backend for {kind:?}"));
+            let mut parser = backend
+                .parser(kind)
+                .unwrap_or_else(|err| panic!("parser creation failed for {kind:?}: {err}"));
+            let source = minimal_source(kind);
+            let tree = parser
+                .parse(source, None)
+                .unwrap_or_else(|| panic!("parser returned None tree for {kind:?}"));
+            // The root should not be a pure error node — if the grammar
+            // rejected the entire fixture the linking succeeded but the
+            // fixture is wrong and should be fixed.
+            assert!(
+                !tree.root_node().is_error(),
+                "root node is ERROR for {kind:?}; fix the minimal fixture for that language"
+            );
+        }
+    }
+}
+
+fn fixture_record(kind: LanguageKind, source: &str) -> FileRecord {
+    let relative_path = format!("fixture.{}", extension_for_kind(kind));
+    FileRecord {
+        id: FileId::new(&relative_path),
+        path: relative_path.clone().into(),
+        relative_path,
+        hash: ContentHash::new(stable_content_hash(source.as_bytes())),
+        size_bytes: source.len() as u64,
+        modified_unix_millis: 0,
+        language: kind,
+        freshness: Freshness::Fresh,
+    }
+}
+
+fn extension_for_kind(kind: LanguageKind) -> &'static str {
+    match kind {
+        LanguageKind::C => "c",
+        LanguageKind::CSharp => "cs",
+        LanguageKind::Cpp => "cpp",
+        LanguageKind::Dart => "dart",
+        LanguageKind::Go => "go",
+        LanguageKind::Java => "java",
+        LanguageKind::JavaScript => "js",
+        LanguageKind::Jsx => "jsx",
+        LanguageKind::Kotlin => "kt",
+        LanguageKind::Php => "php",
+        LanguageKind::Python => "py",
+        LanguageKind::Ruby => "rb",
+        LanguageKind::Rust => "rs",
+        LanguageKind::Scala => "scala",
+        LanguageKind::Swift => "swift",
+        LanguageKind::TypeScript => "ts",
+        LanguageKind::Tsx => "tsx",
+        LanguageKind::Unsupported | LanguageKind::Unknown => {
+            unreachable!("Unsupported and Unknown are not in any LanguageFamily::kinds() iteration")
         }
     }
 }
