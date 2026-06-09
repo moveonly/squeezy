@@ -31,8 +31,9 @@ fn flags_powershell_abbreviated_params() {
     assert!(is_destructive_windows_segment("Remove-Item . -R -Force"));
     assert!(is_destructive_windows_segment("Remove-Item . -Recurse -Fo"));
     assert!(is_destructive_windows_segment("Remove-Item . -Re -Fo"));
-    // `-F` is not a valid abbreviation (ambiguous with -Filter), so the
-    // command is not classified as destructive unless a valid force form is used.
+    // `-F` is not a valid abbreviation (ambiguous with -Filter); ri . -R -F
+    // would fail at the PowerShell runtime but we do not classify it as
+    // destructive since the conservative policy is: only flag *valid* forms.
     assert!(!is_destructive_windows_segment("ri . -R -F"));
 }
 
@@ -229,6 +230,9 @@ fn flags_start_process_runas() {
     assert!(is_destructive_windows_segment(
         "Start-Process cmd.exe -Verb RunAs"
     ));
+    assert!(is_destructive_windows_segment(
+        "start-process cmd -Verb runAs"
+    ));
 }
 
 #[test]
@@ -380,6 +384,9 @@ fn ignores_benign_commands() {
     ));
     // Remove-Item without both Recurse and Force is not caught by this
     // heuristic unless it uses -LiteralPath or suppresses confirmation.
+    // Remove-Item without -Force is not destructive
+    assert!(!is_destructive_windows_segment("Remove-Item -Recurse ."));
+    // Remove-Item without -Recurse is not caught by this heuristic
     assert!(!is_destructive_windows_segment("Remove-Item -Force ."));
     // ri alias without both flags
     assert!(!is_destructive_windows_segment("ri foo.txt"));
@@ -458,4 +465,30 @@ fn ignores_benign_forms_of_existing_entries() {
     assert!(!is_destructive_windows_segment("cipher /e file.txt"));
     // wmic without "delete" is benign
     assert!(!is_destructive_windows_segment("wmic process list brief"));
+}
+
+#[test]
+fn explicit_false_named_flags_do_not_count_as_on() {
+    // `-Force:$false` / `-Recurse:$false` are real PowerShell idioms for
+    // explicitly turning the switch off. They must not classify as forced
+    // recursive deletion.
+    assert!(!is_destructive_windows_segment(
+        "Remove-Item -Recurse:$false -Force ."
+    ));
+    assert!(!is_destructive_windows_segment(
+        "Remove-Item -Recurse -Force:$false ."
+    ));
+    assert!(!is_destructive_windows_segment(
+        "Remove-Item -Recurse:$false -Force:$false ."
+    ));
+    // `-Force:$true` / `-Force:true` / `-Force:1` still count as on.
+    assert!(is_destructive_windows_segment(
+        "Remove-Item -Recurse:$true -Force:$true ."
+    ));
+    assert!(is_destructive_windows_segment(
+        "Remove-Item -Recurse:true -Force:true ."
+    ));
+    assert!(is_destructive_windows_segment(
+        "Remove-Item -Recurse:1 -Force:1 ."
+    ));
 }

@@ -325,6 +325,7 @@ impl ShellProgram {
         }
     }
 
+    /// Build a cmd.exe invocation for the Windows restricted-token sandbox.
     #[cfg(windows)]
     fn windows_cmd(command: &str) -> Self {
         Self {
