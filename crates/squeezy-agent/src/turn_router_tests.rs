@@ -37,6 +37,8 @@ fn default_routing_config() -> RoutingConfig {
         judge_max_chars: DEFAULT_ROUTING_JUDGE_MAX_CHARS,
         judge_model: None,
         extra_heuristic_verbs: Vec::new(),
+        linux_sandbox_sensitive_parent:
+            squeezy_core::DEFAULT_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT,
     }
 }
 
@@ -883,4 +885,44 @@ fn judge_model_per_provider_override_wins() {
     let cfg = app_config_with_providers(providers);
     let cheap: std::sync::Arc<str> = std::sync::Arc::from("gpt-5.4-nano");
     assert_eq!(&*super::judge_model_for("openai", &cfg, &cheap), "my-judge");
+}
+
+// -- Linux sandbox-sensitive routing ----------------------------------------
+
+#[test]
+fn linux_sandbox_sensitive_detects_known_keywords() {
+    assert!(super::is_linux_sandbox_sensitive("run unshare -r sh"));
+    assert!(super::is_linux_sandbox_sensitive(
+        "check if landlock is available"
+    ));
+    assert!(super::is_linux_sandbox_sensitive("install with apt-get"));
+    assert!(super::is_linux_sandbox_sensitive("run docker build ."));
+    assert!(super::is_linux_sandbox_sensitive("try sudo sysctl"));
+    assert!(super::is_linux_sandbox_sensitive(
+        "inspect /proc/self/status"
+    ));
+    assert!(super::is_linux_sandbox_sensitive("read /sys/kernel/debug"));
+    assert!(super::is_linux_sandbox_sensitive("run podman run --rm"));
+    assert!(super::is_linux_sandbox_sensitive(
+        "configure seccomp policy"
+    ));
+    assert!(super::is_linux_sandbox_sensitive(
+        "check user namespace support"
+    ));
+}
+
+#[test]
+fn linux_sandbox_sensitive_case_insensitive() {
+    assert!(super::is_linux_sandbox_sensitive("Run Docker Build ."));
+    assert!(super::is_linux_sandbox_sensitive("SUDO systemctl restart"));
+    assert!(super::is_linux_sandbox_sensitive("check SECCOMP filter"));
+}
+
+#[test]
+fn linux_sandbox_sensitive_does_not_match_unrelated_prompts() {
+    assert!(!super::is_linux_sandbox_sensitive("run cargo test"));
+    assert!(!super::is_linux_sandbox_sensitive("ls src/lib.rs"));
+    assert!(!super::is_linux_sandbox_sensitive("checkout main branch"));
+    assert!(!super::is_linux_sandbox_sensitive("grep TODO src/"));
+    assert!(!super::is_linux_sandbox_sensitive("format the code"));
 }

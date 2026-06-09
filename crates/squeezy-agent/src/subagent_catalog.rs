@@ -200,7 +200,9 @@ impl SubagentCatalog {
 /// On Unix-like systems, only `$HOME/.squeezy/agents` is checked.
 ///
 /// Returns `None` only when no suitable base directory can be determined
-/// from the process environment.
+/// from the process environment. When no default can be derived, a warning is
+/// emitted so Linux services, sudo shells, CI jobs, and containers do not
+/// silently skip user subagent discovery.
 fn default_user_subagents_dir() -> Option<PathBuf> {
     // On all platforms, an explicit $HOME is honoured first so that CI
     // scripts, Git Bash users, and test code can override the default
@@ -221,6 +223,12 @@ fn default_user_subagents_dir() -> Option<PathBuf> {
         }
     }
 
+    warn!(
+        target: "squeezy_agent::subagent_catalog",
+        "HOME is not set; user subagents from ~/.squeezy/agents will not be loaded. \
+         Pass an explicit user_dir to SubagentCatalog::discover, or set HOME, to \
+         suppress this warning."
+    );
     None
 }
 

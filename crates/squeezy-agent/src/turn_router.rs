@@ -149,6 +149,73 @@ const HEURISTIC_VERBS: &[&str] = &[
     "tag",
 ];
 
+/// Substrings that unambiguously flag Linux sandbox-sensitive territory.
+/// These are either multi-word phrases, path prefixes, or hyphenated
+/// commands that cannot appear as part of unrelated words.
+const LINUX_SANDBOX_SENSITIVE_SUBSTRINGS: &[&str] = &[
+    "/proc",
+    "/sys",
+    "apt-get",
+    "network namespace",
+    "kernel policy",
+    "user namespace",
+    "pivot_root",
+    "overlayfs",
+];
+
+/// Single words that flag Linux sandbox-sensitive territory. Checked with
+/// whole-word matching so short names like "apt" do not false-positive on
+/// unrelated words (e.g. a hypothetical "captain").
+const LINUX_SANDBOX_SENSITIVE_WORDS: &[&str] = &[
+    "unshare",
+    "landlock",
+    "seccomp",
+    "sudo",
+    "systemd",
+    "docker",
+    "podman",
+    "pacman",
+    "zypper",
+    "netns",
+    "cgroup",
+    "nsenter",
+    "chroot",
+    "containerd",
+    "rootless",
+    "userns",
+    "apt",
+    "yum",
+    "dnf",
+    "apk",
+];
+
+/// Returns `true` when `user_input` (case-insensitive) contains any
+/// Linux sandbox-sensitive keyword. Used by `classify_turn` to prevent
+/// the heuristic or judge from routing host-sensitive Linux work to
+/// the cheap model tier.
+///
+/// Prompts involving Docker, Podman, container runtimes, and package
+/// managers are treated as sandbox-sensitive even on macOS and Windows
+/// because those workflows require the parent model's care on any platform.
+pub(crate) fn is_linux_sandbox_sensitive(user_input: &str) -> bool {
+    let lower = user_input.to_ascii_lowercase();
+    if LINUX_SANDBOX_SENSITIVE_SUBSTRINGS
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        return true;
+    }
+    // Word-boundary check: split on non-alphanumeric, non-hyphen, non-underscore
+    // characters so "apt" matches "run apt install" but not "captain".
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+        .filter(|w| !w.is_empty())
+        .collect();
+    LINUX_SANDBOX_SENSITIVE_WORDS
+        .iter()
+        .any(|term| words.contains(term))
+}
+
 const AMBIGUITY_MARKERS: &[&str] = &[
     "maybe",
     "figure out",
@@ -437,6 +504,9 @@ pub(crate) struct ClassifyTurnInputs<'a> {
     pub session_mode: SessionMode,
     pub overrides: RoutingOverride,
     pub sticky: bool,
+    /// Mirror of `config.routing.linux_sandbox_sensitive_parent`. Passed
+    /// explicitly so callers can override without touching the config.
+    pub linux_sandbox_sensitive_parent: bool,
 }
 
 /// Result of classifying a single turn. Carries the routing decision
@@ -522,6 +592,13 @@ pub(crate) async fn classify_turn(
 
     if inputs.overrides.force_cheap {
         return ClassifyResult::cheap(CheapReason::UserExplicit, cheap);
+    }
+
+    // Linux sandbox/container/kernel prompts go to the parent by default so the
+    // cheap tier never mishandles host-sensitive work. An explicit `/cheap`
+    // override (consumed above) still wins.
+    if inputs.linux_sandbox_sensitive_parent && is_linux_sandbox_sensitive(inputs.user_input) {
+        return ClassifyResult::parent();
     }
 
     // Short follow-ups inherit the prior turn's route instead of paying for a

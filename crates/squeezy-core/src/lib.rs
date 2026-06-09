@@ -430,6 +430,10 @@ pub const DEFAULT_ROUTING_LARGE_ATTACHMENT_BYPASS_BYTES: u32 = 4_096;
 /// this skip the slam-dunk path and fall through to the borderline
 /// judge (or `Parent`). Sized at ~400 tokens of English at 5 chars/tok.
 pub const DEFAULT_ROUTING_HEURISTIC_MAX_CHARS: u32 = 2_000;
+/// Default for `[routing].linux_sandbox_sensitive_parent`: route prompts
+/// mentioning Linux sandbox/container/kernel keywords to the parent model
+/// even when the heuristic or judge would choose cheap.
+pub const DEFAULT_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT: bool = true;
 /// Char-budget gate for the LLM judge. Prompts longer than this skip the
 /// judge call and route to `Parent` directly — long prompts almost
 /// always carry the kind of nuance the cheap tier struggles with, and a
@@ -1929,13 +1933,17 @@ impl AppConfig {
             ));
         }
         if self.routing.extra_heuristic_verbs.is_empty() {
-            output.push_str("# extra_heuristic_verbs = []  # user-extended verb whitelist\n\n");
+            output.push_str("# extra_heuristic_verbs = []  # user-extended verb whitelist\n");
         } else {
             output.push_str(&format!(
-                "extra_heuristic_verbs = {}\n\n",
+                "extra_heuristic_verbs = {}\n",
                 toml_string_array(&self.routing.extra_heuristic_verbs)
             ));
         }
+        output.push_str(&format!(
+            "linux_sandbox_sensitive_parent = {}  # route Linux sandbox/container prompts to parent\n\n",
+            self.routing.linux_sandbox_sensitive_parent
+        ));
 
         output.push_str("[permissions]\n");
         output.push_str(&format!(
@@ -5014,6 +5022,20 @@ pub struct RoutingConfig {
     /// `[routing].extra_heuristic_verbs = ["deploy", "tail"]` in TOML
     /// or `SQUEEZY_ROUTING_EXTRA_HEURISTIC_VERBS=deploy,tail` env.
     pub extra_heuristic_verbs: Vec<String>,
+    /// When `true` (the default), prompts containing Linux
+    /// sandbox/container/kernel keywords (`unshare`, `landlock`,
+    /// `seccomp`, `sudo`, `docker`, `podman`, `/proc`, `/sys`,
+    /// package-manager commands, and related terms) are routed to the
+    /// parent model rather than the cheap tier. `/cheap` overrides.
+    /// Disable with `[routing].linux_sandbox_sensitive_parent = false`
+    /// or `SQUEEZY_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT=false`.
+    ///
+    /// This guard applies on all platforms (macOS, Linux, Windows), not
+    /// only on Linux, because Docker, Podman, container runtimes, and
+    /// package managers require parent-model care regardless of the host
+    /// OS. The name reflects where the keywords originate, not where the
+    /// guard activates.
+    pub linux_sandbox_sensitive_parent: bool,
 }
 
 impl RoutingConfig {
@@ -5092,6 +5114,16 @@ impl RoutingConfig {
                 })
                 .or(settings.extra_heuristic_verbs)
                 .unwrap_or_default(),
+            linux_sandbox_sensitive_parent: get_var(
+                "SQUEEZY_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT",
+            )
+            .as_deref()
+            .map(parse_enabled_bool)
+            .unwrap_or(
+                settings
+                    .linux_sandbox_sensitive_parent
+                    .unwrap_or(DEFAULT_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT),
+            ),
         }
     }
 
@@ -5126,6 +5158,7 @@ pub struct RoutingSettings {
     pub judge_max_chars: Option<u32>,
     pub judge_model: Option<String>,
     pub extra_heuristic_verbs: Option<Vec<String>>,
+    pub linux_sandbox_sensitive_parent: Option<bool>,
 }
 
 impl RoutingSettings {
@@ -5148,6 +5181,7 @@ impl RoutingSettings {
                 "judge_max_chars",
                 "judge_model",
                 "extra_heuristic_verbs",
+                "linux_sandbox_sensitive_parent",
             ],
             source,
             path,
@@ -5223,6 +5257,12 @@ impl RoutingSettings {
                 source,
                 &field(path, "extra_heuristic_verbs"),
             )?,
+            linux_sandbox_sensitive_parent: bool_value(
+                table,
+                "linux_sandbox_sensitive_parent",
+                source,
+                &field(path, "linux_sandbox_sensitive_parent"),
+            )?,
         })
     }
 
@@ -5254,6 +5294,10 @@ impl RoutingSettings {
         replace_if_some(&mut self.judge_max_chars, next.judge_max_chars);
         replace_if_some(&mut self.judge_model, next.judge_model);
         merge_string_lists(&mut self.extra_heuristic_verbs, next.extra_heuristic_verbs);
+        replace_if_some(
+            &mut self.linux_sandbox_sensitive_parent,
+            next.linux_sandbox_sensitive_parent,
+        );
     }
 }
 

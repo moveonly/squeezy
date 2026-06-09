@@ -370,6 +370,31 @@ cheap_model = "claude-haiku-4-5"
 }
 
 #[test]
+fn routing_linux_sandbox_parent_guard_round_trips_through_inspect() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[routing]
+linux_sandbox_sensitive_parent = false
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    assert!(!config.routing.linux_sandbox_sensitive_parent);
+    let inspect = config.inspect_redacted();
+    assert!(
+        inspect.contains("linux_sandbox_sensitive_parent = false"),
+        "inspect should emit the resolved linux sandbox routing guard: {inspect}"
+    );
+
+    let round_tripped =
+        SettingsFile::from_toml_str(&inspect, "round-trip").expect("inspect parses");
+    let round_tripped_config = AppConfig::from_settings_and_env_vars(round_tripped, |_| None);
+    assert!(!round_tripped_config.routing.linux_sandbox_sensitive_parent);
+}
+
+#[test]
 fn routing_config_fields_display_resolved_defaults_not_blanks() {
     // On OpenAI with no per-provider overrides, the Routing /config fields show
     // the resolved values in effect (not empty) — the provider banner, the

@@ -7212,6 +7212,7 @@ impl TurnRuntime {
                 session_mode: active_mode,
                 overrides: routing_override,
                 sticky: sticky_active,
+                linux_sandbox_sensitive_parent: self.config.routing.linux_sandbox_sensitive_parent,
             },
             self.cancel.clone(),
         )
@@ -15682,6 +15683,24 @@ fn load_session_mode(session_mode: &Arc<AtomicU8>) -> SessionMode {
     })
 }
 
+/// Short hint about Build-mode shell-sandbox readiness for inclusion in
+/// Plan-mode denial messages. The underlying kernel probes
+/// (`linux_unshare_supported`, `linux_landlock_supported`) are OnceLock-cached
+/// so they are cheap after the first call; the `ShellSandboxDoctor` struct
+/// itself is allocated on each call (only `backend: &'static str` and
+/// `available: bool` are read from it here).
+fn build_mode_sandbox_hint() -> String {
+    let doc = squeezy_tools::shell_sandbox_doctor();
+    if doc.available {
+        format!("Build mode would use sandbox backend {}", doc.backend)
+    } else {
+        format!(
+            "Build mode sandbox backend {} is unavailable — required mode would fail",
+            doc.backend
+        )
+    }
+}
+
 pub(crate) fn mode_permission_verdict(
     mode: SessionMode,
     request: &PermissionRequest,
@@ -15718,7 +15737,11 @@ pub(crate) fn mode_permission_verdict(
             return Some(PermissionVerdict {
                 action: PermissionAction::Deny,
                 matched_rule: None,
-                reason: format!("{} mode refuses mutating shell command", mode.as_str()),
+                reason: format!(
+                    "{} mode refuses mutating shell command; switch to Build mode (Shift+Tab) — {}",
+                    mode.as_str(),
+                    build_mode_sandbox_hint()
+                ),
                 silent: false,
             });
         }
@@ -15744,7 +15767,11 @@ pub(crate) fn mode_permission_verdict(
                 PlanModeShellSafety::Mutating => Some(PermissionVerdict {
                     action: PermissionAction::Deny,
                     matched_rule: None,
-                    reason: format!("{} mode refuses mutating shell command", mode.as_str()),
+                    reason: format!(
+                        "{} mode refuses mutating shell command; switch to Build mode (Shift+Tab) — {}",
+                        mode.as_str(),
+                        build_mode_sandbox_hint()
+                    ),
                     silent: false,
                 }),
                 PlanModeShellSafety::NeedsApproval => Some(PermissionVerdict {
@@ -15789,11 +15816,30 @@ pub(crate) fn mode_permission_verdict(
             ),
         }
     } else {
-        format!(
+        let base = format!(
             "{} mode refuses {}",
             mode.as_str(),
             request.capability.as_str()
-        )
+        );
+        // Append sandbox readiness hint for capabilities that involve
+        // shell execution so the user knows what Build mode would do.
+        if mode == SessionMode::Plan
+            && matches!(
+                request.capability,
+                PermissionCapability::Shell
+                    | PermissionCapability::Git
+                    | PermissionCapability::Compiler
+                    | PermissionCapability::Destructive
+            )
+        {
+            format!(
+                "{}; switch to Build mode (Shift+Tab) — {}",
+                base,
+                build_mode_sandbox_hint()
+            )
+        } else {
+            base
+        }
     };
     Some(PermissionVerdict {
         action: PermissionAction::Deny,

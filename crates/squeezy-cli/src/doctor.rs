@@ -49,6 +49,12 @@ pub struct DoctorArgs {
     /// exits without running other checks.
     #[arg(long)]
     pub sandbox_teardown: bool,
+    /// Report detailed Linux shell-sandbox posture (user namespace support,
+    /// Landlock support, seccomp support, required-mode viability) and exit.
+    /// On non-Linux platforms, reports the active backend with a note that the
+    /// Linux detail only applies on Linux.
+    #[arg(long)]
+    pub linux_sandbox: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +162,23 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         } else {
             sandbox_setup_action(AppConfig::from_env_and_settings().ok().as_ref())
         };
+        let exit_code = if matches!(check.status, Status::Fail) {
+            1
+        } else {
+            0
+        };
+        return Ok(DoctorReport {
+            exit_code,
+            checks: vec![check],
+            version,
+            target,
+            json: args.json,
+        });
+    }
+
+    // `--linux-sandbox` is a focused diagnostic: report sandbox posture and exit.
+    if args.linux_sandbox {
+        let check = linux_sandbox_detail_check();
         let exit_code = if matches!(check.status, Status::Fail) {
             1
         } else {
@@ -1488,6 +1511,50 @@ fn sandbox_check(config: Option<&AppConfig>) -> Check {
             Status::Warn
         },
         detail,
+    }
+}
+
+/// Detailed Linux sandbox posture check for `doctor --linux-sandbox`.
+/// On Linux, reports user namespace support, Landlock support, seccomp
+/// support, and required-mode viability. On other platforms, reports the
+/// active backend with a note that Linux detail only applies on Linux.
+fn linux_sandbox_detail_check() -> Check {
+    let report = squeezy_tools::shell_sandbox_doctor();
+    linux_sandbox_check_from_report(report)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_sandbox_check_from_report(report: squeezy_tools::ShellSandboxDoctor) -> Check {
+    let detail = format!(
+        "backend={} available={} — {}",
+        report.backend, report.available, report.detail
+    );
+    // Use Fail (not Warn) so `--linux-sandbox` exits 1 on hosts where required
+    // mode would fail — CI gates written as `squeezy doctor --linux-sandbox`
+    // can rely on the exit code.
+    Check {
+        name: "linux-sandbox".to_string(),
+        status: if report.available {
+            Status::Ok
+        } else {
+            Status::Fail
+        },
+        detail,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_sandbox_check_from_report(report: squeezy_tools::ShellSandboxDoctor) -> Check {
+    Check {
+        name: "linux-sandbox".to_string(),
+        status: Status::Warn,
+        detail: format!(
+            "linux-sandbox detail is only available on Linux \
+             (current platform: {}); active backend={}: {}",
+            std::env::consts::OS,
+            report.backend,
+            report.detail
+        ),
     }
 }
 
