@@ -271,6 +271,12 @@ impl ConversationState {
             metrics: metadata.metrics.clone(),
             redactions: metadata.redactions,
             token_calibration: metadata.token_calibration.clone(),
+            // Tagged structurally (which load path produced this) rather
+            // than semantically (whether the metadata is meaningfully
+            // populated). A resumed session whose `token_calibration` is
+            // bit-identical to `TokenCalibration::default()` still surfaces
+            // as `ResumedSession`. See `CalibrationSource` for the v1
+            // rationale and the future-predicate hook.
             calibration_source: CalibrationSource::ResumedSession,
             routing_sticky_remaining_turns: state.routing_sticky_remaining_turns,
             routing_session_disabled: state.routing_session_disabled,
@@ -717,9 +723,20 @@ pub struct AttachmentShape {
 /// Where the active `TokenCalibration` came from at session start. Shown by
 /// `/cost` so users in CI / containers understand whether token estimates are
 /// warm (from prior sessions) or cold (first run / shared home / corrupt file).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The classification is **structural** (which load path produced the
+/// calibration), not **semantic** (whether the loaded calibration actually
+/// contains warmed-up data). For example, a freshly-resumed session whose
+/// metadata holds `TokenCalibration::default()` is still tagged as
+/// [`Self::ResumedSession`] even though the values are bit-identical to
+/// [`Self::HardCodedDefault`]. This is intentional for v1: the label is
+/// honest about the load path. A future predicate like "is the calibration
+/// meaningfully populated?" could downgrade `ResumedSession` /
+/// `GlobalFile` to `HardCodedDefault` when the providers map is empty.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CalibrationSource {
     /// calibration.json was absent; estimates use hard-coded provider defaults.
+    #[default]
     HardCodedDefault,
     /// calibration.json was present but malformed; fell back to defaults.
     CorruptFallback,
@@ -736,6 +753,23 @@ impl CalibrationSource {
             Self::CorruptFallback => "hard-coded default (calibration file was malformed)",
             Self::GlobalFile => "global calibration.json",
             Self::ResumedSession => "resumed session metadata",
+        }
+    }
+
+    /// Human-readable explanatory note shown alongside [`Self::as_str`] in
+    /// `/cost`. Centralised here so wording / localisation changes touch a
+    /// single source of truth rather than the formatter and the enum
+    /// independently.
+    pub fn cost_note(self) -> &'static str {
+        match self {
+            Self::HardCodedDefault => {
+                "token estimates use provider hard-coded defaults; run a session to warm the calibration"
+            }
+            Self::CorruptFallback => {
+                "calibration.json was malformed; check for file corruption on shared or network homes"
+            }
+            Self::GlobalFile => "estimates warmed from prior session data in calibration.json",
+            Self::ResumedSession => "estimates warmed from this session's saved metadata",
         }
     }
 }

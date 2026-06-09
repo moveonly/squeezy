@@ -111,9 +111,11 @@ impl SessionStore {
 
     /// Load the cross-session `TokenCalibration` if present. Missing files
     /// yield `TokenCalibration::default()` silently. Malformed files also
-    /// fall back to the default, but emit a one-time diagnostic to stderr so
-    /// the user knows the warm-start cache is cold (e.g. in CI or on shared
-    /// homes where corruption is more likely to go unnoticed).
+    /// fall back to the default, but emit one diagnostic per agent startup
+    /// to stderr (this function is called once per `Agent::from_config`,
+    /// so the warning fires at most once per process) so the user knows
+    /// the warm-start cache is cold (e.g. in CI or on shared homes where
+    /// corruption is more likely to go unnoticed).
     pub fn load_global_calibration(&self) -> squeezy_llm::TokenCalibration {
         self.load_global_calibration_inner().0
     }
@@ -2991,6 +2993,15 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     serde_json::from_str(&text).map_err(json_error)
 }
 
+/// Map a [`SqueezyError`] from the calibration load path to a static label
+/// for the redacted stderr warning. Source-coupled to [`read_json`] (this
+/// file): the `SqueezyError::Tool` arm assumes the only producer of that
+/// variant in the calibration load chain is [`json_error`], which only
+/// wraps `serde_json` parse failures - hence the `"malformed JSON"`
+/// label. If a future refactor adds another `SqueezyError::Tool`
+/// producer to the calibration load path, that mapping will need to be
+/// narrowed (e.g. by introducing a calibration-specific `read_json`
+/// variant) so the label stays accurate.
 fn calibration_load_error_kind(error: &SqueezyError) -> &'static str {
     match error {
         SqueezyError::Io(error) => match error.kind() {

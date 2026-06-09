@@ -3,8 +3,7 @@ use std::fmt::Write as _;
 use std::time::SystemTime;
 
 use squeezy_agent::{
-    Agent, CalibrationSource, McpAccounting, ReviewerAuditEntry, SessionAccountingSnapshot,
-    SkillsAccounting,
+    Agent, McpAccounting, ReviewerAuditEntry, SessionAccountingSnapshot, SkillsAccounting,
 };
 use squeezy_llm::{LimitSource, RequestTokenEstimate};
 use squeezy_store::parse_bug_report_section;
@@ -248,22 +247,10 @@ pub(crate) fn format_cost_command(snapshot: &SessionAccountingSnapshot) -> Strin
         style::accent("◎"),
         style::muted(snapshot.calibration_source.as_str()),
     ));
-    let calibration_note = match snapshot.calibration_source {
-        CalibrationSource::HardCodedDefault => {
-            "token estimates use provider hard-coded defaults; run a session to warm the calibration"
-        }
-        CalibrationSource::CorruptFallback => {
-            "calibration.json was malformed; check for file corruption on shared or network homes"
-        }
-        CalibrationSource::GlobalFile => {
-            "estimates warmed from prior session data in calibration.json"
-        }
-        CalibrationSource::ResumedSession => "estimates warmed from this session's saved metadata",
-    };
     out.push_str(&format!(
         "  {} {}\n",
         style::accent("ℹ"),
-        style::muted(calibration_note)
+        style::muted(snapshot.calibration_source.cost_note())
     ));
 
     out.push('\n');
