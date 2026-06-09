@@ -18,6 +18,46 @@ fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
+#[cfg(unix)]
+#[test]
+fn home_relative_display_path_uses_component_boundaries_on_unix() {
+    let home = std::path::Path::new("/tmp/squeezy-home");
+    assert_eq!(
+        home_relative_display_path(
+            std::path::Path::new("/tmp/squeezy-home/.squeezy/settings.toml"),
+            home,
+        ),
+        Some("~/.squeezy/settings.toml".to_string())
+    );
+    assert_eq!(
+        home_relative_display_path(
+            std::path::Path::new("/tmp/squeezy-home-other/settings.toml"),
+            home
+        ),
+        None
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn home_relative_display_path_matches_windows_home_case_insensitively() {
+    let home = std::path::Path::new(r"C:\Users\Me");
+    assert_eq!(
+        home_relative_display_path(
+            std::path::Path::new(r"c:\users\me\.squeezy\settings.toml"),
+            home,
+        ),
+        Some(r"~\.squeezy\settings.toml".to_string())
+    );
+    assert_eq!(
+        home_relative_display_path(
+            std::path::Path::new(r"D:\Users\Me\.squeezy\settings.toml"),
+            home
+        ),
+        None
+    );
+}
+
 #[test]
 fn caret_line_marks_cursor_mid_string_not_end() {
     // Two leading indent spaces then "hello"; cursor parked on index 2 ('l').

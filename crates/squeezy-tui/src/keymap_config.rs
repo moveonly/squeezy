@@ -37,7 +37,6 @@
 //! resolver type and `/keymap` continues to render every binding.
 
 use std::collections::BTreeMap;
-use std::env;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -231,11 +230,15 @@ impl KeybindingsFile {
 }
 
 /// Default location of the user-editable file:
-/// `~/.squeezy/keybindings.toml`. Returns `None` when `$HOME` is
-/// unset (CI sandboxes, some test harnesses), in which case the
+/// `~/.squeezy/keybindings.toml`. Returns `None` when neither `$HOME`
+/// nor a platform home directory (e.g. `USERPROFILE` on Windows) is
+/// resolvable — CI sandboxes, some test harnesses — in which case the
 /// loader degrades to "no user overrides".
+///
+/// Uses `squeezy_core::cached_home_dir()` so the Windows profile-directory
+/// lookup is cached for the process lifetime.
 pub(crate) fn default_keybindings_path() -> Option<PathBuf> {
-    let home = env::var_os("HOME").map(PathBuf::from)?;
+    let home = squeezy_core::cached_home_dir()?;
     Some(home.join(".squeezy").join("keybindings.toml"))
 }
 

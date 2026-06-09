@@ -245,10 +245,10 @@ fn config_without_env_uses_openai_provider_defaults() {
     );
     assert_eq!(config.subagents, SubagentConfig::default());
     assert_eq!(config.telemetry, TelemetryConfig::default());
-    // On Windows the defaults are under %APPDATA%\squeezy\ rather than
-    // ~\.squeezy\, so the path suffix is different. Assert both platforms
-    // produce a non-empty, non-relative default.
-    #[cfg(not(windows))]
+    // On Unix the skills dirs use home-dotdir paths (`.squeezy/skills`,
+    // `.agents/skills`); on non-Unix they use config/data-dir-rooted paths
+    // (`squeezy/skills`, `agents/skills`) so they stay alongside settings.
+    #[cfg(unix)]
     {
         assert!(config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR));
         assert!(
@@ -258,18 +258,24 @@ fn config_without_env_uses_openai_provider_defaults() {
                 .ends_with(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
         );
     }
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
-        let user_dir = config.skills.user_dir.to_string_lossy();
-        let compat_dir = config.skills.compat_user_dir.to_string_lossy();
         assert!(
-            user_dir.contains("squeezy") && user_dir.contains("skills"),
-            "unexpected user_dir on Windows: {user_dir}"
+            config.skills.user_dir.ends_with("squeezy/skills")
+                || config.skills.user_dir.ends_with("squeezy\\skills")
+                || config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR),
+            "unexpected user_dir: {:?}",
+            config.skills.user_dir
         );
-        // Both APPDATA and USERPROFILE fallbacks now use the .squeezy namespace.
         assert!(
-            compat_dir.contains("squeezy") && compat_dir.contains("skills"),
-            "unexpected compat_user_dir on Windows: {compat_dir}"
+            config.skills.compat_user_dir.ends_with("agents/skills")
+                || config.skills.compat_user_dir.ends_with("agents\\skills")
+                || config
+                    .skills
+                    .compat_user_dir
+                    .ends_with(DEFAULT_AGENT_COMPAT_SKILLS_DIR),
+            "unexpected compat_user_dir: {:?}",
+            config.skills.compat_user_dir
         );
     }
     match config.provider {
@@ -6099,43 +6105,110 @@ fn session_metrics_merge_turn_folds_model_ledger() {
     assert_eq!(bucket.main.estimated_usd_micros, Some(84));
 }
 
-#[cfg(windows)]
+// ── Windows path-handling tests ───────────────────────────────────────────────
+
 #[test]
-fn default_squeezy_skills_dir_uses_appdata_on_windows() {
-    // Simulate a Windows environment where HOME is absent but APPDATA is set.
-    // We use a temp approach: just verify the function returns an APPDATA-relative
-    // path when APPDATA is present in the environment (standard CI runner).
-    // If neither APPDATA nor USERPROFILE is set, the function falls through to HOME.
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        let dir = default_squeezy_skills_dir();
-        let expected = std::path::PathBuf::from(&appdata)
-            .join("squeezy")
-            .join("skills");
-        assert_eq!(dir, expected);
-    } else if let Some(userprofile) = std::env::var_os("USERPROFILE") {
-        let dir = default_squeezy_skills_dir();
-        let expected = std::path::PathBuf::from(&userprofile)
-            .join(".squeezy")
-            .join("skills");
-        assert_eq!(dir, expected);
+fn expand_home_path_tilde_alone_uses_home_var() {
+    // Directly test the inner logic: when the path is "~" it should expand
+    // to whatever HOME resolves to. We check that the result is at least
+    // not the literal "~" when a home dir is available.
+    let path = PathBuf::from("~");
+    let expanded = expand_home_path(path.clone());
+    if home_dir_path().is_some() {
+        assert_ne!(expanded, path, "tilde should expand when home dir is known");
+        assert!(expanded.is_absolute(), "expanded tilde should be absolute");
+    } else {
+        assert_eq!(expanded, path, "tilde must survive unexpanded when no home");
     }
+}
+
+#[test]
+fn expand_home_path_tilde_prefix_joins_suffix() {
+    let path = PathBuf::from("~/.squeezy/keybindings.toml");
+    let expanded = expand_home_path(path.clone());
+    if let Some(home) = home_dir_path() {
+        let expected = home.join(".squeezy/keybindings.toml");
+        assert_eq!(expanded, expected);
+    } else {
+        assert_eq!(expanded, path);
+    }
+}
+
+#[test]
+fn expand_home_path_absolute_is_unchanged() {
+    #[cfg(unix)]
+    let path = PathBuf::from("/usr/local/bin/squeezy");
+    #[cfg(not(unix))]
+    let path = PathBuf::from("C:/Program Files/squeezy/squeezy.exe");
+    assert_eq!(expand_home_path(path.clone()), path);
+}
+
+#[test]
+fn expand_home_path_no_tilde_relative_unchanged() {
+    let path = PathBuf::from("relative/path/settings.toml");
+    assert_eq!(expand_home_path(path.clone()), path);
+}
+
+#[test]
+fn repo_settings_id_is_deterministic() {
+    let tmp = std::env::temp_dir();
+    let id1 = repo_settings_id(&tmp);
+    let id2 = repo_settings_id(&tmp);
+    assert_eq!(id1, id2, "same path must yield the same id");
+}
+
+#[test]
+fn repo_settings_id_format_matches_name_hash_pattern() {
+    let tmp = std::env::temp_dir();
+    let id = repo_settings_id(&tmp);
+    // Format is `<name>-<16-hex-digit-hash>`.
+    let (_, hash) = id.rsplit_once('-').expect("id must contain a hyphen");
+    assert_eq!(hash.len(), 16, "hash portion must be 16 hex digits");
+    assert!(
+        hash.chars().all(|c| c.is_ascii_hexdigit()),
+        "hash must be lowercase hex"
+    );
 }
 
 #[cfg(windows)]
 #[test]
-fn default_agent_compat_skills_dir_uses_appdata_on_windows() {
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        let dir = default_agent_compat_skills_dir();
-        let expected = std::path::PathBuf::from(&appdata)
-            .join("squeezy")
-            .join("agent-skills");
-        assert_eq!(dir, expected);
-    } else if let Some(userprofile) = std::env::var_os("USERPROFILE") {
-        let dir = default_agent_compat_skills_dir();
-        // USERPROFILE fallback uses .squeezy namespace for consistency with APPDATA path.
-        let expected = std::path::PathBuf::from(&userprofile)
-            .join(".squeezy")
-            .join("agent-skills");
-        assert_eq!(dir, expected);
-    }
+fn repo_settings_id_windows_drive_letter_case_stable() {
+    use std::path::PathBuf;
+    // Simulate two spellings of the same Windows path that differ only in
+    // drive-letter casing. After the lowercase normalisation both should
+    // hash to the same value.
+    let lower = PathBuf::from("c:\\users\\me\\project");
+    let upper = PathBuf::from("C:\\users\\me\\project");
+    // Both paths don't exist, so canonicalize falls through; the display
+    // strings are `c:\...` and `C:\...`.  After lowercasing the hash input
+    // they should produce equal IDs.
+    assert_eq!(
+        repo_settings_id(&lower),
+        repo_settings_id(&upper),
+        "drive-letter casing must not affect the repo settings id on Windows"
+    );
+}
+
+#[test]
+fn toml_path_round_trip_forward_slashes() {
+    // TOML accepts forward slashes in string values on all platforms.
+    // Verify that a PathBuf round-trips through display() → PathBuf::from().
+    #[cfg(unix)]
+    let raw = "/home/user/squeezy/sessions";
+    #[cfg(not(unix))]
+    let raw = "C:/Users/user/squeezy/sessions";
+    let path = PathBuf::from(raw);
+    let display = path.display().to_string();
+    let round_tripped = PathBuf::from(&display);
+    assert_eq!(path, round_tripped);
+}
+
+#[test]
+fn sanitize_repo_settings_name_strips_special_chars() {
+    // Trailing hyphen from `!` is trimmed by trim_matches('-').
+    assert_eq!(sanitize_repo_settings_name("My Project!"), "my-project");
+    assert_eq!(sanitize_repo_settings_name("!foo!"), "foo");
+    assert_eq!(sanitize_repo_settings_name("squeezy"), "squeezy");
+    assert_eq!(sanitize_repo_settings_name("my_project"), "my_project");
+    assert_eq!(sanitize_repo_settings_name("CamelCase"), "camelcase");
 }

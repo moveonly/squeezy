@@ -5,6 +5,7 @@ use std::{
     env, fmt, fs,
     path::{Path, PathBuf},
     process,
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -9940,6 +9941,13 @@ pub fn repo_settings_id(root: impl AsRef<Path>) -> String {
     let root = root.as_ref();
     let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let display = canonical.display().to_string();
+    // On Windows, drive-letter casing (e.g. `C:\` vs `c:\`) and UNC
+    // normalisation can vary between callers, producing different hashes
+    // for the same root. Lowercase the whole display string before hashing
+    // so per-repo settings are stable regardless of how the drive letter is
+    // spelled. On non-Windows the string is case-sensitive and unchanged.
+    #[cfg(windows)]
+    let display = display.to_lowercase();
     let name = canonical
         .file_name()
         .and_then(|name| name.to_str())
@@ -9979,42 +9987,48 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 pub fn default_squeezy_skills_dir() -> PathBuf {
-    // On Windows HOME is typically absent; prefer stable profile-relative paths.
-    #[cfg(windows)]
+    // On Unix, skills live in the home dotdir for parity with the existing
+    // ~/.squeezy convention. On Windows (and other non-Unix platforms) there
+    // is no $HOME dotdir convention, so we follow the same root as the user
+    // settings file and use `dirs::config_dir()/squeezy/skills` — keeping
+    // skills and settings under the same %APPDATA%\squeezy umbrella.
+    #[cfg(unix)]
     {
-        if let Some(appdata) = env::var_os("APPDATA") {
-            return PathBuf::from(appdata).join("squeezy").join("skills");
-        }
-        if let Some(userprofile) = env::var_os("USERPROFILE") {
-            return PathBuf::from(userprofile).join(".squeezy").join("skills");
-        }
+        home_dir_path()
+            .map(|home| home.join(DEFAULT_SQUEEZY_SKILLS_DIR))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR))
     }
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(DEFAULT_SQUEEZY_SKILLS_DIR))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR))
+    #[cfg(not(unix))]
+    {
+        if let Some(config) = dirs::config_dir() {
+            return config.join("squeezy").join("skills");
+        }
+        home_dir_path()
+            .map(|home| home.join(DEFAULT_SQUEEZY_SKILLS_DIR))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR))
+    }
 }
 
 pub fn default_agent_compat_skills_dir() -> PathBuf {
-    // On Windows HOME is typically absent; prefer stable profile-relative paths.
-    #[cfg(windows)]
+    // Mirror the same platform-aware logic as `default_squeezy_skills_dir`.
+    // On Windows, use `dirs::data_dir()/agents/skills` so the agent-compat
+    // directory is also rooted under a stable user-data location rather than
+    // a dotdir relative to the home directory.
+    #[cfg(unix)]
     {
-        if let Some(appdata) = env::var_os("APPDATA") {
-            return PathBuf::from(appdata).join("squeezy").join("agent-skills");
-        }
-        if let Some(userprofile) = env::var_os("USERPROFILE") {
-            // Use the same `.squeezy` namespace as the APPDATA path so that
-            // skills installed under one profile location remain visible if
-            // APPDATA becomes available (roaming profiles, new machine).
-            return PathBuf::from(userprofile)
-                .join(".squeezy")
-                .join("agent-skills");
-        }
+        home_dir_path()
+            .map(|home| home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
     }
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
+    #[cfg(not(unix))]
+    {
+        if let Some(data) = dirs::data_dir() {
+            return data.join("agents").join("skills");
+        }
+        home_dir_path()
+            .map(|home| home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR))
+    }
 }
 
 /// Returns `true` when `HOME` is absent **and** a skills/prompts default would
@@ -10084,15 +10098,52 @@ fn expand_home_path(path: PathBuf) -> PathBuf {
         return path;
     };
     if path_str == "~" {
-        return env::var_os("HOME").map(PathBuf::from).unwrap_or(path);
+        return home_dir_path().unwrap_or(path);
     }
     if let Some(rest) = path_str.strip_prefix("~/") {
-        return env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join(rest))
-            .unwrap_or(path);
+        return home_dir_path().map(|home| home.join(rest)).unwrap_or(path);
+    }
+    // On Windows, TOML authors may write `~\subdir` (backslash separator).
+    // `PathBuf::to_str` on Windows preserves the separator as `\\` in the
+    // string representation, so we also check for that prefix.
+    #[cfg(windows)]
+    if let Some(rest) = path_str.strip_prefix("~\\") {
+        return home_dir_path().map(|home| home.join(rest)).unwrap_or(path);
     }
     path
+}
+
+/// Returns the current user's home directory, preferring `$HOME` for
+/// Unix compatibility and falling back to `dirs::home_dir()` so that
+/// Windows processes without `HOME` set (but with `USERPROFILE` /
+/// `HOMEDRIVE`+`HOMEPATH` or a known-folder registry entry) still
+/// resolve `~` correctly.
+///
+/// The result is cached in a process-global `OnceLock`. On Windows,
+/// profile and redirected-folder lookups can be noticeably slower than
+/// a simple env-var read; caching removes the per-call overhead and
+/// avoids repeated Win32 `GetUserProfileDirectory` calls during
+/// config-screen rendering.
+///
+/// **Testing note**: because this function caches on first call, the
+/// `dirs::home_dir()` fallback cannot be exercised in a test that runs in
+/// a process where `$HOME` is already set. Coverage of the Windows-without-
+/// `$HOME` path requires a separate process invocation (e.g. an integration
+/// test that unsets `HOME` and calls the binary directly).
+pub fn cached_home_dir() -> Option<PathBuf> {
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .or_else(dirs::home_dir)
+        })
+        .as_deref()
+        .map(PathBuf::from)
+}
+
+fn home_dir_path() -> Option<PathBuf> {
+    cached_home_dir()
 }
 
 /// Walks up the directory tree from `start` looking for `squeezy.toml`.
@@ -10126,6 +10177,11 @@ pub fn find_project_settings_path(start: impl AsRef<Path>) -> Option<PathBuf> {
 pub fn user_settings_template() -> &'static str {
     r#"# User-level Squeezy settings. Uncomment any key you want to override.
 # Commented values are examples or defaults that apply when the key is absent.
+# On Windows this file is at %APPDATA%\squeezy\settings.toml
+# (or wherever SQUEEZY_SETTINGS_PATH points).
+# PowerShell: $env:SQUEEZY_SETTINGS_PATH = "C:\Users\me\squeezy\settings.toml"
+# Path values in TOML require backslash-escaping or forward slashes:
+#   "C:\\Users\\me\\squeezy\\sessions"   or   "C:/Users/me/squeezy/sessions"
 
 [model]
 # provider = "openai"          # openai | anthropic | google | azure_openai | bedrock | ollama
@@ -10150,6 +10206,8 @@ pub fn user_settings_template() -> &'static str {
 # mode = "build"              # build | plan
 # resume_picker = "ask"       # ask | never
 # log_dir = ".squeezy/sessions"
+# Windows path examples: log_dir = "C:\\Users\\me\\squeezy\\sessions"
+#                     or log_dir = "C:/Users/me/squeezy/sessions"
 # log_retention_days = 30
 # log_retention_archive_days = 30  # archived sessions deleted after this many days; 0 disables the archive sweep
 # max_event_bytes = 65536
@@ -10330,6 +10388,9 @@ pub fn user_settings_template() -> &'static str {
 # [skills]
 # user_dir = "~/.squeezy/skills"
 # compat_user_dir = "~/.agents/skills"
+# Windows: TOML path values require backslash-escaping or forward slashes:
+#   user_dir = "C:\\Users\\me\\.squeezy\\skills"   # escaped backslashes
+#   user_dir = "C:/Users/me/.squeezy/skills"        # forward slashes work too
 # active_budget_chars = 4000          # legacy absolute cap; used only when active_budget_mode is unset
 # active_body_cap_chars = 16000
 # preamble_enabled = true
@@ -10556,11 +10617,28 @@ fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>, Vec<Con
         .map(Path::to_path_buf)
         .unwrap_or(cwd);
     let repo_path = per_repo_settings_path(repo_root);
-    load_settings_from_paths(
+    let (settings, sources, mut warnings) = load_settings_from_paths(
         Some(user_path.as_path()),
         project_path.as_deref(),
         Some(repo_path.as_path()),
-    )
+    )?;
+    // Warn when the user-settings path is relative (meaning neither HOME nor
+    // dirs::config_dir resolved a concrete directory). On Windows this most
+    // often means APPDATA and USERPROFILE are both absent, which causes
+    // settings reads/writes to chase the current working directory instead of
+    // a stable per-user location.
+    if user_path.is_relative() {
+        warnings.push(ConfigWarning {
+            source: "config".to_string(),
+            field: format!(
+                "user settings path resolved to a relative path ({}) — \
+                 set SQUEEZY_SETTINGS_PATH to an absolute path to ensure \
+                 a stable, per-user config location",
+                user_path.display()
+            ),
+        });
+    }
+    Ok((settings, sources, warnings))
 }
 
 /// A single tier's settings file as both its parsed form and its raw
@@ -10661,6 +10739,12 @@ fn load_tier_source(path: &Path) -> Result<Option<TierSource>> {
 /// precedence. Env wins because env-var overrides are applied after the merged
 /// settings in `from_settings_and_env_vars`; repo wins next because it's the
 /// last tier merged in `load_settings_from_paths`.
+///
+/// Environment variable lookup via `std::env::var` delegates to the OS: on
+/// Windows the lookup is case-insensitive (the Windows API normalises env var
+/// names), so `OPENAI_API_KEY` and `openai_api_key` both resolve correctly
+/// even when a user sets them in PowerShell with unusual casing. On Unix the
+/// lookup is case-sensitive, matching the POSIX convention.
 pub fn resolve_field_source(
     sources: &SeparatedSources,
     field: &config_schema::FieldMeta,
