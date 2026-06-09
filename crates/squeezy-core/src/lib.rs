@@ -11277,6 +11277,7 @@ pub struct SettingsPermissionIssue {
 /// `'\''` close-reopen idiom so paths containing `'` (or any other
 /// metacharacter) round-trip correctly when piped to a future
 /// `squeezy doctor --apply` command.
+#[cfg(unix)]
 fn shell_quote_single(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('\'');
