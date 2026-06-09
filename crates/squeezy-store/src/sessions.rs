@@ -24,12 +24,6 @@ use squeezy_core::{
 };
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
-/// Monotonic counter that makes sibling temp file names unique within a
-/// process even when multiple session handles concurrently write the same
-/// target path. Combined with `std::process::id()` this eliminates temp-file
-/// collisions on Windows where `rename` fails when a temp is held open by
-/// another writer in the same process.
-static WRITE_UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
 /// Schema version stamped onto every `RolloutEvent` emitted by
 /// [`SessionStore::bundle_rollout_trace`]. The reducer is additive over
