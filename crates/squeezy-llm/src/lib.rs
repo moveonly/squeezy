@@ -80,8 +80,8 @@ pub use contribution::{
 };
 pub use credentials::{
     ApiKeyFuture, ApiKeySource, KeySource, RefreshableToken, ResolvedKey, StaticApiKey, TokenState,
-    delete_api_key, fallback_env_var, resolve_api_key, resolve_api_key_with_inline,
-    resolve_api_key_with_inline_optional, static_api_key_source,
+    delete_api_key, fallback_env_var, resolve_api_key, resolve_api_key_from_credentials_file,
+    resolve_api_key_with_inline, resolve_api_key_with_inline_optional, static_api_key_source,
 };
 pub use faux::{DEFAULT_FAUX_NAME, FauxProvider, FauxScript, FauxStep, FauxToolCall, FauxTurn};
 pub use google::GoogleProvider;
@@ -101,17 +101,18 @@ pub use oauth::{
     DEFAULT_POLICY_MODELS, DevicePollOutcome, GITHUB_COPILOT_AUTH_FILE_NAME,
     GitHubCopilotDeviceCodeResponse, GitHubCopilotLoginHooks, GitHubCopilotLoginOutcome,
     GitHubCopilotOAuthSource, GitHubCopilotProvider, GitHubCopilotUrls,
-    OPENAI_CODEX_AUTH_FILE_NAME, OpenAiCodexLoginOutcome, OpenAiCodexOAuthSource,
-    OpenAiCodexProvider, PersistedGitHubCopilotTokens, PersistedTokens, PkceCodes,
-    PolicyEnablementOutcome, TokenResponse,
-    anthropic_default_storage_path as oauth_anthropic_default_storage_path,
+    OPENAI_CODEX_AUTH_FILE_NAME, OPENAI_CODEX_INTERACTIVE_LOGIN_TIMEOUT_SECS,
+    OpenAiCodexLoginOutcome, OpenAiCodexOAuthSource, OpenAiCodexProvider,
+    PersistedGitHubCopilotTokens, PersistedTokens, PkceCodes, PolicyEnablementOutcome,
+    TokenResponse, anthropic_default_storage_path as oauth_anthropic_default_storage_path,
     anthropic_oauth_beta_header, anthropic_read_tokens as oauth_anthropic_read_tokens,
     anthropic_write_tokens as oauth_anthropic_write_tokens, codex_auth_file_path,
     default_codex_auth_path, default_github_copilot_auth_path, enable_copilot_models,
     exchange_authorization_code, generate_pkce, github_copilot_auth_file_path,
     github_copilot_base_url_from_token, github_copilot_read_tokens, github_copilot_write_tokens,
     is_anthropic_oauth_token, load_codex_token, login_github_copilot_interactive,
-    login_openai_codex_interactive, normalize_github_domain, parse_authorization_input,
+    login_openai_codex_interactive, login_openai_codex_manual,
+    login_openai_codex_with_auto_fallback, normalize_github_domain, parse_authorization_input,
     poll_for_github_token, refresh_anthropic_token, refresh_copilot_token,
     resolve_github_copilot_base_url, save_codex_token, start_github_copilot_device_flow,
 };

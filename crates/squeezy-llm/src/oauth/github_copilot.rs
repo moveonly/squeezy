@@ -328,6 +328,19 @@ pub fn write_tokens(path: &Path, tokens: &PersistedGitHubCopilotTokens) -> Resul
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "GitHub Copilot OAuth token saved without Windows ACL hardening; \
+                 the file's access permissions depend on your profile directory's default ACLs. \
+                 Restrict it manually if your profile directory is shared, synced, or \
+                 enterprise-managed."
+            );
+        }
+    }
     Ok(())
 }
 

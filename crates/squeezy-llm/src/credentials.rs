@@ -209,6 +209,20 @@ pub fn credentials_file_path() -> Option<PathBuf> {
     Some(home.join(".squeezy").join("credentials.json"))
 }
 
+/// Check whether `env_var` (or its fallback alias) is present in the
+/// credentials file. Returns the resolved value when found, `None`
+/// otherwise. Intended for `auth status` display — does **not** update
+/// any resolution chain or emit errors visible to the user; failures
+/// are silently mapped to `None`.
+///
+/// Calling this function has the same side-effects as the private
+/// `read_credentials_file_for`: it may emit a one-shot `tracing::warn!`
+/// when the file exists but has broad permissions on Unix, or on
+/// Windows to note that ACL inspection is unavailable.
+pub fn resolve_api_key_from_credentials_file(env_var: &str) -> Option<String> {
+    read_credentials_file_for(env_var)
+}
+
 /// Read the credentials file and return the value mapped to either
 /// `env_var` or its `fallback_env_var` translation. Missing file is
 /// silent; every other failure mode (bad mode bits, malformed JSON,
@@ -255,8 +269,20 @@ fn read_credentials_file(path: &Path) -> Option<HashMap<String, String>> {
                     return None;
                 }
             }
-            // Suppress unused warning on non-unix without splitting the
-            // function into two cfg-gated bodies.
+            #[cfg(windows)]
+            {
+                // Windows does not expose Unix mode bits. File access is
+                // governed by ACLs which we cannot inspect portably here.
+                // Log at debug level: the `[file-backed]` annotation in
+                // `auth status` already surfaces this information at the
+                // right layer without looking like an error.
+                tracing::debug!(
+                    "credentials file {} is being read on Windows; ACL inspection unavailable",
+                    path.display()
+                );
+            }
+            // Suppress unused warning on non-unix / non-windows without
+            // splitting the function into multiple cfg-gated bodies.
             let _ = meta;
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,

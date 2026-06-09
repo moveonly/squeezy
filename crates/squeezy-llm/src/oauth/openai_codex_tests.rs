@@ -255,6 +255,30 @@ async fn wait_for_callback_code_times_out_when_no_browser_connects() {
         msg.contains("squeezy auth openai-codex login"),
         "timeout recovery hint should use the real CLI subcommand; got: {msg}"
     );
+    assert!(
+        msg.contains("--manual"),
+        "timeout recovery hint should mention manual fallback; got: {msg}"
+    );
+}
+
+#[test]
+fn save_codex_token_replaces_existing_file() {
+    let path = tmp_path("replace-existing");
+    std::fs::write(&path, "stale-token").expect("seed existing file");
+    let token = OpenAiCodexTokenSet {
+        access_token: make_jwt_with_account("acct_replace"),
+        refresh_token: "refresh-replace".to_string(),
+        expires_at_unix_ms: 1_700_000_000_000,
+        account_id: "acct_replace".to_string(),
+    };
+
+    save_codex_token(&path, &token).expect("save replacement");
+
+    let loaded = load_codex_token(&path)
+        .expect("load replacement")
+        .expect("present");
+    assert_eq!(loaded.account_id, "acct_replace");
+    assert_eq!(loaded.refresh_token, "refresh-replace");
 }
 
 // ─── refresh + ApiKeySource interactions ───────────────────────────────────

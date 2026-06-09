@@ -76,12 +76,14 @@ pub const OPENAI_CODEX_AUTH_FILE_NAME: &str = "openai-codex.json";
 /// keeps the next provider request from racing the expiry.
 const REFRESH_LEEWAY: Duration = Duration::from_secs(60);
 
-/// How long to wait for the OAuth browser callback before giving up.
-/// Five minutes is generous enough for a user who needs to log in on
-/// another machine or navigate a consent screen, while still preventing
-/// the local TCP listener from holding a Linux TTY session open
-/// indefinitely when the browser flow was abandoned.
-const CODEX_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long the interactive login waits for the browser to complete the
+/// OAuth callback before giving up. On Windows the firewall or browser
+/// isolation may block the localhost callback indefinitely; a bounded
+/// wait lets the error path surface a helpful message instead of
+/// hanging the terminal.
+pub const OPENAI_CODEX_INTERACTIVE_LOGIN_TIMEOUT_SECS: u64 = 300;
+const INTERACTIVE_LOGIN_TIMEOUT: Duration =
+    Duration::from_secs(OPENAI_CODEX_INTERACTIVE_LOGIN_TIMEOUT_SECS);
 
 /// Number of random bytes the PKCE verifier and OAuth state nonce
 /// consume. RFC 7636 §4.1 recommends 32 bytes for the verifier so the
@@ -239,14 +241,48 @@ pub fn save_codex_token(path: &Path, token: &OpenAiCodexTokenSet) -> Result<()> 
             ))
         })?;
     }
-    std::fs::rename(&tmp, path).map_err(|err| {
+    replace_codex_token_file(&tmp, path).map_err(|err| {
         SqueezyError::Config(format!(
             "could not rename {} to codex auth file {}: {err}",
             tmp.display(),
             path.display()
         ))
     })?;
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "OpenAI Codex OAuth token saved without Windows ACL hardening; \
+                 the file's access permissions depend on your profile directory's default ACLs. \
+                 Restrict it manually if your profile directory is shared, synced, or \
+                 enterprise-managed."
+            );
+        }
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+fn replace_codex_token_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    match std::fs::rename(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists || path.exists() => {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(remove_err) => return Err(remove_err),
+            }
+            std::fs::rename(tmp, path)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_codex_token_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(tmp, path)
 }
 
 // ─── PKCE + base64url helpers ──────────────────────────────────────────────
@@ -640,6 +676,168 @@ where
     })
 }
 
+/// Drive the manual (stdin-paste) OAuth authorization-code flow.
+///
+/// Equivalent to Anthropic's paste flow — useful on Windows desktops
+/// where firewall rules, browser isolation, or enterprise endpoint
+/// software blocks the localhost callback that
+/// [`login_openai_codex_interactive`] relies on.
+///
+/// 1. Generate PKCE + state.
+/// 2. Call `on_open_url` with the authorize URL.
+/// 3. Call `read_input` to get the user-pasted redirect URL or bare code.
+/// 4. Parse the code + optional state from the input; validate state.
+/// 5. Exchange the code against the token endpoint.
+/// 6. Persist the token set to `auth_path`.
+pub async fn login_openai_codex_manual<F, R>(
+    originator: &str,
+    auth_path: &Path,
+    on_open_url: F,
+    read_input: R,
+) -> Result<OpenAiCodexLoginOutcome>
+where
+    F: FnOnce(&str) -> Result<()>,
+    R: FnOnce() -> Result<String>,
+{
+    let pair = generate_pkce()?;
+    let state = generate_state()?;
+    let authorize_url = build_authorize_url(&pair.challenge, &state, originator);
+    on_open_url(&authorize_url)?;
+    let raw = read_input()?;
+    let code = extract_code_from_paste(&raw, &state)?;
+    let client = shared_client(&ProviderTransportConfig::default());
+    let token = exchange_authorization_code(
+        &client,
+        OPENAI_CODEX_TOKEN_URL,
+        &code,
+        &pair.verifier,
+        OPENAI_CODEX_REDIRECT_URI,
+    )
+    .await?;
+    save_codex_token(auth_path, &token)?;
+    Ok(OpenAiCodexLoginOutcome {
+        account_id: token.account_id.clone(),
+        expires_at_unix_ms: token.expires_at_unix_ms,
+        auth_file: auth_path.to_path_buf(),
+    })
+}
+
+/// Drive the interactive OAuth flow with automatic in-session fallback to
+/// the paste flow.
+///
+/// Compared to [`login_openai_codex_interactive`] + [`login_openai_codex_manual`]:
+///
+/// * Generates the PKCE pair and authorize URL **once** so the URL
+///   the user opens is valid for both the automatic callback path and
+///   the paste fallback.
+/// * Falls back automatically — without requiring a new invocation —
+///   when binding the localhost callback port fails or when the
+///   [`INTERACTIVE_LOGIN_TIMEOUT`] elapses before the callback arrives.
+///
+/// Callbacks:
+/// * `on_open_url(url)` — called after the callback listener is bound;
+///   typical callers print it and optionally launch a browser.
+/// * `on_fallback(reason)` — called when the fallback is triggered;
+///   `reason` is a short human-readable string ("port bind failed" or
+///   "callback timed out"). The caller should print the URL and prompt
+///   for the pasted redirect URL or code.
+/// * `read_manual_input()` — reads the pasted redirect URL or bare code
+///   from stdin (or any other source the caller controls).
+pub async fn login_openai_codex_with_auto_fallback<F, G, R>(
+    originator: &str,
+    auth_path: &Path,
+    on_open_url: F,
+    on_fallback: G,
+    read_manual_input: R,
+) -> Result<OpenAiCodexLoginOutcome>
+where
+    F: FnOnce(&str) -> Result<()>,
+    G: FnOnce(&str, &str),
+    R: FnOnce() -> Result<String>,
+{
+    let pair = generate_pkce()?;
+    let state = generate_state()?;
+    let authorize_url = build_authorize_url(&pair.challenge, &state, originator);
+
+    let code = match tokio::net::TcpListener::bind((
+        OPENAI_CODEX_CALLBACK_HOST,
+        OPENAI_CODEX_CALLBACK_PORT,
+    ))
+    .await
+    {
+        Err(_) => {
+            on_fallback(&authorize_url, "port bind failed");
+            let raw = read_manual_input()?;
+            extract_code_from_paste(&raw, &state)?
+        }
+        Ok(listener) => {
+            // Own the localhost callback port before opening the browser so a
+            // competing process cannot receive the authorization code first.
+            on_open_url(&authorize_url)?;
+            let cancel = CancellationToken::new();
+            match wait_for_callback_code_with_timeout(
+                listener,
+                &state,
+                &cancel,
+                INTERACTIVE_LOGIN_TIMEOUT,
+            )
+            .await
+            {
+                Ok(code) => code,
+                Err(err) if err.to_string().contains("timed out") => {
+                    on_fallback(&authorize_url, "callback timed out");
+                    let raw = read_manual_input()?;
+                    extract_code_from_paste(&raw, &state)?
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    };
+
+    let client = shared_client(&ProviderTransportConfig::default());
+    let token = exchange_authorization_code(
+        &client,
+        OPENAI_CODEX_TOKEN_URL,
+        &code,
+        &pair.verifier,
+        OPENAI_CODEX_REDIRECT_URI,
+    )
+    .await?;
+    save_codex_token(auth_path, &token)?;
+    Ok(OpenAiCodexLoginOutcome {
+        account_id: token.account_id.clone(),
+        expires_at_unix_ms: token.expires_at_unix_ms,
+        auth_file: auth_path.to_path_buf(),
+    })
+}
+
+/// Parse a code from user-pasted input (a full redirect URL, bare code,
+/// `code#state` pair, or query-string fragment). Validates the state
+/// parameter if present. Helper used by both `login_openai_codex_manual`
+/// and `login_openai_codex_with_auto_fallback`.
+fn extract_code_from_paste(raw: &str, expected_state: &str) -> Result<String> {
+    let parsed = crate::oauth::anthropic::parse_authorization_input(raw);
+    let code = parsed.code.ok_or_else(|| {
+        SqueezyError::ProviderNotConfigured(
+            "no `code` parameter found in the pasted input; paste either the full \
+             callback URL (http://localhost:1455/auth/callback?code=...&state=...), \
+             the bare authorization code, or a `code#state` pair"
+                .to_string(),
+        )
+    })?;
+    if let Some(pasted_state) = parsed.state
+        && pasted_state != expected_state
+    {
+        return Err(SqueezyError::ProviderNotConfigured(
+            "OAuth state mismatch: the pasted `state` did not match the value squeezy \
+             generated for this session. Re-run `squeezy auth openai-codex login` \
+             from scratch."
+                .to_string(),
+        ));
+    }
+    Ok(code)
+}
+
 /// Accept exactly one HTTP request on `listener`, verify the OAuth
 /// state and extract the `code` query parameter. Closes the socket
 /// after a one-shot HTML response so the browser tab can be safely
@@ -655,7 +853,7 @@ async fn wait_for_callback_code(
     expected_state: &str,
     cancel: &CancellationToken,
 ) -> Result<String> {
-    wait_for_callback_code_with_timeout(listener, expected_state, cancel, CODEX_CALLBACK_TIMEOUT)
+    wait_for_callback_code_with_timeout(listener, expected_state, cancel, INTERACTIVE_LOGIN_TIMEOUT)
         .await
 }
 
@@ -672,7 +870,8 @@ pub(crate) async fn wait_for_callback_code_with_timeout(
         result = timeout(deadline, wait_for_callback_code_inner(listener, expected_state)) => {
             result.map_err(|_| SqueezyError::ProviderNotConfigured(format!(
                 "OpenAI Codex OAuth callback timed out after {} seconds; \
-                 re-run `squeezy auth openai-codex login` to start a new session",
+                 re-run `squeezy auth openai-codex login` to start a new session, \
+                 or add `--manual` to use the paste flow",
                 deadline.as_secs()
             )))?
         }
@@ -714,19 +913,24 @@ async fn wait_for_callback_code_inner(
         let mut parts = request_line.split_whitespace();
         let _method = parts.next();
         let target = parts.next().unwrap_or("");
-        // Restrict to the known callback path; everything else gets
-        // a 404 so a stray health-checker poll doesn't terminate the
-        // login flow.
-        let Some(query) = target.split_once('?').map(|(_, q)| q) else {
-            send_callback_response(&mut socket, 404, "Not Found", "Callback route not found.")
-                .await;
-            continue;
-        };
+        // Restrict to the known callback path before doing anything with
+        // the query string; a stray health-checker or browser pre-fetch
+        // to an unrelated path should not consume the listener.
         if !target.starts_with("/auth/callback") {
             send_callback_response(&mut socket, 404, "Not Found", "Callback route not found.")
                 .await;
             continue;
         }
+        let Some(query) = target.split_once('?').map(|(_, q)| q) else {
+            send_callback_response(
+                &mut socket,
+                400,
+                "Bad Request",
+                "Missing authorization code.",
+            )
+            .await;
+            continue;
+        };
 
         let params = parse_query(query);
         let state = params.get("state").map(String::as_str).unwrap_or_default();

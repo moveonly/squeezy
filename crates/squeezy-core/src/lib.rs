@@ -3874,6 +3874,20 @@ pub struct ProviderSettings {
     pub request_max_retries: Option<u8>,
     pub stream_max_retries: Option<u8>,
     pub stream_idle_timeout_ms: Option<u64>,
+    /// Idle timeout (ms) for TCP connections kept in the shared HTTP pool
+    /// for this provider. Overrides the global
+    /// [`ProviderTransportConfig::pool_idle_timeout_ms`] default. Useful
+    /// on Windows VPN/proxy environments where middleboxes silently reset
+    /// idle connections: lower values (e.g. `15000`) reduce the chance of
+    /// a stale socket being handed to the next request.
+    pub pool_idle_timeout_ms: Option<u64>,
+    /// Maximum number of idle TCP connections kept per origin for this
+    /// provider. Overrides the global
+    /// [`ProviderTransportConfig::pool_max_idle_per_host`] default.
+    pub pool_max_idle_per_host: Option<u32>,
+    /// Upper bound (ms) on inter-retry sleep for this provider. Overrides
+    /// the global [`ProviderTransportConfig::max_retry_delay_ms`] default.
+    pub max_retry_delay_ms: Option<u64>,
     /// `[providers.<section>.headers]` carries `extra_headers` that
     /// reach the upstream verbatim. The Custom-preset workaround for
     /// non-Bearer auth (LiteLLM `x-litellm-key`, PortKey
@@ -3974,6 +3988,9 @@ impl ProviderSettings {
                 "request_max_retries",
                 "stream_max_retries",
                 "stream_idle_timeout_ms",
+                "pool_idle_timeout_ms",
+                "pool_max_idle_per_host",
+                "max_retry_delay_ms",
                 "headers",
                 "request_metadata",
                 "deployment_name_map",
@@ -4199,6 +4216,33 @@ impl ProviderSettings {
                 source,
                 &field(path, "stream_idle_timeout_ms"),
             )?,
+            pool_idle_timeout_ms: u64_nonnegative_value(
+                table,
+                "pool_idle_timeout_ms",
+                source,
+                &field(path, "pool_idle_timeout_ms"),
+            )?,
+            pool_max_idle_per_host: match u64_nonnegative_value(
+                table,
+                "pool_max_idle_per_host",
+                source,
+                &field(path, "pool_max_idle_per_host"),
+            )? {
+                None => None,
+                Some(v) if v <= u32::MAX as u64 => Some(v as u32),
+                Some(v) => {
+                    return Err(SqueezyError::Config(format!(
+                        "{source}: {}: expected an integer fitting in u32 (got {v})",
+                        field(path, "pool_max_idle_per_host"),
+                    )));
+                }
+            },
+            max_retry_delay_ms: u64_nonnegative_value(
+                table,
+                "max_retry_delay_ms",
+                source,
+                &field(path, "max_retry_delay_ms"),
+            )?,
             headers,
             request_metadata: None,
             deployment_name_map,
@@ -4261,6 +4305,12 @@ impl ProviderSettings {
             &mut self.stream_idle_timeout_ms,
             next.stream_idle_timeout_ms,
         );
+        replace_if_some(&mut self.pool_idle_timeout_ms, next.pool_idle_timeout_ms);
+        replace_if_some(
+            &mut self.pool_max_idle_per_host,
+            next.pool_max_idle_per_host,
+        );
+        replace_if_some(&mut self.max_retry_delay_ms, next.max_retry_delay_ms);
         replace_if_some(&mut self.headers, next.headers);
         replace_if_some(&mut self.route_style, next.route_style);
         replace_if_some(&mut self.script, next.script);
@@ -11207,6 +11257,8 @@ fn provider_u64_setting_any(
         let settings = providers.get(*provider)?;
         let value = match key {
             "stream_idle_timeout_ms" => settings.stream_idle_timeout_ms,
+            "pool_idle_timeout_ms" => settings.pool_idle_timeout_ms,
+            "max_retry_delay_ms" => settings.max_retry_delay_ms,
             _ => None,
         }?;
         Some(value.to_string())
@@ -11230,6 +11282,15 @@ fn provider_transport_settings(
         }
         if let Some(value) = settings.stream_idle_timeout_ms {
             transport.stream_idle_timeout_ms = value;
+        }
+        if let Some(value) = settings.pool_idle_timeout_ms {
+            transport.pool_idle_timeout_ms = value;
+        }
+        if let Some(value) = settings.pool_max_idle_per_host {
+            transport.pool_max_idle_per_host = value;
+        }
+        if let Some(value) = settings.max_retry_delay_ms {
+            transport.max_retry_delay_ms = value;
         }
     }
     transport
