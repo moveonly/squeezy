@@ -192,6 +192,15 @@ const MESSAGE_MARKER_GLYPHS: [char; 9] = ['☽', '☾', '◐', '◑', '◔', '�
 /// the rail painted. This is the strip the historical [`copy_range`] TODO
 /// deferred; the copy formatters in [`crate::copy`] apply it per line.
 pub(crate) fn strip_gutter(line: &str) -> &str {
+    // A focused entry's header carries a leading selection caret (`">  "` for
+    // messages, `"> "` for reasoning/slash echoes — see `assistant_line` /
+    // `reasoning_block_lines`). That caret is selection chrome, not content, so
+    // a copy/selection must yield the same text whether or not the entry happens
+    // to be focused when it is grabbed. Drop it first, before the rail/marker
+    // strip. Safe because content rows in this surface never begin with `"> "`
+    // at column 0 — body text hangs under a whitespace indent and Markdown
+    // blockquotes are rendered on indented continuation rows, not at column 0.
+    let line = strip_focus_caret(line);
     let prefix = crate::rail_prefix_width(line);
     // `rail_prefix_width` counts *chars*; advance by that many char boundaries.
     let after_gutter = match line.char_indices().nth(prefix) {
@@ -200,6 +209,28 @@ pub(crate) fn strip_gutter(line: &str) -> &str {
         None => "",
     };
     strip_message_marker(after_gutter)
+}
+
+/// Drop a leading focus/selection caret (`>` plus its trailing space run) when a
+/// line opens on one. The renderer paints `">  "` (message header) or `"> "`
+/// (reasoning / slash echo) at column 0 of the *focused* entry's header; this
+/// removes exactly that so the cleaned text is focus-invariant. A no-op when the
+/// line does not open on `">"` immediately followed by a space.
+fn strip_focus_caret(line: &str) -> &str {
+    let mut chars = line.char_indices();
+    let Some((_, '>')) = chars.next() else {
+        return line;
+    };
+    // Require at least one space after the caret so a stray `>` that begins real
+    // content (no following space) is never eaten.
+    match chars.next() {
+        Some((_, ' ')) => {}
+        _ => return line,
+    }
+    // Skip the caret and every space that follows it (the marker pads to a fixed
+    // 3-cell gutter column).
+    let rest = &line[1..];
+    rest.trim_start_matches(' ')
 }
 
 /// Drop a leading message-prompt marker glyph and its single following space

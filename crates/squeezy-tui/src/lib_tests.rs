@@ -1573,7 +1573,8 @@ async fn left_click_on_indicator_rect_toggles_queue_overlay() {
             width: 80,
             height: 1,
         },
-        ClickAction::ToggleQueueOverlay,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::QueueStrip),
+        interaction::Action::ToggleQueueOverlay,
     );
     handle_mouse(
         &mut app,
@@ -1616,7 +1617,8 @@ async fn topmost_overlapping_click_target_wins() {
             width: 80,
             height: 1,
         },
-        ClickAction::ToggleQueueOverlay,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::QueueStrip),
+        interaction::Action::ToggleQueueOverlay,
     );
     app.register_click(
         Rect {
@@ -1625,13 +1627,27 @@ async fn topmost_overlapping_click_target_wins() {
             width: 10,
             height: 1,
         },
-        ClickAction::ToggleQueueOverlay,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::JumpToLatest),
+        interaction::Action::JumpToLatest,
     );
+    // The later-registered (topmost) target wins where the two overlap.
     let hit = app.click_target_at(7, 4);
-    assert_eq!(hit, Some(ClickAction::ToggleQueueOverlay));
+    assert_eq!(
+        hit,
+        Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::JumpToLatest),
+            interaction::Action::JumpToLatest,
+        )),
+    );
     // Sanity: a coord only inside the FIRST rect still hits the first.
     let outside_overlap = app.click_target_at(50, 4);
-    assert_eq!(outside_overlap, Some(ClickAction::ToggleQueueOverlay));
+    assert_eq!(
+        outside_overlap,
+        Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::QueueStrip),
+            interaction::Action::ToggleQueueOverlay,
+        )),
+    );
 }
 
 #[tokio::test]
@@ -1644,7 +1660,8 @@ async fn begin_frame_clickables_clears_registry() {
             width: 10,
             height: 1,
         },
-        ClickAction::ToggleQueueOverlay,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::QueueStrip),
+        interaction::Action::ToggleQueueOverlay,
     );
     assert!(app.click_target_at(5, 0).is_some());
     app.begin_frame_clickables();
@@ -1756,7 +1773,8 @@ async fn transcript_overlay_mouse_is_modal() {
             width: 80,
             height: 1,
         },
-        ClickAction::ToggleQueueOverlay,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::QueueStrip),
+        interaction::Action::ToggleQueueOverlay,
     );
 
     handle_mouse(
@@ -1785,7 +1803,8 @@ async fn left_click_outside_indicator_does_not_open_overlay() {
             width: 80,
             height: 1,
         },
-        ClickAction::ToggleQueueOverlay,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::QueueStrip),
+        interaction::Action::ToggleQueueOverlay,
     );
     handle_mouse(
         &mut app,
@@ -5798,6 +5817,74 @@ fn tool_result_entries_collapse_by_default_and_carry_overlay_hint() {
     let expanded = render_to_string(&app, 100, 40);
     assert!(expanded.contains("match-15"), "{expanded}");
     assert!(!expanded.contains("receipt output="), "{expanded}");
+}
+
+#[test]
+fn stale_tool_filter_index_falls_back_to_all_after_transcript_shrinks() {
+    // The overlay's `Tool(i)` filter indexes into the live distinct-tool-name
+    // list, recomputed every render. If the transcript mutates while the
+    // overlay stays open and the indexed tool disappears, `i` falls out of
+    // range; without the render-time clamp `entry_matches_overlay_filter`
+    // rejects *every* entry and the overlay renders blank with no recovery but
+    // the `f` key. `overlay_filter` must clamp the stale index back to `All`.
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    app.push_tool_result(sample_tool_result("read", "file contents"));
+
+    // Two distinct tools, so `Tool(1)` ("read") is in range to begin with.
+    let names = distinct_overlay_tool_names(active_transcript_entries(&app));
+    assert_eq!(names, vec!["grep".to_string(), "read".to_string()]);
+
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        filter: OverlayFilter::Tool(1),
+        ..TranscriptOverlayState::default()
+    });
+    assert_eq!(
+        overlay_filter(&app),
+        OverlayFilter::Tool(1),
+        "in-range index passes through untouched"
+    );
+
+    // Drop the "read" tool entry — the distinct-name list shrinks to ["grep"],
+    // so the stored `Tool(1)` is now out of range.
+    app.transcript.retain(|entry| {
+        !matches!(&entry.kind, TranscriptEntryKind::ToolResult(tool)
+            if tool.result.tool_name == "read")
+    });
+    let shrunk = distinct_overlay_tool_names(active_transcript_entries(&app));
+    assert_eq!(shrunk, vec!["grep".to_string()], "list shrank to one tool");
+
+    // The render choke point clamps the now-stale index to `All` so the view
+    // stays populated.
+    assert_eq!(
+        overlay_filter(&app),
+        OverlayFilter::All,
+        "out-of-range Tool(i) clamps to All at render time"
+    );
+
+    // And the surviving entry survives the clamped filter, proving the overlay
+    // is no longer empty.
+    let entries = active_transcript_entries(&app);
+    let turn_start = current_turn_start(entries);
+    assert!(
+        (0..entries.len()).any(|i| entry_matches_overlay_filter(
+            entries,
+            i,
+            overlay_filter(&app),
+            app.coalesce_tool_runs,
+            &shrunk,
+            turn_start,
+        )),
+        "at least one entry must match the clamped filter (overlay not blank)"
+    );
+
+    // The title suffix routes through `overlay_filter` too, so it agrees with
+    // the (now `All`) body — no stray `· filter: tool (f)` chrome.
+    let rendered = render_to_string(&app, 100, 24);
+    assert!(
+        !rendered.contains("filter:"),
+        "title must not advertise a filter after the clamp: {rendered}"
+    );
 }
 
 #[test]

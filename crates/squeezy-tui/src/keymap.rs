@@ -101,8 +101,13 @@ pub(crate) enum Action {
     /// (`Ctrl+Down` default).
     FocusNextEntry,
     /// Toggle the collapsed state of the focused transcript entry in the
-    /// main inline view (`Ctrl+Space` default).
+    /// main inline view (`Ctrl+O` default). Paired with the mouse caret click,
+    /// which dispatches the same fold toggle.
     ToggleFocusedFold,
+    /// Open the focused transcript entry in the Ctrl+T detail overlay
+    /// (`Ctrl+Enter` default). Paired with the mouse "open in detail"
+    /// affordance; both drive `open_focused_entry_in_detail`.
+    OpenFocusedInDetail,
 }
 
 impl Action {
@@ -135,6 +140,7 @@ impl Action {
             Self::FocusPrevEntry => "focus_prev_entry",
             Self::FocusNextEntry => "focus_next_entry",
             Self::ToggleFocusedFold => "toggle_focused_fold",
+            Self::OpenFocusedInDetail => "open_focused_in_detail",
         }
     }
 
@@ -166,6 +172,7 @@ impl Action {
         Action::FocusPrevEntry,
         Action::FocusNextEntry,
         Action::ToggleFocusedFold,
+        Action::OpenFocusedInDetail,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -215,11 +222,14 @@ impl Action {
             Self::JumpPrevError => KeyBinding::new(KeyCode::Char('['), KeyModifiers::ALT),
             Self::JumpNextError => KeyBinding::new(KeyCode::Char(']'), KeyModifiers::ALT),
             // Per-entry fold cursor. `Alt`+arrow is already the user/assistant
-            // jump nav, so the fold cursor uses `Ctrl`+arrow; `Ctrl+Space`
-            // toggles the focused entry's fold (a free chord in the composer).
+            // jump nav, so the fold cursor uses `Ctrl`+arrow. `Ctrl+O` toggles
+            // the focused entry's fold — the keyboard twin of the mouse caret
+            // click — and `Ctrl+Enter` opens the focused entry in the Ctrl+T
+            // detail overlay (both free chords in the composer).
             Self::FocusPrevEntry => KeyBinding::new(KeyCode::Up, KeyModifiers::CONTROL),
             Self::FocusNextEntry => KeyBinding::new(KeyCode::Down, KeyModifiers::CONTROL),
-            Self::ToggleFocusedFold => KeyBinding::new(KeyCode::Char(' '), KeyModifiers::CONTROL),
+            Self::ToggleFocusedFold => KeyBinding::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            Self::OpenFocusedInDetail => KeyBinding::new(KeyCode::Enter, KeyModifiers::CONTROL),
         }
     }
 }

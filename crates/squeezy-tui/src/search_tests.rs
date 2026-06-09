@@ -223,7 +223,7 @@ fn rebuild_sets_current_to_zero_from_empty() {
     let mut s = SearchState::open(SelectionSurface::Main, 80);
     s.query = "foo".to_string();
     let r = rows(&["foo", "bar foo"]);
-    rebuild(&mut s, &r, &[]);
+    rebuild(&mut s, &r, &[], 80);
     assert_eq!(s.matches, vec![m(0, 0..3), m(1, 4..7)]);
     assert_eq!(s.current, Some(0));
 }
@@ -236,7 +236,7 @@ fn rebuild_preserves_nearest_match() {
     let mut s = state("foo", find(&r, &[], "foo", true, true), Some(1));
     assert_eq!(s.current, Some(1));
     // Query unchanged but rebuilt: stays anchored at the same (row, col).
-    rebuild(&mut s, &r, &[]);
+    rebuild(&mut s, &r, &[], 80);
     assert_eq!(
         current_match(&s),
         Some(&m(1, 0..3)),
@@ -249,7 +249,7 @@ fn rebuild_clears_current_when_no_matches() {
     let r = rows(&["alpha", "beta"]);
     let mut s = state("alpha", find(&r, &[], "alpha", true, true), Some(0));
     s.query = "zzz".to_string();
-    rebuild(&mut s, &r, &[]);
+    rebuild(&mut s, &r, &[], 80);
     assert!(s.matches.is_empty());
     assert_eq!(s.current, None);
 }
@@ -262,8 +262,41 @@ fn rebuild_anchors_forward_when_previous_match_disappears() {
     let mut s = state("hit", find(&r, &[], "hit", true, true), Some(2));
     // Narrow the query so only rows 0 and 1 still match.
     s.query = "hit t".to_string();
-    rebuild(&mut s, &r, &[]);
+    rebuild(&mut s, &r, &[], 80);
     assert_eq!(s.matches, vec![m(1, 0..5)]);
+    assert_eq!(s.current, Some(0));
+}
+
+#[test]
+fn rebuild_reanchors_matches_after_width_change() {
+    // Models a resize while search is open: the same logical text reflows to a
+    // different set of painted rows at the new width, and `rebuild` must produce
+    // (row,col) positions against the *new* rows — never keep the stale ones —
+    // and record the new width on the state so it is no longer write-only.
+    //
+    // Narrow width: "needle" wraps onto its own row (row 1).
+    let narrow = rows(&["alpha beta", "needle here"]);
+    let mut s = SearchState::open(SelectionSurface::Main, 12);
+    s.query = "needle".to_string();
+    rebuild(&mut s, &narrow, &[], 12);
+    assert_eq!(
+        s.matches,
+        vec![m(1, 0..6)],
+        "match found on the wrapped row"
+    );
+    assert_eq!(s.width, 12, "width recorded at narrow rebuild");
+
+    // Wider width: the text reflows so "needle" now sits on row 0 at a new col.
+    // A stale match set would still claim (row 1, 0..6); the rebuild must drop
+    // it and re-anchor to the reflowed geometry.
+    let wide = rows(&["alpha beta needle here"]);
+    rebuild(&mut s, &wide, &[], 24);
+    assert_eq!(
+        s.matches,
+        vec![m(0, 11..17)],
+        "matches re-anchor to the reflowed rows, no stale (row,col)"
+    );
+    assert_eq!(s.width, 24, "width updated to the new painted width");
     assert_eq!(s.current, Some(0));
 }
 

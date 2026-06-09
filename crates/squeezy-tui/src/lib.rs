@@ -78,6 +78,7 @@ mod events;
 mod fuzzy;
 mod history;
 mod input;
+mod interaction;
 mod keymap;
 mod keymap_config;
 mod mcp_settings_edit;
@@ -1773,6 +1774,7 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
         Ok(transcript) => {
             app.transcript.clear();
             app.selected_entry = None;
+            app.focus.clear();
             app.next_entry_id = 0;
             app.clear_turn_divider();
             for item in transcript {
@@ -2050,6 +2052,17 @@ async fn handle_input_event(
             // and let the new geometry govern the painted position.
             cancel_main_scroll_anim(app);
             reanchor_active_scroll_on_resize(app);
+            // Search match (row,col) positions were taken at the old painted
+            // width; after a reflow they index the wrong cells. Re-run the find
+            // pass at the new width so highlights re-anchor. No-op when search
+            // is closed (`refresh_search` early-returns on `app.search == None`).
+            // Note: for the Overlay surface, `scroll_search_match_into_view`
+            // reads the `main_text_area_cache` width, which may still hold the
+            // pre-resize value for this one frame — that only affects
+            // scroll-into-view targeting (it self-corrects next frame), never
+            // highlight correctness, which re-derives width from the freshly
+            // wrapped surface rows.
+            refresh_search(app);
             Ok(false)
         }
         // Crossterm only emits these after `EnableFocusChange` succeeded
@@ -2080,15 +2093,24 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         return changed;
     }
 
-    // Left-click is dispatched via the per-frame click registry so any
-    // render path can add new buttons by pushing a `Clickable` — no
-    // edits to this fn are needed when new buttons land. The footer's click
-    // rects are registered footer-relative (origin 0), so translate the
-    // absolute mouse row by the footer's screen origin; clicks above the
-    // footer land in committed scrollback and have no clickable target.
+    // Footer chrome (the prompt-queue strip, jump-to-latest) is dispatched via
+    // the per-frame click registry so a new footer button needs no edit here.
+    // In the inline renderer the footer's click rects are registered
+    // footer-relative (origin 0), so the absolute mouse row is translated by the
+    // footer's screen origin; clicks above the footer land in committed
+    // scrollback and have no chrome target.
+    //
+    // Entry / RowSpan targets are NOT dispatched here: `render_transcript`
+    // registers them in absolute screen coordinates, so the footer-relative
+    // translation does not apply to them, and they carry gesture semantics
+    // (focus-then-select fall-through, double/triple-click → selection) that the
+    // dedicated card block below owns. Restricting this block to `Chrome` keys
+    // keeps the two coordinate spaces from colliding when `footer_origin` is 0.
     if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
         && mouse.row >= app.footer_origin
-        && let Some(action) = app.click_target_at(mouse.column, mouse.row - app.footer_origin)
+        && let Some((key, action)) =
+            app.click_target_at(mouse.column, mouse.row - app.footer_origin)
+        && matches!(key, interaction::TargetKey::Chrome(_))
     {
         dispatch_click_action(app, action);
         return true;
@@ -2109,6 +2131,42 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         let before = active_transcript_scroll(app);
         active_transcript_scroll_mut(app).set_from_bottom(from_bottom, line_count, viewport_h);
         return active_transcript_scroll(app) != before;
+    }
+
+    // Main-view transcript-card affordances: a caret click toggles the entry's
+    // fold, a header click focuses it, a double-click on the caret expands a
+    // collapsed card. Hit-tested in ABSOLUTE screen coordinates (the main text
+    // area is not footer-relative) against the entry targets `render_transcript`
+    // registered this frame, then run through the gesture recognizer so
+    // multi-click synthesis (keyed on the target key, not the screen cell) is
+    // shared with the rest of the substrate. Only fires on a Down event that
+    // actually lands on an entry target.
+    //
+    // Crucially, a header click is *non-consuming*: it focuses the entry and
+    // then falls through to the selection path below so the SAME press still
+    // arms a selection. That keeps the established main-transcript selection
+    // contract intact — a drag from a header range-selects, a double/triple
+    // click word/row-selects, and a bare click leaves no selection — while a
+    // simple header click also focuses. Only the caret (a non-text zone) fully
+    // swallows the click.
+    if app.transcript_overlay.is_none()
+        && app.config_screen.is_none()
+        && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((key, action)) = app.click_target_at(mouse.column, mouse.row)
+        && matches!(
+            key,
+            interaction::TargetKey::Entry(_) | interaction::TargetKey::RowSpan(_, _)
+        )
+    {
+        let now = std::time::Instant::now();
+        let gesture = app
+            .gestures
+            .recognize(interaction::Phase::Press, Some((key, action)), now);
+        match dispatch_card_gesture(app, gesture) {
+            CardPress::Consumed => return true,
+            // Focused the header entry but let the selection path arm too.
+            CardPress::FocusedThenFallThrough | CardPress::Ignored => {}
+        }
     }
 
     // Visual selection over the MAIN transcript text area. Only outside the
@@ -4145,7 +4203,9 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             }
             // Fold the focused inline entry. The overlay guard above already
             // blocks this while Ctrl+T is open (folding is a main-view action;
-            // the overlay has its own expand-all/collapse-all keys).
+            // the overlay has its own expand-all/collapse-all keys). This is
+            // the keyboard twin of the mouse caret click: both reach
+            // `toggle_transcript_entry_fold`.
             if let Some(index) = app.selected_entry {
                 if toggle_transcript_entry_fold(app, index) {
                     let collapsed = app.transcript[index].collapsed;
@@ -4158,6 +4218,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             } else {
                 app.status = "no focused entry — Ctrl+↑/↓ to focus one".to_string();
             }
+            true
+        }
+        keymap::Action::OpenFocusedInDetail => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            // Open the focused entry in the Ctrl+T detail overlay — the
+            // keyboard twin of the mouse "open in detail" affordance; both
+            // reach `open_focused_entry_in_detail`.
+            open_focused_entry_in_detail(app);
             true
         }
     }
@@ -4385,13 +4455,170 @@ fn toggle_prompt_queue_overlay(app: &mut TuiApp) {
     };
 }
 
-/// Dispatch a click on a registered `Clickable`. Single source of truth
-/// for what each `ClickAction` variant does. Adding a new button means
-/// adding a variant to `ClickAction` and one arm here.
-fn dispatch_click_action(app: &mut TuiApp, action: ClickAction) {
+/// The transcript's entry ids in render order. The focus model resolves a
+/// stable [`transcript_surface::EntryId`] back to a live index against this,
+/// the same id-keyed pattern `assistant_entry_ids` / the row builder use.
+fn transcript_entry_ids(app: &TuiApp) -> Vec<u64> {
+    app.transcript.iter().map(|e| e.id).collect()
+}
+
+/// Resolve a focused/clicked `EntryId` back to its live transcript index, or
+/// `None` when the entry no longer exists (pruned/coalesced). Keeps every
+/// index-taking callee (`toggle_transcript_entry_fold`, the render highlight)
+/// working unchanged while dispatch addresses the stable id.
+fn entry_index_for_id(app: &TuiApp, id: transcript_surface::EntryId) -> Option<usize> {
+    let transcript_surface::EntryId(want) = id;
+    app.transcript.iter().position(|e| e.id == want)
+}
+
+/// Dispatch a click on a registered target. Single source of truth for what
+/// each [`interaction::Action`] variant does. Every entry/row variant resolves
+/// its `EntryId` back to a live index, then calls the SAME handler the keyboard
+/// path calls — so keyboard/mouse parity holds by construction. Adding a new
+/// button means adding a variant to [`interaction::Action`] and one arm here.
+fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
     match action {
-        ClickAction::ToggleQueueOverlay => toggle_prompt_queue_overlay(app),
+        interaction::Action::ToggleQueueOverlay => toggle_prompt_queue_overlay(app),
+        interaction::Action::ToggleEntryCollapsed(id) => {
+            if let Some(index) = entry_index_for_id(app, id) {
+                // Clicking the caret focuses the entry it acts on, then folds it
+                // — the same handler Ctrl+O drives.
+                app.selected_entry = Some(index);
+                app.focus.set(id);
+                if toggle_transcript_entry_fold(app, index) {
+                    let collapsed = app.transcript[index].collapsed;
+                    app.status = if collapsed {
+                        "entry collapsed".to_string()
+                    } else {
+                        "entry expanded".to_string()
+                    };
+                    app.needs_redraw = true;
+                }
+            }
+        }
+        interaction::Action::FocusEntry(id) => {
+            if let Some(index) = entry_index_for_id(app, id) {
+                app.selected_entry = Some(index);
+                app.focus.set(id);
+                app.status = format!("selected transcript entry {}", app.transcript[index].id + 1);
+                app.needs_redraw = true;
+            }
+        }
+        interaction::Action::ExpandEntry(id) => {
+            // Double-click a collapsed card → expand it (idempotent: a no-op on
+            // an already-expanded card). Reuses the fold toggle, guarded.
+            if let Some(index) = entry_index_for_id(app, id) {
+                app.selected_entry = Some(index);
+                app.focus.set(id);
+                if app.transcript[index].collapsed && toggle_transcript_entry_fold(app, index) {
+                    app.status = "entry expanded".to_string();
+                    app.needs_redraw = true;
+                }
+            }
+        }
+        interaction::Action::OpenEntryInDetail(id) => {
+            if let Some(index) = entry_index_for_id(app, id) {
+                app.selected_entry = Some(index);
+                app.focus.set(id);
+                open_focused_entry_in_detail(app);
+            }
+        }
+        // Queue delete/reorder, scrollbar-jump, and jump-to-latest are not yet
+        // registered as targets by the render paths; their handlers land with
+        // the affordances that register them. Until then these arms are inert
+        // (no panic), so the registry vocabulary is complete without forcing a
+        // half-wired button into the UI.
+        interaction::Action::QueueDelete(_)
+        | interaction::Action::QueueReorderBegin(_)
+        | interaction::Action::ScrollbarJump
+        | interaction::Action::JumpToLatest => {}
     }
+}
+
+/// How the card-affordance press path should treat a recognized gesture, so it
+/// can coexist with visual text selection over the same header rows.
+///
+/// The main transcript's selection contract is fixed and must not regress:
+/// double-click word-selects, triple-click row-selects, and a press that turns
+/// into a drag range-selects. A card header therefore cannot *swallow* those
+/// gestures. Only the dedicated caret zone (a non-text affordance) fully
+/// consumes a click; a header single-click focuses the entry but then *falls
+/// through* so the very same press still arms a (possibly empty) selection,
+/// letting a drag select and a bare click clear — exactly as before the card
+/// affordances existed.
+enum CardPress {
+    /// The gesture was a caret toggle / collapsed-card expand: consume it; do
+    /// not run the selection path.
+    Consumed,
+    /// The gesture focused a header entry but the press must still flow into the
+    /// selection path (so a drag from the header selects text).
+    FocusedThenFallThrough,
+    /// Not a single-click card gesture (double/triple click, or no action):
+    /// leave it entirely to the selection path (word/row select).
+    Ignored,
+}
+
+/// Classify and partially dispatch a recognized card gesture over the main
+/// transcript view on a press. A single click on the caret toggles the entry's
+/// fold and is consumed; a single click on the header focuses the entry but is
+/// *not* consumed (the selection path still arms, so a drag selects); a
+/// double-click on the caret expands a collapsed card and is consumed. Header
+/// double/triple clicks are left untouched so the selection path word/row-selects.
+fn dispatch_card_gesture(app: &mut TuiApp, gesture: interaction::Gesture) -> CardPress {
+    match gesture {
+        // Caret single-click → toggle the fold (a dedicated non-text zone, so it
+        // fully owns the click). A header single-click → focus the entry, but
+        // fall through so the same press still arms a selection for a drag.
+        interaction::Gesture::Click {
+            action: Some(action @ interaction::Action::ToggleEntryCollapsed(_)),
+            ..
+        } => {
+            dispatch_click_action(app, action);
+            CardPress::Consumed
+        }
+        interaction::Gesture::Click {
+            action: Some(action @ interaction::Action::FocusEntry(_)),
+            ..
+        } => {
+            dispatch_click_action(app, action);
+            CardPress::FocusedThenFallThrough
+        }
+        // Double-click on the *caret* expands a collapsed card and is consumed.
+        // A header double/triple click is left to the selection path (word/row
+        // select), so we only act on the caret's `ToggleEntryCollapsed` here.
+        interaction::Gesture::DoubleClick {
+            action: Some(interaction::Action::ToggleEntryCollapsed(id)),
+            ..
+        } => {
+            dispatch_click_action(app, interaction::Action::ExpandEntry(id));
+            CardPress::Consumed
+        }
+        _ => CardPress::Ignored,
+    }
+}
+
+/// Open the focused transcript entry in the Ctrl+T detail overlay (Expanded),
+/// the open path `ToggleTranscriptOverlay` uses, seeded focused on the entry.
+/// Single source of behaviour for both the `OpenFocusedInDetail` keymap action
+/// and the `OpenEntryInDetail` click action. No-op (with a status hint) when no
+/// entry is focused.
+fn open_focused_entry_in_detail(app: &mut TuiApp) {
+    if app.config_screen.is_some() || app.status_line_setup.is_some() {
+        return;
+    }
+    if app.selected_entry.is_none() {
+        app.status = "no focused entry — Ctrl+↑/↓ to focus one".to_string();
+        return;
+    }
+    app.transcript_overlay_scrollbar_cache.set(None);
+    // Open straight to the "see everything" expanded surface, the same target
+    // the Ctrl+T toggle's open-from-nothing arm produces.
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        detail: OverlayDetail::Expanded,
+        ..TranscriptOverlayState::default()
+    });
+    app.status = "opened entry in detail (Ctrl+T)".to_string();
+    app.needs_redraw = true;
 }
 
 /// Current `(line_count, viewport_h)` for the *active* transcript, using the
@@ -6280,6 +6507,11 @@ fn open_pin_picker(app: &mut TuiApp) {
         return;
     };
     app.selected_entry = Some(start);
+    // Mirror the picker's candidate into the id-keyed focus cursor so the two
+    // stay in lockstep (the design's "pin picker call site becomes focus-set").
+    if let Some(entry) = app.transcript.get(start) {
+        app.focus.set(transcript_surface::EntryId(entry.id));
+    }
     app.pin_picker_active = true;
     update_pin_picker_status(app);
 }
@@ -6906,36 +7138,51 @@ fn toggle_transcript_entry_fold(app: &mut TuiApp, index: usize) -> bool {
     true
 }
 
-/// Move the focused-entry cursor (`app.selected_entry`) one entry earlier, used
-/// by the per-entry fold controls. Wraps to the last entry when nothing is
-/// focused yet.
+/// Sync the legacy `selected_entry` index from the id-keyed focus cursor so the
+/// renderer (which compares an index via `active_selected_entry`) stays in
+/// agreement after an id-space focus move. Resolving the id against the live
+/// entry-id order keeps the index correct even if entries were pruned.
+fn sync_selected_entry_from_focus(app: &mut TuiApp) {
+    let ids = transcript_entry_ids(app);
+    app.selected_entry = app.focus.resolve_index(&ids);
+}
+
+/// Move the focused-entry cursor one entry earlier, used by the per-entry fold
+/// controls. Driven through the id-keyed [`interaction::Focus`] (wraps to the
+/// last entry when nothing is focused yet), then mirrored back to
+/// `selected_entry` for the renderer.
 fn select_previous_transcript_entry(app: &mut TuiApp) {
     if app.transcript.is_empty() {
         app.status = "transcript is empty".to_string();
         return;
     }
-    app.selected_entry = Some(match app.selected_entry {
-        Some(index) => index.saturating_sub(1),
-        None => app.transcript.len() - 1,
-    });
-    let entry = &app.transcript[app.selected_entry.unwrap()];
-    app.status = format!("selected transcript entry {}", entry.id + 1);
+    // Adopt the legacy index into the id cursor first so a focus set elsewhere
+    // (pin picker, mouse) is honoured, then step in id space.
+    let ids = transcript_entry_ids(app);
+    app.focus.set_from_index(app.selected_entry, &ids);
+    let focused = app.focus.focus_prev(&ids);
+    sync_selected_entry_from_focus(app);
+    if let Some(transcript_surface::EntryId(id)) = focused {
+        app.status = format!("selected transcript entry {}", id + 1);
+    }
 }
 
-/// Move the focused-entry cursor (`app.selected_entry`) one entry later, used by
-/// the per-entry fold controls. Wraps to the first entry when nothing is focused
-/// yet.
+/// Move the focused-entry cursor one entry later, used by the per-entry fold
+/// controls. Driven through the id-keyed [`interaction::Focus`] (wraps to the
+/// first entry when nothing is focused yet), then mirrored back to
+/// `selected_entry` for the renderer.
 fn select_next_transcript_entry(app: &mut TuiApp) {
     if app.transcript.is_empty() {
         app.status = "transcript is empty".to_string();
         return;
     }
-    app.selected_entry = Some(match app.selected_entry {
-        Some(index) => (index + 1).min(app.transcript.len() - 1),
-        None => 0,
-    });
-    let entry = &app.transcript[app.selected_entry.unwrap()];
-    app.status = format!("selected transcript entry {}", entry.id + 1);
+    let ids = transcript_entry_ids(app);
+    app.focus.set_from_index(app.selected_entry, &ids);
+    let focused = app.focus.focus_next(&ids);
+    sync_selected_entry_from_focus(app);
+    if let Some(transcript_surface::EntryId(id)) = focused {
+        app.status = format!("selected transcript entry {}", id + 1);
+    }
 }
 
 /// Handle a keystroke while the full-screen transcript overlay is open.
@@ -9493,8 +9740,18 @@ fn refresh_search(app: &mut TuiApp) {
     };
     let rows = selection_surface_rows(app, surface);
     let kinds = search_row_kinds(app, surface, rows.len());
+    // The painted width both surfaces wrap at: the live text-area cache, falling
+    // back to the configured main width. `selection_surface_rows` wrapped at the
+    // same value, so the matches it produces are anchored to this width — record
+    // it on the state so `SearchState.width` tracks reality.
+    let width = app
+        .main_text_area_cache
+        .get()
+        .map(|c| c.text_area.width)
+        .unwrap_or_else(|| main_text_width(app))
+        .max(1);
     if let Some(state) = app.search.as_mut() {
-        search::rebuild(state, &rows, &kinds);
+        search::rebuild(state, &rows, &kinds, width);
     }
     scroll_search_match_into_view(app);
 }
@@ -9608,6 +9865,90 @@ fn search_status_text(state: &search::SearchState) -> String {
     }
 }
 
+/// Width (in cells) of the disclosure-caret hit zone at the start of a card
+/// header row. The caret glyph (`>`/`v`, see [`render::button`]) plus its
+/// padding occupy the leading columns; a click there toggles the entry's fold,
+/// while a click on the rest of the header focuses the entry.
+const CARD_CARET_WIDTH: u16 = 3;
+
+/// Register the per-entry card-header hit targets for every transcript entry
+/// whose header row is currently visible. This is the bridge between the
+/// id-keyed row model and the screen-space registry — the ONLY place card
+/// screen coordinates are computed, and they are thrown away each frame.
+///
+/// The header row of entry `i` is `entry_offsets[i]` (its first painted
+/// wrapped row, in the same row unit as the painted `Vec<Line>`). For each
+/// header row inside the visible window we register, in ABSOLUTE screen
+/// coordinates:
+///   - a leading caret zone → `ToggleEntryCollapsed(EntryId)`, and
+///   - the header remainder → `FocusEntry(EntryId)`.
+///
+/// Both are keyed by the entry's stable `EntryId`, so on resize the same key
+/// re-registers at a fresh rect and the hit-test never consults a remembered
+/// coordinate.
+fn register_transcript_card_targets(
+    app: &TuiApp,
+    text_area: Rect,
+    include_startup_card: bool,
+    total_rows: usize,
+    viewport_h: usize,
+    from_bottom: usize,
+) {
+    if text_area.width == 0 || text_area.height == 0 || total_rows == 0 {
+        return;
+    }
+    // The painted window: `top_row` is the first wrapped row drawn at the top
+    // of the text area (tail-anchored, `from_bottom` up from the end). Mirrors
+    // `main_pos_for_cell`'s window math so the screen `y` we compute matches
+    // where the row is actually painted.
+    let top_row = total_rows
+        .saturating_sub(viewport_h)
+        .saturating_sub(from_bottom);
+    let bottom_row = total_rows.min(top_row + viewport_h);
+
+    let (_lines, entry_offsets) =
+        transcript_lines_and_entry_offsets(app, Some(text_area.width), include_startup_card);
+    let entries = active_transcript_entries(app);
+    for (i, &header_row) in entry_offsets.iter().enumerate() {
+        let Some(entry) = entries.get(i) else {
+            continue;
+        };
+        if header_row < top_row || header_row >= bottom_row {
+            continue;
+        }
+        let id = transcript_surface::EntryId(entry.id);
+        let screen_y = text_area.y + (header_row - top_row) as u16;
+        let caret_w = CARD_CARET_WIDTH.min(text_area.width);
+        // Caret zone → toggle collapse.
+        app.register_click(
+            Rect {
+                x: text_area.x,
+                y: screen_y,
+                width: caret_w,
+                height: 1,
+            },
+            interaction::TargetKey::Entry(id),
+            interaction::Action::ToggleEntryCollapsed(id),
+        );
+        // Header remainder → focus the entry. Registered AFTER the caret so the
+        // caret (narrower, leading) wins on overlap via the reverse hit-test;
+        // but they don't overlap (the remainder starts after the caret zone).
+        let remainder_w = text_area.width.saturating_sub(caret_w);
+        if remainder_w > 0 {
+            app.register_click(
+                Rect {
+                    x: text_area.x + caret_w,
+                    y: screen_y,
+                    width: remainder_w,
+                    height: 1,
+                },
+                interaction::TargetKey::Entry(id),
+                interaction::Action::FocusEntry(id),
+            );
+        }
+    }
+}
+
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_startup_card: bool) {
     // Reserve a 1-cell right gutter for the scrollbar; the text wraps to the
     // narrower column. When the area is too thin to split, fall back to the
@@ -9641,6 +9982,19 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
         from_bottom,
         include_startup_card,
     }));
+
+    // Register each visible entry's card-header hit targets (caret → toggle
+    // collapse, header remainder → focus) into the frame-local registry. Keyed
+    // by the entry's stable EntryId so the target survives resize: the rect is
+    // recomputed here every frame from the live window, the key never is.
+    register_transcript_card_targets(
+        app,
+        text_area,
+        include_startup_card,
+        total_rows,
+        viewport_h,
+        from_bottom,
+    );
 
     // Overlay the visual-selection highlight on the painted rows when a MAIN
     // selection is active. `rows_with_selection_highlight` restyles the selected
@@ -9954,8 +10308,11 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     };
     // Surface the active entry filter in the title when it is narrowing the
     // view, so the user always sees that some entries are hidden (and the `f`
-    // hint for how to change it).
-    let filter_suffix = match state.filter {
+    // hint for how to change it). Route through `overlay_filter(app)` (not
+    // `state.filter`) so a stale out-of-range `Tool(i)` is clamped to `All`
+    // here too — keeping the title suffix consistent with the body, which also
+    // renders through `overlay_filter`.
+    let filter_suffix = match overlay_filter(app) {
         OverlayFilter::All => String::new(),
         other => {
             let tool_names = distinct_overlay_tool_names(active_transcript_entries(app));
@@ -10055,10 +10412,26 @@ fn overlay_detail(app: &TuiApp) -> OverlayDetail {
 /// The entry filter the transcript overlay is currently showing, defaulting to
 /// `All` when no overlay is open (the value the render cache keys on).
 fn overlay_filter(app: &TuiApp) -> OverlayFilter {
-    app.transcript_overlay
+    let filter = app
+        .transcript_overlay
         .as_ref()
         .map(|state| state.filter)
-        .unwrap_or(OverlayFilter::All)
+        .unwrap_or(OverlayFilter::All);
+    // A `Tool(i)` index points into the live distinct-tool-name list, which is
+    // recomputed every render. If the transcript mutated while the overlay
+    // stayed open (a streamed tool entry dropped/coalesced away), `i` can fall
+    // out of range and `entry_matches_overlay_filter` would reject *every*
+    // entry -> a blank overlay with no recovery but the `f` key. Fall back to
+    // `All` so the view stays populated. This is the single render choke point
+    // (painted rows, render-cache key, and search row-kinds all read through
+    // here), so clamping once heals every consumer.
+    if let OverlayFilter::Tool(i) = filter {
+        let tool_names = distinct_overlay_tool_names(active_transcript_entries(app));
+        if i >= tool_names.len() {
+            return OverlayFilter::All;
+        }
+    }
+    filter
 }
 
 fn transcript_overlay_render_key(app: &TuiApp, width: u16) -> TranscriptOverlayRenderKey {
@@ -17220,7 +17593,8 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                     width: area.width,
                     height: 1,
                 },
-                ClickAction::ToggleQueueOverlay,
+                interaction::TargetKey::Chrome(interaction::ChromeKey::QueueStrip),
+                interaction::Action::ToggleQueueOverlay,
             );
         }
     }
@@ -18957,12 +19331,27 @@ pub(crate) struct TuiApp {
     /// types the leader; cleared either by the matching follow-up key
     /// or by any other keystroke (which then falls through normally).
     pub(crate) pending_chord: Option<ChordPrefix>,
-    /// Per-frame click-target registry. Render fns push `Clickable`
-    /// entries here (through `&TuiApp` thanks to interior mutability);
-    /// `handle_mouse` iterates the Vec in reverse on left-click so
-    /// the topmost (later-rendered) hit wins. Cleared at the start of
-    /// every draw via `begin_frame_clickables`.
-    pub(crate) clickables: std::cell::RefCell<Vec<Clickable>>,
+    /// Per-frame, id-anchored hit-test registry (see [`interaction`]).
+    /// Render fns register clickable regions here (through `&TuiApp`
+    /// thanks to interior mutability) keyed by a stable [`interaction::
+    /// TargetKey`] (EntryId / RowId / queue-item id / chrome) plus an
+    /// [`interaction::Action`]; `handle_mouse` hit-tests it in reverse on
+    /// left-click so the topmost (later-rendered) target wins. Cleared at
+    /// the start of every draw via `begin_frame_clickables`. Replaces the
+    /// former bare `Vec<Clickable>`.
+    pub(crate) clickables: std::cell::RefCell<interaction::Registry>,
+    /// Id-keyed focused-entry cursor (see [`interaction::Focus`]). Kept in
+    /// sync with the legacy `selected_entry` index so the renderer keeps
+    /// comparing an index while mouse/keyboard dispatch can address the
+    /// stable EntryId. The index remains the render read-funnel via
+    /// `active_selected_entry`.
+    pub(crate) focus: interaction::Focus,
+    /// Mouse gesture recognizer (see [`interaction::Recognizer`]). Turns
+    /// the raw crossterm Down/Drag/Up/Move stream into semantic gestures,
+    /// absorbing the multi-click synthesis formerly inlined in
+    /// `handle_main_selection_press` and keying multiplicity on the target
+    /// key rather than the screen cell.
+    pub(crate) gestures: interaction::Recognizer,
     /// User-authored slash macros loaded from `~/.squeezy/prompts/` and
     /// `<workspace>/.squeezy/prompts/`. Consulted by
     /// [`handle_slash_command`] when the typed head isn't a built-in
@@ -18987,21 +19376,6 @@ pub(crate) enum ChordPrefix {
     /// `Ctrl+X` — Emacs-style extended-command leader. Currently only
     /// used by `Ctrl+X Q` (toggle the prompt-queue overlay).
     CtrlX,
-}
-
-/// What a click on a registered `Clickable` should do. Add a variant
-/// when a new button lands; add the matching arm in
-/// `dispatch_click_action` next to the existing handlers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClickAction {
-    /// Open / close the prompt-queue reorder overlay.
-    ToggleQueueOverlay,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Clickable {
-    pub(crate) rect: Rect,
-    pub(crate) action: ClickAction,
 }
 
 #[derive(Debug, Default)]
@@ -19058,37 +19432,36 @@ impl TuiApp {
         self.pending_turn_divider = None;
     }
 
-    /// Clear the click-target registry at the start of each frame.
+    /// Clear the hit-test registry at the start of each frame.
     /// Called from `render` / `render_inline` before any widget draws.
     pub(crate) fn begin_frame_clickables(&self) {
-        self.clickables.borrow_mut().clear();
+        self.clickables.borrow_mut().begin_frame();
     }
 
-    /// Record a click target for the frame currently being drawn.
-    /// Render fns hold only `&TuiApp`, so the registry lives in a
-    /// `RefCell` to allow `push` through a shared reference.
-    pub(crate) fn register_click(&self, rect: Rect, action: ClickAction) {
-        self.clickables
-            .borrow_mut()
-            .push(Clickable { rect, action });
+    /// Record a click target for the frame currently being drawn, keyed by a
+    /// stable [`interaction::TargetKey`]. Render fns hold only `&TuiApp`, so
+    /// the registry lives in a `RefCell` to allow registration through a
+    /// shared reference.
+    pub(crate) fn register_click(
+        &self,
+        rect: Rect,
+        key: interaction::TargetKey,
+        action: interaction::Action,
+    ) {
+        self.clickables.borrow_mut().register(rect, key, action);
     }
 
-    /// Topmost click target containing `(column, row)`, if any.
-    /// Iterates the registry in reverse so later-rendered widgets
-    /// (overlays, modals) take precedence over earlier ones at the
-    /// same screen cell.
-    pub(crate) fn click_target_at(&self, column: u16, row: u16) -> Option<ClickAction> {
-        self.clickables
-            .borrow()
-            .iter()
-            .rev()
-            .find(|c| {
-                column >= c.rect.x
-                    && column < c.rect.x.saturating_add(c.rect.width)
-                    && row >= c.rect.y
-                    && row < c.rect.y.saturating_add(c.rect.height)
-            })
-            .map(|c| c.action)
+    /// Topmost click target containing `(column, row)`, if any. Iterates the
+    /// registry in reverse so later-rendered widgets (overlays, modals) take
+    /// precedence over earlier ones at the same screen cell. Returns the
+    /// target key alongside the action so the caller can tell *which* card/row
+    /// was hit even when two share an action variant.
+    pub(crate) fn click_target_at(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<(interaction::TargetKey, interaction::Action)> {
+        self.clickables.borrow().hit_test(column, row)
     }
 
     /// Session id to use for plan IO. Falls back to
@@ -19339,7 +19712,9 @@ impl TuiApp {
             prompt_queue_overlay: None,
             auto_drain_queue: false,
             pending_chord: None,
-            clickables: std::cell::RefCell::new(Vec::new()),
+            clickables: std::cell::RefCell::new(interaction::Registry::new()),
+            focus: interaction::Focus::new(),
+            gestures: interaction::Recognizer::new(),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
             preserve_input_after_slash_command: false,
             settings_path_override: None,

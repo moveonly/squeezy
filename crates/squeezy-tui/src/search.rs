@@ -77,8 +77,12 @@ pub(crate) struct SearchState {
     /// if the active surface changes while search is live, `lib.rs` updates this
     /// and re-runs the find pass.
     pub(crate) surface: SelectionSurface,
-    /// The painted width the match positions were taken at. A width change
-    /// invalidates and re-runs the pass.
+    /// The painted width the live `matches` were computed at. Recorded on every
+    /// [`rebuild`] (not just at open), so it always reflects the width the
+    /// current positions index into. The resize handler re-runs the pass
+    /// unconditionally (`lib.rs` `Event::Resize`), so this is the source of
+    /// truth for "what width are the matches anchored to" rather than a stored
+    /// short-circuit trigger.
     pub(crate) width: u16,
     /// Ordered match positions in reading order (row-major, then col).
     pub(crate) matches: Vec<Match>,
@@ -205,7 +209,15 @@ pub(crate) fn find(
 /// match as well as possible**: keep `current` pointing at the match nearest (by
 /// `(row, col.start)`) to the previously-current one, so an incremental
 /// keystroke / resize / surface switch does not jolt the selected match.
-pub(crate) fn rebuild(state: &mut SearchState, rows: &[Line<'static>], kinds: &[RowKind]) {
+pub(crate) fn rebuild(
+    state: &mut SearchState,
+    rows: &[Line<'static>],
+    kinds: &[RowKind],
+    width: u16,
+) {
+    // Record the width the new positions are computed at so `state.width`
+    // always reflects the geometry the live `matches` index into.
+    state.width = width;
     let previous = state.current.and_then(|i| state.matches.get(i)).cloned();
     state.matches = find(
         rows,
