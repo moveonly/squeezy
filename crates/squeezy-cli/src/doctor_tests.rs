@@ -109,6 +109,7 @@ fn json_summary_counts_full_result_even_when_rows_are_filtered() {
         version: "test",
         target: "test-target",
         json: true,
+        paths: DoctorPaths::default(),
     };
 
     let body = report.json_body();

@@ -23,7 +23,7 @@ use squeezy_core::sensitive_pattern_base;
 use squeezy_core::{ShellSandboxConfig, ShellSandboxMode, ShellSandboxNetworkPolicy};
 use tokio::process::Command;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::shell_exit_signal;
 use crate::shell_program::ShellProgram;
 use crate::{ShellPermissionAnalysis, ShellRunOutcome};
