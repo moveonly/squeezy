@@ -100,10 +100,10 @@ fn wide_glyphs_survive_reflow() {
     // Three fullwidth CJK glyphs plus a trailing ASCII char, first painted at a
     // NARROW width that forces the 7-column run (`好好好` = 6 cols + `x`) to wrap
     // across rows, then a resize WIDE enough to unwrap it. alacritty reflows on
-    // resize and must carry every wide glyph through the rewrap — the survival
-    // property this leg exists to model. (Counting `好` rather than matching an
-    // exact string tolerates the wide-cell spacer the grid reconstruction
-    // surfaces between glyphs; the load-bearing claim is that none are lost.)
+    // resize and must carry every wide glyph through the rewrap, in order, back
+    // onto the first row — the survival-AND-placement property this leg models.
+    // We assert the EXACT reconstructed run rather than just counting `好`, so a
+    // wrong-order or wrong-row reflow that preserved counts would still fail.
     let text = "好好好x".as_bytes();
     let frames = vec![
         // Frame 1: width 4 cannot hold the 7-column run, so it wraps.
@@ -126,23 +126,16 @@ fn wide_glyphs_survive_reflow() {
 
     let grid = AlacrittyEmulator.replay(&log);
 
-    // Every CJK glyph and the trailing ASCII survive the wrap-then-reflow.
-    let joined: String = grid.viewport.concat();
+    // After widening to 20 the whole run unwraps back onto the first row, in the
+    // original order. The grid reconstruction surfaces each wide glyph's trailing
+    // cell as a single blank spacer (alacritty stores `' '` in the WIDE_CHAR_SPACER
+    // cell — see `backend_alacritty.rs`), so the expected row is `好 好 好 x`.
+    // Pinning the exact string fixes both ORDER and PLACEMENT, not just survival
+    // count: a reflow that dropped a glyph, reordered the run, or stranded it on a
+    // later row would all fail here.
     assert_eq!(
-        joined.matches('好').count(),
-        3,
-        "all three wide glyphs must survive the reflow: {:?}",
-        grid.viewport,
-    );
-    assert!(
-        joined.contains('x'),
-        "the trailing ASCII glyph survives too: {:?}",
-        grid.viewport,
-    );
-    // After widening to 20 the whole run unwraps back onto the first row.
-    assert!(
-        grid.viewport[0].contains('好') && grid.viewport[0].contains('x'),
-        "the widened grid holds the reflowed run on one row: {:?}",
+        grid.viewport[0], "好 好 好 x",
+        "the widened grid holds the reflowed run, in order, on the first row: {:?}",
         grid.viewport,
     );
 }

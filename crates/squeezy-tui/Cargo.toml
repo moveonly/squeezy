@@ -53,7 +53,6 @@ toml.workspace = true
 tracing.workspace = true
 tree-sitter.workspace = true
 tree-sitter-bash.workspace = true
-unicode-width.workspace = true
 tree-sitter-c.workspace = true
 tree-sitter-c-sharp.workspace = true
 tree-sitter-cpp.workspace = true
@@ -73,6 +72,7 @@ tree-sitter-sequel.workspace = true
 tree-sitter-toml-updated.workspace = true
 tree-sitter-typescript.workspace = true
 tree-sitter-yaml.workspace = true
+unicode-width.workspace = true
 
 # Optional, gated behind the `term-matrix` feature. See `[features]`.
 vt100 = { workspace = true, optional = true }

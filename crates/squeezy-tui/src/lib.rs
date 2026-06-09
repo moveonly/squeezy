@@ -18985,9 +18985,12 @@ struct TerminalGuard {
     /// Whether mouse capture is enabled for the main screen. Defaults on in
     /// fullscreen (alt-screen norm) unless `SQUEEZY_MOUSE_CAPTURE=0`. When on,
     /// the click registry is live; Shift+drag / Shift+wheel are the native
-    /// selection / scrollback escape hatch. Recorded at `enter` time; Phase 2
-    /// reads it to restore the main mouse policy when the transcript overlay
-    /// closes.
+    /// selection / scrollback escape hatch. Resolved once at `enter` and used
+    /// there to emit the click-capture enable sequence. Retained on the guard
+    /// for symmetry with the other recorded enter state; nothing reads it back
+    /// now that Phase 1 removed the overlay terminal swap (which used to restore
+    /// the main mouse policy when the transcript overlay closed) — hence the
+    /// `dead_code` allow.
     #[allow(dead_code)]
     mouse_capture: bool,
     exit_hint: Option<String>,
@@ -19503,13 +19506,13 @@ impl TerminalGuard {
         Ok(())
     }
 
-    /// Crossterm's autoresize for inline viewports calls `append_lines` to
-    /// shift the previous frame upward before redrawing — leaving the old
-    /// frame's contents (e.g. the "Worked for Ns" divider) stranded as
-    /// scrollback above the new viewport. Wiping from the current viewport
-    /// top down before the next draw means there is nothing stale for the
-    /// scroll to pull up. Alternate-screen mode handles resize cleanly via
-    /// the terminal itself, so the work is inline-only.
+    /// Handle `/clear`: purge the terminal's scrollback and visible screen,
+    /// then reset the append-only flush bookkeeping so the next paint re-emits
+    /// the whole transcript from the top onto the freshly cleared screen.
+    /// Emits `CLEAR_SCROLLBACK_AND_VISIBLE` (the scrollback-purging `\x1b[3J`
+    /// form, matching `clear(1)`), which is reserved for this command — the
+    /// normal exit/leave path never purges scrollback. Only reached on the main
+    /// path; the overlay short-circuits earlier, so no overlay guard is needed.
     fn clear_scrollback_and_visible(&mut self) -> Result<()> {
         // `/clear` keeps the scrollback-purging form (`\x1b[3J`), matching
         // `clear(1)`. Append-only then resets the flush bookkeeping and drops
@@ -19682,11 +19685,11 @@ fn render_footer_to_buffer(
 /// Render finished transcript lines into an owned buffer wrapped to `width`,
 /// reusing the same `Paragraph`/`Wrap { trim: false }` the renderer uses.
 ///
-/// The buffer height is a width-correct UPPER BOUND on the wrapped row count —
-/// not `visual_line_count`'s `chars().count().div_ceil(width)`. That estimate
-/// under-counts two ways and would let `render_lines_to_buffer` (which renders
-/// the same word-wrapping `Paragraph`) silently CLIP overflow rows, truncating
-/// mirrored history:
+/// The buffer height is ratatui's EXACT wrapped row count for `width`
+/// (`Paragraph::line_count`), not `visual_line_count`'s
+/// `chars().count().div_ceil(width)`. That estimate under-counts two ways and
+/// would let the same word-wrapping `Paragraph` silently CLIP overflow rows,
+/// truncating mirrored history:
 ///   1. Word-wrap reflow (`WordWrapper`, `trim: false`) breaks on word
 ///      boundaries, so a word that will not fit leaves the tail of a row blank
 ///      and pushes to the next — a logical line of N chars can occupy MORE rows
@@ -19695,58 +19698,21 @@ fn render_footer_to_buffer(
 ///      as one, so a wide-glyph-heavy line wraps to more rows than the char
 ///      count predicts.
 ///
-/// `wrapped_row_upper_bound` accounts for both (display columns via
-/// `term_display_width`, plus one row of slack per whitespace-delimited word for
-/// the word-boundary reflow), so the buffer can never be too short. Trailing
-/// all-blank rows from the over-allocation are dropped by `buffer_used_height`
-/// so the mirror emits no spurious empty lines.
+/// `line_count` drives the same `WordWrapper`/`Wrap { trim: false }` line
+/// composer as the render below, so it yields the precise height — accounting
+/// for both reflow paths with no over-allocation. `buffer_used_height` still
+/// trims any trailing blank rows so the mirror emits no spurious empty lines.
 fn render_lines_to_owned_buffer(lines: &[Line<'static>], width: u16) -> Buffer {
     let width = width.max(1);
-    let height = wrapped_row_upper_bound(lines, width).max(1);
+    let paragraph = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
+    let height = (paragraph.line_count(width).min(u16::MAX as usize) as u16).max(1);
     let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
-    render_lines_to_buffer(&mut buffer, lines.to_vec());
+    (&paragraph).render(buffer.area, &mut buffer);
     let used = buffer_used_height(&buffer).max(1);
     if used < buffer.area.height {
         buffer.resize(Rect::new(0, 0, width, used));
     }
     buffer
-}
-
-/// A width-correct UPPER BOUND on the number of rows ratatui's
-/// `Paragraph`/`Wrap { trim: false }` wraps `lines` into at `width` columns.
-///
-/// Per logical line: count display columns with [`term_display_width`] (so wide
-/// / CJK glyphs count as 2), take `ceil(cols / width)`, then add one row of
-/// slack for every whitespace-delimited word. The word slack covers the
-/// `WordWrapper` reflow where a word that does not fit the current row is
-/// pushed whole onto the next, leaving a partially-filled row the column
-/// estimate alone would miss. This is a guaranteed over-count (never a clip);
-/// the surplus rows are trimmed by [`buffer_used_height`] after rendering.
-fn wrapped_row_upper_bound(lines: &[Line<'_>], width: u16) -> u16 {
-    let content_width = width.max(1) as usize;
-    lines
-        .iter()
-        .map(|line| {
-            let mut cols = 0usize;
-            let mut words = 0usize;
-            let mut in_word = false;
-            let mut buf = [0u8; 4];
-            for span in &line.spans {
-                for ch in span.content.chars() {
-                    let g = ch.encode_utf8(&mut buf);
-                    cols += term_display_width(g).max(1) as usize;
-                    if ch.is_whitespace() {
-                        in_word = false;
-                    } else if !in_word {
-                        in_word = true;
-                        words += 1;
-                    }
-                }
-            }
-            cols.div_ceil(content_width).max(1) + words
-        })
-        .sum::<usize>()
-        .min(u16::MAX as usize) as u16
 }
 
 /// Height of `buf` counting only up to its last non-blank row (a blank row is
@@ -20016,6 +19982,12 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Render `lines` into an existing buffer with the same word-wrapping
+/// `Paragraph`/`Wrap { trim: false }` the renderer uses. Test-only ground-truth
+/// helper: the mirror sizing path now drives `Paragraph::line_count` directly in
+/// [`render_lines_to_owned_buffer`], but the mirror-height test still renders into
+/// a deliberately oversized buffer here and counts the rows that carry glyphs.
+#[cfg(test)]
 fn render_lines_to_buffer(buffer: &mut Buffer, lines: Vec<Line<'static>>) {
     Paragraph::new(lines)
         .wrap(Wrap { trim: false })

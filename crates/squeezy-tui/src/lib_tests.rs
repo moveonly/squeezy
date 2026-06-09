@@ -5585,6 +5585,81 @@ fn emit_buffer_row_styled_keeps_wide_moon_with_room_to_spare() {
 }
 
 #[test]
+fn emit_buffer_row_styled_keeps_wide_moon_at_exact_fit_boundary() {
+    // The exact-fit boundary of the wide-glyph guard (`rcol + render_w == width`):
+    // a moon glyph (`◐`, rendered two columns wide) whose second column lands on
+    // the LAST column fits exactly and MUST be emitted. This is the case between
+    // the drop test (`> width`, one column too far) and the room-to-spare test;
+    // it pins the guard's comparison to `>` so a `>` -> `>=` mutation (which would
+    // wrongly drop this glyph) is caught.
+    const WIDTH: u16 = 8;
+    let mut buf = Buffer::empty(Rect::new(0, 0, WIDTH, 1));
+    // Six ASCII cells (x = 0..=5), then the moon at x = WIDTH-2 = 6 so its two
+    // rendered columns occupy 6 and 7 — 6 + 2 == 8 == WIDTH, an exact fit.
+    buf.set_string(0, 0, "abcdef", Style::default());
+    buf.set_string(WIDTH - 2, 0, "◐", Style::default()); // x = 6
+
+    let mut out = Vec::new();
+    emit_buffer_row_styled(&mut out, &buf, 0, WIDTH).expect("emit");
+    let text = strip_ansi(&String::from_utf8_lossy(&out));
+
+    assert!(
+        text.contains("abcdef"),
+        "the ASCII prefix must be emitted in full: {text:?}",
+    );
+    assert!(
+        text.contains('◐'),
+        "a wide moon whose second rendered column lands exactly on the last \
+         column fits and must be emitted: {text:?}",
+    );
+    let rendered_width: u16 = text
+        .chars()
+        .map(|c| term_display_width(c.encode_utf8(&mut [0u8; 4])))
+        .sum();
+    assert_eq!(
+        rendered_width, WIDTH,
+        "the exact-fit glyph fills the row to its full width: {text:?}",
+    );
+}
+
+#[test]
+fn emit_buffer_row_styled_keeps_wide_cjk_at_exact_fit_boundary() {
+    // The unicode-width-2 sibling of the exact-fit moon case: a wide CJK glyph
+    // (`好`, which `unicode-width` measures as 2) placed so its two columns land
+    // on the final pair fits exactly (`rcol + render_w == width`) and must be
+    // emitted. Pins the same `>` boundary on the native-width-2 path, where
+    // `term_display_width` already returns 2 without the moon special-case.
+    const WIDTH: u16 = 8;
+    let mut buf = Buffer::empty(Rect::new(0, 0, WIDTH, 1));
+    // Six ASCII cells (x = 0..=5), then `好` at x = WIDTH-2 = 6 occupying 6 and
+    // its continuation cell 7 — 6 + 2 == 8 == WIDTH, an exact fit.
+    buf.set_string(0, 0, "abcdef", Style::default());
+    buf.set_string(WIDTH - 2, 0, "好", Style::default()); // x = 6, continuation at 7
+
+    let mut out = Vec::new();
+    emit_buffer_row_styled(&mut out, &buf, 0, WIDTH).expect("emit");
+    let text = strip_ansi(&String::from_utf8_lossy(&out));
+
+    assert!(
+        text.contains("abcdef"),
+        "the ASCII prefix must be emitted in full: {text:?}",
+    );
+    assert!(
+        text.contains('好'),
+        "a wide CJK glyph whose second column lands exactly on the last column \
+         fits and must be emitted: {text:?}",
+    );
+    let rendered_width: u16 = text
+        .chars()
+        .map(|c| term_display_width(c.encode_utf8(&mut [0u8; 4])))
+        .sum();
+    assert_eq!(
+        rendered_width, WIDTH,
+        "the exact-fit wide glyph fills the row to its full width: {text:?}",
+    );
+}
+
+#[test]
 fn is_wide_rendered_glyph_classifies_the_special_set() {
     // True for every special-cased glyph the footer mirror must reserve two
     // columns for...
