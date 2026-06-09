@@ -189,6 +189,41 @@ pub(crate) fn checkpoint_revert_spec() -> ToolSpec {
     }
 }
 
+pub(crate) fn checkpoint_restore_file_spec() -> ToolSpec {
+    ToolSpec {
+        name: "checkpoint_restore_file".to_string(),
+        description: "Restore one protected file from a checkpoint without reverting the whole checkpoint or group.".to_string(),
+        capability: PermissionCapability::Edit,
+        parallel_safe: false,
+        parameters: tool_schema(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "checkpoint_id": {"type": "string", "description": "Checkpoint id returned by checkpoint_list or mutation tool output."},
+                "path": {"type": "string", "description": "File path to restore. For renames, either the source or destination path may be provided."},
+                "mode": {"type": "string", "enum": ["atomic", "best_effort"], "description": "Rollback mode. Default atomic."}
+            },
+            "required": ["checkpoint_id", "path"]
+        })),
+        prepare_arguments: None,
+    }
+}
+
+pub(crate) fn checkpoint_check_spec() -> ToolSpec {
+    ToolSpec {
+        name: "checkpoint_check".to_string(),
+        description: "Check checkpoint journal, refs, and protected blobs for integrity without changing workspace files.".to_string(),
+        capability: PermissionCapability::Read,
+        parallel_safe: true,
+        parameters: tool_schema(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {}
+        })),
+        prepare_arguments: None,
+    }
+}
+
 pub(crate) fn diff_context_spec() -> ToolSpec {
     ToolSpec {
         name: "diff_context".to_string(),

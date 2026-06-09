@@ -5289,6 +5289,7 @@ fn warn_unknown_tool_schema_names_emits_warning_for_typo_and_skips_known() {
         ],
         discoverable: vec!["totally_made_up".to_string()],
         excluded: Vec::new(),
+        ..squeezy_core::ToolSchemaConfig::default()
     };
 
     tracing::subscriber::with_default(subscriber, || {

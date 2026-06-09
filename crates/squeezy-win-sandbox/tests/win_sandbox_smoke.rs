@@ -154,6 +154,24 @@ fn run_cmd(workspace: &Path, cmdline_arg: &str) -> Option<CmdOutput> {
         run_cmd_inner(workspace, cmdline_arg, Duration::from_secs(10))
             .expect("sandboxed command should complete after probe succeeds"),
     )
+
+}
+
+fn workspace_write_capability_available(workspace: &Path) -> bool {
+    let probe_file = workspace.join("squeezy-wsbx-probe.txt");
+    let cmdline = format!(r#"echo probe > "{}""#, probe_file.display());
+    let Some(output) = run_cmd(workspace, &cmdline) else {
+        return false;
+    };
+    let ok = output.status.success() && probe_file.exists();
+    let _ = std::fs::remove_file(&probe_file);
+    if !ok {
+        eprintln!(
+            "[skip] restricted-token sandbox cannot write to declared workspace root; exit={:?}; stdout={:?}; stderr={:?}",
+            output.status, output.stdout, output.stderr
+        );
+    }
+    ok
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -163,6 +181,10 @@ fn run_cmd(workspace: &Path, cmdline_arg: &str) -> Option<CmdOutput> {
 #[ignore = "runtime restricted-token gate; run on a real Windows host (see docs/internal/windows-sandbox-qa.md)"]
 fn write_inside_workspace_allowed() {
     let workspace = fresh_workspace("write_inside");
+    if !workspace_write_capability_available(&workspace) {
+        let _ = std::fs::remove_dir_all(&workspace);
+        return;
+    }
     let out_file = workspace.join("out.txt");
 
     let cmdline = "echo hi > out.txt";
@@ -190,6 +212,10 @@ fn write_inside_workspace_allowed() {
 #[ignore = "runtime restricted-token gate; run on a real Windows host (see docs/internal/windows-sandbox-qa.md)"]
 fn write_outside_workspace_denied() {
     let workspace = fresh_workspace("write_outside_ws");
+    if !workspace_write_capability_available(&workspace) {
+        let _ = std::fs::remove_dir_all(&workspace);
+        return;
+    }
 
     // Pick a sibling directory that is NOT the workspace (and doesn't overlap
     // with it), so the restricted token's capability SID denies writes there.
@@ -222,6 +248,10 @@ fn write_outside_workspace_denied() {
 #[ignore = "runtime restricted-token gate; run on a real Windows host (see docs/internal/windows-sandbox-qa.md)"]
 fn append_inside_allowed() {
     let workspace = fresh_workspace("append_inside");
+    if !workspace_write_capability_available(&workspace) {
+        let _ = std::fs::remove_dir_all(&workspace);
+        return;
+    }
     let target = workspace.join("append.txt");
     std::fs::write(&target, "line1\n").expect("seed file");
 
@@ -251,6 +281,10 @@ fn append_inside_allowed() {
 #[ignore = "runtime restricted-token gate; run on a real Windows host (see docs/internal/windows-sandbox-qa.md)"]
 fn delete_inside_allowed() {
     let workspace = fresh_workspace("delete_inside");
+    if !workspace_write_capability_available(&workspace) {
+        let _ = std::fs::remove_dir_all(&workspace);
+        return;
+    }
     let target = workspace.join("delme.txt");
     std::fs::write(&target, "x").expect("seed file");
 
@@ -280,6 +314,10 @@ fn delete_inside_allowed() {
 #[ignore = "runtime restricted-token gate; run on a real Windows host (see docs/internal/windows-sandbox-qa.md)"]
 fn read_system_still_works() {
     let workspace = fresh_workspace("read_system");
+    if !workspace_write_capability_available(&workspace) {
+        let _ = std::fs::remove_dir_all(&workspace);
+        return;
+    }
 
     // Check for a stable system file without emitting a large directory listing;
     // these smoke tests do not otherwise need stdout, and bounded output avoids

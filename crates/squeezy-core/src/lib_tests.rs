@@ -227,6 +227,18 @@ fn config_without_env_uses_openai_provider_defaults() {
         DEFAULT_MAX_SEARCH_FILES_PER_TURN
     );
     assert!(!config.checkpoints_enabled);
+    assert_eq!(
+        config.tools.checkpoint_retention_days,
+        DEFAULT_CHECKPOINT_RETENTION_DAYS
+    );
+    assert_eq!(
+        config.tools.checkpoint_max_file_bytes,
+        DEFAULT_CHECKPOINT_MAX_FILE_BYTES
+    );
+    assert_eq!(
+        config.tools.checkpoint_cleanup_interval_secs,
+        DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_SECS
+    );
     assert!(config.tools.lazy_schema_loading);
     assert!(config.tools.core.contains(&"grep".to_string()));
     assert!(config.tools.core.contains(&"plan_patch".to_string()));
@@ -770,6 +782,9 @@ fn config_reads_supported_env_overrides() {
         "SQUEEZY_TELEMETRY_ENDPOINT" => Some("https://telemetry.example/v1/batch".to_string()),
         "SQUEEZY_SESSION_MODE" => Some("plan".to_string()),
         "SQUEEZY_CHECKPOINTS_ENABLED" => Some("true".to_string()),
+        "SQUEEZY_CHECKPOINT_RETENTION_DAYS" => Some("14".to_string()),
+        "SQUEEZY_CHECKPOINT_MAX_FILE_BYTES" => Some("4096".to_string()),
+        "SQUEEZY_CHECKPOINT_CLEANUP_INTERVAL_SECS" => Some("0".to_string()),
         "SQUEEZY_SKILLS_USER_DIR" => Some("/tmp/squeezy-skills".to_string()),
         "SQUEEZY_SKILLS_COMPAT_USER_DIR" => Some("/tmp/agent-skills".to_string()),
         _ => None,
@@ -793,6 +808,9 @@ fn config_reads_supported_env_overrides() {
     assert_eq!(config.max_tool_calls_per_turn, 12);
     assert_eq!(config.max_tool_bytes_read_per_turn, 3456);
     assert_eq!(config.max_search_files_per_turn, 78);
+    assert_eq!(config.tools.checkpoint_retention_days, 14);
+    assert_eq!(config.tools.checkpoint_max_file_bytes, 4096);
+    assert_eq!(config.tools.checkpoint_cleanup_interval_secs, 0);
     assert_eq!(
         config.telemetry,
         TelemetryConfig {
@@ -2674,6 +2692,9 @@ tool_outputs = ".squeezy/tool_outputs"
 
 [tools]
 checkpoints_enabled = true
+checkpoint_retention_days = 3
+checkpoint_max_file_bytes = 8192
+checkpoint_cleanup_interval_secs = 11
 lazy_schema_loading = true
 core = ["webfetch"]
 discoverable = ["read_file"]
@@ -2742,6 +2763,9 @@ reason = "docs lookups are safe"
         Some(PathBuf::from(".squeezy/tool_outputs"))
     );
     assert!(config.checkpoints_enabled);
+    assert_eq!(config.tools.checkpoint_retention_days, 3);
+    assert_eq!(config.tools.checkpoint_max_file_bytes, 8192);
+    assert_eq!(config.tools.checkpoint_cleanup_interval_secs, 11);
     assert!(config.tools.lazy_schema_loading);
     assert!(config.tools.core.contains(&"webfetch".to_string()));
     assert!(!config.tools.core.contains(&"read_file".to_string()));

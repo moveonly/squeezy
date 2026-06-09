@@ -4092,7 +4092,7 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
 }
 
 #[test]
-fn slash_menu_filters_checkpoint_commands_from_disabled_config() {
+fn slash_menu_surfaces_checkpoint_commands_when_disabled_for_discovery() {
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/".to_string());
     let names = input::slash_suggestions_for_app(&app)
@@ -4101,8 +4101,8 @@ fn slash_menu_filters_checkpoint_commands_from_disabled_config() {
         .collect::<Vec<_>>();
     for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
         assert!(
-            !names.contains(&checkpoint_command),
-            "{checkpoint_command} should not be suggested while checkpointing is disabled"
+            names.contains(&checkpoint_command),
+            "{checkpoint_command} should remain discoverable while checkpointing is disabled"
         );
     }
 

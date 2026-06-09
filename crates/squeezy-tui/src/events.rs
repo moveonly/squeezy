@@ -848,7 +848,7 @@ pub(crate) fn drain_pending_mention_walk(app: &mut TuiApp) {
 
 fn edit_recovery_hint(app: &TuiApp) -> &'static str {
     if app.checkpoints_enabled {
-        "/diff to inspect changes · /undo to revert this turn"
+        "/diff to inspect changes · /undo latest checkpoint · /revert-turn <group_id> for a full turn"
     } else {
         "/diff to inspect changes"
     }

@@ -50,6 +50,9 @@ pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
 /// provider does not consult model registries during a request — this
 /// is purely a label that flows through cost/logging surfaces.
 pub const DEFAULT_FAUX_MODEL: &str = "faux-1";
+pub const DEFAULT_CHECKPOINT_RETENTION_DAYS: u64 = 7;
+pub const DEFAULT_CHECKPOINT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+pub const DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_SECS: u64 = 60 * 60;
 
 // Small-fast-model defaults per provider. Used for low-stakes background calls
 // (compaction summaries, classifier prompts, auto-approver) where flagship
@@ -1391,11 +1394,28 @@ impl AppConfig {
         );
         let graph = GraphConfig::from_settings(settings.graph.unwrap_or_default());
         let cache = CacheConfig::from_settings(settings.cache.unwrap_or_default());
-        let tool_settings = settings.tools.unwrap_or_default();
+        let mut tool_settings = settings.tools.unwrap_or_default();
         let checkpoints_enabled = get_var("SQUEEZY_CHECKPOINTS_ENABLED")
             .as_deref()
             .map(parse_enabled_bool)
             .unwrap_or(tool_settings.checkpoints_enabled.unwrap_or(false));
+        if let Some(value) = get_var("SQUEEZY_CHECKPOINT_RETENTION_DAYS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+        {
+            tool_settings.checkpoint_retention_days = Some(value);
+        }
+        if let Some(value) = get_var("SQUEEZY_CHECKPOINT_MAX_FILE_BYTES")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+        {
+            tool_settings.checkpoint_max_file_bytes = Some(value);
+        }
+        if let Some(value) = get_var("SQUEEZY_CHECKPOINT_CLEANUP_INTERVAL_SECS")
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            tool_settings.checkpoint_cleanup_interval_secs = Some(value);
+        }
         let tools = ToolSchemaConfig::from_settings(tool_settings)?;
         let session_resume_picker = session_settings.resume_picker.unwrap_or_default();
         let session_logs = SessionLogConfig::from_settings(&session_settings);
@@ -2263,6 +2283,18 @@ impl AppConfig {
         output.push_str(&format!(
             "checkpoints_enabled = {}\n",
             self.checkpoints_enabled
+        ));
+        output.push_str(&format!(
+            "checkpoint_retention_days = {}\n",
+            self.tools.checkpoint_retention_days
+        ));
+        output.push_str(&format!(
+            "checkpoint_max_file_bytes = {}\n",
+            self.tools.checkpoint_max_file_bytes
+        ));
+        output.push_str(&format!(
+            "checkpoint_cleanup_interval_secs = {}\n",
+            self.tools.checkpoint_cleanup_interval_secs
         ));
         output.push_str(&format!(
             "lazy_schema_loading = {}\n",
@@ -5304,6 +5336,9 @@ impl RoutingSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSchemaConfig {
     pub lazy_schema_loading: bool,
+    pub checkpoint_retention_days: u64,
+    pub checkpoint_max_file_bytes: u64,
+    pub checkpoint_cleanup_interval_secs: u64,
     pub core: Vec<String>,
     pub discoverable: Vec<String>,
     /// Names that must be filtered out before tools are advertised to
@@ -5318,6 +5353,9 @@ impl Default for ToolSchemaConfig {
     fn default() -> Self {
         Self {
             lazy_schema_loading: true,
+            checkpoint_retention_days: DEFAULT_CHECKPOINT_RETENTION_DAYS,
+            checkpoint_max_file_bytes: DEFAULT_CHECKPOINT_MAX_FILE_BYTES,
+            checkpoint_cleanup_interval_secs: DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_SECS,
             core: DEFAULT_CORE_TOOL_NAMES
                 .iter()
                 .map(|name| (*name).to_string())
@@ -5349,6 +5387,15 @@ impl ToolSchemaConfig {
             lazy_schema_loading: settings
                 .lazy_schema_loading
                 .unwrap_or(defaults.lazy_schema_loading),
+            checkpoint_retention_days: settings
+                .checkpoint_retention_days
+                .unwrap_or(defaults.checkpoint_retention_days),
+            checkpoint_max_file_bytes: settings
+                .checkpoint_max_file_bytes
+                .unwrap_or(defaults.checkpoint_max_file_bytes),
+            checkpoint_cleanup_interval_secs: settings
+                .checkpoint_cleanup_interval_secs
+                .unwrap_or(defaults.checkpoint_cleanup_interval_secs),
             core,
             discoverable,
             excluded,
@@ -5372,6 +5419,9 @@ impl ToolSchemaConfig {
 pub struct ToolSchemaSettings {
     pub checkpoints_enabled: Option<bool>,
     pub lazy_schema_loading: Option<bool>,
+    pub checkpoint_retention_days: Option<u64>,
+    pub checkpoint_max_file_bytes: Option<u64>,
+    pub checkpoint_cleanup_interval_secs: Option<u64>,
     pub core: Option<Vec<String>>,
     pub discoverable: Option<Vec<String>>,
     pub excluded: Option<Vec<String>>,
@@ -5384,6 +5434,9 @@ impl ToolSchemaSettings {
             &[
                 "checkpoints_enabled",
                 "lazy_schema_loading",
+                "checkpoint_retention_days",
+                "checkpoint_max_file_bytes",
+                "checkpoint_cleanup_interval_secs",
                 "core",
                 "discoverable",
                 "excluded",
@@ -5404,6 +5457,24 @@ impl ToolSchemaSettings {
                 source,
                 &field(path, "lazy_schema_loading"),
             )?,
+            checkpoint_retention_days: u64_value(
+                table,
+                "checkpoint_retention_days",
+                source,
+                &field(path, "checkpoint_retention_days"),
+            )?,
+            checkpoint_max_file_bytes: u64_value(
+                table,
+                "checkpoint_max_file_bytes",
+                source,
+                &field(path, "checkpoint_max_file_bytes"),
+            )?,
+            checkpoint_cleanup_interval_secs: u64_value(
+                table,
+                "checkpoint_cleanup_interval_secs",
+                source,
+                &field(path, "checkpoint_cleanup_interval_secs"),
+            )?,
             core: string_array_value(table, "core", source, &field(path, "core"))?,
             discoverable: string_array_value(
                 table,
@@ -5418,6 +5489,18 @@ impl ToolSchemaSettings {
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.checkpoints_enabled, next.checkpoints_enabled);
         replace_if_some(&mut self.lazy_schema_loading, next.lazy_schema_loading);
+        replace_if_some(
+            &mut self.checkpoint_retention_days,
+            next.checkpoint_retention_days,
+        );
+        replace_if_some(
+            &mut self.checkpoint_max_file_bytes,
+            next.checkpoint_max_file_bytes,
+        );
+        replace_if_some(
+            &mut self.checkpoint_cleanup_interval_secs,
+            next.checkpoint_cleanup_interval_secs,
+        );
         merge_string_lists(&mut self.core, next.core);
         merge_string_lists(&mut self.discoverable, next.discoverable);
         merge_string_lists(&mut self.excluded, next.excluded);
@@ -10676,6 +10759,9 @@ pub fn user_settings_template() -> &'static str {
 
 # [tools]
 # checkpoints_enabled = false
+# checkpoint_retention_days = 7
+# checkpoint_max_file_bytes = 2097152
+# checkpoint_cleanup_interval_secs = 3600
 # lazy_schema_loading = true
 # `update_task_state` and `load_tool_schema` are always-core control tools
 # and do not need to appear in `core`. See `DEFAULT_CORE_TOOL_NAMES` in
@@ -10849,6 +10935,9 @@ pub fn project_settings_template() -> &'static str {
 
 # [tools]
 # checkpoints_enabled = false
+# checkpoint_retention_days = 7
+# checkpoint_max_file_bytes = 2097152
+# checkpoint_cleanup_interval_secs = 3600
 # lazy_schema_loading = true
 # `update_task_state` and `load_tool_schema` are always-core control tools
 # and do not need to appear in `core`. See `DEFAULT_CORE_TOOL_NAMES` in

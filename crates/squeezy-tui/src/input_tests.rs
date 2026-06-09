@@ -147,7 +147,7 @@ fn copy_is_hidden_from_slash_menu() {
 }
 
 #[test]
-fn checkpoint_commands_hide_when_checkpointing_is_disabled() {
+fn slash_menu_surfaces_checkpoint_commands_when_disabled_for_discovery() {
     let names = slash_suggestions("/")
         .into_iter()
         .filter(|cmd| cmd.visible_with_checkpoints(false))
@@ -156,8 +156,8 @@ fn checkpoint_commands_hide_when_checkpointing_is_disabled() {
 
     for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
         assert!(
-            !names.contains(&checkpoint_command),
-            "{checkpoint_command} should be hidden when checkpointing is disabled"
+            names.contains(&checkpoint_command),
+            "{checkpoint_command} should remain discoverable when checkpointing is disabled"
         );
     }
 }

@@ -26,15 +26,25 @@ A `CheckpointRecord` (`crates/squeezy-vcs/src/lib.rs`) carries:
 
 `RollbackTarget` (same file) is therefore three-way:
 
-- `Latest` — the most recent record.
+- `Latest` — the most recent record that has not already been fully rolled
+  back by a successful rollback journal entry.
 - `Group(group_id)` — every record tagged with that turn id.
 - `Checkpoint(id)` — one specific record.
 
 Both `Atomic` and `BestEffort` rollback modes accept any of the three
-targets; the sha256 and file-type gates are identical in all cases.
-`checkpoint_undo` targets `Latest`; `checkpoint_revert` requires exactly one
-of `group_id` or `checkpoint_id`. Both tool surfaces preflight the full set of
-paths that rollback can mutate, including the source side of a reversed rename.
+targets; the sha256 and file-type gates are identical in all cases. `Atomic`
+writes a backup of every touched path to memory before applying so a per-file
+write failure rolls the workspace back to the pre-rollback bytes — atomic apart
+from a crash window between apply and restore. A process crash between the
+partial apply and either successful completion or backup restore can leave the
+workspace half-applied with no on-disk recovery state.
+
+`checkpoint_undo` targets `Latest`; `checkpoint_revert` requires exactly one of
+`group_id` or `checkpoint_id`. Both tool surfaces preflight the full set of
+paths that rollback can mutate, including the source side of a reversed rename
+and hardlink peers. `checkpoint_restore_file` uses the same conflict and path
+safety gates but restores only one file and does not mark the whole checkpoint
+consumed for future `Latest` undo selection.
 
 Rollback safety is checked against the raw worktree byte hash when the
 checkpoint recorded one. Git blob hashes remain in the record for object
@@ -117,6 +127,11 @@ Large-file discovery is Git-driven: the shadow repo asks `git ls-files -z
 metadata checks. This avoids recursive per-path `git check-ignore` calls on
 large Linux workspaces.
 
+The store options are configured from `[tools]`: `checkpoint_retention_days`,
+`checkpoint_max_file_bytes`, and `checkpoint_cleanup_interval_secs`. Cleanup is
+throttled by the interval so ordinary edit checkpoints do not synchronously
+rewrite the journal and run `git gc` on every mutation.
+
 Rollback attempts are journaled even when only some paths are restored.
 `BestEffort` mode converts per-file filesystem errors into structured
 conflicts and continues with later files. `Atomic` mode preflights
@@ -131,18 +146,25 @@ on Windows, where read-only attributes, editor locks, antivirus
 scanners, and sync tools can reject one write/delete while other paths
 are still safe.
 
+Rollback path preflight returns every path a rollback may write or delete. For
+renames that includes both the destination path and the restored source path,
+so current workspace write policy is checked before any rollback target can
+recreate a source file. For hardlinked files, preflight also includes peer
+paths that relinking may mutate.
+
 `checkpoint_doctor` (also reachable from `/checkpoints doctor`) performs a
 no-op shadow snapshot and reports the normalized workspace/shadow paths, Git
 path mode, relevant shadow Git config, discovered `.gitattributes`, lock-file
 writability, protected-ref create/delete capability, and a temporary CRLF
 checkpoint/mutate/rollback smoke result. The smoke workspace is created outside
-the user's project and removed after the report.
+the user's project and removed after the report. `checkpoint_check` reports
+journal/ref/blob integrity without running the smoke.
 
 ## What This Document Is Not
 
 This is not a user manual. The agent-visible tools (`checkpoint_list`,
 `checkpoint_doctor`, `checkpoint_show`, `checkpoint_undo`,
-`checkpoint_revert`) are
+`checkpoint_revert`, `checkpoint_restore_file`, `checkpoint_check`) are
 documented in their own specs under `crates/squeezy-tools/src/`. This
 file records *why* the `group_id` axis exists so a future refactor
 does not pare it down to `Latest` + `Checkpoint(id)` on the grounds

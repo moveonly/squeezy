@@ -35,6 +35,18 @@ pub(crate) struct CheckpointRevertArgs {
     mode: Option<RollbackMode>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointRestoreFileArgs {
+    pub(crate) checkpoint_id: String,
+    pub(crate) path: String,
+    mode: Option<RollbackMode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckpointCheckArgs {}
+
 impl ToolRegistry {
     pub(crate) async fn execute_checkpoint_list(&self, call: &ToolCall) -> ToolResult {
         if let Err(err) = serde_json::from_value::<CheckpointListArgs>(call.arguments.clone()) {
@@ -139,7 +151,7 @@ impl ToolRegistry {
             return checkpoints_disabled_result(call);
         };
         let target = RollbackTarget::Latest;
-        if let Some(result) = self.preflight_checkpoint_rollback_paths(call, target) {
+        if let Some(result) = self.assess_rollback_paths(call, target) {
             return result;
         }
         match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
@@ -147,10 +159,7 @@ impl ToolRegistry {
                 self.invalidate_diff_cache();
                 // `rollback` returns `skipped && !applied` with no
                 // conflicts when the journal had nothing to select. That
-                // is the clean-tree happy path — no checkpoints exist to
-                // undo. Surface it as a Success result carrying a
-                // structured `message`, distinct from Stale (which is
-                // reserved for partial rollbacks and conflicts).
+                // is the clean-tree happy path: no checkpoints exist to undo.
                 let nothing_to_undo =
                     result.skipped && !result.applied && result.conflicts.is_empty();
                 if nothing_to_undo {
@@ -203,10 +212,83 @@ impl ToolRegistry {
         let Some(checkpoints) = self.checkpoints.as_ref() else {
             return checkpoints_disabled_result(call);
         };
-        if let Some(result) = self.preflight_checkpoint_rollback_paths(call, target) {
+        if let Some(result) = self.assess_rollback_paths(call, target) {
             return result;
         }
         match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
+            Ok(result) => {
+                self.invalidate_diff_cache();
+                let nothing_to_revert =
+                    result.skipped && !result.applied && result.conflicts.is_empty();
+                if nothing_to_revert {
+                    return make_result(
+                        call,
+                        ToolStatus::Success,
+                        json!({
+                            "rollback": result,
+                            "message": "nothing to revert",
+                        }),
+                        ToolCostHint::default(),
+                        None,
+                    );
+                }
+                let message = rollback_message(&result);
+                make_result(
+                    call,
+                    if result.conflicts.is_empty() && !result.skipped && result.applied {
+                        ToolStatus::Success
+                    } else {
+                        ToolStatus::Stale
+                    },
+                    json!({
+                        "rollback": result,
+                        "message": message,
+                    }),
+                    ToolCostHint::default(),
+                    None,
+                )
+            }
+            Err(err) => tool_error(call, err),
+        }
+    }
+
+    pub(crate) async fn execute_checkpoint_restore_file(&self, call: &ToolCall) -> ToolResult {
+        let args = match serde_json::from_value::<CheckpointRestoreFileArgs>(call.arguments.clone())
+        {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return checkpoints_disabled_result(call);
+        };
+        let paths = match checkpoints.restore_checkpoint_file_paths(&args.checkpoint_id, &args.path)
+        {
+            Ok(paths) if paths.is_empty() => vec![args.path.clone()],
+            Ok(paths) => paths,
+            Err(err) => return tool_error(call, err),
+        };
+        for path in paths {
+            if let Err(err) = safety::assess_write_path(&path, &self.root, &self.shell_sandbox) {
+                return make_result(
+                    call,
+                    ToolStatus::Denied,
+                    json!({
+                        "error": err.message(),
+                        "path": path,
+                        "reason": err.code(),
+                        "permission_denied": true,
+                        "policy_denied": true,
+                    }),
+                    ToolCostHint::default(),
+                    None,
+                );
+            }
+        }
+        match checkpoints.restore_checkpoint_file(
+            &args.checkpoint_id,
+            &args.path,
+            args.mode.unwrap_or_default(),
+        ) {
             Ok(result) => {
                 self.invalidate_diff_cache();
                 let message = rollback_message(&result);
@@ -229,37 +311,57 @@ impl ToolRegistry {
         }
     }
 
-    fn preflight_checkpoint_rollback_paths(
+    pub(crate) async fn execute_checkpoint_check(&self, call: &ToolCall) -> ToolResult {
+        if let Err(err) = serde_json::from_value::<CheckpointCheckArgs>(call.arguments.clone()) {
+            return tool_arg_error(call, err);
+        }
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return checkpoints_disabled_result(call);
+        };
+        match checkpoints.integrity_report() {
+            Ok(report) => make_result(
+                call,
+                if report.ok {
+                    ToolStatus::Success
+                } else {
+                    ToolStatus::Stale
+                },
+                json!({ "integrity": report }),
+                ToolCostHint::default(),
+                None,
+            ),
+            Err(err) => tool_error(call, err),
+        }
+    }
+
+    fn assess_rollback_paths(
         &self,
         call: &ToolCall,
         target: RollbackTarget<'_>,
     ) -> Option<ToolResult> {
         let checkpoints = self.checkpoints.as_ref()?;
-        match checkpoints.rollback_paths(target) {
-            Ok(paths) => {
-                for path in paths {
-                    if let Err(err) =
-                        safety::assess_write_path(&path, &self.root, &self.shell_sandbox)
-                    {
-                        return Some(make_result(
-                            call,
-                            ToolStatus::Denied,
-                            json!({
-                                "error": err.message(),
-                                "path": path,
-                                "reason": err.code(),
-                                "permission_denied": true,
-                                "policy_denied": true,
-                            }),
-                            ToolCostHint::default(),
-                            None,
-                        ));
-                    }
-                }
-                None
+        let paths = match checkpoints.rollback_paths(target) {
+            Ok(paths) => paths,
+            Err(err) => return Some(tool_error(call, err)),
+        };
+        for path in paths {
+            if let Err(err) = safety::assess_write_path(&path, &self.root, &self.shell_sandbox) {
+                return Some(make_result(
+                    call,
+                    ToolStatus::Denied,
+                    json!({
+                        "error": err.message(),
+                        "path": path,
+                        "reason": err.code(),
+                        "permission_denied": true,
+                        "policy_denied": true,
+                    }),
+                    ToolCostHint::default(),
+                    None,
+                ));
             }
-            Err(err) => Some(tool_error(call, err)),
         }
+        None
     }
 }
 

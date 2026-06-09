@@ -645,7 +645,9 @@ pub(crate) async fn shell_sandbox_backend_probe_failure(
 ) -> Option<String> {
     match plan.backend {
         "macos-sandbox-exec" => macos_sandbox_plan_probe_failure(plan, timeout).await,
-        "windows-restricted-token" => windows_restricted_plan_probe_failure(plan, timeout).await,
+        "windows-restricted-token" | "windows-elevated" => {
+            windows_sandbox_plan_probe_failure(plan, timeout).await
+        }
         // Linux support is already probed before this point via unshare and
         // Landlock capability checks; a second process probe would add latency
         // without exercising the same pre_exec path.
@@ -718,47 +720,50 @@ async fn macos_sandbox_plan_probe_failure(
 }
 
 #[cfg(target_os = "windows")]
-async fn windows_restricted_plan_probe_failure(
-    plan: ShellSandboxPlan,
+async fn windows_sandbox_plan_probe_failure(
+    mut plan: ShellSandboxPlan,
     timeout: Duration,
 ) -> Option<String> {
-    use squeezy_win_sandbox::{
-        WinNetwork, WinSandboxSpec, WinTokenMode, WinWritableRoot, spawn_restricted_token,
-    };
-
-    let Some(cwd) = plan.filesystem_write_roots.first().cloned() else {
-        return Some("windows restricted-token probe has no writable workspace root".to_string());
-    };
-
-    let mut args = plan.args.clone();
-    let Some(command_arg) = args.last_mut() else {
+    let Some(command_arg) = plan.args.last_mut() else {
         return Some(format!(
             "shell sandbox backend {} probe could not build command",
             plan.backend
         ));
     };
-    *command_arg = "echo squeezy-sandbox-ready".to_string();
+    *command_arg = "echo squeezy_sandbox_probe".to_string();
 
-    let mut argv = Vec::with_capacity(args.len() + 1);
-    argv.push(plan.program.clone());
-    argv.extend(args);
-
-    let spec = WinSandboxSpec {
-        token_mode: WinTokenMode::WritableRootsCapability,
+    let Some(workdir) = plan.filesystem_write_roots.first().cloned() else {
+        return Some(format!(
+            "shell sandbox backend {} probe has no writable workspace root",
+            plan.backend
+        ));
+    };
+    let spec = squeezy_win_sandbox::WinSandboxSpec {
+        token_mode: squeezy_win_sandbox::WinTokenMode::WritableRootsCapability,
         writable_roots: plan
             .filesystem_write_roots
             .iter()
-            .map(WinWritableRoot::new)
+            .map(squeezy_win_sandbox::WinWritableRoot::new)
             .collect(),
-        read_roots: Vec::new(),
+        read_roots: plan.filesystem_read_roots.clone(),
         deny_read_paths: Vec::new(),
         protected_metadata_names: Vec::new(),
         sensitive_path_patterns: Vec::new(),
-        network: WinNetwork::Unenforced,
-        state_dir: crate::win_sandbox_spec::win_state_dir(),
+        network: squeezy_win_sandbox::WinNetwork::Unenforced,
+        state_dir: squeezy_core::default_win_sandbox_state_dir(),
     };
+    let mut argv = Vec::with_capacity(1 + plan.args.len());
+    argv.push(plan.program.clone());
+    argv.extend(plan.args.iter().cloned());
+    // The probe deliberately inherits the host environment so the backend has
+    // the same `PATH`, `SystemRoot`, and adjacent variables a real shell would see.
     let env: HashMap<String, String> = std::env::vars().collect();
-    let mut child = match spawn_restricted_token(&spec, &argv, &cwd, &env, false) {
+    let spawned = if plan.backend == "windows-elevated" {
+        squeezy_win_sandbox::spawn_elevated(&spec, &argv, &workdir, &env, false)
+    } else {
+        squeezy_win_sandbox::spawn_restricted_token(&spec, &argv, &workdir, &env, false)
+    };
+    let mut child = match spawned {
         Ok(child) => child,
         Err(err) => {
             return Some(format!(
@@ -771,33 +776,39 @@ async fn windows_restricted_plan_probe_failure(
     let timeout = timeout.max(Duration::from_secs(5));
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) if status.success() => None,
-        Ok(Ok(status)) => Some(format!(
-            "shell sandbox backend {} probe exited with {status:?}",
-            plan.backend
+        Ok(Ok(status)) => Some(shell_sandbox_backend_probe_status_reason(
+            plan.backend,
+            &status,
         )),
-        Ok(Err(err)) => Some(format!(
-            "shell sandbox backend {} probe wait failed: {err}",
-            plan.backend
-        )),
+        Ok(Err(err)) => {
+            child.kill();
+            let _ = child.wait().await;
+            Some(format!(
+                "shell sandbox backend {} probe wait failed: {err}",
+                plan.backend
+            ))
+        }
         Err(_) => {
             child.kill();
+            let _ = child.wait().await;
             Some(format!(
-                "shell sandbox backend {} probe timed out after {timeout:?}",
-                plan.backend
+                "shell sandbox backend {} probe timed out after {} ms",
+                plan.backend,
+                timeout.as_millis()
             ))
         }
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-async fn windows_restricted_plan_probe_failure(
+async fn windows_sandbox_plan_probe_failure(
     _plan: ShellSandboxPlan,
     _timeout: Duration,
 ) -> Option<String> {
     None
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn shell_sandbox_backend_probe_status_reason(
     backend: &'static str,
     status: &std::process::ExitStatus,
