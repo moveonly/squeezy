@@ -9817,22 +9817,35 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 pub fn default_squeezy_skills_dir() -> PathBuf {
-    if let Some(home) = env::var_os("HOME") {
-        return PathBuf::from(home).join(DEFAULT_SQUEEZY_SKILLS_DIR);
+    squeezy_skills_dir_for_home(env::var_os("HOME").map(PathBuf::from), dirs::data_dir())
+}
+
+pub fn default_agent_compat_skills_dir() -> PathBuf {
+    agent_compat_skills_dir_for_home(env::var_os("HOME").map(PathBuf::from), dirs::data_dir())
+}
+
+/// Pure helper for `default_squeezy_skills_dir`. Factored out so the
+/// HOME-unset fallback (containers, systemd units) can be unit tested
+/// without mutating process env, which races with any other test that
+/// reads `HOME` without taking the env mutex.
+fn squeezy_skills_dir_for_home(home: Option<PathBuf>, data: Option<PathBuf>) -> PathBuf {
+    if let Some(home) = home {
+        return home.join(DEFAULT_SQUEEZY_SKILLS_DIR);
     }
-    // When HOME is absent (containers, systemd services) use the
-    // platform data dir so skills don't bind to the process cwd.
-    if let Some(data) = dirs::data_dir() {
+    if let Some(data) = data {
         return data.join("squeezy").join("skills");
     }
     PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR)
 }
 
-pub fn default_agent_compat_skills_dir() -> PathBuf {
-    if let Some(home) = env::var_os("HOME") {
-        return PathBuf::from(home).join(DEFAULT_AGENT_COMPAT_SKILLS_DIR);
+/// Pure helper for `default_agent_compat_skills_dir`. See
+/// `squeezy_skills_dir_for_home` for the rationale on the explicit
+/// `home` / `data` parameters.
+fn agent_compat_skills_dir_for_home(home: Option<PathBuf>, data: Option<PathBuf>) -> PathBuf {
+    if let Some(home) = home {
+        return home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR);
     }
-    if let Some(data) = dirs::data_dir() {
+    if let Some(data) = data {
         return data.join("agents").join("skills");
     }
     PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR)
@@ -10344,26 +10357,21 @@ fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>, Vec<Con
     // systemd units, or CI environments. Skip the warning when the operator
     // already set SQUEEZY_SETTINGS_PATH, which is the documented escape hatch
     // for HOME-less environments — warning in that case is a false positive.
-    #[cfg(unix)]
-    {
-        if env::var_os("HOME").is_none() && env::var_os("SQUEEZY_SETTINGS_PATH").is_none() {
-            warnings.push(ConfigWarning {
-                source: "environment".to_string(),
-                field: format!(
-                    "HOME is not set; user settings, skills, and session paths fall back to \
-                     platform defaults or process-relative locations ({user_path}). \
-                     Set HOME or use SQUEEZY_SETTINGS_PATH / SQUEEZY_SESSION_DIR to override.",
-                    user_path = user_path.display()
-                ),
-            });
-        }
+    if let Some(warning) = home_unset_warning(
+        env::var_os("HOME").is_some(),
+        env::var_os("SQUEEZY_SETTINGS_PATH").is_some(),
+        &user_path,
+    ) {
+        warnings.push(warning);
     }
-    // Warn when SQUEEZY_SESSION_DIR is set with a leading '~'. After the
-    // tilde-expansion fix this resolves correctly, but the warning makes
-    // the automatic expansion visible in config output.
+    // Warn when SQUEEZY_SESSION_DIR is set with a leading '~'. The
+    // expansion helper recognises only `~` and `~/...`; `~user/...`
+    // is left as a literal relative path under cwd, which is almost
+    // never what the operator wanted. Split the warning so each case
+    // promises only what `expand_home_path` actually delivers.
     if let Ok(raw) = env::var("SQUEEZY_SESSION_DIR") {
         let trimmed = raw.trim();
-        if trimmed.starts_with('~') {
+        if trimmed == "~" || trimmed.starts_with("~/") {
             warnings.push(ConfigWarning {
                 source: "SQUEEZY_SESSION_DIR".to_string(),
                 field: format!(
@@ -10371,9 +10379,57 @@ fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>, Vec<Con
                      Squeezy expands it against HOME automatically."
                 ),
             });
+        } else if trimmed.starts_with('~') {
+            warnings.push(ConfigWarning {
+                source: "SQUEEZY_SESSION_DIR".to_string(),
+                field: format!(
+                    "SQUEEZY_SESSION_DIR value '{trimmed}' starts with '~user/...'; \
+                     Squeezy does not expand `~user/...` and the value will be \
+                     treated as a literal relative path. Use an absolute path \
+                     (e.g. /home/user/sessions) instead."
+                ),
+            });
         }
     }
     Ok((settings, sources, warnings))
+}
+
+/// Pure version of the HOME-unset warning. Factored out so it can be
+/// unit tested without mutating the process environment, which races
+/// any other test that reads `HOME` without taking the env mutex.
+///
+/// Returns `Some(ConfigWarning)` only on Unix when `home_set` is false
+/// and `settings_path_set` is false (`SQUEEZY_SETTINGS_PATH` is the
+/// documented escape hatch for HOME-less environments). The warning
+/// surfaces the resolved fallback path to make it easy for an operator
+/// to see where Squeezy is actually looking.
+fn home_unset_warning(
+    home_set: bool,
+    settings_path_set: bool,
+    user_path: &Path,
+) -> Option<ConfigWarning> {
+    #[cfg(unix)]
+    {
+        if !home_set && !settings_path_set {
+            return Some(ConfigWarning {
+                source: "environment".to_string(),
+                field: format!(
+                    "HOME is not set; user settings, skills, and session paths fall back to \
+                     the platform config/data directories (dirs::config_dir() / \
+                     dirs::data_dir(); on Linux these honour $XDG_CONFIG_HOME / \
+                     $XDG_DATA_HOME) or, when those are unavailable, process-relative \
+                     locations ({user_path}). Set HOME or use SQUEEZY_SETTINGS_PATH / \
+                     SQUEEZY_SESSION_DIR to override.",
+                    user_path = user_path.display()
+                ),
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (home_set, settings_path_set, user_path);
+    }
+    None
 }
 
 /// A single tier's settings file as both its parsed form and its raw
@@ -10510,19 +10566,30 @@ pub fn resolve_field_source(
 /// value was chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigPaths {
-    /// Primary user settings file (`~/.squeezy/settings.toml` or
-    /// `$XDG_CONFIG_HOME/squeezy/settings.toml` when HOME is absent).
+    /// Primary user settings file (`~/.squeezy/settings.toml` or, when HOME
+    /// is absent, the platform config dir from `dirs::config_dir()`:
+    /// `$XDG_CONFIG_HOME/squeezy/settings.toml` on Linux,
+    /// `~/Library/Application Support/squeezy/settings.toml` on macOS,
+    /// `%APPDATA%\squeezy\settings.toml` on Windows).
     pub user_settings: PathBuf,
-    /// Source that determined `user_settings` (`"env"`, `"home"`, `"xdg"`, or `"default"`).
+    /// Source that determined `user_settings`. One of:
+    /// - `"env"`            — `SQUEEZY_SETTINGS_PATH` is set.
+    /// - `"home"`           — Unix HOME-based dotdir (`~/.squeezy/settings.toml`).
+    /// - `"platform_config"` — `dirs::config_dir()` (XDG on Linux,
+    ///   `Application Support` on macOS, `%APPDATA%` on Windows).
+    /// - `"default"`        — process-relative fallback `.squeezy/settings.toml`.
     pub user_settings_source: &'static str,
     /// Committed project settings (nearest `squeezy.toml` above cwd), if found.
     pub project_settings: Option<PathBuf>,
     /// Per-machine repo-local settings (`~/.squeezy/projects/<hash>/settings.toml`).
     pub repo_settings: PathBuf,
-    /// Session log directory as overridden by `SQUEEZY_SESSION_DIR`. `None` when the
-    /// env var is not set; note that `[session].log_dir` from TOML is **not** reflected
-    /// here. For the fully resolved log directory, see `AppConfig.session_logs.log_dir`.
-    pub session_log_dir: Option<PathBuf>,
+    /// Session log directory as overridden by `SQUEEZY_SESSION_DIR`. `None` when
+    /// the env var is not set; **`[session].log_dir` from TOML is not reflected
+    /// here** (this struct is computed without reading any TOML). The field is
+    /// named `_env` to make the env-only nature explicit; for the fully resolved
+    /// log directory after TOML and CLI flags are applied, see
+    /// `AppConfig.session_logs.log_dir`.
+    pub session_log_dir_env: Option<PathBuf>,
     /// Default user skills directory (HOME-based or platform data dir).
     /// Does not reflect `SQUEEZY_SKILLS_USER_DIR` or `[skills].user_dir` TOML overrides.
     /// For the effective runtime value, see `AppConfig.skills`.
@@ -10537,7 +10604,10 @@ pub struct ConfigPaths {
     pub projects_dir: PathBuf,
     /// Whether `HOME` is set in the current environment.
     pub home_set: bool,
-    /// Absolute normalized `HOME` value, if set.
+    /// Raw `HOME` value as read from the environment, if set. Not canonicalized:
+    /// trailing slashes, `..` segments, and unresolved symlinks pass through
+    /// untouched. Suitable for display in `squeezy doctor`-style output where
+    /// the user benefits from seeing the literal env value.
     pub home: Option<PathBuf>,
 }
 
@@ -10552,12 +10622,15 @@ pub fn resolved_config_paths() -> ConfigPaths {
     // Mirror the branch order in default_settings_path() so the source tag is
     // accurate. On non-Unix, home_squeezy_subpath() always returns None, so
     // HOME being set does not actually steer the path to the dotdir branch.
+    // The string `"platform_config"` is used (rather than `"xdg"`) because
+    // `dirs::config_dir()` resolves to `Application Support` on macOS and
+    // `%APPDATA%` on Windows — neither of which is XDG.
     let user_settings_source = if env::var_os("SQUEEZY_SETTINGS_PATH").is_some() {
         "env"
     } else if cfg!(unix) && home_set {
         "home"
     } else if dirs::config_dir().is_some() {
-        "xdg"
+        "platform_config"
     } else {
         "default"
     };
@@ -10571,7 +10644,7 @@ pub fn resolved_config_paths() -> ConfigPaths {
         .unwrap_or_else(|| cwd.clone());
     let repo_settings = per_repo_settings_path(&repo_root);
 
-    let session_log_dir = env::var("SQUEEZY_SESSION_DIR")
+    let session_log_dir_env = env::var("SQUEEZY_SESSION_DIR")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
@@ -10582,7 +10655,7 @@ pub fn resolved_config_paths() -> ConfigPaths {
         user_settings_source,
         project_settings,
         repo_settings,
-        session_log_dir,
+        session_log_dir_env,
         squeezy_skills_dir: default_squeezy_skills_dir(),
         agent_compat_skills_dir: default_agent_compat_skills_dir(),
         prompt_history: default_prompt_history_path(),
@@ -10597,6 +10670,25 @@ pub fn resolved_config_paths() -> ConfigPaths {
 pub struct SettingsPermissionIssue {
     pub path: PathBuf,
     pub message: String,
+}
+
+/// Wrap `value` in POSIX single quotes so it can be safely pasted into a
+/// shell. Embedded single quotes are escaped using the standard
+/// `'\''` close-reopen idiom so paths containing `'` (or any other
+/// metacharacter) round-trip correctly when piped to a future
+/// `squeezy doctor --apply` command.
+fn shell_quote_single(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Check existing settings files for overly permissive Unix permissions.
@@ -10626,9 +10718,9 @@ pub fn check_settings_file_permissions() -> Vec<SettingsPermissionIssue> {
                     path: path.clone(),
                     message: format!(
                         "settings file has loose permissions ({:#o}); expected 0o600 \
-                         (owner read/write only). Run: chmod 600 '{}'",
+                         (owner read/write only). Run: chmod 600 {}",
                         mode & 0o777,
-                        path.display()
+                        shell_quote_single(&path.display().to_string())
                     ),
                 });
             }

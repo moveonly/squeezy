@@ -4712,8 +4712,11 @@ fn resolve_field_source_uses_repo_then_project_then_user() {
     let profile_field = &models.fields[2]; // profile
 
     // Env-override fields might be set in the test environment; clear them so
-    // the test asserts the tier precedence, not env precedence.
-    // SAFETY: tests run single-threaded by default for this module.
+    // the test asserts the tier precedence, not env precedence. Hold the
+    // shared env mutex to serialize against any other test in this module
+    // that mutates the same vars.
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: env mutations are guarded by TEST_ENV_MUTEX above.
     unsafe {
         std::env::remove_var("SQUEEZY_PROVIDER");
         std::env::remove_var("SQUEEZY_MODEL");
@@ -4732,6 +4735,7 @@ fn resolve_field_source_uses_repo_then_project_then_user() {
         resolve_field_source(&sources, profile_field),
         config_schema::FieldSource::Default
     );
+    drop(_env_guard);
 }
 
 #[test]
@@ -4750,10 +4754,14 @@ fn resolve_field_source_returns_env_when_env_var_set() {
         Some("SQUEEZY_PROVIDER"),
         "provider field should declare env_override; precondition for this test"
     );
-    // SAFETY: tests run single-threaded by default for this module.
+    // Hold the shared env mutex while we mutate process env so we don't
+    // race with any other test that touches SQUEEZY_PROVIDER.
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: env mutations are guarded by TEST_ENV_MUTEX above.
     unsafe { std::env::set_var("SQUEEZY_PROVIDER", "anthropic") };
     let resolved = resolve_field_source(&sources, provider_field);
     unsafe { std::env::remove_var("SQUEEZY_PROVIDER") };
+    drop(_env_guard);
     assert_eq!(resolved, config_schema::FieldSource::Env);
 }
 
@@ -6134,5 +6142,232 @@ fn config_warning_emitted_for_squeezy_session_dir_with_tilde() {
     assert!(
         has_warning,
         "expected a ConfigWarning for SQUEEZY_SESSION_DIR with tilde"
+    );
+}
+
+#[test]
+fn no_session_dir_warning_when_value_is_absolute() {
+    // Negative companion to the positive tilde test: an absolute
+    // SQUEEZY_SESSION_DIR must not produce the tilde-expansion warning.
+    // Pins the `starts_with('~')` predicate so a future change can't turn
+    // it into an unconditional warning.
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("SQUEEZY_SESSION_DIR", "/var/log/squeezy") };
+    let result = AppConfig::from_env_and_settings();
+    unsafe { std::env::remove_var("SQUEEZY_SESSION_DIR") };
+    drop(_env_guard);
+
+    let config = result.expect("from_env_and_settings should succeed");
+    let has_tilde_warning = config
+        .config_warnings
+        .iter()
+        .any(|w| w.source == "SQUEEZY_SESSION_DIR");
+    assert!(
+        !has_tilde_warning,
+        "absolute SQUEEZY_SESSION_DIR must not produce a tilde warning"
+    );
+}
+
+#[test]
+fn no_session_dir_warning_when_unset() {
+    // When SQUEEZY_SESSION_DIR is unset, the tilde-expansion warning must
+    // not fire. Guards against a future change that triggers on the env
+    // var being present at all.
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::remove_var("SQUEEZY_SESSION_DIR") };
+    let result = AppConfig::from_env_and_settings();
+    drop(_env_guard);
+
+    let config = result.expect("from_env_and_settings should succeed");
+    let has_tilde_warning = config
+        .config_warnings
+        .iter()
+        .any(|w| w.source == "SQUEEZY_SESSION_DIR");
+    assert!(
+        !has_tilde_warning,
+        "unset SQUEEZY_SESSION_DIR must not produce a tilde warning"
+    );
+}
+
+#[test]
+fn config_warning_for_session_dir_user_tilde_does_not_promise_expansion() {
+    // The `~user/...` form is left literal by `expand_home_path`, so the
+    // warning must explicitly say "does not expand" rather than promising
+    // automatic expansion. Pin the wording so a future change can't quietly
+    // re-enable the misleading message reported in PR #400 review.
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("SQUEEZY_SESSION_DIR", "~alice/sessions") };
+    let result = AppConfig::from_env_and_settings();
+    unsafe { std::env::remove_var("SQUEEZY_SESSION_DIR") };
+    drop(_env_guard);
+
+    let config = result.expect("from_env_and_settings should succeed");
+    let warning = config
+        .config_warnings
+        .iter()
+        .find(|w| w.source == "SQUEEZY_SESSION_DIR")
+        .expect("expected a SQUEEZY_SESSION_DIR warning for '~user/...'");
+    assert!(
+        warning.field.contains("does not expand"),
+        "warning for '~user/...' must say it is not expanded"
+    );
+    assert!(
+        !warning
+            .field
+            .contains("expands it against HOME automatically"),
+        "warning for '~user/...' must not promise HOME expansion"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn home_unset_warning_fires_on_unix_without_home_or_settings_path() {
+    // The category note explicitly asks for HOME-unset coverage. Test the
+    // factored helper directly rather than mutating process env, since
+    // many other tests read `HOME` indirectly (e.g. via
+    // `default_squeezy_skills_dir`) without taking the env mutex and would
+    // race with a real `remove_var("HOME")`.
+    let user_path = PathBuf::from("/etc/squeezy/settings.toml");
+    let warning = home_unset_warning(false, false, &user_path)
+        .expect("HOME unset on Unix without SETTINGS_PATH must produce a warning");
+    assert_eq!(warning.source, "environment");
+    assert!(warning.field.contains("HOME is not set"));
+    assert!(
+        warning.field.contains(&user_path.display().to_string()),
+        "warning should surface the resolved fallback path"
+    );
+    // Mention the platform fallback so an operator does not have to enable
+    // RUST_LOG=trace to find which path Squeezy actually chose.
+    assert!(warning.field.contains("dirs::config_dir()"));
+}
+
+#[cfg(unix)]
+#[test]
+fn home_unset_warning_suppressed_by_settings_path_escape_hatch() {
+    // SQUEEZY_SETTINGS_PATH is the documented escape hatch for HOME-less
+    // environments. Pin the suppression so a future change can't quietly
+    // start spamming the warning when the operator opted in.
+    let user_path = PathBuf::from("/etc/squeezy/settings.toml");
+    assert!(
+        home_unset_warning(false, true, &user_path).is_none(),
+        "SQUEEZY_SETTINGS_PATH must suppress the HOME-unset warning"
+    );
+    assert!(
+        home_unset_warning(true, false, &user_path).is_none(),
+        "warning must not fire when HOME is set"
+    );
+    assert!(
+        home_unset_warning(true, true, &user_path).is_none(),
+        "warning must not fire when both HOME and SETTINGS_PATH are present"
+    );
+}
+
+#[test]
+fn squeezy_skills_dir_for_home_falls_back_to_data_dir_when_home_unset() {
+    // The HOME-unset branch added in PR #400 is never exercised when HOME
+    // is set (the typical `cargo test` env). Hit it via the pure helper
+    // so the test does not race with concurrent tests reading HOME.
+    let data = PathBuf::from("/var/lib/data");
+    let skills = squeezy_skills_dir_for_home(None, Some(data.clone()));
+    assert_eq!(skills, data.join("squeezy").join("skills"));
+
+    let compat = agent_compat_skills_dir_for_home(None, Some(data.clone()));
+    assert_eq!(compat, data.join("agents").join("skills"));
+}
+
+#[test]
+fn squeezy_skills_dir_for_home_uses_home_when_provided() {
+    let home = PathBuf::from("/home/alice");
+    let data = PathBuf::from("/var/lib/data");
+    let skills = squeezy_skills_dir_for_home(Some(home.clone()), Some(data.clone()));
+    assert_eq!(skills, home.join(DEFAULT_SQUEEZY_SKILLS_DIR));
+
+    let compat = agent_compat_skills_dir_for_home(Some(home.clone()), Some(data));
+    assert_eq!(compat, home.join(DEFAULT_AGENT_COMPAT_SKILLS_DIR));
+}
+
+#[test]
+fn squeezy_skills_dir_for_home_falls_back_to_relative_when_no_home_or_data() {
+    let skills = squeezy_skills_dir_for_home(None, None);
+    assert_eq!(skills, PathBuf::from(DEFAULT_SQUEEZY_SKILLS_DIR));
+    let compat = agent_compat_skills_dir_for_home(None, None);
+    assert_eq!(compat, PathBuf::from(DEFAULT_AGENT_COMPAT_SKILLS_DIR));
+}
+
+#[test]
+fn expand_home_path_leaves_named_user_tilde_literal() {
+    // `~alice/sessions` and `~root` are not expanded — `expand_home_path`
+    // intentionally only handles the `~` and `~/...` forms. Pin the
+    // current "leave it alone" semantics so a future widening to
+    // `~user/...` (e.g. via `getpwnam_r`) shows up as a deliberate change.
+    let named = PathBuf::from("~alice/sessions");
+    assert_eq!(expand_home_path(named.clone()), named);
+
+    let bare_named = PathBuf::from("~root");
+    assert_eq!(expand_home_path(bare_named.clone()), bare_named);
+}
+
+#[cfg(unix)]
+#[test]
+fn check_settings_file_permissions_detects_group_writable_file() {
+    // The category note flagged 0o620 (group-writable but not readable)
+    // as a risk. The check uses `mode & 0o177 != 0` which catches it,
+    // but only the 0o644 case was previously exercised. Lock the
+    // group-write semantics in.
+    use std::os::unix::fs::PermissionsExt;
+    let tmp =
+        std::env::temp_dir().join(format!("squeezy-perm-gw-test-{}.toml", std::process::id()));
+    std::fs::write(&tmp, b"[model]\n").unwrap();
+    let mut perms = std::fs::metadata(&tmp).unwrap().permissions();
+    perms.set_mode(0o620);
+    std::fs::set_permissions(&tmp, perms).unwrap();
+
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", tmp.to_str().unwrap()) };
+    let issues = check_settings_file_permissions();
+    unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") };
+    drop(_env_guard);
+    let _ = std::fs::remove_file(&tmp);
+
+    assert!(
+        !issues.is_empty(),
+        "expected a permission issue for 0o620 (group-writable) settings file"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_settings_file_permissions_follows_symlink_target() {
+    // Symlink rejection is correctly deferred per PR #400 review. Pin the
+    // current behaviour: when `SQUEEZY_SETTINGS_PATH` points at a symlink,
+    // `fs::metadata` follows the link and reports the target's mode. Future
+    // symlink-rejection work can update this test to assert the new policy.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("squeezy-symlink-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("real-settings.toml");
+    let link = dir.join("settings.toml");
+    std::fs::write(&target, b"[model]\n").unwrap();
+    let mut perms = std::fs::metadata(&target).unwrap().permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&target, perms).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", link.to_str().unwrap()) };
+    let issues = check_settings_file_permissions();
+    unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") };
+    drop(_env_guard);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !issues.is_empty(),
+        "perm check should follow the symlink to the 0o644 target and flag it"
+    );
+    assert_eq!(
+        issues[0].path, link,
+        "issue path should report the symlink (the configured path), \
+         not the resolved target"
     );
 }
