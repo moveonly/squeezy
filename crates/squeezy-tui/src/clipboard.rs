@@ -95,6 +95,29 @@ pub(crate) trait ClipboardSink {
     fn write_temp_file(&mut self, payload: &[u8], suggested_name: &str) -> io::Result<PathBuf>;
 }
 
+/// Forward through a boxed sink so a [`ClipboardChain<Box<dyn ClipboardSink>>`]
+/// can be stored on the app and injected with either [`RealSink`] (production)
+/// or a [`RecordingSink`] (tests) without monomorphizing the field to one impl.
+/// This is what keeps the chain's trace-test seam alive at the app layer.
+impl ClipboardSink for Box<dyn ClipboardSink> {
+    fn write_terminal(&mut self, bytes: &[u8]) -> io::Result<()> {
+        (**self).write_terminal(bytes)
+    }
+
+    fn run_command(
+        &mut self,
+        program: &str,
+        args: &[&str],
+        payload: &[u8],
+    ) -> io::Result<CommandOutcome> {
+        (**self).run_command(program, args, payload)
+    }
+
+    fn write_temp_file(&mut self, payload: &[u8], suggested_name: &str) -> io::Result<PathBuf> {
+        (**self).write_temp_file(payload, suggested_name)
+    }
+}
+
 /// Production [`ClipboardSink`]: real stdout, real subprocesses, real files.
 #[derive(Debug, Default)]
 pub(crate) struct RealSink;
@@ -125,12 +148,17 @@ impl ClipboardSink for RealSink {
             .spawn()?;
 
         // Take stdin, write the payload, and drop it to signal EOF before we
-        // wait — otherwise the child may block forever reading.
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(payload)?;
-        }
+        // wait — otherwise the child may block forever reading. Capture the
+        // write result rather than `?`-ing it: short-circuiting here would skip
+        // the `wait` below and leak the child as a zombie. We ALWAYS reap, then
+        // propagate the write error if there was one.
+        let write_result = match child.stdin.take() {
+            Some(mut stdin) => stdin.write_all(payload),
+            None => Ok(()),
+        };
 
         let output = child.wait_with_output()?;
+        write_result?;
         Ok(CommandOutcome {
             status_code: output.status.code(),
             success: output.status.success(),
@@ -414,8 +442,11 @@ pub(crate) struct ClipboardChain<S: ClipboardSink> {
     providers: Vec<ClipboardProvider>,
     /// Configurable OSC 52 payload cap (defaults to [`DEFAULT_OSC52_MAX_BYTES`]).
     osc52_max_bytes: usize,
-    /// When set, chunk oversized OSC 52 payloads across multiple writes per
-    /// the spec form rather than failing over to the platform command.
+    /// When set, write an oversized OSC 52 payload as a SINGLE escape split
+    /// across several `write_terminal` calls (so no one write exceeds the cap),
+    /// rather than failing over to the platform command. This is not the
+    /// multi-escape OSC 52 chunking protocol — it is one
+    /// `ESC ] 52 ; c ; <b64> ST` sequence emitted piecewise.
     osc52_chunk: bool,
     /// When set, any payload larger than this requires `request.confirmed`.
     confirm_threshold: Option<usize>,
@@ -549,11 +580,13 @@ impl<S: ClipboardSink> ClipboardChain<S> {
             ));
         }
 
-        // Over the cap, chunking enabled: emit the spec chunked form. The
-        // opening write carries the OSC 52 prefix, the middle writes are bare
-        // base64 continuations, and the final write closes with `ESC \`
-        // (ST). Terminals that accept chunked OSC 52 reassemble the full
-        // payload; the byte stream the sink records round-trips to `encoded`.
+        // Over the cap, chunking enabled: emit ONE OSC 52 escape split across
+        // several writes so no single `write_terminal` exceeds the cap. The
+        // opening write carries the `ESC ] 52 ; c ;` prefix, the middle writes
+        // are bare base64 continuations of the same sequence, and the final
+        // write closes with `ESC \` (ST). This is not the multi-escape OSC 52
+        // chunking protocol; concatenating the recorded writes round-trips to
+        // the single full sequence terminals already accept.
         let chunk_size = self.osc52_max_bytes.max(1);
         let bytes = encoded.as_bytes();
         let mut offset = 0;

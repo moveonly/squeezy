@@ -216,9 +216,10 @@ fn strip_message_marker(line: &str) -> &str {
     match chars.next() {
         // Marker followed by a space: drop both.
         Some((idx, ' ')) => &line[idx + 1..],
-        // Marker at end of line, or marker immediately followed by content
-        // (no space): drop just the marker.
+        // Marker immediately followed by content (no space): drop just the
+        // marker, keeping the content from the second char on.
         Some((idx, _)) => &line[idx..],
+        // Marker at end of line (it was the only/last char): nothing remains.
         None => "",
     }
 }

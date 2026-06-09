@@ -301,6 +301,34 @@ fn code_block_none_when_cursor_outside_fence() {
     );
 }
 
+#[test]
+fn code_block_none_for_dangling_unclosed_fence() {
+    // An opening fence with no closing fence is incomplete: even with the cursor
+    // parked inside the would-be block, resolution must find no fenced range
+    // rather than running off the end of the rows.
+    let rows = vec![
+        row(0, Some(1), Some(RowKind::Message), "intro"),
+        row(1, Some(1), Some(RowKind::Message), "```rust"),
+        row(2, Some(1), Some(RowKind::Message), "let x = 1;"),
+        row(3, Some(1), Some(RowKind::Message), "let y = 2;"),
+    ];
+    // Cursor on the open fence and on a body line both resolve to nothing.
+    for focus in [RowId(1), RowId(2), RowId(3)] {
+        assert!(
+            gather(
+                &rows,
+                Some(focus),
+                CopyScope::CodeBlockUnderCursor,
+                CopyFormat::Plain,
+                &never_assistant,
+                None,
+            )
+            .is_none(),
+            "dangling fence with focus {focus:?} must not resolve a block"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Viewport / FullTranscript
 // ---------------------------------------------------------------------------
@@ -575,7 +603,9 @@ fn cjk_content_is_preserved_verbatim_across_rows() {
 fn wide_emoji_and_combining_glyphs_survive_gutter_strip() {
     // A mix of wide emoji (🦀, two cells), a ZWJ family emoji (one grapheme,
     // several scalars), and a combining accent must all round-trip unchanged.
-    let content = "ship it 🦀 — café 👨‍👩‍👧 done";
+    // `café` is written with an explicit combining acute (e + U+0301) so the
+    // base glyph and its mark must stay together through the strip.
+    let content = "ship it 🦀 — cafe\u{0301} 👨\u{200d}👩\u{200d}👧 done";
     let rows = vec![row(
         0,
         Some(1),
@@ -595,6 +625,32 @@ fn wide_emoji_and_combining_glyphs_survive_gutter_strip() {
     // The em-dash inside content is NOT a rail dash and must be preserved; only
     // gutter chrome is stripped.
     assert!(text.contains('—'), "em-dash content must survive: {text}");
+
+    // No wide-cell boundary truncation mid-grapheme: the copied scalar sequence
+    // is byte-identical to the source, so every multi-cell glyph (🦀, the family
+    // emoji) and every multi-scalar grapheme (the ZWJ sequence, e + combining
+    // acute) is intact — never sliced at a wide-cell boundary.
+    assert_eq!(text.as_bytes(), content.as_bytes());
+    // The ZWJ joiners survive in place (a truncation at a wide cell would drop a
+    // member emoji or a joiner and leave a dangling U+200D), and the combining
+    // mark stays bound to its base char.
+    assert_eq!(
+        text.matches('\u{200d}').count(),
+        2,
+        "both ZWJ joiners must survive intact: {text:?}"
+    );
+    assert!(
+        text.contains("e\u{0301}"),
+        "the combining acute must stay attached to its base: {text:?}"
+    );
+    // The terminal cell width is preserved end-to-end (a mid-glyph cut would
+    // change the rendered width), confirming no wide cell was halved.
+    let cell_width = |s: &str| {
+        s.chars()
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum::<usize>()
+    };
+    assert_eq!(cell_width(&text), cell_width(content));
 }
 
 #[test]

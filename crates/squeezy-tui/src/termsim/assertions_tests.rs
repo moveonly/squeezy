@@ -51,6 +51,31 @@ fn latest_response_found_in_viewport_or_scrollback() {
 }
 
 #[test]
+fn latest_response_found_via_joined_rows_across_wrap_boundary() {
+    // A reflow split the logical line "the final answer" across two viewport
+    // rows: "the final" then "answer". No single row contains the wrapped
+    // needle, so the per-row pass must miss it and the joined-rows fallback
+    // (rows joined by "\n") must recognize it.
+    let g = grid_with_viewport(&["the final", "answer"]);
+    // Per-row alone cannot see across the boundary.
+    assert!(!g.viewport.iter().any(|r| r.contains("final\nanswer")));
+    // The joined fallback reconstructs the boundary and finds the tail.
+    assert!(latest_response_present(&g, "final\nanswer").is_ok());
+    // A needle that is nowhere in either form still fails.
+    assert!(latest_response_present(&g, "final answer").is_err());
+}
+
+#[test]
+fn latest_response_found_via_joined_rows_across_scrollback_viewport_seam() {
+    // The split can also straddle the scrollback→viewport seam (the last
+    // committed row + the first live row). The fallback joins the two iterators
+    // in that order, so a needle spanning the seam is still found.
+    let mut g = grid_with_viewport(&["answer"]);
+    g.scrollback = vec!["the final".to_string()];
+    assert!(latest_response_present(&g, "final\nanswer").is_ok());
+}
+
+#[test]
 fn cursor_bounds_checks_against_frame_height() {
     let mark = FrameMark {
         byte_offset: 0,

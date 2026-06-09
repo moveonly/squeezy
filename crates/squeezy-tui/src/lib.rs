@@ -4118,7 +4118,12 @@ fn active_transcript_geometry(app: &TuiApp) -> (usize, usize) {
     // screen is up and includes the startup card on a tall enough terminal.
     let include_startup_card = area.height >= 16;
     let viewport_h = main_transcript_height(app, area, include_startup_card);
-    let lines = transcript_lines_for_render(app, Some(area.width), include_startup_card);
+    // Wrap at the text width the renderer actually uses: `render_transcript`
+    // reserves a 1-cell scrollbar gutter and wraps at `width - 1`. Measuring at
+    // the full `area.width` would undercount wrapped rows, so the off-frame
+    // `from_bottom` clamp would disagree with the painted line count.
+    let (text_area, _) = transcript_main_text_and_scrollbar_areas(area);
+    let lines = transcript_lines_for_render(app, Some(text_area.width), include_startup_card);
     (lines.len(), viewport_h as usize)
 }
 
@@ -6137,13 +6142,27 @@ fn sanitize_inline(text: &str) -> String {
 }
 
 /// Build the production clipboard provider chain from env-probed
-/// capabilities. OSC 52 (when believed honoured) → platform command → durable
-/// temp-file fallback. Used by the semantic copy/export path.
-fn build_clipboard_chain() -> clipboard::ClipboardChain<clipboard::RealSink> {
+/// capabilities, over the given side-effect sink. OSC 52 (when believed
+/// honoured) → platform command → durable temp-file fallback. Used by the
+/// semantic copy/export path. The sink is injected (rather than hard-wired to
+/// [`clipboard::RealSink`]) so the field is a `ClipboardChain<Box<dyn
+/// ClipboardSink>>` and an app-layer copy test can drive a `RecordingSink`
+/// with no real terminal/clipboard/subprocess I/O.
+fn build_clipboard_chain(
+    sink: Box<dyn clipboard::ClipboardSink>,
+) -> clipboard::ClipboardChain<Box<dyn clipboard::ClipboardSink>> {
     let env_get = |key: &str| std::env::var_os(key);
     let caps = clipboard::detect_clipboard_capabilities_from_env(env_get);
     let platform = clipboard::platform_commands(env_get);
-    clipboard::ClipboardChain::default_chain(clipboard::RealSink, caps, platform)
+    // TODO(copy-confirm): the chain supports a large-payload confirmation gate
+    // (`set_confirm_threshold` → `CopyOutcome::NeedsConfirmation`), but wiring an
+    // interactive confirm requires a pending-confirm app state plus a
+    // repeat/confirm key handler in the key dispatch, which is owned by a
+    // separate phase. Until that lands we deliberately leave the threshold unset
+    // so `deliver_copy` never has to surface `NeedsConfirmation`, and large
+    // copies degrade gracefully through the platform command / temp-file
+    // fallback instead. See the matching TODO in `deliver_copy`.
+    clipboard::ClipboardChain::default_chain(sink, caps, platform)
 }
 
 /// Pre-build path for [`CopyScope::LastAssistant`]: when the assistant is still
@@ -6247,8 +6266,17 @@ fn build_scope_payload(
 ) -> Option<String> {
     // Copy with full detail so a folded tool card yields its complete output,
     // not the truncated preview — the user-intuitive behaviour, independent of
-    // what is painted.
-    let detail = transcript_surface::DetailPolicy::Expanded;
+    // what is painted. The Viewport scope is the exception: its row window is
+    // derived from the painted surface's scroll geometry (`viewport_h` +
+    // `from_bottom`), so it must index into the SAME surface's rows. Building it
+    // `Expanded` (a different, taller row model) would slice the wrong rows when
+    // a card is folded on screen, so Viewport builds the row model `Collapsed`
+    // — folded exactly like the inline view the window measures.
+    let detail = if scope == copy::CopyScope::Viewport {
+        transcript_surface::DetailPolicy::Collapsed
+    } else {
+        transcript_surface::DetailPolicy::Expanded
+    };
     let width = main_text_width(app);
     let rows = transcript_surface::build_transcript_rows(app, width, detail);
 
@@ -6312,6 +6340,13 @@ fn deliver_copy(app: &mut TuiApp, text: &str, label: &str) {
                     .push(app.status.clone(), toast::ToastVariant::Error);
                 return;
             }
+            // TODO(copy-confirm): when the large-payload confirmation gate is
+            // wired (see the TODO in `build_clipboard_chain`), pass
+            // `request.confirmed` through from a pending-confirm app state and
+            // add a `CopyOutcome::NeedsConfirmation` arm here that sets that
+            // state + an info toast and confirms on a repeat/confirm key. Until
+            // then the threshold is unset, so `copy` never returns
+            // `NeedsConfirmation` and it falls into the generic failure arm.
             let request = clipboard::CopyRequest::new(text, label);
             let outcome = app.clipboard_chain.copy(&request);
             let (toast_msg, variant) = outcome.toast();
@@ -18097,7 +18132,7 @@ pub(crate) struct TuiApp {
     /// too large for OSC 52 still lands via the platform binary or a file
     /// rather than silently failing. The legacy `clipboard` field above
     /// stays the source for any pre-existing call site not yet migrated.
-    pub(crate) clipboard_chain: clipboard::ClipboardChain<clipboard::RealSink>,
+    pub(crate) clipboard_chain: clipboard::ClipboardChain<Box<dyn clipboard::ClipboardSink>>,
     /// Persistent main-view focus cursor for entry/tool/code copies, as a
     /// `RowId` into the freshly built transcript row list. `None` defaults to
     /// the live tail (the last entry-owned row), so "copy current entry"
@@ -18352,6 +18387,20 @@ impl TuiApp {
         )
     }
 
+    /// Replace the semantic copy/export chain with one driven by `sink`, so an
+    /// app-layer copy test can inject a [`clipboard::RecordingSink`] and assert
+    /// the copied bytes reach it with no real terminal/clipboard/subprocess I/O.
+    /// The env-probed providers and config are rebuilt over the new sink.
+    ///
+    /// Consumed only by the in-crate `#[cfg(test)]` copy suite; under the
+    /// `testing` feature alone (no `test`) that consumer is not compiled, so
+    /// allow the otherwise-"unused" method rather than splitting the cfg.
+    #[cfg(any(test, feature = "testing"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_clipboard_sink_for_test(&mut self, sink: Box<dyn clipboard::ClipboardSink>) {
+        self.clipboard_chain = build_clipboard_chain(sink);
+    }
+
     fn new_with_startup(
         provider_name: &'static str,
         config: &AppConfig,
@@ -18514,7 +18563,7 @@ impl TuiApp {
             pending_feedback: None,
             pending_report: None,
             clipboard,
-            clipboard_chain: build_clipboard_chain(),
+            clipboard_chain: build_clipboard_chain(Box::new(clipboard::RealSink)),
             copy_focus: None,
             copy_format: copy::CopyFormat::default_format(),
             main_text_width: std::cell::Cell::new(0),

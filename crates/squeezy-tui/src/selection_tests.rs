@@ -298,6 +298,41 @@ fn char_offset_for_display_col_mixed_ascii_and_wide() {
 }
 
 #[test]
+fn char_offset_for_display_col_skips_combining_marks() {
+    // "e" + combining acute + "x": the combining mark (U+0301, zero-width) sits
+    // ON the `e`'s cell, occupying NO cell of its own. Display cell 0 is `e`
+    // (char 0), cell 1 is `x` (char 2). A naive `w.max(1)` gave the mark a
+    // phantom cell, resolving col 1 to the mark (char 1) — the off-by-one.
+    let text = "e\u{0301}x";
+    assert_eq!(char_offset_for_display_col(text, 0), 0); // base `e`
+    assert_eq!(char_offset_for_display_col(text, 1), 2); // `x`, NOT the mark
+    assert_eq!(char_offset_for_display_col(text, 2), 3); // past end → char count
+}
+
+#[test]
+fn char_offset_for_display_col_skips_zwj_joiners() {
+    // A ZWJ family emoji "👨\u{200d}👩": two wide scalars (2 cells each) joined
+    // by a zero-width U+200D. Chars: 👨(0) ZWJ(1) 👩(2), trailing "!"(3).
+    // Display cells: 👨 -> 0,1 ; 👩 -> 2,3 ; ! -> 4. The ZWJ must consume no
+    // cell, so cells 2,3 resolve to the second emoji (char 2), never the joiner.
+    let text = "👨\u{200d}👩!";
+    assert_eq!(char_offset_for_display_col(text, 0), 0); // first cell of 👨
+    assert_eq!(char_offset_for_display_col(text, 1), 0); // second cell of 👨
+    assert_eq!(char_offset_for_display_col(text, 2), 2); // first cell of 👩 (skips ZWJ at char 1)
+    assert_eq!(char_offset_for_display_col(text, 3), 2); // second cell of 👩
+    assert_eq!(char_offset_for_display_col(text, 4), 3); // the "!"
+}
+
+#[test]
+fn char_offset_for_display_col_leading_combining_mark() {
+    // A pathological leading zero-width char must not steal cell 0 from the
+    // first real glyph.
+    let text = "\u{0301}ab";
+    assert_eq!(char_offset_for_display_col(text, 0), 1); // `a`, not the mark
+    assert_eq!(char_offset_for_display_col(text, 1), 2); // `b`
+}
+
+#[test]
 fn col_span_on_wide_row_selects_by_char_offset() {
     // Selection columns are char offsets; a wide row of 3 chars selects 1..3.
     let s = sel(
@@ -307,11 +342,25 @@ fn col_span_on_wide_row_selects_by_char_offset() {
         SelectionMode::Cell,
     );
     // "你好世" has 3 chars (display width 6) — col math is in CHARS.
+    let text = "你好世";
     let span = s.col_span_for_row(0, 3).unwrap();
     assert_eq!(span, 1..3);
     // And the cleaned text slice over those char offsets picks the wide glyphs.
-    let rows = vec![line("你好世")];
+    let rows = vec![line(text)];
     assert_eq!(selection_clean_text(&rows, &s), "好世");
+
+    // Display-cell alignment: the char-offset span maps onto the right terminal
+    // CELLS (each wide glyph is two cells), so the highlight the renderer paints
+    // lands exactly on cols 2..6 — not just the right chars.
+    assert_eq!(display_width_of_chars(text, span.start), 2); // skip 你 (2 cells)
+    assert_eq!(display_width_of_chars(text, span.end), 6); // through 世 (6 cells)
+    // The selected slice itself is 4 cells wide (好 + 世).
+    let selected: String = text.chars().take(span.end).skip(span.start).collect();
+    assert_eq!(display_width_of_chars(&selected, span.end - span.start), 4);
+    // And a display-col round-trip resolves the span's cell edges back to the
+    // same char offsets the highlight/copy use.
+    assert_eq!(char_offset_for_display_col(text, 2), span.start);
+    assert_eq!(char_offset_for_display_col(text, 6), span.end);
 }
 
 // ---- highlight restyle ----------------------------------------------------

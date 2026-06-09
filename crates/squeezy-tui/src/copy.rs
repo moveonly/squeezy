@@ -84,8 +84,10 @@ impl CopyScope {
 pub(crate) enum CopyFormat {
     /// Plain text: gutter-stripped `copy_text`, one row per line.
     Plain,
-    /// Markdown: plain text with detected code blocks re-fenced and message
-    /// blocks prefixed with a `**Assistant**` / `**User**` heading.
+    /// Markdown: gutter-stripped text with each message entry prefixed by a
+    /// `**Assistant**` / `**User**` heading. Existing ``` fence rows are passed
+    /// through verbatim (and suppress headings while open); the formatter does
+    /// not synthesize or re-fence code blocks.
     Markdown,
     /// A JSON array of event objects, one per resolved entry:
     /// `{ "id", "kind", "text" }`. Chrome rows are skipped.
@@ -296,10 +298,13 @@ fn format_plain(rows: &[TranscriptRow]) -> String {
     joined.trim_end().to_string()
 }
 
-/// Markdown: gutter-stripped text, but with detected code blocks re-wrapped in
-/// real ``` fences (preserving the info string the fence row carried) and each
-/// message entry prefixed with a `**Assistant**` / `**User**` heading derived
-/// from its kind + role. Operates on entry granularity using `entry_id` runs.
+/// Markdown: gutter-stripped text with each message entry prefixed by a
+/// `**Assistant**` / `**User**` heading derived from its kind + role, operating
+/// on entry granularity using `entry_id` runs. Any ``` fence rows already
+/// present in the transcript are emitted verbatim; while a fence is open the
+/// heading emission is suppressed so a `"```"` boundary is never mistaken for an
+/// entry change. The formatter does not synthesize or re-fence code blocks —
+/// the fences it preserves are the ones the rows already carried.
 fn format_markdown(rows: &[TranscriptRow], is_assistant: &dyn Fn(EntryId) -> bool) -> String {
     let mut out = String::new();
     let mut prev_entry: Option<Option<EntryId>> = None;

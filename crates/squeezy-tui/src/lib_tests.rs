@@ -13332,6 +13332,61 @@ fn osc52_clipboard_rejects_payloads_above_cap() {
     assert!(err.contains(&OSC52_MAX_PAYLOAD_BYTES.to_string()), "{err}");
 }
 
+/// Finding 1 (Phase 5a review): the app-layer copy path must be able to inject
+/// a recording sink so a copy that falls through to the richer
+/// `ClipboardChain` lands the exact bytes on a TEST seam — never real OSC 52 /
+/// subprocess / temp-file I/O. Drives the production `deliver_copy` with the
+/// primary sink failing and an oversized payload (so the chain is consulted),
+/// and asserts the chain delivered our payload to the injected
+/// `RecordingSink`.
+#[test]
+fn deliver_copy_routes_oversized_payload_to_injected_recording_sink() {
+    // Primary clipboard fails so `deliver_copy` falls through to the chain.
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: Arc::new(StdMutex::new(Vec::new())),
+            error: Some("primary sink unavailable".to_string()),
+        }),
+    );
+
+    // Inject a recording sink into the semantic-copy chain; retain a shared
+    // handle so we can read back exactly what reached it.
+    let sink = crate::clipboard::RecordingSink::new();
+    let calls = sink.handle();
+    app.set_clipboard_sink_for_test(Box::new(sink));
+
+    // Oversized so `deliver_copy` consults the chain (small copies stay on the
+    // primary OSC 52 path and never touch the chain).
+    let payload = "z".repeat(OSC52_MAX_PAYLOAD_BYTES + 1);
+    deliver_copy(&mut app, &payload, "assistant message");
+
+    // The chain reported success (a provider accepted it) and the recorded
+    // bytes carry our exact payload — proving the copy reached the test seam,
+    // not a real terminal/clipboard/subprocess.
+    assert!(
+        app.status.starts_with("copied assistant message"),
+        "expected a copied-status, got {:?}",
+        app.status
+    );
+    let recorded = calls.lock().unwrap().clone();
+    assert!(!recorded.is_empty(), "the chain must have used the sink");
+    let landed = recorded.iter().any(|call| match call {
+        // The payload is oversized for OSC 52's cap, so a platform command
+        // carries the raw bytes verbatim.
+        crate::clipboard::SinkCall::Command { payload: p, .. } => p == payload.as_bytes(),
+        // If the env-probed chain has no OSC 52 and a platform command, the
+        // temp-file fallback still carries the exact bytes.
+        crate::clipboard::SinkCall::TempFile { payload: p, .. } => p == payload.as_bytes(),
+        // OSC 52 only ever sees the base64 escape, never the raw payload.
+        crate::clipboard::SinkCall::Terminal { .. } => false,
+    });
+    assert!(
+        landed,
+        "the exact payload bytes must reach the injected sink, calls: {recorded:?}"
+    );
+}
+
 fn test_app(mode: SessionMode) -> TuiApp {
     test_app_with_clipboard(mode, Box::new(NoopClipboard))
 }

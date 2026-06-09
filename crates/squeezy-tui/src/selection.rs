@@ -31,9 +31,10 @@
 //! [`crate::transcript_surface::plain_text_of_line`]) already use. Mapping a
 //! mouse **display column** (where a CJK/wide glyph occupies two cells) onto a
 //! char offset is a hit-testing concern handled at the call site; this module
-//! exposes [`char_offset_for_display_col`] and [`display_width_of_chars`] so the
-//! mouse handler and tests share one width-aware mapping rather than each
-//! re-deriving it.
+//! exposes [`char_offset_for_display_col`] so the mouse handler and tests share
+//! one width-aware mapping rather than each re-deriving it. The inverse helper
+//! [`display_width_of_chars`] is used only by this module's tests (asserting the
+//! cell width of a char-offset prefix); the mouse handler does not consume it.
 //!
 //! Until the renderers and gesture/key handlers consume this module (the Phase 5
 //! integration step), the whole surface is dead in a plain `cargo build`, so the
@@ -216,10 +217,19 @@ pub(crate) fn char_offset_for_display_col(line_plain: &str, display_col: usize) 
     let mut consumed = 0usize;
     for (idx, ch) in line_plain.chars().enumerate() {
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        // Zero-width chars (combining marks, ZWJ joiners) attach to the
+        // preceding grapheme and occupy no display cell, so a click never
+        // resolves *to* one and they must not consume a column. Skipping them
+        // (rather than treating them as one cell via `w.max(1)`) keeps the
+        // mapping aligned: a click past a base glyph lands on the next *cell*
+        // glyph, not on a phantom cell for the zero-width char.
+        if w == 0 {
+            continue;
+        }
         // A click on any cell the glyph occupies selects up to that glyph; the
         // boundary that "contains" the click is the one whose cell span covers
         // display_col.
-        if display_col < consumed + w.max(1) {
+        if display_col < consumed + w {
             return idx;
         }
         consumed += w;
@@ -383,7 +393,9 @@ pub(crate) fn selection_clean_text(rows: &[Line<'static>], sel: &Selection) -> S
         // Shift the selection into the cleaned text's char space, clamping the
         // start up past the stripped gutter so a selection that begins inside
         // the chrome still starts at the first content char.
-        let lo = span.start.max(gutter_chars).saturating_sub(gutter_chars);
+        // (`x.max(g).saturating_sub(g)` == `x.saturating_sub(g)` for all `x`, so
+        // the saturating subtraction alone does the clamp.)
+        let lo = span.start.saturating_sub(gutter_chars);
         let hi = span.end.saturating_sub(gutter_chars);
         let lo = lo.min(cleaned_len);
         let hi = hi.min(cleaned_len).max(lo);
