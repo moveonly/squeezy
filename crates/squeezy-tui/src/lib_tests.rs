@@ -2105,6 +2105,33 @@ async fn slash_command_queues_mid_turn() {
 }
 
 #[tokio::test]
+async fn slash_cheap_fallback_notice_says_next_turn() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    apply_dispatch_command(&mut app, &mut agent, DispatchCommand::Cheap).await;
+
+    assert_eq!(app.status, "routing: forced cheap next turn");
+    assert!(
+        agent.mode_state_snapshot().pending_force_cheap,
+        "/cheap should arm the one-shot override"
+    );
+    let notice = last_message_content(&app).expect("/cheap notice");
+    assert!(
+        notice.contains("next turn forced to the cheap model (one-shot)"),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("the next turn will fall back to the parent model"),
+        "{notice}"
+    );
+    assert!(
+        !notice.contains("this turn will"),
+        "fallback notice must not imply the current turn changes: {notice}"
+    );
+}
+
+#[tokio::test]
 async fn queued_slash_clear_executes_after_running_turn_finishes() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -5103,6 +5130,31 @@ fn slash_help_table_entries_exist_in_registry() {
             help_names.contains(registry_name),
             "SLASH_COMMANDS entry {registry_name:?} has no entry in SLASH_COMMAND_HELP_TABLE; \
              add a help entry before shipping this command"
+        );
+    }
+}
+
+/// Bidirectional drift test for the high-value routing and mode command set.
+///
+/// These commands are part of the core routing/mode control surface and are
+/// especially likely to confuse users if they lack help entries.  The original
+/// drift test only checks the reverse direction (help entries must exist in the
+/// registry); this test checks that every routing/mode command has a curated
+/// help entry so `/help /parent`, `/help /cheap`, etc. resolve locally instead
+/// of falling through to unsupported/generic help.
+#[test]
+fn routing_and_mode_commands_have_help_entries() {
+    use squeezy_skills::slash_command_help_names;
+
+    const ROUTING_MODE_COMMANDS: &[&str] = &["/plan", "/build", "/cheap", "/parent", "/router"];
+
+    let help_names: std::collections::HashSet<&str> = slash_command_help_names().collect();
+
+    for cmd in ROUTING_MODE_COMMANDS {
+        assert!(
+            help_names.contains(cmd),
+            "routing/mode command {cmd:?} has no entry in SLASH_COMMAND_HELP_TABLE; \
+             add a help entry so `/help {cmd}` resolves locally"
         );
     }
 }

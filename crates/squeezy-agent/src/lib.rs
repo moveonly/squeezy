@@ -1388,6 +1388,27 @@ where
 /// Uses a type alias to satisfy the `type_complexity` lint.
 type OllamaWindowCache = Arc<tokio::sync::Mutex<Option<(Instant, Option<u64>)>>>;
 
+/// A point-in-time snapshot of the agent's mode and routing state.
+///
+/// Returned by [`Agent::mode_state_snapshot`]. Intended for the TUI status
+/// line and tests to read from a single authoritative source rather than
+/// piecing together routing state from multiple fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeStateSnapshot {
+    /// The current session mode (`Plan` or `Build`).
+    pub session_mode: squeezy_core::SessionMode,
+    /// Whether session-wide auto-routing to the cheap tier is disabled
+    /// (`/router off`). Does not affect an explicit `/cheap` one-shot.
+    pub routing_session_disabled: bool,
+    /// A one-shot `/cheap` override is pending for the next turn.
+    pub pending_force_cheap: bool,
+    /// A one-shot `/parent` override is pending for the next turn.
+    pub pending_force_parent: bool,
+    /// Number of sticky-escalation turns remaining (parent model forced
+    /// after a mid-turn escalation). Zero means no active sticky window.
+    pub sticky_turns_remaining: u8,
+}
+
 #[derive(Clone)]
 pub struct Agent {
     config: AppConfig,
@@ -2234,6 +2255,36 @@ impl Agent {
                 let _ = session.write_resume_state(&resume);
             }
         });
+    }
+
+    /// Resolve the cheap-tier model for the current provider, honoring any
+    /// explicit overrides in `[model].small_fast_model` or
+    /// `[providers.<name>].cheap_model` before falling back to the built-in
+    /// per-provider mini tier. Returns `None` when the provider has no
+    /// distinct cheap tier and no override is configured; `/cheap` will fall
+    /// back to the parent model in that case (the TUI surfaces a preflight
+    /// notice so the fallback is not silent).
+    pub fn cheap_model(&self) -> Option<String> {
+        cheap_model_for(self.provider.name(), &self.config)
+    }
+
+    /// Return a point-in-time snapshot of the agent's mode and routing state.
+    ///
+    /// This is the single authoritative source the TUI status line and tests
+    /// should read: current session mode, whether auto-routing is
+    /// session-disabled, pending one-shot overrides, and the sticky-escalation
+    /// window. Routing fields are read from the same `routing_state` lock so
+    /// that portion of the snapshot is internally consistent.
+    pub fn mode_state_snapshot(&self) -> ModeStateSnapshot {
+        let session_mode = self.session_mode();
+        let routing = self.routing_state.lock().expect("routing state lock");
+        ModeStateSnapshot {
+            session_mode,
+            routing_session_disabled: routing.pending_override.session_disabled,
+            pending_force_cheap: routing.pending_override.force_cheap,
+            pending_force_parent: routing.pending_override.force_parent,
+            sticky_turns_remaining: routing.sticky.remaining_turns,
+        }
     }
 
     /// Test-only handle to the subagent registry so callers can

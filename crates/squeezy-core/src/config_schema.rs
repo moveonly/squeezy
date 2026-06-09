@@ -26,13 +26,14 @@ use crate::{
     DEFAULT_REPORT_ENDPOINT, DEFAULT_REPORT_MAX_BYTES, DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS,
     DEFAULT_SESSION_LOG_RETENTION_DAYS, DEFAULT_SESSION_MAX_EVENT_BYTES,
     DEFAULT_SESSION_MAX_SESSION_BYTES, DEFAULT_STREAM_IDLE_TIMEOUT_MS,
-    DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS, DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
-    DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS, DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL,
-    DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL, DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS,
-    DEFAULT_TUI_SPINNER_NAME, DEFAULT_TUI_THEME_NAME, DEFAULT_WEBSEARCH_PROVIDER,
-    OpenAiCompatiblePreset, PermissionMode, PermissionPolicyMode, ProviderConfig, ReasoningEffort,
-    ResponseVerbosity, SessionMode, SessionResumePicker, StatusVerbosity, ToolOutputVerbosity,
-    TranscriptDefault, TuiSynchronizedOutput, normalize_tui_spinner_name, normalize_tui_theme_name,
+    DEFAULT_SUBAGENT_MAX_CONCURRENT, DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
+    DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL, DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
+    DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
+    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_TUI_SPINNER_NAME,
+    DEFAULT_TUI_THEME_NAME, DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode,
+    PermissionPolicyMode, ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode,
+    SessionResumePicker, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault,
+    TuiSynchronizedOutput, normalize_tui_spinner_name, normalize_tui_theme_name,
 };
 
 /// When a save takes effect.
@@ -1938,6 +1939,23 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default: || FieldValue::String(String::new()),
                 help: "Override model id for the Explore subagent. Empty inherits the main model.",
                 env_override: Some("SQUEEZY_EXPLORE_MODEL"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "max_concurrent",
+                toml_path: &["subagents", "max_concurrent"],
+                kind: FieldKind::Integer {
+                    min: 1,
+                    max: 256,
+                    suffix: None,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_subagent_max_concurrent,
+                set: set_subagent_max_concurrent,
+                default_display: "20",
+                default: || FieldValue::Integer(DEFAULT_SUBAGENT_MAX_CONCURRENT as i64),
+                help: "Maximum number of subagents that may run concurrently per parent agent turn. The `/config` UI accepts 1–256; values set via TOML or `SQUEEZY_SUBAGENT_MAX_CONCURRENT` are not capped at the runtime but are clamped to ≥1.",
+                env_override: Some("SQUEEZY_SUBAGENT_MAX_CONCURRENT"),
                 secret: false,
             },
             FieldMeta {
@@ -3994,6 +4012,24 @@ fn set_subagent_explore_model(cfg: &mut AppConfig, value: FieldValue) -> Result<
         _ => return Err("expects string"),
     };
     cfg.subagents.explore_model = if s.trim().is_empty() { None } else { Some(s) };
+    Ok(())
+}
+
+fn get_subagent_max_concurrent(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.subagents.max_concurrent as i64)
+}
+fn set_subagent_max_concurrent(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let v = match value {
+        FieldValue::Integer(v) => v,
+        _ => return Err("expects integer"),
+    };
+    if v < 1 {
+        return Err("max_concurrent must be at least 1");
+    }
+    if v > 256 {
+        return Err("max_concurrent must be at most 256");
+    }
+    cfg.subagents.max_concurrent = v as usize;
     Ok(())
 }
 

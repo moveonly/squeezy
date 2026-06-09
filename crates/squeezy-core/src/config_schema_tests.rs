@@ -216,6 +216,10 @@ fn subagent_integer_schema_defaults_match_runtime_constants() {
     }
     let cases = [
         Case {
+            label: "max_concurrent",
+            runtime_default: crate::DEFAULT_SUBAGENT_MAX_CONCURRENT as i64,
+        },
+        Case {
             label: "max_tool_calls_per_call",
             runtime_default: crate::DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL as i64,
         },
