@@ -1928,7 +1928,8 @@ impl CheckpointStore {
             for file in &record.files {
                 let identity = path_identity_key(&file.path);
                 let path = safe_workspace_path(&self.root, &file.path)?;
-                if let Some(conflict) = reparse_path_conflict(&record.id, &file.path, &self.root, &path)
+                if let Some(conflict) =
+                    reparse_path_conflict(&record.id, &file.path, &self.root, &path)
                 {
                     conflicts.push(conflict);
                     continue;
