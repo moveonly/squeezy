@@ -43,7 +43,7 @@ fn watcher_emits_change_batch_after_debounce_window() {
         // default is 10s.
         debounce_ms: 250,
     };
-    let watcher = FileWatcher::start_polling_for_tests(config, move |batch: ChangeBatch| {
+    let watcher = FileWatcher::start_polling(config, move |batch: ChangeBatch| {
         captured_clone.lock().unwrap().push(batch);
     })
     .expect("watcher start");

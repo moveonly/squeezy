@@ -841,11 +841,34 @@ pub(crate) fn graph_payload(
     // count of still-pending changed paths (read from the manager, since the
     // unprocessed paths are left queued in that case). Emitted only when the
     // refresh did not fully complete, so a healthy graph pays no byte cost.
+    // Capture once: acquiring the mutex twice for the same counter would be
+    // redundant and could produce inconsistent values if a watcher thread
+    // enqueues a path between the two calls.
+    let pending_events = manager.pending_changed_count();
     if refresh.budget_exhausted {
         payload.insert("refresh_incomplete".to_string(), json!(true));
+        payload.insert("stale_pending".to_string(), json!(pending_events));
+    }
+    let watcher = manager.watcher_status();
+    // Mirror the `refresh_incomplete` gating above: a healthy graph pays no
+    // byte cost on the wire. Emit the `indexing` block only when the
+    // session is in a degraded state the model should know about — polling
+    // fallback engaged, pending events queued, or any captured
+    // fallback_reason. Healthy native sessions and one-shot CLI invocations
+    // (mode = Disabled with no fallback reason) skip the ~80-110 bytes of
+    // stable JSON entirely.
+    let watcher_degraded = matches!(watcher.mode, squeezy_graph::WatcherMode::PollingFallback)
+        || pending_events > 0
+        || watcher.fallback_reason.is_some();
+    if watcher_degraded {
         payload.insert(
-            "stale_pending".to_string(),
-            json!(manager.pending_changed_count()),
+            "indexing".to_string(),
+            json!({
+                "watcher_mode": watcher.mode.as_str(),
+                "watcher_backend": watcher.backend,
+                "pending_events": pending_events,
+                "fallback_reason": watcher.fallback_reason,
+            }),
         );
     }
     // Surface unmatched watcher events: events that were pending but did not
@@ -5175,6 +5198,13 @@ mod graph_payload_refresh_status_tests {
         assert_eq!(
             payload.get("graph_available"),
             Some(&serde_json::json!(true))
+        );
+        // The `indexing` block follows the same cost-first gating as
+        // `refresh_incomplete`: a healthy graph (here, a non-watching
+        // one-shot construction) pays nothing on the wire.
+        assert!(
+            payload.get("indexing").is_none(),
+            "healthy disabled-watcher payload must omit the indexing block, got {payload:?}"
         );
         assert!(payload.get("refresh_incomplete").is_none());
         assert!(payload.get("stale_pending").is_none());

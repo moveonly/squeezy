@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     env,
     ffi::OsString,
     fs,
@@ -451,44 +451,46 @@ impl WorkspaceCrawler {
                 continue;
             }
             let path = entry.into_path();
-            let relative_path = relative_path(&root, &path)?;
-
-            // `fs::metadata` follows symlinks; it returns an error for dangling
-            // symlinks (target missing). Treat that gracefully: skip the entry
-            // rather than aborting the whole crawl. For non-symlink entries we
-            // still propagate the error because it indicates a genuine I/O problem.
-            let metadata = if file_type.is_symlink() {
-                match fs::metadata(&path) {
-                    Ok(m) => m,
-                    Err(_) => continue, // dangling symlink: skip silently
+            let relative_path = match relative_path(&root, &path) {
+                Ok(relative_path) => relative_path,
+                Err(err) => {
+                    record_walk_error(&mut walk_errors, &path, err);
+                    continue;
                 }
-            } else {
-                fs::metadata(&path)?
+            };
+
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    record_walk_error(&mut walk_errors, &path, err);
+                    continue;
+                }
             };
             if !metadata.is_file() {
                 continue;
             }
             let size_bytes = metadata.len();
             if file_type.is_symlink() {
-                // `canonicalize` also fails for dangling symlinks; handle the same
-                // way as the metadata failure above.
-                match fs::canonicalize(&path) {
-                    Ok(target) if !target.starts_with(&root) => {
-                        // Symlink target lies outside the workspace root. Record it
-                        // in coverage so callers can explain why the file is absent,
-                        // rather than silently omitting it from the index.
-                        record_excluded_file(
-                            &mut excluded,
-                            &mut coverage,
-                            &path,
-                            relative_path,
-                            size_bytes,
-                            ExclusionReason::ExternalSymlink,
-                        );
+                let target = match fs::canonicalize(&path) {
+                    Ok(target) => target,
+                    Err(err) => {
+                        record_walk_error(&mut walk_errors, &path, err);
                         continue;
                     }
-                    Ok(_) => {}         // target is inside root; fall through to index
-                    Err(_) => continue, // dangling symlink: skip silently
+                };
+                if !target.starts_with(&root) {
+                    // Symlink target lies outside the workspace root. Record it
+                    // in coverage so callers can explain why the file is absent,
+                    // rather than silently omitting it from the index.
+                    record_excluded_file(
+                        &mut excluded,
+                        &mut coverage,
+                        &path,
+                        relative_path,
+                        size_bytes,
+                        ExclusionReason::ExternalSymlink,
+                    );
+                    continue;
                 }
             }
             let language = classify_language(&path);
@@ -534,7 +536,13 @@ impl WorkspaceCrawler {
                 continue;
             }
 
-            let bytes = fs::read(&path)?;
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    record_walk_error(&mut walk_errors, &path, err);
+                    continue;
+                }
+            };
             if looks_binary(&bytes) {
                 if self.compiled_policy.includes_class(ExclusionReason::Binary) {
                     unsupported.push(unsupported_file(
@@ -629,6 +637,10 @@ impl WorkspaceCrawler {
             indexing_decision,
         })
     }
+}
+
+fn record_walk_error(walk_errors: &mut Vec<String>, path: &Path, err: impl std::fmt::Display) {
+    walk_errors.push(format!("{}: {err}", path.display()));
 }
 
 fn keep_entry(
@@ -793,6 +805,7 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
     let mut negative_signals = Vec::new();
     let context = IndexingDecisionContext::from_env();
     let workspace_signals = scan_workspace_signals(root);
+    let has_case_mismatches = workspace_signals.has_case_mismatches();
 
     if context.is_home_dir(root) {
         negative_signals.push("workspace root is the user's home directory".to_string());
@@ -814,6 +827,9 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
         has_strong_positive = true;
         positive_signals.push(marker);
     }
+    for near_miss in workspace_signals.project_marker_case_mismatches {
+        negative_signals.push(near_miss);
+    }
     for source in workspace_signals.shallow_source_markers {
         has_strong_positive = true;
         positive_signals.push(source);
@@ -834,6 +850,13 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
         format!("indexing allowed: {}", positive_signals.join(", "))
     } else if blocked_by_root {
         format!("indexing skipped: {}", negative_signals.join(", "))
+    } else if has_case_mismatches {
+        // Case-mismatch branch before README: a near-miss marker is a more
+        // actionable diagnostic than a README-only message.
+        format!(
+            "indexing skipped: no exact project marker or shallow source file; {}",
+            negative_signals.join(", ")
+        )
     } else if positive_signals
         .iter()
         .any(|signal| signal.contains("README"))
@@ -853,6 +876,15 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
 }
 
 fn is_protected_root(root: &Path) -> bool {
+    // macOS system roots and Linux pseudo-filesystem roots are unconditionally
+    // blocked: they are never real project roots and can contain enormous or
+    // virtual file trees that must not be crawled.
+    //
+    // Broad Linux package/source trees (/opt, /usr, /var) are intentionally
+    // NOT listed here. They can contain real project checkouts and source trees.
+    // The indexing-signal check (VCS marker, project config, shallow sources)
+    // prevents accidental bulk indexing of system-managed content within them.
+    // On macOS, /var canonicalises to /private/var which is in the list below.
     const PROTECTED: &[&str] = &[
         "/",
         "/Applications",
@@ -864,11 +896,13 @@ fn is_protected_root(root: &Path) -> bool {
         "/bin",
         "/dev",
         "/etc",
-        "/opt",
         "/private",
+        "/boot",
+        "/proc",
+        "/run",
         "/sbin",
-        "/usr",
-        "/var",
+        "/snap",
+        "/sys",
     ];
     PROTECTED.iter().any(|path| Path::new(path) == root)
 }
@@ -910,8 +944,18 @@ fn vcs_marker_at(path: &Path) -> Option<&'static str> {
 struct WorkspaceSignalScan {
     has_readme: bool,
     project_markers: Vec<String>,
+    project_marker_case_mismatches: Vec<String>,
     shallow_source_markers: Vec<String>,
     code_directory_markers: Vec<String>,
+}
+
+impl WorkspaceSignalScan {
+    /// True when `project_marker_case_mismatches` is non-empty. Checked
+    /// structurally in `decide_indexing` rather than by substring-matching
+    /// the human-readable message strings.
+    fn has_case_mismatches(&self) -> bool {
+        !self.project_marker_case_mismatches.is_empty()
+    }
 }
 
 fn scan_workspace_signals(root: &Path) -> WorkspaceSignalScan {
@@ -925,6 +969,8 @@ fn scan_workspace_signals(root: &Path) -> WorkspaceSignalScan {
     let root_entry_names = root_entry_names(&root_entries);
     let has_readme = root_entries.iter().any(is_readme_entry);
     let project_markers = project_markers_from_root(root, Some((&root_entry_names, &root_entries)));
+    let project_marker_case_mismatches =
+        project_marker_case_mismatches(root, &root_entry_names, &root_entries, &project_markers);
 
     let mut source_scan = SourceMarkerScan::default();
     collect_source_markers_from_entries(&root_entries, 0, None, &mut source_scan);
@@ -935,6 +981,7 @@ fn scan_workspace_signals(root: &Path) -> WorkspaceSignalScan {
     WorkspaceSignalScan {
         has_readme,
         project_markers,
+        project_marker_case_mismatches,
         shallow_source_markers: source_scan.signals,
         code_directory_markers,
     }
@@ -993,6 +1040,89 @@ fn project_marker_exists(
     root_entry_names
         .map(|names| names.contains(std::ffi::OsStr::new(marker)) || root.join(marker).exists())
         .unwrap_or_else(|| root.join(marker).exists())
+}
+
+fn project_marker_case_mismatches(
+    root: &Path,
+    root_entry_names: &BTreeSet<OsString>,
+    entries: &[fs::DirEntry],
+    resolved_markers: &[String],
+) -> Vec<String> {
+    // Build a case-folded lookup table once so each marker check is O(1)
+    // rather than scanning all directory entries linearly.
+    let lower_to_actual: HashMap<String, &OsString> = root_entry_names
+        .iter()
+        .filter_map(|name| name.to_str().map(|s| (s.to_ascii_lowercase(), name)))
+        .collect();
+
+    let mut mismatches = Vec::new();
+    for marker in CODE_PROJECT_MARKERS.iter().copied() {
+        if marker.contains('/') || root_entry_names.contains(std::ffi::OsStr::new(marker)) {
+            continue;
+        }
+        // On case-insensitive filesystems (default macOS APFS, default
+        // Windows NTFS) `project_marker_exists` accepts a mis-cased file as
+        // the marker, so the marker already shows up in `resolved_markers`.
+        // Suppress the near-miss diagnostic in that case to avoid a
+        // confusing negative signal alongside the positive one.
+        if project_marker_exists(root, marker, Some(root_entry_names)) {
+            continue;
+        }
+        if let Some(actual_os) = lower_to_actual.get(&marker.to_ascii_lowercase())
+            && let Some(actual) = actual_os.to_str()
+        {
+            mismatches.push(format!(
+                "project marker case differs from expected project marker {marker}: found {actual}"
+            ));
+        }
+    }
+
+    // A sibling entry that already produced a real `.csproj/.sln/.slnx`
+    // marker means the case-insensitive filesystem accepted some other
+    // file at the expected extension; do not emit a mis-cased extension
+    // diagnostic alongside the positive marker.
+    let already_resolved_dotnet_extensions: BTreeSet<&'static str> = ["csproj", "sln", "slnx"]
+        .into_iter()
+        .filter(|ext| {
+            entries.iter().any(|entry| {
+                let file_name = entry.file_name();
+                let Some(name) = file_name.to_str() else {
+                    return false;
+                };
+                let Some(actual_ext) = Path::new(name).extension().and_then(|e| e.to_str()) else {
+                    return false;
+                };
+                let resolved = format!("project marker {name}");
+                actual_ext == *ext && resolved_markers.iter().any(|m| m == &resolved)
+            })
+        })
+        .collect();
+    for entry in entries {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let extension = Path::new(name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default();
+        let expected_extension = match extension.to_ascii_lowercase().as_str() {
+            "csproj" => "csproj",
+            "sln" => "sln",
+            "slnx" => "slnx",
+            _ => continue,
+        };
+        if extension != expected_extension
+            && !already_resolved_dotnet_extensions.contains(expected_extension)
+        {
+            mismatches.push(format!(
+                "project marker case differs from expected .{expected_extension} extension: found {name}"
+            ));
+        }
+    }
+    mismatches.sort();
+    mismatches.dedup();
+    mismatches
 }
 
 fn dotnet_project_markers(root: &Path, entries: Option<&[fs::DirEntry]>) -> Vec<String> {

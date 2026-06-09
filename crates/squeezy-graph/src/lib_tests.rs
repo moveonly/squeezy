@@ -1805,6 +1805,156 @@ fn graph_manager_refresh_keeps_pending_when_budget_exhausted() {
     }
 }
 
+#[test]
+fn graph_manager_open_watching_records_active_watcher_status() {
+    let root = temp_root("graph-manager-watching-status");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src").join("lib.rs"), "pub fn ready() {}\n").unwrap();
+
+    let manager = GraphManager::open_watching(
+        &root,
+        RefreshConfig {
+            debounce: Duration::from_millis(0),
+            idle_refresh_interval: Duration::from_secs(30),
+            per_tool_refresh_budget: Duration::from_secs(5),
+        },
+        CrawlOptions::default(),
+        None,
+        watcher::WatcherConfig {
+            src_dirs: vec![root.clone()],
+            debounce_ms: 50,
+        },
+    )
+    .unwrap();
+
+    let status = manager.watcher_status();
+    assert!(
+        matches!(
+            status.mode,
+            WatcherMode::Native | WatcherMode::PollingFallback
+        ),
+        "expected native or polling fallback watcher mode, got {:?}",
+        status.mode,
+    );
+    assert!(
+        !status.backend.is_empty() && status.backend != "none",
+        "expected a non-empty, non-disabled backend name, got {:?}",
+        status.backend,
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn resolve_watcher_attachment_uses_native_when_it_succeeds() {
+    // Drive a real native watcher against a temp directory; this is the
+    // single platform-touching unit test for the attachment helper. The
+    // other two arms below are pure logic and unit-tested with synthetic
+    // results, which keeps them deterministic across OSes.
+    let root = temp_root("resolve-watcher-attachment-native");
+    let started = watcher::FileWatcher::start(
+        watcher::WatcherConfig {
+            src_dirs: vec![root.clone()],
+            debounce_ms: 50,
+        },
+        |_batch| {},
+    );
+    let polling_start = || {
+        panic!("polling fallback must not be invoked when native succeeds");
+        #[allow(unreachable_code)]
+        Err(SqueezyError::Tool("unused".to_string()))
+    };
+    let (slot, status) = resolve_watcher_attachment(started, polling_start);
+    assert!(slot.is_some(), "native success must populate the slot");
+    assert_eq!(status.mode, WatcherMode::Native);
+    assert_eq!(status.backend, watcher::native_backend_name());
+    assert!(status.fallback_reason.is_none());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn resolve_watcher_attachment_falls_back_to_polling_when_native_fails() {
+    let native_err: Result<watcher::FileWatcher> =
+        Err(SqueezyError::Tool("inotify watches exhausted".to_string()));
+    // Build a real PollWatcher against a temp dir for the polling-success
+    // arm so the slot type is real and dropping it tears down cleanly.
+    let root = temp_root("resolve-watcher-attachment-polling-fallback");
+    let polling_start = || {
+        watcher::FileWatcher::start_polling(
+            watcher::WatcherConfig {
+                src_dirs: vec![root.clone()],
+                debounce_ms: 50,
+            },
+            |_batch| {},
+        )
+    };
+    let (slot, status) = resolve_watcher_attachment(native_err, polling_start);
+    assert!(slot.is_some(), "polling success must populate the slot");
+    assert_eq!(status.mode, WatcherMode::PollingFallback);
+    assert_eq!(status.backend, watcher::polling_backend_name());
+    let reason = status
+        .fallback_reason
+        .as_deref()
+        .expect("polling fallback must surface the native error");
+    assert!(
+        reason.contains("inotify watches exhausted"),
+        "fallback_reason must surface the native error, got {reason:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn resolve_watcher_attachment_degrades_to_disabled_when_both_backends_fail() {
+    // Regression for PR #366 review B1: a dual native+polling failure must
+    // NOT propagate out of `open_watching`. The pre-watcher constructor
+    // (`open_with_store`) never touched the filesystem watcher, so a flaky
+    // watcher could never take down the whole graph. If `open_watching`
+    // propagated the dual-failure error, the live registry path
+    // (`squeezy-tools/src/lib.rs`) would collapse the graph slot to `None`
+    // for the rest of the session and every graph tool would return
+    // `graph_unavailable`.
+    let native_err: Result<watcher::FileWatcher> =
+        Err(SqueezyError::Tool("inotify watches exhausted".to_string()));
+    let polling_start = || -> Result<watcher::FileWatcher> {
+        Err(SqueezyError::Tool(
+            "FUSE mount refuses recursive watch".to_string(),
+        ))
+    };
+    let (slot, status) = resolve_watcher_attachment(native_err, polling_start);
+    assert!(
+        slot.is_none(),
+        "dual-failure must leave the watcher slot empty"
+    );
+    assert_eq!(
+        status.mode,
+        WatcherMode::Disabled,
+        "dual-failure must degrade to Disabled, not propagate the error"
+    );
+    assert_eq!(status.backend, "none");
+    let reason = status
+        .fallback_reason
+        .as_deref()
+        .expect("dual-failure must record a fallback_reason for operators");
+    assert!(
+        reason.starts_with("native: "),
+        "fallback_reason must lead with the native failure, got {reason:?}"
+    );
+    assert!(
+        reason.contains("inotify watches exhausted"),
+        "fallback_reason must surface the native error, got {reason:?}"
+    );
+    assert!(
+        reason.contains("; polling: "),
+        "fallback_reason must separate native and polling failures, got {reason:?}"
+    );
+    assert!(
+        reason.contains("FUSE mount refuses recursive watch"),
+        "fallback_reason must surface the polling error, got {reason:?}"
+    );
+}
+
 /// `call_chain` must honor the same `max_depth` bound as the BFS call-graph
 /// listing (`bfs_call_packets` in squeezy-tools): a target reachable in exactly
 /// `d` call edges is found iff `max_depth >= d`, never one edge further. Locks

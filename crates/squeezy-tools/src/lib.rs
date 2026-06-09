@@ -28,7 +28,7 @@ use squeezy_core::{
     PermissionRuleSource, PermissionScope, Redactor, Result, ShellSandboxConfig, ShellSandboxMode,
     SkillsConfig, SqueezyError,
 };
-use squeezy_graph::{CargoFactProvenance, GraphManager};
+use squeezy_graph::{CargoFactProvenance, GraphManager, watcher::WatcherConfig};
 use squeezy_mcp::ExternalMcpTool;
 pub use squeezy_mcp::{
     McpClientRegistry, McpElicitationAction, McpElicitationAuditEvent, McpElicitationAuditOutcome,
@@ -245,7 +245,7 @@ pub(crate) const DEFAULT_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
 pub(crate) const MAX_SHELL_OUTPUT_BYTE_CAP: usize = 128_000;
 const DIFF_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 /// Upper bound a graph tool waits for the deferred
-/// `GraphManager::open_with_store` background task to finish before it
+/// background graph-open task to finish before it
 /// falls back to `graph_unavailable_result`. The condvar fires the instant
 /// the background open completes, so the model only ever pays this wait on
 /// the very first graph tool call of a session and small/medium projects
@@ -372,7 +372,7 @@ fn emit_graph_build_telemetry(
     telemetry.spawn(event);
 }
 
-/// Bug #7: fold a `GraphManager::open_with_store` result into the graph slot
+/// Bug #7: fold a `GraphManager` open result into the graph slot
 /// while preserving the open error. On `Ok` the manager is returned to be
 /// stored; on `Err` the slot stays `None` but the reason is recorded in
 /// `error_slot` so an *errored* open (parser/crawl/store failure) is
@@ -1141,11 +1141,11 @@ pub struct ToolRegistry {
     pub(crate) graph: Arc<StdMutex<Option<GraphManager>>>,
     /// `(ready, cv)` paired with `graph`. Tools that need the graph wait
     /// on the condvar with a bounded timeout when the slot is still
-    /// `None` so a background `open_with_store` (started during
+    /// `None` so a background graph open (started during
     /// construction) doesn't strand them on `graph_unavailable` while
     /// the workspace crawl + tree-sitter init is still finishing.
     pub(crate) graph_ready: Arc<(StdMutex<bool>, Condvar)>,
-    /// Bug #7: records the error from a failed `GraphManager::open_with_store`
+    /// Bug #7: records the error from a failed `GraphManager` open
     /// so an *errored* open (parser/crawl/store failure) is distinguishable
     /// from a structurally-absent graph. When the slot is `Some(reason)` the
     /// graph is `None` because the open *failed*, not because the workspace
@@ -1486,7 +1486,7 @@ impl ToolRegistry {
         // `SqueezyError::Config` here instead of silently disabling the
         // policy on every hot-path call.
         let compiled_policy = Arc::new(crawl_options.policy.compile()?);
-        // Defer the graph open: `GraphManager::open_with_store` walks the
+        // Defer the graph open: opening the graph walks the
         // workspace, initialises every tree-sitter grammar, and hydrates
         // redb partitions — typically the single largest contributor to
         // session startup. Hand that work to the blocking pool when a
@@ -1519,11 +1519,15 @@ impl ToolRegistry {
                                 .map(Arc::new)
                         })
                         .flatten();
-                    let opened_result = GraphManager::open_with_store(
+                    let opened_result = GraphManager::open_watching(
                         &root_for_graph,
                         Default::default(),
                         crawl_options_for_graph,
                         graph_store,
+                        WatcherConfig {
+                            src_dirs: vec![root_for_graph.clone()],
+                            ..WatcherConfig::default()
+                        },
                     );
                     if let Some(telemetry) = telemetry_for_graph.as_ref() {
                         emit_graph_build_telemetry(telemetry, &opened_result);
@@ -1677,7 +1681,7 @@ impl ToolRegistry {
     }
 
     /// Block (on a `std::sync::Condvar`) for up to `max_wait` waiting
-    /// for the deferred `GraphManager::open_with_store` background task
+    /// for the deferred `GraphManager` background open task
     /// to mark the graph slot ready. Returns whether the graph is ready
     /// (i.e. the caller can expect `self.graph.lock().as_mut()` to be
     /// `Some` unless the open itself failed). Callers fall back to the
@@ -1696,7 +1700,7 @@ impl ToolRegistry {
         }
     }
 
-    /// Bug #7: the reason a `GraphManager::open_with_store` *failed*, if it
+    /// Bug #7: the reason a `GraphManager` open *failed*, if it
     /// did. `Some(reason)` means the graph slot is `None` because the open
     /// errored (parser/crawl/store failure) — distinguishable from a workspace
     /// that legitimately has no graph (`None` here, graph slot `None`). Returns
@@ -1933,7 +1937,7 @@ impl ToolRegistry {
     /// Return the advertised tool list. The result is cached behind an
     /// `Arc<Vec<ToolSpec>>` and re-used across turns; the cache is
     /// Current per-language file counts from the graph, or `None` when
-    /// the background `GraphManager::open_with_store` hasn't finished
+    /// the background `GraphManager` open hasn't finished
     /// yet. When the watcher has accumulated pending changes since the
     /// last refresh, opportunistically calls `refresh_before_query`
     /// (which has its own debounce + idle interval, so the cost is

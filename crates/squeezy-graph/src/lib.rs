@@ -25,6 +25,7 @@ use squeezy_parse::{
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
 use squeezy_workspace::{CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler};
+use tracing::{error, warn};
 
 use crate::languages::{
     csharp::{
@@ -2256,6 +2257,41 @@ pub struct RefreshReport {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WatcherMode {
+    #[default]
+    Disabled,
+    Native,
+    PollingFallback,
+}
+
+impl WatcherMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Native => "native",
+            Self::PollingFallback => "polling_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatcherStatus {
+    pub mode: WatcherMode,
+    pub backend: &'static str,
+    pub fallback_reason: Option<String>,
+}
+
+impl Default for WatcherStatus {
+    fn default() -> Self {
+        Self {
+            mode: WatcherMode::Disabled,
+            backend: "none",
+            fallback_reason: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LanguageReport {
     pub c_files: usize,
     pub csharp_files: usize,
@@ -2279,6 +2315,69 @@ pub struct LanguageReport {
     pub unknown_files: usize,
 }
 
+/// Map the outcome of the native watcher's `start` (and a lazily-evaluated
+/// polling fallback closure) to the watcher slot + status the
+/// [`GraphManager`] should publish.
+///
+/// Extracted so the dual-failure → [`WatcherMode::Disabled`] path can be
+/// unit-tested directly, without depending on platform-specific failure
+/// modes (inotify watch budget exhaustion, FUSE/NFS refusal, etc.).
+///
+/// B1 contract: if both backends fail, return `None` + a Disabled status
+/// that captures both reasons. Do NOT propagate an error — losing the
+/// whole graph for the session because the watcher couldn't attach would
+/// be a strict regression versus the pre-watcher constructor.
+fn resolve_watcher_attachment<P>(
+    native: Result<watcher::FileWatcher>,
+    polling_start: P,
+) -> (Option<watcher::FileWatcher>, WatcherStatus)
+where
+    P: FnOnce() -> Result<watcher::FileWatcher>,
+{
+    match native {
+        Ok(file_watcher) => (
+            Some(file_watcher),
+            WatcherStatus {
+                mode: WatcherMode::Native,
+                backend: watcher::native_backend_name(),
+                fallback_reason: None,
+            },
+        ),
+        Err(native_err) => {
+            let fallback_reason = native_err.to_string();
+            warn!(
+                reason = %fallback_reason,
+                "native watcher failed; falling back to polling watcher"
+            );
+            match polling_start() {
+                Ok(file_watcher) => (
+                    Some(file_watcher),
+                    WatcherStatus {
+                        mode: WatcherMode::PollingFallback,
+                        backend: watcher::polling_backend_name(),
+                        fallback_reason: Some(fallback_reason),
+                    },
+                ),
+                Err(poll_err) => {
+                    let combined_reason = format!("native: {fallback_reason}; polling: {poll_err}");
+                    error!(
+                        reason = %combined_reason,
+                        "native watcher failed and polling fallback failed; live refresh disabled for this session"
+                    );
+                    (
+                        None,
+                        WatcherStatus {
+                            mode: WatcherMode::Disabled,
+                            backend: "none",
+                            fallback_reason: Some(combined_reason),
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
 pub struct GraphManager {
     root: PathBuf,
     crawler: WorkspaceCrawler,
@@ -2296,8 +2395,12 @@ pub struct GraphManager {
     pending_changed_paths: Arc<Mutex<HashSet<PathBuf>>>,
     /// Optional running file-system watcher whose lifetime is tied to this
     /// manager. `RAII` drop stops it. `None` for one-shot CLI callers that
-    /// open the graph without watching the filesystem.
-    _watcher: Option<watcher::FileWatcher>,
+    /// open the graph without watching the filesystem, and also `None` when
+    /// both the native and polling backends failed to start (see
+    /// `open_watching`).
+    #[allow(dead_code)]
+    watcher: Option<watcher::FileWatcher>,
+    watcher_status: WatcherStatus,
 }
 
 impl GraphManager {
@@ -2374,14 +2477,27 @@ impl GraphManager {
     ) -> Result<Self> {
         let mut manager = Self::open_with_optional_store(root, config, crawl_options, store)?;
         let handle = Arc::clone(&manager.pending_changed_paths);
-        let file_watcher = watcher::FileWatcher::start(watcher_config, move |batch| {
+        let native_result = watcher::FileWatcher::start(watcher_config.clone(), move |batch| {
             if let Ok(mut paths) = handle.lock() {
                 for path in batch.modified.into_iter().chain(batch.removed) {
                     paths.insert(path);
                 }
             }
-        })?;
-        manager._watcher = Some(file_watcher);
+        });
+        let polling_start = || {
+            let handle = Arc::clone(&manager.pending_changed_paths);
+            watcher::FileWatcher::start_polling(watcher_config, move |batch| {
+                if let Ok(mut paths) = handle.lock() {
+                    for path in batch.modified.into_iter().chain(batch.removed) {
+                        paths.insert(path);
+                    }
+                }
+            })
+        };
+        let (file_watcher, watcher_status) =
+            resolve_watcher_attachment(native_result, polling_start);
+        manager.watcher = file_watcher;
+        manager.watcher_status = watcher_status;
         Ok(manager)
     }
 
@@ -2465,7 +2581,12 @@ impl GraphManager {
             last_refresh: Instant::now(),
             build_report,
             pending_changed_paths: Arc::new(Mutex::new(HashSet::new())),
-            _watcher: None,
+            watcher: None,
+            watcher_status: WatcherStatus {
+                mode: WatcherMode::Disabled,
+                backend: "none",
+                fallback_reason: None,
+            },
         })
     }
 
@@ -2508,6 +2629,10 @@ impl GraphManager {
             .lock()
             .map(|paths| paths.len())
             .unwrap_or(0)
+    }
+
+    pub fn watcher_status(&self) -> &WatcherStatus {
+        &self.watcher_status
     }
 
     pub fn record_changed_path(&mut self, path: impl Into<PathBuf>) {

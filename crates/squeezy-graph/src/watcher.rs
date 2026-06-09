@@ -54,6 +54,24 @@ impl Default for WatcherConfig {
     }
 }
 
+/// Native watcher backend used on this platform.
+pub const fn native_backend_name() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "inotify"
+    } else if cfg!(target_os = "macos") {
+        "fsevents"
+    } else if cfg!(target_os = "windows") {
+        "read_directory_changes"
+    } else {
+        "native"
+    }
+}
+
+/// Polling fallback backend used when the native watcher cannot be registered.
+pub const fn polling_backend_name() -> &'static str {
+    "polling"
+}
+
 /// Batch of file-system changes delivered when the debounce window expires.
 #[derive(Debug, Default, Clone)]
 pub struct ChangeBatch {
@@ -121,13 +139,19 @@ impl FileWatcher {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn start_polling_for_tests<F>(config: WatcherConfig, on_change: F) -> Result<Self>
+    /// Start a polling watcher. This is slower than the OS-native backend, but
+    /// it keeps long-lived indexing alive when native registration fails, for
+    /// example when Linux inotify watch limits are exhausted or a recursive
+    /// watch cannot be installed on a FUSE/NFS mount.
+    pub fn start_polling<F>(config: WatcherConfig, on_change: F) -> Result<Self>
     where
         F: Fn(ChangeBatch) + Send + 'static,
     {
         let timeout = Duration::from_millis(config.debounce_ms);
-        let poll_interval = Duration::from_millis(50).min(timeout.max(Duration::from_millis(1)));
+        // Poll every 50 ms by default, but never faster than the debounce
+        // window (minimum 1 ms) so a very short debounce does not spin the
+        // poll loop.
+        let poll_interval = timeout.clamp(Duration::from_millis(1), Duration::from_millis(50));
         let mut debouncer = notify_debouncer_full::new_debouncer_opt::<
             _,
             notify_debouncer_full::notify::PollWatcher,
@@ -189,6 +213,13 @@ fn handle_debounce_result(result: DebounceEventResult) -> Option<ChangeBatch> {
         // may fire a Modify event for a deletion (the file is already gone
         // when we check). The post-debounce existence check is the most
         // portable signal.
+        //
+        // Do NOT canonicalize event paths here. FileWatcher::start already
+        // registers the canonical watched root, so notify reports paths that
+        // are already rooted at the canonical root. Calling canonicalize() on
+        // individual entries would silently resolve internal workspace symlinks
+        // to their targets, breaking refresh attribution for files that the
+        // crawler records under their symlink spelling.
         if path.exists() {
             modified.push(path);
         } else {

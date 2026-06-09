@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use squeezy_win_sandbox::{
     WinNetwork, WinSandboxSpec, WinTokenMode, WinWritableRoot, spawn_restricted_token,
 };
+use tokio::io::AsyncReadExt;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -63,10 +64,17 @@ fn fresh_workspace(tag: &str) -> PathBuf {
     dir
 }
 
+struct CmdOutput {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
 /// Run `cmd /c <cmdline_arg>` (a single shell command string) inside the
-/// sandbox rooted at `workspace`.  Returns the child's exit status, or `None`
-/// if the spawn was skipped because the host can't create restricted tokens.
-fn run_cmd(workspace: &Path, cmdline_arg: &str) -> Option<std::process::ExitStatus> {
+/// sandbox rooted at `workspace`.  Returns the child's captured output, or
+/// `None` if the spawn was skipped because the host can't create restricted
+/// tokens.
+fn run_cmd(workspace: &Path, cmdline_arg: &str) -> Option<CmdOutput> {
     let spec = make_spec(workspace);
     let argv = vec!["cmd".to_string(), "/c".to_string(), cmdline_arg.to_string()];
     let env: HashMap<String, String> = std::env::vars().collect();
@@ -80,8 +88,32 @@ fn run_cmd(workspace: &Path, cmdline_arg: &str) -> Option<std::process::ExitStat
         }
     };
 
-    let status = rt.block_on(child.wait()).expect("wait failed");
-    Some(status)
+    let mut stdout = child.take_stdout();
+    let mut stderr = child.take_stderr();
+    let (status, stdout_text, stderr_text) = rt.block_on(async move {
+        let stdout_task = async move {
+            let mut text = String::new();
+            if let Some(out) = stdout.as_mut() {
+                let _ = out.read_to_string(&mut text).await;
+            }
+            text
+        };
+        let stderr_task = async move {
+            let mut text = String::new();
+            if let Some(err) = stderr.as_mut() {
+                let _ = err.read_to_string(&mut text).await;
+            }
+            text
+        };
+        let wait_task = child.wait();
+        let (status, stdout_text, stderr_text) = tokio::join!(wait_task, stdout_task, stderr_task);
+        (status.expect("wait failed"), stdout_text, stderr_text)
+    });
+    Some(CmdOutput {
+        status,
+        stdout: stdout_text,
+        stderr: stderr_text,
+    })
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -93,14 +125,17 @@ fn write_inside_workspace_allowed() {
     let workspace = fresh_workspace("write_inside");
     let out_file = workspace.join("out.txt");
 
-    let cmdline = format!(r#"echo hi > "{}""#, out_file.display());
-    let Some(status) = run_cmd(&workspace, &cmdline) else {
+    let cmdline = "echo hi > out.txt";
+    let Some(output) = run_cmd(&workspace, cmdline) else {
         return;
     };
 
     assert!(
-        status.success(),
-        "write inside workspace should succeed; exit={status:?}"
+        output.status.success(),
+        "write inside workspace should succeed; exit={:?}; stdout={:?}; stderr={:?}",
+        output.status,
+        output.stdout,
+        output.stderr,
     );
     assert!(
         out_file.exists(),
@@ -128,7 +163,7 @@ fn write_outside_workspace_denied() {
     // Ignore the exit status here: cmd.exe may exit 0 even when a shell
     // redirection is denied.  The authoritative signal is whether the file was
     // created.
-    let Some(_status) = run_cmd(&workspace, &cmdline) else {
+    let Some(_output) = run_cmd(&workspace, &cmdline) else {
         return;
     };
 
@@ -150,14 +185,17 @@ fn append_inside_allowed() {
     let target = workspace.join("append.txt");
     std::fs::write(&target, "line1\n").expect("seed file");
 
-    let cmdline = format!(r#"echo line2 >> "{}""#, target.display());
-    let Some(status) = run_cmd(&workspace, &cmdline) else {
+    let cmdline = "echo line2 >> append.txt";
+    let Some(output) = run_cmd(&workspace, cmdline) else {
         return;
     };
 
     assert!(
-        status.success(),
-        "append inside workspace should succeed; exit={status:?}"
+        output.status.success(),
+        "append inside workspace should succeed; exit={:?}; stdout={:?}; stderr={:?}",
+        output.status,
+        output.stdout,
+        output.stderr,
     );
     let contents = std::fs::read_to_string(&target).expect("read file after append");
     assert!(
@@ -176,14 +214,17 @@ fn delete_inside_allowed() {
     let target = workspace.join("delme.txt");
     std::fs::write(&target, "x").expect("seed file");
 
-    let cmdline = format!(r#"del /q "{}""#, target.display());
-    let Some(status) = run_cmd(&workspace, &cmdline) else {
+    let cmdline = "del /q delme.txt";
+    let Some(output) = run_cmd(&workspace, cmdline) else {
         return;
     };
 
     assert!(
-        status.success(),
-        "delete inside workspace should succeed; exit={status:?}"
+        output.status.success(),
+        "delete inside workspace should succeed; exit={:?}; stdout={:?}; stderr={:?}",
+        output.status,
+        output.stdout,
+        output.stderr,
     );
     assert!(
         !target.exists(),
@@ -200,15 +241,22 @@ fn delete_inside_allowed() {
 fn read_system_still_works() {
     let workspace = fresh_workspace("read_system");
 
-    // `dir C:\Windows` lists the directory — a read-only operation that should
-    // always succeed on the restricted-token tier.
-    let Some(status) = run_cmd(&workspace, r"dir C:\Windows") else {
+    // Check for a stable system file without emitting a large directory listing;
+    // these smoke tests do not otherwise need stdout, and an un-drained listing
+    // can fill the pipe before the process exits.
+    let Some(output) = run_cmd(
+        &workspace,
+        r#"if exist C:\Windows\System32\cmd.exe (exit /b 0) else (exit /b 1)"#,
+    ) else {
         return;
     };
 
     assert!(
-        status.success(),
-        "reading C:\\Windows with dir should succeed on restricted-token tier; exit={status:?}"
+        output.status.success(),
+        "reading C:\\Windows should succeed on restricted-token tier; exit={:?}; stdout={:?}; stderr={:?}",
+        output.status,
+        output.stdout,
+        output.stderr,
     );
 
     let _ = std::fs::remove_dir_all(&workspace);
