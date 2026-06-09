@@ -59,10 +59,11 @@ use squeezy_telemetry::{
 use squeezy_tools::{
     McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
     PlanModeShellSafety, ShellAskApprover, ShellAskDecision, ShellAskRequest,
-    ShellBestEffortFallback, ShellPreClassification, ToolCall, ToolCostHint, ToolExecutionOptions,
-    ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime, ToolResult,
-    ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig, classify_plan_mode_shell_command,
-    pre_classify_shell, sha256_hex, shell_best_effort_fallback_from_result,
+    ShellBestEffortFallback, ShellPreClassification, ShellWindowsDegraded, ToolCall, ToolCostHint,
+    ToolExecutionOptions, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
+    ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig,
+    classify_plan_mode_shell_command, pre_classify_shell, sha256_hex,
+    shell_best_effort_fallback_from_result, shell_windows_degraded_from_result,
 };
 use tokio::{
     sync::{Mutex, Notify, broadcast, mpsc, oneshot},
@@ -1461,6 +1462,11 @@ pub struct Agent {
     /// old sequential semantics so rapid toggle/restart/add/remove actions
     /// settle in the same order the user requested them.
     mcp_background_queue: Arc<McpBackgroundQueue>,
+    /// Root cancellation token for agent-lifetime background tasks. Cancelling
+    /// the current token bounds MCP reload/toggle/restart tasks so they cannot
+    /// hold tool-registry or store handles across `Agent::shutdown`. The token
+    /// is renewed after shutdown because the `Agent` remains reusable.
+    shutdown_token: Arc<StdMutex<CancellationToken>>,
     /// Cross-turn state for the per-turn model router. Tracks the
     /// escalation-sticky window and any pending `/cheap` / `/parent` /
     /// `/router` user override. Shared with each `TurnRuntime` via
@@ -2165,6 +2171,7 @@ impl Agent {
             event_broadcast,
             background_tasks: Arc::new(StdMutex::new(tokio::task::JoinSet::new())),
             mcp_background_queue: Arc::new(McpBackgroundQueue::default()),
+            shutdown_token: Arc::new(StdMutex::new(CancellationToken::new())),
             routing_state: Arc::new(StdMutex::new(turn_router::RoutingPersistentState::default())),
             last_request_overhead_tokens: Arc::new(AtomicU64::new(0)),
             configured_model_context_window,
@@ -2289,10 +2296,9 @@ impl Agent {
         }
         let tools = self.tools.clone();
         let servers = next.mcp_servers.clone();
+        let cancel = self.mcp_shutdown_child_token();
         let task = async move {
-            let _ = tools
-                .replace_mcp_servers(servers, CancellationToken::new())
-                .await;
+            let _ = tools.replace_mcp_servers(servers, cancel).await;
         };
         // Hand the spawn to the tracked `JoinSet` so `Agent::shutdown`
         // waits for the registry to settle before dropping the redb
@@ -2550,6 +2556,14 @@ impl Agent {
     /// from inside an agent turn. The "manual" group id mirrors how the agent
     /// labels human-driven invocations so checkpoint grouping stays
     /// consistent across both entry points.
+    ///
+    /// Cancellation: this is a directly-awaited (sync) entry point whose
+    /// caller can drop the future to abort, so it issues a fresh
+    /// `CancellationToken` rather than a `mcp_shutdown_child_token()` child.
+    /// `Agent::shutdown` cannot interrupt an in-flight call here; the
+    /// `_in_background` siblings (e.g. `set_mcp_server_enabled_in_background`,
+    /// `restart_mcp_server_in_background`) are the ones that adopt the
+    /// shutdown-rooted token because they outlive their caller.
     pub async fn execute_local_tool(&self, call: ToolCall) -> ToolResult {
         self.tools
             .execute_for_group(call, CancellationToken::new(), "manual".to_string())
@@ -2560,6 +2574,11 @@ impl Agent {
     /// background refresh on each `start_turn`; this helper lets tests
     /// and the eval harness pre-warm the cache so the very first turn
     /// can issue `mcp__*` tool calls without racing the background task.
+    ///
+    /// See [`Agent::execute_local_tool`] for the rationale behind the fresh
+    /// `CancellationToken`: this is a sync entry point whose caller controls
+    /// cancellation by dropping the future, so it does not enrol in the
+    /// shutdown-rooted token tree.
     pub async fn refresh_mcp_tools(&self) -> squeezy_tools::McpRefreshOutcome {
         self.tools.refresh_mcp_tools(CancellationToken::new()).await
     }
@@ -2568,6 +2587,12 @@ impl Agent {
     /// agent. Returns the same refresh outcome `refresh_mcp_tools`
     /// produces so the caller (the `/mcp` config page, eval driver)
     /// can pull the new per-server status.
+    ///
+    /// Cancellation: as with `execute_local_tool` and `refresh_mcp_tools`,
+    /// this is a sync call whose caller owns the lifetime, so we mint a
+    /// fresh token. The `_in_background` sibling spawns into the agent's
+    /// JoinSet and therefore uses `mcp_shutdown_child_token()` so
+    /// `Agent::shutdown` can drain it.
     pub async fn set_mcp_server_enabled(
         &mut self,
         server_name: &str,
@@ -2596,9 +2621,10 @@ impl Agent {
             server.enabled = enabled;
         }
         let tools = self.tools.clone();
+        let cancel = self.mcp_shutdown_child_token();
         let task = async move {
             let _ = tools
-                .set_mcp_server_enabled(&server_name, enabled, CancellationToken::new())
+                .set_mcp_server_enabled(&server_name, enabled, cancel)
                 .await;
         };
         self.spawn_mcp_background_task(task);
@@ -2611,7 +2637,7 @@ impl Agent {
         server_name: &str,
     ) -> squeezy_tools::McpResult<squeezy_tools::McpRefreshOutcome> {
         self.tools
-            .restart_mcp_server(server_name, CancellationToken::new())
+            .restart_mcp_server(server_name, self.mcp_shutdown_child_token())
             .await
     }
 
@@ -2620,10 +2646,9 @@ impl Agent {
     /// that snapshot while this task runs.
     pub fn restart_mcp_server_in_background(&self, server_name: String) {
         let tools = self.tools.clone();
+        let cancel = self.mcp_shutdown_child_token();
         let task = async move {
-            let _ = tools
-                .restart_mcp_server(&server_name, CancellationToken::new())
-                .await;
+            let _ = tools.restart_mcp_server(&server_name, cancel).await;
         };
         self.spawn_mcp_background_task(task);
     }
@@ -2638,7 +2663,7 @@ impl Agent {
     ) -> squeezy_tools::McpRefreshOutcome {
         self.config.mcp_servers = servers.clone();
         self.tools
-            .replace_mcp_servers(servers, CancellationToken::new())
+            .replace_mcp_servers(servers, self.mcp_shutdown_child_token())
             .await
     }
 
@@ -2651,10 +2676,9 @@ impl Agent {
     ) {
         self.config.mcp_servers = servers.clone();
         let tools = self.tools.clone();
+        let cancel = self.mcp_shutdown_child_token();
         let task = async move {
-            let _ = tools
-                .replace_mcp_servers(servers, CancellationToken::new())
-                .await;
+            let _ = tools.replace_mcp_servers(servers, cancel).await;
         };
         self.spawn_mcp_background_task(task);
     }
@@ -2687,6 +2711,13 @@ impl Agent {
         }
     }
 
+    fn mcp_shutdown_child_token(&self) -> CancellationToken {
+        match self.shutdown_token.lock() {
+            Ok(token) => token.child_token(),
+            Err(poison) => poison.into_inner().child_token(),
+        }
+    }
+
     /// Snapshot of the registry's live server map. Mirrors
     /// `AppConfig.mcp_servers` but reads from the registry directly so
     /// callers see post-`replace_mcp_servers` state.
@@ -2710,11 +2741,23 @@ impl Agent {
     /// `start_turn` will simply register new tasks into the now-empty
     /// JoinSet.
     pub async fn shutdown(&self) {
+        // Signal all agent-lifetime background tasks (MCP reload, toggle,
+        // restart) to stop. This bounds their lifetime so callers can safely
+        // drop the agent and reopen any held file handles (e.g. redb on
+        // Windows, which uses an exclusive lock).
+        match self.shutdown_token.lock() {
+            Ok(token) => token.cancel(),
+            Err(poison) => poison.into_inner().cancel(),
+        }
         let mut tasks = match self.background_tasks.lock() {
             Ok(mut guard) => std::mem::take(&mut *guard),
             Err(poison) => std::mem::take(&mut *poison.into_inner()),
         };
         while tasks.join_next().await.is_some() {}
+        match self.shutdown_token.lock() {
+            Ok(mut token) => *token = CancellationToken::new(),
+            Err(poison) => *poison.into_inner() = CancellationToken::new(),
+        }
     }
 
     pub fn subscribe_jobs(&self) -> broadcast::Receiver<JobEvent> {
@@ -14726,6 +14769,11 @@ fn emit_tool_telemetry(
             &fallback.backend,
         ));
     }
+    // Windows: fire a separate telemetry event so Windows shell backend
+    // degradation is separable from Unix sandbox runtime failures in dashboards.
+    if let Some(degraded) = shell_windows_degraded_from_result(result) {
+        telemetry.spawn(TelemetryEvent::shell_windows_degraded(&degraded.backend));
+    }
 }
 
 /// Detect a shell best_effort sandbox fallback in `result` and, when this
@@ -14739,26 +14787,45 @@ async fn maybe_emit_shell_sandbox_fallback_warning(
     turn_id: TurnId,
     result: &ToolResult,
 ) {
-    let Some(ShellBestEffortFallback {
+    // Unix best_effort path: fires once per session on the first sandbox
+    // degradation (sandbox exec crashed, unshare failed, etc.).
+    if let Some(ShellBestEffortFallback {
         backend,
         fallback_count,
         first_in_session,
         fallback_reason,
     }) = shell_best_effort_fallback_from_result(result)
-    else {
-        return;
-    };
-    if !first_in_session {
+    {
+        if first_in_session {
+            let _ = tx
+                .send(AgentEvent::ShellSandboxBestEffortFallback {
+                    turn_id,
+                    backend,
+                    fallback_count,
+                    fallback_reason,
+                })
+                .await;
+        }
         return;
     }
-    let _ = tx
-        .send(AgentEvent::ShellSandboxBestEffortFallback {
-            turn_id,
-            backend,
-            fallback_count,
-            fallback_reason,
-        })
-        .await;
+    // Windows: every shell run uses `windows-job-object` with no FS/network
+    // isolation. Emit the dedicated Windows warning once per session so the
+    // TUI can display a Windows-specific safety notice.
+    if let Some(ShellWindowsDegraded {
+        backend,
+        filesystem,
+        first_in_session,
+    }) = shell_windows_degraded_from_result(result)
+        && first_in_session
+    {
+        let _ = tx
+            .send(AgentEvent::ShellWindowsDegraded {
+                turn_id,
+                backend,
+                filesystem,
+            })
+            .await;
+    }
 }
 
 /// SHA-256 of the canonical JSON arguments the model sent for a tool call.
@@ -18104,6 +18171,16 @@ pub enum AgentEvent {
     /// caveat without having to execute a shell command first.
     WindowsSandboxActive {
         turn_id: TurnId,
+    },
+    /// Fires once per session on Windows when the first shell result reports
+    /// `windows-job-object` or `best_effort_unavailable` filesystem isolation.
+    /// Unlike [`ShellSandboxBestEffortFallback`] this is not a runtime
+    /// failure; it describes the steady-state Windows sandbox posture and lets
+    /// the TUI display a Windows-specific safety notice.
+    ShellWindowsDegraded {
+        turn_id: TurnId,
+        backend: String,
+        filesystem: String,
     },
     /// Per-turn progress callout emitted every few tool calls so a user
     /// watching a live transcript can see cost accumulating before the

@@ -12292,6 +12292,9 @@ fn shell_best_effort_does_not_retry_signal_exit_without_output() {
         raw_spillover: None,
         win_job_object_status: None,
         tty_degraded: false,
+        tty_downgraded: false,
+        windows_job_assigned: None,
+        windows_timeout_job_cleanup_ok: None,
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run);
@@ -12447,6 +12450,9 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
         raw_spillover: None,
         win_job_object_status: None,
         tty_degraded: false,
+        tty_downgraded: false,
+        windows_job_assigned: None,
+        windows_timeout_job_cleanup_ok: None,
     };
 
     let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run)

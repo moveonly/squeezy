@@ -12124,3 +12124,20 @@ fn redact_tool_call_arguments_strips_secret() {
         "secret must be absent from redacted tool-call arguments; got: {redacted_str:?}"
     );
 }
+
+#[tokio::test]
+async fn agent_shutdown_renews_mcp_shutdown_token() {
+    let agent = Agent::new_ephemeral(AppConfig::default(), Arc::new(MockProvider::new(vec![])));
+    let old_child = agent.mcp_shutdown_child_token();
+
+    agent.shutdown().await;
+
+    assert!(
+        old_child.is_cancelled(),
+        "shutdown must cancel already-issued MCP background tokens"
+    );
+    assert!(
+        !agent.mcp_shutdown_child_token().is_cancelled(),
+        "Agent remains reusable after shutdown, so new MCP work must receive a live token"
+    );
+}

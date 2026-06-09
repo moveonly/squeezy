@@ -1451,6 +1451,26 @@ impl TelemetryEvent {
         }
     }
 
+    /// `shell.windows_degraded{backend}` counter event. Fires once per session
+    /// on Windows when the first shell result carries `windows-job-object` or
+    /// `best_effort_unavailable` filesystem isolation. Separable from
+    /// `shell_sandbox_best_effort_fallback` (which counts Unix runtime sandbox
+    /// failures) so Windows shell backend degradation is independently
+    /// filterable in dashboards.
+    pub fn shell_windows_degraded(backend: &str) -> Self {
+        Self {
+            event: TelemetryEventName::ShellWindowsDegraded,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                tool_name: Some(FirstPartyToolName::Shell),
+                tool_family: Some(ToolFamily::Shell),
+                sandbox_backend: Some(backend.to_string()),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
     /// `ai_reviewer.allow_downgrade{capability}` counter event. Fires when
     /// the AI reviewer model returned `allow` but the requested capability
     /// is not in the operator's `allow_capabilities` allowlist, so the
@@ -1805,6 +1825,11 @@ pub enum TelemetryEventName {
     /// dashboards rather than only in audit logs.
     #[serde(rename = "approval_best_effort_fallback")]
     ShellSandboxBestEffortFallback,
+    /// `shell.windows_degraded{backend}` — Windows steady-state sandbox
+    /// posture. Separable from `ShellSandboxBestEffortFallback` so
+    /// Windows shell runs can be filtered independently in dashboards.
+    #[serde(rename = "shell_windows_degraded")]
+    ShellWindowsDegraded,
     /// `ai_reviewer.allow_downgrade{capability}` — emitted when the AI
     /// reviewer would have approved but the capability was not in the
     /// operator's `allow_capabilities` allowlist, so the verdict silently
@@ -2389,6 +2414,22 @@ fn with_summary_id(mut event: TelemetryEvent, summary_id: &str) -> TelemetryEven
     event
 }
 
+/// Rolls per-event telemetry into the session summary that callers fold
+/// into the final `summary` event.
+///
+/// `failure_count` is the cumulative counter of "things that meaningfully
+/// failed mid-run", and most failure-shaped events both increment it and
+/// add a per-kind row in `failure_counts`. There is one deliberate
+/// asymmetry: `ShellWindowsDegraded` only ticks the per-kind row, not
+/// `failure_count`, because it is a steady-state platform posture (every
+/// Windows `windows-job-object` run hits it) rather than a runtime
+/// failure. Counting it as a failure would dominate any Windows session's
+/// cumulative failure_count and drown out genuine errors. Per-kind rows
+/// stay separable so dashboards that want platform breakdowns still get
+/// them. `ShellSandboxBestEffortFallback`, by contrast, *is* a runtime
+/// degradation (the configured sandbox couldn't start and we fell back),
+/// so it bumps both. Any future steady-state-degradation event should
+/// mirror the `ShellWindowsDegraded` shape.
 #[derive(Debug, Default)]
 struct SummaryAccumulator {
     provider: Option<ProviderKind>,
@@ -2609,6 +2650,15 @@ impl SummaryAccumulator {
                 increment_count(
                     &mut self.failure_counts,
                     "approval_best_effort_fallback".to_string(),
+                );
+            }
+            TelemetryEventName::ShellWindowsDegraded => {
+                // Windows steady-state degradation: counted separately from
+                // Unix sandbox runtime failures so dashboards can filter by
+                // platform without Unix/Windows signals cross-contaminating.
+                increment_count(
+                    &mut self.failure_counts,
+                    "shell_windows_degraded".to_string(),
                 );
             }
             TelemetryEventName::AiReviewerAllowDowngrade => {

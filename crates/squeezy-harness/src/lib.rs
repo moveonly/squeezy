@@ -688,6 +688,7 @@ async fn run_agent_with_config(
             | AgentEvent::ReasoningSegment { .. }
             | AgentEvent::ShellSandboxBestEffortFallback { .. }
             | AgentEvent::WindowsSandboxActive { .. }
+            | AgentEvent::ShellWindowsDegraded { .. }
             | AgentEvent::TurnRouted { .. } => {}
         }
     }

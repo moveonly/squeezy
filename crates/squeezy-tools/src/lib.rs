@@ -2605,6 +2605,20 @@ impl ToolRegistry {
                 {
                     metadata.insert("description".to_string(), description.to_string());
                 }
+                // On Windows, show the resolved shell in the approval metadata so
+                // the reviewer can see whether the command runs under pwsh, powershell,
+                // cmd.exe, or a custom override. Quoting, redirects, and destructive
+                // verbs differ significantly between these shells.
+                #[cfg(windows)]
+                {
+                    let shell = shell_program::ShellProgram::for_command(command);
+                    let shell_name = std::path::Path::new(&shell.program)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&shell.program)
+                        .to_string();
+                    metadata.insert("resolved_shell".to_string(), shell_name);
+                }
                 suggested_rules.push(PermissionRule::new(
                     analysis.capability.as_str(),
                     analysis.rule_target.clone(),
@@ -7021,6 +7035,36 @@ pub(crate) fn detect_line_endings(bytes: &[u8]) -> &'static str {
         (false, true) => "lf",
         (false, false) => "none",
     }
+}
+
+/// Describes the once-per-session Windows degradation event embedded in a
+/// shell result when the run used `windows-job-object` or
+/// `best_effort_unavailable` filesystem isolation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellWindowsDegraded {
+    pub backend: String,
+    pub filesystem: String,
+    /// `true` the first time this is seen in the session so the TUI can emit
+    /// a one-shot banner; `false` for every subsequent degraded run.
+    pub first_in_session: bool,
+}
+
+/// Extract the Windows degradation descriptor from a shell `ToolResult`.
+/// Returns `None` when the result is not a Windows-degraded shell run or when
+/// the payload does not carry the expected fields.
+pub fn shell_windows_degraded_from_result(result: &ToolResult) -> Option<ShellWindowsDegraded> {
+    if result.tool_name != "shell" {
+        return None;
+    }
+    let payload = result.content.get("sandbox")?.get("windows_degraded")?;
+    let backend = payload.get("backend")?.as_str()?.to_string();
+    let filesystem = payload.get("filesystem")?.as_str()?.to_string();
+    let first_in_session = payload.get("first_in_session")?.as_bool()?;
+    Some(ShellWindowsDegraded {
+        backend,
+        filesystem,
+        first_in_session,
+    })
 }
 
 pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {

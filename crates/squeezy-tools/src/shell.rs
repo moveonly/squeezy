@@ -80,6 +80,20 @@ pub(crate) struct ShellRunOutcome {
     /// non-TTY pipes (Windows without ConPTY). The caller surfaces this as a
     /// note in the tool result.
     pub(crate) tty_degraded: bool,
+    /// Set when `tty: true` was requested but the platform does not support
+    /// ConPTY and the run fell back to piped stdin/stdout/stderr. The model
+    /// should be informed so it can adjust output-parsing expectations.
+    pub(crate) tty_downgraded: bool,
+    /// Windows Job Object assignment status. `None` means no Job Object was
+    /// attempted (Unix, or a Windows sandbox tier that manages its own job).
+    /// `Some(true)` means the process was successfully assigned; `Some(false)`
+    /// means creation or assignment failed and process-tree cleanup is
+    /// best-effort only.
+    pub(crate) windows_job_assigned: Option<bool>,
+    /// Result of `TerminateJobObject` called during a timeout cleanup.
+    /// `None` when not on Windows, not timed out, or no job object was held.
+    /// `Some(false)` means descendants may survive the timeout.
+    pub(crate) windows_timeout_job_cleanup_ok: Option<bool>,
 }
 
 struct ShellRunRequest<'a> {
@@ -100,7 +114,12 @@ pub(crate) struct ShellExecutionGuard {
 }
 
 enum ShellRunError {
-    Cancelled,
+    /// Shell was cancelled. Carries the Windows Job Object cleanup result:
+    /// `None` = no job object was active; `Some(true)` = job terminated
+    /// successfully; `Some(false)` = terminate failed (descendants may survive).
+    Cancelled {
+        windows_job_cleanup_ok: Option<bool>,
+    },
     SandboxStartDenied(String),
     /// Spawn failure on a non-required sandboxed backend where the OS or
     /// container environment blocked the spawn/pre-exec path (e.g. the
@@ -110,6 +129,28 @@ enum ShellRunError {
     /// path instead of surfacing a hard tool error.
     SpawnFallback(String),
     Io(std::io::Error),
+}
+
+/// Decide whether to call `TerminateJobObject` and report the resulting
+/// cleanup state. Shared by the cancel and timeout cleanup paths because
+/// both observe the same three states:
+///
+/// - `assigned == Some(true)`: the process is in the job, so termination
+///   should propagate to the full process tree; report the terminate
+///   result.
+/// - `assigned == Some(false)`: the job was created but the process never
+///   landed in it, so `TerminateJobObject` on an empty job would silently
+///   return `Ok` while descendants survive — report `Some(false)` and skip
+///   the call so callers can surface the leak.
+/// - `assigned == None`: the sandbox tier owns its own job (or this is a
+///   non-Windows path), so there is nothing to clean up at this layer.
+#[cfg(windows)]
+fn windows_job_cleanup_status(job: Option<&ShellJob>, assigned: Option<bool>) -> Option<bool> {
+    match assigned {
+        Some(true) => job.map(|j| j.terminate(1).is_ok()),
+        Some(false) => Some(false),
+        None => None,
+    }
 }
 
 impl ToolRegistry {
@@ -309,7 +350,9 @@ impl ToolRegistry {
             .await
         {
             Ok(run) => run,
-            Err(ShellRunError::Cancelled) => {
+            Err(ShellRunError::Cancelled {
+                windows_job_cleanup_ok,
+            }) => {
                 self.audit_shell(
                     call,
                     &args,
@@ -324,7 +367,7 @@ impl ToolRegistry {
                     &[],
                     &[],
                 );
-                return ToolResult::cancelled(call);
+                return shell_cancelled_result(call, windows_job_cleanup_ok);
             }
             Err(ShellRunError::SandboxStartDenied(reason)) => {
                 self.audit_shell(
@@ -393,7 +436,9 @@ impl ToolRegistry {
                     .await
                 {
                     Ok(run) => run,
-                    Err(ShellRunError::Cancelled) => {
+                    Err(ShellRunError::Cancelled {
+                        windows_job_cleanup_ok: _,
+                    }) => {
                         self.audit_shell(
                             call,
                             &args,
@@ -485,7 +530,9 @@ impl ToolRegistry {
                 .await
             {
                 Ok(run) => run,
-                Err(ShellRunError::Cancelled) => {
+                Err(ShellRunError::Cancelled {
+                    windows_job_cleanup_ok,
+                }) => {
                     self.audit_shell(
                         call,
                         &args,
@@ -500,7 +547,7 @@ impl ToolRegistry {
                         &[],
                         &[],
                     );
-                    return ToolResult::cancelled(call);
+                    return shell_cancelled_result(call, windows_job_cleanup_ok);
                 }
                 Err(ShellRunError::SandboxStartDenied(reason)) => {
                     self.audit_shell(
@@ -536,6 +583,9 @@ impl ToolRegistry {
             raw_spillover,
             win_job_object_status,
             tty_degraded,
+            tty_downgraded,
+            windows_job_assigned,
+            windows_timeout_job_cleanup_ok,
         } = run;
 
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
@@ -740,6 +790,86 @@ impl ToolRegistry {
                 ),
             );
         }
+        // Windows: surface the degraded sandbox state and Job Object assignment
+        // so the agent layer can emit the once-per-session TUI banner and
+        // callers can detect missing process-tree cleanup guarantees.
+        if sandbox_plan.backend == "windows-job-object"
+            || sandbox_plan.filesystem == "best_effort_unavailable"
+        {
+            // The Unix `best_effort_fallback` writer above and this Windows
+            // writer both target the same `sandbox` key, and
+            // `insert_content_field` overwrites rather than merges. The two
+            // paths are mutually exclusive today (a best-effort fallback
+            // rewrites the plan to `backend: "none"`, `filesystem:
+            // "not_enforced"`, neither of which satisfies the predicate
+            // above), so this assertion locks the invariant in debug builds
+            // — any future plan-shape change that lets both fire would
+            // otherwise silently drop the Unix payload.
+            debug_assert!(
+                raw_content
+                    .as_object()
+                    .and_then(|obj| obj.get("sandbox"))
+                    .and_then(|s| s.as_object())
+                    .map(|s| !s.contains_key("best_effort_fallback"))
+                    .unwrap_or(true),
+                "sandbox.best_effort_fallback and sandbox.windows_degraded must be mutually exclusive",
+            );
+            let first_in_session = self.shell_sandbox_health.record_windows_degraded();
+            // Include the resolved shell so approval prompts and model context
+            // show which shell interpreted the command.
+            let resolved_shell = std::path::Path::new(&sandbox_plan.program)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&sandbox_plan.program)
+                .to_string();
+            insert_content_field(
+                &mut raw_content,
+                "sandbox",
+                json!({
+                    "windows_degraded": {
+                        "first_in_session": first_in_session,
+                        "backend": sandbox_plan.backend,
+                        "filesystem": sandbox_plan.filesystem,
+                        "resolved_shell": resolved_shell,
+                    }
+                }),
+            );
+        }
+        if windows_job_assigned.is_some() || windows_timeout_job_cleanup_ok.is_some() {
+            let mut windows_info = serde_json::Map::new();
+            if let Some(assigned) = windows_job_assigned {
+                windows_info.insert("job_object_assigned".to_string(), json!(assigned));
+                windows_info.insert(
+                    "cleanup_note".to_string(),
+                    json!(if assigned {
+                        "process tree will be terminated with the job"
+                    } else {
+                        "Job Object assignment failed; only direct child is covered by kill_on_drop"
+                    }),
+                );
+            }
+            if let Some(cleanup_ok) = windows_timeout_job_cleanup_ok {
+                windows_info.insert("timeout_job_cleanup".to_string(), json!(cleanup_ok));
+                if !cleanup_ok {
+                    windows_info.insert(
+                        "timeout_cleanup_note".to_string(),
+                        json!("TerminateJobObject failed on timeout; descendant processes may still be running"),
+                    );
+                }
+            }
+            insert_content_field(
+                &mut raw_content,
+                "windows",
+                serde_json::Value::Object(windows_info),
+            );
+        }
+        if tty_downgraded {
+            insert_content_field(
+                &mut raw_content,
+                "tty_downgraded",
+                json!("TTY requested but ConPTY is not available; ran with pipes"),
+            );
+        }
         if let Some(summary) = implicit_skill {
             insert_content_field(
                 &mut raw_content,
@@ -851,6 +981,8 @@ impl ToolRegistry {
         // needed only on the relevant platform but must compile on all targets.
         #[allow(unused_mut)]
         let mut tty_degraded = false;
+        #[allow(unused_mut)]
+        let mut tty_downgraded = false;
 
         if win_sandbox_backend {
             #[cfg(windows)]
@@ -861,6 +993,7 @@ impl ToolRegistry {
                 // the same tty_degraded signal as the non-sandbox tokio path.
                 if tty {
                     tty_degraded = true;
+                    tty_downgraded = true;
                 }
                 let _ = tty;
                 drop(shell_ask_approver);
@@ -927,6 +1060,8 @@ impl ToolRegistry {
                     // requested backend, just without a controlling terminal.
                     // The outcome records `tty_degraded = true` so the caller
                     // can surface a note to the user.
+                    tty_degraded = true;
+                    tty_downgraded = true;
                     command
                         .stdin(Stdio::null())
                         .stdout(Stdio::piped())
@@ -947,6 +1082,7 @@ impl ToolRegistry {
                 #[cfg(not(unix))]
                 {
                     tty_degraded = true;
+                    tty_downgraded = true;
                 }
             }
             configure_shell_process_group(&mut command);
@@ -1025,24 +1161,31 @@ impl ToolRegistry {
         // should be independently observable — a failed job means
         // timeout/cancel may not kill all descendants.
         #[cfg(windows)]
-        let (shell_job, win_job_object_status): (Option<ShellJob>, &'static str) =
-            if win_sandbox_backend {
-                (None, "sandbox_managed")
-            } else {
-                match ShellJob::new() {
-                    Ok(job) => {
-                        if let Some(pid) = child.id() {
-                            match job.assign_process(pid) {
-                                Ok(()) => (Some(job), "assigned"),
-                                Err(_) => (Some(job), "assign_failed"),
-                            }
-                        } else {
-                            (Some(job), "pid_unavailable")
+        let (shell_job, win_job_object_status, windows_job_assigned): (
+            Option<ShellJob>,
+            &'static str,
+            Option<bool>,
+        ) = if win_sandbox_backend {
+            (None, "sandbox_managed", None)
+        } else {
+            match ShellJob::new() {
+                Ok(job) => {
+                    if let Some(pid) = child.id() {
+                        match job.assign_process(pid) {
+                            Ok(()) => (Some(job), "assigned", Some(true)),
+                            Err(_) => (Some(job), "assign_failed", Some(false)),
                         }
+                    } else {
+                        (Some(job), "pid_unavailable", Some(false))
                     }
-                    Err(_) => (None, "create_failed"),
                 }
-            };
+                Err(_) => (None, "create_failed", Some(false)),
+            }
+        };
+        #[cfg(not(windows))]
+        let _win_job_object_status: &'static str = "not_windows";
+        #[cfg(not(windows))]
+        let windows_job_assigned: Option<bool> = None;
 
         let stdout_capture = ShellStreamCapture::default();
         let stderr_capture = ShellStreamCapture::default();
@@ -1084,25 +1227,33 @@ impl ToolRegistry {
             _ = cancel.cancelled() => {
                 terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
                 #[cfg(windows)]
-                if let Some(job) = shell_job.as_ref() {
-                    let _ = job.terminate(1);
-                }
+                let cancel_job_cleanup_ok =
+                    windows_job_cleanup_status(shell_job.as_ref(), windows_job_assigned);
+                #[cfg(not(windows))]
+                let cancel_job_cleanup_ok: Option<bool> = None;
                 stdout_task.abort();
                 stderr_task.abort();
                 drop(ask_server);
-                return Err(ShellRunError::Cancelled);
+                return Err(ShellRunError::Cancelled {
+                    windows_job_cleanup_ok: cancel_job_cleanup_ok,
+                });
             }
             result = time::timeout(Duration::from_millis(timeout_ms), child.wait()) => result,
         };
 
         let timed_out = status.is_err();
+        #[cfg(windows)]
+        let mut windows_timeout_job_cleanup_ok: Option<bool> = None;
+        #[cfg(not(windows))]
+        let windows_timeout_job_cleanup_ok: Option<bool> = None;
         let exit_status = match status {
             Ok(Ok(status)) => Some(status),
             Err(_) => {
                 terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
                 #[cfg(windows)]
-                if let Some(job) = shell_job.as_ref() {
-                    let _ = job.terminate(1);
+                {
+                    windows_timeout_job_cleanup_ok =
+                        windows_job_cleanup_status(shell_job.as_ref(), windows_job_assigned);
                 }
                 None
             }
@@ -1147,6 +1298,9 @@ impl ToolRegistry {
             #[cfg(not(windows))]
             win_job_object_status: None,
             tty_degraded,
+            tty_downgraded,
+            windows_job_assigned,
+            windows_timeout_job_cleanup_ok,
         })
     }
 }
@@ -1319,6 +1473,32 @@ pub(crate) fn shell_command_needs_checkpoint(
         }
         _ => true,
     }
+}
+
+/// Build a cancelled `ToolResult` for a shell call. When `windows_job_cleanup_ok`
+/// is `Some(false)` the Job Object cleanup failed and descendants may survive,
+/// so a degraded-cleanup note is included in the result to avoid silent
+/// process leakage.
+pub(crate) fn shell_cancelled_result(
+    call: &ToolCall,
+    windows_job_cleanup_ok: Option<bool>,
+) -> ToolResult {
+    if windows_job_cleanup_ok == Some(false) {
+        return make_result(
+            call,
+            ToolStatus::Cancelled,
+            json!({
+                "error": "tool call cancelled",
+                "windows": {
+                    "job_object_cleanup": "failed",
+                    "note": "process tree cleanup not guaranteed; descendant processes may still be running"
+                }
+            }),
+            ToolCostHint::default(),
+            None,
+        );
+    }
+    ToolResult::cancelled(call)
 }
 
 pub(crate) fn shell_policy_denied(

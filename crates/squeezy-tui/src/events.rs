@@ -475,6 +475,16 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                             .to_string(),
                     );
                 }
+                AgentEvent::ShellWindowsDegraded { backend, .. } => {
+                    // Fires at most once per session on Windows. Unlike
+                    // ShellSandboxBestEffortFallback this is not a runtime
+                    // failure — the Windows sandbox posture is always
+                    // degraded when running with windows-job-object.
+                    let notice = format!(
+                        "shell sandbox: running on Windows with backend `{backend}`; no filesystem or network isolation is enforced. Shell commands run with process-tree cleanup only."
+                    );
+                    app.push_warn(notice);
+                }
                 AgentEvent::CostUpdate {
                     tool_count,
                     input_tokens,

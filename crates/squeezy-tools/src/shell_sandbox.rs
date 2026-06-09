@@ -66,6 +66,11 @@ pub(crate) struct ShellSandboxHealth {
     /// per session, we compute this once and clone it per call instead.
     pub(crate) preserved_env_cache:
         OnceLock<std::collections::BTreeMap<String, std::ffi::OsString>>,
+    /// One-shot latch for the Windows-specific degradation banner. Windows
+    /// shell runs always use `windows-job-object` with no FS/network
+    /// isolation; the TUI should warn once per session rather than on
+    /// every call.
+    windows_degraded_warned: AtomicBool,
 }
 
 /// Outcome of `ShellSandboxHealth::record_best_effort_fallback`. The agent
@@ -135,6 +140,14 @@ impl ShellSandboxHealth {
     #[cfg(test)]
     pub(crate) fn best_effort_fallback_count(&self) -> u64 {
         self.best_effort_fallback_count.load(Ordering::Relaxed)
+    }
+
+    /// Record a Windows-specific shell degradation event and return whether
+    /// this is the first occurrence in the session. The caller embeds the
+    /// returned flag into the result so the agent can emit a once-per-session
+    /// TUI warning without requiring a side channel.
+    pub(crate) fn record_windows_degraded(&self) -> bool {
+        !self.windows_degraded_warned.swap(true, Ordering::Relaxed)
     }
 }
 

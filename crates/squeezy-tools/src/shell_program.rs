@@ -4,8 +4,7 @@
 //! their own `cfg(target_os = ...)` blocks; this module covers everything
 //! else.
 
-#[cfg(windows)]
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ShellProgram {
@@ -20,11 +19,26 @@ pub(crate) struct ShellProgram {
     pub display_name: String,
 }
 
-/// Cached Windows shell binary path resolved once per process. Stores just
-/// the resolved program path (not the command-specific args) because args
-/// always include the user command which differs per call.
-#[cfg(windows)]
-static WINDOWS_SHELL_BINARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// Cached result of default-shell resolution. On Windows, calling
+/// `which::which` on every `for_command` invocation performs process-level
+/// PATH walks; caching the resolved binary amortises that cost across all
+/// shell tool calls in the same process.
+///
+/// The cache is only populated when `SQUEEZY_SHELL` is not set (the default
+/// resolution path). Override paths (`SQUEEZY_SHELL=…`) are not cached
+/// because they are already fast (direct path or a single `which` lookup).
+/// The entry is discarded when `SQUEEZY_SHELL` transitions from unset to set.
+#[derive(Debug, Clone)]
+struct CachedShellBase {
+    /// Resolved program path (e.g. `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`).
+    program: String,
+    /// Argument prefix that precedes the command string (e.g.
+    /// `["-NoLogo", "-NoProfile", "-Command"]` for PowerShell).
+    arg_prefix: Vec<String>,
+    display_name: String,
+}
+
+static SHELL_BASE_CACHE: Mutex<Option<CachedShellBase>> = Mutex::new(None);
 
 impl ShellProgram {
     /// Resolve the shell program + arguments to run `command`.
@@ -43,13 +57,63 @@ impl ShellProgram {
     ///   convention (`-NoLogo -NoProfile -Command` for PowerShell variants,
     ///   `/D /S /C` for cmd).
     ///
-    /// On Windows the default resolution result is cached per process via a
-    /// `OnceLock` so repeated calls (e.g. in shell-heavy sessions) do not
-    /// probe `which` on every plan.
+    /// Caching: the cache is consulted only when `SQUEEZY_SHELL` is unset.
+    /// Setting `SQUEEZY_SHELL` temporarily takes a non-cached path (the
+    /// override is resolved per-call), but unsetting it again returns the
+    /// previously cached default. `PATH` changes during the process
+    /// lifetime are not detected; the cached `which::which` result is
+    /// reused for the rest of the process. Override and git-bash paths
+    /// bypass the cache entirely.
     pub(crate) fn for_command(command: &str) -> Self {
+        // Try the per-process cache when no override is configured. The
+        // SQUEEZY_SHELL override paths are cheap and command-specific, so
+        // they bypass the cache.
+        if std::env::var_os("SQUEEZY_SHELL").is_none() {
+            // Tentative read: hold the lock only long enough to clone the
+            // cached entry. `which::which` (a potentially blocking PATH
+            // walk on Windows) runs outside the critical section so other
+            // tokio futures contending on shell tool calls don't queue
+            // behind a first-time resolution.
+            if let Ok(guard) = SHELL_BASE_CACHE.lock()
+                && let Some(ref cached) = *guard
+            {
+                let mut args = cached.arg_prefix.clone();
+                args.push(command.to_string());
+                return Self {
+                    program: cached.program.clone(),
+                    args,
+                    display_name: cached.display_name.clone(),
+                };
+            }
+            let resolved = Self::resolve_default(command);
+            // The command is always the last argument; store the prefix.
+            let arg_prefix: Vec<String> =
+                resolved.args[..resolved.args.len().saturating_sub(1)].to_vec();
+            // Re-acquire the lock to publish. If a concurrent caller
+            // already populated the cache, leave their value in place —
+            // both will be equivalent under the "no SQUEEZY_SHELL, same
+            // PATH" precondition we just used.
+            if let Ok(mut guard) = SHELL_BASE_CACHE.lock()
+                && guard.is_none()
+            {
+                *guard = Some(CachedShellBase {
+                    program: resolved.program.clone(),
+                    arg_prefix,
+                    display_name: resolved.display_name.clone(),
+                });
+            }
+            return resolved;
+        }
+
         if let Ok(custom) = std::env::var("SQUEEZY_SHELL") {
             return Self::resolve_override(&custom, command);
         }
+        Self::resolve_default(command)
+    }
+
+    /// Resolve without consulting the cache. Called on the first cache miss
+    /// or when the cache lock is unavailable.
+    fn resolve_default(command: &str) -> Self {
         #[cfg(unix)]
         {
             Self::unix_sh(command)
@@ -60,8 +124,6 @@ impl ShellProgram {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            // Unsupported OS — fall through to a POSIX-shell invocation and
-            // let `Command::spawn` produce the appropriate error.
             Self::unix_sh(command)
         }
     }

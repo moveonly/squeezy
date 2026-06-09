@@ -2542,6 +2542,21 @@ impl Driver {
                         },
                     )?;
                 }
+                AgentEvent::ShellWindowsDegraded {
+                    turn_id, backend, ..
+                } => {
+                    let turn_str = format!("{turn_id:?}");
+                    self.capture.record(
+                        Some(turn_str),
+                        EvalEventKind::ShellSandboxDegraded {
+                            backend,
+                            // Windows degradation is steady-state, not a
+                            // runtime fallback; use 0 as the count so eval
+                            // findings can distinguish Windows from Unix.
+                            fallback_count: 0,
+                        },
+                    )?;
+                }
                 AgentEvent::Completed {
                     turn_id,
                     message,
