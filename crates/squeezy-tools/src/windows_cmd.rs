@@ -85,12 +85,13 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
 }
 
 /// True when the token list contains a `-Recurse` flag or an unambiguous
-/// PowerShell abbreviation of it (`-r`, `-re`, `-rec`, …).
+/// PowerShell abbreviation of it (`-r`, `-re`, `-rec`, …). Explicit-false
+/// named-parameter forms (`-Recurse:$false`, `-Recurse:false`, `-Recurse:0`)
+/// don't count as Recurse being on.
 fn powershell_has_recurse_flag(tokens: &[&str]) -> bool {
     tokens.iter().skip(1).any(|tok| {
         let t = tok.to_ascii_lowercase();
-        // Named-parameter-with-value forms: `-Recurse:$true`, `-Recurse:true`
-        if t.starts_with("-recurse") {
+        if powershell_named_flag_is_on(&t, "-recurse") {
             return true;
         }
         // Unambiguous prefix abbreviations of `-Recurse` that don't collide
@@ -108,14 +109,33 @@ fn powershell_has_recurse_flag(tokens: &[&str]) -> bool {
 /// Remove-Item's parameter set, `-f` is ambiguous between `-Force` and
 /// `-Filter` and PowerShell itself would reject it with an ambiguity error.
 /// `-fo` is the first unambiguous prefix that resolves only to `-Force`.
+/// Explicit-false forms (`-Force:$false`) don't count.
 fn powershell_has_force_flag(tokens: &[&str]) -> bool {
     tokens.iter().skip(1).any(|tok| {
         let t = tok.to_ascii_lowercase();
-        if t.starts_with("-force") {
+        if powershell_named_flag_is_on(&t, "-force") {
             return true;
         }
         matches!(t.as_str(), "-fo" | "-for" | "-forc")
     })
+}
+
+/// True when `lower_tok` is the bare flag `name` (e.g. `-force`) or the
+/// named-parameter form with a truthy value (`-force:$true`, `-force:true`,
+/// `-force:1`). Explicit-false forms (`-force:$false`) and unrelated tokens
+/// (`-forced`) return false. `lower_tok` must already be lowercased.
+fn powershell_named_flag_is_on(lower_tok: &str, name: &str) -> bool {
+    let Some(rest) = lower_tok.strip_prefix(name) else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    let Some(value) = rest.strip_prefix(':') else {
+        // `-forced` / `-recursed` etc. are not the named flag.
+        return false;
+    };
+    matches!(value, "$true" | "true" | "1")
 }
 
 #[cfg(test)]

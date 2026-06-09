@@ -29,7 +29,9 @@ impl ShellProgram {
     ///   resolved via `which::which`. The shell call follows each shell's
     ///   convention (`-NoLogo -NoProfile -Command` for PowerShell variants,
     ///   `/D /S /C` for cmd). The resolved binary is cached per session so
-    ///   PATH probing runs only once.
+    ///   PATH probing runs only once. The cache is process-lifetime: a
+    ///   mid-session install/move of `pwsh` won't be picked up until restart;
+    ///   `SQUEEZY_SHELL` is checked before the cache so it always overrides.
     pub(crate) fn for_command(command: &str) -> Self {
         if let Ok(custom) = std::env::var("SQUEEZY_SHELL") {
             return Self::resolve_override(&custom, command);

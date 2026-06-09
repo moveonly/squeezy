@@ -103,3 +103,29 @@ fn ignores_benign_commands() {
     // ri alias without both flags
     assert!(!is_destructive_windows_segment("ri foo.txt"));
 }
+
+#[test]
+fn explicit_false_named_flags_do_not_count_as_on() {
+    // `-Force:$false` / `-Recurse:$false` are real PowerShell idioms for
+    // explicitly turning the switch off. They must not classify as forced
+    // recursive deletion.
+    assert!(!is_destructive_windows_segment(
+        "Remove-Item -Recurse:$false -Force ."
+    ));
+    assert!(!is_destructive_windows_segment(
+        "Remove-Item -Recurse -Force:$false ."
+    ));
+    assert!(!is_destructive_windows_segment(
+        "Remove-Item -Recurse:$false -Force:$false ."
+    ));
+    // `-Force:$true` / `-Force:true` / `-Force:1` still count as on.
+    assert!(is_destructive_windows_segment(
+        "Remove-Item -Recurse:$true -Force:$true ."
+    ));
+    assert!(is_destructive_windows_segment(
+        "Remove-Item -Recurse:true -Force:true ."
+    ));
+    assert!(is_destructive_windows_segment(
+        "Remove-Item -Recurse:1 -Force:1 ."
+    ));
+}

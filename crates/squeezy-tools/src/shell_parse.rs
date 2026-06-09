@@ -1581,15 +1581,15 @@ pub(crate) fn is_read_only_shell_segment(segment: &str) -> bool {
 fn windows_segment_has_output_flag(segment: &str) -> bool {
     let lower = segment.to_ascii_lowercase();
     let tokens: Vec<&str> = lower.split_whitespace().collect();
+    // `-LiteralPath` and `-FilePath` are intentionally excluded: they're the
+    // *path* parameter on read cmdlets in the allowlist (e.g. `Get-Content
+    // -LiteralPath`, `Get-FileHash -FilePath`). The prefix-only allowlist in
+    // `is_read_only_windows_segment` already excludes writer cmdlets like
+    // `Out-File`/`Set-Content`/`Add-Content`, so this stays defensive.
     tokens.iter().any(|tok| {
         matches!(
             *tok,
-            "-outfile"
-                | "-filepath"
-                | "-literalpath"
-                | "-destination"
-                | "-destinationpath"
-                | "-append"
+            "-outfile" | "-destination" | "-destinationpath" | "-append"
         )
     })
 }
@@ -2005,15 +2005,15 @@ fn expand_env_vars(input: &str) -> String {
 /// Extract the variable name from a PowerShell `${env:VARNAME}` brace form.
 /// Returns `Some("VARNAME")` when the prefix is `env:` (case-insensitive).
 fn powershell_env_provider_var(brace_content: &str) -> Option<String> {
-    // "env:" is always 4 ASCII bytes regardless of case.
+    // "env:" is always 4 ASCII bytes regardless of case. Use `get` to avoid
+    // panicking if `brace_content` has a multi-byte UTF-8 codepoint straddling
+    // byte index 4 (e.g. `${ℓ:VAR}`); such inputs simply aren't `env:` prefixed.
     const ENV_PREFIX_LEN: usize = 4;
-    if brace_content.len() <= ENV_PREFIX_LEN {
-        return None;
-    }
-    let (prefix, var_name) = brace_content.split_at(ENV_PREFIX_LEN);
+    let prefix = brace_content.get(..ENV_PREFIX_LEN)?;
     if !prefix.eq_ignore_ascii_case("env:") {
         return None;
     }
+    let var_name = &brace_content[ENV_PREFIX_LEN..];
     if !var_name.is_empty()
         && var_name
             .chars()

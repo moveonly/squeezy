@@ -388,6 +388,61 @@ fn write_targets_cover_windows_verbs() {
 }
 
 #[test]
+fn expand_env_vars_does_not_panic_on_multi_byte_brace_content() {
+    // Regression: `powershell_env_provider_var` previously sliced the brace
+    // body at byte index 4 with `split_at`, which panicked when byte 4 fell
+    // inside a multi-byte UTF-8 codepoint (e.g. `ℓ`). The expander is reached
+    // from any user-typed shell command via `extract_shell_write_targets` →
+    // `expand_path_vars` → `expand_env_vars`, so a panic there crashes the
+    // shell tool pipeline. The non-`env:` brace body must round-trip as a
+    // literal `${...}`.
+    let target = "touch \"${ñℓ:VAR}/x\"";
+    let extracted = extract_shell_write_targets(target);
+    assert_eq!(extracted, vec!["${ñℓ:VAR}/x".to_string()]);
+    // Same shape with the `${env:` prefix straddled by a multi-byte char must
+    // also round-trip literally — the prefix check is byte-aligned and the
+    // body is not `env:`.
+    let extracted = extract_shell_write_targets("touch \"${€nv:VAR}/x\"");
+    assert_eq!(extracted, vec!["${€nv:VAR}/x".to_string()]);
+}
+
+#[test]
+fn write_targets_expand_powershell_env_provider() {
+    let home = test_home();
+    let home = home.trim_end_matches('/');
+    // `$env:HOME` (case-insensitive `env:`) resolves through the PowerShell
+    // env-provider syntax the same as `$HOME`.
+    assert_eq!(
+        extract_shell_write_targets("Out-File \"$env:HOME/x\""),
+        vec![format!("{home}/x")]
+    );
+    assert_eq!(
+        extract_shell_write_targets("Out-File \"$ENV:HOME/x\""),
+        vec![format!("{home}/x")]
+    );
+    // Brace form `${env:HOME}` resolves identically.
+    assert_eq!(
+        extract_shell_write_targets("Out-File \"${env:HOME}/x\""),
+        vec![format!("{home}/x")]
+    );
+    // Unset env-provider name stays literal so the unresolved-var check
+    // escalates on the residual `$`.
+    assert_eq!(
+        extract_shell_write_targets("Out-File \"$env:SQZ_DEFINITELY_UNSET/x\""),
+        vec!["$env:SQZ_DEFINITELY_UNSET/x".to_string()]
+    );
+    assert_eq!(
+        extract_shell_write_targets("Out-File \"${env:SQZ_DEFINITELY_UNSET}/x\""),
+        vec!["${env:SQZ_DEFINITELY_UNSET}/x".to_string()]
+    );
+    // Degenerate `$env:` with no name is left literal.
+    assert_eq!(
+        extract_shell_write_targets("Out-File \"$env:/x\""),
+        vec!["$env:/x".to_string()]
+    );
+}
+
+#[test]
 fn write_targets_expand_percent_vars() {
     let home = test_home();
     let home = home.trim_end_matches('/');
