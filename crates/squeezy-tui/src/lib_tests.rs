@@ -16253,7 +16253,7 @@ fn rail_wrap_flattens_embedded_line_breaks_before_measuring() {
 
     assert_eq!(rows.len(), 1, "{text}");
     assert!(!text.contains('\n') || text.lines().count() == 1, "{text}");
-    assert!(text.contains("Ran rg --json pattern| head -5"), "{text}");
+    assert!(text.contains("Ran rg --json pattern | head -5"), "{text}");
 }
 
 #[test]

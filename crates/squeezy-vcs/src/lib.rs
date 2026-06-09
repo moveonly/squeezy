@@ -1933,9 +1933,14 @@ impl CheckpointStore {
             for file in &record.files {
                 let identity = path_identity_key(&file.path);
                 let path = safe_workspace_path(&self.root, &file.path)?;
-                if let Some(conflict) =
-                    reparse_path_conflict(&record.id, &file.path, &self.root, &path)
-                {
+                let restoring_symlink = file.before_file_type == Some(CheckpointFileType::Symlink);
+                if let Some(conflict) = reparse_path_conflict(
+                    &record.id,
+                    &file.path,
+                    &self.root,
+                    &path,
+                    restoring_symlink,
+                ) {
                     conflicts.push(conflict);
                     continue;
                 }
@@ -1961,9 +1966,13 @@ impl CheckpointStore {
                 if let Some(from_path) = file.from_path.as_deref() {
                     let source_path = safe_workspace_path(&self.root, from_path)?;
                     let source_identity = path_identity_key(from_path);
-                    if let Some(conflict) =
-                        reparse_path_conflict(&record.id, from_path, &self.root, &source_path)
-                    {
+                    if let Some(conflict) = reparse_path_conflict(
+                        &record.id,
+                        from_path,
+                        &self.root,
+                        &source_path,
+                        restoring_symlink,
+                    ) {
                         conflicts.push(conflict);
                         continue;
                     }
@@ -2418,11 +2427,16 @@ impl CheckpointStore {
                 {
                     continue;
                 }
+                let restoring_symlink = file.before_file_type == Some(CheckpointFileType::Symlink);
                 for path in rollback_write_paths(file) {
                     let absolute = self.root.join(&path);
-                    if let Some(conflict) =
-                        filesystem_preflight_conflict(&record.id, &path, &self.root, &absolute)
-                    {
+                    if let Some(conflict) = filesystem_preflight_conflict(
+                        &record.id,
+                        &path,
+                        &self.root,
+                        &absolute,
+                        restoring_symlink,
+                    ) {
                         conflicts.push(conflict);
                     }
                 }
@@ -3929,8 +3943,11 @@ fn filesystem_preflight_conflict(
     path: &str,
     root: &Path,
     absolute: &Path,
+    allow_symlink_leaf: bool,
 ) -> Option<RollbackConflict> {
-    if let Some(conflict) = reparse_path_conflict(checkpoint_id, path, root, absolute) {
+    if let Some(conflict) =
+        reparse_path_conflict(checkpoint_id, path, root, absolute, allow_symlink_leaf)
+    {
         return Some(conflict);
     }
     match fs::symlink_metadata(absolute) {
@@ -4002,7 +4019,10 @@ fn parent_writability_conflict(
             }
         }
     }
-    if let Some(conflict) = reparse_path_conflict(checkpoint_id, path, root, current) {
+    // `current` here is an ancestor directory of the file being restored, so a
+    // symlink at this level is never an acceptable leaf — always treat it as a
+    // reparse conflict (pass `false`).
+    if let Some(conflict) = reparse_path_conflict(checkpoint_id, path, root, current, false) {
         return Some(conflict);
     }
     let metadata = fs::symlink_metadata(current).ok()?;
@@ -4058,14 +4078,28 @@ fn reparse_path_conflict(
     path: &str,
     root: &Path,
     absolute: &Path,
+    allow_symlink_leaf: bool,
 ) -> Option<RollbackConflict> {
     let relative = absolute.strip_prefix(root).ok()?;
+    let components: Vec<_> = relative.components().collect();
+    let last_idx = components.len().saturating_sub(1);
     let mut current = root.to_path_buf();
-    for component in relative.components() {
+    for (idx, component) in components.iter().enumerate() {
         current.push(component.as_os_str());
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 if metadata_is_reparse_or_symlink(&metadata) {
+                    // A symlinked *ancestor* always blocks: restoring through it
+                    // could resolve outside the workspace. A symlinked *leaf*
+                    // only blocks when we are not deliberately restoring a
+                    // symlink to that path. Restoring a tracked symlink replaces
+                    // the leaf atomically (temp sibling + rename) and never
+                    // follows it, so it is safe; a leaf that became a symlink
+                    // when the checkpoint expected a regular file still
+                    // conflicts (`allow_symlink_leaf` is false in that case).
+                    if allow_symlink_leaf && idx == last_idx {
+                        continue;
+                    }
                     return Some(reparse_point_conflict(checkpoint_id, path));
                 }
             }

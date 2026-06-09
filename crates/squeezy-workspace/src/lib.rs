@@ -1170,6 +1170,14 @@ impl WorkspaceRootKind {
         if path == "/" {
             return Self::UnixRoot;
         }
+        // Protected unix roots fall into two groups:
+        //   * macOS/BSD system roots that never host a user workspace, and
+        //   * Linux pseudo-filesystems (`/proc`, `/sys`, `/run`, `/boot`,
+        //     `/snap`) that are kernel/virtual mounts, not source trees.
+        // Package/optional roots (`/opt`, `/usr`, `/var`) are deliberately
+        // NOT protected: legitimate checkouts live under them
+        // (`/usr/local/src`, `/var/www`, `/opt/<app>`), so blanket-protecting
+        // them would wrongly suppress indexing and ancestor VCS detection.
         if matches!(
             path,
             "/Applications"
@@ -1179,13 +1187,15 @@ impl WorkspaceRootKind {
                 | "/Users"
                 | "/Volumes"
                 | "/bin"
+                | "/boot"
                 | "/dev"
                 | "/etc"
-                | "/opt"
                 | "/private"
+                | "/proc"
+                | "/run"
                 | "/sbin"
-                | "/usr"
-                | "/var"
+                | "/snap"
+                | "/sys"
         ) {
             return Self::UnixProtectedRoot;
         }

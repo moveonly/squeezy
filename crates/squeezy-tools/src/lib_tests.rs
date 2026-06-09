@@ -11604,7 +11604,7 @@ fn destructive_redirect_detection_ignores_fd_duplication_and_quotes() {
 
     // Redirecting noise to /dev/null is stderr/stdout suppression, not a
     // destructive filesystem write.
-    let stderr_null_redirect = analyze_shell_command("rg --json pattern 2>/dev/null");
+    let stderr_null_redirect = analyze_shell_command("acme-nav list --json 2>/dev/null");
     assert_eq!(stderr_null_redirect.capability, PermissionCapability::Shell);
     assert!(!stderr_null_redirect.destructive);
 

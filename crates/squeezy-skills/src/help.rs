@@ -1048,6 +1048,15 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         related: &["tui"],
     },
     SlashCommandHelp {
+        name: "/terminal",
+        what: "Show terminal diagnostic info: TTY status, TERM/COLORTERM, clipboard and desktop-notification capability, and the detected shell. Useful when debugging display, color, copy, or notification issues across terminal emulators.",
+        syntax: "/terminal",
+        examples: &["/terminal  — print the current terminal capability diagnostic"],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["tui", "doctor"],
+    },
+    SlashCommandHelp {
         name: "/attach",
         what: "Insert a file or directory token in the prompt editor as attached context.",
         syntax: "/attach <path>",
