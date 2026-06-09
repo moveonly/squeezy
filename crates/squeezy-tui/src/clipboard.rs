@@ -75,7 +75,7 @@ pub(crate) struct CommandOutcome {
 /// Production = [`RealSink`] (stdout/flush, `std::process::Command`, temp dir).
 /// Tests = [`RecordingSink`], which records every call and replays scripted
 /// outcomes so the chain is fully trace-testable without real I/O.
-pub(crate) trait ClipboardSink {
+pub(crate) trait ClipboardSink: Send {
     /// Write raw OSC 52 (or any) bytes to the terminal.
     fn write_terminal(&mut self, bytes: &[u8]) -> io::Result<()>;
 
@@ -95,11 +95,13 @@ pub(crate) trait ClipboardSink {
     fn write_temp_file(&mut self, payload: &[u8], suggested_name: &str) -> io::Result<PathBuf>;
 }
 
-/// Forward through a boxed sink so a [`ClipboardChain<Box<dyn ClipboardSink>>`]
+/// Forward through a boxed sink so a [`ClipboardChain<Box<dyn ClipboardSink + Send>>`]
 /// can be stored on the app and injected with either [`RealSink`] (production)
 /// or a [`RecordingSink`] (tests) without monomorphizing the field to one impl.
 /// This is what keeps the chain's trace-test seam alive at the app layer.
-impl ClipboardSink for Box<dyn ClipboardSink> {
+/// `+ Send` keeps the boxed sink `Send` so the owning app/`Driver` future
+/// stays `Send` for `tokio::spawn`.
+impl ClipboardSink for Box<dyn ClipboardSink + Send> {
     fn write_terminal(&mut self, bytes: &[u8]) -> io::Result<()> {
         (**self).write_terminal(bytes)
     }

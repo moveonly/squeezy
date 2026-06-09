@@ -6149,8 +6149,8 @@ fn sanitize_inline(text: &str) -> String {
 /// ClipboardSink>>` and an app-layer copy test can drive a `RecordingSink`
 /// with no real terminal/clipboard/subprocess I/O.
 fn build_clipboard_chain(
-    sink: Box<dyn clipboard::ClipboardSink>,
-) -> clipboard::ClipboardChain<Box<dyn clipboard::ClipboardSink>> {
+    sink: Box<dyn clipboard::ClipboardSink + Send>,
+) -> clipboard::ClipboardChain<Box<dyn clipboard::ClipboardSink + Send>> {
     let env_get = |key: &str| std::env::var_os(key);
     let caps = clipboard::detect_clipboard_capabilities_from_env(env_get);
     let platform = clipboard::platform_commands(env_get);
@@ -18132,7 +18132,7 @@ pub(crate) struct TuiApp {
     /// too large for OSC 52 still lands via the platform binary or a file
     /// rather than silently failing. The legacy `clipboard` field above
     /// stays the source for any pre-existing call site not yet migrated.
-    pub(crate) clipboard_chain: clipboard::ClipboardChain<Box<dyn clipboard::ClipboardSink>>,
+    pub(crate) clipboard_chain: clipboard::ClipboardChain<Box<dyn clipboard::ClipboardSink + Send>>,
     /// Persistent main-view focus cursor for entry/tool/code copies, as a
     /// `RowId` into the freshly built transcript row list. `None` defaults to
     /// the live tail (the last entry-owned row), so "copy current entry"
@@ -18397,7 +18397,10 @@ impl TuiApp {
     /// allow the otherwise-"unused" method rather than splitting the cfg.
     #[cfg(any(test, feature = "testing"))]
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn set_clipboard_sink_for_test(&mut self, sink: Box<dyn clipboard::ClipboardSink>) {
+    pub(crate) fn set_clipboard_sink_for_test(
+        &mut self,
+        sink: Box<dyn clipboard::ClipboardSink + Send>,
+    ) {
         self.clipboard_chain = build_clipboard_chain(sink);
     }
 
