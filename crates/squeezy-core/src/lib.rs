@@ -7455,6 +7455,7 @@ fn default_sensitive_path_patterns() -> Vec<String> {
         // XDG and cloud CLI credential locations not covered above.
         // Added as part of the Linux-hardening pass.
         ".password-store/**",
+        ".local/share/gnupg/**",
         ".config/sops/**",
         ".config/1Password/**",
         ".azure/**",
@@ -10054,7 +10055,7 @@ pub fn user_settings_template() -> &'static str {
 # read_roots = []                  # extra absolute directories shell may read
 # write_roots = []                 # extra absolute directories shell may read/write
 # protected_metadata_names = [".git", ".squeezy", ".agents"]
-# sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*", ".password-store/**", ".config/sops/**", ".config/1Password/**", ".azure/**", ".config/gcloud/**", ".config/kube/**"]
+# sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*", ".password-store/**", ".local/share/gnupg/**", ".config/sops/**", ".config/1Password/**", ".azure/**", ".config/gcloud/**", ".config/kube/**"]
 
 [hardening]
 # disable_core_dumps = true

@@ -11746,16 +11746,18 @@ fn shell_sandbox_required_mode_fails_closed_when_unshare_probe_says_no() {
     );
 }
 
-/// Regression: when static probes pass but `pre_exec` unshare/Landlock fails
-/// at runtime (preflight false-positive), `shell_sandbox_runtime_unavailable`
-/// must detect the failure so the agent can surface a sandbox-unavailable
-/// denial rather than silently accepting an unsandboxed exit-1.
+/// Unit-tests the `_with_probe` helper directly: exit-1 + empty stderr +
+/// `linux_unshare_available = false` is classified as runtime-unavailable.
+///
+/// Note: this does NOT exercise the production path. The non-`_with_probe`
+/// caller (`shell_sandbox_runtime_unavailable`) reads from the
+/// `OnceLock`-cached `linux_unshare_supported()` probe, which is fixed for
+/// the process lifetime. The real preflight false-positive fix (a bounded
+/// child probe that re-validates `pre_exec` viability) is tracked under the
+/// PR's "Deferred: Real child-process probe for Linux preflight" item.
 #[test]
 #[cfg(target_os = "linux")]
-fn shell_sandbox_runtime_unavailable_detects_preflight_false_positive() {
-    // Static probes said yes (plan was created), but after spawn the
-    // kernel denied unshare: child exits 1 with empty stderr. Re-probing
-    // the parent at that point returns false → runtime-unavailable.
+fn shell_sandbox_runtime_unavailable_with_probe_treats_userns_gone_as_unavailable() {
     let plan = fake_sandbox_plan("linux-direct-syscalls", true);
     assert!(
         shell_sandbox_runtime_unavailable_with_probe(&plan, Some(1), "", false),

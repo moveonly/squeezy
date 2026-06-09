@@ -570,8 +570,12 @@ fn shell_preview_shows_sandbox_posture_when_backend_known() {
         "sandbox filesystem posture should appear in preview: {out}"
     );
     assert!(
-        out.contains("deny_by_default"),
-        "sandbox network policy should appear in preview: {out}"
+        out.contains("network deny_by_default"),
+        "sandbox network policy should appear in preview with `network` label: {out}"
+    );
+    assert!(
+        !out.contains("network-policy"),
+        "posture row should not use the legacy `network-policy` label: {out}"
     );
 }
 

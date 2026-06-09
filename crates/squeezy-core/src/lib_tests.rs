@@ -6002,6 +6002,7 @@ fn default_sensitive_paths_include_xdg_and_cloud_creds() {
     // Linux-hardening additions: XDG and cloud CLI secrets.
     for expected in [
         ".password-store/**",
+        ".local/share/gnupg/**",
         ".config/sops/**",
         ".config/1Password/**",
         ".azure/**",
@@ -6021,6 +6022,7 @@ fn user_settings_template_lists_hardened_sensitive_path_defaults() {
 
     for expected in [
         ".password-store/**",
+        ".local/share/gnupg/**",
         ".config/sops/**",
         ".config/1Password/**",
         ".azure/**",

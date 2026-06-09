@@ -783,6 +783,22 @@ fn update_check(status: UpdateStatus) -> Check {
 /// and the Windows restricted-token / elevated tiers.
 fn sandbox_check() -> Check {
     let report = squeezy_tools::shell_sandbox_doctor();
+    Check {
+        name: "sandbox".to_string(),
+        status: if report.available {
+            Status::Ok
+        } else {
+            Status::Warn
+        },
+        detail: sandbox_check_detail(&report),
+    }
+}
+
+/// Format the human-readable detail string for `doctor sandbox`. Pulled out so
+/// the per-field formatting (the `;`-separated clauses for Linux fields) can be
+/// unit-tested directly against a synthetic `ShellSandboxDoctor` without
+/// requiring the real per-platform probe to run.
+fn sandbox_check_detail(report: &squeezy_tools::ShellSandboxDoctor) -> String {
     let mut detail = format!("backend {}: {}", report.backend, report.detail);
     // Surface Linux-specific sandbox health fields for diagnostics.
     if let Some(userns) = report.linux_user_namespaces {
@@ -809,15 +825,7 @@ fn sandbox_check() -> Check {
     if report.linux_ask_socket_blocked == Some(true) {
         detail.push_str("; squeezy-ask-in-child: blocked (AF_UNIX denied by seccomp)");
     }
-    Check {
-        name: "sandbox".to_string(),
-        status: if report.available {
-            Status::Ok
-        } else {
-            Status::Warn
-        },
-        detail,
-    }
+    detail
 }
 
 /// `doctor --sandbox-setup`: provision the Windows elevated shell-sandbox tier.

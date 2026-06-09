@@ -188,7 +188,7 @@ fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) 
                 posture.push_str(&format!("  filesystem {fs}"));
             }
             if let Some(net) = network {
-                posture.push_str(&format!("  network-policy {net}"));
+                posture.push_str(&format!("  network {net}"));
             }
             lines.push(dim(posture));
         }

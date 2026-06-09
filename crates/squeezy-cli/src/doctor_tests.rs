@@ -420,3 +420,120 @@ fn state_store_check_fails_when_path_unwritable() {
     let check = state_store_check(&config);
     assert_eq!(check.status, Status::Fail, "detail: {}", check.detail);
 }
+
+// ── sandbox_check_detail: per-field formatting ────────────────────────────
+//
+// `sandbox_check` itself calls `squeezy_tools::shell_sandbox_doctor()` and is
+// platform-dependent, but the user-visible string assembly is encapsulated in
+// `sandbox_check_detail(&ShellSandboxDoctor)`. Cover that helper directly so a
+// future refactor of the per-field clauses gets caught regardless of host.
+
+fn doctor_report(
+    backend: &'static str,
+    available: bool,
+    detail: &str,
+) -> squeezy_tools::ShellSandboxDoctor {
+    squeezy_tools::ShellSandboxDoctor {
+        backend,
+        available,
+        detail: detail.to_string(),
+        linux_user_namespaces: None,
+        linux_landlock_abi: None,
+        linux_seccomp_available: None,
+        linux_ask_socket_blocked: None,
+    }
+}
+
+#[test]
+fn sandbox_check_detail_includes_linux_fields_when_present() {
+    let report = squeezy_tools::ShellSandboxDoctor {
+        linux_user_namespaces: Some(true),
+        linux_landlock_abi: Some(4),
+        linux_seccomp_available: Some(true),
+        linux_ask_socket_blocked: Some(true),
+        ..doctor_report(
+            "linux-direct-syscalls",
+            true,
+            "direct unshare(2) + Landlock + seccomp",
+        )
+    };
+    let detail = sandbox_check_detail(&report);
+    assert!(
+        detail.starts_with("backend linux-direct-syscalls: "),
+        "detail should preserve the existing backend prefix: {detail}"
+    );
+    assert!(
+        detail.contains("; user-namespaces: available"),
+        "detail should surface userns availability: {detail}"
+    );
+    assert!(
+        detail.contains("; landlock-abi: 4"),
+        "detail should include the numeric landlock ABI: {detail}"
+    );
+    assert!(
+        detail.contains("; seccomp: available"),
+        "detail should surface seccomp availability: {detail}"
+    );
+    assert!(
+        detail.contains("; squeezy-ask-in-child: blocked"),
+        "detail should mention the AF_UNIX/seccomp ask-socket block: {detail}"
+    );
+}
+
+#[test]
+fn sandbox_check_detail_marks_unavailable_when_probes_say_so() {
+    let report = squeezy_tools::ShellSandboxDoctor {
+        linux_user_namespaces: Some(false),
+        linux_landlock_abi: Some(0),
+        linux_seccomp_available: Some(false),
+        // Ask-socket block is only emitted on Some(true); leave it None here
+        // and assert below that the marker does not appear.
+        linux_ask_socket_blocked: None,
+        ..doctor_report("linux-direct-syscalls", false, "no-op")
+    };
+    let detail = sandbox_check_detail(&report);
+    assert!(
+        detail.contains("; user-namespaces: unavailable"),
+        "detail should mark userns unavailable: {detail}"
+    );
+    assert!(
+        detail.contains("; landlock-abi: unavailable"),
+        "abi == 0 should render as `landlock-abi: unavailable`: {detail}"
+    );
+    assert!(
+        detail.contains("; seccomp: unavailable"),
+        "detail should mark seccomp unavailable: {detail}"
+    );
+    assert!(
+        !detail.contains("squeezy-ask-in-child"),
+        "ask-socket block must not appear unless explicitly Some(true): {detail}"
+    );
+}
+
+#[test]
+fn sandbox_check_detail_omits_linux_clauses_on_non_linux() {
+    // All four Linux-specific Options are None on macOS / Windows; the helper
+    // must not synthesize the clauses in that case.
+    let report = doctor_report("macos-sandbox-exec", true, "sandbox-exec present");
+    let detail = sandbox_check_detail(&report);
+    assert_eq!(
+        detail, "backend macos-sandbox-exec: sandbox-exec present",
+        "non-Linux platforms should not get Linux clauses appended"
+    );
+}
+
+#[test]
+fn sandbox_check_detail_omits_ask_socket_block_when_false() {
+    // The reviewer flagged that `linux_ask_socket_blocked` is gated on
+    // `Some(true)`, not presence: `Some(false)` is the boring case and must
+    // not produce a clause.
+    let report = squeezy_tools::ShellSandboxDoctor {
+        linux_ask_socket_blocked: Some(false),
+        ..doctor_report("linux-direct-syscalls", true, "ok")
+    };
+    let detail = sandbox_check_detail(&report);
+    assert!(
+        !detail.contains("squeezy-ask-in-child"),
+        "Some(false) must not synthesize the ask-socket-blocked clause: {detail}"
+    );
+}
