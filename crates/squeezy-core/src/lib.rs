@@ -10835,6 +10835,42 @@ pub fn project_settings_template() -> &'static str {
 "#
 }
 
+/// Template for the per-machine repo-local settings tier
+/// (`~/.squeezy/projects/<hash>/settings.toml`).
+///
+/// This file is **not** committed; it holds machine-specific overrides that
+/// should not affect other contributors.  Common uses: provider credentials,
+/// local base-URL overrides, and personal model preferences for this project.
+pub fn local_settings_template() -> &'static str {
+    r#"# Per-machine repo-local Squeezy settings.
+# This file lives in ~/.squeezy/projects/<project-hash>/settings.toml and is
+# NOT committed.  Use it for machine-specific overrides that should not affect
+# other contributors: provider credentials, local base-URL overrides, personal
+# model preferences for this project, and sandbox tuning.
+# Uncomment any key you want to override.
+
+[model]
+# provider = "openai"          # openai | anthropic | google | azure_openai | bedrock | ollama
+# profile = "balanced"         # cheap | balanced | strong
+# model = "gpt-5.5"            # provider-specific model id; leave unset to use the provider default
+# reasoning_effort = "medium"  # low | medium | high | xhigh; only sent to capable providers
+
+# [providers.openai]
+# api_key_env = "OPENAI_API_KEY"
+# base_url = "https://api.openai.com/v1"
+
+# [providers.anthropic]
+# api_key_env = "ANTHROPIC_API_KEY"
+
+[permissions]
+# mode = "auto_review"           # default | auto_review | full_access | custom
+
+# [permissions.shell_sandbox]
+# mode = "best_effort"              # best_effort | required | off | external
+# network = "allow_when_approved"   # deny_by_default | allow_when_approved
+"#
+}
+
 fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>, Vec<ConfigWarning>)> {
     let user_path = default_settings_path();
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

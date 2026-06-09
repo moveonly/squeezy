@@ -394,6 +394,8 @@ pub const PROVIDER_OPTIONS: &[&str] = &[
     "azure_openai",
     "bedrock",
     "ollama",
+    "openai_codex",
+    "github_copilot",
     "openrouter",
     "vercel",
     "portkey",
@@ -405,9 +407,13 @@ pub const PROVIDER_OPTIONS: &[&str] = &[
     "together",
     "fireworks",
     "cerebras",
+    "deepinfra",
+    "baseten",
     "lmstudio",
     "vllm",
     "llamacpp",
+    "cloudflare_workers_ai",
+    "cloudflare_ai_gateway",
     "openai_compatible",
 ];
 
