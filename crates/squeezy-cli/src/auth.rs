@@ -393,6 +393,14 @@ fn handle_openai_codex_login(args: &OpenAiCodexLoginArgs) -> squeezy_core::Resul
                 eprintln!("(--no-browser: not launching a browser; waiting for callback…)");
                 return Ok(());
             }
+            if is_headless_linux() {
+                eprintln!(
+                    "(headless Linux: no DISPLAY or WAYLAND_DISPLAY detected; \
+                     open the URL above in a browser on another machine, \
+                     then paste the full redirect URL here when prompted)"
+                );
+                return Ok(());
+            }
             match open_browser(url) {
                 Ok(()) => {
                     eprintln!("Browser launched. Waiting for callback…");
@@ -556,6 +564,13 @@ fn handle_github_copilot_login(args: &GitHubCopilotLoginArgs) -> squeezy_core::R
             eprintln!("--no-browser: not launching a browser; waiting for authorization…");
             return;
         }
+        if is_headless_linux() {
+            eprintln!(
+                "(headless Linux: no DISPLAY or WAYLAND_DISPLAY detected; \
+                 open the URL above in a browser on another machine and enter the device code)"
+            );
+            return;
+        }
         match open_browser(url) {
             Ok(()) => eprintln!("Browser launched. Waiting for authorization…"),
             Err(err) => eprintln!(
@@ -694,6 +709,13 @@ fn expires_in_human(expires_at_unix_ms: u64) -> Option<String> {
 /// `open` on macOS, `xdg-open` on Linux, `cmd /C start` on Windows.
 /// Falls back to an explicit error so the caller can print the URL
 /// for the user to open manually.
+///
+/// On Linux this delegates to [`try_open_browser`] so both code paths
+/// share the same fallback ladder (xdg-open → gio open →
+/// sensible-browser), stdio suppression, and exit-status check.
+/// The old single-launcher path silently returned `Ok(())` even when
+/// `xdg-open` exited with a non-zero status, which produced a
+/// misleading "Browser launched" message on headless/minimal systems.
 fn open_browser(url: &str) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -702,8 +724,14 @@ fn open_browser(url: &str) -> std::io::Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        std::process::Command::new("xdg-open").arg(url).status()?;
-        Ok(())
+        if try_open_browser(url) {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no working browser launcher found (tried xdg-open, gio open, sensible-browser)",
+            ))
+        }
     }
     #[cfg(target_os = "windows")]
     {
@@ -719,6 +747,26 @@ fn open_browser(url: &str) -> std::io::Result<()> {
             std::io::ErrorKind::Unsupported,
             "no browser launcher for this platform",
         ))
+    }
+}
+
+/// Returns `true` on Linux when no display or browser environment is
+/// present — a reliable signal that the process is running in an SSH
+/// session, container, CI runner, or other headless environment where
+/// launching a desktop browser will silently fail.
+///
+/// Checks `$DISPLAY` (X11), `$WAYLAND_DISPLAY`, and `$BROWSER`
+/// (explicit override).  Always returns `false` on non-Linux platforms.
+fn is_headless_linux() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        env::var_os("DISPLAY").is_none()
+            && env::var_os("WAYLAND_DISPLAY").is_none()
+            && env::var_os("BROWSER").is_none()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }
 
@@ -1295,7 +1343,13 @@ async fn run_anthropic_oauth_login(args: &AnthropicLoginArgs) -> squeezy_core::R
     writeln!(stdout, "  Authorize URL:")?;
     writeln!(stdout, "    {authorize_url}")?;
     if !args.no_browser {
-        if try_open_browser(&authorize_url) {
+        if is_headless_linux() {
+            writeln!(
+                stdout,
+                "  (headless Linux: no DISPLAY or WAYLAND_DISPLAY detected; \
+                 open the URL above in a browser on another machine)"
+            )?;
+        } else if try_open_browser(&authorize_url) {
             writeln!(stdout, "  Opened the authorize URL in your browser.")?;
         } else {
             writeln!(

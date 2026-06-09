@@ -170,8 +170,30 @@ fn read_tokens_returns_none_when_missing() {
 fn read_tokens_errors_on_malformed_json() {
     let path = tmp_path("malformed");
     std::fs::write(&path, "{ this is not json").expect("write");
+    // Ensure the file has strict permissions so the mode check passes
+    // and the malformed-JSON error is the one surfaced.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+    }
     let err = read_tokens(&path).expect_err("malformed");
     assert!(err.to_string().contains("not valid JSON"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn read_tokens_rejects_group_readable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = tmp_path("group-readable");
+    std::fs::write(&path, "{}").expect("write placeholder");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod 640");
+    let err = read_tokens(&path).expect_err("group-readable file should be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("640") || msg.contains("permissions"),
+        "error should mention the mode; got: {msg}"
+    );
 }
 
 #[test]

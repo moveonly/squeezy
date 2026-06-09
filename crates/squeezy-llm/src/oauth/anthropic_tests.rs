@@ -202,6 +202,21 @@ fn read_tokens_returns_none_when_file_is_absent() {
     assert!(result.is_none());
 }
 
+#[cfg(unix)]
+#[test]
+fn read_tokens_rejects_group_readable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = temp_token_path("group-readable");
+    std::fs::write(&path, "{}").expect("write placeholder");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod 640");
+    let err = read_tokens(&path).expect_err("group-readable file should be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("640") || msg.contains("permissions"),
+        "error should mention the mode; got: {msg}"
+    );
+}
+
 #[test]
 fn load_from_path_returns_provider_not_configured_when_absent() {
     let path = temp_token_path("absent-load");
