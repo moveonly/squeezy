@@ -56,6 +56,10 @@ pub(crate) enum Action {
     CopyViewport,
     /// Copy the entire transcript to the clipboard (`Alt+a` default).
     CopyFullTranscript,
+    /// Copy the active visual selection to the clipboard (`Alt+y`
+    /// default). Convenience only — every copy chord already prefers an
+    /// active selection when one is present; this is the explicit verb.
+    CopySelection,
     /// Restore the most recently cancelled prompt back into the
     /// composer (`Ctrl+R` default).
     RestoreCancelledPrompt,
@@ -101,6 +105,7 @@ impl Action {
             Self::CopyCodeBlock => "copy_code_block",
             Self::CopyViewport => "copy_viewport",
             Self::CopyFullTranscript => "copy_full_transcript",
+            Self::CopySelection => "copy_selection",
             Self::RestoreCancelledPrompt => "restore_cancelled_prompt",
             Self::ScrollTranscriptPageUp => "page_up",
             Self::ScrollTranscriptPageDown => "page_down",
@@ -127,6 +132,7 @@ impl Action {
         Action::CopyCodeBlock,
         Action::CopyViewport,
         Action::CopyFullTranscript,
+        Action::CopySelection,
         Action::RestoreCancelledPrompt,
         Action::ScrollTranscriptPageUp,
         Action::ScrollTranscriptPageDown,
@@ -165,6 +171,7 @@ impl Action {
             Self::CopyCodeBlock => KeyBinding::new(KeyCode::Char('k'), KeyModifiers::ALT),
             Self::CopyViewport => KeyBinding::new(KeyCode::Char('v'), KeyModifiers::ALT),
             Self::CopyFullTranscript => KeyBinding::new(KeyCode::Char('a'), KeyModifiers::ALT),
+            Self::CopySelection => KeyBinding::new(KeyCode::Char('y'), KeyModifiers::ALT),
             Self::RestoreCancelledPrompt => {
                 KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL)
             }

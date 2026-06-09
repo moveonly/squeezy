@@ -8569,9 +8569,10 @@ fn emergency_drop_teardown_emits_no_transcript_mirror() {
 /// Finding-1 height fix: `visual_line_count`'s `chars().count().div_ceil(width)`
 /// estimate UNDER-counts a logical line that (a) word-wraps a too-long word and
 /// (b) contains wide CJK glyphs measured as one column but rendered as two. The
-/// clean-exit mirror sizes its buffer with `render_lines_to_owned_buffer` (a
-/// width-correct upper bound), so EVERY wrapped row is emitted; the old estimate
-/// would clip the overflow rows and truncate mirrored history.
+/// clean-exit mirror sizes its buffer with `render_lines_to_owned_buffer`, which
+/// gets the exact wrapped-row count from `Paragraph::line_count`, so EVERY
+/// wrapped row is emitted; the old estimate would clip the overflow rows and
+/// truncate mirrored history.
 #[test]
 fn finish_fullscreen_mirror_height_covers_wrapped_rows_not_visual_estimate() {
     // Width 10. The line forces both pathologies:
@@ -18545,4 +18546,753 @@ fn scroll_state_stays_valid_across_deterministic_resizes() {
             "i={i}: follower offset must equal max_scroll"
         );
     }
+}
+
+// =====================================================================
+// Phase 5b: visual selection over the transcript row model.
+// End-to-end through `render_transcript` (stamps the text-area cache),
+// `handle_mouse` (press/drag/release, double/triple click), and
+// `handle_key` (Shift+nav extend, Esc clear), into the clipboard copy.
+// =====================================================================
+
+/// Render only the MAIN transcript surface (which stamps
+/// `main_text_area_cache`) and return the painted buffer so a test can locate
+/// the screen cell a glyph landed on before driving a mouse gesture at it.
+fn render_transcript_to_buffer(app: &TuiApp, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_transcript(frame, Rect::new(0, 0, width, height), app, false))
+        .expect("draw");
+    terminal.backend().buffer().clone()
+}
+
+/// First `(x, y)` cell whose row, read left to right, contains `needle`.
+fn find_text_cell(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+    let area = buffer.area;
+    for y in 0..area.height {
+        let row: String = (0..area.width).map(|x| buffer[(x, y)].symbol()).collect();
+        if let Some(byte_col) = row.find(needle) {
+            // Convert the byte offset into a column (cells are 1 char wide here).
+            let col = row[..byte_col].chars().count() as u16;
+            return Some((col, y));
+        }
+    }
+    None
+}
+
+fn left_down(column: u16, row: u16, modifiers: KeyModifiers) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column,
+        row,
+        modifiers,
+    }
+}
+
+fn left_drag(column: u16, row: u16) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn left_up(column: u16, row: u16) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+#[test]
+fn mouse_drag_selects_a_row_and_arms_the_selection() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hello world"));
+
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "hello world").expect("answer painted");
+
+    // Press at the 'h', drag across the word, release.
+    assert!(handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE)));
+    assert!(handle_mouse(&mut app, left_drag(x + 5, y)));
+    assert!(handle_mouse(&mut app, left_up(x + 5, y)));
+
+    let sel = app.selection.as_ref().expect("selection armed by the drag");
+    assert_eq!(sel.surface, crate::selection::SelectionSurface::Main);
+    assert!(
+        !sel.is_empty(),
+        "a multi-cell drag is a non-empty selection"
+    );
+}
+
+#[test]
+fn bare_click_leaves_no_selection() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hello world"));
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "hello world").expect("answer painted");
+
+    // Press and release at the same cell with no drag: a click, not a selection.
+    assert!(handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE)));
+    assert!(handle_mouse(&mut app, left_up(x, y)));
+    assert!(
+        app.selection.is_none(),
+        "a bare click must not leave a 1-cell selection"
+    );
+}
+
+#[tokio::test]
+async fn copy_acts_on_the_active_selection_over_the_focused_unit() {
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::user("question here"));
+    app.push_transcript_item(TranscriptItem::assistant("the answer text"));
+
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "the answer text").expect("answer painted");
+
+    // Triple-click selects the whole row, regardless of layout chrome.
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    assert!(app.selection.is_some(), "triple-click arms a row selection");
+
+    // A copy chord that would otherwise grab the last assistant message instead
+    // copies the active selection.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("copy");
+
+    let written = writes.lock().unwrap().clone();
+    assert_eq!(
+        written.as_slice(),
+        ["the answer text"],
+        "copy must yield the selected row's clean text"
+    );
+    assert!(
+        app.status.contains("copied selection"),
+        "status toast names the selection: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn esc_clears_the_selection_before_any_other_consumer() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("selectable text"));
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "selectable text").expect("painted");
+
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_drag(x + 6, y));
+    handle_mouse(&mut app, left_up(x + 6, y));
+    assert!(app.selection.is_some(), "drag armed a selection");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+    assert!(app.selection.is_none(), "first Esc clears the selection");
+    assert!(
+        app.status.contains("selection cleared"),
+        "status: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn shift_down_extends_a_seeded_selection_by_a_row() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for i in 0..20 {
+        app.push_transcript_item(TranscriptItem::user(format!("line {i}")));
+    }
+    // Render so the text-area cache (row count + viewport) is populated.
+    let _ = render_transcript_to_buffer(&app, 40, 12);
+
+    // No selection yet: Shift+Down seeds one and extends the cursor down a row.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift down");
+    let sel = app
+        .selection
+        .as_ref()
+        .expect("shift+down seeds a selection");
+    let (start, end) = sel.normalized();
+    assert!(
+        end.row >= start.row,
+        "the row span is well-ordered ({}..={})",
+        start.row,
+        end.row
+    );
+    assert_eq!(
+        sel.mode,
+        crate::selection::SelectionMode::Row,
+        "a Shift+nav extend selects whole rows"
+    );
+}
+
+#[test]
+fn double_click_selects_the_word_under_the_pointer() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("alpha beta gamma"));
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "beta").expect("painted");
+
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+
+    let sel = app
+        .selection
+        .as_ref()
+        .expect("double-click arms a word selection");
+    assert_eq!(sel.mode, crate::selection::SelectionMode::Word);
+    let rows = main_surface_rows(&app);
+    let text = crate::selection::selection_clean_text(&rows, sel);
+    assert_eq!(text, "beta", "the word under the pointer is selected");
+}
+
+// ---- additional Phase 5b coverage -----------------------------------------
+// The cases above pin the gesture entry points; the ones below fill in the
+// remaining keyboard extends (Shift+arrow row, Shift+page, Shift+Home/End to
+// boundary), the triple-click row mode, the rendered-frame highlight, and the
+// full clean-text-through-the-recording-sink copy assertion.
+
+/// The plain text painted on screen row `y`, left to right.
+fn buffer_row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+    (0..buffer.area.width)
+        .map(|x| buffer[(x, y)].symbol())
+        .collect()
+}
+
+/// Every screen cell on row `y` that carries the selection highlight (the
+/// REVERSED modifier baked by `render_transcript`), joined into a string.
+fn reversed_cells_on_row(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+    (0..buffer.area.width)
+        .filter(|&x| buffer[(x, y)].modifier.contains(Modifier::REVERSED))
+        .map(|x| buffer[(x, y)].symbol())
+        .collect()
+}
+
+fn left_drag_with(column: u16, row: u16, modifiers: KeyModifiers) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        column,
+        row,
+        modifiers,
+    }
+}
+
+/// Seed a non-empty MAIN selection by pressing at `(x, y)` and dragging one cell
+/// to the right, returning the armed app's selection-bearing state.
+fn seed_drag_selection(app: &mut TuiApp, x: u16, y: u16) {
+    handle_mouse(app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(app, left_drag_with(x + 1, y, KeyModifiers::NONE));
+    handle_mouse(app, left_up(x + 1, y));
+    assert!(
+        app.selection.as_ref().is_some_and(|s| !s.is_empty()),
+        "drag seeded a non-empty selection"
+    );
+}
+
+/// The painted geometry stamped by the last `render_transcript`: the surface row
+/// count and the page (viewport height in rows). Keyboard extends move the cursor
+/// over this same painted row model and page by exactly this `viewport_h`, so
+/// tests derive their expectations from here rather than from
+/// `active_transcript_geometry` (which re-measures against the real terminal
+/// size, not the test render).
+struct PaintedGeometry {
+    total_rows: usize,
+    viewport_h: usize,
+}
+
+fn painted_geometry(app: &TuiApp) -> PaintedGeometry {
+    let cache = app
+        .main_text_area_cache
+        .get()
+        .expect("render_transcript stamps the text-area cache");
+    PaintedGeometry {
+        total_rows: cache.total_rows,
+        viewport_h: usize::from(cache.viewport_h),
+    }
+}
+
+#[tokio::test]
+async fn shift_up_extends_an_existing_selection_one_row_at_a_time() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for i in 0..20 {
+        app.push_transcript_item(TranscriptItem::user(format!("entry {i}")));
+    }
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    // The transcript is tail-anchored, so the LAST entries are the visible ones.
+    let (x, y) = find_text_cell(&buffer, "entry 19").expect("the tail row is painted");
+    seed_drag_selection(&mut app, x, y);
+    let anchor_row = app.selection.as_ref().unwrap().anchor.row;
+    assert!(anchor_row >= 2, "need room above to walk up");
+
+    // Each Shift+Up walks the cursor up exactly one visual row and switches the
+    // selection into whole-row mode.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift up");
+    let sel = app
+        .selection
+        .as_ref()
+        .expect("selection survives the extend");
+    assert_eq!(sel.mode, crate::selection::SelectionMode::Row);
+    assert_eq!(sel.anchor.row, anchor_row, "anchor stays fixed");
+    assert_eq!(sel.cursor.row, anchor_row - 1, "cursor moved up one row");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift up again");
+    let sel = app.selection.as_ref().unwrap();
+    assert_eq!(
+        sel.cursor.row,
+        anchor_row - 2,
+        "a second Shift+Up moves one more row"
+    );
+    assert_eq!(sel.row_span(), (anchor_row - 2)..=anchor_row);
+}
+
+#[tokio::test]
+async fn shift_down_retracts_the_cursor_back_toward_the_anchor() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for i in 0..20 {
+        app.push_transcript_item(TranscriptItem::user(format!("entry {i}")));
+    }
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    // Seed at the tail (no room to extend DOWN), then walk the cursor up two
+    // rows so a Shift+Down has somewhere to retract to — exercising RowDown
+    // moving the cursor down one row toward the fixed anchor.
+    let (x, y) = find_text_cell(&buffer, "entry 19").expect("the tail row is painted");
+    seed_drag_selection(&mut app, x, y);
+    let anchor_row = app.selection.as_ref().unwrap().anchor.row;
+
+    for _ in 0..2 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+        )
+        .await
+        .expect("shift up");
+    }
+    assert_eq!(app.selection.as_ref().unwrap().cursor.row, anchor_row - 2);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift down");
+    let sel = app.selection.as_ref().unwrap();
+    assert_eq!(sel.mode, crate::selection::SelectionMode::Row);
+    assert_eq!(sel.anchor.row, anchor_row, "anchor stays fixed");
+    assert_eq!(
+        sel.cursor.row,
+        anchor_row - 1,
+        "Shift+Down moves the cursor down one row toward the anchor"
+    );
+}
+
+#[tokio::test]
+async fn shift_pageup_then_pagedown_extends_and_retracts_by_a_page() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for i in 0..60 {
+        app.push_transcript_item(TranscriptItem::user(format!("row {i:02}")));
+    }
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "row 59").expect("the tail row is painted");
+    seed_drag_selection(&mut app, x, y);
+    let anchor_row = app.selection.as_ref().unwrap().anchor.row;
+    // The keyboard extend pages by the PAINTED viewport height (the cache the
+    // render stamped), not the live terminal size.
+    let geom = painted_geometry(&app);
+    let page = geom.viewport_h.max(1);
+    assert!(
+        page > 0 && geom.total_rows > page,
+        "need more rows than a page"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift pageup");
+    let sel = app
+        .selection
+        .as_ref()
+        .expect("selection survives a page extend");
+    assert_eq!(sel.mode, crate::selection::SelectionMode::Row);
+    assert_eq!(
+        sel.anchor.row, anchor_row,
+        "anchor stays fixed across a page extend"
+    );
+    let up_cursor = sel.cursor.row;
+    assert_eq!(
+        up_cursor,
+        anchor_row.saturating_sub(page),
+        "Shift+PageUp walks the cursor up one painted viewport of rows"
+    );
+
+    // Shift+PageDown brings the cursor back toward the anchor by one page (the
+    // page is re-measured from the cache the PageUp's auto-scroll re-stamped).
+    let page_down = painted_geometry(&app).viewport_h.max(1);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift pagedown");
+    let sel = app.selection.as_ref().unwrap();
+    assert_eq!(
+        sel.cursor.row,
+        (up_cursor + page_down).min(anchor_row),
+        "Shift+PageDown retracts the cursor one viewport back toward the anchor"
+    );
+}
+
+#[tokio::test]
+async fn shift_home_and_end_run_the_cursor_to_the_row_boundaries() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("boundary check line"));
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "boundary").expect("painted");
+    // Anchor a cell selection partway into the word so Home/End have somewhere
+    // to travel from.
+    handle_mouse(&mut app, left_down(x + 4, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_drag_with(x + 6, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_up(x + 6, y));
+    let cursor_row = app.selection.as_ref().unwrap().cursor.row;
+
+    // Shift+Home drives the cursor to the start of its line (col 0).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift home");
+    let sel = app
+        .selection
+        .as_ref()
+        .expect("selection survives Shift+Home");
+    assert_eq!(
+        sel.cursor.row, cursor_row,
+        "Shift+Home keeps the cursor on its row"
+    );
+    assert_eq!(
+        sel.cursor.col, 0,
+        "Shift+Home runs the cursor to the line start"
+    );
+
+    // Shift+End drives the cursor to the end of the row's content.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift end");
+    let sel = app.selection.as_ref().unwrap();
+    let rows = main_surface_rows(&app);
+    let row_len = crate::transcript_surface::plain_text_of_line(&rows[sel.cursor.row])
+        .chars()
+        .count();
+    assert_eq!(
+        sel.cursor.col, row_len,
+        "Shift+End runs the cursor to the row's last content char"
+    );
+}
+
+#[test]
+fn mouse_drag_press_extend_release_tracks_the_cursor_across_cells() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("drag across these cells"));
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "drag across these cells").expect("painted");
+
+    // Press anchors a collapsed cell selection.
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    let anchor = app
+        .selection
+        .as_ref()
+        .expect("press anchors a selection")
+        .anchor;
+    assert_eq!(anchor.row, app.selection.as_ref().unwrap().cursor.row);
+
+    // Each drag moves the cursor end only; the anchor stays put.
+    handle_mouse(&mut app, left_drag_with(x + 4, y, KeyModifiers::NONE));
+    let mid = app.selection.as_ref().unwrap();
+    assert_eq!(mid.anchor, anchor, "anchor fixed during the drag");
+    assert!(
+        mid.cursor.col > anchor.col,
+        "cursor advanced with the pointer"
+    );
+    let mid_cursor_col = mid.cursor.col;
+
+    handle_mouse(&mut app, left_drag_with(x + 9, y, KeyModifiers::NONE));
+    let later = app.selection.as_ref().unwrap();
+    assert_eq!(later.anchor, anchor, "anchor still fixed");
+    assert!(
+        later.cursor.col > mid_cursor_col,
+        "a further drag extends the cursor further"
+    );
+
+    // Release keeps the multi-cell selection (only a collapsed cell is dropped).
+    handle_mouse(&mut app, left_up(x + 9, y));
+    assert!(
+        app.selection.as_ref().is_some_and(|s| !s.is_empty()),
+        "release keeps a non-empty drag selection"
+    );
+}
+
+#[test]
+fn triple_click_selects_the_whole_row_in_row_mode() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("triple click whole row"));
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "triple").expect("painted");
+
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+
+    let sel = app
+        .selection
+        .as_ref()
+        .expect("triple-click arms a selection");
+    assert_eq!(
+        sel.mode,
+        crate::selection::SelectionMode::Row,
+        "the third click promotes to whole-row mode"
+    );
+    // A row-mode selection spans 0..row_len, so the clean text is the row's full
+    // content with the layout chrome stripped.
+    let rows = main_surface_rows(&app);
+    let text = crate::selection::selection_clean_text(&rows, sel);
+    assert_eq!(text, "triple click whole row");
+}
+
+#[test]
+fn selected_cells_carry_the_reversed_highlight_in_the_rendered_frame() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("highlight me please"));
+
+    // Locate "please" on screen and select exactly that word via double-click.
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (px, py) = find_text_cell(&buffer, "please").expect("painted");
+    handle_mouse(&mut app, left_down(px, py, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_down(px, py, KeyModifiers::NONE));
+    assert_eq!(
+        app.selection.as_ref().unwrap().mode,
+        crate::selection::SelectionMode::Word,
+        "double-click word-selects"
+    );
+
+    // Re-render WITH the selection active: only the selected glyphs carry the
+    // REVERSED highlight, and unselected cells on the same row do not.
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (hx, hy) = find_text_cell(&buffer, "please").expect("still painted");
+    assert_eq!(
+        reversed_cells_on_row(&buffer, hy),
+        "please",
+        "exactly the selected word is highlighted on its row: {:?}",
+        buffer_row_text(&buffer, hy)
+    );
+    // A neighbouring word on the same row stays un-highlighted.
+    let row_text = buffer_row_text(&buffer, hy);
+    assert!(row_text.contains("highlight"), "row text: {row_text:?}");
+    for x in 0..buffer.area.width {
+        if x >= hx && x < hx + "please".chars().count() as u16 {
+            continue;
+        }
+        assert!(
+            !buffer[(x, hy)].modifier.contains(Modifier::REVERSED),
+            "cell x={x} outside the selection must not be reversed (row {row_text:?})"
+        );
+    }
+}
+
+#[test]
+fn no_selection_means_no_reversed_cells_in_the_frame() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("nothing selected here"));
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (_, y) = find_text_cell(&buffer, "nothing selected here").expect("painted");
+    assert!(
+        app.selection.is_none(),
+        "no gesture ran, so there is no selection"
+    );
+    assert_eq!(
+        reversed_cells_on_row(&buffer, y),
+        "",
+        "without a selection no cell carries the highlight"
+    );
+}
+
+#[tokio::test]
+async fn copy_of_a_drag_selection_sends_clean_text_through_the_recording_sink() {
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::user("the prompt"));
+    app.push_transcript_item(TranscriptItem::assistant("copy this exact phrase"));
+
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "copy this exact phrase").expect("painted");
+    // Drag-select the whole visible phrase (well past its end so the cursor
+    // clamps to the row end).
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_drag_with(x + 30, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_up(x + 30, y));
+
+    // Nothing has been sent to the clipboard yet — selecting is not copying.
+    assert!(
+        writes.lock().unwrap().is_empty(),
+        "drag-selecting must not touch the clipboard"
+    );
+
+    // The copy chord routes the selection's clean text through the sink exactly
+    // once, stripping the row's layout chrome.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("copy");
+
+    let sent = writes.lock().unwrap().clone();
+    assert_eq!(
+        sent.as_slice(),
+        ["copy this exact phrase"],
+        "the recording sink received exactly the selected clean text"
+    );
+    assert!(
+        app.status.contains("copied selection"),
+        "status names the selection: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn copy_with_no_selection_does_not_send_empty_selection_text() {
+    // Guards the routing: a copy chord with no active selection falls back to
+    // the semantic unit (the last assistant message), never an empty send.
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::assistant("fallback answer"));
+    let _ = render_transcript_to_buffer(&app, 40, 12);
+    assert!(app.selection.is_none(), "no selection armed");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("copy");
+
+    let sent = writes.lock().unwrap().clone();
+    assert_eq!(
+        sent.as_slice(),
+        ["fallback answer"],
+        "with no selection the copy chord sends the focused unit, not empty text"
+    );
+    assert!(
+        app.status.contains("copied assistant message"),
+        "status names the fallback unit: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn esc_clears_a_keyboard_seeded_selection() {
+    // The earlier Esc test clears a mouse-drag selection; this pins that a
+    // keyboard-seeded (Shift+Down) selection is cleared by the same first Esc.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for i in 0..20 {
+        app.push_transcript_item(TranscriptItem::user(format!("k{i}")));
+    }
+    let _ = render_transcript_to_buffer(&app, 40, 12);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift up seeds");
+    assert!(app.selection.is_some(), "Shift+Up seeds a selection");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+    assert!(
+        app.selection.is_none(),
+        "Esc clears the keyboard-seeded selection"
+    );
+    assert!(
+        app.status.contains("selection cleared"),
+        "status: {}",
+        app.status
+    );
 }

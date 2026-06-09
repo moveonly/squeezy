@@ -90,6 +90,7 @@ mod proposed_plan;
 mod render;
 mod resume_picker;
 mod scroll;
+mod selection;
 mod settings_watcher;
 mod size_source;
 mod startup_model_picker;
@@ -2107,6 +2108,59 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         active_transcript_scroll_mut(app).set_from_bottom(from_bottom, line_count, viewport_h);
         return active_transcript_scroll(app) != before;
     }
+
+    // Visual selection over the MAIN transcript text area. Only outside the
+    // overlay/config screens (those own their own surfaces). Press hit-tests the
+    // text rectangle; drag/release track an in-flight drag.
+    if app.transcript_overlay.is_none() && app.config_screen.is_none() {
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                if let Some(pos) = main_point_from_mouse(app, mouse.column, mouse.row) {
+                    return handle_main_selection_press(
+                        app,
+                        pos,
+                        mouse.column,
+                        mouse.row,
+                        mouse.modifiers,
+                    );
+                }
+            }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                if app
+                    .selection
+                    .as_ref()
+                    .is_some_and(|s| s.surface == selection::SelectionSurface::Main)
+                    && let Some(pos) = main_point_from_mouse_clamped(app, mouse.column, mouse.row)
+                {
+                    let cursor_row = pos.row;
+                    set_selection_cursor(app, pos);
+                    let (total_rows, _) = active_transcript_geometry(app);
+                    scroll_selection_cursor_into_view(
+                        app,
+                        selection::SelectionSurface::Main,
+                        cursor_row,
+                        total_rows.saturating_sub(1),
+                    );
+                    return true;
+                }
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                // Release ends a drag; a bare click (collapsed cell selection)
+                // leaves no selection so a single click doesn't paint a 1-cell
+                // highlight.
+                if let Some(sel) = app.selection.as_ref()
+                    && sel.surface == selection::SelectionSurface::Main
+                {
+                    if sel.is_empty() {
+                        app.selection = None;
+                    }
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
     // Wheel scroll always scrolls the transcript — the inline viewport
     // disables the terminal's native wheel-to-arrow translation, so without
     // this the user would have no way to scroll once mouse capture was on.
@@ -2187,6 +2241,409 @@ fn main_scrollbar_from_bottom_from_mouse(app: &TuiApp, column: u16, row: u16) ->
         (position * cached.max_from_bottom) / travel
     };
     Some(cached.max_from_bottom.saturating_sub(top_line_scroll))
+}
+
+// ---------------------------------------------------------------------------
+// Visual selection (mouse + keyboard) over the painted transcript rows
+// ---------------------------------------------------------------------------
+//
+// The pure model lives in `crate::selection`: an anchor/cursor pair over one
+// surface's painted wrapped `Vec<Line>`, the per-row column-span math, and the
+// highlight + clean-text bridges. lib.rs owns the `TuiApp` field, the per-frame
+// text-area cache, the gesture/key dispatch, and the clipboard delivery.
+
+/// A second/third left press at the same cell within this many milliseconds is
+/// treated as a double/triple click (word / row select).
+const MULTI_CLICK_MS: u128 = 400;
+
+/// The painted wrapped rows of the MAIN transcript surface this frame — the
+/// exact `Vec<Line>` `render_transcript` drew, so a `selection::Pos` row indexes
+/// them faithfully. Rebuilt from the cached width + startup-card flag.
+fn main_surface_rows(app: &TuiApp) -> Vec<Line<'static>> {
+    let cache = app.main_text_area_cache.get();
+    let (width, include_card) = match cache {
+        Some(c) => (c.text_area.width, c.include_startup_card),
+        None => (main_text_width(app), false),
+    };
+    transcript_lines_for_render(app, Some(width.max(1)), include_card)
+}
+
+/// The painted wrapped rows of the active selection surface (main or overlay).
+fn selection_surface_rows(
+    app: &TuiApp,
+    surface: selection::SelectionSurface,
+) -> Vec<Line<'static>> {
+    match surface {
+        selection::SelectionSurface::Main => main_surface_rows(app),
+        selection::SelectionSurface::Overlay => {
+            let width = app
+                .main_text_area_cache
+                .get()
+                .map(|c| c.text_area.width)
+                .unwrap_or_else(|| main_text_width(app));
+            with_transcript_overlay_rows(app, width.max(1), |rows| rows.to_vec())
+        }
+    }
+}
+
+/// Map an absolute `(column, row)` mouse cell onto a surface-local
+/// `selection::Pos` for the MAIN text area, using the per-frame
+/// `main_text_area_cache`. `None` when the cell is outside the text rectangle.
+fn main_point_from_mouse(app: &TuiApp, column: u16, row: u16) -> Option<selection::Pos> {
+    let cache = app.main_text_area_cache.get()?;
+    let area = cache.text_area;
+    if column < area.x
+        || column >= area.x.saturating_add(area.width)
+        || row < area.y
+        || row >= area.y.saturating_add(area.height)
+    {
+        return None;
+    }
+    Some(main_pos_for_cell(app, &cache, column, row))
+}
+
+/// Like [`main_point_from_mouse`] but clamps an out-of-bounds pointer onto the
+/// nearest edge cell instead of returning `None` — used while dragging so a
+/// pointer that slides above/below the text area still extends to the
+/// first/last visible row (auto-scroll then reveals more).
+fn main_point_from_mouse_clamped(app: &TuiApp, column: u16, row: u16) -> Option<selection::Pos> {
+    let cache = app.main_text_area_cache.get()?;
+    let area = cache.text_area;
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let col = column.clamp(area.x, area.x + area.width - 1);
+    let r = row.clamp(area.y, area.y + area.height - 1);
+    Some(main_pos_for_cell(app, &cache, col, r))
+}
+
+/// Shared cell→`Pos` math: resolve the wrapped-row index from the painted scroll
+/// window, then the wide-glyph-aware char column within that row's plain text.
+fn main_pos_for_cell(
+    app: &TuiApp,
+    cache: &MainTextAreaCache,
+    column: u16,
+    row: u16,
+) -> selection::Pos {
+    let total_rows = cache.total_rows;
+    let last = total_rows.saturating_sub(1);
+    let local_row = usize::from(row.saturating_sub(cache.text_area.y));
+    // First visible row: tail-anchored window, `from_bottom` up from the end.
+    let top_row = total_rows
+        .saturating_sub(usize::from(cache.viewport_h))
+        .saturating_sub(cache.from_bottom);
+    let row_idx = (top_row + local_row).min(last);
+
+    let display_col = usize::from(column.saturating_sub(cache.text_area.x));
+    let rows = main_surface_rows(app);
+    let col = rows
+        .get(row_idx)
+        .map(|line| {
+            selection::char_offset_for_display_col(
+                &transcript_surface::plain_text_of_line(line),
+                display_col,
+            )
+        })
+        .unwrap_or(0);
+    selection::Pos::new(row_idx, col)
+}
+
+/// The active selection surface: the overlay when it is open, else the main
+/// view. Selections do not survive crossing surfaces (the row `Vec`s differ).
+fn active_selection_surface(app: &TuiApp) -> selection::SelectionSurface {
+    if app.transcript_overlay.is_some() {
+        selection::SelectionSurface::Overlay
+    } else {
+        selection::SelectionSurface::Main
+    }
+}
+
+/// The `(row_count, viewport_h, from_bottom)` of the active selection surface,
+/// for keyboard extends + auto-scroll. The overlay uses its own scroll; the main
+/// view uses the cached painted geometry.
+fn selection_surface_geometry(
+    app: &TuiApp,
+    surface: selection::SelectionSurface,
+) -> (usize, usize) {
+    match surface {
+        selection::SelectionSurface::Main => {
+            let cache = app.main_text_area_cache.get();
+            match cache {
+                Some(c) => (c.total_rows, usize::from(c.viewport_h)),
+                None => {
+                    let (rows, vh) = active_transcript_geometry(app);
+                    (rows, vh)
+                }
+            }
+        }
+        selection::SelectionSurface::Overlay => {
+            let width = app
+                .main_text_area_cache
+                .get()
+                .map(|c| c.text_area.width)
+                .unwrap_or_else(|| main_text_width(app));
+            let row_count = with_transcript_overlay_rows(app, width.max(1), |rows| rows.len());
+            let viewport_h = app
+                .transcript_overlay_scrollbar_cache
+                .get()
+                .map(|c| usize::from(c.scrollbar_area.height))
+                .unwrap_or(0);
+            (row_count, viewport_h)
+        }
+    }
+}
+
+/// Begin a fresh cell selection anchored at `pos` on `surface`, with drag
+/// tracking armed.
+fn start_selection(app: &mut TuiApp, surface: selection::SelectionSurface, pos: selection::Pos) {
+    let width = app
+        .main_text_area_cache
+        .get()
+        .map(|c| c.text_area.width)
+        .unwrap_or_else(|| main_text_width(app));
+    app.selection = Some(selection::Selection::at(
+        surface,
+        pos,
+        selection::SelectionMode::Cell,
+        width,
+    ));
+}
+
+/// Move the active selection's cursor to `pos` (keeping the anchor fixed). A
+/// no-op when there is no selection.
+fn set_selection_cursor(app: &mut TuiApp, pos: selection::Pos) {
+    if let Some(sel) = app.selection.as_mut() {
+        sel.cursor = pos;
+    }
+}
+
+/// Seed a selection at the surface's tail when none exists, then drive a
+/// keyboard extend (`mv`) over the surface rows, auto-scrolling to keep the
+/// cursor visible.
+fn extend_selection(app: &mut TuiApp, mv: SelectionMove) {
+    let surface = match app.selection.as_ref() {
+        Some(sel) => sel.surface,
+        None => active_selection_surface(app),
+    };
+    let (row_count, viewport_h) = selection_surface_geometry(app, surface);
+    if row_count == 0 {
+        return;
+    }
+    let last = row_count - 1;
+
+    if app.selection.is_none() {
+        // Seed at the bottom visible row, column 0.
+        let from_bottom = match surface {
+            selection::SelectionSurface::Main => app
+                .main_text_area_cache
+                .get()
+                .map(|c| c.from_bottom)
+                .unwrap_or(0),
+            selection::SelectionSurface::Overlay => 0,
+        };
+        let seed_row = last.saturating_sub(from_bottom);
+        let width = app
+            .main_text_area_cache
+            .get()
+            .map(|c| c.text_area.width)
+            .unwrap_or_else(|| main_text_width(app));
+        app.selection = Some(selection::Selection::at(
+            surface,
+            selection::Pos::new(seed_row, 0),
+            selection::SelectionMode::Cell,
+            width,
+        ));
+    }
+
+    let rows = selection_surface_rows(app, surface);
+    let page = viewport_h.max(1);
+    let sel = app.selection.as_mut().expect("seeded above");
+    let cur_row = sel.cursor.row.min(last);
+    let cur_line_len = rows
+        .get(cur_row)
+        .map(|l| transcript_surface::plain_text_of_line(l).chars().count())
+        .unwrap_or(0);
+
+    match mv {
+        SelectionMove::RowUp => selection::extend_by_row(sel, -1, row_count),
+        SelectionMove::RowDown => selection::extend_by_row(sel, 1, row_count),
+        SelectionMove::PageUp => selection::extend_by_page(sel, page, true, row_count),
+        SelectionMove::PageDown => selection::extend_by_page(sel, page, false, row_count),
+        SelectionMove::LineHome => {
+            // Two-stage: to line start; if already there, to surface top.
+            if sel.cursor.col == 0 {
+                sel.cursor = selection::Pos::new(0, 0);
+            } else {
+                sel.cursor = selection::Pos::new(cur_row, 0);
+            }
+        }
+        SelectionMove::LineEnd => {
+            // Two-stage: to line end; if already there, to surface bottom.
+            if sel.cursor.col >= cur_line_len {
+                let last_len = rows
+                    .get(last)
+                    .map(|l| transcript_surface::plain_text_of_line(l).chars().count())
+                    .unwrap_or(0);
+                sel.cursor = selection::Pos::new(last, last_len);
+            } else {
+                sel.cursor = selection::Pos::new(cur_row, cur_line_len);
+            }
+        }
+    }
+
+    let cursor_row = app.selection.as_ref().expect("seeded above").cursor.row;
+    scroll_selection_cursor_into_view(app, surface, cursor_row, last);
+}
+
+/// Auto-scroll the active surface so `cursor_row` is inside the viewport.
+fn scroll_selection_cursor_into_view(
+    app: &mut TuiApp,
+    surface: selection::SelectionSurface,
+    cursor_row: usize,
+    last: usize,
+) {
+    match surface {
+        selection::SelectionSurface::Main => {
+            let (total_rows, viewport_h) = active_transcript_geometry(app);
+            if viewport_h == 0 || total_rows == 0 {
+                return;
+            }
+            let from_bottom =
+                active_transcript_scroll(app).offset_from_bottom(total_rows, viewport_h);
+            let last = last.min(total_rows.saturating_sub(1));
+            let bottom_visible = last.saturating_sub(from_bottom);
+            let top_visible = bottom_visible.saturating_sub(viewport_h.saturating_sub(1));
+            if cursor_row < top_visible {
+                scroll_transcript_up(app, top_visible - cursor_row);
+            } else if cursor_row > bottom_visible {
+                scroll_transcript_down(app, cursor_row - bottom_visible);
+            }
+        }
+        selection::SelectionSurface::Overlay => {
+            // Bring the cursor row to the top of the overlay viewport if it's
+            // off-screen above/below.
+            let scroll = resolved_transcript_overlay_scroll(app);
+            let viewport_h = app
+                .transcript_overlay_scrollbar_cache
+                .get()
+                .map(|c| usize::from(c.scrollbar_area.height))
+                .unwrap_or(0);
+            if viewport_h == 0 {
+                return;
+            }
+            if cursor_row < scroll {
+                set_transcript_overlay_scroll(app, cursor_row);
+            } else if cursor_row >= scroll + viewport_h {
+                set_transcript_overlay_scroll(app, cursor_row + 1 - viewport_h);
+            }
+        }
+    }
+}
+
+/// Handle a left mouse press on the MAIN text area: shift-click extends the
+/// existing selection, a 2nd press at the same cell selects the word, a 3rd the
+/// row, and a plain press starts a new cell selection. Returns `true` (consumed).
+fn handle_main_selection_press(
+    app: &mut TuiApp,
+    pos: selection::Pos,
+    column: u16,
+    row: u16,
+    modifiers: KeyModifiers,
+) -> bool {
+    let now = std::time::Instant::now();
+    let multiplicity = match app.last_click {
+        Some((at, c, r, count))
+            if c == column && r == row && now.duration_since(at).as_millis() <= MULTI_CLICK_MS =>
+        {
+            (count + 1).min(3)
+        }
+        _ => 1,
+    };
+    app.last_click = Some((now, column, row, multiplicity));
+
+    // Shift+click extends the current selection's cursor (when one exists on
+    // this surface).
+    if modifiers.contains(KeyModifiers::SHIFT)
+        && app
+            .selection
+            .as_ref()
+            .is_some_and(|s| s.surface == selection::SelectionSurface::Main)
+    {
+        set_selection_cursor(app, pos);
+        return true;
+    }
+
+    match multiplicity {
+        2 => select_word_at(app, selection::SelectionSurface::Main, pos),
+        3 => select_row_at(app, selection::SelectionSurface::Main, pos),
+        _ => start_selection(app, selection::SelectionSurface::Main, pos),
+    }
+    true
+}
+
+/// Double-click: select the word under `pos` over that row's plain text, snapping
+/// the anchor/cursor to word bounds (`SelectionMode::Word`).
+fn select_word_at(app: &mut TuiApp, surface: selection::SelectionSurface, pos: selection::Pos) {
+    let rows = selection_surface_rows(app, surface);
+    let Some(line) = rows.get(pos.row) else {
+        start_selection(app, surface, pos);
+        return;
+    };
+    let plain = transcript_surface::plain_text_of_line(line);
+    let bounds = selection::word_bounds(&plain, pos.col);
+    let width = app
+        .main_text_area_cache
+        .get()
+        .map(|c| c.text_area.width)
+        .unwrap_or_else(|| main_text_width(app));
+    let mut sel = selection::Selection::at(
+        surface,
+        selection::Pos::new(pos.row, bounds.start),
+        selection::SelectionMode::Word,
+        width,
+    );
+    sel.cursor = selection::Pos::new(pos.row, bounds.end);
+    app.selection = Some(sel);
+}
+
+/// Triple-click: select the whole visual row under `pos` (`SelectionMode::Row`).
+fn select_row_at(app: &mut TuiApp, surface: selection::SelectionSurface, pos: selection::Pos) {
+    let rows = selection_surface_rows(app, surface);
+    let row_len = rows
+        .get(pos.row)
+        .map(|l| transcript_surface::plain_text_of_line(l).chars().count())
+        .unwrap_or(0);
+    let width = app
+        .main_text_area_cache
+        .get()
+        .map(|c| c.text_area.width)
+        .unwrap_or_else(|| main_text_width(app));
+    let mut sel = selection::Selection::at(
+        surface,
+        selection::Pos::new(pos.row, 0),
+        selection::SelectionMode::Row,
+        width,
+    );
+    sel.cursor = selection::Pos::new(pos.row, row_len);
+    app.selection = Some(sel);
+}
+
+/// Copy the active selection's clean text to the clipboard with a status toast.
+/// Returns `true` when there was a non-empty selection to copy.
+fn copy_active_selection(app: &mut TuiApp) -> bool {
+    let Some(sel) = app.selection.clone() else {
+        return false;
+    };
+    if sel.is_empty() {
+        return false;
+    }
+    let rows = selection_surface_rows(app, sel.surface);
+    let text = selection::selection_clean_text(&rows, &sel);
+    if text.is_empty() {
+        return false;
+    }
+    deliver_copy(app, &text, "selection");
+    true
 }
 
 fn handle_transcript_overlay_mouse(
@@ -2588,6 +3045,22 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         app.terminal_title_state = TerminalTitleState::Cleared;
     }
 
+    // Esc clears an active visual selection BEFORE any search / detail / exit
+    // consumer. Highest precedence among Esc handlers: a first Esc drops the
+    // selection, only a second reaches the turn-interrupt / bare-Esc no-op
+    // below. Gated so it never steals Esc from a modal surface. The overlay
+    // owns its own selection, so allow the clear there too.
+    if key.code == KeyCode::Esc
+        && app.selection.is_some()
+        && app.config_screen.is_none()
+        && !app.pin_picker_active
+        && app.pending_chord.is_none()
+    {
+        app.selection = None;
+        app.status = "selection cleared".to_string();
+        return Ok(false);
+    }
+
     // The /pin picker is fully modal: it owns ↑/↓/Enter/Esc until it closes,
     // so the highlighted candidate can't be cleared by stray input.
     if app.pin_picker_active {
@@ -2631,6 +3104,28 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         app.pending_chord = Some(ChordPrefix::CtrlX);
         app.status = "Ctrl+X… (Q opens queue · Esc cancels)".to_string();
         return Ok(false);
+    }
+
+    // Shift+PageUp/PageDown/Home/End extend the visual selection. These resolve
+    // through the keymap to plain scroll/jump otherwise, so intercept them
+    // BEFORE `dispatch_keymap_action` swallows them. Main surface only — the
+    // overlay owns its own page navigation.
+    if key.modifiers.contains(KeyModifiers::SHIFT)
+        && app.transcript_overlay.is_none()
+        && app.config_screen.is_none()
+        && app.status_line_setup.is_none()
+    {
+        let mv = match key.code {
+            KeyCode::PageUp => Some(SelectionMove::PageUp),
+            KeyCode::PageDown => Some(SelectionMove::PageDown),
+            KeyCode::Home => Some(SelectionMove::LineHome),
+            KeyCode::End => Some(SelectionMove::LineEnd),
+            _ => None,
+        };
+        if let Some(mv) = mv {
+            extend_selection(app, mv);
+            return Ok(false);
+        }
     }
 
     // Rebindable actions (F11/Ctrl+T/Ctrl+P/Ctrl+Y/Ctrl+R/PageUp/PageDown/
@@ -2895,7 +3390,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 return Ok(false);
             }
             if key.modifiers.contains(KeyModifiers::SHIFT) {
-                select_previous_transcript_entry(app);
+                extend_selection(app, SelectionMove::RowUp);
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 recall_prompt_history(app, HistoryDirection::Previous);
             } else if move_input_cursor_up(app) {
@@ -2912,7 +3407,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 return Ok(false);
             }
             if key.modifiers.contains(KeyModifiers::SHIFT) {
-                select_next_transcript_entry(app);
+                extend_selection(app, SelectionMove::RowDown);
             } else if key.modifiers.contains(KeyModifiers::ALT) {
                 recall_prompt_history(app, HistoryDirection::Next);
             } else if move_input_cursor_down(app) {
@@ -3375,6 +3870,15 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             copy_transcript_scope(app, copy::CopyScope::FullTranscript, app.copy_format)
+        }
+        keymap::Action::CopySelection => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            // Explicit "copy the selection" verb. With an active selection,
+            // `copy_transcript_scope` copies it; with none it falls back to the
+            // focused entry (the most useful no-selection default).
+            copy_transcript_scope(app, copy::CopyScope::FocusedEntry, app.copy_format)
         }
         keymap::Action::RestoreCancelledPrompt => {
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
@@ -5706,6 +6210,13 @@ fn copy_transcript_scope(
     scope: copy::CopyScope,
     format: copy::CopyFormat,
 ) -> bool {
+    // An active visual selection wins over the requested semantic unit: every
+    // copy chord copies the selection when one is present, otherwise the focused
+    // unit. The clean-text comes from the selection's own painted surface.
+    if copy_active_selection(app) {
+        return true;
+    }
+
     // Pending-stream special case: the freshest assistant answer may not be a
     // committed row yet. Copy it directly before building the row model.
     if scope == copy::CopyScope::LastAssistant
@@ -6039,6 +6550,10 @@ fn set_all_transcript_collapsed(app: &mut TuiApp, collapsed: bool) -> usize {
     changed
 }
 
+// Retained for the `/pin` `selected_entry` candidate model (and its test
+// coverage). Shift+Up/Down now drive the row-level visual selection instead, so
+// these are no longer wired to a key in production.
+#[allow(dead_code)]
 fn select_previous_transcript_entry(app: &mut TuiApp) {
     if app.transcript.is_empty() {
         app.status = "transcript is empty".to_string();
@@ -6052,6 +6567,7 @@ fn select_previous_transcript_entry(app: &mut TuiApp) {
     app.status = format!("selected transcript entry {}", entry.id + 1);
 }
 
+#[allow(dead_code)]
 fn select_next_transcript_entry(app: &mut TuiApp) {
     if app.transcript.is_empty() {
         app.status = "transcript is empty".to_string();
@@ -8430,6 +8946,13 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
     }
 }
 
+/// The style applied to selected cells: a reversed (inverted fg/bg) run. Chosen
+/// over a fixed theme color so the highlight reads as a selection on any palette
+/// and never collides with the row's own foreground.
+fn selection_highlight_style() -> Style {
+    Style::default().add_modifier(Modifier::REVERSED)
+}
+
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_startup_card: bool) {
     // Reserve a 1-cell right gutter for the scrollbar; the text wraps to the
     // narrower column. When the area is too thin to split, fall back to the
@@ -8451,6 +8974,29 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
         total_rows,
         viewport_h,
     ));
+
+    // Stamp the text rectangle + wrapped-row geometry so a mouse press/drag maps
+    // a cell onto a surface-local `selection::Pos`. The painted lines ARE the
+    // wrapped rows (`transcript_lines_for_render` with `Some(width)`), so the
+    // `Pos` row indexes them faithfully.
+    app.main_text_area_cache.set(Some(MainTextAreaCache {
+        text_area,
+        total_rows,
+        viewport_h: text_area.height,
+        from_bottom,
+        include_startup_card,
+    }));
+
+    // Overlay the visual-selection highlight on the painted rows when a MAIN
+    // selection is active. `rows_with_selection_highlight` restyles the selected
+    // cells (the same char-offset basis the copy uses) and leaves the rest
+    // untouched, so the highlight matches the copied text exactly.
+    let lines = match app.selection.as_ref() {
+        Some(sel) if sel.surface == selection::SelectionSurface::Main => {
+            selection::rows_with_selection_highlight(&lines, sel, selection_highlight_style())
+        }
+        _ => lines,
+    };
     let paragraph = Paragraph::new(lines)
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
@@ -8728,7 +9274,11 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let row_count = rows.len();
         let scroll =
             resolved_transcript_overlay_scroll_for_state(state, row_count, text_area.height);
-        render_transcript_overlay_rows(frame, text_area, rows, scroll);
+        let overlay_selection = app
+            .selection
+            .as_ref()
+            .filter(|s| s.surface == selection::SelectionSurface::Overlay);
+        render_transcript_overlay_rows(frame, text_area, rows, scroll, overlay_selection);
         if scrollbar_area.width > 0
             && let Some(geometry) =
                 transcript_overlay_scrollbar_geometry(row_count, scrollbar_area.height, scroll)
@@ -8997,12 +9547,24 @@ fn render_transcript_overlay_rows(
     area: Rect,
     rows: &[Line<'static>],
     scroll: usize,
+    selection: Option<&selection::Selection>,
 ) {
     frame.render_widget(ratatui::widgets::Clear, area);
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let visible_rows = rows
+    // Bake the selection highlight onto the full pre-scroll row list (the same
+    // char-offset basis copy uses), THEN skip/take the visible window.
+    let highlighted;
+    let source: &[Line<'static>] = match selection {
+        Some(sel) => {
+            highlighted =
+                selection::rows_with_selection_highlight(rows, sel, selection_highlight_style());
+            &highlighted
+        }
+        None => rows,
+    };
+    let visible_rows = source
         .iter()
         .skip(scroll)
         .take(usize::from(area.height))
@@ -9064,6 +9626,37 @@ pub(crate) struct MainScrollbarCache {
     total_rows: usize,
     viewport_h: u16,
     max_from_bottom: usize,
+}
+
+/// Per-frame snapshot of the MAIN transcript TEXT rectangle plus the geometry
+/// needed to map a mouse `(column, row)` cell onto a surface-local
+/// [`selection::Pos`] (wrapped-row index + char column). Stamped in
+/// `render_transcript`; `None` before the first frame.
+///
+/// `total_rows`/`viewport_h` are the wrapped-row content length and the text
+/// viewport height; `from_bottom` is the painted scroll distance from the tail;
+/// `include_startup_card` records the flag the painted line list was built with
+/// so the hit-test rebuilds the SAME wrapped rows the frame drew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MainTextAreaCache {
+    text_area: Rect,
+    total_rows: usize,
+    viewport_h: u16,
+    from_bottom: usize,
+    include_startup_card: bool,
+}
+
+/// How a keyboard extend moves the selection cursor (Shift+nav). The per-move
+/// math lives in `extend_selection`, delegating row/page motion to
+/// `crate::selection`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectionMove {
+    RowUp,
+    RowDown,
+    PageUp,
+    PageDown,
+    LineHome,
+    LineEnd,
 }
 
 /// In-flight smooth-scroll animation for the MAIN transcript view.
@@ -17271,6 +17864,21 @@ pub(crate) struct TuiApp {
     /// click/drag can map to a `from_bottom` without re-deriving the layout.
     /// Set at the end of `render_transcript`; `None` when content fits.
     pub(crate) main_scrollbar_cache: std::cell::Cell<Option<MainScrollbarCache>>,
+    /// Per-frame snapshot of the MAIN transcript text rectangle + wrapped-row
+    /// geometry so a mouse press/drag maps a cell onto a surface-local
+    /// `selection::Pos`. Set in `render_transcript`; `None` before the first
+    /// frame.
+    pub(crate) main_text_area_cache: std::cell::Cell<Option<MainTextAreaCache>>,
+    /// Active visual selection over the painted transcript rows (main view or
+    /// Ctrl+T overlay), or `None`. Surface-local: the anchor/cursor index the
+    /// active surface's wrapped `Vec<Line>`. Drives copy when present and the
+    /// highlight in both renders.
+    pub(crate) selection: Option<selection::Selection>,
+    /// Timestamp + cell + running count of the last left press, for
+    /// synthesising double/triple clicks (crossterm delivers no click-count). A
+    /// press within the multi-click window at the same cell escalates word →
+    /// row select.
+    pub(crate) last_click: Option<(std::time::Instant, u16, u16, u8)>,
     /// Sub-notch wheel/trackpad accumulator. Trackpads emit many small
     /// high-frequency notches; summing them here (and applying whole lines while
     /// keeping the remainder) means fast bursts of small events add up instead
@@ -17814,6 +18422,9 @@ impl TuiApp {
                 TranscriptOverlayRenderCache::default(),
             ),
             main_scrollbar_cache: std::cell::Cell::new(None),
+            main_text_area_cache: std::cell::Cell::new(None),
+            selection: None,
+            last_click: None,
             wheel_accum: 0,
             main_scroll_anim: None,
             // Smooth/eased scroll for large jumps. Honour a reduced-motion /
