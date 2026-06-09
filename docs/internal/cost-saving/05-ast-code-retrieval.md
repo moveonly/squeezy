@@ -87,8 +87,8 @@ pub struct ParsedFile {
 }
 ```
 
-Unsupported files round-trip through `ParsedFile::unsupported`, which
-suggests `"bounded read/grep/list navigation"` as the fallback.
+Unsupported files round-trip through `ParsedFile::unsupported`, which suggests
+`"bounded read/grep/list navigation for <relative-path>"` as the fallback.
 
 ### Signature / body split
 
@@ -496,17 +496,19 @@ sees code it doesn't need.
 **Unsupported languages.** Anything outside the supported `LanguageFamily` set
 — for example Zig, Haskell, Elixir, Lua, Bash, SQL, HTML, CSS, YAML, TOML, and
 Markdown — produces a
-`ParsedFile::unsupported` and gets `"bounded read/grep/list navigation"`
-as the documented fallback. The graph contains a `File`
+`ParsedFile::unsupported` and gets
+`"bounded read/grep/list navigation for <relative-path>"` as the documented
+fallback. The graph contains a `File`
 symbol for the file but no declarations; the agent can still read it,
 just with no slice shortcut.
 
 **Grammar imperfections.** When tree-sitter parses with errors, the
-extractor still proceeds but pushes a `ParseDiagnostic` with
-`Confidence::Partial` (`languages/rust.rs:19-25`). Downstream packets
-inherit that confidence, so the model can see that a slice came from
-a partially-parsed file. Missing nodes (`node.is_missing()`) are
-skipped with a diagnostic at `languages/rust.rs:49-55`.
+extractor still proceeds but pushes `ParseDiagnostic` entries with
+`Confidence::Partial`, the language, node/parent kinds, compact source excerpts,
+the parse-error count, and a partial-parse summary. Downstream packets inherit
+that confidence, so the model can see that a slice came from a partially-parsed
+file. Missing nodes (`node.is_missing()`) are skipped with the same structured
+language, parent-node, excerpt, and partial-confidence context.
 
 **Missing `body_span`.** Some declarations have no body — `const`
 items, externally-declared functions in C headers, trait method

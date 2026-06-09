@@ -65,19 +65,29 @@ fn fresh_workspace(tag: &str) -> PathBuf {
     dir
 }
 
-struct CmdOutput {
+struct CommandOutcome {
     status: std::process::ExitStatus,
     stdout: String,
     stderr: String,
 }
 
-fn run_cmd_inner(
+fn ps_quote_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "''"))
+}
+
+fn run_powershell_inner(
     workspace: &Path,
-    cmdline_arg: &str,
+    command: &str,
     timeout: Duration,
-) -> Result<CmdOutput, String> {
+) -> Result<CommandOutcome, String> {
     let spec = make_spec(workspace);
-    let argv = vec!["cmd".to_string(), "/c".to_string(), cmdline_arg.to_string()];
+    let argv = vec![
+        "powershell.exe".to_string(),
+        "-NoLogo".to_string(),
+        "-NoProfile".to_string(),
+        "-Command".to_string(),
+        command.to_string(),
+    ];
     let env: HashMap<String, String> = std::env::vars().collect();
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -110,7 +120,7 @@ fn run_cmd_inner(
         let stdout_text = stdout_task.await.unwrap_or_default();
         let stderr_text = stderr_task.await.unwrap_or_default();
         match wait {
-            Ok(Ok(status)) => Ok(CmdOutput {
+            Ok(Ok(status)) => Ok(CommandOutcome {
                 status,
                 stdout: stdout_text,
                 stderr: stderr_text,
@@ -122,9 +132,9 @@ fn run_cmd_inner(
 }
 
 fn sandbox_smoke_available(workspace: &Path) -> bool {
-    match run_cmd_inner(
+    match run_powershell_inner(
         workspace,
-        "echo squeezy-sandbox-ready",
+        "Write-Output squeezy-sandbox-ready",
         Duration::from_secs(5),
     ) {
         Ok(output) if output.status.success() => true,
@@ -142,25 +152,27 @@ fn sandbox_smoke_available(workspace: &Path) -> bool {
     }
 }
 
-/// Run `cmd /c <cmdline_arg>` (a single shell command string) inside the
-/// sandbox rooted at `workspace`.  Returns the child's captured output, or
-/// `None` if the host can't run a basic restricted-token sandboxed command.
-fn run_cmd(workspace: &Path, cmdline_arg: &str) -> Option<CmdOutput> {
+/// Run a PowerShell command inside the sandbox rooted at `workspace`. Returns
+/// the child's captured output, or `None` if the host can't run a basic
+/// restricted-token sandboxed command.
+fn run_powershell(workspace: &Path, command: &str) -> Option<CommandOutcome> {
     if !sandbox_smoke_available(workspace) {
         return None;
     }
 
     Some(
-        run_cmd_inner(workspace, cmdline_arg, Duration::from_secs(10))
+        run_powershell_inner(workspace, command, Duration::from_secs(10))
             .expect("sandboxed command should complete after probe succeeds"),
     )
-
 }
 
 fn workspace_write_capability_available(workspace: &Path) -> bool {
     let probe_file = workspace.join("squeezy-wsbx-probe.txt");
-    let cmdline = format!(r#"echo probe > "{}""#, probe_file.display());
-    let Some(output) = run_cmd(workspace, &cmdline) else {
+    let command = format!(
+        "Set-Content -LiteralPath {} -Value probe",
+        ps_quote_path(&probe_file)
+    );
+    let Some(output) = run_powershell(workspace, &command) else {
         return false;
     };
     let ok = output.status.success() && probe_file.exists();
@@ -187,17 +199,20 @@ fn write_inside_workspace_allowed() {
     }
     let out_file = workspace.join("out.txt");
 
-    let cmdline = "echo hi > out.txt";
-    let Some(output) = run_cmd(&workspace, cmdline) else {
+    let command = format!(
+        "Set-Content -LiteralPath {} -Value hi",
+        ps_quote_path(&out_file)
+    );
+    let Some(outcome) = run_powershell(&workspace, &command) else {
         return;
     };
 
     assert!(
-        output.status.success(),
+        outcome.status.success(),
         "write inside workspace should succeed; exit={:?}; stdout={:?}; stderr={:?}",
-        output.status,
-        output.stdout,
-        output.stderr,
+        outcome.status,
+        outcome.stdout,
+        outcome.stderr
     );
     assert!(
         out_file.exists(),
@@ -225,11 +240,13 @@ fn write_outside_workspace_denied() {
     // Remove any leftover from a previous run.
     let _ = std::fs::remove_file(&evil_file);
 
-    let cmdline = format!(r#"echo x > "{}""#, evil_file.display());
-    // Ignore the exit status here: cmd.exe may exit 0 even when a shell
-    // redirection is denied.  The authoritative signal is whether the file was
-    // created.
-    let Some(_output) = run_cmd(&workspace, &cmdline) else {
+    let command = format!(
+        "Set-Content -LiteralPath {} -Value x",
+        ps_quote_path(&evil_file)
+    );
+    // Ignore the exit status here: the authoritative signal is whether the
+    // outside file was created.
+    let Some(_outcome) = run_powershell(&workspace, &command) else {
         return;
     };
 
@@ -255,17 +272,20 @@ fn append_inside_allowed() {
     let target = workspace.join("append.txt");
     std::fs::write(&target, "line1\n").expect("seed file");
 
-    let cmdline = "echo line2 >> append.txt";
-    let Some(output) = run_cmd(&workspace, cmdline) else {
+    let command = format!(
+        "Add-Content -LiteralPath {} -Value line2",
+        ps_quote_path(&target)
+    );
+    let Some(outcome) = run_powershell(&workspace, &command) else {
         return;
     };
 
     assert!(
-        output.status.success(),
+        outcome.status.success(),
         "append inside workspace should succeed; exit={:?}; stdout={:?}; stderr={:?}",
-        output.status,
-        output.stdout,
-        output.stderr,
+        outcome.status,
+        outcome.stdout,
+        outcome.stderr
     );
     let contents = std::fs::read_to_string(&target).expect("read file after append");
     assert!(
@@ -288,21 +308,44 @@ fn delete_inside_allowed() {
     let target = workspace.join("delme.txt");
     std::fs::write(&target, "x").expect("seed file");
 
-    let cmdline = "del /q delme.txt";
-    let Some(output) = run_cmd(&workspace, cmdline) else {
+    let command = format!("Remove-Item -LiteralPath {} -Force", ps_quote_path(&target));
+    let Some(outcome) = run_powershell(&workspace, &command) else {
         return;
     };
 
     assert!(
-        output.status.success(),
+        outcome.status.success(),
         "delete inside workspace should succeed; exit={:?}; stdout={:?}; stderr={:?}",
-        output.status,
-        output.stdout,
-        output.stderr,
+        outcome.status,
+        outcome.stdout,
+        outcome.stderr
     );
     assert!(
         !target.exists(),
         "file should be gone after delete inside workspace"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// Deleting inside protected metadata must be denied even when the workspace
+/// root itself is writable.
+#[test]
+fn protected_metadata_delete_denied() {
+    let workspace = fresh_workspace("metadata_delete");
+    let git_dir = workspace.join(".git");
+    std::fs::create_dir_all(&git_dir).expect("seed metadata dir");
+    let config = git_dir.join("config");
+    std::fs::write(&config, "keep").expect("seed metadata file");
+
+    let command = format!("Remove-Item -LiteralPath {} -Force", ps_quote_path(&config));
+    let Some(_outcome) = run_powershell(&workspace, &command) else {
+        return;
+    };
+
+    assert!(
+        config.exists(),
+        "protected metadata file should survive sandboxed delete attempt"
     );
 
     let _ = std::fs::remove_dir_all(&workspace);
@@ -322,19 +365,19 @@ fn read_system_still_works() {
     // Check for a stable system file without emitting a large directory listing;
     // these smoke tests do not otherwise need stdout, and bounded output avoids
     // filling pipes before the process exits.
-    let Some(output) = run_cmd(
+    let Some(outcome) = run_powershell(
         &workspace,
-        r#"if exist C:\Windows\System32\cmd.exe (exit /b 0) else (exit /b 1)"#,
+        r"if (Test-Path -LiteralPath 'C:\Windows\System32\cmd.exe') { exit 0 } else { exit 1 }",
     ) else {
         return;
     };
 
     assert!(
-        output.status.success(),
+        outcome.status.success(),
         "reading C:\\Windows\\System32\\cmd.exe should succeed on restricted-token tier; exit={:?}; stdout={:?}; stderr={:?}",
-        output.status,
-        output.stdout,
-        output.stderr,
+        outcome.status,
+        outcome.stdout,
+        outcome.stderr
     );
 
     let _ = std::fs::remove_dir_all(&workspace);

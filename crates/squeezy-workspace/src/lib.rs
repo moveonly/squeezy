@@ -1776,13 +1776,14 @@ fn unsupported_file(
     size_bytes: u64,
     reason: UnsupportedReason,
 ) -> UnsupportedFile {
+    let suggested_fallback = format!("bounded read/grep/list navigation for {relative_path}");
     UnsupportedFile {
         path: path.to_path_buf(),
         relative_path,
         extension,
         size_bytes,
         reason,
-        suggested_fallback: "bounded read/grep/list navigation".to_string(),
+        suggested_fallback,
     }
 }
 

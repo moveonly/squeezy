@@ -75,6 +75,155 @@ fn helper() {}
 }
 
 #[test]
+fn parse_error_diagnostics_include_language_span_excerpt_and_partial_summary() {
+    let source = "fn broken( {\n    let value = ;\n}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/broken.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let diagnostic = parsed
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.partial_parse.is_some())
+        .expect("malformed Rust should emit a partial-parse diagnostic");
+    assert_eq!(diagnostic.language, Some(LanguageKind::Rust));
+    assert!(
+        diagnostic.message.contains("Rust parse has")
+            || diagnostic.message.contains("Rust parse is missing"),
+        "diagnostic should name the language and parse state: {diagnostic:?}"
+    );
+    assert!(diagnostic.span.is_some());
+    assert!(
+        diagnostic
+            .node_kind
+            .as_deref()
+            .is_some_and(|kind| !kind.is_empty()),
+        "diagnostic should include the smallest tree-sitter node kind"
+    );
+    assert!(
+        diagnostic
+            .excerpt
+            .as_deref()
+            .is_some_and(|excerpt| !excerpt.is_empty()),
+        "diagnostic should include a compact source excerpt"
+    );
+    let partial = diagnostic.partial_parse.as_ref().unwrap();
+    assert_eq!(partial.confidence, Confidence::Partial);
+    assert!(partial.partially_trusted);
+    assert!(partial.parse_error_count >= 1);
+}
+
+#[test]
+fn parse_error_diagnostics_are_capped_and_non_duplicating_per_span() {
+    // Build a Rust source with many independent malformed sites so the
+    // smallest-error walker has lots of leaf candidates. The helper caps its
+    // emission at `MAX_PARSE_DIAGNOSTICS_PER_FILE` and the per-language
+    // visitor owns missing-node reporting separately, so every emitted
+    // diagnostic should:
+    //   * stay within `MAX_PARSE_DIAGNOSTICS_PER_FILE` from the parse-error
+    //     helper (the visitor's missing-node path is capped under the same
+    //     constant via `ExtractContext::missing_node_diagnostics_emitted`), and
+    //   * remain unique across (span, message) so the file-level diagnostic
+    //     list never repeats the same finding at the same location.
+    let mut source = String::new();
+    for index in 0..(MAX_PARSE_DIAGNOSTICS_PER_FILE * 4) {
+        source.push_str(&format!("fn broken_{index}( {{\n    let v = ;\n}}\n"));
+    }
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/many_broken.rs", &source);
+    let parsed = parser
+        .parse_source(&record, source.clone())
+        .expect("parse should succeed for many-broken fixture");
+
+    let parse_error_diagnostics = parsed
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("tree-sitter parse error"))
+        .count();
+    assert!(
+        parse_error_diagnostics > 0,
+        "expected at least one parse-error diagnostic for the many-broken fixture: {parsed:?}"
+    );
+    assert!(
+        parse_error_diagnostics <= MAX_PARSE_DIAGNOSTICS_PER_FILE,
+        "parse-error diagnostics ({parse_error_diagnostics}) exceed cap of \
+         {MAX_PARSE_DIAGNOSTICS_PER_FILE}: {parsed:?}"
+    );
+
+    let missing_diagnostics = parsed
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("is missing"))
+        .count();
+    assert!(
+        missing_diagnostics <= MAX_PARSE_DIAGNOSTICS_PER_FILE,
+        "missing-node diagnostics ({missing_diagnostics}) exceed cap of \
+         {MAX_PARSE_DIAGNOSTICS_PER_FILE}: {parsed:?}"
+    );
+
+    let mut seen = std::collections::HashSet::new();
+    for diagnostic in &parsed.diagnostics {
+        let key = (diagnostic.span, diagnostic.message.clone());
+        assert!(
+            seen.insert(key),
+            "duplicate diagnostic span/message in many-broken fixture: {:?}",
+            parsed.diagnostics
+        );
+    }
+}
+
+#[test]
+fn parser_feature_coverage_report_groups_emitted_facts_by_language() {
+    let source = r#"
+use crate::service::Service;
+
+pub struct Runner;
+
+impl Runner {
+    pub fn run(&self, service: Service) {
+        service.execute();
+        helper();
+    }
+}
+
+fn helper() {}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let report = parser_feature_coverage_report(&[parsed]);
+    let rust = report
+        .languages
+        .iter()
+        .find(|coverage| coverage.language == LanguageKind::Rust)
+        .expect("Rust coverage missing");
+
+    assert_eq!(rust.files, 1);
+    assert_eq!(rust.declaration_kinds.get("struct"), Some(&1));
+    assert!(
+        rust.declaration_kinds.get("method").copied().unwrap_or(0) >= 1,
+        "method declarations should be counted: {rust:?}"
+    );
+    assert_eq!(rust.import_kinds.get("named"), Some(&1));
+    assert!(
+        rust.call_kinds.get("direct").copied().unwrap_or(0) >= 1,
+        "direct calls should be counted: {rust:?}"
+    );
+    assert!(
+        rust.reference_kinds.get("type").copied().unwrap_or(0) >= 1,
+        "type references should be counted: {rust:?}"
+    );
+    assert!(
+        rust.confidence_distribution
+            .get(Confidence::ExactSyntax.id())
+            .copied()
+            .unwrap_or(0)
+            >= 1,
+        "confidence distribution should include emitted exact-syntax facts: {rust:?}"
+    );
+}
+
+#[test]
 fn language_parser_initializes_parsers_on_demand() {
     let mut parser = LanguageParser::new().unwrap();
     assert!(parser.parsers.parsers.is_empty());
@@ -1124,17 +1273,7 @@ fn extract_python_module_exports_requires_word_boundary() {
     fn run_exports(source: &str) -> Vec<String> {
         let mut record_py = record("src/mod.py", source);
         record_py.language = LanguageKind::Python;
-        let mut ctx = ExtractContext {
-            file: record_py,
-            source,
-            symbols: Vec::new(),
-            imports: Vec::new(),
-            calls: Vec::new(),
-            references: Vec::new(),
-            body_hits: Vec::new(),
-            diagnostics: Vec::new(),
-            go_type_index: std::collections::HashMap::new(),
-        };
+        let mut ctx = ExtractContext::new(record_py, source);
         extract_python_module_exports(&mut ctx);
         ctx.imports
             .into_iter()

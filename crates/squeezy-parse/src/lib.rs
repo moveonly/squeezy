@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     fs,
 };
 
@@ -38,6 +38,18 @@ const MAX_SOURCE_BYTES: usize = u32::MAX as usize;
 /// otherwise be starved during a cold index.
 const PARSE_WORKERS_ENV: &str = "SQUEEZY_PARSE_WORKERS";
 
+/// Maximum number of structured parse diagnostics that any single file may emit
+/// from either the parse-error helper or the missing-node visitor path. The
+/// two paths share the same budget shape so the per-file diagnostic vector
+/// stays bounded even on severely broken files.
+pub const MAX_PARSE_DIAGNOSTICS_PER_FILE: usize = 8;
+
+/// Maximum number of characters retained in a single `ParseDiagnostic` excerpt
+/// before it is truncated with a trailing ellipsis. Public so downstream
+/// packet writers and docs can quote the same number rather than duplicating
+/// the constant.
+pub const MAX_EXCERPT_CHARS: usize = 120;
+
 pub fn crate_name() -> &'static str {
     CRATE_NAME
 }
@@ -58,10 +70,14 @@ pub struct ParsedFile {
 
 impl ParsedFile {
     pub fn unsupported(file: FileRecord, reason: impl Into<String>) -> Self {
+        let suggested_fallback = format!(
+            "bounded read/grep/list navigation for {}",
+            file.relative_path
+        );
         Self {
             unsupported: Some(UnsupportedParse {
                 reason: reason.into(),
-                suggested_fallback: "bounded read/grep/list navigation".to_string(),
+                suggested_fallback,
             }),
             file,
             package: None,
@@ -230,6 +246,102 @@ pub struct ParseDiagnostic {
     pub message: String,
     pub span: Option<SourceSpan>,
     pub confidence: Confidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<LanguageKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_error_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_parse: Option<PartialParseSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialParseSummary {
+    pub parse_error_count: usize,
+    /// Confidence label for the partial-parse summary itself. Always
+    /// [`Confidence::Partial`] today — it intentionally mirrors the enclosing
+    /// [`ParseDiagnostic::confidence`] so downstream packet writers that
+    /// flatten a `PartialParseSummary` out of a parse diagnostic do not have
+    /// to re-derive the partial-trust signal from the diagnostic itself.
+    pub confidence: Confidence,
+    pub partially_trusted: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParserFeatureCoverageReport {
+    pub languages: Vec<ParserLanguageFeatureCoverage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParserLanguageFeatureCoverage {
+    pub language: LanguageKind,
+    pub files: usize,
+    pub declaration_kinds: BTreeMap<String, usize>,
+    pub import_kinds: BTreeMap<String, usize>,
+    pub call_kinds: BTreeMap<String, usize>,
+    pub reference_kinds: BTreeMap<String, usize>,
+    pub body_hit_kinds: BTreeMap<String, usize>,
+    pub confidence_distribution: BTreeMap<String, usize>,
+}
+
+impl ParserLanguageFeatureCoverage {
+    fn new(language: LanguageKind) -> Self {
+        Self {
+            language,
+            files: 0,
+            declaration_kinds: BTreeMap::new(),
+            import_kinds: BTreeMap::new(),
+            call_kinds: BTreeMap::new(),
+            reference_kinds: BTreeMap::new(),
+            body_hit_kinds: BTreeMap::new(),
+            confidence_distribution: BTreeMap::new(),
+        }
+    }
+}
+
+pub fn parser_feature_coverage_report(parsed_files: &[ParsedFile]) -> ParserFeatureCoverageReport {
+    let mut by_language = HashMap::<LanguageKind, ParserLanguageFeatureCoverage>::new();
+    for parsed in parsed_files {
+        let coverage = by_language
+            .entry(parsed.file.language)
+            .or_insert_with(|| ParserLanguageFeatureCoverage::new(parsed.file.language));
+        coverage.files += 1;
+        for symbol in &parsed.symbols {
+            increment_count(&mut coverage.declaration_kinds, symbol_kind_id(symbol.kind));
+            increment_count(
+                &mut coverage.confidence_distribution,
+                symbol.confidence.id(),
+            );
+        }
+        for import in &parsed.imports {
+            increment_count(&mut coverage.import_kinds, import_kind_id(import.kind));
+        }
+        for call in &parsed.calls {
+            increment_count(&mut coverage.call_kinds, call_kind_id(call.kind));
+            increment_count(&mut coverage.confidence_distribution, call.confidence.id());
+        }
+        for reference in &parsed.references {
+            increment_count(
+                &mut coverage.reference_kinds,
+                reference_kind_id(reference.kind),
+            );
+        }
+        for body_hit in &parsed.body_hits {
+            increment_count(
+                &mut coverage.body_hit_kinds,
+                body_hit_kind_id(body_hit.kind),
+            );
+        }
+    }
+
+    let mut languages = by_language.into_values().collect::<Vec<_>>();
+    languages.sort_by_key(|coverage| coverage.language.display_name());
+    ParserFeatureCoverageReport { languages }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -700,7 +812,7 @@ fn update_parse_summary(summary: &mut ParseSummary, parsed_file: &ParsedFile) {
     if parsed_file
         .diagnostics
         .iter()
-        .any(|d| d.message.starts_with("syntax_error:"))
+        .any(|d| d.partial_parse.is_some())
     {
         summary.syntax_error_files += 1;
     }
@@ -717,6 +829,12 @@ fn append_source_diagnostics(source: &str, diagnostics: &mut Vec<ParseDiagnostic
             message: "bom: source begins with UTF-8 BOM".to_string(),
             span: None,
             confidence: Confidence::ExactSyntax,
+            language: None,
+            node_kind: None,
+            parent_kind: None,
+            parse_error_count: None,
+            excerpt: None,
+            partial_parse: None,
         });
     }
     if source.contains("\r\n") {
@@ -724,13 +842,19 @@ fn append_source_diagnostics(source: &str, diagnostics: &mut Vec<ParseDiagnostic
             message: "crlf: source contains CRLF line endings".to_string(),
             span: None,
             confidence: Confidence::ExactSyntax,
+            language: None,
+            node_kind: None,
+            parent_kind: None,
+            parse_error_count: None,
+            excerpt: None,
+            partial_parse: None,
         });
     }
 }
 
 fn append_parse_diagnostics(
     source: &str,
-    tree: &Tree,
+    _tree: &Tree,
     had_bom: bool,
     diagnostics: &mut Vec<ParseDiagnostic>,
 ) {
@@ -738,12 +862,79 @@ fn append_parse_diagnostics(
     if had_bom {
         diagnostics.push(utf8_bom_diagnostic());
     }
-    if tree.root_node().has_error() {
-        diagnostics.push(ParseDiagnostic {
-            message: "syntax_error: tree-sitter parse produced ERROR or MISSING nodes".to_string(),
-            span: None,
-            confidence: Confidence::Partial,
-        });
+}
+
+fn increment_count(map: &mut BTreeMap<String, usize>, key: &'static str) {
+    if let Some(count) = map.get_mut(key) {
+        *count += 1;
+    } else {
+        map.insert(key.to_string(), 1);
+    }
+}
+
+fn symbol_kind_id(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Class => "class",
+        SymbolKind::Crate => "crate",
+        SymbolKind::File => "file",
+        SymbolKind::Interface => "interface",
+        SymbolKind::Module => "module",
+        SymbolKind::Struct => "struct",
+        SymbolKind::Enum => "enum",
+        SymbolKind::Union => "union",
+        SymbolKind::Trait => "trait",
+        SymbolKind::Impl => "impl",
+        SymbolKind::Function => "function",
+        SymbolKind::Method => "method",
+        SymbolKind::Const => "const",
+        SymbolKind::Static => "static",
+        SymbolKind::TypeAlias => "type_alias",
+        SymbolKind::Field => "field",
+        SymbolKind::Variant => "variant",
+        SymbolKind::Macro => "macro",
+        SymbolKind::Test => "test",
+        SymbolKind::Unknown => "unknown",
+    }
+}
+
+fn import_kind_id(kind: ImportKind) -> &'static str {
+    match kind {
+        ImportKind::Unspecified => "unspecified",
+        ImportKind::Named => "named",
+        ImportKind::Default => "default",
+        ImportKind::Namespace => "namespace",
+        ImportKind::Static => "static",
+        ImportKind::Wildcard => "wildcard",
+    }
+}
+
+fn call_kind_id(kind: ParsedCallKind) -> &'static str {
+    match kind {
+        ParsedCallKind::Direct => "direct",
+        ParsedCallKind::Method => "method",
+        ParsedCallKind::Macro => "macro",
+    }
+}
+
+fn reference_kind_id(kind: ReferenceKind) -> &'static str {
+    match kind {
+        ReferenceKind::Identifier => "identifier",
+        ReferenceKind::Type => "type",
+        ReferenceKind::Path => "path",
+        ReferenceKind::Field => "field",
+        ReferenceKind::Attribute => "attribute",
+    }
+}
+
+fn body_hit_kind_id(kind: BodyHitKind) -> &'static str {
+    match kind {
+        BodyHitKind::Identifier => "identifier",
+        BodyHitKind::Type => "type",
+        BodyHitKind::Path => "path",
+        BodyHitKind::Call => "call",
+        BodyHitKind::Macro => "macro",
+        BodyHitKind::Literal => "literal",
+        BodyHitKind::Attribute => "attribute",
     }
 }
 
@@ -1064,6 +1255,12 @@ fn utf8_bom_diagnostic() -> ParseDiagnostic {
             .to_string(),
         span: None,
         confidence: Confidence::Partial,
+        language: None,
+        node_kind: None,
+        parent_kind: None,
+        parse_error_count: None,
+        excerpt: None,
+        partial_parse: None,
     }
 }
 
@@ -1077,6 +1274,171 @@ struct ExtractContext<'source> {
     body_hits: Vec<BodyHit>,
     diagnostics: Vec<ParseDiagnostic>,
     go_type_index: HashMap<String, SymbolId>,
+    missing_node_diagnostics_emitted: usize,
+}
+
+impl<'source> ExtractContext<'source> {
+    pub(crate) fn new(file: FileRecord, source: &'source str) -> Self {
+        Self {
+            file,
+            source,
+            symbols: Vec::new(),
+            imports: Vec::new(),
+            calls: Vec::new(),
+            references: Vec::new(),
+            body_hits: Vec::new(),
+            diagnostics: Vec::new(),
+            go_type_index: HashMap::new(),
+            missing_node_diagnostics_emitted: 0,
+        }
+    }
+}
+
+fn record_parse_error_diagnostics(root: Node<'_>, ctx: &mut ExtractContext<'_>) {
+    if !root.has_error() {
+        return;
+    }
+
+    let parse_error_count = count_parse_error_nodes(root);
+    if parse_error_count == 0 {
+        return;
+    }
+    let mut error_nodes = Vec::new();
+    collect_smallest_parse_error_nodes(root, &mut error_nodes);
+    if error_nodes.is_empty() {
+        error_nodes.push(root);
+    }
+
+    for node in error_nodes.into_iter().take(MAX_PARSE_DIAGNOSTICS_PER_FILE) {
+        let node_kind = node.kind().to_string();
+        let parent_kind = node.parent().map(|parent| parent.kind().to_string());
+        ctx.diagnostics.push(ParseDiagnostic {
+            message: format!(
+                "{} parse has {parse_error_count} tree-sitter parse error(s) near {node_kind}; partial parse facts remain available with partial confidence",
+                ctx.file.language.display_name()
+            ),
+            span: Some(span_from_node(node)),
+            confidence: Confidence::Partial,
+            language: Some(ctx.file.language),
+            node_kind: Some(node_kind),
+            parent_kind,
+            parse_error_count: Some(parse_error_count),
+            excerpt: source_excerpt_for_node(node, ctx.source),
+            partial_parse: Some(PartialParseSummary {
+                parse_error_count,
+                confidence: Confidence::Partial,
+                partially_trusted: true,
+            }),
+        });
+    }
+}
+
+fn record_missing_node_diagnostic(node: Node<'_>, ctx: &mut ExtractContext<'_>) {
+    if ctx.missing_node_diagnostics_emitted >= MAX_PARSE_DIAGNOSTICS_PER_FILE {
+        return;
+    }
+    let node_kind = node.kind().to_string();
+    let parent_kind = node.parent().map(|parent| parent.kind().to_string());
+    let message = match parent_kind.as_deref() {
+        Some(parent_label) => format!(
+            "{} parse is missing {node_kind} under {parent_label}; partial parse facts remain available with partial confidence",
+            ctx.file.language.display_name()
+        ),
+        None => format!(
+            "{} parse is missing {node_kind}; partial parse facts remain available with partial confidence",
+            ctx.file.language.display_name()
+        ),
+    };
+    ctx.diagnostics.push(ParseDiagnostic {
+        message,
+        span: Some(span_from_node(node)),
+        confidence: Confidence::Partial,
+        language: Some(ctx.file.language),
+        node_kind: Some(node_kind),
+        parent_kind,
+        parse_error_count: Some(1),
+        excerpt: source_excerpt_for_node(node, ctx.source),
+        partial_parse: Some(PartialParseSummary {
+            parse_error_count: 1,
+            confidence: Confidence::Partial,
+            partially_trusted: true,
+        }),
+    });
+    ctx.missing_node_diagnostics_emitted += 1;
+}
+
+fn count_parse_error_nodes(node: Node<'_>) -> usize {
+    let mut count = usize::from(node.is_error());
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.has_error() || child.is_error() {
+            count += count_parse_error_nodes(child);
+        }
+    }
+    count
+}
+
+fn collect_smallest_parse_error_nodes<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tree>>) {
+    if !node.has_error() && !node.is_error() {
+        return;
+    }
+
+    let mut cursor = node.walk();
+    let mut child_with_error = false;
+    for child in node.children(&mut cursor) {
+        if child.has_error() || child.is_error() {
+            child_with_error = true;
+            collect_smallest_parse_error_nodes(child, out);
+        }
+    }
+    // Emit a leaf only for genuine ERROR nodes; MISSING nodes are reported
+    // separately by each language's visitor via `record_missing_node_diagnostic`
+    // so we avoid emitting duplicate diagnostics at the same span when a file
+    // contains both ERROR and MISSING leaves.
+    if !child_with_error && node.is_error() {
+        out.push(node);
+    }
+}
+
+fn source_excerpt_for_node(node: Node<'_>, source: &str) -> Option<String> {
+    let source_len = source.len();
+    let start = node.start_byte().min(source_len);
+    let end = node.end_byte().min(source_len);
+    let raw = if start < end {
+        source.get(start..end)
+    } else {
+        line_containing_byte(source, start)
+    }?;
+    compact_excerpt(raw)
+}
+
+fn line_containing_byte(source: &str, byte: usize) -> Option<&str> {
+    let byte = floor_char_boundary(source, byte.min(source.len()));
+    let start = source[..byte].rfind('\n').map_or(0, |index| index + 1);
+    let end = source[byte..]
+        .find('\n')
+        .map_or(source.len(), |index| byte + index);
+    source.get(start..end)
+}
+
+fn floor_char_boundary(source: &str, byte: usize) -> usize {
+    let mut byte = byte.min(source.len());
+    while byte > 0 && !source.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    byte
+}
+
+fn compact_excerpt(raw: &str) -> Option<String> {
+    let mut excerpt = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if excerpt.is_empty() {
+        return None;
+    }
+    if excerpt.chars().count() > MAX_EXCERPT_CHARS {
+        excerpt = excerpt.chars().take(MAX_EXCERPT_CHARS).collect();
+        excerpt.push_str("...");
+    }
+    Some(excerpt)
 }
 
 fn extract_body_hit(

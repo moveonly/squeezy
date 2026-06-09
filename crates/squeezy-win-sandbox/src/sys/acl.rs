@@ -11,8 +11,9 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSID};
 use windows_sys::Win32::Storage::FileSystem::{
-    DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+    DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_WRITE_ATTRIBUTES,
+    FILE_WRITE_DATA, FILE_WRITE_EA,
 };
 
 use super::winutil::{OwnedSid, to_wide_path};
@@ -135,6 +136,13 @@ fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
+/// Grant read/write/execute/delete rights (inheritable) to `sid_str` on `path`.
+pub(crate) fn add_allow_ace(path: &Path, sid_str: &str) -> crate::Result<()> {
+    let mask =
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD;
+    apply_ace(path, sid_str, mask, SET_ACCESS, true)
+}
+
 fn apply_ace_recursive(
     path: &Path,
     sid_str: &str,
@@ -173,8 +181,21 @@ fn apply_ace_recursive(
 
 /// Grant read/write/execute on `path` and every existing non-symlink descendant.
 pub(crate) fn add_allow_ace_recursive(path: &Path, sid_str: &str) -> crate::Result<()> {
-    let mask = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+    let mask =
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD;
     apply_ace_recursive(path, sid_str, mask, SET_ACCESS)
+}
+
+/// Add an inheritable deny ACE blocking all write/delete operations.
+pub(crate) fn add_deny_write_ace(path: &Path, sid_str: &str) -> crate::Result<()> {
+    let mask = FILE_GENERIC_WRITE
+        | FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | DELETE
+        | FILE_DELETE_CHILD;
+    apply_ace(path, sid_str, mask, DENY_ACCESS, true)
 }
 
 /// Add a deny-write ACE on `path` and every existing non-symlink descendant.
@@ -184,7 +205,8 @@ pub(crate) fn add_deny_write_ace_recursive(path: &Path, sid_str: &str) -> crate:
         | FILE_APPEND_DATA
         | FILE_WRITE_EA
         | FILE_WRITE_ATTRIBUTES
-        | DELETE;
+        | DELETE
+        | FILE_DELETE_CHILD;
     apply_ace_recursive(path, sid_str, mask, DENY_ACCESS)
 }
 
@@ -199,7 +221,8 @@ pub(crate) fn add_deny_write_ace_no_inherit(path: &Path, sid_str: &str) -> crate
         | FILE_APPEND_DATA
         | FILE_WRITE_EA
         | FILE_WRITE_ATTRIBUTES
-        | DELETE;
+        | DELETE
+        | FILE_DELETE_CHILD;
     apply_ace(path, sid_str, mask, DENY_ACCESS, false)
 }
 

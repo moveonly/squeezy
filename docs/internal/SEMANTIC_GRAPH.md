@@ -64,6 +64,10 @@ more than it does. Files in a supported language that is disabled by
 `[graph].languages` use the same fallback record shape with a distinct disabled
 language reason, so the allow-list affects parser scheduling without hiding
 files from coverage and repo-profile diagnostics.
+Parser diagnostics retain partial tree-sitter evidence with language, smallest
+error spans, parent-node context, compact source excerpts, and
+partial-confidence summaries so graph/tool callers can show why a file is only
+partially trusted.
 
 Generated, vendored, dependency cache, build output, binary, lockfile, and large
 files are excluded from graph indexing by default with compact reason-tagged
