@@ -2998,8 +2998,8 @@ fn diff_verify_command_uses_nested_manifest_when_root_has_no_cargo() {
 fn cargo_setup_failure_reason_separates_environment_from_code_failures() {
     // The exact failure shape that keeps surfacing: a private git dependency
     // cargo can't fetch/authenticate, with a pinned revision that is gone.
-    let dep_failure = "Updating git repository `https://github.com/SonarSource/semsitter.git`\n\
-         error: failed to get `udg-gen` as a dependency of package `sonar-context-augmentation`\n\
+    let dep_failure = "Updating git repository `https://github.com/acme-corp/private-lib.git`\n\
+         error: failed to get `udg-gen` as a dependency of package `widget-graph`\n\
          Caused by:\n  failed to load source for dependency `udg-gen`\n\
          Caused by:\n  revision 0a910a90 not found\n\
          Caused by:\n  failed to authenticate when downloading repository\n";
@@ -11604,9 +11604,9 @@ fn destructive_redirect_detection_ignores_fd_duplication_and_quotes() {
 
     // Redirecting noise to /dev/null is stderr/stdout suppression, not a
     // destructive filesystem write.
-    let sonar_stderr_null = analyze_shell_command("sonar context list --json 2>/dev/null");
-    assert_eq!(sonar_stderr_null.capability, PermissionCapability::Shell);
-    assert!(!sonar_stderr_null.destructive);
+    let stderr_null_redirect = analyze_shell_command("rg --json pattern 2>/dev/null");
+    assert_eq!(stderr_null_redirect.capability, PermissionCapability::Shell);
+    assert!(!stderr_null_redirect.destructive);
 
     let cargo_stdout_null = analyze_shell_command("cargo test >/dev/null");
     assert_eq!(cargo_stdout_null.capability, PermissionCapability::Compiler);
@@ -11637,13 +11637,13 @@ fn destructive_redirect_detection_ignores_fd_duplication_and_quotes() {
 #[test]
 fn plan_mode_shell_read_only_classifier_blocks_repo_mutators() {
     assert!(plan_mode_shell_command_is_read_only(
-        "sonar context guidelines get --languages java 2>/dev/null"
+        "rg -l 'fn main' --type rust 2>/dev/null"
     ));
     assert!(plan_mode_shell_command_is_read_only(
         "find . -name \"*.java\" -not -path \"*/target/*\" | head -60"
     ));
     assert!(plan_mode_shell_command_is_read_only(
-        "sonar context navigation search-signatures --pattern \".*\" --fields \"fqn,file_path,start_line\" --limit 20 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(x['fqn'],'->',x['file_path']) for x in d.get('results',[])]\" 2>/dev/null || true"
+        "rg -l 'fn main' 2>/dev/null | python3 -c \"import sys; [print(l.strip()) for l in sys.stdin]\" 2>/dev/null || true"
     ));
     assert!(plan_mode_shell_command_is_read_only("cargo fmt --check"));
     assert!(plan_mode_shell_command_is_read_only(

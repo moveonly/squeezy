@@ -162,14 +162,14 @@ pub(crate) struct ShellExecutionGuard {
 }
 
 enum ShellRunError {
-    /// Shell was cancelled. Carries the Windows Job Object cleanup result:
-    /// `None` = no job object was active; `Some(true)` = job terminated
-    /// successfully; `Some(false)` = terminate failed (descendants may survive).
-    /// Also carries Unix kill metadata so callers can include process-group
-    /// signal outcomes in audit rows.
+    /// Shell was cancelled. Carries Unix process-group kill metadata and the
+    /// Windows Job Object cleanup result (`None` = no job object was active;
+    /// `Some(true)` = job terminated successfully; `Some(false)` = terminate
+    /// failed and descendants may survive) so callers can include both in audit
+    /// and result payloads.
     Cancelled {
-        windows_job_cleanup_ok: Option<bool>,
         kill_meta: Option<ShellKillMeta>,
+        windows_job_cleanup_ok: Option<bool>,
     },
     SandboxStartDenied(String),
     /// Spawn failure on a non-required sandboxed backend where the OS or
@@ -402,6 +402,7 @@ impl ToolRegistry {
         {
             Ok(run) => run,
             Err(ShellRunError::Cancelled {
+                kill_meta,
                 windows_job_cleanup_ok,
                 kill_meta,
             }) => {
@@ -420,7 +421,7 @@ impl ToolRegistry {
                     &[],
                     &[],
                 );
-                return shell_cancelled_result(call, windows_job_cleanup_ok);
+                return shell_cancelled_result(call, windows_job_cleanup_ok, kill_meta);
             }
             Err(ShellRunError::SandboxStartDenied(reason)) => {
                 self.audit_shell(
@@ -490,8 +491,8 @@ impl ToolRegistry {
                 {
                     Ok(run) => run,
                     Err(ShellRunError::Cancelled {
-                        windows_job_cleanup_ok,
                         kill_meta,
+                        windows_job_cleanup_ok,
                     }) => {
                         let error_msg = shell_cancelled_error_msg(kill_meta.as_ref());
                         self.audit_shell(
@@ -508,7 +509,7 @@ impl ToolRegistry {
                             &[],
                             &[],
                         );
-                        return shell_cancelled_result(call, windows_job_cleanup_ok);
+                        return shell_cancelled_result(call, windows_job_cleanup_ok, kill_meta);
                     }
                     Err(ShellRunError::SandboxStartDenied(reason)) => {
                         self.audit_shell(
@@ -586,6 +587,7 @@ impl ToolRegistry {
             {
                 Ok(run) => run,
                 Err(ShellRunError::Cancelled {
+                    kill_meta,
                     windows_job_cleanup_ok,
                     kill_meta,
                 }) => {
@@ -604,7 +606,7 @@ impl ToolRegistry {
                         &[],
                         &[],
                     );
-                    return shell_cancelled_result(call, windows_job_cleanup_ok);
+                    return shell_cancelled_result(call, windows_job_cleanup_ok, kill_meta);
                 }
                 Err(ShellRunError::SandboxStartDenied(reason)) => {
                     self.audit_shell(
@@ -1355,6 +1357,7 @@ impl ToolRegistry {
                 stderr_task.abort();
                 drop(ask_server);
                 return Err(ShellRunError::Cancelled {
+                    kill_meta: cancel_kill_meta,
                     windows_job_cleanup_ok: cancel_job_cleanup_ok,
                     kill_meta: cancel_kill_meta,
                 });
@@ -1632,18 +1635,38 @@ pub(crate) fn shell_command_needs_checkpoint(
 pub(crate) fn shell_cancelled_result(
     call: &ToolCall,
     windows_job_cleanup_ok: Option<bool>,
+    kill_meta: Option<ShellKillMeta>,
 ) -> ToolResult {
-    if windows_job_cleanup_ok == Some(false) {
+    if windows_job_cleanup_ok == Some(false) || kill_meta.is_some() {
+        let mut content = serde_json::Map::new();
+        content.insert("error".to_string(), json!("tool call cancelled"));
+        if let Some(km) = kill_meta {
+            content.insert(
+                "kill_meta".to_string(),
+                json!({
+                    "pgid": km.pgid,
+                    "sigterm_ok": km.sigterm_ok,
+                    "grace_expired": km.grace_expired,
+                    "sigkill_sent": km.sigkill_sent,
+                    "sigkill_ok": km.sigkill_ok,
+                    "direct_child_fallback": km.direct_child_fallback,
+                    "direct_child_kill_ok": km.direct_child_kill_ok,
+                }),
+            );
+        }
+        if windows_job_cleanup_ok == Some(false) {
+            content.insert(
+                "windows".to_string(),
+                json!({
+                    "job_object_cleanup": "failed",
+                    "note": "process tree cleanup not guaranteed; descendant processes may still be running"
+                }),
+            );
+        }
         return make_result(
             call,
             ToolStatus::Cancelled,
-            json!({
-                "error": "tool call cancelled",
-                "windows": {
-                    "job_object_cleanup": "failed",
-                    "note": "process tree cleanup not guaranteed; descendant processes may still be running"
-                }
-            }),
+            serde_json::Value::Object(content),
             ToolCostHint::default(),
             None,
         );
