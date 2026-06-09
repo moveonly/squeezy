@@ -13314,10 +13314,15 @@ impl ModelLedger {
         self.0.values()
     }
 
-    /// Combined cost across every bucket and both origins (main + subagent).
-    /// Used for the `/cost` "By model" Σ total row; equals the session's
-    /// `provider` + `subagent_provider` aggregate by construction, so the
-    /// drill's total matches the headline.
+    /// Combined cost across every bucket and every origin (main + subagent
+    /// + reviewer). Used for the `/cost` "By model" Σ total row.
+    ///
+    /// Equals `state.cost` (which folds in reviewer and classifier spend
+    /// persisted on the permission path) for sessions whose ledger contains
+    /// only first-party providers; the legacy `provider` + `subagent_provider`
+    /// headline aggregate excludes reviewer / classifier spend by
+    /// construction, so the headline-vs-drill reconciliation invariant is
+    /// against `state.cost`, not the headline aggregates.
     pub fn totals(&self) -> CostSnapshot {
         let mut total = CostSnapshot::default();
         for bucket in self.0.values() {

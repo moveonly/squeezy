@@ -14932,6 +14932,28 @@ async fn permission_decision_for_request(
         )
         .await
     {
+        // Persist classifier spend symmetrically with the reviewer branch
+        // above (state.cost + per-model ledger) so it survives across
+        // turns and is visible in `/cost --by-model`. Without this, a
+        // classifier-priced round contributes to the live broker total
+        // for the current turn but evaporates on the next broker reseed
+        // (which reads from `state.cost`). PR #403 review Non-blocking
+        // #1.
+        if (classifier_cost.estimated_usd_micros.is_some()
+            || classifier_cost.input_tokens.is_some()
+            || classifier_cost.output_tokens.is_some())
+            && let Some(conversation_state) = &context.conversation_state
+        {
+            let mut state = conversation_state.lock().await;
+            merge_cost(&mut state.cost, &classifier_cost);
+            merge_cost(&mut state.metrics.provider, &classifier_cost);
+            state.metrics.model_ledger.record(
+                context.provider.name(),
+                &context.config.model,
+                CostOrigin::AiReviewer,
+                &classifier_cost,
+            );
+        }
         // Accumulate classifier cost so the turn loop can fold it into
         // the active CostBroker alongside reviewer spend.
         reviewer_usd_micros =
@@ -14956,7 +14978,15 @@ async fn permission_decision_for_request(
     }
     match verdict.action {
         PermissionAction::Allow => {
-            PermissionOutcome::no_reviewer_cost(approved_decision(context, &request))
+            // The reviewer can legitimately raise an `Ask` request to `Allow`
+            // (the AutoReview "reviewer auto-approves" path). When that
+            // happens we have already accumulated `reviewer_usd_micros` above
+            // and must forward it to the broker, otherwise the live cap-basis
+            // snapshot under-counts for the most common reviewer outcome.
+            PermissionOutcome {
+                decision: approved_decision(context, &request),
+                reviewer_usd_micros,
+            }
         }
         PermissionAction::Deny => {
             if verdict.silent {
@@ -15240,11 +15270,13 @@ fn shell_ask_approver_for_context(context: &ToolExecutionContext<'_>) -> ShellAs
             let permission = runtime.tools.permission_request(&synthetic_call);
             // reviewer_usd_micros is not folded into a broker here because
             // shell_ask callbacks run outside the main turn loop and have no
-            // broker reference. The spend IS already persisted to state.cost
-            // (and thus visible to the next turn's broker seed), so the
-            // cap-basis total is always eventually correct. The intra-turn
-            // live snapshot has a minor lag bounded by a single reviewer or
-            // classifier call (max_output_tokens: 120 / 80).
+            // broker reference. The spend (both reviewer and classifier
+            // components) is already persisted to state.cost by
+            // `permission_decision_for_request` itself, and thus visible to
+            // the next turn's broker seed, so the cap-basis total is always
+            // eventually correct. The intra-turn live snapshot has a minor
+            // lag bounded by a single reviewer or classifier call
+            // (max_output_tokens: 120 / 80).
             let outcome =
                 permission_decision_for_request(&runtime, &synthetic_call, permission).await;
             match outcome.decision {

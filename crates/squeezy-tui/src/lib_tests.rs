@@ -4450,6 +4450,20 @@ fn format_cost_command_renders_by_model_drill() {
             ..CostSnapshot::default()
         },
     );
+    // Reviewer spend on the routing-judge model so the drill must render
+    // a third per-origin row. Without this row the Σ total exceeds the
+    // sum of the printed per-origin entries by `reviewer_usd_micros`.
+    model_ledger.record(
+        "anthropic",
+        "claude-haiku-4-5",
+        CostOrigin::AiReviewer,
+        &CostSnapshot {
+            input_tokens: Some(1_500),
+            output_tokens: Some(120),
+            estimated_usd_micros: Some(2_000),
+            ..CostSnapshot::default()
+        },
+    );
 
     let metrics = SessionMetrics {
         subagent_calls: 1,
@@ -4486,18 +4500,24 @@ fn format_cost_command_renders_by_model_drill() {
 
     let output = strip_ansi_escape_sequences(&commands::format_cost_command(&snapshot));
     assert!(output.contains("By model"), "{output}");
-    // Highest-spend model first, marked active, with main/subagent split and
-    // the full token distribution.
+    // Highest-spend model first, marked active, with main/subagent/reviewer
+    // split and the full token distribution.
     assert!(output.contains("anthropic:claude-opus-4-8"), "{output}");
     assert!(output.contains("(active)"), "{output}");
     assert!(output.contains("anthropic:claude-haiku-4-5"), "{output}");
     assert!(output.contains("main usd="), "{output}");
     assert!(output.contains("subagent usd="), "{output}");
+    // Reviewer row keeps the per-origin sum reconciled with Σ once any
+    // AI reviewer round has run for this session (Blocking #1 of PR #403
+    // review).
+    assert!(output.contains("reviewer usd="), "{output}");
     assert!(output.contains("cache_r=210000"), "{output}");
     assert!(output.contains("cache_w=90000"), "{output}");
-    // Σ total == cost.estimated_usd (910000) + subagent_provider (48000) == 958000
-    // == sum of every ledger bucket. This invariant keeps the drill honest.
-    assert!(output.contains("total usd=$0.958000"), "{output}");
+    // Σ total == opus main (900000) + haiku main (10000)
+    //         + haiku subagent (48000) + haiku reviewer (2000) == 960000
+    // == sum of every ledger bucket × every origin. This invariant keeps
+    // the drill honest now that reviewer spend has its own slot.
+    assert!(output.contains("total usd=$0.960000"), "{output}");
 }
 
 #[tokio::test]

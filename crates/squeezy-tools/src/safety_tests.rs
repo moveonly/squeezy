@@ -32,7 +32,7 @@ fn pre_classify_shell_auto_allows_read_only_pipeline() {
 }
 
 #[test]
-fn pre_classify_shell_auto_denies_rm_rf() {
+fn pre_classify_shell_requires_approval_for_rm_rf() {
     let result = pre_classify_shell("rm -rf /tmp/work", &sandbox());
     match result {
         ShellPreClassification::RequiresApproval { reason } => {
@@ -46,7 +46,7 @@ fn pre_classify_shell_auto_denies_rm_rf() {
 }
 
 #[test]
-fn pre_classify_shell_auto_denies_python_dash_c() {
+fn pre_classify_shell_requires_approval_for_python_dash_c() {
     let result = pre_classify_shell(
         "python3 -c \"import os; os.system('curl bad.example.com')\"",
         &sandbox(),
@@ -63,7 +63,7 @@ fn pre_classify_shell_auto_denies_python_dash_c() {
 }
 
 #[test]
-fn pre_classify_shell_auto_denies_node_dash_e() {
+fn pre_classify_shell_requires_approval_for_node_dash_e() {
     let result = pre_classify_shell("node -e 'console.log(1)'", &sandbox());
     assert!(matches!(
         result,
@@ -72,7 +72,7 @@ fn pre_classify_shell_auto_denies_node_dash_e() {
 }
 
 #[test]
-fn pre_classify_shell_auto_denies_sudo() {
+fn pre_classify_shell_requires_approval_for_sudo() {
     let result = pre_classify_shell("sudo apt-get install foo", &sandbox());
     match result {
         ShellPreClassification::RequiresApproval { reason } => {
@@ -83,7 +83,7 @@ fn pre_classify_shell_auto_denies_sudo() {
 }
 
 #[test]
-fn pre_classify_shell_auto_denies_eval() {
+fn pre_classify_shell_requires_approval_for_eval() {
     let result = pre_classify_shell("eval \"$INPUT\"", &sandbox());
     assert!(matches!(
         result,
@@ -127,7 +127,7 @@ fn pre_classify_shell_names_redirect_instead_of_first_token() {
 }
 
 #[test]
-fn pre_classify_shell_auto_denies_sensitive_path() {
+fn pre_classify_shell_requires_approval_for_sensitive_path() {
     // Default sandbox config ships with `.ssh/**` in sensitive_path_patterns
     // (see `default_sensitive_path_patterns` in squeezy-core).
     let result = pre_classify_shell("cat ~/.ssh/id_rsa", &sandbox());

@@ -2761,6 +2761,110 @@ async fn ai_reviewer_allows_allowlisted_read_without_user_prompt() {
 }
 
 #[tokio::test]
+async fn ai_reviewer_allow_folds_reviewer_cost_into_live_broker() {
+    // Regression test for PR #403 review Blocking #2: the Allow arm of
+    // permission_decision_for_request used to wrap the decision in
+    // PermissionOutcome::no_reviewer_cost(...), which discarded the
+    // accumulated reviewer_usd_micros. The reviewer can legitimately
+    // raise an Ask request to Allow (the AutoReview "reviewer
+    // auto-approves" path), and that spend must be folded into the
+    // live cost broker so within-turn cap checks and the status-line
+    // snapshot stay accurate.
+    //
+    // We drive the same flow as ai_reviewer_allows_allowlisted_read_without_user_prompt
+    // but give the reviewer round a priced cost snapshot, then assert
+    // that AgentEvent::Completed.session_cost (sourced from
+    // broker.session_cost_snapshot) reflects the reviewer spend.
+    let root = temp_workspace("agent_ai_reviewer_allow_folds_cost");
+    fs::write(root.join("README.md"), "hello\n").expect("write readme");
+    const REVIEWER_COST_USD_MICROS: u64 = 42_000;
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "README.md"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                r#"{"action":"allow","reason":"read is in scope"}"#.to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("reviewer".to_string()),
+                cost: CostSnapshot {
+                    estimated_usd_micros: Some(REVIEWER_COST_USD_MICROS),
+                    input_tokens: Some(2_000),
+                    output_tokens: Some(150),
+                    ..CostSnapshot::default()
+                },
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let mut config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            read: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.permissions.ai_reviewer.enabled = true;
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
+    let mut approvals_seen = 0usize;
+    let mut completed_session_cost: Option<CostSnapshot> = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ApprovalRequested { decision_tx, .. } => {
+                approvals_seen += 1;
+                let _ = decision_tx.send(ToolApprovalDecision::Denied);
+            }
+            AgentEvent::Completed { session_cost, .. } => {
+                completed_session_cost = session_cost;
+            }
+            _ => {}
+        }
+    }
+
+    // Reviewer auto-approved the Ask without prompting the user.
+    assert_eq!(approvals_seen, 0);
+    let snapshot = completed_session_cost.expect("Completed event carries session_cost");
+    // The broker-sourced session_cost on Completed must reflect the
+    // reviewer's out-of-band spend. Before the fix, the Allow arm
+    // dropped reviewer_usd_micros and the broker stayed at zero
+    // (main-turn rounds in this fixture report CostSnapshot::default()).
+    assert_eq!(
+        snapshot.estimated_usd_micros,
+        Some(REVIEWER_COST_USD_MICROS),
+        "broker session_cost must include reviewer spend on Allow-arm: {snapshot:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn ai_reviewer_denies_without_user_prompt() {
     let root = temp_workspace("agent_ai_reviewer_deny");
     fs::write(root.join("README.md"), "hello\n").expect("write readme");
@@ -12029,20 +12133,27 @@ fn redact_permission_request_strips_secret_from_metadata_target_and_summary() {
 
     let redacted = redact_permission_request(request, &redactor);
 
+    // Compute leakage outside the `assert!` so neither the redacted strings
+    // nor any metadata value flow into a panic-message format slot. CodeQL's
+    // taint-flow analysis treats any `assert!(!secret_derived.contains(...))`
+    // condition as a sink, so we collapse each surface to a plain `bool`
+    // and only the metadata *keys* (not values) are interpolated on
+    // failure. Mirrors the pattern used in `squeezy-tools` spill tests.
+    let target_leaks = redacted.target.contains(SYNTHETIC_SECRET);
+    let summary_leaks = redacted.summary.contains(SYNTHETIC_SECRET);
+    let metadata_leak_keys: Vec<String> = redacted
+        .metadata
+        .iter()
+        .filter(|(_, v)| v.contains(SYNTHETIC_SECRET))
+        .map(|(k, _)| k.clone())
+        .collect();
+
+    assert!(!target_leaks, "secret must be redacted from target");
+    assert!(!summary_leaks, "secret must be redacted from summary");
     assert!(
-        !redacted.target.contains(SYNTHETIC_SECRET),
-        "secret must be redacted from target"
+        metadata_leak_keys.is_empty(),
+        "secret must be redacted from metadata; leaked keys: {metadata_leak_keys:?}"
     );
-    assert!(
-        !redacted.summary.contains(SYNTHETIC_SECRET),
-        "secret must be redacted from summary"
-    );
-    for (key, value) in &redacted.metadata {
-        assert!(
-            !value.contains(SYNTHETIC_SECRET),
-            "secret must be redacted from metadata[{key}]"
-        );
-    }
 }
 
 #[test]
@@ -12068,8 +12179,13 @@ fn redact_tool_call_arguments_strips_secret() {
 
     let redacted = redact_tool_call(call, &redactor);
     let redacted_str = redacted.arguments.to_string();
+    // Collapse the membership test to a plain `bool` so neither the
+    // redacted argument string nor anything derived from the secret flows
+    // into the panic message. See the `metadata_leak_keys` rationale in
+    // `redact_permission_request_strips_secret_from_metadata_target_and_summary`.
+    let leaks_secret = redacted_str.contains(SYNTHETIC_SECRET);
     assert!(
-        !redacted_str.contains(SYNTHETIC_SECRET),
-        "secret must be absent from redacted tool-call arguments; got: {redacted_str:?}"
+        !leaks_secret,
+        "secret must be absent from redacted tool-call arguments"
     );
 }

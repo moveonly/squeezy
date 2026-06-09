@@ -404,6 +404,15 @@ impl CostBroker {
     /// reviewer/classifier budgets.
     ///
     /// A `usd_micros` of zero is a no-op.
+    ///
+    /// Caller contract: every out-of-band LLM spender that records into
+    /// `state.cost` directly (reviewer, classifier, future hook-driven
+    /// gating, etc.) **must** call this on the active turn's broker before
+    /// yielding back to the turn loop. Otherwise the cap-basis total under-
+    /// counts the spend within the current turn and pre-flight cap checks
+    /// run against a stale floor. The dollar total eventually reconciles on
+    /// the next turn's `seed_session` (which reads from `state.cost`), but
+    /// the intra-turn cap is the contract this function exists to keep.
     pub(crate) fn record_out_of_band_session_cost(&mut self, usd_micros: u64) {
         if usd_micros == 0 {
             return;

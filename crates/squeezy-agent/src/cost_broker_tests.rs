@@ -572,6 +572,65 @@ fn record_out_of_band_session_cost_advances_cap_basis_and_snapshot() {
 }
 
 #[test]
+fn record_out_of_band_session_cost_does_not_fire_cost_warning_then_next_record_provider_cost_does()
+{
+    // Lock the documented one-round lag (PR #403 review Nit #4).
+    // `record_out_of_band_session_cost` advances the cap-basis but does
+    // not check the warning threshold itself; if reviewer / classifier
+    // spend pushes past `cost_warn_percent`, the `CostWarning` event
+    // fires at the next `record_provider_cost` call (typically the next
+    // main-turn round). This test pins that contract.
+    let config = squeezy_core::AppConfig {
+        max_session_cost_usd_micros: Some(10_000),
+        cost_warn_percent: 80,
+        ..Default::default()
+    };
+    let mut broker = CostBroker::new(&config);
+    broker.seed_session(
+        &squeezy_core::CostSnapshot::default(),
+        squeezy_llm::TokenCalibration::default(),
+    );
+    // Out-of-band reviewer spend pushes the broker past the 80% warn
+    // threshold (8_500 / 10_000 = 85%) but does NOT fire CostWarning.
+    broker.record_out_of_band_session_cost(8_500);
+    assert_eq!(broker.session_cost_usd_micros, 8_500);
+    assert!(
+        !broker.warn_emitted,
+        "out-of-band record must not flip warn_emitted by itself"
+    );
+    // The next main-turn round picks up the lag and fires CostWarning
+    // exactly once, even for a zero-cost provider round (which still
+    // observes the threshold crossing on entry).
+    let small_round = squeezy_core::CostSnapshot {
+        estimated_usd_micros: Some(100),
+        ..Default::default()
+    };
+    let status = broker.record_provider_cost(
+        "anthropic",
+        "claude-haiku-4-5",
+        CostOrigin::Main,
+        &small_round,
+    );
+    assert!(
+        status.is_some(),
+        "next main-turn round must fire CostWarning to surface the prior out-of-band threshold crossing"
+    );
+    assert!(broker.warn_emitted);
+    // And the warning is one-shot — a subsequent priced round does not
+    // re-fire it.
+    let status_again = broker.record_provider_cost(
+        "anthropic",
+        "claude-haiku-4-5",
+        CostOrigin::Main,
+        &small_round,
+    );
+    assert!(
+        status_again.is_none(),
+        "CostWarning is one-shot per session even after the out-of-band fold"
+    );
+}
+
+#[test]
 fn session_metrics_without_model_ledger_field_deserializes_empty() {
     // A session persisted before `model_ledger` existed (field absent) must
     // deserialize with an empty ledger and never error — the resume-safety

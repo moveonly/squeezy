@@ -156,9 +156,16 @@ pub(crate) fn format_cost_command(snapshot: &SessionAccountingSnapshot) -> Strin
             } else {
                 style::accent(&model_label)
             };
-            // One row per non-empty origin so the main-vs-subagent split is
-            // explicit; a model with both prints two rows under one label.
-            for (scope, slot) in [("main", &bucket.main), ("subagent", &bucket.subagent)] {
+            // One row per non-empty origin so the main / subagent / reviewer
+            // split is explicit; a model with multiple origins prints multiple
+            // rows under one label. The reviewer row is required for the Σ
+            // total to reconcile with the per-row sum once an AI reviewer has
+            // run.
+            for (scope, slot) in [
+                ("main", &bucket.main),
+                ("subagent", &bucket.subagent),
+                ("reviewer", &bucket.reviewer),
+            ] {
                 if !cost_snapshot_has_data(slot) {
                     continue;
                 }

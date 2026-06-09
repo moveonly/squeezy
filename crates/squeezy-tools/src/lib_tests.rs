@@ -13205,6 +13205,15 @@ fn tool_spec_capability_matches_permission_request_baseline() {
     // Tools not listed here get an empty object; if that causes a false
     // pass (early Read escape before classification), the test comment
     // below explains why that is still safe for the current set.
+    //
+    // Maintenance contract: tools listed here are exactly those whose
+    // `permission_request` branch needs non-empty arguments to reach the
+    // capability advertised in `ToolSpec.capability`. When you add a new
+    // tool that requires non-default args *and* advertises a non-Read
+    // capability, you must add a branch here; otherwise this test will
+    // silently pass (the default `_ => json!({})` arm hits the synthesized
+    // tool's empty-args path which can short-circuit to Read for some
+    // tools), defeating the consistency check. PR #403 review Nit #2.
     let arguments_for = |name: &str| -> serde_json::Value {
         match name {
             "apply_patch" => json!({"patch": "--- a/x\n+++ b/x\n@@ -1 +1 @@\n+line\n"}),
