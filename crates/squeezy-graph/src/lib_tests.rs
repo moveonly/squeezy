@@ -7,7 +7,9 @@ use std::{
 
 use squeezy_core::{ContentHash, FileId, LanguageKind, SqueezyError};
 use squeezy_parse::{LanguageParser, ParsedFile, ReferenceKind, RustParser};
-use squeezy_workspace::{CrawlOptions, FileRecord, IndexingPolicy, stable_content_hash};
+use squeezy_workspace::{
+    CrawlOptions, FileRecord, IndexingPolicy, filesystem_paths_match, stable_content_hash,
+};
 
 use super::*;
 
@@ -94,12 +96,12 @@ fn signature_span_survives_graph_and_excludes_body() {
 }
 
 #[test]
-fn paths_match_deleted_windows_event_spelling_without_canonicalize() {
-    assert!(paths_match(
+fn filesystem_paths_match_deleted_windows_event_spelling_without_canonicalize() {
+    assert!(filesystem_paths_match(
         Path::new(r"C:\Users\Alice\repo\src\Lib.rs"),
         Path::new(r"c:/users/alice/repo/src/lib.rs")
     ));
-    assert!(paths_match(
+    assert!(filesystem_paths_match(
         Path::new(r"\\?\C:\Users\Alice\repo\src\Lib.rs"),
         Path::new(r"c:/users/alice/repo/src/lib.rs")
     ));
