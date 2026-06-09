@@ -46,7 +46,7 @@ use squeezy_store::{
     BugReportOptions, CleanupMode, RepoProfileLoad, STALE_RUNNING_SESSION_THRESHOLD_MS,
     SemanticSupport, SessionEvent, SessionMetadata, SessionQuery, SessionReplayTape, SessionStatus,
     SessionStore, default_bug_report_path, ensure_repo_profile, parse_bug_report_section,
-    paths_same, refresh_repo_profile,
+    refresh_repo_profile,
 };
 use squeezy_telemetry::{
     FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
@@ -3209,7 +3209,7 @@ fn handle_repo_languages(
 ) -> squeezy_core::Result<()> {
     use squeezy_core::LanguageKind;
 
-    let snapshot = WorkspaceCrawler::new(crawl_options_from_graph(graph_config))
+    let snapshot = WorkspaceCrawler::try_new(crawl_options_from_graph(graph_config))?
         .crawl(root)
         .map_err(|e| SqueezyError::Tool(format!("workspace crawl failed: {e}")))?;
 

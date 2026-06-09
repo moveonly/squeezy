@@ -1744,6 +1744,7 @@ impl CheckpointStore {
         Ok(selected)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn checkpoint_files(
         &self,
         before_tree: &str,
@@ -3037,6 +3038,7 @@ impl CheckpointStore {
         git_output_vec_allow_status(&self.root, full_args, success).map_err(SqueezyError::Tool)
     }
 
+    #[allow(dead_code)]
     fn git_vec_with_stdin_allow_status(
         &self,
         args: Vec<String>,
@@ -3885,6 +3887,7 @@ fn run_checkpoint_smoke_inner() -> Result<CheckpointSmokeReport> {
     result
 }
 
+#[allow(dead_code)]
 fn collect_workspace_file_entries(
     root: &Path,
     dir: &Path,

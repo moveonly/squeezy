@@ -8,6 +8,7 @@ use std::{
 use serde::Serialize;
 use squeezy_core::{Result, SqueezyError};
 
+#[allow(dead_code)]
 pub(crate) fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -138,6 +139,7 @@ fn temp_stem(path: &Path) -> String {
     out
 }
 
+#[allow(dead_code)]
 fn annotate_replace_error(error: io::Error) -> SqueezyError {
     SqueezyError::Io(io::Error::new(
         error.kind(),
@@ -163,6 +165,7 @@ fn annotate_single_path_error(action: &str, path: &Path, error: io::Error) -> io
     )
 }
 
+#[allow(dead_code)]
 fn json_error(error: serde_json::Error) -> SqueezyError {
     SqueezyError::Agent(format!("json serialization failed: {error}"))
 }

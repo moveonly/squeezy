@@ -111,11 +111,7 @@ pub(crate) fn is_destructive_windows_segment(segment: &str) -> bool {
         "takeown" => return flag_matches("/r"),
         "icacls" => return flag_matches("/reset") || flag_matches("/grant:r"),
         "attrib" => return flag_matches("/s") && (flag_matches("-r") || flag_matches("+h")),
-        "net" => {
-            if tokens.get(1).copied() == Some("user") {
-                return flag_matches("/delete");
-            }
-        }
+        "net" if tokens.get(1).copied() == Some("user") => return flag_matches("/delete"),
         // Shutdown / restart from cmd
         "shutdown" => {
             return flag_matches("/s")

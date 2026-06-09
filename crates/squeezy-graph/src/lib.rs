@@ -1259,6 +1259,7 @@ impl SemanticGraph {
     /// `SemanticGraph::from_parsed`; the rebuilt-from-scratch slots and
     /// importers are overwritten only for files whose fingerprint still
     /// matches, so stale entries are never applied.
+    #[allow(dead_code)]
     pub(crate) fn apply_warm_resolver_cache(
         &mut self,
         entries: Vec<(FileId, resolver_cache::ResolverFileEntry)>,
