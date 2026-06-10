@@ -22588,6 +22588,308 @@ async fn quote_key_with_an_overlay_open_does_not_quote() {
     );
 }
 
+// =====================================================================
+// §12.1.6 Multi-Cursor-Like Transcript Selection.
+// End-to-end through `handle_key` (Alt+d add, Ctrl+Alt+Y combined copy),
+// `handle_mouse` (modifier-click add/toggle), the real `render()`
+// highlight, and Esc-clear of the whole set.
+// =====================================================================
+
+/// `Alt+d`: commit the live range into the disjoint set.
+fn add_selection_key() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT)
+}
+
+/// `Ctrl+Alt+Y`: copy the combined committed set plus the live range.
+fn copy_multi_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('y'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// Triple-click the screen row carrying `needle` to whole-row-select it.
+fn triple_click_row(app: &mut TuiApp, needle: &str) {
+    let buffer = render_transcript_to_buffer(app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, needle).expect("row painted");
+    handle_mouse(app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(app, left_down(x, y, KeyModifiers::NONE));
+}
+
+#[tokio::test]
+async fn add_selection_chord_commits_the_live_range_into_the_disjoint_set() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("alpha row text"));
+
+    triple_click_row(&mut app, "alpha row text");
+    assert!(
+        app.selection.is_some(),
+        "triple-click armed a row selection"
+    );
+    assert!(app.selection_set.is_empty(), "set starts empty");
+
+    handle_key(&mut app, &mut agent, add_selection_key())
+        .await
+        .expect("alt+d");
+
+    assert_eq!(
+        app.selection_set.len(),
+        1,
+        "the live range moved into the set"
+    );
+    assert!(
+        app.selection.is_none(),
+        "committing clears the live range for the next disjoint gesture"
+    );
+    assert!(
+        app.status.contains("added selection"),
+        "status names the add: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn add_selection_chord_without_a_live_range_is_a_noop() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("nothing selected"));
+    assert!(app.selection.is_none());
+
+    // No live selection → the chord adds nothing and the set stays empty.
+    handle_key(&mut app, &mut agent, add_selection_key())
+        .await
+        .expect("alt+d");
+    assert!(app.selection_set.is_empty(), "no range to commit");
+}
+
+#[tokio::test]
+async fn combined_copy_yields_every_disjoint_range_in_one_payload() {
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::assistant("first selectable"));
+    app.push_transcript_item(TranscriptItem::assistant("second selectable"));
+
+    // Commit the first row into the set, then leave the second row as the live
+    // range; the combined copy must include both.
+    triple_click_row(&mut app, "first selectable");
+    handle_key(&mut app, &mut agent, add_selection_key())
+        .await
+        .expect("alt+d");
+    triple_click_row(&mut app, "second selectable");
+    assert_eq!(app.selection_set.len(), 1, "first row committed");
+    assert!(app.selection.is_some(), "second row is the live range");
+
+    handle_key(&mut app, &mut agent, copy_multi_key())
+        .await
+        .expect("ctrl+alt+y");
+
+    let written = writes.lock().unwrap().clone();
+    assert_eq!(written.len(), 1, "exactly one combined copy landed");
+    let payload = &written[0];
+    assert!(
+        payload.contains("first selectable") && payload.contains("second selectable"),
+        "the combined payload carries both disjoint ranges: {payload:?}"
+    );
+    assert!(
+        payload.contains("\n\n"),
+        "disjoint blocks are separated by a blank line: {payload:?}"
+    );
+    assert!(
+        app.status.contains("copied 2 selections"),
+        "status names the combined copy: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn combined_copy_with_no_ranges_does_nothing() {
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::assistant("empty edge case"));
+    assert!(app.selection.is_none() && app.selection_set.is_empty());
+
+    handle_key(&mut app, &mut agent, copy_multi_key())
+        .await
+        .expect("ctrl+alt+y");
+
+    assert!(
+        writes.lock().unwrap().is_empty(),
+        "no selection means nothing is copied"
+    );
+}
+
+#[test]
+fn modifier_click_commits_the_live_range_and_starts_a_new_one() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("aaa bbb ccc"));
+    app.push_transcript_item(TranscriptItem::assistant("ddd eee fff"));
+
+    // Arm a live drag on the first row.
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x1, y1) = find_text_cell(&buffer, "aaa bbb ccc").expect("row 1 painted");
+    handle_mouse(&mut app, left_down(x1, y1, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_drag(x1 + 6, y1));
+    handle_mouse(&mut app, left_up(x1 + 6, y1));
+    assert!(app.selection.is_some(), "first drag armed a live range");
+    assert!(app.selection_set.is_empty());
+
+    // Ctrl-click on the second row commits the first range and starts a new one.
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x2, y2) = find_text_cell(&buffer, "ddd eee fff").expect("row 2 painted");
+    handle_mouse(&mut app, left_down(x2, y2, KeyModifiers::CONTROL));
+    assert_eq!(
+        app.selection_set.len(),
+        1,
+        "the modifier-click committed the prior live range"
+    );
+    assert!(
+        app.selection.is_some(),
+        "and started a fresh live range at the click"
+    );
+}
+
+#[test]
+fn modifier_click_inside_a_committed_range_toggles_it_off() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("toggle this row"));
+
+    // Commit a whole-row selection into the set.
+    triple_click_row(&mut app, "toggle this row");
+    let sel = app.selection.clone().expect("row selection armed");
+    assert!(app.selection_set.add(sel), "seed the set with the row");
+    app.selection = None;
+    assert_eq!(app.selection_set.len(), 1);
+
+    // A Ctrl-click on a cell inside that committed range removes it.
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "toggle this row").expect("painted");
+    handle_mouse(&mut app, left_down(x + 2, y, KeyModifiers::CONTROL));
+    assert!(
+        app.selection_set.is_empty(),
+        "the modifier-click toggled the committed range off"
+    );
+}
+
+#[tokio::test]
+async fn esc_clears_the_whole_disjoint_set() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("clear me row"));
+
+    // Commit one range, then leave the live range armed too.
+    triple_click_row(&mut app, "clear me row");
+    handle_key(&mut app, &mut agent, add_selection_key())
+        .await
+        .expect("alt+d");
+    triple_click_row(&mut app, "clear me row");
+    assert_eq!(app.selection_set.len(), 1);
+    assert!(app.selection.is_some());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+
+    assert!(app.selection.is_none(), "Esc cleared the live range");
+    assert!(
+        app.selection_set.is_empty(),
+        "Esc cleared the committed set in one step"
+    );
+}
+
+#[test]
+fn render_highlights_every_disjoint_range_at_once() {
+    // The real `render()` path must paint the REVERSED highlight on each
+    // committed range plus the live one. Count the reversed cells across the
+    // whole screen with one committed range, then with two, and assert the
+    // second paints strictly more highlighted cells.
+    fn reversed_cell_count(app: &TuiApp) -> usize {
+        let backend = TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| render(frame, app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut count = 0usize;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                if buffer[(x, y)]
+                    .style()
+                    .add_modifier
+                    .contains(Modifier::REVERSED)
+                {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("highlight row one"));
+    app.push_transcript_item(TranscriptItem::assistant("highlight row two"));
+
+    // Build the surface rows once so the whole-row members align with the paint.
+    let _ = render_transcript_to_buffer(&app, 60, 16);
+    let rows = main_surface_rows(&app);
+    let row_of = |needle: &str| {
+        rows.iter()
+            .position(|line| crate::transcript_surface::plain_text_of_line(line).contains(needle))
+            .expect("row present")
+    };
+    let one = row_of("highlight row one");
+    let two = row_of("highlight row two");
+    let len_of = |r: usize| {
+        crate::transcript_surface::plain_text_of_line(&rows[r])
+            .chars()
+            .count()
+    };
+
+    // One committed range.
+    let mut a = selection::Selection::at(
+        selection::SelectionSurface::Main,
+        selection::Pos::new(one, 0),
+        selection::SelectionMode::Row,
+        60,
+    );
+    a.cursor = selection::Pos::new(one, len_of(one));
+    assert!(app.selection_set.add(a));
+    let with_one = reversed_cell_count(&app);
+    assert!(with_one > 0, "the committed range paints a highlight");
+
+    // A second disjoint committed range paints strictly more.
+    let mut b = selection::Selection::at(
+        selection::SelectionSurface::Main,
+        selection::Pos::new(two, 0),
+        selection::SelectionMode::Row,
+        60,
+    );
+    b.cursor = selection::Pos::new(two, len_of(two));
+    assert!(app.selection_set.add(b));
+    let with_two = reversed_cell_count(&app);
+    assert!(
+        with_two > with_one,
+        "a second disjoint range adds more highlighted cells ({with_one} -> {with_two})"
+    );
+}
+
 #[tokio::test]
 async fn esc_clears_the_selection_before_any_other_consumer() {
     let mut agent = test_agent(SessionMode::Build);

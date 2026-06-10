@@ -120,6 +120,7 @@ mod mention;
 mod metrics;
 mod minimap;
 mod modal;
+mod multi_selection;
 mod notification;
 mod overlay;
 mod paste_preview;
@@ -2150,7 +2151,8 @@ fn classify_key_interaction(app: &TuiApp, key: KeyEvent) -> Option<latency::Inte
             | keymap::Action::CopyAllCode
             | keymap::Action::CopyViewport
             | keymap::Action::CopyFullTranscript
-            | keymap::Action::CopySelection => InteractionKind::CopyAck,
+            | keymap::Action::CopySelection
+            | keymap::Action::CopyMultiSelection => InteractionKind::CopyAck,
             _ => InteractionKind::KeypressEcho,
         });
     }
@@ -3400,6 +3402,30 @@ fn handle_main_selection_press(
         return true;
     }
 
+    // §12.1.6 multi-select modifier-click (Ctrl/Alt held): the mouse mirror of
+    // the `Alt+d` add-selection chord. A click on a cell already inside a
+    // committed range toggles that range off; otherwise the live range (if any)
+    // is committed into the set and a fresh disjoint range is started at the
+    // click. The keyboard path (`Alt+d`) stays the primary, reliable affordance.
+    if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+        if app
+            .selection_set
+            .remove_at(selection::SelectionSurface::Main, pos)
+        {
+            app.status = if app.selection_set.is_empty() {
+                "removed selection".to_string()
+            } else {
+                format!("removed selection ({} ranges)", app.selection_set.len())
+            };
+            return true;
+        }
+        // Commit the current live range (if non-empty) before starting a new one
+        // so the disjoint set grows by the previous gesture's range.
+        add_live_selection_to_set(app);
+        start_selection(app, selection::SelectionSurface::Main, pos);
+        return true;
+    }
+
     match multiplicity {
         2 => select_word_at(app, rows, selection::SelectionSurface::Main, pos),
         3 => select_row_at(app, rows, selection::SelectionSurface::Main, pos),
@@ -3484,6 +3510,58 @@ fn copy_active_selection(app: &mut TuiApp) -> bool {
         return false;
     }
     deliver_copy(app, &text, "selection");
+    true
+}
+
+/// Multi-Cursor-Like Transcript Selection (§12.1.6): commit the live visual
+/// selection into the disjoint [`TuiApp::selection_set`] and clear the live one
+/// so the next gesture starts a fresh non-contiguous range. Returns `true` when
+/// a range was actually committed (a non-empty main-view selection); `false`
+/// leaves both untouched so the chord can fall through.
+fn add_live_selection_to_set(app: &mut TuiApp) -> bool {
+    let Some(sel) = app.selection.clone() else {
+        return false;
+    };
+    if sel.is_empty() || sel.surface != selection::SelectionSurface::Main {
+        return false;
+    }
+    if !app.selection_set.add(sel) {
+        return false;
+    }
+    // The live range is now owned by the set; clear it so the next drag/extend
+    // builds a fresh disjoint range rather than re-editing the committed one.
+    app.selection = None;
+    let n = app.selection_set.len();
+    app.status = if n == 1 {
+        "added selection (1 range)".to_string()
+    } else {
+        format!("added selection ({n} ranges)")
+    };
+    true
+}
+
+/// Multi-Cursor-Like Transcript Selection (§12.1.6): copy the combined committed
+/// set PLUS the live selection as one payload (distinct ranges separated by a
+/// blank line). Returns `true` when there was any non-empty range to copy.
+fn copy_multi_selection(app: &mut TuiApp) -> bool {
+    let ranges = multi_selection::combined_ranges(&app.selection_set, app.selection.as_ref());
+    if ranges.is_empty() {
+        return false;
+    }
+    // Every member shares the MAIN surface (the set + a main-view live range),
+    // so one row build serves the whole combined copy.
+    let rows = selection_surface_rows(app, selection::SelectionSurface::Main);
+    let text = multi_selection::combined_clean_text(&rows, &ranges);
+    if text.is_empty() {
+        return false;
+    }
+    let n = ranges.len();
+    let label = if n == 1 {
+        "selection".to_string()
+    } else {
+        format!("{n} selections")
+    };
+    deliver_copy(app, &text, &label);
     true
 }
 
@@ -4182,8 +4260,12 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // overlays do not paint a selection), so this gate defers to every in-app
     // modal surface — when one is open it owns its own Esc, and a lingering
     // main-view selection must NOT steal that first Esc from it.
+    //
+    // §12.1.6: the committed disjoint set counts as "an active selection" for
+    // this gate, so a single Esc also clears every committed range (not just the
+    // live one) in one step.
     if key.code == KeyCode::Esc
-        && app.selection.is_some()
+        && (app.selection.is_some() || !app.selection_set.is_empty())
         && app.config_screen.is_none()
         && app.transcript_overlay.is_none()
         && app.status_line_setup.is_none()
@@ -4192,6 +4274,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         && app.pending_chord.is_none()
     {
         app.selection = None;
+        app.selection_set.clear();
         app.status = "selection cleared".to_string();
         return Ok(false);
     }
@@ -5582,6 +5665,21 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             quote_selection_to_compose(app)
+        }
+        keymap::Action::AddSelectionToSet => {
+            // §12.1.6: commit the live range into the disjoint set. Guarded like
+            // the other selection verbs so a modal/config surface owns its keys.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            add_live_selection_to_set(app)
+        }
+        keymap::Action::CopyMultiSelection => {
+            // §12.1.6: copy every committed disjoint range plus the live one.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            copy_multi_selection(app)
         }
         keymap::Action::RestoreCancelledPrompt => {
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
@@ -20966,6 +21064,19 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
     // selection is active. `rows_with_selection_highlight` restyles the selected
     // cells (the same char-offset basis the copy uses) and leaves the rest
     // untouched, so the highlight matches the copied text exactly.
+    //
+    // Multi-Cursor-Like Transcript Selection (§12.1.6): paint EVERY committed
+    // disjoint range from `selection_set` as well as the live one, so all
+    // non-contiguous selections show at once. Each pass clones the rows and only
+    // patches its own span, so the highlights compose (a row touched by two
+    // disjoint ranges keeps both). Applied to main-view ranges only.
+    let mut lines = lines;
+    for sel in app.selection_set.members() {
+        if sel.surface == selection::SelectionSurface::Main {
+            lines =
+                selection::rows_with_selection_highlight(&lines, sel, selection_highlight_style());
+        }
+    }
     let lines = match app.selection.as_ref() {
         Some(sel) if sel.surface == selection::SelectionSurface::Main => {
             selection::rows_with_selection_highlight(&lines, sel, selection_highlight_style())
@@ -31176,6 +31287,14 @@ pub(crate) struct TuiApp {
     /// active surface's wrapped `Vec<Line>`. Drives copy when present and the
     /// highlight in both renders.
     pub(crate) selection: Option<selection::Selection>,
+    /// Multi-Cursor-Like Transcript Selection (§12.1.6): the committed
+    /// *disjoint* extra ranges, in addition to the live one in
+    /// [`TuiApp::selection`]. `Alt+d` commits the live range here (and a
+    /// modifier-click on the main view does the same), letting the user build up
+    /// several non-contiguous selections; `Ctrl+Alt+Y` copies them all at once.
+    /// Empty by default, so a session that never multi-selects renders and copies
+    /// byte-identically to the single-selection build.
+    pub(crate) selection_set: multi_selection::SelectionSet,
     /// Live incremental-search session over the painted transcript rows (main
     /// view or Ctrl+T overlay), or `None`. Surface-local match positions index
     /// the active surface's wrapped `Vec<Line>`; drives the in-search key
@@ -32200,6 +32319,7 @@ impl TuiApp {
             main_text_area_cache: std::cell::Cell::new(None),
             last_frame_size: std::cell::Cell::new(None),
             selection: None,
+            selection_set: multi_selection::SelectionSet::new(),
             search: None,
             jump_marks: jump_marks::JumpMarkStack::new(),
             show_minimap: false,

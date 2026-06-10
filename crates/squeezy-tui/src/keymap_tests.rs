@@ -294,6 +294,59 @@ fn quote_selection_to_compose_round_trips_and_defaults_to_greater_than() {
 }
 
 #[test]
+fn multi_selection_actions_round_trip_and_default_to_their_chords() {
+    // §12.1.6 Multi-Cursor-Like Transcript Selection: both new actions' slugs
+    // round-trip, are registered in `ALL` (so `/keymap` lists them and overrides
+    // can target them), and default to their respective chords.
+    assert_eq!(
+        Action::from_slug("add_selection_to_set"),
+        Some(Action::AddSelectionToSet)
+    );
+    assert_eq!(
+        Action::from_slug("copy_multi_selection"),
+        Some(Action::CopyMultiSelection)
+    );
+    assert!(Action::ALL.contains(&Action::AddSelectionToSet));
+    assert!(Action::ALL.contains(&Action::CopyMultiSelection));
+
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    // Add-to-set defaults to `Alt+d`.
+    assert_eq!(
+        resolver.binding(Action::AddSelectionToSet),
+        KeyBinding::new(KeyCode::Char('d'), KeyModifiers::ALT),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('d'), KeyModifiers::ALT),
+        Some(Action::AddSelectionToSet),
+    );
+    // Combined copy defaults to `Ctrl+Alt+Y`.
+    assert_eq!(
+        resolver.binding(Action::CopyMultiSelection),
+        KeyBinding::new(
+            KeyCode::Char('y'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+    );
+    assert_eq!(
+        resolver.lookup(
+            KeyCode::Char('y'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+        Some(Action::CopyMultiSelection),
+    );
+
+    // Both are Meta/Alt chords, so both carry the terminal-dependent note.
+    assert_eq!(
+        Action::AddSelectionToSet.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+    assert_eq!(
+        Action::CopyMultiSelection.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+}
+
+#[test]
 fn shifted_symbol_binding_folds_away_an_incidental_shift_modifier() {
     // The shift bit on an already-shifted printable symbol is redundant and
     // terminal-dependent, so `KeyBinding::new` normalises it away — `>` with or

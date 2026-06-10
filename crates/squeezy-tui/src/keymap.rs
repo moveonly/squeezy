@@ -72,6 +72,15 @@ pub(crate) enum Action {
     /// main-view selection is active; otherwise the `>` keystroke falls
     /// through to normal composer input.
     QuoteSelectionToCompose,
+    /// Multi-Cursor-Like Transcript Selection (§12.1.6): commit the live visual
+    /// selection into the disjoint selection set so the next gesture starts a
+    /// fresh non-contiguous range (`Alt+d` default). With no live selection it
+    /// is a no-op and falls through.
+    AddSelectionToSet,
+    /// Multi-Cursor-Like Transcript Selection (§12.1.6): copy EVERY committed
+    /// disjoint range plus the live one as one combined payload (`Ctrl+Alt+Y`
+    /// default), distinct blocks separated by a blank line.
+    CopyMultiSelection,
     /// Restore the most recently cancelled prompt back into the
     /// composer (`Ctrl+R` default).
     RestoreCancelledPrompt,
@@ -372,6 +381,8 @@ impl Action {
             Self::CopyFullTranscript => "copy_full_transcript",
             Self::CopySelection => "copy_selection",
             Self::QuoteSelectionToCompose => "quote_selection_to_compose",
+            Self::AddSelectionToSet => "add_selection_to_set",
+            Self::CopyMultiSelection => "copy_multi_selection",
             Self::RestoreCancelledPrompt => "restore_cancelled_prompt",
             Self::ScrollTranscriptPageUp => "page_up",
             Self::ScrollTranscriptPageDown => "page_down",
@@ -438,6 +449,8 @@ impl Action {
         Action::CopyFullTranscript,
         Action::CopySelection,
         Action::QuoteSelectionToCompose,
+        Action::AddSelectionToSet,
+        Action::CopyMultiSelection,
         Action::RestoreCancelledPrompt,
         Action::ScrollTranscriptPageUp,
         Action::ScrollTranscriptPageDown,
@@ -533,6 +546,12 @@ impl Action {
             | Self::CopyViewport
             | Self::CopyFullTranscript
             | Self::CopySelection
+            // Multi-Cursor-Like Transcript Selection (§12.1.6): add-to-set is
+            // `Alt+d` (Meta/Alt encoding) and the combined copy is `Ctrl+Alt+Y`
+            // (Ctrl+Alt/Meta) — both the classically-unreliable case across Linux
+            // terminals, tmux, and SSH as the rest of the copy/nav family.
+            | Self::AddSelectionToSet
+            | Self::CopyMultiSelection
             | Self::JumpPrevUserTurn
             | Self::JumpNextUserTurn
             | Self::JumpPrevAssistant
@@ -683,6 +702,16 @@ impl Action {
             Self::QuoteSelectionToCompose => {
                 KeyBinding::new(KeyCode::Char('>'), KeyModifiers::NONE)
             }
+            // Multi-Cursor-Like Transcript Selection (§12.1.6). `Alt+d`
+            // ("disjoint add") commits the live range into the set; `d` is free
+            // among the semantic-copy/nav Alt letters. The combined copy uses the
+            // obscure `Ctrl+Alt+Y` chord, sitting next to the single-selection
+            // copy's `Alt+y` so the family stays mnemonic without colliding.
+            Self::AddSelectionToSet => KeyBinding::new(KeyCode::Char('d'), KeyModifiers::ALT),
+            Self::CopyMultiSelection => KeyBinding::new(
+                KeyCode::Char('y'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
             Self::RestoreCancelledPrompt => {
                 KeyBinding::new(KeyCode::Char('r'), KeyModifiers::CONTROL)
             }
