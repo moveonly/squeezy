@@ -60,6 +60,15 @@ fn strip_focus_caret_only_eats_a_true_column_zero_caret() {
 }
 
 #[test]
+fn strip_message_marker_handles_no_space_and_eol_markers() {
+    // No space after the marker: drop just the marker glyph, keep the content
+    // verbatim (slices on a `char_indices` boundary, so it stays UTF-8-safe).
+    assert_eq!(strip_message_marker("☽answer"), "answer");
+    // The marker is the only/last char: nothing remains after it.
+    assert_eq!(strip_message_marker("●"), "");
+}
+
+#[test]
 fn plain_text_of_spans_matches_line_projection() {
     let line = styled_line("alpha beta gamma");
     assert_eq!(plain_text_of_spans(&line.spans), plain_text_of_line(&line));

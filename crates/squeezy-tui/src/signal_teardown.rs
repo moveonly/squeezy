@@ -52,11 +52,24 @@ static ALT_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(unix)]
 static SUSPEND_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// Guards single installation of the panic hook and signal handlers across the
-/// process. A second fullscreen TUI in the same process reuses the already
-/// installed hook/handlers (they read the shared [`ALT_SCREEN_ACTIVE`] flag, so
-/// they stay correct for whichever guard is live).
+/// Guards single installation of the panic hook across the process (the OS-signal
+/// handlers have their own [`SIGNAL_HANDLERS_INSTALLED`] guard). A second
+/// fullscreen TUI in the same process reuses the already installed hook (it reads
+/// the shared [`ALT_SCREEN_ACTIVE`] flag, so it stays correct for whichever guard
+/// is live). Also gates [`restore_previous_panic_hook`], so the restore is
+/// idempotent: only the swap-from-`true` caller actually puts the old hook back.
 static HOOKS_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Guards single installation of the OS-signal handlers across the process,
+/// mirroring [`HOOKS_INSTALLED`]. The CLI BackToSetup / model-switch loop
+/// re-invokes `run_inner_with_terminal` in the same process, which would
+/// otherwise spawn a fresh SIGTERM/SIGHUP/SIGTSTP listener task on every
+/// re-entry — orphaned tasks accumulating for the process lifetime. Installing
+/// exactly once keeps those listeners correct for every later in-process session
+/// (they read the shared [`ALT_SCREEN_ACTIVE`] / [`SUSPEND_REQUESTED`] statics);
+/// deliberately never reset on clean exit.
+#[cfg(unix)]
+static SIGNAL_HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// The boxed panic hook type `std::panic::set_hook` accepts / `take_hook`
 /// returns. Aliased so [`PREVIOUS_PANIC_HOOK`]'s `Mutex<Option<…>>` stays
@@ -173,10 +186,23 @@ pub(crate) fn restore_previous_panic_hook() {
 pub(crate) fn install_signal_handlers() {
     use tokio::signal::unix::{SignalKind, signal};
 
+    // Install exactly once per process, mirroring the panic hook's
+    // `HOOKS_INSTALLED` guard. The CLI BackToSetup / model-switch loop re-invokes
+    // `run_inner_with_terminal` in the same process; without this each re-entry
+    // would spawn fresh listener tasks that leak for the process lifetime. The
+    // existing listeners read the shared statics, so they stay correct for a later
+    // in-process session — install once, never reset on clean exit.
+    if SIGNAL_HANDLERS_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
     // Best-effort: if the runtime cannot register a listener (e.g. another
     // library already took an incompatible handler), we simply fall back to the
     // panic hook + Drop. A failed registration must never abort startup.
-    for kind in [SignalKind::terminate(), SignalKind::hangup()] {
+    for (kind, signo) in [
+        (SignalKind::terminate(), libc::SIGTERM),
+        (SignalKind::hangup(), libc::SIGHUP),
+    ] {
         let Ok(mut stream) = signal(kind) else {
             continue;
         };
@@ -184,10 +210,11 @@ pub(crate) fn install_signal_handlers() {
             if stream.recv().await.is_some() {
                 run_emergency_teardown();
                 // Re-raising the default disposition would require resetting the
-                // handler; exiting non-zero here is sufficient and keeps the
-                // restore deterministic. The OS still reports termination to the
-                // parent shell.
-                std::process::exit(130);
+                // handler; exiting with the conventional `128 + signo` status
+                // (143 for SIGTERM, 129 for SIGHUP) is sufficient, keeps the
+                // restore deterministic, and reports the originating signal to the
+                // parent shell instead of masquerading as SIGINT (130).
+                std::process::exit(128 + signo);
             }
         });
     }
@@ -211,12 +238,14 @@ pub(crate) fn install_signal_handlers() {
 /// once per turn; a `true` return means it should run the cooperative
 /// suspend/resume cycle (clean terminal restore, re-raise SIGTSTP with the
 /// default disposition, then re-enter + force a full redraw). Always `false` on
-/// non-Unix (no job-control suspend), so the loop's call site stays `cfg`-free.
+/// non-Unix (no job-control suspend).
 //
-// On non-Unix the only lib call site (`lib.rs`, behind `#[cfg(unix)]`) compiles
-// out, so the lib never references this. It is still exercised by the
-// `#[cfg(not(unix))]` test, hence we keep the function (not a `cfg`-split) and
-// silence the lib-target dead-code lint off Unix instead of deleting it.
+// The only non-test caller (`lib.rs`) is itself `#[cfg(unix)]`-gated — it must
+// be, because `suspend_and_resume` is `#[cfg(unix)]`-only — so on non-Unix the
+// lib never references this function and it is reached only by the
+// `#[cfg(not(unix))]` test. We keep the single function (not a `cfg`-split) and
+// silence the lib-target dead-code lint off Unix, where the `false` arm exists
+// purely so that off-Unix test can run.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn take_suspend_request() -> bool {
     #[cfg(unix)]
@@ -285,6 +314,15 @@ pub(crate) fn reraise_sigtstp_default() {
 /// no-op so the call site in the event loop is unconditional and `cfg`-free.
 #[cfg(not(unix))]
 pub(crate) fn install_signal_handlers() {}
+
+/// Test-only: read whether the panic hook is currently installed (the
+/// `HOOKS_INSTALLED` guard). Lets a test prove that a guard's `Drop` restores the
+/// previous hook on a non-alt / error-path exit — i.e. the install/restore are
+/// symmetric, not leaked behind `finish_fullscreen`'s alt-screen early-return.
+#[cfg(test)]
+pub(crate) fn panic_hook_installed_for_test() -> bool {
+    HOOKS_INSTALLED.load(Ordering::SeqCst)
+}
 
 #[cfg(test)]
 #[path = "signal_teardown_tests.rs"]

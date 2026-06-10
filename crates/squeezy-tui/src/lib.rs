@@ -923,9 +923,11 @@ async fn run_inner_with_terminal(
         // so the clean terminal restore + re-raise + redraw never races the
         // renderer or runs on a half-mutated model. The SIGTSTP handler only
         // flips a flag (`take_suspend_request`); the guard owns the byte work.
-        // `take_suspend_request` is always `false` on non-Unix, so this whole
-        // block compiles to nothing there. Suspend during a running turn is
-        // safe: only the terminal is parked; the async turn keeps its state.
+        // The `#[cfg(unix)]` below (required — `suspend_and_resume` is Unix-only)
+        // compiles this whole block out off Unix; `take_suspend_request` is also
+        // `false` there, but it is the cfg gate that removes the call. Suspend
+        // during a running turn is safe: only the terminal is parked; the async
+        // turn keeps its state.
         #[cfg(unix)]
         if signal_teardown::take_suspend_request() {
             terminal.suspend_and_resume(&mut app);
@@ -32283,13 +32285,13 @@ struct TerminalGuard {
     /// Whether mouse capture is enabled for the main screen. Defaults on in
     /// fullscreen (alt-screen norm) unless `SQUEEZY_MOUSE_CAPTURE=0`. When on,
     /// the click registry is live; Shift+drag / Shift+wheel are the native
-    /// selection / scrollback escape hatch. Resolved once at `enter` and used
-    /// there to emit the click-capture enable sequence. Retained on the guard
-    /// for symmetry with the other recorded enter state; nothing reads it back
-    /// now that Phase 1 removed the overlay terminal swap (which used to restore
-    /// the main mouse policy when the transcript overlay closed) — hence the
-    /// `dead_code` allow.
-    #[allow(dead_code)]
+    /// selection / scrollback escape hatch. Resolved once at `enter`, used there
+    /// to emit the click-capture enable sequence, and re-read by
+    /// `suspend_and_resume` / `run_pending_editor_handoff` (Unix) when they
+    /// re-enter the alternate screen, so mouse capture is re-armed to the same
+    /// policy on resume. Off Unix there is no suspend/resume reader, so the field
+    /// is dead there — hence the `cfg`-gated `dead_code` allow.
+    #[cfg_attr(not(unix), allow(dead_code))]
     mouse_capture: bool,
     exit_hint: Option<String>,
     /// Resolved DEC 2026 synchronized-output flag. Computed once at
@@ -32499,7 +32501,18 @@ fn emit_terminal_emergency_teardown<W: Write>(
         DisableAlternateScroll,
         Print(DISABLE_MOUSE_MODES),
         Print("\x1b]0;\x07")
-    )
+    )?;
+    // Re-show the hardware cursor that `emit_terminal_enter_setup` hid. The clean
+    // paths (Drop / finish_fullscreen / suspend_and_resume) restore it with a
+    // separate `show_cursor()` crossterm call, but the crash paths (panic hook /
+    // SIGTERM / SIGHUP) run ONLY these bytes — so without this the cursor stays
+    // hidden after a panic/kill until the user runs `reset`/`tput cnorm`. Emit it
+    // as a raw `?25h` here so the single-sourced teardown re-shows the cursor on
+    // EVERY path. Best-effort (`let _ =`) — this is also reached from inside the
+    // panic hook, where a failed write must never panic — and idempotent: the
+    // clean paths' extra `show_cursor()` is a harmless double-show.
+    let _ = writer.write_all(b"\x1b[?25h");
+    Ok(())
 }
 
 /// Emit the clean-exit (`TerminalGuard::finish_fullscreen`) byte sequence into
@@ -32579,13 +32592,22 @@ fn emit_finish_fullscreen<W: Write>(
 
 /// Mark the app so the very next loop frame repaints EVERYTHING from model state
 /// after a SIGTSTP/SIGCONT resume. The freshly re-entered alternate screen is
-/// blank, so we cannot trust ratatui's incremental diff: `needs_redraw` forces a
-/// draw past the idle-skip gate, and `pending_resize` forces it past the frame
-/// limiter's wants-draw gate and re-anchors scroll geometry as if the size may
-/// have changed while suspended (the user may have resized the window in the
-/// shell). Factored out of [`TerminalGuard::suspend_and_resume`] so the
-/// forced-redraw contract is unit-testable on every platform without the
-/// Unix-only blocking re-raise.
+/// blank, so we cannot trust ratatui's incremental diff:
+///   * `needs_redraw` triggers the draw (it is the OR term the idle-skip gate
+///     reads — see the `wants_draw` gate in the run loop).
+///   * `pending_resize` is also set because the window may have been resized in
+///     the shell while suspended; it likewise contributes to `wants_draw`, but
+///     its load-bearing job is re-anchoring scroll geometry, not a second gate.
+///
+/// Because the size may have changed under us, this re-anchors scroll geometry
+/// the same way the `Event::Resize` arm does: `cancel_main_scroll_anim` snaps any
+/// in-flight ease (its start position is now stale) and `reanchor_active_scroll_on_resize`
+/// clamps the stored `from_bottom` to the (possibly smaller) new `max_scroll`, so
+/// the first post-resume "scroll down" presses are not silently swallowed.
+///
+/// Factored out of [`TerminalGuard::suspend_and_resume`] so the forced-redraw +
+/// re-anchor contract is unit-testable on every platform without the Unix-only
+/// blocking re-raise.
 ///
 /// Compiled on Unix (the only suspend/resume target) and in any test build (so
 /// the contract test runs on Windows CI too); elsewhere it would be dead code.
@@ -32593,6 +32615,11 @@ fn emit_finish_fullscreen<W: Write>(
 fn mark_full_redraw_after_resume(app: &mut TuiApp) {
     app.needs_redraw = true;
     app.pending_resize = true;
+    // Re-anchor scroll geometry as if a resize happened while suspended: snap any
+    // in-flight ease (its start anchor is stale) and clamp the stored `from_bottom`
+    // to the new max_scroll. Mirrors the `Event::Resize` arm.
+    cancel_main_scroll_anim(app);
+    reanchor_active_scroll_on_resize(app);
 }
 
 /// Pre-flight check for the conditions [`TerminalGuard::enter`] refuses on:
@@ -32674,7 +32701,9 @@ impl TerminalGuard {
         // idempotent across the process and additive — the clean lifecycle is
         // unchanged; these only cover the paths where `Drop` cannot run (a panic
         // message printing pre-unwind, or a SIGTERM/SIGHUP killing the process).
-        // The panic hook is restored on the clean exit in `finish_fullscreen`.
+        // The panic hook is restored in `TerminalGuard::Drop` — which runs on
+        // every exit (clean, inline, or an error-path `?`), so the install is
+        // unconditional and the restore is symmetric.
         signal_teardown::set_alt_screen_active(true);
         signal_teardown::install_panic_hook();
         let backend = CrosstermBackend::new(writer);
@@ -32805,10 +32834,10 @@ impl TerminalGuard {
         // not re-leave an alternate screen we already left.
         self.alt_screen_active = false;
         signal_teardown::set_alt_screen_active(false);
-        // Clean exit: put back the panic hook that was in place before `enter`
-        // installed the emergency-teardown one, so a subsequent TUI (or non-TUI
-        // code) in this process is unaffected by our hook.
-        signal_teardown::restore_previous_panic_hook();
+        // NOTE: the previous panic hook is restored in `Drop` (which always runs
+        // after this clean exit), so it is NOT restored here — that keeps the
+        // restore symmetric across clean / inline / error-path exits instead of
+        // only the alt-screen clean-exit path. See `Drop`.
         // Raw mode is the very last thing disabled — after every CRLF write above
         // — so bare-`\n` stair-stepping can't occur mid-mirror. Then show the
         // hardware cursor `enter` hid, and flush so everything is emitted before
@@ -33650,6 +33679,13 @@ impl Drop for TerminalGuard {
             signal_teardown::set_alt_screen_active(false);
         }
         let _ = terminal.show_cursor();
+        // Restore the panic hook that was in place before `enter` installed the
+        // emergency-teardown one. Done HERE (not only in `finish_fullscreen`) so it
+        // runs on EVERY exit — clean, inline (`alt_screen_active == false`), or an
+        // error-path `?` early-return that never reaches `finish_fullscreen` —
+        // keeping the second-TUI / non-TUI contract intact. Idempotent via the
+        // `HOOKS_INSTALLED` swap, so it is a no-op if a clean exit already restored.
+        signal_teardown::restore_previous_panic_hook();
     }
 }
 

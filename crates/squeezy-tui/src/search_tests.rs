@@ -373,3 +373,46 @@ fn match_column_is_in_full_line_space_after_gutter_strip() {
         .collect();
     assert_eq!(slice, "world");
 }
+
+// ---- case-fold expansion + wide glyph offset stability ---------------------
+
+#[test]
+fn match_col_is_stable_past_1_to_n_lowercase_expansion() {
+    // `İ` (U+0130) lowercases to TWO chars ("i" + combining dot above), so the
+    // line's straightforward char-by-char lowering desyncs char offsets and
+    // `find` falls back to the offset-preserving `simple_lower` fold. The reported
+    // `col` must still index the correct chars in the FULL line — i.e. the İ
+    // counts as exactly one column despite the 1:N expansion.
+    let r = rows(&["İstanbul guide"]);
+    let found = find(&r, &[], "guide", true, true);
+    // "guide" begins at char offset 9 in "İstanbul guide" (İ s t a n b u l ' ').
+    assert_eq!(found, vec![m(0, 9..14)]);
+    // Sanity: that range slices "guide" out of the full line, proving the offset
+    // survived the İ→i+combining expansion.
+    let full: String = "İstanbul guide".chars().collect();
+    let slice: String = full
+        .chars()
+        .skip(found[0].col.start)
+        .take(found[0].col.len())
+        .collect();
+    assert_eq!(slice, "guide");
+}
+
+#[test]
+fn match_col_counts_wide_cjk_glyphs_as_single_columns() {
+    // The reported `col` is a CHAR offset (consumed by char-slicing in selection),
+    // NOT a byte offset and NOT a display-cell offset. With two wide CJK glyphs
+    // before the match, a byte-offset regression would report 7..12 and a
+    // display-cell (2-cells-per-CJK) regression would report 5..10; the correct
+    // char offset is 3..8.
+    let r = rows(&["日本 world"]);
+    let found = find(&r, &[], "world", true, true);
+    assert_eq!(found, vec![m(0, 3..8)]);
+    let full: String = "日本 world".chars().collect();
+    let slice: String = full
+        .chars()
+        .skip(found[0].col.start)
+        .take(found[0].col.len())
+        .collect();
+    assert_eq!(slice, "world");
+}

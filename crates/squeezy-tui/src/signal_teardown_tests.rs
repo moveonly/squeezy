@@ -101,6 +101,20 @@ fn panic_hook_teardown_emits_disable_sequence_in_order() {
         !ansi.contains("\x1b[3J"),
         "teardown must never purge scrollback (\\x1b[3J)"
     );
+
+    // H1: the crash path runs ONLY these bytes (the panic hook / SIGTERM / SIGHUP
+    // handlers never call the separate `show_cursor()` the clean paths use), so
+    // the emitter itself must re-show the hardware cursor `enter` hid — otherwise
+    // a panic/kill leaves the cursor invisible until `reset` / `tput cnorm`. The
+    // show must land AFTER LeaveAlternateScreen so it applies to the normal buffer.
+    let show_pos = ansi
+        .find("\x1b[?25h")
+        .expect("crash-path teardown must re-show the hardware cursor");
+    assert!(
+        show_pos > leave_pos,
+        "cursor show must come AFTER LeaveAlternateScreen so it lands on the \
+         restored normal buffer"
+    );
 }
 
 /// Best-effort: a writer that fails partway through the teardown must not panic.
@@ -211,12 +225,63 @@ fn suspend_request_is_read_and_cleared_once() {
 }
 
 /// On non-Unix there is no job-control suspend, so the request drain is always
-/// `false` — the loop's call site stays `cfg`-free and never suspends.
+/// `false` — the loop's call site is `cfg(unix)`-gated and never suspends here.
 #[cfg(not(unix))]
 #[test]
 fn suspend_request_is_always_false_off_unix() {
     assert!(
         !super::take_suspend_request(),
         "no SIGTSTP suspend exists off Unix; the drain must always be false"
+    );
+}
+
+/// Serializes every test that mutates the process-global panic hook, so the
+/// parallel test pool cannot interleave an install/restore round-trip with a
+/// concurrent `TerminalGuard::Drop` (which now also restores the hook).
+static PANIC_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// H2 — panic-hook restore symmetry. `TerminalGuard::enter` installs the
+/// emergency-teardown panic hook UNCONDITIONALLY, but the restore used to live
+/// only inside `finish_fullscreen`, AFTER its `if !alt_screen_active` early
+/// return. So an inline (non-alt) guard or any error-path `?` exit that drops the
+/// guard WITHOUT a clean `finish_fullscreen` leaked the hook (`HOOKS_INSTALLED`
+/// stuck `true`), breaking the second-TUI / non-TUI contract. The fix moves the
+/// restore into `Drop`, which runs on EVERY exit. This pins that: with a guard
+/// whose `alt_screen_active` is `false` (the inline / already-finished state),
+/// dropping it still restores the previous hook.
+#[test]
+fn drop_restores_panic_hook_on_non_alt_exit() {
+    let _guard = PANIC_HOOK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // Start from a known-clean hook state: if a prior test left it installed,
+    // restore first so this test owns the round-trip.
+    super::restore_previous_panic_hook();
+    assert!(
+        !super::panic_hook_installed_for_test(),
+        "precondition: no panic hook installed before this test"
+    );
+
+    // Install our emergency-teardown hook (records the previous one).
+    super::install_panic_hook();
+    assert!(
+        super::panic_hook_installed_for_test(),
+        "install_panic_hook must mark the hook installed"
+    );
+
+    // Build a fullscreen capture guard and force the non-alt / already-finished
+    // state — exactly what an inline guard or an error-path exit looks like when
+    // `finish_fullscreen` was never reached (or short-circuited its early return).
+    let (mut guard, _sink) = crate::TerminalGuard::for_capture_test(80, 24);
+    guard.alt_screen_active = false;
+    crate::signal_teardown::set_alt_screen_active(false);
+
+    // Dropping the guard must restore the previous hook even though no clean
+    // `finish_fullscreen` ran on this (non-alt) guard.
+    drop(guard);
+    assert!(
+        !super::panic_hook_installed_for_test(),
+        "Drop must restore the previous panic hook on a non-alt / error-path exit"
     );
 }

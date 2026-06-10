@@ -10319,12 +10319,18 @@ fn resume_marks_app_for_full_redraw() {
 
     assert!(
         app.needs_redraw,
-        "resume must force a redraw past the idle-skip gate"
+        "resume must trigger a redraw (the idle-skip gate reads `needs_redraw`)"
     );
     assert!(
         app.pending_resize,
-        "resume must force a draw past the frame-limiter wants-draw gate and \
-         re-anchor scroll geometry"
+        "resume must flag a pending resize so scroll geometry is re-anchored \
+         (the size may have changed in the shell while suspended)"
+    );
+    // The re-anchor side effect: `mark_full_redraw_after_resume` snaps any
+    // in-flight ease, so no smooth-scroll animation lingers across the resume.
+    assert!(
+        app.main_scroll_anim.is_none(),
+        "resume must cancel any in-flight main-scroll ease (its start is stale)"
     );
 }
 
