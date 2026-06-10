@@ -22707,6 +22707,370 @@ async fn quote_key_with_an_overlay_open_does_not_quote() {
 }
 
 // =====================================================================
+// §12.3.2 Prompt Snippets From Selection.
+// End-to-end through `handle_key` (Alt+3 save, the picker's Up/Down/
+// Enter/q/d/c verbs), `handle_mouse` (click select, double-click insert),
+// the real `render()` overlay, and a resize sweep.
+// =====================================================================
+
+/// `Alt+3`: save the active main-view selection as a snippet.
+fn save_snippet_key() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT)
+}
+
+/// `Ctrl+Alt+S`: toggle the saved-snippets picker overlay.
+fn toggle_snippets_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('s'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+#[tokio::test]
+async fn save_snippet_key_with_active_selection_stores_a_named_snippet() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("reusable snippet body"));
+
+    triple_click_row(&mut app, "reusable snippet body");
+    assert!(
+        app.selection.is_some(),
+        "triple-click armed a row selection"
+    );
+    assert!(app.snippets.is_empty(), "store starts empty");
+
+    handle_key(&mut app, &mut agent, save_snippet_key())
+        .await
+        .expect("save snippet key");
+
+    assert_eq!(app.snippets.len(), 1, "one snippet saved");
+    let snippet = &app.snippets.snippets()[0];
+    assert_eq!(snippet.text, "reusable snippet body");
+    assert_eq!(
+        snippet.name, "reusable snippet body",
+        "name from first line"
+    );
+    assert!(
+        app.selection.is_none(),
+        "saving consumes the selection so the next gesture starts fresh"
+    );
+    assert!(
+        app.status.contains("saved snippet"),
+        "status names the save action: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn save_snippet_key_without_a_selection_falls_through_to_composer() {
+    // With no active selection, `Alt+3` must keep its normal composer meaning so
+    // the chord never steals a key. (Alt+digit reaches the composer's own input
+    // path; we only assert the store stays empty — the verb did not fire.)
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(app.selection.is_none());
+
+    handle_key(&mut app, &mut agent, save_snippet_key())
+        .await
+        .expect("save snippet key");
+
+    assert!(
+        app.snippets.is_empty(),
+        "with no selection the save verb does not fire"
+    );
+    assert!(!app.snippets_open, "and the picker does not open");
+}
+
+#[tokio::test]
+async fn ctrl_alt_s_toggles_the_snippets_picker() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(!app.snippets_open, "starts closed");
+
+    handle_key(&mut app, &mut agent, toggle_snippets_key())
+        .await
+        .unwrap();
+    assert!(app.snippets_open, "Ctrl+Alt+S opens the picker");
+    handle_key(&mut app, &mut agent, toggle_snippets_key())
+        .await
+        .unwrap();
+    assert!(!app.snippets_open, "Ctrl+Alt+S again closes it");
+}
+
+#[tokio::test]
+async fn snippets_picker_renders_entries_and_empty_state() {
+    let mut app = test_app(SessionMode::Build);
+
+    // Empty-state line renders when there are no snippets.
+    app.snippets_open = true;
+    let empty = render_to_string(&app, 100, 24);
+    assert!(empty.contains("Prompt snippets"), "title renders: {empty}");
+    assert!(
+        empty.contains("No snippets yet"),
+        "empty-state hint renders: {empty}"
+    );
+
+    // With snippets, the names and previews render.
+    app.snippets.save(
+        "first snippet body",
+        snippet_store::SnippetSource {
+            surface: snippet_store::SnippetSurface::Main,
+            row_start: 0,
+            row_end: 0,
+            chars: 18,
+            bytes: 18,
+        },
+    );
+    app.snippets.save(
+        "second snippet body here",
+        snippet_store::SnippetSource {
+            surface: snippet_store::SnippetSurface::Main,
+            row_start: 1,
+            row_end: 2,
+            chars: 24,
+            bytes: 24,
+        },
+    );
+    let listed = render_to_string(&app, 100, 24);
+    assert!(
+        listed.contains("second snippet body here"),
+        "newest name renders: {listed}"
+    );
+    assert!(
+        listed.contains("first snippet body"),
+        "older name renders: {listed}"
+    );
+    assert!(
+        listed.contains("Insert"),
+        "the button strip renders: {listed}"
+    );
+}
+
+#[tokio::test]
+async fn snippets_picker_keyboard_insert_into_composer() {
+    // The keyboard path: open the picker, navigate to the older snippet, and
+    // Enter inserts it into the composer at the caret.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("older snippet text"));
+    app.push_transcript_item(TranscriptItem::assistant("newest snippet text"));
+
+    // Save both as snippets via the real save verb.
+    triple_click_row(&mut app, "older snippet text");
+    handle_key(&mut app, &mut agent, save_snippet_key())
+        .await
+        .unwrap();
+    triple_click_row(&mut app, "newest snippet text");
+    handle_key(&mut app, &mut agent, save_snippet_key())
+        .await
+        .unwrap();
+    assert_eq!(app.snippets.len(), 2);
+
+    app.snippets_open = true;
+    app.input.clear();
+    app.input_cursor = 0;
+
+    // Move down to the older snippet, then insert it.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        app.input, "older snippet text",
+        "Enter inserted the selected (older) snippet into the composer"
+    );
+    assert!(!app.snippets_open, "inserting closes the picker");
+}
+
+#[tokio::test]
+async fn snippets_picker_keyboard_queue_stages_a_prompt() {
+    // `q` stages the selected snippet onto the prompt queue without closing the
+    // picker, so several can be queued in a row.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("queue me snippet"));
+    triple_click_row(&mut app, "queue me snippet");
+    handle_key(&mut app, &mut agent, save_snippet_key())
+        .await
+        .unwrap();
+    app.snippets_open = true;
+    let before = app.prompt_queue.len();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        app.prompt_queue.len(),
+        before + 1,
+        "the snippet was staged onto the queue"
+    );
+    assert_eq!(
+        app.prompt_queue.back().map(String::as_str),
+        Some("queue me snippet")
+    );
+    assert!(app.snippets_open, "queueing keeps the picker open");
+}
+
+#[tokio::test]
+async fn snippets_picker_keyboard_delete_and_clear() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let src = |row: usize, text: &str| snippet_store::SnippetSource {
+        surface: snippet_store::SnippetSurface::Main,
+        row_start: row,
+        row_end: row,
+        chars: text.chars().count(),
+        bytes: text.len(),
+    };
+    app.snippets.save("a", src(0, "a"));
+    app.snippets.save("b", src(1, "b"));
+    app.snippets.save("c", src(2, "c"));
+    app.snippets_open = true;
+
+    // `d` deletes the selected (newest) snippet.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.snippets.len(), 2, "one snippet deleted");
+
+    // `c` clears the rest.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.snippets.is_empty(), "the stash was cleared");
+    assert_eq!(app.status, "snippets cleared");
+}
+
+#[tokio::test]
+async fn snippets_picker_esc_closes_without_leaking_to_composer() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.snippets.save(
+        "x",
+        snippet_store::SnippetSource {
+            surface: snippet_store::SnippetSurface::Main,
+            row_start: 0,
+            row_end: 0,
+            chars: 1,
+            bytes: 1,
+        },
+    );
+    app.snippets_open = true;
+    app.input.clear();
+
+    // A character key inside the open picker is swallowed (modal), not typed.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.input, "", "keys are swallowed while the picker is open");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(!app.snippets_open, "Esc closes the picker");
+}
+
+#[tokio::test]
+async fn snippets_picker_mouse_click_selects_and_double_click_inserts() {
+    // The mouse path: render the picker (populating the click registry), click a
+    // row to select it, then double-click to insert it into the composer.
+    let mut app = test_app(SessionMode::Build);
+    let src = |row: usize, text: &str| snippet_store::SnippetSource {
+        surface: snippet_store::SnippetSurface::Main,
+        row_start: row,
+        row_end: row,
+        chars: text.chars().count(),
+        bytes: text.len(),
+    };
+    app.snippets.save("oldest body", src(0, "oldest body"));
+    app.snippets.save("newest body", src(1, "newest body"));
+    app.snippets_open = true;
+
+    // Render through the real `render()` so the picker registers its row targets.
+    let _ = render_to_string(&app, 100, 24);
+
+    let older_id = app.snippets.snippets()[1].id;
+    let cell = queue_cell_for(
+        &app,
+        100,
+        24,
+        interaction::TargetKey::SnippetEntry(older_id),
+        interaction::Action::SnippetSelect(older_id),
+    )
+    .expect("older snippet row should be a registered click target");
+
+    // Single click selects the older row.
+    handle_mouse(&mut app, left_down(cell.0, cell.1, KeyModifiers::NONE));
+    assert_eq!(
+        app.snippets.selected_snippet().map(|s| s.id),
+        Some(older_id),
+        "clicking the older row selected it"
+    );
+
+    // A second click on the same row (a double-click) inserts it.
+    app.input.clear();
+    app.input_cursor = 0;
+    handle_mouse(&mut app, left_down(cell.0, cell.1, KeyModifiers::NONE));
+    assert_eq!(
+        app.input, "oldest body",
+        "the double-click inserted the older snippet into the composer"
+    );
+    assert!(!app.snippets_open, "inserting closes the picker");
+}
+
+#[tokio::test]
+async fn snippets_picker_survives_narrow_resize() {
+    let mut app = test_app(SessionMode::Build);
+    let src = |row: usize, text: &str| snippet_store::SnippetSource {
+        surface: snippet_store::SnippetSurface::Main,
+        row_start: row,
+        row_end: row,
+        chars: text.chars().count(),
+        bytes: text.len(),
+    };
+    app.snippets.save("payload one", src(0, "payload one"));
+    app.snippets.save("payload two", src(1, "payload two"));
+    app.snippets_open = true;
+
+    for (w, h) in [(20u16, 6u16), (40, 10), (120, 40)] {
+        let out = render_to_string(&app, w, h);
+        assert!(out.contains("snippet"), "title visible at {w}x{h}: {out}");
+    }
+}
+
+// =====================================================================
 // §12.1.6 Multi-Cursor-Like Transcript Selection.
 // End-to-end through `handle_key` (Alt+d add, Ctrl+Alt+Y combined copy),
 // `handle_mouse` (modifier-click add/toggle), the real `render()`

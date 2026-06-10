@@ -61,6 +61,10 @@ pub(crate) enum TargetKey {
     /// its stable per-entry id (NOT its list index) so an eviction mid-gesture
     /// never shifts the hit target.
     ClipboardEntry(u64),
+    /// A snippet row in the Prompt Snippets picker overlay (§12.3.2), addressed
+    /// by its stable per-snippet id (NOT its list index) so a delete/drop
+    /// mid-gesture never shifts the hit target.
+    SnippetEntry(u64),
     /// A chrome affordance that carries no entry/row id.
     Chrome(ChromeKey),
 }
@@ -187,6 +191,14 @@ pub(crate) enum ChromeKey {
     /// affordance with no identity of its own; a left click anywhere on the line
     /// dismisses the shown hint — the mouse twin of the `DismissFirstRunHint` verb.
     FirstRunHint,
+    /// The "Insert" button in the Prompt Snippets picker (§12.3.2).
+    SnippetInsert,
+    /// The "Queue" button in the Prompt Snippets picker (§12.3.2).
+    SnippetQueue,
+    /// The "Delete" button in the Prompt Snippets picker (§12.3.2).
+    SnippetDelete,
+    /// The "Clear all" button in the Prompt Snippets picker (§12.3.2).
+    SnippetClear,
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -374,6 +386,23 @@ pub(crate) enum Action {
     /// the `DismissFirstRunHint` keyboard verb; a click on the dim hint strip retires
     /// the hint (latched seen for the session) so it never returns.
     DismissFirstRunHint,
+    /// Select the given snippet (by stable id) in the Prompt Snippets picker
+    /// (§12.3.2). Mouse twin of the picker's Up/Down arrows. Fed by a single click
+    /// on a snippet row.
+    SnippetSelect(u64),
+    /// Insert the given snippet (by stable id) into the composer (§12.3.2). Mouse
+    /// twin of the picker's Enter verb / the "Insert" button. Fed by a double-click
+    /// on a snippet row.
+    SnippetInsertCompose(u64),
+    /// Stage the given snippet (by stable id) onto the prompt queue (§12.3.2).
+    /// Mouse twin of the picker's `q` verb / the "Queue" button.
+    SnippetEnqueue(u64),
+    /// Delete the given snippet (by stable id) from the store (§12.3.2). Mouse
+    /// twin of the picker's `d` verb / the "Delete" button.
+    SnippetDelete(u64),
+    /// Clear every saved snippet (§12.3.2). Mouse twin of the picker's `c` verb /
+    /// the "Clear all" button.
+    SnippetClear,
 }
 
 impl Action {
@@ -428,6 +457,11 @@ impl Action {
         Action::BreadcrumbActivate(0),
         Action::OpenRenameForEntry(EntryId(0)),
         Action::DismissFirstRunHint,
+        Action::SnippetSelect(0),
+        Action::SnippetInsertCompose(0),
+        Action::SnippetEnqueue(0),
+        Action::SnippetDelete(0),
+        Action::SnippetClear,
     ];
 }
 

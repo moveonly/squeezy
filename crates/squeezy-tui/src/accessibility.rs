@@ -732,6 +732,15 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // (Ctrl+Alt+N default). The dim hint strip's click and the keyboard verb both
         // drive the same `dismiss_first_run_hint` handler.
         A::DismissFirstRunHint => KeyboardPath::Keymap(Action::DismissFirstRunHint),
+        // Prompt Snippets picker (§12.3.2) — the picker's own key handler owns
+        // Up/Down (select), Enter (insert into the composer), `q` (queue), `d`
+        // (delete), and `c` (clear) before the global keymap sees them, so every
+        // mouse affordance routes to the same handler its picker key drives.
+        A::SnippetSelect(_) => KeyboardPath::Always("snippets Up/Down"),
+        A::SnippetInsertCompose(_) => KeyboardPath::Always("snippets Enter"),
+        A::SnippetEnqueue(_) => KeyboardPath::Always("snippets q"),
+        A::SnippetDelete(_) => KeyboardPath::Always("snippets d"),
+        A::SnippetClear => KeyboardPath::Always("snippets c"),
     })
 }
 

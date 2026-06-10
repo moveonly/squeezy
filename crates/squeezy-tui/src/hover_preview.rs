@@ -138,9 +138,10 @@ pub(crate) fn policy_for(key: TargetKey) -> PointerActivationPolicy {
         // behind explicit targets); they are inert under the shared
         // double-click/preview contract so a stray double-click can never fire a
         // delete/clear/reorder by accident.
-        TargetKey::QueueItem(_) | TargetKey::ClipboardEntry(_) | TargetKey::Chrome(_) => {
-            PointerActivationPolicy::inert()
-        }
+        TargetKey::QueueItem(_)
+        | TargetKey::ClipboardEntry(_)
+        | TargetKey::SnippetEntry(_)
+        | TargetKey::Chrome(_) => PointerActivationPolicy::inert(),
     }
 }
 

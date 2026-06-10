@@ -81,6 +81,15 @@ pub(crate) enum Action {
     /// disjoint range plus the live one as one combined payload (`Ctrl+Alt+Y`
     /// default), distinct blocks separated by a blank line.
     CopyMultiSelection,
+    /// Prompt Snippets From Selection (§12.3.2): save the active main-view visual
+    /// selection as a reusable named prompt snippet (`Alt+3` default). With no
+    /// live selection it is a no-op and falls through so the key keeps its normal
+    /// meaning.
+    SaveSnippetFromSelection,
+    /// Prompt Snippets From Selection (§12.3.2): toggle the saved-snippets picker
+    /// overlay (`Ctrl+Alt+S` default), from which a snippet inserts into the
+    /// composer or is staged onto the prompt queue.
+    ToggleSnippets,
     /// Restore the most recently cancelled prompt back into the
     /// composer (`Ctrl+R` default).
     RestoreCancelledPrompt,
@@ -405,6 +414,8 @@ impl Action {
             Self::QuoteSelectionToCompose => "quote_selection_to_compose",
             Self::AddSelectionToSet => "add_selection_to_set",
             Self::CopyMultiSelection => "copy_multi_selection",
+            Self::SaveSnippetFromSelection => "save_snippet_from_selection",
+            Self::ToggleSnippets => "toggle_snippets",
             Self::RestoreCancelledPrompt => "restore_cancelled_prompt",
             Self::ScrollTranscriptPageUp => "page_up",
             Self::ScrollTranscriptPageDown => "page_down",
@@ -476,6 +487,8 @@ impl Action {
         Action::QuoteSelectionToCompose,
         Action::AddSelectionToSet,
         Action::CopyMultiSelection,
+        Action::SaveSnippetFromSelection,
+        Action::ToggleSnippets,
         Action::RestoreCancelledPrompt,
         Action::ScrollTranscriptPageUp,
         Action::ScrollTranscriptPageDown,
@@ -580,6 +593,13 @@ impl Action {
             // terminals, tmux, and SSH as the rest of the copy/nav family.
             | Self::AddSelectionToSet
             | Self::CopyMultiSelection
+            // Prompt Snippets From Selection (§12.3.2): save-from-selection is
+            // `Alt+3` (an Alt+digit chord) and the picker toggle is `Ctrl+Alt+S`
+            // (a Ctrl+Alt/Meta chord) — both the classically-unreliable Meta/Alt
+            // encoding case across Linux terminals, tmux, and SSH as the rest of
+            // the nav/copy/overlay family.
+            | Self::SaveSnippetFromSelection
+            | Self::ToggleSnippets
             | Self::JumpPrevUserTurn
             | Self::JumpNextUserTurn
             | Self::JumpPrevAssistant
@@ -752,6 +772,22 @@ impl Action {
             Self::AddSelectionToSet => KeyBinding::new(KeyCode::Char('d'), KeyModifiers::ALT),
             Self::CopyMultiSelection => KeyBinding::new(
                 KeyCode::Char('y'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Prompt Snippets From Selection (§12.3.2). `Alt+3` saves the active
+            // selection as a snippet — the next free `Alt`+digit after `Alt+1`
+            // (hover preview) and `Alt+2` (breadcrumbs); every bare `Alt` letter in
+            // the nav/copy/overlay family is taken, so the digit is the free,
+            // composer-clear pick. The picker overlay opens with `Ctrl+Alt+S` —
+            // `S` recalls "Snippet" and follows the `Ctrl+Alt+letter` style
+            // (`Ctrl+Alt+L`/`Ctrl+Alt+M`/`Ctrl+Alt+P`); bare `Alt+s` is already the
+            // turn-outline overlay, so the Ctrl+Alt modifier keeps the picker
+            // distinct and clear of every composer chord.
+            Self::SaveSnippetFromSelection => {
+                KeyBinding::new(KeyCode::Char('3'), KeyModifiers::ALT)
+            }
+            Self::ToggleSnippets => KeyBinding::new(
+                KeyCode::Char('s'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
             Self::RestoreCancelledPrompt => {

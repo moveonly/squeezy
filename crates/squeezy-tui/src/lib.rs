@@ -148,6 +148,7 @@ mod session_timeline;
 mod settings_watcher;
 mod signal_teardown;
 mod size_source;
+mod snippet_store;
 mod startup_model_picker;
 mod status;
 mod status_line_setup;
@@ -1796,6 +1797,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.paste_transform.is_some()
         || app.paste_staging.is_some()
         || app.clipboard_history_open
+        || app.snippets_open
         || app.transcript_index_open
         || app.related_links_open
         || app.duplicate_folds_open
@@ -2441,6 +2443,42 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                 ) => {
                     app.clipboard_history.select_id(id);
                     recopy_clipboard_entry(app, id);
+                }
+                _ => dispatch_click_action(app, action),
+            }
+        }
+        return true;
+    }
+
+    // The Prompt Snippets picker (§12.3.2) owns the pointer while open: a
+    // left-click on a snippet row selects it, a double-click inserts it into the
+    // composer, and a click on a button runs its verb. Every other click is
+    // swallowed so a stray press can't fall through to the surface beneath.
+    // Hit-tested in ABSOLUTE screen coordinates against the targets the picker
+    // registered this frame.
+    if app.snippets_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((key, action)) = app.click_target_at(mouse.column, mouse.row)
+            && matches!(
+                key,
+                interaction::TargetKey::SnippetEntry(_) | interaction::TargetKey::Chrome(_)
+            )
+        {
+            // A second click on the SAME row within the multi-click window
+            // promotes a select into an insert, so a double-click inserts into the
+            // composer — the mouse twin of Enter. The recognizer keys multiplicity
+            // on the target id, so a 1-cell jitter still counts as a double.
+            let now = std::time::Instant::now();
+            let gesture =
+                app.gestures
+                    .recognize(interaction::Phase::Press, Some((key, action)), now);
+            match (gesture, action) {
+                (
+                    interaction::Gesture::DoubleClick { .. }
+                    | interaction::Gesture::TripleClick { .. },
+                    interaction::Action::SnippetSelect(id),
+                ) => {
+                    insert_snippet_into_composer(app, id);
                 }
                 _ => dispatch_click_action(app, action),
             }
@@ -3657,6 +3695,216 @@ fn quote_selection_to_compose(app: &mut TuiApp) -> bool {
     true
 }
 
+/// Prompt Snippets From Selection (§12.3.2): save the active visual selection as
+/// a reusable named snippet. The clean text comes from the selection's own
+/// painted surface (the same gutter-stripped projection a copy/quote uses), so
+/// the snippet stores clean prose/code rather than rail chrome. The name is
+/// derived from the snippet's first non-empty line, and the originating row span
+/// + size are retained as internal provenance.
+///
+/// Returns `true` only when a non-empty selection was saved; `false` leaves the
+/// store untouched so the key falls through.
+fn save_snippet_from_selection(app: &mut TuiApp) -> bool {
+    let Some(sel) = app.selection.clone() else {
+        return false;
+    };
+    if sel.is_empty() {
+        return false;
+    }
+    let rows = selection_surface_rows(app, sel.surface);
+    let text = selection::selection_clean_text(&rows, &sel);
+    if text.trim().is_empty() {
+        return false;
+    }
+    let (start, end) = sel.normalized();
+    let surface = match sel.surface {
+        selection::SelectionSurface::Main => snippet_store::SnippetSurface::Main,
+        selection::SelectionSurface::Overlay => snippet_store::SnippetSurface::Overlay,
+    };
+    let source = snippet_store::SnippetSource {
+        surface,
+        row_start: start.row,
+        row_end: end.row,
+        chars: text.chars().count(),
+        bytes: text.len(),
+    };
+    let Some(id) = app.snippets.save(&text, source) else {
+        return false;
+    };
+    // The selection is consumed into the stash; drop it so the next gesture
+    // starts fresh, matching the quote-to-compose verb.
+    app.selection = None;
+    let large = app
+        .snippets
+        .snippets()
+        .iter()
+        .find(|s| s.id == id)
+        .is_some_and(snippet_store::Snippet::is_large);
+    let rows = source.row_count();
+    let row_label = if rows == 1 {
+        "1 row".to_string()
+    } else {
+        format!("{rows} rows")
+    };
+    app.status = if large {
+        format!(
+            "saved large snippet ({row_label}, {} bytes) — Ctrl+Alt+S to insert · may bloat a prompt",
+            text.len()
+        )
+    } else {
+        format!(
+            "saved snippet ({row_label}, {} chars) — Ctrl+Alt+S to insert into composer or queue",
+            source.chars,
+        )
+    };
+    app.needs_redraw = true;
+    true
+}
+
+/// `"N snippets"` / `"1 snippet"` for the snippets picker status line.
+fn count_label_snippets(count: usize) -> String {
+    if count == 1 {
+        "1 snippet".to_string()
+    } else {
+        format!("{count} snippets")
+    }
+}
+
+/// `Ctrl+Alt+S`: toggle the saved-snippets picker overlay (§12.3.2).
+fn toggle_snippets(app: &mut TuiApp) {
+    app.snippets_open = !app.snippets_open;
+    app.status = if app.snippets_open {
+        if app.snippets.is_empty() {
+            "snippets (empty) — save one with Alt+3 over a selection · Esc to close".to_string()
+        } else {
+            format!(
+                "snippets: {} — ↑↓ select · Enter insert · q queue · d delete · c clear · Esc close",
+                count_label_snippets(app.snippets.len()),
+            )
+        }
+    } else {
+        "snippets closed".to_string()
+    };
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the snippets picker (§12.3.2) is open. Returns `true` when
+/// the key was consumed (so it never leaks to the composer or the global
+/// keymap). Mirrors the clipboard-history picker's before-the-global-keymap
+/// consumption: Esc/Ctrl+Alt+S close, Up/Down move the selection, Enter inserts
+/// the selected snippet into the composer, `q` stages it onto the prompt queue,
+/// `d` deletes it, and `c` clears the whole stash.
+fn handle_snippets_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.snippets_open {
+        return false;
+    }
+    // The picker's own toggle chord closes it, so the same key both opens and
+    // closes — without leaking to the global keymap, which the modal swallows.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleSnippets) {
+        app.snippets_open = false;
+        app.status = "snippets closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.snippets_open = false;
+            app.status = "snippets closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up => {
+            app.snippets.select_up();
+            app.needs_redraw = true;
+        }
+        KeyCode::Down => {
+            app.snippets.select_down();
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter => {
+            insert_selected_snippet_into_composer(app);
+        }
+        KeyCode::Char('q') => {
+            enqueue_selected_snippet(app);
+        }
+        KeyCode::Char('d') | KeyCode::Delete => {
+            delete_selected_snippet(app);
+        }
+        KeyCode::Char('c') => {
+            app.snippets.clear();
+            app.status = "snippets cleared".to_string();
+            app.needs_redraw = true;
+        }
+        // Swallow every other key so the picker is modal.
+        _ => {}
+    }
+    true
+}
+
+/// Insert the picker's selected snippet into the composer, close the picker, and
+/// confirm. A no-op when the stash is empty.
+fn insert_selected_snippet_into_composer(app: &mut TuiApp) {
+    let Some(id) = app.snippets.selected_snippet().map(|s| s.id) else {
+        return;
+    };
+    insert_snippet_into_composer(app, id);
+}
+
+/// Insert the snippet with `id` into the composer at the caret, close the picker,
+/// and confirm. Resolved by stable id so a concurrent delete never inserts the
+/// wrong snippet. A no-op when no such snippet exists.
+fn insert_snippet_into_composer(app: &mut TuiApp, id: u64) {
+    let Some(text) = app.snippets.text_of(id).map(str::to_string) else {
+        return;
+    };
+    app.snippets.select_id(id);
+    input::insert_input_text(app, &text);
+    app.snippets_open = false;
+    app.status = format!("inserted snippet into composer ({} bytes)", text.len());
+    app.needs_redraw = true;
+}
+
+/// Stage the picker's selected snippet onto the prompt queue and confirm. A
+/// no-op when the stash is empty. The picker stays open so several snippets can
+/// be queued in a row.
+fn enqueue_selected_snippet(app: &mut TuiApp) {
+    let Some(id) = app.snippets.selected_snippet().map(|s| s.id) else {
+        return;
+    };
+    enqueue_snippet(app, id);
+}
+
+/// Stage the snippet with `id` onto the back of the prompt queue and confirm.
+/// Resolved by stable id so a concurrent delete never queues the wrong snippet.
+/// A no-op when no such snippet exists.
+fn enqueue_snippet(app: &mut TuiApp, id: u64) {
+    let Some(text) = app.snippets.text_of(id).map(str::to_string) else {
+        return;
+    };
+    app.snippets.select_id(id);
+    app.prompt_queue.push_back(text);
+    app.status = format!("queued snippet ({} in queue)", app.prompt_queue.len());
+    app.needs_redraw = true;
+}
+
+/// Delete the picker's selected snippet from the store and confirm. A no-op when
+/// the stash is empty.
+fn delete_selected_snippet(app: &mut TuiApp) {
+    let Some(id) = app.snippets.selected_snippet().map(|s| s.id) else {
+        return;
+    };
+    if app.snippets.delete(id) {
+        app.status = if app.snippets.is_empty() {
+            "deleted snippet (stash now empty)".to_string()
+        } else {
+            format!(
+                "deleted snippet ({} left)",
+                count_label_snippets(app.snippets.len())
+            )
+        };
+        app.needs_redraw = true;
+    }
+}
+
 fn handle_transcript_overlay_mouse(
     app: &mut TuiApp,
     mouse: crossterm::event::MouseEvent,
@@ -4156,6 +4404,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // key never leaks into the composer underneath. Sits beside the paste modal
     // at the front for the same reason.
     if app.clipboard_history_open && handle_clipboard_history_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Prompt Snippets picker (§12.3.2) is modal while open: it owns the
+    // keyboard (↑↓ select, Enter insert, q queue, d delete, c clear, Esc close)
+    // BEFORE any selection-clear, search, chord, or keymap dispatch, so a stray
+    // key never leaks into the composer underneath. Sits beside the clipboard
+    // picker at the front for the same reason.
+    if app.snippets_open && handle_snippets_key(app, key) {
         return Ok(false);
     }
 
@@ -5758,6 +6015,31 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             copy_multi_selection(app)
+        }
+        keymap::Action::SaveSnippetFromSelection => {
+            // §12.3.2: save the active main-view selection as a snippet. Guarded
+            // like the other selection verbs so a modal/config surface owns its
+            // keys; only fires with a live main-view selection, otherwise the key
+            // falls through.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            let main_selection_active = app
+                .selection
+                .as_ref()
+                .is_some_and(|s| s.surface == selection::SelectionSurface::Main);
+            if !main_selection_active {
+                return false;
+            }
+            save_snippet_from_selection(app)
+        }
+        keymap::Action::ToggleSnippets => {
+            // §12.3.2: toggle the saved-snippets picker overlay.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_snippets(app);
+            true
         }
         keymap::Action::RestoreCancelledPrompt => {
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
@@ -8032,6 +8314,7 @@ fn first_run_hint_suppressed(app: &TuiApp) -> bool {
         || app.paste_transform.is_some()
         || app.paste_staging.is_some()
         || app.clipboard_history_open
+        || app.snippets_open
         || app.search.is_some()
         || app.pending_approval.is_some()
         || app.pending_request_user_input.is_some()
@@ -11369,6 +11652,30 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::ClipboardClear => {
             app.clipboard_history.clear();
             app.status = "clipboard history cleared".to_string();
+            app.needs_redraw = true;
+        }
+        // Prompt Snippets picker (§12.3.2). Each routes through the same handler
+        // the keyboard verb drives, so mouse/keyboard parity holds by
+        // construction. Select resolves the row by its stable id; insert/queue/
+        // delete act on it; clear wipes the whole stash.
+        interaction::Action::SnippetSelect(id) => {
+            if app.snippets.select_id(id) {
+                app.needs_redraw = true;
+            }
+        }
+        interaction::Action::SnippetInsertCompose(id) => {
+            insert_snippet_into_composer(app, id);
+        }
+        interaction::Action::SnippetEnqueue(id) => {
+            enqueue_snippet(app, id);
+        }
+        interaction::Action::SnippetDelete(id) => {
+            app.snippets.select_id(id);
+            delete_selected_snippet(app);
+        }
+        interaction::Action::SnippetClear => {
+            app.snippets.clear();
+            app.status = "snippets cleared".to_string();
             app.needs_redraw = true;
         }
         // External Editor Handoff confirmation overlay (§12.6.5): clicking a
@@ -17389,6 +17696,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_clipboard_history_surface(frame, area, app);
         return;
     }
+    // The Prompt Snippets picker (§12.3.2) paints as a fullscreen overlay over
+    // everything else while open, registering its per-snippet row + button click
+    // targets every frame. Checked beside the clipboard picker so its targets
+    // register and it owns the surface while open.
+    if app.snippets_open {
+        render_snippets_surface(frame, area, app);
+        return;
+    }
     // The Local Transcript Index overlay (§12.5.1) paints as a fullscreen summary
     // over everything else while open, registering its per-category row click
     // targets every frame. Checked beside the clipboard picker so its targets
@@ -18330,6 +18645,254 @@ fn render_clipboard_history_buttons(frame: &mut Frame<'_>, inner: Rect, app: &Tu
                 },
                 interaction::TargetKey::Chrome(interaction::ChromeKey::ClipboardClear),
                 interaction::Action::ClipboardClear,
+            );
+        }
+    }
+}
+
+/// Paint the Prompt Snippets picker (§12.3.2) as a centered modal: a title, a
+/// header with the snippet count + total bytes (or an empty-state hint), the
+/// windowed list of snippet rows, and a bottom button strip. Mirrors the
+/// clipboard-history picker's layout so the two overlays read consistently.
+fn render_snippets_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Prompt snippets ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "— reusable bits saved from selections (Alt+3) ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 100, 24, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let total_bytes: usize = app.snippets.snippets().iter().map(|s| s.bytes()).sum();
+    let header = if app.snippets.is_empty() {
+        Line::from(Span::styled(
+            "No snippets yet — select transcript text and press Alt+3 to save one here.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} · {total_bytes} bytes total · ↑↓ select · Enter insert · q queue · d delete · c clear",
+                count_label_snippets(app.snippets.len()),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let header_rect = Rect { height: 1, ..inner };
+    frame.render_widget(Paragraph::new(header), header_rect);
+
+    // The list occupies the rows between the header and the bottom button strip
+    // (last inner row, second-to-last a gap).
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height).saturating_sub(2);
+    if list_bottom > list_top {
+        let list_rect = Rect {
+            x: inner.x,
+            y: list_top,
+            width: inner.width,
+            height: list_bottom - list_top,
+        };
+        render_snippets_list(frame, list_rect, app);
+    }
+
+    render_snippets_buttons(frame, inner, app);
+}
+
+/// Paint the windowed list of snippet rows into `list_rect` and register each
+/// visible row's rect as a [`interaction::TargetKey::SnippetEntry`] click target.
+/// The window scrolls to keep the selected row visible; each row shows the
+/// snippet name, a `[large]` tag when it is big enough to bloat a prompt, and a
+/// bounded one-line preview of the body.
+fn render_snippets_list(frame: &mut Frame<'_>, list_rect: Rect, app: &TuiApp) {
+    let snippets = app.snippets.snippets();
+    if snippets.is_empty() || list_rect.height == 0 {
+        return;
+    }
+    let rows = list_rect.height as usize;
+    let selected = app.snippets.selected_index();
+    // Scroll the window so the selected row stays visible.
+    let start = selected
+        .saturating_sub(rows.saturating_sub(1))
+        .min(snippets.len().saturating_sub(rows.min(snippets.len())));
+    let end = (start + rows).min(snippets.len());
+
+    for (offset, snippet) in snippets[start..end].iter().enumerate() {
+        let index = start + offset;
+        let is_selected = index == selected;
+        let row_y = list_rect.y + offset as u16;
+        let row_rect = Rect {
+            x: list_rect.x,
+            y: row_y,
+            width: list_rect.width,
+            height: 1,
+        };
+
+        let marker = if is_selected { "› " } else { "  " };
+        // ASCII tag (not an emoji) so the marker is terminal-safe, fixed width,
+        // and screen-reader-friendly — matching the rest of Squeezy's chrome.
+        let large = if snippet.is_large() { "[large] " } else { "" };
+        let name_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(format!("{large}{}", snippet.name), name_style),
+            Span::styled(
+                format!("  {}", snippet.preview()),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole row as a click target keyed by the snippet's stable
+        // id (NOT its index), so a click selects/inserts the right snippet even
+        // after a delete/drop reshuffles the list.
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::SnippetEntry(snippet.id),
+            interaction::Action::SnippetSelect(snippet.id),
+        );
+    }
+}
+
+/// Paint the `[ Insert ]` / `[ Queue ]` / `[ Delete ]` / `[ Clear all ]` button
+/// strip on the modal's bottom inner row and register each button's rect as a
+/// chrome click target. The insert/queue/delete buttons act on the
+/// currently-selected snippet (resolved by id at click time); they are still
+/// painted (greyed) on an empty stash but register no target.
+fn render_snippets_buttons(frame: &mut Frame<'_>, inner: Rect, app: &TuiApp) {
+    const INSERT: &str = "[ Insert (Enter) ]";
+    const QUEUE: &str = "[ Queue (q) ]";
+    const DELETE: &str = "[ Delete (d) ]";
+    const CLEAR: &str = "[ Clear all (c) ]";
+    let row = inner.y + inner.height.saturating_sub(1);
+    let has_snippets = !app.snippets.is_empty();
+
+    let accent = crate::render::theme::accent();
+    let quiet = crate::render::theme::quiet();
+    let active = if has_snippets { accent } else { quiet };
+    let strip = Line::from(vec![
+        Span::styled(
+            INSERT,
+            Style::default().fg(active).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(QUEUE, Style::default().fg(active)),
+        Span::raw("  "),
+        Span::styled(DELETE, Style::default().fg(active)),
+        Span::raw("  "),
+        Span::styled(CLEAR, Style::default().fg(quiet)),
+    ]);
+    let strip_rect = Rect {
+        x: inner.x,
+        y: row,
+        width: inner.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(strip), strip_rect);
+
+    // Register button rects left-to-right, clamped to the inner width. The
+    // insert/queue/delete buttons only register when there is a selected snippet
+    // to act on; clear-all always registers (valid on any non-empty stash).
+    let selected_id = app.snippets.selected_snippet().map(|s| s.id);
+    let mut x = inner.x;
+    let right = inner.x.saturating_add(inner.width);
+
+    if let Some(id) = selected_id {
+        let w = (INSERT.chars().count() as u16).min(right.saturating_sub(x));
+        if w > 0 {
+            app.register_click(
+                Rect {
+                    x,
+                    y: row,
+                    width: w,
+                    height: 1,
+                },
+                interaction::TargetKey::Chrome(interaction::ChromeKey::SnippetInsert),
+                interaction::Action::SnippetInsertCompose(id),
+            );
+        }
+    }
+    x = x
+        .saturating_add(INSERT.chars().count() as u16)
+        .saturating_add(2);
+
+    if let Some(id) = selected_id
+        && x < right
+    {
+        let w = (QUEUE.chars().count() as u16).min(right.saturating_sub(x));
+        if w > 0 {
+            app.register_click(
+                Rect {
+                    x,
+                    y: row,
+                    width: w,
+                    height: 1,
+                },
+                interaction::TargetKey::Chrome(interaction::ChromeKey::SnippetQueue),
+                interaction::Action::SnippetEnqueue(id),
+            );
+        }
+    }
+    x = x
+        .saturating_add(QUEUE.chars().count() as u16)
+        .saturating_add(2);
+
+    if let Some(id) = selected_id
+        && x < right
+    {
+        let w = (DELETE.chars().count() as u16).min(right.saturating_sub(x));
+        if w > 0 {
+            app.register_click(
+                Rect {
+                    x,
+                    y: row,
+                    width: w,
+                    height: 1,
+                },
+                interaction::TargetKey::Chrome(interaction::ChromeKey::SnippetDelete),
+                interaction::Action::SnippetDelete(id),
+            );
+        }
+    }
+    x = x
+        .saturating_add(DELETE.chars().count() as u16)
+        .saturating_add(2);
+
+    if has_snippets && x < right {
+        let w = (CLEAR.chars().count() as u16).min(right.saturating_sub(x));
+        if w > 0 {
+            app.register_click(
+                Rect {
+                    x,
+                    y: row,
+                    width: w,
+                    height: 1,
+                },
+                interaction::TargetKey::Chrome(interaction::ChromeKey::SnippetClear),
+                interaction::Action::SnippetClear,
             );
         }
     }
@@ -32529,6 +33092,15 @@ pub(crate) struct TuiApp {
     /// picker owns key/mouse routing. Toggled by the `ToggleClipboardHistory`
     /// keymap action.
     pub(crate) clipboard_history_open: bool,
+    /// Prompt Snippets From Selection (§12.3.2): a bounded, session-scoped store
+    /// of named prompt snippets captured from transcript selections. Drives the
+    /// picker overlay; starts empty and stays cheap at idle.
+    pub(crate) snippets: snippet_store::SnippetStore,
+    /// Whether the saved-snippets picker overlay (§12.3.2) is open. `false` =
+    /// closed (the resting state, paints nothing extra); `true` = the fullscreen
+    /// picker owns key/mouse routing. Toggled by the `ToggleSnippets` keymap
+    /// action.
+    pub(crate) snippets_open: bool,
     /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
     /// keyed by stable entry id and grouped by category (user turns, tool calls,
     /// errors, …). Rebuilt incrementally — only when the transcript's
@@ -33386,6 +33958,8 @@ impl TuiApp {
             clipboard_chain: build_clipboard_chain(Box::new(clipboard::RealSink)),
             clipboard_history: clipboard_history::ClipboardHistoryStore::new(),
             clipboard_history_open: false,
+            snippets: snippet_store::SnippetStore::new(),
+            snippets_open: false,
             transcript_index: transcript_index::TranscriptIndex::new(),
             transcript_index_open: false,
             transcript_index_selected: 0,
