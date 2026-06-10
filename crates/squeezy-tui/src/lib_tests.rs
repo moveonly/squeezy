@@ -27589,3 +27589,287 @@ async fn duplicate_folds_renders_across_resizes() {
         );
     }
 }
+
+// ===========================================================================
+// Error Lenses (§12.5.6) — integration tests driving the real `render()` /
+// `handle_key` / `handle_mouse` paths through the TestBackend.
+// ===========================================================================
+
+/// Build an app whose transcript has a failed tool result carrying a multi-line
+/// error output (a rustc diagnostic with a `file:line:col` location plus a
+/// permission error), a *successful* tool whose output merely *mentions* "error"
+/// (which must NOT produce a lens — structured success wins), and a user prompt.
+/// Seeds a deterministic viewport so geometry is host-independent.
+fn app_with_failed_output() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    app.push_transcript_item(TranscriptItem::user("build it".to_string()));
+    // A successful tool whose output contains the word "error" but is NOT a
+    // failure: it must contribute no lens.
+    app.push_tool_result(sample_tool_result(
+        "shell",
+        "checked for errors: none found\nok",
+    ));
+    // A FAILED tool with two actionable error lines, one carrying a location.
+    let mut failed = sample_tool_result(
+        "shell",
+        "error[E0277]: the trait bound `T: Foo` is not satisfied\n  \
+         --> src/lib.rs:12:9\ncp: cannot create '/etc/x': Permission denied",
+    );
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+    app
+}
+
+#[tokio::test]
+async fn error_lens_alt_x_opens_overlay_and_lists_lenses() {
+    let mut app = app_with_failed_output();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+x opens the error-lens overlay");
+
+    assert!(app.error_lens_open, "Alt+x opens the overlay");
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Error lenses"), "header present:\n{out}");
+    // The failed tool contributes a rustc lens (and its location line) plus a
+    // permission lens; the successful tool contributes nothing.
+    assert!(
+        app.error_lenses.count_of(error_lens::ErrorClass::Rustc) >= 1,
+        "rustc lens detected",
+    );
+    assert_eq!(
+        app.error_lenses
+            .count_of(error_lens::ErrorClass::Permission),
+        1,
+        "permission lens detected",
+    );
+    // The extracted location and a class tag appear in the painted rows.
+    assert!(out.contains("src/lib.rs:12:9"), "location row:\n{out}");
+    assert!(out.contains("[rustc]"), "class tag row:\n{out}");
+}
+
+#[tokio::test]
+async fn error_lens_keyboard_navigates_and_jumps() {
+    let mut app = app_with_failed_output();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open lenses");
+    let _ = render_to_string(&app, 80, 24);
+    assert_eq!(
+        app.error_lens_selected, 0,
+        "cursor starts at the first lens"
+    );
+
+    // Down moves the cursor.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down moves cursor");
+    assert_eq!(app.error_lens_selected, 1, "Down advances the lens cursor");
+
+    // Up moves it back.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("up moves cursor");
+    assert_eq!(app.error_lens_selected, 0, "Up retreats the lens cursor");
+
+    // Enter jumps to the failing entry behind the selected lens and walks the
+    // cursor forward (the "Enter for next" idiom).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter jumps");
+    assert!(
+        app.status.contains("error lens"),
+        "status reflects the jump: {}",
+        app.status,
+    );
+    assert_eq!(
+        app.error_lens_selected, 1,
+        "Enter walks the cursor forward to the next lens",
+    );
+
+    // Esc closes the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc closes");
+    assert!(!app.error_lens_open, "Esc closes the overlay");
+}
+
+#[tokio::test]
+async fn error_lens_alt_x_toggles_closed_without_leaking() {
+    let mut app = app_with_failed_output();
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
+
+    handle_key(&mut app, &mut agent, chord).await.expect("open");
+    assert!(app.error_lens_open);
+    let _ = render_to_string(&app, 80, 24);
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("close");
+    assert!(!app.error_lens_open, "Alt+x toggles closed");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn error_lens_mouse_click_selects_and_jumps() {
+    let mut app = app_with_failed_output();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open lenses");
+    let _ = render_to_string(&app, 80, 24);
+
+    // Scan for a registered lens-row target.
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ErrorLensRow(idx)),
+                _,
+            )) = app.click_target_at(col, row)
+            {
+                // Find the SECOND row so the click changes the cursor off 0.
+                if idx == 1 {
+                    hit_cell = Some((col, row));
+                    break 'scan;
+                }
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("a lens row target is registered");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(
+        app.error_lens_selected, 1,
+        "clicking a lens row selects exactly that lens (no auto-advance)",
+    );
+    assert!(
+        app.status.contains("error lens"),
+        "click jumps and reports: {}",
+        app.status,
+    );
+    // The overlay stays open (the click jumped within it, not closed it).
+    assert!(app.error_lens_open);
+}
+
+#[tokio::test]
+async fn error_lens_empty_transcript_shows_empty_state() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open lenses on an empty transcript");
+
+    assert!(app.error_lens_open);
+    assert!(app.error_lenses.is_empty());
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Error lenses"), "header still paints:\n{out}");
+    assert!(
+        out.contains("No actionable errors"),
+        "empty-state line:\n{out}",
+    );
+
+    // Enter on an empty overlay is a harmless no-op (no panic, nothing jumps).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter on empty lenses");
+    assert!(app.error_lenses.is_empty());
+}
+
+#[tokio::test]
+async fn error_lens_successful_output_with_error_word_is_not_detected() {
+    // A transcript whose ONLY tool succeeded must produce no lenses even though
+    // its output literally contains "error" — structured status gates detection.
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    app.push_tool_result(sample_tool_result(
+        "shell",
+        "error: this is just text in a successful run\nall good",
+    ));
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open lenses");
+    assert!(
+        app.error_lenses.is_empty(),
+        "a successful tool contributes no lens",
+    );
+}
+
+#[tokio::test]
+async fn error_lens_renders_across_resizes() {
+    let mut app = app_with_failed_output();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open lenses");
+
+    for (w, h) in [(80u16, 24u16), (120, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Error lenses"),
+            "header paints at {w}x{h}:\n{out}",
+        );
+    }
+}

@@ -220,6 +220,14 @@ pub(crate) enum Action {
     /// toggles a span open. The fold model rebuilds incrementally only on a
     /// transcript revision bump, so an idle session pays nothing.
     ToggleDuplicateFolds,
+    /// Open / close the Error Lenses overlay (`Alt+x` default; §12.5.6). A
+    /// fullscreen list of the actionable error lines detected inside failed tool
+    /// outputs — each classified (rustc / cargo / test / permission / network /
+    /// panic / sandbox), carrying its message and any extracted `file:line`
+    /// location — with keyboard/mouse navigation that jumps the main view to the
+    /// failing entry. The lens model rebuilds incrementally only on a transcript
+    /// revision bump, so an idle session pays nothing.
+    ToggleErrorLens,
 }
 
 impl Action {
@@ -272,6 +280,7 @@ impl Action {
             Self::ToggleTranscriptIndex => "toggle_transcript_index",
             Self::ToggleRelatedLinks => "toggle_related_links",
             Self::ToggleDuplicateFolds => "toggle_duplicate_folds",
+            Self::ToggleErrorLens => "toggle_error_lens",
         }
     }
 
@@ -323,6 +332,7 @@ impl Action {
         Action::ToggleTranscriptIndex,
         Action::ToggleRelatedLinks,
         Action::ToggleDuplicateFolds,
+        Action::ToggleErrorLens,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -418,6 +428,9 @@ impl Action {
             // Duplicate-fold overlay toggle is `Alt+u` — the same Meta/Alt
             // encoding that is unreliable across Linux terminals, tmux, and SSH.
             | Self::ToggleDuplicateFolds
+            // Error-Lens overlay toggle is `Alt+x` — the same Meta/Alt encoding
+            // that is unreliable across Linux terminals, tmux, and SSH.
+            | Self::ToggleErrorLens
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -575,6 +588,11 @@ impl Action {
             // family (c/o/k/v/a/y/m/r/w/h/l/p/b/e/f/i/g) are taken, so `u` is the
             // free letter that stays clear of the composer chords.
             Self::ToggleDuplicateFolds => KeyBinding::new(KeyCode::Char('u'), KeyModifiers::ALT),
+            // Error Lenses (§12.5.6). `Alt+x` — `x` recalls "eXamine the error".
+            // Bare `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/r/w/h/l/p/
+            // b/e/f/i/g/u) are taken; `x` is free and stays clear of the composer
+            // chords.
+            Self::ToggleErrorLens => KeyBinding::new(KeyCode::Char('x'), KeyModifiers::ALT),
         }
     }
 }

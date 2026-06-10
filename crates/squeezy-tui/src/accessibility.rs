@@ -656,6 +656,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // sees them, so a row click and the keyboard reach the same
         // `duplicate_fold_activate_selected` handler.
         A::DuplicateFoldSelect(_) => KeyboardPath::Always("duplicate folds ↑↓/Enter"),
+        // Error Lenses overlay (§12.5.6) — the overlay's own key handler owns
+        // ↑↓/kj (move the lens cursor) and Enter/→/l (jump to the failing entry
+        // behind the selected lens) before the global keymap sees them, so a row
+        // click and the keyboard reach the same `error_lens_jump_to_selected`
+        // handler.
+        A::ErrorLensSelect(_) => KeyboardPath::Always("error lenses ↑↓/Enter"),
     })
 }
 

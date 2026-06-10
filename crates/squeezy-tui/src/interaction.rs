@@ -131,6 +131,10 @@ pub(crate) enum ChromeKey {
     /// its 0-based index in the span list so a click selects (and a second click
     /// jumps to / expands) exactly that fold.
     DuplicateFoldRow(usize),
+    /// An error-lens row in the Error Lenses overlay (§12.5.6), keyed by its
+    /// 0-based index in the detected-lens list so a click selects + jumps to the
+    /// failing entry behind exactly that lens.
+    ErrorLensRow(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -245,6 +249,11 @@ pub(crate) enum Action {
     /// toggle the span expanded/collapsed. Mouse twin of moving the cursor with
     /// ↑↓ and pressing Enter; a click selects, jumps, and toggles in one go.
     DuplicateFoldSelect(usize),
+    /// Select the given error-lens row in the Error Lenses overlay (§12.5.6):
+    /// move the cursor onto it and jump the main view to the failing entry behind
+    /// it. Mouse twin of moving the cursor with ↑↓ and pressing Enter; a click
+    /// both selects and jumps in one go.
+    ErrorLensSelect(usize),
 }
 
 impl Action {
@@ -285,6 +294,7 @@ impl Action {
         Action::TranscriptIndexSelect(0),
         Action::RelatedLinkSelect(0),
         Action::DuplicateFoldSelect(0),
+        Action::ErrorLensSelect(0),
     ];
 }
 

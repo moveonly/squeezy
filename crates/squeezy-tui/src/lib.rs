@@ -93,6 +93,7 @@ mod diff_detail_pane;
 mod dogfood;
 mod duplicate_fold;
 mod editor_handoff;
+mod error_lens;
 mod events;
 mod export_destination;
 mod fuzzy;
@@ -1780,6 +1781,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.transcript_index_open
         || app.related_links_open
         || app.duplicate_folds_open
+        || app.error_lens_open
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
     {
@@ -2395,6 +2397,24 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
                 interaction::TargetKey::Chrome(interaction::ChromeKey::DuplicateFoldRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Error Lenses overlay (§12.5.6) owns the pointer while open: a left-click
+    // on a lens row selects it and jumps the main view to the failing entry
+    // behind it; every other click is swallowed so a stray press can't fall
+    // through to the surface beneath. Hit-tested in ABSOLUTE screen coordinates
+    // against the row targets `render_error_lens_surface` registered this frame.
+    if app.error_lens_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ErrorLensRow(_)),
                 action,
             )) = app.click_target_at(mouse.column, mouse.row)
         {
@@ -3647,6 +3667,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // key never leaks into the composer underneath. Sits beside the transcript
     // index at the front for the same reason.
     if app.duplicate_folds_open && handle_duplicate_folds_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Error Lenses overlay (§12.5.6) is modal while open: it owns the
+    // keyboard (↑↓/kj move the lens cursor, Enter/→/l jump to the failing entry,
+    // Esc/Alt+x close) BEFORE any selection-clear, search, chord, or keymap
+    // dispatch, so a stray key never leaks into the composer underneath. Sits
+    // beside the duplicate-folds overlay at the front for the same reason.
+    if app.error_lens_open && handle_error_lens_key(app, key) {
         return Ok(false);
     }
 
@@ -5332,6 +5361,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_duplicate_folds(app);
             true
         }
+        keymap::Action::ToggleErrorLens => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_error_lens(app);
+            true
+        }
     }
 }
 
@@ -5826,6 +5865,125 @@ fn duplicate_fold_activate_selected(app: &mut TuiApp) {
         "duplicate fold {position}/{span_count} {verb} ({count} outputs) — Enter toggle \u{00b7} Esc close",
     );
     app.needs_redraw = true;
+}
+
+/// `Alt+x`: toggle the Error Lenses overlay (§12.5.6). The overlay is a
+/// fullscreen list of the actionable error lines detected inside failed tool
+/// outputs — each classified (rustc / cargo / test / permission / network /
+/// panic / sandbox), carrying its message and any extracted `file:line`
+/// location. Opening it refreshes the lens model (a no-op rebuild when the
+/// transcript has not changed since the last refresh, so the cost is only paid
+/// on a real change), resets the selection cursor, and confirms via the status
+/// line. Sets `needs_redraw` so the toggle paints immediately.
+fn toggle_error_lens(app: &mut TuiApp) {
+    app.error_lens_open = !app.error_lens_open;
+    if app.error_lens_open {
+        refresh_error_lenses(app);
+        app.error_lens_selected = 0;
+        app.status = if app.error_lenses.is_empty() {
+            "error lenses (none) — Esc to close".to_string()
+        } else {
+            format!(
+                "error lenses: {} — \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} Esc close",
+                app.error_lenses.summary(),
+            )
+        };
+    } else {
+        app.status = "error lenses closed".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Error Lenses overlay (§12.5.6) is open. Returns `true`
+/// when the key was consumed (so it never leaks to the composer or global
+/// keymap). Mirrors the duplicate-fold overlay's before-the-global-keymap modal
+/// consumption: the toggle chord (`Alt+x`) and Esc close; Up/Down (and k/j) move
+/// the lens cursor; Enter (and l/→) jumps the main view to the failing entry
+/// behind the selected lens.
+fn handle_error_lens_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.error_lens_open {
+        return false;
+    }
+    // The overlay's own toggle chord (`Alt+x` by default) closes it, so the same
+    // key both opens and closes — without leaking to the global keymap, which the
+    // modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleErrorLens) {
+        app.error_lens_open = false;
+        app.status = "error lenses closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    let count = app.error_lenses.len();
+    match key.code {
+        KeyCode::Esc => {
+            app.error_lens_open = false;
+            app.status = "error lenses closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.error_lens_selected = app.error_lens_selected.saturating_sub(1);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if count > 0 {
+                app.error_lens_selected = (app.error_lens_selected + 1).min(count - 1);
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            error_lens_jump_to_selected(app, true);
+        }
+        // Swallow every other key so the overlay is modal: a stray keystroke
+        // cannot leak into the composer underneath while the overlay owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Jump the main view to the failing entry behind the error-lens overlay's
+/// selected lens (§12.5.6). Resolves the lens at the cursor, scrolls to its
+/// source entry via the same `jump_to_entry_id` path the index/minimap/jump-nav
+/// use, and reports the class + any extracted location in the status line. A
+/// no-op (status hint) when there is nothing to jump to.
+///
+/// `advance` controls the cursor afterward: the keyboard Enter verb passes
+/// `true` so a *repeated* Enter walks forward through the lens list (wrapping at
+/// the end) — the "Enter for next" idiom the status line advertises; the mouse
+/// click passes `false` because a click is a precise pick that should land and
+/// stay on exactly the clicked row.
+fn error_lens_jump_to_selected(app: &mut TuiApp, advance: bool) {
+    let Some((entry_id, class, location)) =
+        app.error_lenses.get(app.error_lens_selected).map(|lens| {
+            (
+                lens.entry_id,
+                lens.class,
+                lens.location
+                    .as_ref()
+                    .map(error_lens::ErrorLocation::display),
+            )
+        })
+    else {
+        app.status = "error lenses: nothing to jump to".to_string();
+        return;
+    };
+    if jump_to_entry_id(app, entry_id) {
+        let position = app.error_lens_selected + 1;
+        let total = app.error_lenses.len();
+        let where_ = location.map(|loc| format!(" @ {loc}")).unwrap_or_default();
+        app.status = format!(
+            "error lens {position}/{total} [{}]{where_} — Enter for next \u{00b7} Esc close",
+            class.label(),
+        );
+        // Walk the cursor forward to the next lens so a repeated Enter steps
+        // through the whole error list (wrapping). The mouse path skips this so a
+        // click stays put on the row it picked.
+        if advance && let Some(next) = app.error_lenses.next_index(Some(app.error_lens_selected)) {
+            app.error_lens_selected = next;
+        }
+        app.needs_redraw = true;
+    } else {
+        app.status = "error lenses: could not jump".to_string();
+    }
 }
 
 /// Re-copy the picker's selected entry back to the clipboard through the same
@@ -6672,6 +6830,76 @@ fn refresh_duplicate_folds(app: &mut TuiApp) {
     let fingerprint = duplicate_fold::DuplicateFolds::fingerprint_of(candidates.iter());
     app.duplicate_folds
         .rebuild_if_stale(fingerprint, &candidates);
+}
+
+/// The text the Error Lenses detector (§12.5.6) scans for one entry. Pulls the
+/// human-visible *failure* output: for a tool result, the error/stderr/stdout/
+/// output/message/text fields of the content (joined so a failure that printed
+/// to both stderr and stdout is fully scanned), falling back to the serialized
+/// content blob; for a failed log line, its message; for a failed assistant
+/// message, its prose. `None` for an entry with no scannable text. Distinct from
+/// `fold_output_text` (which only cares about a single comparison fingerprint):
+/// error detection wants the *error* channels, so it prefers `error`/`stderr`.
+fn error_lens_text(entry: &TranscriptEntry) -> Option<String> {
+    match &entry.kind {
+        TranscriptEntryKind::ToolResult(tool) => {
+            let content = &tool.result.content;
+            let mut parts: Vec<String> = Vec::new();
+            for key in ["error", "stderr", "message", "stdout", "output", "text"] {
+                if let Some(text) = content.get(key).and_then(|v| v.as_str())
+                    && !text.trim().is_empty()
+                {
+                    parts.push(text.to_string());
+                }
+            }
+            if parts.is_empty() {
+                // Structured-only result: scan the canonical content blob so an
+                // `{"error": ...}`-shaped payload still surfaces.
+                Some(content.to_string())
+            } else {
+                Some(parts.join("\n"))
+            }
+        }
+        TranscriptEntryKind::Log(log) => Some(log.message().to_string()),
+        TranscriptEntryKind::Message(item) => Some(item.content.clone()),
+        _ => None,
+    }
+}
+
+/// Build the per-entry error-lens candidate slice from the active transcript
+/// (§12.5.6). Only entries the renderer/jump-nav already classify as a failure
+/// (`entry_is_error`) contribute — structured status decides *whether* an entry
+/// failed, so the line detectors never have to. Each carries its stable id,
+/// content revision (so a mutation re-detects), and its failure output text.
+/// Pure over the entry slice.
+fn build_error_candidates(entries: &[TranscriptEntry]) -> Vec<error_lens::ErrorCandidate> {
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, entry)| {
+            if !entry_is_error(entries, i) {
+                return None;
+            }
+            let text = error_lens_text(entry)?;
+            Some(error_lens::ErrorCandidate {
+                id: entry.id,
+                revision: entry.revision,
+                text,
+            })
+        })
+        .collect()
+}
+
+/// Refresh the Error Lenses model (§12.5.6) against the active transcript,
+/// recomputing **only** when the failed candidates' (id, revision) fingerprint
+/// has moved since the last refresh. Called lazily — right before the overlay
+/// opens or renders — so an idle session that never opens the overlay pays
+/// nothing, and an open overlay re-detects only on a real transcript change
+/// rather than every frame.
+fn refresh_error_lenses(app: &mut TuiApp) {
+    let candidates = build_error_candidates(active_transcript_entries(app));
+    let fingerprint = error_lens::ErrorLenses::fingerprint_of(candidates.iter());
+    app.error_lenses.rebuild_if_stale(fingerprint, &candidates);
 }
 
 /// Compact human label for an entry id used in the recent-jump status readout
@@ -7634,6 +7862,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::DuplicateFoldSelect(index) => {
             app.duplicate_folds_selected = index;
             duplicate_fold_activate_selected(app);
+        }
+        // A click on an Error Lenses row (§12.5.6): move the cursor onto it and
+        // jump the main view to the failing entry behind it — the mouse twin of
+        // ↑↓ + Enter, in one go.
+        interaction::Action::ErrorLensSelect(index) => {
+            app.error_lens_selected = index;
+            error_lens_jump_to_selected(app, false);
         }
     }
 }
@@ -13148,6 +13383,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_duplicate_folds_surface(frame, area, app);
         return;
     }
+    // The Error Lenses overlay (§12.5.6) paints as a fullscreen list over
+    // everything else while open, registering its per-lens row click targets
+    // every frame. Checked beside the duplicate-folds overlay so its targets
+    // register and it owns the surface while open.
+    if app.error_lens_open {
+        render_error_lens_surface(frame, area, app);
+        return;
+    }
     // The External Editor Handoff confirmation overlay (§12.6.5) paints as a
     // fullscreen modal over everything else while open, registering its
     // accept/reopen/discard button click targets every frame. Checked after the
@@ -14246,6 +14489,128 @@ fn render_duplicate_folds_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
             row_rect,
             interaction::TargetKey::Chrome(interaction::ChromeKey::DuplicateFoldRow(index)),
             interaction::Action::DuplicateFoldSelect(index),
+        );
+    }
+}
+
+/// Paint the Error Lenses overlay (§12.5.6) as a centered modal: a header with
+/// the per-class summary + navigation hint, then one selectable row per detected
+/// lens. Each row shows its severity/class tag, message, and any extracted
+/// `file:line` location, and registers an
+/// [`interaction::ChromeKey::ErrorLensRow`] click target so a click reaches the
+/// same `error_lens_jump_to_selected` path as ↑↓+Enter. Reads the
+/// already-refreshed lens model (kept current by `draw_app` while open), so
+/// painting is constant-time and does no transcript walk.
+fn render_error_lens_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Error lenses ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} actionable errors in failed output ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 88, 20, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let count = app.error_lenses.len();
+    // Header: summary + navigation hint, or an empty-state line.
+    let header = if count == 0 {
+        Line::from(Span::styled(
+            "No actionable errors detected in failed output.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} Esc close",
+                app.error_lenses.summary(),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if count == 0 {
+        return;
+    }
+
+    // Clamp the cursor to the lens count so a lens that vanished (e.g. after a
+    // clear) can never leave the cursor past the end.
+    let selected = app.error_lens_selected.min(count - 1);
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+
+    for (index, lens) in app.error_lenses.lenses().iter().enumerate().take(rows) {
+        let is_selected = index == selected;
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + index as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let marker = if is_selected { "\u{203a} " } else { "  " };
+        // A red error / yellow warning tag so severity carries color *and* a
+        // text label (no color-only meaning), the [class] in brackets, the
+        // location (if any), then the trimmed message.
+        let severity_color = match lens.severity {
+            error_lens::ErrorSeverity::Error => crate::render::theme::red(),
+            error_lens::ErrorSeverity::Warning => crate::render::theme::warn(),
+        };
+        let message_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let location_text = lens
+            .location
+            .as_ref()
+            .map(|loc| format!("{} ", loc.display()))
+            .unwrap_or_default();
+        let line = Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(
+                format!("{:<5} ", lens.severity.label()),
+                Style::default()
+                    .fg(severity_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<11} ", format!("[{}]", lens.class.label())),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(
+                location_text,
+                Style::default().fg(crate::render::theme::accent()),
+            ),
+            Span::styled(lens.message.clone(), message_style),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole row as a click target keyed by its lens-list index
+        // so a click selects + jumps to exactly that lens.
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::ErrorLensRow(index)),
+            interaction::Action::ErrorLensSelect(index),
         );
     }
 }
@@ -25822,6 +26187,22 @@ pub(crate) struct TuiApp {
     /// Cursor into the fold overlay's list of detected spans (§12.5.4). Clamped
     /// to the span count each render. Only meaningful while the overlay is open.
     pub(crate) duplicate_folds_selected: usize,
+    /// Error Lenses model (§12.5.6): the actionable error lines detected inside
+    /// failed tool outputs, each classified (rustc / cargo / test / permission /
+    /// network / panic / sandbox), carrying its message and any extracted
+    /// `file:line` location. Rebuilt incrementally — only when the failed
+    /// candidates' (id, revision) fingerprint moves — by `refresh_error_lenses`,
+    /// so an idle session pays one `u64` comparison per refresh. Drives the
+    /// error-lens overlay's list and quick-jump navigation.
+    pub(crate) error_lenses: error_lens::ErrorLenses,
+    /// Whether the Error Lenses overlay (§12.5.6) is open. `false` = closed (the
+    /// resting state, paints nothing extra); `true` = the fullscreen list owns
+    /// key/mouse routing. Toggled by the `ToggleErrorLens` keymap action.
+    pub(crate) error_lens_open: bool,
+    /// Cursor into the error-lens overlay's list of detected lenses (§12.5.6).
+    /// Clamped to the lens count each render. Only meaningful while the overlay
+    /// is open.
+    pub(crate) error_lens_selected: usize,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -26394,6 +26775,9 @@ impl TuiApp {
             duplicate_folds: duplicate_fold::DuplicateFolds::new(),
             duplicate_folds_open: false,
             duplicate_folds_selected: 0,
+            error_lenses: error_lens::ErrorLenses::new(),
+            error_lens_open: false,
+            error_lens_selected: 0,
             editor_handoff: None,
             pending_editor_handoff: None,
             copy_focus: None,
@@ -28607,6 +28991,14 @@ impl TerminalGuard {
         // costs nothing (this branch is skipped entirely).
         if app.duplicate_folds_open {
             refresh_duplicate_folds(app);
+        }
+
+        // Keep the Error Lenses model (§12.5.6) current while its overlay is
+        // open, on the same no-op-when-unchanged terms: an open-but-idle overlay
+        // costs one `u64` comparison and a closed overlay costs nothing (this
+        // branch is skipped entirely).
+        if app.error_lens_open {
+            refresh_error_lenses(app);
         }
 
         let paint = self.paint_one_frame(app);
