@@ -119,6 +119,10 @@ pub(crate) enum ChromeKey {
     /// the transcript while a filter is active. A click cycles the filter forward
     /// — the mouse twin of the `Alt+f` keyboard verb.
     SemanticFilterBadge,
+    /// A category row in the Local Transcript Index overlay (§12.5.1), keyed by
+    /// its 0-based index in the populated-category list so a click selects (and a
+    /// second click jumps within) exactly that category.
+    TranscriptIndexRow(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -219,6 +223,11 @@ pub(crate) enum Action {
     /// twin of the `Alt+f` keyboard verb / a click on the active-filter badge;
     /// both step the filter through its cycle and request a redraw.
     CycleSemanticFilter,
+    /// Select the given category row in the Local Transcript Index overlay
+    /// (§12.5.1) and jump the main view to the next entry in it. Mouse twin of
+    /// moving the cursor with ↑↓ and pressing Enter; a click both selects and
+    /// jumps in one go.
+    TranscriptIndexSelect(usize),
 }
 
 impl Action {
@@ -256,6 +265,7 @@ impl Action {
         Action::ClipboardClear,
         Action::EditorHandoffSelect(0),
         Action::CycleSemanticFilter,
+        Action::TranscriptIndexSelect(0),
     ];
 }
 

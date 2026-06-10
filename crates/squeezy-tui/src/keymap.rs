@@ -192,6 +192,13 @@ pub(crate) enum Action {
     /// which dispatches the same forward cycle. A main-surface action; off (`All`)
     /// by default so an idle session paints nothing extra.
     CycleSemanticFilter,
+    /// Open / close the Local Transcript Index overlay (`Alt+i` default;
+    /// §12.5.1). A fullscreen summary of the in-memory transcript index — entry
+    /// counts by category (user turns, tool calls, errors, reasoning, subagents,
+    /// …) with keyboard/mouse navigation that jumps the main view to the next
+    /// entry in the selected category. The index rebuilds incrementally only on a
+    /// transcript revision bump, so an idle session pays nothing.
+    ToggleTranscriptIndex,
 }
 
 impl Action {
@@ -240,6 +247,7 @@ impl Action {
             Self::BuildSessionBundle => "build_session_bundle",
             Self::OpenComposerInEditor => "open_composer_in_editor",
             Self::CycleSemanticFilter => "cycle_semantic_filter",
+            Self::ToggleTranscriptIndex => "toggle_transcript_index",
         }
     }
 
@@ -287,6 +295,7 @@ impl Action {
         Action::BuildSessionBundle,
         Action::OpenComposerInEditor,
         Action::CycleSemanticFilter,
+        Action::ToggleTranscriptIndex,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -369,6 +378,9 @@ impl Action {
             | Self::OpenComposerInEditor
             // Semantic-filter cycle is `Alt+f` — the same Meta/Alt encoding case.
             | Self::CycleSemanticFilter
+            // Transcript-index overlay toggle is `Alt+i` — the same Meta/Alt
+            // encoding that is unreliable across Linux terminals, tmux, and SSH.
+            | Self::ToggleTranscriptIndex
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -509,6 +521,10 @@ impl Action {
             // "filter". Bare `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/
             // r/w/h/l/p/b/e) are taken; `f` is free.
             Self::CycleSemanticFilter => KeyBinding::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            // Local Transcript Index (§12.5.1). `Alt+i` — `i` recalls "index".
+            // Bare `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/r/w/h/l/p/
+            // b/e/f) are taken; `i` is free.
+            Self::ToggleTranscriptIndex => KeyBinding::new(KeyCode::Char('i'), KeyModifiers::ALT),
         }
     }
 }

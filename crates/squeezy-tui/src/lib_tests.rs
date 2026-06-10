@@ -26708,3 +26708,238 @@ fn semantic_filter_renders_without_panic_across_sizes() {
         }
     }
 }
+
+// ===========================================================================
+// Local Transcript Index (§12.5.1) — integration tests driving the real
+// `render()` / `handle_key` / `handle_mouse` paths through the TestBackend.
+// ===========================================================================
+
+/// Build an app with a mixed transcript: two user turns, a successful tool call,
+/// a failed tool call, an error log, and a note. Seeds a deterministic viewport
+/// so geometry/jump math is host-independent.
+fn app_with_mixed_transcript() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    app.push_transcript_item(TranscriptItem::user("first question".to_string()));
+    app.push_tool_result(sample_tool_result("shell", "ok output"));
+    let mut failed = sample_tool_result("edit", "boom");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+    app.push_log("turn failed: provider error".to_string());
+    app.push_note("a quiet note".to_string());
+    app.push_transcript_item(TranscriptItem::user("second question".to_string()));
+    app
+}
+
+#[tokio::test]
+async fn transcript_index_alt_i_opens_overlay_and_renders_categories() {
+    let mut app = app_with_mixed_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+i opens the transcript index");
+
+    assert!(app.transcript_index_open, "Alt+i opens the overlay");
+    let out = render_to_string(&app, 80, 24);
+    assert!(out.contains("Transcript index"), "header present:\n{out}");
+    // The populated categories appear with their labels.
+    assert!(out.contains("user turns"), "user turns row:\n{out}");
+    assert!(out.contains("tool calls"), "tool calls row:\n{out}");
+    assert!(out.contains("errors"), "errors row:\n{out}");
+    // Two user turns were pushed.
+    assert_eq!(
+        app.transcript_index
+            .count(transcript_index::EntryCategory::UserTurn),
+        2
+    );
+    // The failed tool cross-cuts into the error bucket alongside the error log.
+    assert!(
+        app.transcript_index
+            .count(transcript_index::EntryCategory::Error)
+            >= 2,
+        "failed tool + error log both counted",
+    );
+}
+
+#[tokio::test]
+async fn transcript_index_keyboard_navigates_and_jumps() {
+    let mut app = app_with_mixed_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open index");
+    let _ = render_to_string(&app, 80, 24);
+
+    // Down moves the category cursor.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down moves the cursor");
+    assert_eq!(app.transcript_index_selected, 1);
+
+    // Enter jumps to the next entry in the selected category and records the
+    // anchor so a subsequent Enter walks forward.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter jumps");
+    assert!(
+        app.transcript_index_anchor.is_some(),
+        "a jump records the anchor for forward walking",
+    );
+    assert!(
+        app.status.contains("transcript index"),
+        "status reflects the jump: {}",
+        app.status,
+    );
+
+    // Esc closes the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc closes");
+    assert!(!app.transcript_index_open, "Esc closes the overlay");
+}
+
+#[tokio::test]
+async fn transcript_index_alt_i_toggles_closed_again() {
+    let mut app = app_with_mixed_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT);
+
+    handle_key(&mut app, &mut agent, chord).await.expect("open");
+    assert!(app.transcript_index_open);
+    let _ = render_to_string(&app, 80, 24);
+    // The same chord closes it without leaking to the composer.
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("close");
+    assert!(!app.transcript_index_open, "Alt+i toggles closed");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn transcript_index_mouse_click_jumps() {
+    let mut app = app_with_mixed_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open index");
+    // Render registers the per-row click targets for this frame.
+    let _ = render_to_string(&app, 80, 24);
+
+    // Scan the painted area for a registered transcript-index row target.
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::TranscriptIndexRow(_)),
+                _,
+            )) = app.click_target_at(col, row)
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("a transcript-index row target is registered");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        app.transcript_index_anchor.is_some(),
+        "clicking a category row jumps and records the anchor",
+    );
+    // The overlay stays open (the click jumped within it, not closed it).
+    assert!(app.transcript_index_open);
+}
+
+#[tokio::test]
+async fn transcript_index_empty_transcript_shows_empty_state() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open index on an empty transcript");
+
+    assert!(app.transcript_index_open);
+    assert_eq!(app.transcript_index.total(), 0);
+    let out = render_to_string(&app, 80, 24);
+    assert!(
+        out.contains("Transcript index"),
+        "header still paints:\n{out}"
+    );
+    assert!(
+        out.contains("No transcript entries"),
+        "empty-state line:\n{out}",
+    );
+
+    // Enter on an empty index is a harmless no-op (no jump, no panic).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter on empty index");
+    assert!(app.transcript_index_anchor.is_none());
+}
+
+#[tokio::test]
+async fn transcript_index_renders_across_resizes() {
+    let mut app = app_with_mixed_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open index");
+
+    for (w, h) in [(80u16, 24u16), (120, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Transcript index"),
+            "header paints at {w}x{h}:\n{out}",
+        );
+    }
+}

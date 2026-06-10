@@ -638,6 +638,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // (Alt+f default). The badge click and the keyboard verb both drive the
         // same `cycle_main_semantic_filter` handler.
         A::CycleSemanticFilter => KeyboardPath::Keymap(Action::CycleSemanticFilter),
+        // Local Transcript Index overlay (§12.5.1) — the overlay's own key
+        // handler owns ↑↓/kj (move the category cursor) and Enter/→/l (jump to the
+        // next entry in the selected category) before the global keymap sees them,
+        // so a row click and the keyboard reach the same
+        // `transcript_index_jump_to_selected` handler.
+        A::TranscriptIndexSelect(_) => KeyboardPath::Always("transcript index ↑↓/Enter"),
     })
 }
 

@@ -138,6 +138,7 @@ mod streaming;
 mod streaming_patch;
 mod terminal_writer;
 mod toast;
+mod transcript_index;
 mod transcript_surface;
 mod wide_block;
 // Visual Diff Dashboard (§12.10.4). `cfg(test)`-gated so the dev-only cell-grid
@@ -1773,6 +1774,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.paste_transform.is_some()
         || app.paste_staging.is_some()
         || app.clipboard_history_open
+        || app.transcript_index_open
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
     {
@@ -2338,6 +2340,24 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                 _ => dispatch_click_action(app, action),
             }
         }
+        return true;
+    }
+
+    // The Local Transcript Index overlay (§12.5.1) owns the pointer while open: a
+    // left-click on a category row selects it and jumps to its next entry; every
+    // other click is swallowed so a stray press can't fall through to the surface
+    // beneath. Hit-tested in ABSOLUTE screen coordinates against the row targets
+    // `render_transcript_index_surface` registered this frame.
+    if app.transcript_index_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::TranscriptIndexRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
         return true;
     }
 
@@ -3557,6 +3577,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // key never leaks into the composer underneath. Sits beside the paste modal
     // at the front for the same reason.
     if app.clipboard_history_open && handle_clipboard_history_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Local Transcript Index overlay (§12.5.1) is modal while open: it owns
+    // the keyboard (↑↓/kj move category, Enter/→/l jump, Esc/Alt+i close) BEFORE
+    // any selection-clear, search, chord, or keymap dispatch, so a stray key
+    // never leaks into the composer underneath. Sits beside the clipboard picker
+    // at the front for the same reason.
+    if app.transcript_index_open && handle_transcript_index_key(app, key) {
         return Ok(false);
     }
 
@@ -5203,6 +5232,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             cycle_main_semantic_filter(app, false);
             true
         }
+        keymap::Action::ToggleTranscriptIndex => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_transcript_index(app);
+            true
+        }
     }
 }
 
@@ -5351,6 +5390,125 @@ fn handle_clipboard_history_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         _ => {}
     }
     true
+}
+
+/// `Alt+i`: toggle the Local Transcript Index overlay (§12.5.1). The overlay is a
+/// fullscreen summary of the in-memory index — entry counts by category with
+/// keyboard/mouse navigation. Opening it refreshes the index (a no-op rebuild
+/// when the transcript has not changed since the last refresh, so the cost is
+/// only paid on a real change), resets the selection cursor, and confirms via the
+/// status line. Sets `needs_redraw` so the toggle paints immediately.
+fn toggle_transcript_index(app: &mut TuiApp) {
+    app.transcript_index_open = !app.transcript_index_open;
+    if app.transcript_index_open {
+        refresh_transcript_index(app);
+        app.transcript_index_selected = 0;
+        app.transcript_index_anchor = None;
+        let total = app.transcript_index.total();
+        app.status = if total == 0 {
+            "transcript index (empty) — Esc to close".to_string()
+        } else {
+            format!(
+                "transcript index: {} — \u{2191}\u{2193} category \u{00b7} Enter jump \u{00b7} Esc close",
+                app.transcript_index.summary(),
+            )
+        };
+    } else {
+        app.status = "transcript index closed".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Local Transcript Index overlay (§12.5.1) is open.
+/// Returns `true` when the key was consumed (so it never leaks to the composer or
+/// global keymap). Mirrors the clipboard-history picker's before-the-global-keymap
+/// modal consumption: the toggle chord (`Alt+i`) and Esc close; Up/Down (and k/j)
+/// move the category cursor; Enter (and l/→) jumps the main view to the next
+/// entry in the selected category, walking forward on repeat.
+fn handle_transcript_index_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.transcript_index_open {
+        return false;
+    }
+    // The overlay's own toggle chord (`Alt+i` by default) closes it, so the same
+    // key both opens and closes — without leaking to the global keymap, which the
+    // modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleTranscriptIndex) {
+        app.transcript_index_open = false;
+        app.status = "transcript index closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    let categories = app.transcript_index.non_empty_categories();
+    match key.code {
+        KeyCode::Esc => {
+            app.transcript_index_open = false;
+            app.status = "transcript index closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if !categories.is_empty() {
+                app.transcript_index_selected = app
+                    .transcript_index_selected
+                    .min(categories.len() - 1)
+                    .saturating_sub(1);
+                // Moving categories restarts the forward walk.
+                app.transcript_index_anchor = None;
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !categories.is_empty() {
+                let last = categories.len() - 1;
+                app.transcript_index_selected = (app.transcript_index_selected + 1).min(last);
+                app.transcript_index_anchor = None;
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            transcript_index_jump_to_selected(app);
+        }
+        // Swallow every other key so the overlay is modal: a stray keystroke
+        // cannot leak into the composer underneath while the overlay owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Jump the main view to the next entry in the index overlay's selected category
+/// (§12.5.1), walking forward through that category on repeat. Resolves the
+/// category from the cursor, asks the index for the next id after the last jumped
+/// anchor (wrapping at the end), scrolls there via the same `jump_to_entry_id`
+/// path the minimap/jump-nav use, and records the new anchor. A no-op (status
+/// hint) when the selected category is empty.
+fn transcript_index_jump_to_selected(app: &mut TuiApp) {
+    let categories = app.transcript_index.non_empty_categories();
+    let Some(&category) = categories.get(app.transcript_index_selected) else {
+        app.status = "transcript index: nothing to jump to".to_string();
+        return;
+    };
+    let anchor = app.transcript_index_anchor;
+    let Some(target) = app.transcript_index.next_in(category, anchor) else {
+        app.status = format!("no {} to jump to", category.label());
+        return;
+    };
+    if jump_to_entry_id(app, target) {
+        app.transcript_index_anchor = Some(target);
+        let position = app
+            .transcript_index
+            .ids(category)
+            .iter()
+            .position(|&id| id == target)
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let count = app.transcript_index.count(category);
+        app.status = format!(
+            "transcript index: {} {position}/{count} — Enter for next \u{00b7} Esc close",
+            category.label(),
+        );
+        app.needs_redraw = true;
+    } else {
+        app.status = format!("could not jump to {}", category.label());
+    }
 }
 
 /// Re-copy the picker's selected entry back to the clipboard through the same
@@ -6002,6 +6160,74 @@ fn jump_to_entry_id(app: &mut TuiApp, entry_id: u64) -> bool {
     let from_bottom = max_scroll.saturating_sub(offset.min(max_scroll));
     commit_main_from_bottom_animated(app, from_bottom);
     true
+}
+
+/// Classify one transcript entry into its primary [`transcript_index::EntryCategory`]
+/// for the Local Transcript Index (§12.5.1). Reuses the same role / `LogKind` /
+/// `entry_is_error` predicates the renderer and jump-nav use, so the index's
+/// notion of "this is a tool call / error / subagent" matches what the user
+/// sees. The error cross-cut (a failed tool/message also counting under the
+/// error bucket) is computed separately via `entry_is_error` in
+/// [`build_index_entries`].
+fn index_category_of(entries: &[TranscriptEntry], index: usize) -> transcript_index::EntryCategory {
+    use transcript_index::EntryCategory;
+    let entry = &entries[index];
+    match &entry.kind {
+        TranscriptEntryKind::Message(item) if item.role == Role::User => EntryCategory::UserTurn,
+        TranscriptEntryKind::Message(item) if item.role == Role::Assistant => {
+            // A failed assistant message still reads primarily as assistant; the
+            // error cross-cut tags it for the error bucket in addition.
+            EntryCategory::Assistant
+        }
+        TranscriptEntryKind::Message(_) => EntryCategory::Note,
+        TranscriptEntryKind::ToolResult(_) => EntryCategory::ToolCall,
+        TranscriptEntryKind::Reasoning(_) => EntryCategory::Reasoning,
+        TranscriptEntryKind::PlanCard(_) => EntryCategory::Plan,
+        TranscriptEntryKind::Diff(_) => EntryCategory::Diff,
+        TranscriptEntryKind::SlashEcho(_) => EntryCategory::Note,
+        TranscriptEntryKind::Log(log) => match log.kind {
+            LogKind::Subagent => EntryCategory::Subagent,
+            LogKind::Error => EntryCategory::Error,
+            _ => EntryCategory::Note,
+        },
+    }
+}
+
+/// Build the per-entry classification slice the index consumes from the active
+/// transcript. Each entry contributes its stable id, content revision (so a
+/// mutation re-indexes), primary category, error cross-cut flag, and — for tool
+/// results — its tool name (for per-tool lookup). Pure over the entry slice.
+fn build_index_entries(entries: &[TranscriptEntry]) -> Vec<transcript_index::IndexedEntry> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let tool_name = match &entry.kind {
+                TranscriptEntryKind::ToolResult(tool) => Some(tool.result.tool_name.clone()),
+                _ => None,
+            };
+            transcript_index::IndexedEntry {
+                id: entry.id,
+                revision: entry.revision,
+                primary: index_category_of(entries, i),
+                is_error: entry_is_error(entries, i),
+                tool_name,
+            }
+        })
+        .collect()
+}
+
+/// Refresh the Local Transcript Index (§12.5.1) against the active transcript,
+/// rebuilding **only** when the transcript's (id, revision, category, error,
+/// tool) fingerprint has moved since the last refresh. Called lazily — right
+/// before the index overlay opens or renders — so an idle session that never
+/// opens the overlay pays nothing, and an open overlay re-indexes only on a real
+/// transcript change (append, stream settle, revision bump, clear, compaction,
+/// fold toggle, resume) rather than every frame.
+fn refresh_transcript_index(app: &mut TuiApp) {
+    let entries = build_index_entries(active_transcript_entries(app));
+    let fingerprint = transcript_index::TranscriptIndex::fingerprint_of(entries.iter());
+    app.transcript_index.rebuild_if_stale(fingerprint, &entries);
 }
 
 /// Compact human label for an entry id used in the recent-jump status readout
@@ -6939,6 +7165,17 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // keyboard verb drives, so mouse/keyboard parity holds by construction.
         interaction::Action::CycleSemanticFilter => {
             cycle_main_semantic_filter(app, false);
+        }
+        // A click on a Local Transcript Index category row (§12.5.1): move the
+        // cursor onto it and jump the main view to the next entry in it — the
+        // mouse twin of ↑↓ + Enter, in one go. Selecting a *different* category
+        // restarts that category's forward walk.
+        interaction::Action::TranscriptIndexSelect(index) => {
+            if app.transcript_index_selected != index {
+                app.transcript_index_anchor = None;
+            }
+            app.transcript_index_selected = index;
+            transcript_index_jump_to_selected(app);
         }
     }
 }
@@ -12389,6 +12626,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_clipboard_history_surface(frame, area, app);
         return;
     }
+    // The Local Transcript Index overlay (§12.5.1) paints as a fullscreen summary
+    // over everything else while open, registering its per-category row click
+    // targets every frame. Checked beside the clipboard picker so its targets
+    // register and it owns the surface while open.
+    if app.transcript_index_open {
+        render_transcript_index_surface(frame, area, app);
+        return;
+    }
     // The External Editor Handoff confirmation overlay (§12.6.5) paints as a
     // fullscreen modal over everything else while open, registering its
     // accept/reopen/discard button click targets every frame. Checked after the
@@ -13140,6 +13385,106 @@ fn render_clipboard_history_buttons(frame: &mut Frame<'_>, inner: Rect, app: &Tu
                 interaction::Action::ClipboardClear,
             );
         }
+    }
+}
+
+/// Paint the Local Transcript Index overlay (§12.5.1) as a centered modal: a
+/// header with the total entry count, then one selectable row per populated
+/// category showing its label and count. The selected row is marked; each row is
+/// registered as an [`interaction::ChromeKey::TranscriptIndexRow`] click target so
+/// a click reaches the same `transcript_index_jump_to_selected` path as ↑↓+Enter.
+/// Reads the already-refreshed index (kept current by `draw_app` while open), so
+/// painting is constant-time and does no transcript walk.
+fn render_transcript_index_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Transcript index ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} jump by category ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 72, 18, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let categories = app.transcript_index.non_empty_categories();
+    // Header: total + navigation hint, or an empty-state line.
+    let header = if categories.is_empty() {
+        Line::from(Span::styled(
+            "No transcript entries to index yet.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} indexed \u{00b7} \u{2191}\u{2193} category \u{00b7} Enter jump \u{00b7} Esc close",
+                count_label_entries(app.transcript_index.total()),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if categories.is_empty() {
+        return;
+    }
+
+    // Clamp the cursor to the populated-category count so a category that emptied
+    // out (e.g. after a clear) can never leave the cursor past the end.
+    let selected = app.transcript_index_selected.min(categories.len() - 1);
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+
+    for (index, &category) in categories.iter().enumerate().take(rows) {
+        let is_selected = index == selected;
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + index as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let marker = if is_selected { "\u{203a} " } else { "  " };
+        let label_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let count = app.transcript_index.count(category);
+        let line = Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(format!("{:<12}", category.label()), label_style),
+            Span::styled(
+                format!("{count}"),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole row as a click target keyed by its category-list
+        // index so a click selects + jumps to exactly that category.
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::TranscriptIndexRow(index)),
+            interaction::Action::TranscriptIndexSelect(index),
+        );
     }
 }
 
@@ -24656,6 +25001,27 @@ pub(crate) struct TuiApp {
     /// picker owns key/mouse routing. Toggled by the `ToggleClipboardHistory`
     /// keymap action.
     pub(crate) clipboard_history_open: bool,
+    /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
+    /// keyed by stable entry id and grouped by category (user turns, tool calls,
+    /// errors, …). Rebuilt incrementally — only when the transcript's
+    /// (id, revision, category) fingerprint moves — by `refresh_transcript_index`,
+    /// so an idle session pays one `u64` comparison per refresh and rebuilds
+    /// nothing. Drives the index overlay's summary and navigation.
+    pub(crate) transcript_index: transcript_index::TranscriptIndex,
+    /// Whether the Local Transcript Index overlay (§12.5.1) is open. `false` =
+    /// closed (the resting state, paints nothing extra); `true` = the fullscreen
+    /// summary owns key/mouse routing. Toggled by the `ToggleTranscriptIndex`
+    /// keymap action.
+    pub(crate) transcript_index_open: bool,
+    /// Cursor into the index overlay's list of non-empty categories (§12.5.1).
+    /// Clamped to the populated-category count each render. Only meaningful while
+    /// the overlay is open.
+    pub(crate) transcript_index_selected: usize,
+    /// The entry id the index overlay last jumped to within the selected
+    /// category (§12.5.1), so repeated Enter/clicks walk forward through that
+    /// category's entries instead of re-landing on the first. `None` until the
+    /// first jump; reset when the selected category changes.
+    pub(crate) transcript_index_anchor: Option<u64>,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -25217,6 +25583,10 @@ impl TuiApp {
             clipboard_chain: build_clipboard_chain(Box::new(clipboard::RealSink)),
             clipboard_history: clipboard_history::ClipboardHistoryStore::new(),
             clipboard_history_open: false,
+            transcript_index: transcript_index::TranscriptIndex::new(),
+            transcript_index_open: false,
+            transcript_index_selected: 0,
+            transcript_index_anchor: None,
             editor_handoff: None,
             pending_editor_handoff: None,
             copy_focus: None,
@@ -27407,6 +27777,14 @@ impl TerminalGuard {
             let (mh, mm, eh, em) = main_render_cache::cache_stats();
             (mh + eh, mm + em)
         };
+
+        // Keep the Local Transcript Index (§12.5.1) current while its overlay is
+        // open: the refresh is a no-op rebuild when the transcript fingerprint is
+        // unchanged, so an open-but-idle overlay costs one `u64` comparison and a
+        // closed overlay costs nothing (this branch is skipped entirely).
+        if app.transcript_index_open {
+            refresh_transcript_index(app);
+        }
 
         let paint = self.paint_one_frame(app);
 
