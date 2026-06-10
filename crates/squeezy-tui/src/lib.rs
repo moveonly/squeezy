@@ -84,6 +84,7 @@ mod approval;
 #[cfg(test)]
 mod bench_render;
 mod bookmarks;
+mod change_summary;
 mod clipboard;
 mod clipboard_history;
 mod commands;
@@ -1795,6 +1796,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.bookmarks_open
         || app.session_timeline_open
         || app.annotations_open
+        || app.changes_since_open
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
     {
@@ -2530,6 +2532,24 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
                 interaction::TargetKey::Chrome(interaction::ChromeKey::TimelineRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The What Changed Since Here? overlay (§12.2.7) owns the pointer while open: a
+    // left-click on a change row selects it and jumps the main view to the entry
+    // it stands for; every other click is swallowed so a stray press can't fall
+    // through to the surface beneath. Hit-tested in ABSOLUTE screen coordinates
+    // against the row targets `render_changes_since_surface` registered this frame.
+    if app.changes_since_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ChangeSinceRow(_)),
                 action,
             )) = app.click_target_at(mouse.column, mouse.row)
         {
@@ -3916,6 +3936,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // leaks into the composer underneath. Sits beside the other front-of-loop
     // overlays for the same reason.
     if app.session_timeline_open && handle_session_timeline_key(app, key) {
+        return Ok(false);
+    }
+
+    // The What Changed Since Here? overlay (§12.2.7) is modal while open: it owns
+    // the keyboard (↑↓/kj/n/p move the change cursor, Enter/→/l jump to the
+    // change's entry, m re-marks the anchor, Esc/Alt+0 close) BEFORE any
+    // selection-clear, search, chord, or keymap dispatch, so a stray key never
+    // leaks into the composer underneath. Sits beside the other front-of-loop
+    // overlays for the same reason.
+    if app.changes_since_open && handle_changes_since_key(app, key) {
         return Ok(false);
     }
 
@@ -5716,6 +5746,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_annotations(app);
             true
         }
+        keymap::Action::ToggleChangesSince => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_changes_since(app);
+            true
+        }
     }
 }
 
@@ -6693,6 +6733,172 @@ fn session_timeline_jump_to_selected(app: &mut TuiApp, advance: bool) {
         app.needs_redraw = true;
     } else {
         app.status = "session timeline: could not jump".to_string();
+    }
+}
+
+// ---- What Changed Since Here? (§12.2.7) ----
+
+/// The "since here" anchor the toggle marks: the focused entry when one is
+/// focused (`Ctrl+↑/↓`), else the entry currently at the top of the viewport (the
+/// same reading-position anchor the bookmark / jump-mark / annotate verbs use),
+/// resolved to its stable id *and* its chronological sequence (its index in the
+/// active transcript). `None` only when the transcript is empty. Resolving to a
+/// stable id (not a row) here is what lets the delta survive every later reflow.
+fn changes_since_anchor(app: &TuiApp) -> Option<change_summary::Anchor> {
+    let entries = active_transcript_entries(app);
+    let target_id = if let Some(index) = active_selected_entry(app)
+        && let Some(entry) = entries.get(index)
+    {
+        entry.id
+    } else {
+        current_top_entry_id(app)?
+    };
+    let sequence = entries.iter().position(|e| e.id == target_id)? as u32;
+    Some(change_summary::Anchor {
+        entry_id: target_id,
+        sequence,
+    })
+}
+
+/// `Alt+0`: toggle the What Changed Since Here? overlay (§12.2.7). Opening it
+/// marks the "since here" point at the current reading position (the focused or
+/// top-visible entry), scans every later transcript event, and surfaces the
+/// changes observed since — file edits, commands/tests, errors, checkpoints,
+/// approval decisions, and other tool results — grouped into a summarized delta.
+/// Parks the cursor on the first change and confirms via the status line with
+/// honest "observed since" framing. Sets `needs_redraw` so the toggle paints
+/// immediately.
+fn toggle_changes_since(app: &mut TuiApp) {
+    app.changes_since_open = !app.changes_since_open;
+    if app.changes_since_open {
+        // Mark the anchor at the current reading position, then build the delta.
+        if let Some(anchor) = changes_since_anchor(app) {
+            app.change_summary.set_anchor(anchor);
+        }
+        refresh_change_summary(app);
+        // Park the cursor on the first (oldest) change so the review reads
+        // top-to-bottom like a checklist.
+        app.changes_since_selected = 0;
+        app.status = if !app.change_summary.has_anchor() {
+            "what changed since here (no transcript to mark) — Esc to close".to_string()
+        } else if app.change_summary.is_empty() {
+            "what changed since here: nothing observed since this point — m re-mark \u{00b7} Esc close".to_string()
+        } else {
+            format!(
+                "what changed since here (observed): {} — \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} m re-mark \u{00b7} Esc close",
+                app.change_summary.summary(),
+            )
+        };
+    } else {
+        app.status = "what changed since here closed".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the What Changed Since Here? overlay (§12.2.7) is open.
+/// Returns `true` when the key was consumed (so it never leaks to the composer or
+/// global keymap). The toggle chord (`Alt+0`) and Esc close; Up/Down (and k/j,
+/// plus n/p) move the change cursor over the flattened delta; `m` re-marks the
+/// anchor at the current reading position and rebuilds; Enter (and l/→) jumps the
+/// main view to the entry behind the selected change.
+fn handle_changes_since_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.changes_since_open {
+        return false;
+    }
+    // The overlay's own toggle chord (`Alt+0` by default) closes it, so the same
+    // key both opens and closes — without leaking to the global keymap, which the
+    // modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleChangesSince) {
+        app.changes_since_open = false;
+        app.status = "what changed since here closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    let count = app.change_summary.len();
+    match key.code {
+        KeyCode::Esc => {
+            app.changes_since_open = false;
+            app.status = "what changed since here closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
+            app.changes_since_selected = app.changes_since_selected.saturating_sub(1);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
+            if count > 0 {
+                app.changes_since_selected = (app.changes_since_selected + 1).min(count - 1);
+            }
+            app.needs_redraw = true;
+        }
+        // `m` re-marks the "since here" point at the current reading position and
+        // rebuilds the delta, re-parking the cursor on the first change.
+        KeyCode::Char('m') => {
+            if let Some(anchor) = changes_since_anchor(app) {
+                app.change_summary.set_anchor(anchor);
+            }
+            refresh_change_summary(app);
+            app.changes_since_selected = 0;
+            app.status = if app.change_summary.is_empty() {
+                "what changed since here: re-marked — nothing observed since \u{00b7} Esc close"
+                    .to_string()
+            } else {
+                format!(
+                    "what changed since here: re-marked — {} \u{00b7} Esc close",
+                    app.change_summary.summary(),
+                )
+            };
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            changes_since_jump_to_selected(app, true);
+        }
+        // Swallow every other key so the overlay is modal: a stray keystroke
+        // cannot leak into the composer underneath while the overlay owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Jump the main view to the transcript entry behind the What Changed Since Here?
+/// overlay's selected change (§12.2.7). Resolves the change at the cursor, scrolls
+/// to its source entry via the same `jump_to_entry_id` path the index / outline /
+/// timeline / jump-nav use, and reports the group / position in the status line. A
+/// no-op (status hint) when there is nothing to jump to.
+///
+/// `advance` controls the cursor afterward: the keyboard Enter verb passes `true`
+/// so a *repeated* Enter walks forward through the delta (wrapping at the end);
+/// the mouse click passes `false` because a click is a precise pick that should
+/// land and stay on exactly the clicked row.
+fn changes_since_jump_to_selected(app: &mut TuiApp, advance: bool) {
+    let Some((entry_id, group)) = app
+        .change_summary
+        .get(app.changes_since_selected)
+        .map(|item| (item.entry_id, item.group))
+    else {
+        app.status = "what changed since here: nothing to jump to".to_string();
+        return;
+    };
+    if jump_to_entry_id(app, entry_id) {
+        let position = app.changes_since_selected + 1;
+        let total = app.change_summary.len();
+        app.status = format!(
+            "what changed {position}/{total} [{}] — Enter for next \u{00b7} Esc close",
+            group.heading(),
+        );
+        // Walk the cursor forward to the next change so a repeated Enter steps
+        // through the whole delta (wrapping). The mouse path skips this so a click
+        // stays put on the row it picked.
+        if advance
+            && let Some(next) = app
+                .change_summary
+                .next_index(Some(app.changes_since_selected))
+        {
+            app.changes_since_selected = next;
+        }
+        app.needs_redraw = true;
+    } else {
+        app.status = "what changed since here: could not jump".to_string();
     }
 }
 
@@ -8616,6 +8822,23 @@ fn refresh_session_timeline(app: &mut TuiApp) {
     app.session_timeline.rebuild_if_stale(fingerprint, &sources);
 }
 
+/// Refresh the What Changed Since Here? delta (§12.2.7) against the active
+/// transcript, rebuilding **only** when the anchor moved or the entries'
+/// fingerprint has shifted since the last refresh. Reuses the same classified
+/// [`session_timeline::TimelineSource`] slice the Session Timeline builds (so the
+/// "what changed" view stays in lock-step with the timeline), then folds the
+/// entries *after* the marked anchor into grouped change items. Called lazily —
+/// right before the overlay opens or renders — so an idle session that never marks
+/// a point pays nothing, and an open overlay re-builds only on a real transcript
+/// change (append, stream settle, revision bump, clear, compaction, resume) or an
+/// anchor move, never every frame.
+fn refresh_change_summary(app: &mut TuiApp) {
+    let sources = build_timeline_sources(active_transcript_entries(app));
+    let anchor = app.change_summary.anchor();
+    let fingerprint = change_summary::ChangeSummary::fingerprint_of(anchor, sources.iter());
+    app.change_summary.rebuild_if_stale(fingerprint, &sources);
+}
+
 /// Count the non-blank lines in a text blob — the body row count a lane header
 /// advertises ("tool output (12 lines)"). Bounded by counting only what is
 /// present; an empty/blank blob yields 0.
@@ -9824,6 +10047,14 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // opening the list (Alt+\) and selecting the entry.
         interaction::Action::OpenAnnotationsForEntry(id) => {
             open_annotations_for_entry(app, id.0);
+        }
+        // A click on a What Changed Since Here? change row (§12.2.7): move the
+        // cursor onto it and jump the main view to the transcript entry the change
+        // stands for — the mouse twin of ↑↓ + Enter, in one go. The index is into
+        // the flattened (grouped) change list, matching what the row registered.
+        interaction::Action::ChangeSinceSelectJump(index) => {
+            app.changes_since_selected = index;
+            changes_since_jump_to_selected(app, false);
         }
     }
 }
@@ -15741,6 +15972,15 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_session_timeline_surface(frame, area, app);
         return;
     }
+    // The What Changed Since Here? overlay (§12.2.7) paints as a fullscreen grouped
+    // delta list over everything else while open, registering its per-change row
+    // click targets every frame. Checked beside the session-timeline overlay (its
+    // sibling: mark a point, review the delta) so its targets register and it owns
+    // the surface while open.
+    if app.changes_since_open {
+        render_changes_since_surface(frame, area, app);
+        return;
+    }
     // The Entry Annotations overlay (§12.2.5) paints as a fullscreen jump-list /
     // composer over everything else while open, registering its per-annotation row
     // click targets every frame. Checked beside the bookmarks overlay so its
@@ -17352,6 +17592,169 @@ fn render_session_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             interaction::TargetKey::Chrome(interaction::ChromeKey::TimelineRow(index)),
             interaction::Action::TimelineSelectJump(index),
         );
+    }
+}
+
+/// Paint the What Changed Since Here? overlay (§12.2.7) as a centered modal: a
+/// title, a one-line summary / navigation header (or an honest empty-state line),
+/// then the grouped delta — a non-clickable heading per change group, then one
+/// selectable row per change beneath it (a caret on the selected row, a red
+/// `failed` tag — color *and* text, never color-only — for a failing change, and
+/// the change's short deterministic label). Each change row is a
+/// [`interaction::ChromeKey::ChangeSinceRow`] click target keyed by its flattened
+/// index so a click reaches the same `changes_since_jump_to_selected` path as
+/// ↑↓+Enter. The framing is the spec's honest "observed since" language — the
+/// header never claims a full project history. Reads the already-refreshed delta
+/// (kept current by the run loop while open), so painting is constant-time and
+/// does no transcript walk.
+fn render_changes_since_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = Line::from(vec![
+        Span::styled(
+            " What changed since here ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} observed in this session ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 92, 26, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let total = app.change_summary.len();
+
+    // Header: summary + navigation hint, or an honest empty-state line. A delta
+    // with no anchor and one with an anchor-but-no-later-changes read differently.
+    let header = if !app.change_summary.has_anchor() {
+        Line::from(Span::styled(
+            "No \"since here\" point marked yet.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else if total == 0 {
+        Line::from(Span::styled(
+            "Nothing observed since this point \u{00b7} m to re-mark \u{00b7} Esc close",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} m re-mark \u{00b7} Esc close",
+                app.change_summary.summary(),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if total == 0 {
+        return;
+    }
+
+    // Clamp the cursor to the change count so a change that vanished (e.g. after a
+    // refresh) can never leave the cursor past the end.
+    let selected = app.changes_since_selected.min(total - 1);
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+
+    // Build a flat display program: a heading line whenever the group changes,
+    // then each change row. Headings are non-selectable; change rows carry their
+    // flattened index (the cursor / click model). The display index keeps headings
+    // and rows interleaved so the panel reads as a grouped checklist.
+    enum DisplayRow<'a> {
+        Heading(change_summary::ChangeGroupKind),
+        Change {
+            index: usize,
+            item: &'a change_summary::ChangeItem,
+        },
+    }
+    let mut program: Vec<DisplayRow<'_>> = Vec::new();
+    let mut last_group: Option<change_summary::ChangeGroupKind> = None;
+    for (index, item) in app.change_summary.items().iter().enumerate() {
+        if last_group != Some(item.group) {
+            program.push(DisplayRow::Heading(item.group));
+            last_group = Some(item.group);
+        }
+        program.push(DisplayRow::Change { index, item });
+    }
+
+    // Find the display offset of the selected change so the list scrolls to keep it
+    // visible when the delta is taller than the available rows.
+    let selected_display = program
+        .iter()
+        .position(|row| matches!(row, DisplayRow::Change { index, .. } if *index == selected))
+        .unwrap_or(0);
+    let first = selected_display.saturating_sub(rows.saturating_sub(1));
+
+    for (offset, row) in program.iter().enumerate().skip(first).take(rows) {
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + (offset - first) as u16,
+            width: inner.width,
+            height: 1,
+        };
+        match row {
+            DisplayRow::Heading(group) => {
+                let n = app.change_summary.count_of(*group);
+                let line = Line::from(Span::styled(
+                    format!("  {} ({n})", group.heading()),
+                    Style::default()
+                        .fg(crate::render::theme::accent())
+                        .add_modifier(Modifier::BOLD),
+                ));
+                frame.render_widget(Paragraph::new(line), row_rect);
+            }
+            DisplayRow::Change { index, item } => {
+                let is_selected = *index == selected;
+                let caret = if is_selected { "  \u{203a} " } else { "    " };
+                // A failed change carries a red `failed` tag (color *and* text, no
+                // color-only meaning); a normal change leaves the tag column blank.
+                let status_span = if item.failed {
+                    Span::styled(
+                        format!("{:<8} ", "failed"),
+                        Style::default()
+                            .fg(crate::render::theme::red())
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::raw(format!("{:<8} ", ""))
+                };
+                let label_style = if is_selected {
+                    Style::default()
+                        .fg(crate::render::theme::secondary())
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(crate::render::theme::foreground())
+                };
+                let line = Line::from(vec![
+                    Span::styled(
+                        caret,
+                        Style::default().fg(if is_selected {
+                            crate::render::theme::secondary()
+                        } else {
+                            crate::render::theme::quiet()
+                        }),
+                    ),
+                    status_span,
+                    Span::styled(item.label.clone(), label_style),
+                ]);
+                frame.render_widget(Paragraph::new(line), row_rect);
+
+                // Register the whole change row as a click target keyed by its
+                // FLATTENED index so a click selects + jumps to exactly that change.
+                app.register_click(
+                    row_rect,
+                    interaction::TargetKey::Chrome(interaction::ChromeKey::ChangeSinceRow(*index)),
+                    interaction::Action::ChangeSinceSelectJump(*index),
+                );
+            }
+        }
     }
 }
 
@@ -29843,6 +30246,25 @@ pub(crate) struct TuiApp {
     /// existing annotation (the commit replaces the selected one) or while not
     /// composing.
     pub(crate) annotation_edit_new_entry: Option<u64>,
+    /// What Changed Since Here? model (§12.2.7): the marked "since here" anchor
+    /// plus the summarized delta of changes observed after it — file edits,
+    /// commands/tests, errors, checkpoints, approval decisions, and other tool
+    /// results — grouped and linked to the transcript entry each change stands
+    /// for. Rebuilt incrementally — only when the anchor moves or the entries'
+    /// (id, revision, kind, error, label) fingerprint moves — by
+    /// `refresh_change_summary`, so an idle session pays one `u64` comparison per
+    /// refresh. The resting state has no anchor and an empty delta, so a session
+    /// that never marks a point costs nothing.
+    pub(crate) change_summary: change_summary::ChangeSummary,
+    /// Whether the What Changed Since Here? overlay (§12.2.7) is open. `false` =
+    /// closed (the resting state, paints nothing extra); `true` = the fullscreen
+    /// delta list owns key/mouse routing. Toggled by the `ToggleChangesSince`
+    /// keymap action.
+    pub(crate) changes_since_open: bool,
+    /// Cursor into the change-summary overlay's flattened change list (§12.2.7).
+    /// Clamped to the change count each render. Only meaningful while the overlay
+    /// is open.
+    pub(crate) changes_since_selected: usize,
     /// The post-edit confirmation overlay for External Editor Handoff (§12.6.5).
     /// `None` = no handoff in flight (the resting state, paints nothing extra);
     /// `Some` = the user edited the composer in `$EDITOR` and the
@@ -30442,6 +30864,9 @@ impl TuiApp {
             annotations_selected: 0,
             annotation_edit: None,
             annotation_edit_new_entry: None,
+            change_summary: change_summary::ChangeSummary::new(),
+            changes_since_open: false,
+            changes_since_selected: 0,
             editor_handoff: None,
             pending_editor_handoff: None,
             copy_focus: None,
@@ -32695,6 +33120,14 @@ impl TerminalGuard {
         // skipped entirely).
         if app.session_timeline_open {
             refresh_session_timeline(app);
+        }
+
+        // Keep the What Changed Since Here? delta (§12.2.7) current while its
+        // overlay is open, on the same no-op-when-unchanged terms: an open-but-idle
+        // overlay costs one `u64` comparison and a closed overlay costs nothing
+        // (this branch is skipped entirely).
+        if app.changes_since_open {
+            refresh_change_summary(app);
         }
 
         let paint = self.paint_one_frame(app);

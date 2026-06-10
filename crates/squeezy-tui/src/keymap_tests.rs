@@ -587,6 +587,40 @@ fn annotation_defaults_do_not_collide_with_other_actions() {
 }
 
 #[test]
+fn changes_since_default_binds_alt_0_and_is_terminal_dependent() {
+    // §12.2.7 What Changed Since Here?: slug round-trips, is registered in `ALL`,
+    // binds `Alt+0`, and is honestly classified terminal-dependent (an Alt+digit
+    // Meta chord).
+    assert_eq!(
+        Action::from_slug("toggle_changes_since"),
+        Some(Action::ToggleChangesSince),
+    );
+    assert!(Action::ALL.contains(&Action::ToggleChangesSince));
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('0'), KeyModifiers::ALT),
+        Some(Action::ToggleChangesSince),
+    );
+    assert_eq!(
+        Action::ToggleChangesSince.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+}
+
+#[test]
+fn changes_since_default_does_not_collide_with_other_actions() {
+    // The new `Alt+0` default must not shadow (or be shadowed by) any existing
+    // default binding.
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    for collision in resolver.collisions() {
+        assert!(
+            !collision.1.contains(&Action::ToggleChangesSince),
+            "changes-since default collides: {collision:?}",
+        );
+    }
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.

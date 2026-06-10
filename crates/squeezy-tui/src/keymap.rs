@@ -306,6 +306,19 @@ pub(crate) enum Action {
     /// it is stable across redraws and resize; an idle session that never opens it
     /// pays nothing.
     ToggleAnnotations,
+    /// Mark a "What Changed Since Here?" point and open its delta overlay (`Alt+0`
+    /// default; §12.2.7). The anchor is the focused (or top-visible) transcript
+    /// entry's stable id; opening the overlay scans every later transcript event
+    /// and surfaces the changes observed since — file edits, commands/tests,
+    /// errors, checkpoints, approval decisions, and other tool results — as a
+    /// grouped, summarized delta. The cursor (↑↓/kj, plus n/p for next/previous)
+    /// selects a change and Enter/→/l jumps the main view to the entry it stands
+    /// for; `m` re-marks the anchor at the current reading position. The delta
+    /// rebuilds incrementally only on an anchor move or a transcript revision bump,
+    /// so an idle session pays nothing. Uses honest "observed since" language — it
+    /// reports only what this session's transcript recorded, never a full project
+    /// history.
+    ToggleChangesSince,
 }
 
 impl Action {
@@ -368,6 +381,7 @@ impl Action {
             Self::ToggleSessionTimeline => "toggle_session_timeline",
             Self::AnnotateEntry => "annotate_entry",
             Self::ToggleAnnotations => "toggle_annotations",
+            Self::ToggleChangesSince => "toggle_changes_since",
         }
     }
 
@@ -429,6 +443,7 @@ impl Action {
         Action::ToggleSessionTimeline,
         Action::AnnotateEntry,
         Action::ToggleAnnotations,
+        Action::ToggleChangesSince,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -554,6 +569,10 @@ impl Action {
             // encoding case as the rest of the nav/overlay family.
             | Self::AnnotateEntry
             | Self::ToggleAnnotations
+            // What Changed Since Here? overlay toggle is `Alt+0` — an Alt+digit
+            // chord, the same Meta/Alt encoding that is unreliable across Linux
+            // terminals, tmux, and SSH as the rest of the nav/overlay family.
+            | Self::ToggleChangesSince
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -754,6 +773,12 @@ impl Action {
             // punctuation key).
             Self::AnnotateEntry => KeyBinding::new(KeyCode::Char('/'), KeyModifiers::ALT),
             Self::ToggleAnnotations => KeyBinding::new(KeyCode::Char('\\'), KeyModifiers::ALT),
+            // What Changed Since Here? (§12.2.7). `Alt+0` — the next free `Alt`+digit
+            // after `Alt+8` (hyperlinks) and `Alt+9` (session timeline); it sits
+            // beside the timeline chord it complements (mark a point, review the
+            // delta) and every bare `Alt` letter in the nav/copy/overlay family is
+            // taken. Mnemonic-free but unambiguous and clear of every composer chord.
+            Self::ToggleChangesSince => KeyBinding::new(KeyCode::Char('0'), KeyModifiers::ALT),
         }
     }
 }

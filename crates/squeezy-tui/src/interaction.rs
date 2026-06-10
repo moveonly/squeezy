@@ -163,6 +163,10 @@ pub(crate) enum ChromeKey {
     /// entry's header row (§12.2.5), keyed by the entry's stable [`EntryId`] so a
     /// click opens the annotations overlay parked on that entry's note.
     EntryAnnotationMarker(EntryId),
+    /// A change row in the What Changed Since Here? overlay (§12.2.7), keyed by its
+    /// 0-based index in the flattened (grouped) change list so a click selects +
+    /// jumps the main view to the transcript entry the change stands for.
+    ChangeSinceRow(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -318,6 +322,12 @@ pub(crate) enum Action {
     /// on an entry's header row. Keyed by the entry's stable [`EntryId`] so the
     /// target survives resize.
     OpenAnnotationsForEntry(EntryId),
+    /// Select the given change row in the What Changed Since Here? overlay
+    /// (§12.2.7): move the cursor onto it and jump the main view to the transcript
+    /// entry the change stands for. Mouse twin of moving the cursor with ↑↓ and
+    /// pressing Enter; a click both selects and jumps in one go. The index is into
+    /// the flattened (grouped) change list.
+    ChangeSinceSelectJump(usize),
 }
 
 impl Action {
@@ -366,6 +376,7 @@ impl Action {
         Action::TimelineSelectJump(0),
         Action::AnnotationSelectJump(0),
         Action::OpenAnnotationsForEntry(EntryId(0)),
+        Action::ChangeSinceSelectJump(0),
     ];
 }
 

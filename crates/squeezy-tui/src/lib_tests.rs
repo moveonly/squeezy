@@ -29199,6 +29199,344 @@ async fn session_timeline_renders_across_resizes() {
     );
 }
 
+// ---- What Changed Since Here? (§12.2.7) ----
+
+/// Build a transcript whose changes happen after the first prompt, so marking the
+/// "since here" point at the head surfaces an edit, a passing tool, a failed tool,
+/// a subagent failure, and an assistant turn as the delta. Seeds a deterministic
+/// viewport so geometry is host-independent.
+fn app_with_changes_since() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    app.push_transcript_item(TranscriptItem::user("refactor the parser".to_string()));
+    app.push_tool_result(sample_tool_result("read_file", "fn parse() {}\n"));
+    let mut failed = sample_tool_result("shell", "boom");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+    app.push_subagent_note("subagent research failed: could not reach host".to_string());
+    app.push_transcript_item(TranscriptItem::assistant(
+        "Here is the refactored parser.".to_string(),
+    ));
+    app
+}
+
+/// Focus the first transcript entry so the "since here" anchor is deterministic
+/// (the head), independent of host scroll geometry. Returns the app ready to open
+/// the overlay with the whole tail as the delta.
+fn changes_since_app_anchored_at_head() -> TuiApp {
+    let mut app = app_with_changes_since();
+    // Focus the first entry (the prompt) so the anchor is the head, independent of
+    // host scroll geometry.
+    app.selected_entry = Some(0);
+    app
+}
+
+#[tokio::test]
+async fn changes_since_alt_0_marks_point_and_lists_delta() {
+    let mut app = changes_since_app_anchored_at_head();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+0 marks a point and opens the overlay");
+
+    assert!(app.changes_since_open, "Alt+0 opens the overlay");
+    assert!(
+        app.change_summary.has_anchor(),
+        "a since-here point is marked"
+    );
+    let out = render_to_string(&app, 80, 24);
+    assert!(
+        out.contains("What changed since here"),
+        "header present:\n{out}",
+    );
+    assert!(
+        out.contains("observed in this session"),
+        "honest observed-since framing:\n{out}",
+    );
+
+    // Everything after the prompt is the delta: one edit-less read tool (command),
+    // one failed tool (error), one failed subagent (error), one assistant turn
+    // (result). The read_file tool has no diff, so it groups under commands.
+    assert_eq!(
+        app.change_summary.len(),
+        4,
+        "every later entry surfaced once"
+    );
+    assert_eq!(
+        app.change_summary
+            .count_of(change_summary::ChangeGroupKind::Commands),
+        1,
+    );
+    // The failed shell tool and the failed subagent both land under errors.
+    assert_eq!(
+        app.change_summary
+            .count_of(change_summary::ChangeGroupKind::Errors),
+        2,
+        "failed tool + failed subagent both grouped as errors",
+    );
+    assert!(
+        app.change_summary.failed_count() >= 2,
+        "both failures flagged: {}",
+        app.change_summary.failed_count(),
+    );
+
+    // Group headings, the failed tag, and a change label all paint.
+    assert!(out.contains("commands & tests"), "command heading:\n{out}");
+    assert!(out.contains("errors"), "errors heading:\n{out}");
+    assert!(out.contains("failed"), "failed status tag:\n{out}");
+}
+
+#[tokio::test]
+async fn changes_since_keyboard_navigates_and_jumps() {
+    let mut app = changes_since_app_anchored_at_head();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open overlay");
+    let _ = render_to_string(&app, 80, 24);
+    // Opens parked on the first (oldest) change so the review reads like a list.
+    assert_eq!(
+        app.changes_since_selected, 0,
+        "cursor parks on the first change"
+    );
+
+    // Down advances; Up retreats; both clamp inside the delta.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down moves cursor");
+    assert_eq!(
+        app.changes_since_selected, 1,
+        "Down advances the change cursor"
+    );
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("up moves cursor");
+    assert_eq!(
+        app.changes_since_selected, 0,
+        "Up retreats the change cursor"
+    );
+
+    // Enter jumps to the change's entry and walks the cursor forward.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter jumps");
+    assert!(
+        app.status.contains("what changed"),
+        "status reflects the jump: {}",
+        app.status,
+    );
+    assert_eq!(
+        app.changes_since_selected, 1,
+        "Enter walks the cursor forward to the next change",
+    );
+
+    // Esc closes the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc closes");
+    assert!(!app.changes_since_open, "Esc closes the overlay");
+}
+
+#[tokio::test]
+async fn changes_since_mouse_click_selects_and_jumps() {
+    let mut app = changes_since_app_anchored_at_head();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open overlay");
+    let _ = render_to_string(&app, 80, 24);
+
+    // Scan for a registered change-row target — the SECOND change so the click
+    // changes the cursor off whatever it parked on (the first).
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ChangeSinceRow(idx)),
+                _,
+            )) = app.click_target_at(col, row)
+                && idx == 1
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("a change row target is registered");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(
+        app.changes_since_selected, 1,
+        "clicking a change row selects exactly that change (no auto-advance)",
+    );
+    assert!(
+        app.status.contains("what changed"),
+        "click jumps and reports: {}",
+        app.status,
+    );
+    // The overlay stays open (the click jumped within it, not closed it).
+    assert!(app.changes_since_open);
+}
+
+#[tokio::test]
+async fn changes_since_anchor_at_end_is_honest_empty_delta() {
+    let mut app = app_with_changes_since();
+    let mut agent = test_agent(SessionMode::Build);
+    // Anchor on the LAST entry (the assistant turn): nothing came after it.
+    let last = active_transcript_entries(&app).len() - 1;
+    app.selected_entry = Some(last);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open overlay anchored at the tail");
+
+    assert!(app.changes_since_open);
+    assert!(app.change_summary.has_anchor(), "the mark stands");
+    assert!(
+        app.change_summary.is_empty(),
+        "an anchor at the end honestly reports no later changes",
+    );
+    let out = render_to_string(&app, 80, 24);
+    assert!(
+        out.contains("What changed since here"),
+        "header still paints:\n{out}",
+    );
+    assert!(
+        out.contains("Nothing observed since"),
+        "honest empty-state line:\n{out}",
+    );
+
+    // Enter on an empty delta is a harmless no-op (no panic, nothing jumps).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter on empty delta");
+    assert!(app.changes_since_open, "still open, nothing jumped");
+}
+
+#[tokio::test]
+async fn changes_since_empty_transcript_shows_no_mark_state() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(80, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open overlay on an empty transcript");
+
+    assert!(app.changes_since_open);
+    assert!(
+        !app.change_summary.has_anchor(),
+        "no entry to mark on an empty transcript",
+    );
+    let out = render_to_string(&app, 80, 24);
+    assert!(
+        out.contains("What changed since here"),
+        "header still paints:\n{out}",
+    );
+    assert!(
+        out.contains("No \"since here\" point"),
+        "no-mark empty-state line:\n{out}",
+    );
+}
+
+#[tokio::test]
+async fn changes_since_alt_0_toggles_closed_without_leaking() {
+    let mut app = changes_since_app_anchored_at_head();
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT);
+
+    handle_key(&mut app, &mut agent, chord).await.expect("open");
+    assert!(app.changes_since_open);
+    let _ = render_to_string(&app, 80, 24);
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("close");
+    assert!(!app.changes_since_open, "Alt+0 toggles closed");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn changes_since_renders_across_resizes() {
+    let mut app = changes_since_app_anchored_at_head();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open overlay");
+
+    // The first change's logical jump target must survive a resize: capture the
+    // entry id before, render at several sizes, and confirm it is unchanged (ids
+    // are width-independent).
+    let first_id = app.change_summary.items().first().map(|i| i.entry_id);
+    for (w, h) in [(80u16, 24u16), (120, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("What changed since here"),
+            "header paints at {w}x{h}:\n{out}",
+        );
+    }
+    assert_eq!(
+        app.change_summary.items().first().map(|i| i.entry_id),
+        first_id,
+        "the first change's stable id survives every resize",
+    );
+}
+
 // ---- Collapsible Reasoning/Tool Lanes (§12.2.2) ----
 
 /// Build a transcript whose tail is a tool result carrying a call (so it

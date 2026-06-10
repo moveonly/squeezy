@@ -702,6 +702,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // note; the keyboard twin is `Alt+\` (open the list) then ↑↓ to the entry,
         // or `Alt+/` to annotate the focused entry. Reachable without a mouse.
         A::OpenAnnotationsForEntry(_) => KeyboardPath::Always("annotations Alt+\\ / Alt+/"),
+        // What Changed Since Here? overlay (§12.2.7) — the overlay's own key handler
+        // owns ↑↓/kj/n/p (move the change cursor / next-previous), m (re-mark the
+        // anchor), and Enter/→/l (jump to the entry behind the selected change)
+        // before the global keymap sees them, so a row click and the keyboard reach
+        // the same `changes_since_jump_to_selected` handler.
+        A::ChangeSinceSelectJump(_) => KeyboardPath::Always("what changed since here ↑↓/Enter"),
     })
 }
 
