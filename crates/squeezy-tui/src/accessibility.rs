@@ -756,6 +756,17 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         A::ScratchpadEnqueue => KeyboardPath::Always("scratchpad Ctrl+Q"),
         A::ScratchpadAppend => KeyboardPath::Always("scratchpad Ctrl+L"),
         A::ScratchpadClear => KeyboardPath::Always("scratchpad Ctrl+K"),
+        // Prompt Templates picker / card (§12.3.6) — while the picker is open its
+        // own key handler owns Up/Down (select a template), Enter (instantiate /
+        // enqueue the filled card), Tab/↑↓ (move between the card's slots), typing
+        // (fill the focused slot), `d` (delete), and `c` (clear) before the global
+        // keymap sees them, so every mouse affordance routes to the same handler
+        // its picker/card key drives.
+        A::TemplateSelect(_) => KeyboardPath::Always("templates Up/Down"),
+        A::TemplateFocusSlot(_) => KeyboardPath::Always("templates Tab/↑↓"),
+        A::TemplateEnqueue => KeyboardPath::Always("templates Enter"),
+        A::TemplateDelete(_) => KeyboardPath::Always("templates d"),
+        A::TemplateClear => KeyboardPath::Always("templates c"),
     })
 }
 

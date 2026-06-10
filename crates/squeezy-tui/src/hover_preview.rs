@@ -141,6 +141,7 @@ pub(crate) fn policy_for(key: TargetKey) -> PointerActivationPolicy {
         TargetKey::QueueItem(_)
         | TargetKey::ClipboardEntry(_)
         | TargetKey::SnippetEntry(_)
+        | TargetKey::TemplateEntry(_)
         | TargetKey::Chrome(_) => PointerActivationPolicy::inert(),
     }
 }

@@ -23071,6 +23071,432 @@ async fn snippets_picker_survives_narrow_resize() {
 }
 
 // =====================================================================
+// §12.3.6 Prompt Templates As Queue Cards.
+// End-to-end through `handle_key` (Ctrl+Alt+T toggle, ↑↓ select, Enter fill,
+// type-to-fill slots, Enter enqueue), `handle_mouse` (click template row /
+// slot row / Enqueue button), the real `render()` list + card surfaces, the
+// blocked-while-unfilled status, the empty-store edge case, and resize.
+// =====================================================================
+
+/// `Ctrl+Alt+T`: toggle the Prompt Templates picker overlay.
+fn toggle_templates_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// A store with one fully-controlled template (`Review {file}`) and the picker
+/// open on the LIST. Clears the starter seed so the test owns the contents.
+fn template_app_with_one() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.templates.clear();
+    app.templates
+        .save(Some("Review template"), "Review {file} for bugs.");
+    app.templates_open = true;
+    app
+}
+
+#[tokio::test]
+async fn ctrl_alt_t_toggles_the_templates_picker() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(!app.templates_open, "starts closed");
+
+    handle_key(&mut app, &mut agent, toggle_templates_key())
+        .await
+        .unwrap();
+    assert!(app.templates_open, "Ctrl+Alt+T opens the picker");
+    handle_key(&mut app, &mut agent, toggle_templates_key())
+        .await
+        .unwrap();
+    assert!(!app.templates_open, "Ctrl+Alt+T again closes it");
+}
+
+#[tokio::test]
+async fn templates_picker_renders_list_and_empty_state() {
+    let mut app = test_app(SessionMode::Build);
+
+    // Empty-store state: clear the starter seed first.
+    app.templates.clear();
+    app.templates_open = true;
+    let empty = render_to_string(&app, 100, 24);
+    assert!(empty.contains("Prompt templates"), "title renders: {empty}");
+    assert!(
+        empty.contains("No templates yet"),
+        "empty-state hint renders: {empty}"
+    );
+
+    // With templates, names + slot counts + previews render.
+    app.templates.save(Some("Review one"), "Review {file} now");
+    app.templates.save(Some("Two slots"), "Compare {a} and {b}");
+    let listed = render_to_string(&app, 100, 24);
+    assert!(
+        listed.contains("Two slots"),
+        "newest name renders: {listed}"
+    );
+    assert!(
+        listed.contains("Review one"),
+        "older name renders: {listed}"
+    );
+    assert!(
+        listed.contains("{file}"),
+        "preview keeps slot markers: {listed}"
+    );
+    assert!(listed.contains("2 slots"), "slot count renders: {listed}");
+    assert!(
+        listed.contains("Delete"),
+        "the button strip renders: {listed}"
+    );
+}
+
+#[tokio::test]
+async fn templates_keyboard_fill_and_enqueue_blocks_until_complete() {
+    // The full keyboard path: open on the list, Enter to instantiate the card,
+    // Enter while a slot is empty is BLOCKED (with inline status), then type a
+    // value and Enter enqueues the resolved prompt.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = template_app_with_one();
+    let before = app.prompt_queue.len();
+
+    // Enter on the list instantiates the selected template into a card.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.template_card.is_some(), "Enter opened a fillable card");
+    assert_eq!(
+        app.template_card.as_ref().unwrap().missing_slots(),
+        vec!["file".to_string()],
+        "the {{file}} slot starts empty"
+    );
+
+    // Enter with the slot still empty is blocked — nothing enqueues.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.prompt_queue.len(), before, "blocked: nothing enqueued");
+    assert!(
+        app.status.contains("fill"),
+        "the block is explained inline: {}",
+        app.status
+    );
+    assert!(
+        app.template_card.is_some(),
+        "the card stays open while blocked"
+    );
+
+    // Type a value into the focused slot.
+    for ch in "src/lib.rs".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        app.template_card
+            .as_ref()
+            .unwrap()
+            .missing_slots()
+            .is_empty(),
+        "the slot is now filled"
+    );
+
+    // Enter now resolves + enqueues the prompt and returns to the list.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.prompt_queue.len(),
+        before + 1,
+        "the filled card enqueued"
+    );
+    assert_eq!(
+        app.prompt_queue.back().map(String::as_str),
+        Some("Review src/lib.rs for bugs."),
+        "the resolved prompt substituted the slot value"
+    );
+    assert!(app.template_card.is_none(), "enqueue returns to the list");
+    assert!(app.templates_open, "the picker stays open after enqueue");
+}
+
+#[tokio::test]
+async fn templates_card_esc_backs_out_to_list_then_closes() {
+    // Esc in CARD mode backs out to the list (not the whole overlay); Esc in LIST
+    // mode closes the picker.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = template_app_with_one();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.template_card.is_some(), "card opened");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.template_card.is_none(), "Esc backed out of the card");
+    assert!(
+        app.templates_open,
+        "...but the picker is still open on the list"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(!app.templates_open, "a second Esc closes the picker");
+}
+
+#[tokio::test]
+async fn templates_keys_are_swallowed_and_do_not_leak_to_composer() {
+    // While the picker is open every printable key is consumed by the modal, never
+    // typed into the composer underneath.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = template_app_with_one();
+    app.input.clear();
+
+    // A bare letter in LIST mode is swallowed (not the d/c verbs).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.input, "", "list-mode keys never reach the composer");
+
+    // In CARD mode, typed characters fill the slot, not the composer.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.input, "", "card-mode keys never reach the composer");
+    assert_eq!(
+        app.template_card.as_ref().unwrap().value_at(0),
+        "q",
+        "the character filled the focused slot instead"
+    );
+}
+
+#[tokio::test]
+async fn templates_card_renders_blocked_then_runnable_status() {
+    // The card surface shows the inline "blocked: fill ..." status until every
+    // slot is filled, then flips to "all slots filled".
+    let mut app = template_app_with_one();
+    app.template_card = app
+        .templates
+        .instantiate(app.templates.selected_template().unwrap().id);
+
+    let blocked = render_to_string(&app, 100, 24);
+    assert!(
+        blocked.contains("Fill 'Review template'"),
+        "card header: {blocked}"
+    );
+    assert!(
+        blocked.contains("{file}"),
+        "the slot row renders: {blocked}"
+    );
+    assert!(
+        blocked.contains("blocked"),
+        "blocked status renders: {blocked}"
+    );
+    assert!(
+        blocked.contains("(empty)"),
+        "empty slot reads (empty): {blocked}"
+    );
+
+    // Fill it and re-render: the status flips and Enqueue activates.
+    if let Some(card) = app.template_card.as_mut() {
+        for ch in "x".chars() {
+            card.insert_char(ch);
+        }
+    }
+    let runnable = render_to_string(&app, 100, 24);
+    assert!(
+        runnable.contains("all slots filled"),
+        "runnable status renders: {runnable}"
+    );
+    assert!(
+        runnable.contains("Enqueue"),
+        "the Enqueue button renders: {runnable}"
+    );
+}
+
+#[tokio::test]
+async fn templates_mouse_click_row_opens_card_and_slot_then_enqueue() {
+    // The mouse path: click a template row to open its card, click the slot row to
+    // focus it, fill it from the keyboard, then click the Enqueue button.
+    let mut app = template_app_with_one();
+    let before = app.prompt_queue.len();
+
+    // Render to register the list row targets, then click the template row.
+    let _ = render_to_string(&app, 100, 24);
+    let id = app.templates.selected_template().unwrap().id;
+    let row_cell = queue_cell_for(
+        &app,
+        100,
+        24,
+        interaction::TargetKey::TemplateEntry(id),
+        interaction::Action::TemplateSelect(id),
+    )
+    .expect("template row registers a click target");
+    handle_mouse(
+        &mut app,
+        left_down(row_cell.0, row_cell.1, KeyModifiers::NONE),
+    );
+    assert!(
+        app.template_card.is_some(),
+        "clicking a row opened the card"
+    );
+
+    // Render the card to register the slot row target, then click it.
+    let _ = render_to_string(&app, 100, 24);
+    let slot_cell = queue_cell_for(
+        &app,
+        100,
+        24,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::TemplateSlotRow(0)),
+        interaction::Action::TemplateFocusSlot(0),
+    )
+    .expect("slot row registers a click target");
+    handle_mouse(
+        &mut app,
+        left_down(slot_cell.0, slot_cell.1, KeyModifiers::NONE),
+    );
+    assert_eq!(
+        app.template_card.as_ref().unwrap().focused_index(),
+        0,
+        "clicking the slot row focused it"
+    );
+
+    // Fill the slot, re-render so the Enqueue button registers, then click it.
+    if let Some(card) = app.template_card.as_mut() {
+        for ch in "README.md".chars() {
+            card.insert_char(ch);
+        }
+    }
+    let _ = render_to_string(&app, 100, 24);
+    let enqueue_cell = queue_cell_for(
+        &app,
+        100,
+        24,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::TemplateEnqueue),
+        interaction::Action::TemplateEnqueue,
+    )
+    .expect("Enqueue button registers once the card is runnable");
+    handle_mouse(
+        &mut app,
+        left_down(enqueue_cell.0, enqueue_cell.1, KeyModifiers::NONE),
+    );
+
+    assert_eq!(app.prompt_queue.len(), before + 1, "the click enqueued");
+    assert_eq!(
+        app.prompt_queue.back().map(String::as_str),
+        Some("Review README.md for bugs."),
+    );
+    assert!(app.template_card.is_none(), "enqueue returns to the list");
+}
+
+#[tokio::test]
+async fn templates_enqueue_button_unregistered_while_slot_empty() {
+    // The Enqueue button registers NO click target while a slot is empty, so a
+    // mouse click can never enqueue an unresolved card (keyboard parity: Enter is
+    // likewise blocked).
+    let mut app = template_app_with_one();
+    app.template_card = app
+        .templates
+        .instantiate(app.templates.selected_template().unwrap().id);
+
+    let _ = render_to_string(&app, 100, 24);
+    assert!(
+        queue_cell_for(
+            &app,
+            100,
+            24,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::TemplateEnqueue),
+            interaction::Action::TemplateEnqueue,
+        )
+        .is_none(),
+        "no Enqueue target while the card is unresolved"
+    );
+}
+
+#[tokio::test]
+async fn templates_picker_survives_narrow_resize() {
+    let mut app = template_app_with_one();
+    // List mode across sizes.
+    for (w, h) in [(20u16, 6u16), (40, 10), (120, 40)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("template"),
+            "list title visible at {w}x{h}: {out}"
+        );
+    }
+    // Card mode across sizes (no panic painting the slot editor at tiny sizes).
+    app.template_card = app
+        .templates
+        .instantiate(app.templates.selected_template().unwrap().id);
+    for (w, h) in [(20u16, 6u16), (40, 10), (120, 40)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("template"),
+            "card title visible at {w}x{h}: {out}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn templates_starter_store_is_nonempty_on_first_open() {
+    // A fresh app seeds a couple of starter templates so the picker is
+    // discoverable before the user authors one.
+    let app = test_app(SessionMode::Build);
+    assert!(!app.templates.is_empty(), "starter templates are seeded");
+    let mut open = app;
+    open.templates_open = true;
+    let out = render_to_string(&open, 100, 24);
+    assert!(
+        out.contains("{file}"),
+        "a starter slot marker renders: {out}"
+    );
+}
+
+// =====================================================================
 // §12.1.6 Multi-Cursor-Like Transcript Selection.
 // End-to-end through `handle_key` (Alt+d add, Ctrl+Alt+Y combined copy),
 // `handle_mouse` (modifier-click add/toggle), the real `render()`

@@ -132,6 +132,7 @@ mod pinned_compare;
 mod prompt_history;
 mod prompt_queue;
 mod prompt_queue_multiselect;
+mod prompt_template;
 mod proposed_plan;
 mod queue_edit;
 mod queue_groups;
@@ -1802,6 +1803,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.clipboard_history_open
         || app.snippets_open
         || app.scratchpad_open
+        || app.templates_open
         || app.transcript_index_open
         || app.related_links_open
         || app.duplicate_folds_open
@@ -2487,6 +2489,25 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                 }
                 _ => dispatch_click_action(app, action),
             }
+        }
+        return true;
+    }
+
+    // The Prompt Templates picker (§12.3.6) owns the pointer while open: a
+    // left-click on a template row selects + instantiates it into a card, a click
+    // on a slot row focuses that slot for editing, and a click on a button runs its
+    // verb. Every other click is swallowed so a stray press can't fall through to
+    // the surface beneath. Hit-tested in ABSOLUTE screen coordinates against the
+    // targets the picker registered this frame.
+    if app.templates_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((key, action)) = app.click_target_at(mouse.column, mouse.row)
+            && matches!(
+                key,
+                interaction::TargetKey::TemplateEntry(_) | interaction::TargetKey::Chrome(_)
+            )
+        {
+            dispatch_click_action(app, action);
         }
         return true;
     }
@@ -4144,6 +4165,260 @@ fn scratchpad_append_context(app: &mut TuiApp) {
     app.needs_redraw = true;
 }
 
+// ===========================================================================
+// Prompt Templates As Queue Cards (§12.3.6)
+// ===========================================================================
+
+/// `"N templates"` / `"1 template"` for the templates picker status line.
+fn count_label_templates(count: usize) -> String {
+    if count == 1 {
+        "1 template".to_string()
+    } else {
+        format!("{count} templates")
+    }
+}
+
+/// Status line for the open templates picker, reflecting whether it is showing the
+/// template LIST or an instantiated CARD being filled.
+fn templates_open_status(app: &TuiApp) -> String {
+    if let Some(card) = app.template_card.as_ref() {
+        let missing = card.missing_slots();
+        if card.has_no_slots() {
+            return format!(
+                "template '{}': no slots — Enter to enqueue · Esc back",
+                card.name
+            );
+        }
+        if missing.is_empty() {
+            format!(
+                "template '{}': all slots filled — Enter to enqueue · Tab next slot · Esc back",
+                card.name
+            )
+        } else {
+            format!(
+                "template '{}': fill {} ({} left) — type to fill · Tab next · Esc back",
+                card.name,
+                missing.join(", "),
+                missing.len(),
+            )
+        }
+    } else if app.templates.is_empty() {
+        "templates (empty) — c clears · Esc close (Ctrl+Alt+T)".to_string()
+    } else {
+        format!(
+            "templates: {} — ↑↓ select · Enter fill · d delete · c clear · Esc close",
+            count_label_templates(app.templates.len()),
+        )
+    }
+}
+
+/// `Ctrl+Alt+T`: toggle the Prompt Templates picker overlay (§12.3.6). Opening
+/// always starts on the template LIST (the card, if any, is dropped so a reopen is
+/// a clean pick); closing drops any in-progress card so its half-filled slots do
+/// not linger.
+fn toggle_templates(app: &mut TuiApp) {
+    app.templates_open = !app.templates_open;
+    app.template_card = None;
+    app.status = if app.templates_open {
+        templates_open_status(app)
+    } else {
+        "templates closed".to_string()
+    };
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Prompt Templates picker (§12.3.6) is open. Returns
+/// `true` when the key was consumed (so it never leaks to the composer or the
+/// global keymap). Two modes:
+///
+///   - LIST mode (`template_card == None`): Up/Down move the selection, Enter
+///     instantiates the selected template into a card, `d` deletes, `c` clears,
+///     Esc / the toggle chord close.
+///   - CARD mode (`template_card == Some`): Tab/↑↓ move between slots, a printable
+///     char / Backspace edit the focused slot, Enter enqueues the resolved card
+///     (blocked with inline status while a slot is empty), Esc backs out to the
+///     list. The toggle chord closes the whole overlay.
+fn handle_templates_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.templates_open {
+        return false;
+    }
+    // The picker's own toggle chord closes the whole overlay from either mode, so
+    // the same key both opens and closes — without leaking to the global keymap,
+    // which the modal swallows.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleTemplates) {
+        app.templates_open = false;
+        app.template_card = None;
+        app.status = "templates closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    if app.template_card.is_some() {
+        handle_template_card_key(app, key);
+    } else {
+        handle_template_list_key(app, key);
+    }
+    true
+}
+
+/// Key handling for the template LIST (no card open yet).
+fn handle_template_list_key(app: &mut TuiApp, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.templates_open = false;
+            app.status = "templates closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up => {
+            app.templates.select_up();
+            app.needs_redraw = true;
+        }
+        KeyCode::Down => {
+            app.templates.select_down();
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter => {
+            instantiate_selected_template(app);
+        }
+        KeyCode::Char('d') | KeyCode::Delete => {
+            delete_selected_template(app);
+        }
+        KeyCode::Char('c') => {
+            app.templates.clear();
+            app.status = "templates cleared".to_string();
+            app.needs_redraw = true;
+        }
+        // Swallow every other key so the picker is modal.
+        _ => {}
+    }
+}
+
+/// Key handling for an open template CARD being filled.
+fn handle_template_card_key(app: &mut TuiApp, key: KeyEvent) {
+    let Some(card) = app.template_card.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            // Back out to the list (do NOT close the whole overlay) so the user can
+            // pick a different template without losing their place.
+            app.template_card = None;
+            app.status = templates_open_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter => {
+            enqueue_template_card(app);
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            card.focus_next();
+            app.status = templates_open_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            card.focus_prev();
+            app.status = templates_open_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Backspace => {
+            card.delete_back();
+            app.status = templates_open_status(app);
+            app.needs_redraw = true;
+        }
+        // Ctrl+U: clear the focused slot's value (composer-style "kill line").
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            card.clear_focused();
+            app.status = templates_open_status(app);
+            app.needs_redraw = true;
+        }
+        // A printable character (no Ctrl/Alt modifier) fills the focused slot;
+        // Shift is folded into the produced glyph already, so it is allowed through.
+        KeyCode::Char(ch)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            card.insert_char(ch);
+            app.status = templates_open_status(app);
+            app.needs_redraw = true;
+        }
+        // Swallow every other key so the card editor is modal.
+        _ => {}
+    }
+}
+
+/// Instantiate the picker's selected template into an editable card (§12.3.6). A
+/// no-op when the store is empty. Resolved by stable id so a concurrent delete
+/// never instantiates the wrong template.
+fn instantiate_selected_template(app: &mut TuiApp) {
+    let Some(id) = app.templates.selected_template().map(|t| t.id) else {
+        return;
+    };
+    instantiate_template(app, id);
+}
+
+/// Instantiate the template with `id` into an editable card and focus its first
+/// slot (§12.3.6). A no-op when no such template exists. A slot-less template is
+/// instantiated all the same — it is runnable immediately and the user just
+/// presses Enter to enqueue it.
+fn instantiate_template(app: &mut TuiApp, id: u64) {
+    app.templates.select_id(id);
+    let Some(card) = app.templates.instantiate(id) else {
+        return;
+    };
+    app.template_card = Some(card);
+    app.status = templates_open_status(app);
+    app.needs_redraw = true;
+}
+
+/// Resolve the open template card and stage it onto the prompt queue (§12.3.6).
+/// BLOCKS with an inline "fill these slots" status while any slot is still empty —
+/// the spec's "Missing/invalid slots block execution with inline status" — and
+/// only on a clean resolution pushes the prompt, drops the card, and returns to the
+/// list so another template can be filled.
+fn enqueue_template_card(app: &mut TuiApp) {
+    let Some(card) = app.template_card.as_ref() else {
+        return;
+    };
+    match card.resolved() {
+        Ok(text) => {
+            app.prompt_queue.push_back(text);
+            let name = card.name.clone();
+            app.template_card = None;
+            app.status = format!(
+                "queued template '{name}' ({} in queue)",
+                app.prompt_queue.len()
+            );
+            app.needs_redraw = true;
+        }
+        Err(prompt_template::ResolveError::MissingSlots(missing)) => {
+            app.status = format!(
+                "cannot enqueue — fill {} ({} left)",
+                missing.join(", "),
+                missing.len(),
+            );
+            app.needs_redraw = true;
+        }
+    }
+}
+
+/// Delete the picker's selected template from the store and confirm (§12.3.6). A
+/// no-op when the store is empty.
+fn delete_selected_template(app: &mut TuiApp) {
+    let Some(id) = app.templates.selected_template().map(|t| t.id) else {
+        return;
+    };
+    if app.templates.delete(id) {
+        app.status = if app.templates.is_empty() {
+            "deleted template (store now empty)".to_string()
+        } else {
+            format!(
+                "deleted template ({} left)",
+                count_label_templates(app.templates.len())
+            )
+        };
+        app.needs_redraw = true;
+    }
+}
+
 fn handle_transcript_overlay_mouse(
     app: &mut TuiApp,
     mouse: crossterm::event::MouseEvent,
@@ -4652,6 +4927,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // key never leaks into the composer underneath. Sits beside the clipboard
     // picker at the front for the same reason.
     if app.snippets_open && handle_snippets_key(app, key) {
+        return Ok(false);
+    }
+
+    // The Prompt Templates picker (§12.3.6) is modal while open: it owns the
+    // keyboard (↑↓ select / Enter fill / d delete / c clear in LIST mode; Tab/↑↓
+    // move slot, type to fill, Enter enqueue, Esc back in CARD mode) BEFORE any
+    // selection-clear, search, chord, or keymap dispatch, so a stray key never
+    // leaks into the composer underneath. Sits beside the snippets picker for the
+    // same reason.
+    if app.templates_open && handle_templates_key(app, key) {
         return Ok(false);
     }
 
@@ -6780,6 +7065,17 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_scratchpad(app);
             true
         }
+        keymap::Action::ToggleTemplates => {
+            // §12.3.6: open / close the Prompt Templates picker. Main-surface
+            // overlay; the config/setup screens own their own routing, and the
+            // Ctrl+T overlay guard above already blocks this while the overlay is
+            // open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_templates(app);
+            true
+        }
     }
 }
 
@@ -8814,6 +9110,7 @@ fn first_run_hint_suppressed(app: &TuiApp) -> bool {
         || app.clipboard_history_open
         || app.snippets_open
         || app.scratchpad_open
+        || app.templates_open
         || app.search.is_some()
         || app.pending_approval.is_some()
         || app.pending_request_user_input.is_some()
@@ -12502,6 +12799,41 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::ScratchpadClear => {
             app.scratchpad.clear();
             app.status = scratchpad_open_status(app);
+            app.needs_redraw = true;
+        }
+        // Prompt Templates picker (§12.3.6): a click on a template row selects +
+        // instantiates it into an editable card — the mouse twin of moving the
+        // cursor with ↑↓ and pressing Enter. Resolved by stable id so a concurrent
+        // delete never instantiates the wrong template.
+        interaction::Action::TemplateSelect(id) => {
+            instantiate_template(app, id);
+        }
+        // A click on a slot row in the open card focuses that slot for editing —
+        // the mouse twin of Tab / ↑↓ slot movement.
+        interaction::Action::TemplateFocusSlot(index) => {
+            if let Some(card) = app.template_card.as_mut()
+                && card.focus_index(index)
+            {
+                app.status = templates_open_status(app);
+                app.needs_redraw = true;
+            }
+        }
+        // The "Enqueue" button: resolve the filled card and stage it (blocked with
+        // inline status while a slot is empty) — the same `enqueue_template_card`
+        // the Enter key drives, so mouse/keyboard parity holds by construction.
+        interaction::Action::TemplateEnqueue => {
+            enqueue_template_card(app);
+        }
+        // The "Delete" button / list `d`: delete the template by stable id — the
+        // mouse twin of the picker's `d` verb.
+        interaction::Action::TemplateDelete(id) => {
+            app.templates.select_id(id);
+            delete_selected_template(app);
+        }
+        // The "Clear all" button / list `c`: drop every saved template.
+        interaction::Action::TemplateClear => {
+            app.templates.clear();
+            app.status = "templates cleared".to_string();
             app.needs_redraw = true;
         }
     }
@@ -18462,6 +18794,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_snippets_surface(frame, area, app);
         return;
     }
+    // The Prompt Templates picker (§12.3.6) paints as a fullscreen overlay over
+    // everything else while open, registering its per-template row / slot row /
+    // button click targets every frame. Checked beside the snippets picker so its
+    // targets register and it owns the surface while open.
+    if app.templates_open {
+        render_templates_surface(frame, area, app);
+        return;
+    }
     // The Local Transcript Index overlay (§12.5.1) paints as a fullscreen summary
     // over everything else while open, registering its per-category row click
     // targets every frame. Checked beside the clipboard picker so its targets
@@ -19673,6 +20013,411 @@ fn render_snippets_buttons(frame: &mut Frame<'_>, inner: Rect, app: &TuiApp) {
                 interaction::Action::SnippetClear,
             );
         }
+    }
+}
+
+/// Paint the Prompt Templates picker (§12.3.6) over the whole frame.
+///
+/// Two modes share the modal surface: the template LIST (browse + select) and an
+/// instantiated CARD (fill its `{slot}`s then enqueue). The mode is chosen by
+/// `app.template_card` so the picker can be a thin shell over the pure model.
+fn render_templates_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Prompt templates ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "— reusable prompts with editable slots (Ctrl+Alt+T) ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 100, 24, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if app.template_card.is_some() {
+        render_template_card(frame, inner, app);
+    } else {
+        render_template_list(frame, inner, app);
+    }
+}
+
+/// Paint the LIST mode: a header stat line, the windowed list of template rows
+/// (each registered as a [`interaction::TargetKey::TemplateEntry`] click target),
+/// and the `[ Delete ]` / `[ Clear all ]` button strip.
+fn render_template_list(frame: &mut Frame<'_>, inner: Rect, app: &TuiApp) {
+    let header = if app.templates.is_empty() {
+        Line::from(Span::styled(
+            "No templates yet — they appear here as fillable queue cards (Ctrl+Alt+T).",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} · ↑↓ select · Enter fill slots · d delete · c clear",
+                count_label_templates(app.templates.len()),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height).saturating_sub(2);
+    if list_bottom > list_top {
+        let list_rect = Rect {
+            x: inner.x,
+            y: list_top,
+            width: inner.width,
+            height: list_bottom - list_top,
+        };
+        render_template_rows(frame, list_rect, app);
+    }
+    render_template_list_buttons(frame, inner, app);
+}
+
+/// Paint the windowed list of template rows into `list_rect` and register each
+/// visible row's rect as a [`interaction::TargetKey::TemplateEntry`] click target.
+/// The window scrolls to keep the selected row visible; each row shows the
+/// template name, a slot count, and a bounded one-line preview of the body.
+fn render_template_rows(frame: &mut Frame<'_>, list_rect: Rect, app: &TuiApp) {
+    let templates = app.templates.templates();
+    if templates.is_empty() || list_rect.height == 0 {
+        return;
+    }
+    let rows = list_rect.height as usize;
+    let selected = app.templates.selected_index();
+    let start = selected
+        .saturating_sub(rows.saturating_sub(1))
+        .min(templates.len().saturating_sub(rows.min(templates.len())));
+    let end = (start + rows).min(templates.len());
+
+    for (offset, template) in templates[start..end].iter().enumerate() {
+        let index = start + offset;
+        let is_selected = index == selected;
+        let row_rect = Rect {
+            x: list_rect.x,
+            y: list_rect.y + offset as u16,
+            width: list_rect.width,
+            height: 1,
+        };
+        let marker = if is_selected { "› " } else { "  " };
+        let slot_count = template.slot_count();
+        let slots = if slot_count == 1 {
+            "1 slot".to_string()
+        } else {
+            format!("{slot_count} slots")
+        };
+        let name_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(
+                format!("[{slots}] "),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(template.name.clone(), name_style),
+            Span::styled(
+                format!("  {}", template.preview()),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::TemplateEntry(template.id),
+            interaction::Action::TemplateSelect(template.id),
+        );
+    }
+}
+
+/// Paint the `[ Delete ]` / `[ Clear all ]` button strip on the LIST mode's bottom
+/// inner row and register each button's rect as a chrome click target. The delete
+/// button acts on the currently-selected template (resolved by id at click time);
+/// both are painted greyed on an empty store but register no target.
+fn render_template_list_buttons(frame: &mut Frame<'_>, inner: Rect, app: &TuiApp) {
+    const DELETE: &str = "[ Delete (d) ]";
+    const CLEAR: &str = "[ Clear all (c) ]";
+    let row = inner.y + inner.height.saturating_sub(1);
+    let has_templates = !app.templates.is_empty();
+    let accent = crate::render::theme::accent();
+    let quiet = crate::render::theme::quiet();
+    let active = if has_templates { accent } else { quiet };
+    let strip = Line::from(vec![
+        Span::styled(DELETE, Style::default().fg(active)),
+        Span::raw("  "),
+        Span::styled(CLEAR, Style::default().fg(quiet)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(strip),
+        Rect {
+            x: inner.x,
+            y: row,
+            width: inner.width,
+            height: 1,
+        },
+    );
+    let right = inner.x.saturating_add(inner.width);
+    let mut x = inner.x;
+    if let Some(id) = app.templates.selected_template().map(|t| t.id) {
+        let w = (DELETE.chars().count() as u16).min(right.saturating_sub(x));
+        if w > 0 {
+            app.register_click(
+                Rect {
+                    x,
+                    y: row,
+                    width: w,
+                    height: 1,
+                },
+                interaction::TargetKey::Chrome(interaction::ChromeKey::TemplateDelete),
+                interaction::Action::TemplateDelete(id),
+            );
+        }
+    }
+    x = x
+        .saturating_add(DELETE.chars().count() as u16)
+        .saturating_add(2);
+    if has_templates && x < right {
+        let w = (CLEAR.chars().count() as u16).min(right.saturating_sub(x));
+        if w > 0 {
+            app.register_click(
+                Rect {
+                    x,
+                    y: row,
+                    width: w,
+                    height: 1,
+                },
+                interaction::TargetKey::Chrome(interaction::ChromeKey::TemplateClear),
+                interaction::Action::TemplateClear,
+            );
+        }
+    }
+}
+
+/// Paint the CARD mode: a header naming the template, the resolved-prompt preview,
+/// the per-slot editor rows (each a [`interaction::ChromeKey::TemplateSlotRow`]
+/// click target), an inline missing-slots status, and the `[ Enqueue ]` button.
+fn render_template_card(frame: &mut Frame<'_>, inner: Rect, app: &TuiApp) {
+    let Some(card) = app.template_card.as_ref() else {
+        return;
+    };
+    // Name the focused slot in the header so the user always knows which slot a
+    // keystroke lands in, even when the slot list is scrolled.
+    let focus_label = match card.focused_slot() {
+        Some(name) => format!(
+            "Fill '{}' · slot {}/{} {{{name}}}",
+            card.name,
+            card.focused_index() + 1,
+            card.slot_count(),
+        ),
+        None => format!("Fill '{}'", card.name),
+    };
+    let header = Line::from(vec![
+        Span::styled(
+            focus_label,
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  Tab next · type to fill · Ctrl+U clear · Enter enqueue · Esc back",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    // Slot editor rows occupy the band between the header and the bottom button +
+    // status rows (last inner row = button, second-to-last = inline status).
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height).saturating_sub(2);
+    if card.has_no_slots() {
+        if list_bottom > list_top {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "  (this template has no slots — press Enter to enqueue it)",
+                    Style::default().fg(crate::render::theme::quiet()),
+                ))),
+                Rect {
+                    x: inner.x,
+                    y: list_top,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+        }
+    } else if list_bottom > list_top {
+        let band = Rect {
+            x: inner.x,
+            y: list_top,
+            width: inner.width,
+            height: list_bottom - list_top,
+        };
+        render_template_slot_rows(frame, band, app, card);
+    }
+
+    // Inline missing-slots status on the second-to-last inner row.
+    let status_row = inner.y + inner.height.saturating_sub(2);
+    if status_row >= list_top {
+        let missing = card.missing_slots();
+        let status = if missing.is_empty() {
+            Line::from(Span::styled(
+                "all slots filled — Enter to enqueue",
+                Style::default().fg(crate::render::theme::accent()),
+            ))
+        } else {
+            Line::from(Span::styled(
+                format!(
+                    "blocked: fill {} ({} left)",
+                    missing.join(", "),
+                    missing.len()
+                ),
+                Style::default().fg(crate::render::theme::warn()),
+            ))
+        };
+        frame.render_widget(
+            Paragraph::new(status),
+            Rect {
+                x: inner.x,
+                y: status_row,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+
+    // The Enqueue button on the bottom inner row. Greyed (no target) while a slot
+    // is still empty so a click cannot enqueue an unresolved card; the keyboard
+    // Enter is likewise blocked with status by `enqueue_template_card`.
+    const ENQUEUE: &str = "[ Enqueue (Enter) ]";
+    let row = inner.y + inner.height.saturating_sub(1);
+    let runnable = card.missing_slots().is_empty();
+    let color = if runnable {
+        crate::render::theme::accent()
+    } else {
+        crate::render::theme::quiet()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            ENQUEUE,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))),
+        Rect {
+            x: inner.x,
+            y: row,
+            width: inner.width,
+            height: 1,
+        },
+    );
+    if runnable {
+        let w = (ENQUEUE.chars().count() as u16).min(inner.width);
+        if w > 0 {
+            app.register_click(
+                Rect {
+                    x: inner.x,
+                    y: row,
+                    width: w,
+                    height: 1,
+                },
+                interaction::TargetKey::Chrome(interaction::ChromeKey::TemplateEnqueue),
+                interaction::Action::TemplateEnqueue,
+            );
+        }
+    }
+}
+
+/// Paint one editor row per slot into `band` and register each as a
+/// [`interaction::ChromeKey::TemplateSlotRow`] click target keyed by slot index.
+/// The focused slot is marked with `›` and its value shown with a `_` caret; an
+/// empty slot reads `(empty)` in the quiet colour so the user sees what is left to
+/// fill.
+fn render_template_slot_rows(
+    frame: &mut Frame<'_>,
+    band: Rect,
+    app: &TuiApp,
+    card: &prompt_template::TemplateCard,
+) {
+    let slots = card.slots();
+    let rows = band.height as usize;
+    let focused = card.focused_index();
+    // Scroll the window so the focused slot stays visible.
+    let start = focused
+        .saturating_sub(rows.saturating_sub(1))
+        .min(slots.len().saturating_sub(rows.min(slots.len())));
+    let end = (start + rows).min(slots.len());
+
+    for (offset, name) in slots[start..end].iter().enumerate() {
+        let index = start + offset;
+        let is_focused = index == focused;
+        let row_rect = Rect {
+            x: band.x,
+            y: band.y + offset as u16,
+            width: band.width,
+            height: 1,
+        };
+        let marker = if is_focused { "› " } else { "  " };
+        let value = card.value_at(index);
+        let value_span = if value.is_empty() {
+            Span::styled(
+                "(empty)",
+                Style::default().fg(crate::render::theme::quiet()),
+            )
+        } else {
+            Span::styled(
+                value.to_string(),
+                Style::default().fg(crate::render::theme::foreground()),
+            )
+        };
+        let name_style = if is_focused {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let mut spans = vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_focused {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(format!("{{{name}}}"), name_style),
+            Span::styled("  =  ", Style::default().fg(crate::render::theme::quiet())),
+            value_span,
+        ];
+        // A caret on the focused row so the editor reads as a text field.
+        if is_focused {
+            spans.push(Span::styled(
+                "_",
+                Style::default().fg(crate::render::theme::accent()),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), row_rect);
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::TemplateSlotRow(index)),
+            interaction::Action::TemplateFocusSlot(index),
+        );
     }
 }
 
@@ -34325,6 +35070,22 @@ pub(crate) struct TuiApp {
     /// pane owns key/mouse routing for editing. Toggled by the `ToggleScratchpad`
     /// keymap action. The buffer persists across opens/closes/turns regardless.
     pub(crate) scratchpad_open: bool,
+    /// Prompt Templates As Queue Cards (§12.3.6): a bounded, session-scoped store
+    /// of reusable parameterised prompt templates (e.g. `Review {file}`). Drives
+    /// the picker overlay; seeded with a couple of starter templates so the picker
+    /// is discoverable on first open, then survives across turns. Cheap at idle.
+    pub(crate) templates: prompt_template::TemplateStore,
+    /// Whether the Prompt Templates picker overlay (§12.3.6) is open. `false` =
+    /// closed (the resting state, paints nothing extra); `true` = the fullscreen
+    /// picker owns key/mouse routing. Toggled by the `ToggleTemplates` keymap
+    /// action.
+    pub(crate) templates_open: bool,
+    /// The Prompt Template card (§12.3.6) currently being filled, or `None` when
+    /// the picker is showing the template LIST. `Some` = a template was selected
+    /// and instantiated into an editable card whose `{slot}`s the user fills before
+    /// enqueueing; the picker overlay then paints the card + slot editor instead of
+    /// the list. Cleared back to `None` when the user backs out (Esc) or enqueues.
+    pub(crate) template_card: Option<prompt_template::TemplateCard>,
     /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
     /// keyed by stable entry id and grouped by category (user turns, tool calls,
     /// errors, …). Rebuilt incrementally — only when the transcript's
@@ -35203,6 +35964,9 @@ impl TuiApp {
             snippets_open: false,
             scratchpad: scratchpad::Scratchpad::new(),
             scratchpad_open: false,
+            templates: prompt_template::TemplateStore::with_starters(),
+            templates_open: false,
+            template_card: None,
             transcript_index: transcript_index::TranscriptIndex::new(),
             transcript_index_open: false,
             transcript_index_selected: 0,

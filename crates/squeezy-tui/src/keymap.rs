@@ -415,6 +415,16 @@ pub(crate) enum Action {
     /// verb fill it. Keyboard- and mouse-driven; closed is the resting state, so a
     /// session that never opens it pays nothing.
     ToggleScratchpad,
+    /// Open / close the Prompt Templates picker (`Ctrl+Alt+T` default; §12.3.6).
+    /// Reusable parameterised prompt templates — e.g. `Review {file}` — shown as
+    /// queue cards with editable slots. The picker lists saved templates; selecting
+    /// one instantiates a card whose `{slot}`s the user fills (Tab/↑↓ to move
+    /// between slots, type to edit) before enqueueing or running the resolved
+    /// prompt. Missing/blank slots BLOCK execution with inline status (the spec's
+    /// "Missing/invalid slots block execution with inline status"). The template
+    /// store survives across turns; closed is the resting state, so a session that
+    /// never opens it pays nothing. Keyboard- and mouse-driven.
+    ToggleTemplates,
 }
 
 impl Action {
@@ -491,6 +501,7 @@ impl Action {
             Self::DismissFirstRunHint => "dismiss_first_run_hint",
             Self::ToggleToolActions => "toggle_tool_actions",
             Self::ToggleScratchpad => "toggle_scratchpad",
+            Self::ToggleTemplates => "toggle_templates",
         }
     }
 
@@ -566,6 +577,7 @@ impl Action {
         Action::DismissFirstRunHint,
         Action::ToggleToolActions,
         Action::ToggleScratchpad,
+        Action::ToggleTemplates,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -750,6 +762,11 @@ impl Action {
             // Meta/Alt encoding that is unreliable across Linux terminals, tmux,
             // and SSH as the rest of the nav/copy/overlay family.
             | Self::ToggleScratchpad
+            // Prompt Templates picker toggle is `Ctrl+Alt+T` — a Ctrl+Alt (Meta)
+            // chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+A`/`Ctrl+Alt+H`/
+            // `Ctrl+Alt+P` chords above.
+            | Self::ToggleTemplates
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1067,6 +1084,18 @@ impl Action {
             // send-to-composer / queue verbs use `Ctrl+I` / `Ctrl+Q` (handled by
             // the pane's own modal key handler, not rebindable here).
             Self::ToggleScratchpad => KeyBinding::new(KeyCode::Char('4'), KeyModifiers::ALT),
+            // Prompt Templates picker (§12.3.6). `Ctrl+Alt+T` — the next free
+            // `Ctrl+Alt` letter after `Ctrl+Alt+S` (snippets), `Ctrl+Alt+A`
+            // (tool actions), `Ctrl+Alt+H`/`Ctrl+Alt+P`/`Ctrl+Alt+R`/`Ctrl+Alt+N`.
+            // `T` reads as "template" and pairs naturally with the snippets chord
+            // it sits beside (both are reusable-prompt stashes). The plain `Ctrl+T`
+            // (transcript overlay) and `Alt+t` (pinned compare) are distinct
+            // chords. The in-card slot-fill / enqueue verbs are handled by the
+            // picker's own modal key handler, not rebindable here.
+            Self::ToggleTemplates => KeyBinding::new(
+                KeyCode::Char('t'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
         }
     }
 }

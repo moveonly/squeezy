@@ -65,6 +65,10 @@ pub(crate) enum TargetKey {
     /// by its stable per-snippet id (NOT its list index) so a delete/drop
     /// mid-gesture never shifts the hit target.
     SnippetEntry(u64),
+    /// A template row in the Prompt Templates picker overlay (§12.3.6), addressed
+    /// by its stable per-template id (NOT its list index) so a delete/drop
+    /// mid-gesture never shifts the hit target.
+    TemplateEntry(u64),
     /// A chrome affordance that carries no entry/row id.
     Chrome(ChromeKey),
 }
@@ -211,6 +215,17 @@ pub(crate) enum ChromeKey {
     ScratchpadAppend,
     /// The "Clear" button in the Scratchpad Pane (§12.3.3).
     ScratchpadClear,
+    /// A slot row in an open Prompt Template card (§12.3.6), keyed by its 0-based
+    /// index in the card's slot list so a click focuses exactly that slot for
+    /// editing.
+    TemplateSlotRow(usize),
+    /// The "Enqueue" button in the Prompt Templates card (§12.3.6) — resolves the
+    /// filled card and stages it onto the prompt queue.
+    TemplateEnqueue,
+    /// The "Delete" button in the Prompt Templates picker (§12.3.6).
+    TemplateDelete,
+    /// The "Clear all" button in the Prompt Templates picker (§12.3.6).
+    TemplateClear,
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -432,6 +447,24 @@ pub(crate) enum Action {
     /// Clear the scratchpad buffer and its source links (§12.3.3). Mouse twin of
     /// the pane's `Ctrl+K` verb / the "Clear" button.
     ScratchpadClear,
+    /// Select the given template (by stable id) in the Prompt Templates picker
+    /// (§12.3.6) and instantiate it into an editable card. Mouse twin of the
+    /// picker's Up/Down + Enter. Fed by a click on a template row.
+    TemplateSelect(u64),
+    /// Focus the given slot (by 0-based index) in the open Prompt Template card
+    /// (§12.3.6) for editing. Mouse twin of the card's Tab / ↑↓ slot movement; fed
+    /// by a click on a slot row.
+    TemplateFocusSlot(usize),
+    /// Resolve the filled Prompt Template card and stage it onto the prompt queue
+    /// (§12.3.6). Mouse twin of the card's Enter verb / the "Enqueue" button.
+    /// Blocked (with inline status) while any slot is still empty.
+    TemplateEnqueue,
+    /// Delete the picker's selected template (by stable id) from the store
+    /// (§12.3.6). Mouse twin of the picker's `d` verb / the "Delete" button.
+    TemplateDelete(u64),
+    /// Clear every saved template (§12.3.6). Mouse twin of the picker's `c` verb /
+    /// the "Clear all" button.
+    TemplateClear,
 }
 
 impl Action {
@@ -496,6 +529,11 @@ impl Action {
         Action::ScratchpadEnqueue,
         Action::ScratchpadAppend,
         Action::ScratchpadClear,
+        Action::TemplateSelect(0),
+        Action::TemplateFocusSlot(0),
+        Action::TemplateEnqueue,
+        Action::TemplateDelete(0),
+        Action::TemplateClear,
     ];
 }
 
