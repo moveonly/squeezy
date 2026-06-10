@@ -134,6 +134,7 @@ mod prompt_queue;
 mod prompt_queue_multiselect;
 mod proposed_plan;
 mod queue_edit;
+mod queue_groups;
 mod queue_run_next;
 mod quote_compose;
 mod rename_labels;
@@ -11801,6 +11802,168 @@ fn queue_merge_to_composer(app: &mut TuiApp) -> bool {
     true
 }
 
+// ===========================================================================
+// Queue Groups (§12.3.4)
+//
+// Named batches layered over the flat prompt queue (`TuiApp::prompt_queue_groups`),
+// addressed by the same stable item ids the multi-select set and the
+// direct-manipulation registry use. The verbs — group the tagged (or focused)
+// prompts, collapse/expand a group, pause/resume a group, dissolve a group —
+// all resolve their ids to live indices at action time and prune drained
+// members first, so a concurrent front-drain or reorder can never make them
+// touch the wrong row. These are the shared handlers the overlay's keyboard
+// verbs and the per-item mouse middle-click both dispatch through, so the
+// keyboard/mouse parity holds by construction.
+// ===========================================================================
+
+/// Keep the group model honest before any group op: re-align the id sidecar to
+/// the live queue, then prune members that drained / were deleted (dropping a
+/// group emptied that way). Mirrors the `sync_queue_ids` + `retain_live` pair
+/// the multi-select verbs run, so a stale id can never make a group op act on a
+/// vanished prompt.
+fn sync_queue_groups(app: &mut TuiApp) {
+    sync_queue_ids(app);
+    let ids = queue_live_ids(app);
+    app.prompt_queue_groups.retain_live(&ids);
+}
+
+/// Group the tagged queued prompts (§12.3.4) into a fresh named batch. When the
+/// multi-select set is empty, falls back to grouping the single focused prompt,
+/// so the verb is useful with or without an active selection. The new group
+/// becomes each member's sole owner (regrouping pulls a prompt out of any group
+/// it was already in). Clears the multi-selection afterwards (the batch is now
+/// the durable organization). Returns `true` if a group was formed; `false` on
+/// an empty queue / stale cursor.
+fn queue_create_group_from_selection(app: &mut TuiApp) -> bool {
+    sync_queue_groups(app);
+    let mut ids = app
+        .prompt_queue_multiselect
+        .ids_in_queue_order(&queue_live_ids(app));
+    if ids.is_empty() {
+        // No group tagged: fall back to the single focused row.
+        if let Some(state) = app.prompt_queue_overlay.as_ref()
+            && let Some(&id) = app.prompt_queue_ids.get(state.selected)
+        {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return false;
+    }
+    let Some(_gid) = app.prompt_queue_groups.create_group(&ids) else {
+        return false;
+    };
+    let count = ids.len();
+    app.prompt_queue_multiselect.clear();
+    app.status = format!(
+        "grouped {count} queued prompt{} ({} group{})",
+        if count == 1 { "" } else { "s" },
+        app.prompt_queue_groups.len(),
+        if app.prompt_queue_groups.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
+    app.needs_redraw = true;
+    true
+}
+
+/// The id of the group owning the focused queued prompt, or `None` when the
+/// cursor sits on a loose prompt / an empty queue. The shared lookup the
+/// collapse / pause / dissolve verbs resolve their target group through.
+fn focused_queue_group_id(app: &TuiApp) -> Option<u64> {
+    let state = app.prompt_queue_overlay.as_ref()?;
+    let &id = app.prompt_queue_ids.get(state.selected)?;
+    app.prompt_queue_groups.group_id_of_item(id)
+}
+
+/// Toggle the collapsed state of the group owning the focused prompt (§12.3.4).
+/// A loose prompt (no group) is a quiet no-op. Returns `true` if a group toggled.
+/// The single source of truth the keyboard `z` and the mouse middle-click share.
+fn queue_group_toggle_collapse_focused(app: &mut TuiApp) -> bool {
+    sync_queue_groups(app);
+    let Some(gid) = focused_queue_group_id(app) else {
+        app.status = "focused prompt is not in a group".to_string();
+        app.needs_redraw = true;
+        return false;
+    };
+    queue_group_toggle_collapse_by_id(app, gid)
+}
+
+/// Toggle the collapsed state of the group with `group_id` (§12.3.4). The
+/// id-keyed primitive the focused-keyboard verb and the mouse middle-click both
+/// route through, so the two stay identical by construction. No-op (returns
+/// false) if the group has been dissolved / drained out.
+fn queue_group_toggle_collapse_by_id(app: &mut TuiApp, group_id: u64) -> bool {
+    let Some(now_collapsed) = app.prompt_queue_groups.toggle_collapsed(group_id) else {
+        return false;
+    };
+    app.status = if now_collapsed {
+        "collapsed queue group".to_string()
+    } else {
+        "expanded queue group".to_string()
+    };
+    app.needs_redraw = true;
+    true
+}
+
+/// Toggle the paused state of the group owning the focused prompt (§12.3.4). A
+/// paused group's prompts are held back from the drain pump until resumed (the
+/// prompts are not deleted). A loose prompt is a quiet no-op. Returns `true` if a
+/// group toggled.
+fn queue_group_toggle_pause_focused(app: &mut TuiApp) -> bool {
+    sync_queue_groups(app);
+    let Some(gid) = focused_queue_group_id(app) else {
+        app.status = "focused prompt is not in a group".to_string();
+        app.needs_redraw = true;
+        return false;
+    };
+    let Some(now_paused) = app.prompt_queue_groups.toggle_paused(gid) else {
+        return false;
+    };
+    // Pausing a group is an explicit "hold this back" edit, so it disarms the
+    // auto-drain pump the same way deleting a queued prompt does — otherwise the
+    // pump could keep draining loose prompts while the user is mid-edit. Resuming
+    // does not re-arm it; the next turn-finish drains as usual.
+    if now_paused {
+        app.auto_drain_queue = false;
+    }
+    app.status = if now_paused {
+        "paused queue group (its prompts will not run)".to_string()
+    } else {
+        "resumed queue group".to_string()
+    };
+    app.needs_redraw = true;
+    true
+}
+
+/// Dissolve the group owning the focused prompt (§12.3.4), returning its members
+/// loose into the queue (the prompts are untouched — only the grouping is
+/// removed). A loose prompt is a quiet no-op. Returns `true` if a group dissolved.
+fn queue_group_dissolve_focused(app: &mut TuiApp) -> bool {
+    sync_queue_groups(app);
+    let Some(gid) = focused_queue_group_id(app) else {
+        app.status = "focused prompt is not in a group".to_string();
+        app.needs_redraw = true;
+        return false;
+    };
+    if !app.prompt_queue_groups.dissolve(gid) {
+        return false;
+    }
+    app.status = format!(
+        "dissolved queue group ({} group{} left)",
+        app.prompt_queue_groups.len(),
+        if app.prompt_queue_groups.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
+    app.needs_redraw = true;
+    true
+}
+
 /// Run Selected Queued Next (§11G.9): promote the focused queued prompt to the
 /// front so it runs before everything else still waiting. When idle (no turn
 /// running) the prompt is moved to the front and the auto-drain pump is armed, so
@@ -11897,6 +12060,13 @@ fn toggle_prompt_queue_overlay(app: &mut TuiApp) {
         // Keep the id sidecar aligned to the live queue the moment the
         // overlay opens, so the very first hit-target frame is id-stable.
         sync_queue_ids(app);
+        // Prune any Queue-Group members that drained while the overlay was
+        // closed, so a re-opened overlay never paints a marker for a vanished
+        // prompt and a fully-drained group is dropped. Groups themselves SURVIVE
+        // the open/close cycle (they are a durable batch organization), unlike
+        // the transient multi-selection cleared below.
+        let live_ids = queue_live_ids(app);
+        app.prompt_queue_groups.retain_live(&live_ids);
         Some(prompt_queue::PromptQueueState::new())
     };
     // A multi-selection never survives an open/close cycle: tags are scoped to
@@ -11908,7 +12078,7 @@ fn toggle_prompt_queue_overlay(app: &mut TuiApp) {
     }
     app.status = if app.prompt_queue_overlay.is_some() {
         format!(
-            "prompt queue ({} queued) · ↑↓ focus · Space tag · Enter/e edit · r run next · m merge · Del remove · u undo · Esc close",
+            "prompt queue ({} queued) · ↑↓ focus · Space tag · g group · z fold · p pause · Enter/e edit · r run next · Del remove · Esc close",
             app.prompt_queue.len()
         )
     } else {
@@ -14281,6 +14451,10 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 app.prompt_queue_overlay = None;
                 app.editing_queue_id = None;
                 app.prompt_queue_multiselect.clear();
+                // The Queue-Groups (§12.3.4) batches are keyed by queue-item ids
+                // that are all gone now, so drop them too rather than leave them
+                // naming vanished prompts.
+                app.prompt_queue_groups = queue_groups::QueueGroups::new();
                 app.auto_drain_queue = false;
                 app.transcript_overlay = None;
                 app.transcript_overlay_scrollbar_cache.set(None);
@@ -16292,6 +16466,30 @@ fn handle_queue_multiselect_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             queue_merge_to_composer(app);
             true
         }
+        // Queue Groups (§12.3.4). `g` folds the tagged (or focused) prompts into
+        // a named batch; `Shift+g` (`G`) dissolves the group under focus;
+        // `z` collapses/expands it; `p` pauses/resumes it (a paused group's
+        // prompts are skipped by the drain pump). All are plain printable keys
+        // not used by the existing overlay verbs, so they keep the overlay's
+        // "consume before the global keymap" pattern without colliding. `G` is
+        // matched before `g` so the shifted variant is not swallowed as a bare
+        // group-create.
+        KeyCode::Char('G') => {
+            queue_group_dissolve_focused(app);
+            true
+        }
+        KeyCode::Char('g') => {
+            queue_create_group_from_selection(app);
+            true
+        }
+        KeyCode::Char('z') | KeyCode::Char('Z') => {
+            queue_group_toggle_collapse_focused(app);
+            true
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            queue_group_toggle_pause_focused(app);
+            true
+        }
         // Group delete / move only claim the key when a group is active; an
         // empty group falls through to `PromptQueueState::dispatch` so the
         // single-row Delete / Shift+arrow semantics are unchanged.
@@ -16584,6 +16782,31 @@ fn handle_queue_overlay_mouse(
             }
             _ => None,
         },
+        // Middle-click on a queue row toggles the collapse of the group that owns
+        // it (§12.3.4) — the mouse twin of the keyboard `z` verb. Both seat the
+        // overlay focus on the row, then route through the same
+        // `queue_group_toggle_collapse_by_id`, so the paths stay identical by
+        // construction. A click on a loose (ungrouped) row or one that has since
+        // drained out resolves to a quiet no-op. A press off any queue item falls
+        // through.
+        MouseEventKind::Down(MouseButton::Middle) => match hit_test(app, &mouse) {
+            Some((interaction::TargetKey::QueueItem(id), _)) => {
+                sync_queue_groups(app);
+                if let Some(index) = queue_index_for_id(app, id) {
+                    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+                        state.selected = index;
+                    }
+                    if let Some(gid) = app.prompt_queue_groups.group_id_of_item(id) {
+                        queue_group_toggle_collapse_by_id(app, gid);
+                    } else {
+                        app.status = "queued prompt is not in a group".to_string();
+                        app.needs_redraw = true;
+                    }
+                }
+                Some(true)
+            }
+            _ => None,
+        },
         // Drag/Release are only queue gestures while a reorder drag is armed;
         // otherwise fall through (a held drag with no queue drag is a
         // text-selection / scrollbar gesture the later arms own).
@@ -16682,13 +16905,31 @@ fn queue_input_behind_running_turn(app: &mut TuiApp, input: String) {
     app.status = format!("queued ({})", app.prompt_queue.len());
 }
 
+/// The index of the front-most queued prompt that is *runnable*: not a member of
+/// a paused queue group (§12.3.4). Returns `None` when the queue is empty or
+/// every remaining prompt is held back by a paused group. The drain pump drains
+/// this item rather than blindly popping the front, so a paused batch parks its
+/// prompts while loose prompts and running groups keep flowing. Pure over the
+/// id sidecar + group model, so the policy is pinned by tests without a pump.
+fn next_runnable_queue_index(app: &TuiApp) -> Option<usize> {
+    app.prompt_queue_ids
+        .iter()
+        .position(|id| !app.prompt_queue_groups.is_item_paused(*id))
+}
+
 async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Agent) {
     while app.turn_rx.is_none() && !prompt_queue_drain_blocked(app) {
-        let Some(next) = app.prompt_queue.pop_front() else {
+        // Keep the id sidecar aligned before consulting the group model so a
+        // front-drain since the last tick can't stale the pause lookup.
+        sync_queue_ids(app);
+        let Some(index) = next_runnable_queue_index(app) else {
             return;
         };
-        // Keep the id sidecar aligned to the front-drain.
-        app.prompt_queue_ids.pop_front();
+        let Some(next) = app.prompt_queue.remove(index) else {
+            return;
+        };
+        // Carry the id sidecar with the removed slot so the two stay aligned.
+        app.prompt_queue_ids.remove(index);
         let remaining = app.prompt_queue.len();
         app.status = if remaining == 0 {
             "running queued prompt".to_string()
@@ -31472,9 +31713,10 @@ fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
     let queue_overlay_lines = app
         .prompt_queue_overlay
         .as_ref()
-        // Group markers never change the line count, so the height calc can
-        // skip computing them (`None`).
-        .map(|state| prompt_queue::render_lines(state, &app.prompt_queue, None).len())
+        // Multi-select / Queue-Group markers are inline prefixes that never
+        // change the line count, so the height calc can skip computing them
+        // (`None`).
+        .map(|state| prompt_queue::render_lines(state, &app.prompt_queue, None, None).len())
         .unwrap_or(0);
     let overlay_lines = if queue_overlay_lines > 0 {
         0
@@ -31890,10 +32132,24 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .iter()
         .map(|id| app.prompt_queue_multiselect.contains(*id))
         .collect();
+    // Per-item Queue-Group marker (§12.3.4), one per queue slot in queue order,
+    // so the overlay paints a `[G]`/`[P]` tag next to each grouped prompt.
+    let queue_groups: Vec<Option<&queue_groups::QueueGroup>> = app
+        .prompt_queue_ids
+        .iter()
+        .map(|id| app.prompt_queue_groups.group_of_item(*id))
+        .collect();
     let queue_overlay_lines: Vec<Line<'static>> = app
         .prompt_queue_overlay
         .as_ref()
-        .map(|state| prompt_queue::render_lines(state, &app.prompt_queue, Some(&queue_tagged)))
+        .map(|state| {
+            prompt_queue::render_lines(
+                state,
+                &app.prompt_queue,
+                Some(&queue_tagged),
+                Some(&queue_groups),
+            )
+        })
         .unwrap_or_default();
     let queue_open = !queue_overlay_lines.is_empty();
     let overlay_lines = if queue_open {
@@ -31913,9 +32169,20 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     };
     // Keep the indicator visible even when the overlay is open so the
     // same row stays clickable to toggle it back closed. The glyph
-    // switches between `>` and `v` to reflect state.
-    let indicator_line =
-        prompt_queue::indicator_line(&app.prompt_queue, app.turn_rx.is_some(), queue_open);
+    // switches between `>` and `v` to reflect state. The Queue-Groups
+    // (§12.3.4) summary rides along so paused/blocked batches show in the
+    // strip without opening the overlay.
+    let queue_groups_summary = if app.prompt_queue_groups.is_empty() {
+        String::new()
+    } else {
+        queue_groups::groups_summary(&app.prompt_queue_groups)
+    };
+    let indicator_line = prompt_queue::indicator_line(
+        &app.prompt_queue,
+        app.turn_rx.is_some(),
+        queue_open,
+        Some(queue_groups_summary.as_str()),
+    );
     let extra_height = queue_overlay_lines.len()
         + overlay_lines.len()
         + mention_lines.len()
@@ -34438,6 +34705,15 @@ pub(crate) struct TuiApp {
     /// pure `PromptQueueState` because the tagging is id-keyed and only lib.rs
     /// owns the id sidecar.
     pub(crate) prompt_queue_multiselect: prompt_queue_multiselect::MultiSelect,
+    /// Queue Groups (§12.3.4): named batches layered over the flat prompt queue,
+    /// addressed by the same stable item ids. A group can be collapsed (hidden
+    /// behind a header in the overlay), paused (its prompts are skipped by the
+    /// drain pump), or dissolved (ungrouped). Empty means no grouping is active
+    /// and the queue behaves as a flat list. Unlike the multi-select set, groups
+    /// SURVIVE an overlay open/close cycle — a batch is a durable organization of
+    /// the queue, not a transient selection — and are pruned of drained members
+    /// by `retain_live` whenever the queue may have shifted.
+    pub(crate) prompt_queue_groups: queue_groups::QueueGroups,
     /// Set true when a turn just completed (success, cancel, or fail)
     /// and the queue is non-empty. The main loop reads this immediately
     /// after `drain_agent_events` returns, pops the next prompt, and
@@ -34998,6 +35274,7 @@ impl TuiApp {
             prompt_queue_overlay: None,
             editing_queue_id: None,
             prompt_queue_multiselect: prompt_queue_multiselect::MultiSelect::new(),
+            prompt_queue_groups: queue_groups::QueueGroups::new(),
             auto_drain_queue: false,
             pending_chord: None,
             clickables: std::cell::RefCell::new(interaction::Registry::new()),

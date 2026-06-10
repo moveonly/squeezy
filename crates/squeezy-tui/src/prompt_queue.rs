@@ -156,16 +156,26 @@ fn preview(text: &str) -> String {
 /// in queue order; `None` (or a shorter slice) renders the base overlay with no
 /// group markers. A tagged row gets a `[x]` checkbox in the accent colour; the
 /// header hint switches to the multi-select cheatsheet while a group is active.
+///
+/// `groups` is a per-item Queue-Group marker (§12.3.4), one entry per queue slot
+/// in queue order: `Some(group)` for a grouped prompt (painted with a `[G]`/`[P]`
+/// tag reflecting running/paused state) or `None` for a loose prompt (painted as
+/// aligning blanks). A shorter / absent slice paints every row loose. Markers are
+/// inline prefixes, so they never change the row count the height calc relies on.
 pub(crate) fn render_lines(
     state: &PromptQueueState,
     queue: &VecDeque<String>,
     tagged: Option<&[bool]>,
+    groups: Option<&[Option<&crate::queue_groups::QueueGroup>]>,
 ) -> Vec<Line<'static>> {
     let group_active = tagged.is_some_and(|t| t.iter().any(|&b| b));
+    let any_group = groups.is_some_and(|g| g.iter().any(|m| m.is_some()));
     let hint = if group_active {
-        "  Space tag · a all · Del delete group · Shift+↑↓ move group · m merge · c clear"
+        "  Space tag · g group · Del delete group · Shift+↑↓ move group · m merge · c clear"
+    } else if any_group {
+        "  ↑↓ select · g group · z fold · p pause · G dissolve · r run next · Del remove · Esc close"
     } else {
-        "  ↑↓ select · Space tag · Shift+↑↓ reorder · Enter/e edit · r run next · Del remove · m merge · Esc close"
+        "  ↑↓ select · Space tag · g group · Shift+↑↓ reorder · Enter/e edit · r run next · Del remove · Esc close"
     };
     let header = Line::from(vec![
         Span::styled(
@@ -190,6 +200,7 @@ pub(crate) fn render_lines(
         let index = start + rel;
         let is_selected = index == state.selected;
         let is_tagged = tagged.and_then(|t| t.get(index)).copied().unwrap_or(false);
+        let group = groups.and_then(|g| g.get(index)).copied().flatten();
         let marker = if is_selected { "› " } else { "  " };
         let style = if is_selected {
             Style::default()
@@ -198,7 +209,14 @@ pub(crate) fn render_lines(
         } else {
             Style::default().fg(palette::muted_fg())
         };
-        let body = format!("{:>2}. {}", index + 1, preview(item));
+        // A collapsed group's member rows stay in place (so the windowing and the
+        // hit-target rects never drift) but read as folded — the preview is
+        // replaced by the group name on the first member and dimmed elsewhere.
+        let body = if let Some(g) = group.filter(|g| g.collapsed) {
+            format!("{:>2}. ⊟ {} ({})", index + 1, g.name, g.members.len())
+        } else {
+            format!("{:>2}. {}", index + 1, preview(item))
+        };
         lines.push(Line::from(vec![
             Span::styled(
                 marker,
@@ -209,6 +227,7 @@ pub(crate) fn render_lines(
                 }),
             ),
             crate::prompt_queue_multiselect::marker_span(is_tagged),
+            crate::queue_groups::group_marker_span(group),
             Span::raw(" "),
             Span::styled(body, style),
         ]));
@@ -225,10 +244,16 @@ mod tests;
 /// dark blue so the row reads as a disclosure button — `>` when the
 /// reorder overlay is closed (click to expand), `v` when it's open
 /// (click to collapse).
+///
+/// `groups` is the Queue-Groups (§12.3.4) one-line summary
+/// ([`crate::queue_groups::groups_summary`]) — e.g. `Group 1 (2, paused)` — or
+/// `None`/empty when no groups exist. When present it is appended in the warn
+/// colour so the strip "shows next/paused/blocked groups and item counts".
 pub(crate) fn indicator_line(
     queue: &VecDeque<String>,
     turn_running: bool,
     overlay_open: bool,
+    groups: Option<&str>,
 ) -> Option<Line<'static>> {
     if queue.is_empty() {
         return None;
@@ -247,6 +272,15 @@ pub(crate) fn indicator_line(
         "Ctrl+X Q to reorder"
     };
     let mut spans = button_spans(&format!("queued: {n}"), state);
+    // Surface the group summary (counts + paused/collapsed flags) right after the
+    // count so a held-back batch is visible without opening the overlay.
+    if let Some(summary) = groups.filter(|s| !s.is_empty()) {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("· {summary}"),
+            Style::default().fg(crate::render::theme::warn()),
+        ));
+    }
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
         hint,

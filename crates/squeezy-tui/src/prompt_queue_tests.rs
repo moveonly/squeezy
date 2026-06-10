@@ -118,16 +118,23 @@ fn unrelated_keys_are_ignored() {
 #[test]
 fn indicator_line_present_when_queue_non_empty() {
     let queue = queue_of(&["a", "b"]);
-    assert!(indicator_line(&queue, true, false).is_some());
-    assert!(indicator_line(&queue, true, true).is_some());
-    assert!(indicator_line(&VecDeque::new(), true, false).is_none());
+    assert!(indicator_line(&queue, true, false, None).is_some());
+    assert!(indicator_line(&queue, true, true, None).is_some());
+    assert!(indicator_line(&VecDeque::new(), true, false, None).is_none());
+    // A group summary rides along in the strip when present.
+    let line = indicator_line(&queue, false, false, Some("Group 1 (2, paused)")).expect("line");
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        text.contains("Group 1 (2, paused)"),
+        "summary in strip: {text}"
+    );
 }
 
 #[test]
 fn render_lines_includes_header_and_empty_marker() {
     let state = PromptQueueState::new();
     let queue: VecDeque<String> = VecDeque::new();
-    let lines = render_lines(&state, &queue, None);
+    let lines = render_lines(&state, &queue, None, None);
     assert!(lines.len() >= 2);
 }
 
@@ -137,7 +144,7 @@ fn render_lines_paints_multiselect_checkbox() {
     let queue = queue_of(&["alpha", "beta", "gamma"]);
     // Tag the middle item only.
     let tagged = [false, true, false];
-    let lines = render_lines(&state, &queue, Some(&tagged));
+    let lines = render_lines(&state, &queue, Some(&tagged), None);
     let text: String = lines
         .iter()
         .flat_map(|l| l.spans.iter())
@@ -157,7 +164,7 @@ fn render_lines_paints_multiselect_checkbox() {
 fn render_lines_header_is_base_hint_with_no_group() {
     let state = PromptQueueState::new();
     let queue = queue_of(&["alpha"]);
-    let lines = render_lines(&state, &queue, Some(&[false]));
+    let lines = render_lines(&state, &queue, Some(&[false]), None);
     let header: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(header.contains("reorder"), "base header hint: {header}");
     assert!(!header.contains("delete group"));

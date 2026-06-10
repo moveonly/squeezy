@@ -25089,6 +25089,415 @@ fn queue_overlay_paints_the_edit_hint_across_a_resize() {
 }
 
 // ===========================================================================
+// Queue Groups (§12.3.4): named batches over the flat queue — group / collapse /
+// pause / dissolve, driven through the real overlay key + mouse paths, the real
+// render(), and the real drain pump.
+// ===========================================================================
+
+#[tokio::test]
+async fn g_groups_the_tagged_prompts_into_a_named_batch() {
+    // Tag b and c, then `g` folds them into "Group 1".
+    let (mut app, mut agent) = queue_app_with_tags(&["a", "b", "c", "d"], &[1, 2]).await;
+    let id_b = queue_id_at(&app, 1);
+    let id_c = queue_id_at(&app, 2);
+    let id_a = queue_id_at(&app, 0);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("g groups the tagged prompts");
+    assert_eq!(app.prompt_queue_groups.len(), 1);
+    let gid = app
+        .prompt_queue_groups
+        .group_id_of_item(id_b)
+        .expect("group");
+    assert_eq!(app.prompt_queue_groups.group_id_of_item(id_c), Some(gid));
+    // The loose prompt stays loose.
+    assert_eq!(app.prompt_queue_groups.group_id_of_item(id_a), None);
+    // Grouping clears the multi-selection (the batch is now the organization).
+    assert!(app.prompt_queue_multiselect.is_empty());
+    assert!(app.status.contains("grouped 2 queued prompts"));
+    // `g` never leaks into the composer.
+    assert!(app.input.is_empty(), "g must not reach the composer");
+}
+
+#[tokio::test]
+async fn g_with_no_selection_groups_the_focused_prompt() {
+    let mut app = queue_app(&["a", "b", "c"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 1; // focus "b"
+    }
+    let id_b = queue_id_at(&app, 1);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("g groups the focused prompt");
+    assert_eq!(app.prompt_queue_groups.len(), 1);
+    assert!(app.prompt_queue_groups.group_id_of_item(id_b).is_some());
+    assert!(app.status.contains("grouped 1 queued prompt "));
+}
+
+#[tokio::test]
+async fn p_pauses_and_resumes_the_focused_group_and_gates_the_drain() {
+    let (mut app, mut agent) = queue_app_with_tags(&["a", "b"], &[0, 1]).await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("group");
+    let id_a = queue_id_at(&app, 0);
+    // Focus is on a grouped row; `p` pauses the whole group.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("p pauses the group");
+    assert!(app.prompt_queue_groups.is_item_paused(id_a));
+    assert!(app.status.contains("paused queue group"));
+    // A paused group disarms the auto-drain pump, and no item is runnable.
+    assert!(!app.auto_drain_queue);
+    assert_eq!(next_runnable_queue_index(&app), None);
+    // `p` again resumes; the front item becomes runnable.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("p resumes the group");
+    assert!(!app.prompt_queue_groups.is_item_paused(id_a));
+    assert_eq!(next_runnable_queue_index(&app), Some(0));
+}
+
+#[tokio::test]
+async fn z_toggles_collapse_and_repaints_the_group_as_folded() {
+    let mut app = queue_app(&["alpha", "beta"]);
+    let mut agent = test_agent(SessionMode::Build);
+    // Group both rows.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("select all");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("group");
+    let id_alpha = queue_id_at(&app, 0);
+    // Expanded: the overlay shows the prompt preview text.
+    let expanded = render_to_string(&app, 100, 20);
+    assert!(expanded.contains("alpha"), "expanded body: {expanded}");
+    // `z` collapses; the body folds to the group name (preview hidden).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("z collapses");
+    assert!(
+        app.prompt_queue_groups
+            .group_of_item(id_alpha)
+            .expect("group")
+            .collapsed
+    );
+    let collapsed = render_to_string(&app, 100, 20);
+    assert!(
+        collapsed.contains("Group 1"),
+        "collapsed header shows the group name: {collapsed}"
+    );
+    assert!(app.status.contains("collapsed queue group"));
+}
+
+#[tokio::test]
+async fn shift_g_dissolves_the_focused_group_loose() {
+    let (mut app, mut agent) = queue_app_with_tags(&["a", "b", "c"], &[0, 1]).await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("group");
+    assert_eq!(app.prompt_queue_groups.len(), 1);
+    let id_a = queue_id_at(&app, 0);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    // `Shift+g` (reported as Char('G')) dissolves the group under focus.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("Shift+g dissolves");
+    assert!(app.prompt_queue_groups.is_empty());
+    assert_eq!(app.prompt_queue_groups.group_id_of_item(id_a), None);
+    // The prompts themselves are untouched — only the grouping is gone.
+    assert_eq!(queue_texts(&app), vec!["a", "b", "c"]);
+    assert!(app.status.contains("dissolved queue group"));
+}
+
+#[tokio::test]
+async fn group_verb_on_loose_row_is_a_quiet_noop() {
+    // `z`/`p`/`G` on a row that is not in any group do nothing destructive.
+    let mut app = queue_app(&["a", "b"]);
+    let mut agent = test_agent(SessionMode::Build);
+    for key in [
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+    ] {
+        handle_key(&mut app, &mut agent, key)
+            .await
+            .expect("group verb on loose row");
+    }
+    assert!(app.prompt_queue_groups.is_empty());
+    assert_eq!(queue_texts(&app), vec!["a", "b"]);
+    assert!(app.input.is_empty(), "group verbs never leak to composer");
+    assert!(app.status.contains("not in a group"));
+}
+
+#[tokio::test]
+async fn paused_front_group_parks_while_loose_prompt_drains() {
+    // The drain policy runs the next *runnable* item: a paused front group is
+    // skipped while a loose prompt behind it is the next to run. Asserted through
+    // the real `next_runnable_queue_index` the pump consults, so it is pinned
+    // without starting a model turn (a real prompt would spawn an agent turn).
+    let mut app = queue_app(&["front", "back"]);
+    let mut agent = test_agent(SessionMode::Build);
+    // Group + pause the FRONT prompt only; the second stays loose.
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("group front");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("pause front");
+    let paused_id = queue_id_at(&app, 0);
+    assert!(app.prompt_queue_groups.is_item_paused(paused_id));
+    // The next runnable item is the loose "back" at index 1, NOT the paused
+    // front item — the pump would drain index 1 and leave the paused member.
+    assert_eq!(next_runnable_queue_index(&app), Some(1));
+    // Simulate the pump draining that runnable item.
+    app.prompt_queue.remove(1);
+    app.prompt_queue_ids.remove(1);
+    // Only the paused-group member remains, and nothing is runnable now.
+    assert_eq!(queue_texts(&app), vec!["front"]);
+    assert_eq!(queue_id_at(&app, 0), paused_id);
+    assert_eq!(
+        next_runnable_queue_index(&app),
+        None,
+        "with only the paused member left, nothing is runnable"
+    );
+    // Resuming the group makes its member runnable again.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("resume front");
+    assert_eq!(next_runnable_queue_index(&app), Some(0));
+}
+
+#[tokio::test]
+async fn middle_click_toggles_group_collapse_via_mouse() {
+    // Mouse parity: a middle-click on a grouped row drives the same collapse
+    // toggle the keyboard `z` does, through the real render() hit-test registry.
+    let mut app = queue_app(&["aaa", "bbb"]);
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("select all");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("group");
+    let width = 100u16;
+    let height = 20u16;
+    let _ = render_to_string(&app, width, height);
+    let id_aaa = queue_id_at(&app, 0);
+    let (col, row) = queue_cell_for(
+        &app,
+        width,
+        height,
+        interaction::TargetKey::QueueItem(id_aaa),
+        interaction::Action::QueueReorderBegin(id_aaa),
+    )
+    .expect("aaa row registered");
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Middle),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        app.prompt_queue_groups
+            .group_of_item(id_aaa)
+            .expect("group")
+            .collapsed,
+        "middle-click collapses the group"
+    );
+    // A second middle-click expands it again (parity with the keyboard toggle).
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Middle),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        !app.prompt_queue_groups
+            .group_of_item(id_aaa)
+            .expect("group")
+            .collapsed
+    );
+}
+
+#[tokio::test]
+async fn groups_survive_overlay_close_and_reopen() {
+    // Unlike the transient multi-selection, a group is durable: it persists
+    // across an overlay close/reopen cycle.
+    let (mut app, mut agent) = queue_app_with_tags(&["a", "b", "c"], &[0, 1]).await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("group");
+    let id_a = queue_id_at(&app, 0);
+    assert_eq!(app.prompt_queue_groups.len(), 1);
+    // Close, then reopen, the overlay.
+    toggle_prompt_queue_overlay(&mut app);
+    assert!(app.prompt_queue_overlay.is_none());
+    toggle_prompt_queue_overlay(&mut app);
+    assert!(app.prompt_queue_overlay.is_some());
+    // The group is still there and still owns its members.
+    assert_eq!(app.prompt_queue_groups.len(), 1);
+    assert!(app.prompt_queue_groups.group_id_of_item(id_a).is_some());
+    // The multi-selection, by contrast, did not survive.
+    assert!(app.prompt_queue_multiselect.is_empty());
+}
+
+#[tokio::test]
+async fn retain_live_drops_a_fully_drained_group_on_reopen() {
+    // Group the front prompt, drain it (a turn ran), then reopen the overlay:
+    // the now-empty group is pruned rather than painting a stale marker.
+    let mut app = queue_app(&["a", "b"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("group front");
+    assert_eq!(app.prompt_queue_groups.len(), 1);
+    // Front-drain the grouped item outside the overlay.
+    app.prompt_queue.pop_front();
+    app.prompt_queue_ids.pop_front();
+    // Close + reopen runs retain_live; the emptied group is dropped.
+    toggle_prompt_queue_overlay(&mut app);
+    toggle_prompt_queue_overlay(&mut app);
+    assert!(app.prompt_queue_groups.is_empty());
+}
+
+#[test]
+fn queue_strip_shows_group_summary_across_a_resize() {
+    // The queue strip surfaces the group summary (count + paused flag) so a
+    // held-back batch is visible without opening the overlay, at wide + narrow.
+    let mut app = queue_app(&["draft one", "draft two"]);
+    let id0 = queue_id_at(&app, 0);
+    let id1 = queue_id_at(&app, 1);
+    let gid = app
+        .prompt_queue_groups
+        .create_group(&[id0, id1])
+        .expect("group");
+    app.prompt_queue_groups.toggle_paused(gid);
+    // Close the overlay so the strip (not the overlay rows) carries the summary.
+    app.prompt_queue_overlay = None;
+    for (w, h) in [(120u16, 16u16), (70u16, 16u16)] {
+        let rendered = render_to_string(&app, w, h);
+        assert!(
+            rendered.contains("paused"),
+            "the paused group must show in the strip at {w}x{h}: {rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn empty_queue_group_verbs_are_quiet_noops() {
+    // Edge case: an open overlay over an empty queue. The group verbs must not
+    // panic, create a group, or leak into the composer.
+    let mut app = test_app(SessionMode::Build);
+    app.prompt_queue_overlay = Some(prompt_queue::PromptQueueState::new());
+    let mut agent = test_agent(SessionMode::Build);
+    for key in [
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+    ] {
+        handle_key(&mut app, &mut agent, key)
+            .await
+            .expect("group verb on empty queue");
+    }
+    assert!(app.prompt_queue_groups.is_empty());
+    assert!(app.input.is_empty());
+    // The overlay still paints its header at a small size without panicking, and
+    // the group summary stays empty (no group was formed over the empty queue).
+    let rendered = render_to_string(&app, 40, 16);
+    assert!(
+        rendered.contains("Queued prompts"),
+        "empty overlay still paints its header: {rendered}"
+    );
+    assert_eq!(queue_groups::groups_summary(&app.prompt_queue_groups), "");
+}
+
+// ===========================================================================
 // Run Selected Queued Next (§11G.9)
 // ===========================================================================
 
