@@ -425,6 +425,21 @@ pub(crate) enum Action {
     /// store survives across turns; closed is the resting state, so a session that
     /// never opens it pays nothing. Keyboard- and mouse-driven.
     ToggleTemplates,
+    /// Replayable Interaction Macros (§12.3.7): arm / disarm macro RECORDING
+    /// (`Ctrl+Alt+K` default). While armed, every committed logical command (the
+    /// canonical keymap action a keyboard chord or a mouse affordance dispatches)
+    /// is appended to the in-progress macro; pressing the verb again stops
+    /// recording and stores the macro for replay. Noise — hover, mouse move,
+    /// ticks, resize, toasts — is ignored by construction (it commits no keymap
+    /// action). Costs nothing until pressed; an idle session never records.
+    ToggleMacroRecord,
+    /// Replayable Interaction Macros (§12.3.7): REPLAY the most recently recorded
+    /// macro (`Ctrl+Alt+J` default). Re-dispatches each recorded logical command
+    /// through the same dispatcher a live press uses, so replay never bypasses an
+    /// approval gate and is indistinguishable from the user performing the steps.
+    /// Visible (a progress strip) and cancellable (Esc / the record toggle). A
+    /// no-op when no macro has been recorded yet; costs nothing until pressed.
+    ReplayMacro,
 }
 
 impl Action {
@@ -502,6 +517,8 @@ impl Action {
             Self::ToggleToolActions => "toggle_tool_actions",
             Self::ToggleScratchpad => "toggle_scratchpad",
             Self::ToggleTemplates => "toggle_templates",
+            Self::ToggleMacroRecord => "toggle_macro_record",
+            Self::ReplayMacro => "replay_macro",
         }
     }
 
@@ -578,6 +595,8 @@ impl Action {
         Action::ToggleToolActions,
         Action::ToggleScratchpad,
         Action::ToggleTemplates,
+        Action::ToggleMacroRecord,
+        Action::ReplayMacro,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -767,6 +786,13 @@ impl Action {
             // terminals, tmux, and SSH as the `Ctrl+Alt+A`/`Ctrl+Alt+H`/
             // `Ctrl+Alt+P` chords above.
             | Self::ToggleTemplates
+            // Replayable Interaction Macros (§12.3.7): record toggle is
+            // `Ctrl+Alt+K` and replay is `Ctrl+Alt+J` — both Ctrl+Alt (Meta)
+            // chords, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+A`/`Ctrl+Alt+H`/
+            // `Ctrl+Alt+P`/`Ctrl+Alt+T` chords above.
+            | Self::ToggleMacroRecord
+            | Self::ReplayMacro
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1094,6 +1120,21 @@ impl Action {
             // picker's own modal key handler, not rebindable here.
             Self::ToggleTemplates => KeyBinding::new(
                 KeyCode::Char('t'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Replayable Interaction Macros (§12.3.7). `Ctrl+Alt+K` arms / disarms
+            // recording ("Kapture") and `Ctrl+Alt+J` replays ("re-do, J next to
+            // K"): both are free `Ctrl+Alt` letters — `Ctrl+Alt+L`/`M`/`P`/`S`/`A`/
+            // `H`/`R`/`N`/`T` are taken by the debug/overlay/picker chords above,
+            // and the bare `Alt+k`/`Alt+j` chords are the copy-code-block /
+            // copy-all-code verbs, so the Ctrl+Alt modifier keeps the macro verbs
+            // distinct from both while staying clear of every composer chord.
+            Self::ToggleMacroRecord => KeyBinding::new(
+                KeyCode::Char('k'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            Self::ReplayMacro => KeyBinding::new(
+                KeyCode::Char('j'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }

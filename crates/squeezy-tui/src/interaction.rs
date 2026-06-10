@@ -226,6 +226,11 @@ pub(crate) enum ChromeKey {
     TemplateDelete,
     /// The "Clear all" button in the Prompt Templates picker (§12.3.6).
     TemplateClear,
+    /// The Replayable Interaction Macros (§12.3.7) record/replay status strip. A
+    /// single affordance with no identity of its own; a left click on the line
+    /// stops/cancels the active recording or replay — the mouse twin of the
+    /// `ToggleMacroRecord` verb.
+    MacroStrip,
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -472,6 +477,11 @@ pub(crate) enum Action {
     /// Clear every saved template (§12.3.6). Mouse twin of the picker's `c` verb /
     /// the "Clear all" button.
     TemplateClear,
+    /// A click on the Replayable Interaction Macros (§12.3.7) status strip: stop /
+    /// cancel the active recording or replay. Mouse twin of the `ToggleMacroRecord`
+    /// keyboard verb; both route to the same `toggle_macro_record` handler, so
+    /// keyboard/mouse parity holds by construction.
+    MacroToggleRecord,
 }
 
 impl Action {
@@ -542,6 +552,7 @@ impl Action {
         Action::TemplateEnqueue,
         Action::TemplateDelete(0),
         Action::TemplateClear,
+        Action::MacroToggleRecord,
     ];
 }
 

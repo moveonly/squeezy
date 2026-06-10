@@ -116,6 +116,7 @@ mod keymap_config;
 mod lane_fold;
 mod latency;
 mod logical_scroll;
+mod macros;
 mod main_render_cache;
 mod mcp_settings_edit;
 mod mention;
@@ -1821,6 +1822,10 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.command_palette.is_some()
         || app.editor_handoff.is_some()
         || app.transcript_overlay.is_some()
+        // While a macro is recording or replaying (§12.3.7) a quick session
+        // switch would derail the in-flight workflow, so block it like every
+        // other modal/overlay context above.
+        || app.macro_recorder.is_active()
     {
         return false;
     }
@@ -2359,6 +2364,22 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // to check up front.
     if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
         && let Some((interaction::TargetKey::Chrome(interaction::ChromeKey::FirstRunHint), action)) =
+            app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
+    }
+
+    // The Replayable Interaction Macros (§12.3.7) record/replay status strip is
+    // NON-modal: while the recorder is active it registers a single `MacroStrip`
+    // target on its dim top-row line. A left click on it stops/cancels the active
+    // recording or replay (the mouse twin of the `ToggleMacroRecord` verb), but —
+    // like the first-run hint strip above — a click that misses the line is NOT
+    // swallowed: it falls through so the strip never steals a click meant for the
+    // surface beneath it. Hit-tested in absolute screen coordinates; only fullscreen
+    // overlays would have returned before here, and they never register this target.
+    if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((interaction::TargetKey::Chrome(interaction::ChromeKey::MacroStrip), action)) =
             app.click_target_at(mouse.column, mouse.row)
     {
         dispatch_click_action(app, action);
@@ -4228,6 +4249,109 @@ fn toggle_templates(app: &mut TuiApp) {
     app.needs_redraw = true;
 }
 
+/// `Ctrl+Alt+K`: arm / disarm macro RECORDING (§12.3.7). When idle it arms a
+/// fresh recording; while already recording it stops, storing the macro for
+/// replay (or discarding an empty one); while a replay is in flight it cancels
+/// the replay instead (the toggle doubles as the cancel affordance). The status
+/// always reports honestly what happened so the automation stays visible.
+fn toggle_macro_record(app: &mut TuiApp) {
+    if app.macro_recorder.is_replaying() {
+        app.macro_recorder.cancel();
+        app.status = "macro replay cancelled".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    if app.macro_recorder.is_recording() {
+        let record_chord = key_hint(app, keymap::Action::ReplayMacro);
+        app.status = match app.macro_recorder.stop_recording() {
+            macros::StopOutcome::Stored {
+                name,
+                len,
+                truncated,
+            } => {
+                if truncated {
+                    format!(
+                        "recorded {name} ({len} steps, clipped at max) — {record_chord} to replay"
+                    )
+                } else {
+                    format!("recorded {name} ({len} steps) — {record_chord} to replay")
+                }
+            }
+            macros::StopOutcome::Empty => "macro recording cancelled (no steps)".to_string(),
+            macros::StopOutcome::NotRecording => "not recording".to_string(),
+        };
+        app.needs_redraw = true;
+        return;
+    }
+    let stop_chord = key_hint(app, keymap::Action::ToggleMacroRecord);
+    if app.macro_recorder.start_recording() {
+        app.status =
+            format!("● recording macro — perform steps, {stop_chord} to stop · Esc cancels");
+        app.needs_redraw = true;
+    }
+}
+
+/// `Ctrl+Alt+J`: replay the most recently recorded macro (§12.3.7). Re-dispatches
+/// each recorded logical command through the SAME dispatcher a live keyboard/mouse
+/// press uses (`dispatch_keymap_action_inner`), so replay never bypasses an
+/// approval gate and is indistinguishable from the user performing the steps. The
+/// replay is bounded by the macro length and pumped step-by-step so the recorder's
+/// progress is observable; it returns to idle when the macro is exhausted. A no-op
+/// (with a hint) when nothing has been recorded, or when a record/replay is already
+/// in flight.
+fn replay_macro(app: &mut TuiApp, agent: &mut Agent) {
+    if app.macro_recorder.is_recording() {
+        app.status = "stop recording before replaying".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    if app.macro_recorder.is_replaying() {
+        // Already replaying (e.g. a re-entrant press): leave the in-flight replay
+        // alone rather than restarting it.
+        return;
+    }
+    if !app.macro_recorder.has_replayable() {
+        let record_chord = key_hint(app, keymap::Action::ToggleMacroRecord);
+        app.status = format!("no macro recorded yet — {record_chord} to record one");
+        app.needs_redraw = true;
+        return;
+    }
+    if !app.macro_recorder.begin_replay() {
+        return;
+    }
+    // Pump every recorded command through the real dispatcher. The loop is bounded
+    // by the macro length (`next_replay_command` returns `None` once exhausted and
+    // returns the recorder to idle), so it always terminates. A synthesized key
+    // event carrying the recorded action's default binding is unnecessary — we
+    // re-resolve through the dispatcher by the action's CURRENT binding, so a
+    // rebound key still replays the same logical command. We feed the action's
+    // bound key so the dispatcher's `lookup` resolves it back to the same action.
+    let mut steps = 0usize;
+    while let Some(action) = app.macro_recorder.next_replay_command() {
+        let key = macro_replay_key_event(app, action);
+        let _ = dispatch_keymap_action_inner(app, agent, key);
+        steps += 1;
+        // Hard ceiling mirrors the recorder cap so a corrupted state can never
+        // spin: the recorder caps a macro at `macros::MAX_MACRO_LEN`, so a replay
+        // can never legitimately exceed it.
+        if steps >= macros::MAX_MACRO_LEN {
+            break;
+        }
+    }
+    app.status = format!("replayed macro ({steps} step(s))");
+    app.needs_redraw = true;
+}
+
+/// Build the synthetic [`KeyEvent`] that re-dispatches a recorded macro command
+/// (§12.3.7) through the keymap. The recorder stores the canonical
+/// [`keymap::Action`]; replay feeds the action's CURRENTLY-bound key back through
+/// `dispatch_keymap_action_inner` so `lookup` resolves it to the same action — a
+/// rebind between record and replay still replays the same logical command.
+fn macro_replay_key_event(app: &TuiApp, action: keymap::Action) -> KeyEvent {
+    let binding = app.keymap.binding(action);
+    KeyEvent::new(binding.code, binding.modifiers)
+}
+
 /// Handle a key while the Prompt Templates picker (§12.3.6) is open. Returns
 /// `true` when the key was consumed (so it never leaks to the composer or the
 /// global keymap). Two modes:
@@ -5241,6 +5365,25 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             extend_selection(app, mv);
             return Ok(false);
         }
+    }
+
+    // Replayable Interaction Macros (§12.3.7): while a recording is armed, Esc
+    // cancels it (discarding the in-progress macro) — the spec's "cancellable"
+    // twin of the record toggle. Checked before the keymap dispatch so the cancel
+    // wins over any Esc-bound action, but ONLY when recording is active, so a
+    // session that is not recording keeps Esc's normal meaning entirely. A
+    // fullscreen overlay / config screen owns its own Esc, so skip there.
+    if key.code == KeyCode::Esc
+        && key.modifiers.is_empty()
+        && app.macro_recorder.is_recording()
+        && app.config_screen.is_none()
+        && app.status_line_setup.is_none()
+        && app.transcript_overlay.is_none()
+    {
+        app.macro_recorder.cancel();
+        app.status = "macro recording cancelled".to_string();
+        app.needs_redraw = true;
+        return Ok(false);
     }
 
     // Rebindable actions (F11/Ctrl+T/Ctrl+P/Ctrl+Y/Ctrl+R/PageUp/PageDown/
@@ -6380,7 +6523,38 @@ fn handle_search_key(app: &mut TuiApp, key: KeyEvent) -> Option<bool> {
     }
 }
 
+/// Resolve `key` to its keymap action and dispatch it, recording the committed
+/// logical command into the active macro (§12.3.7) when one is being recorded.
+///
+/// This is the single chokepoint every rebindable keyboard verb flows through,
+/// so it is the natural place to capture the *committed* logical-command stream a
+/// macro records: an action is recorded ONLY when it actually ran (the inner
+/// dispatch returned `true`) and is not itself a macro-control verb (recording the
+/// record/replay toggles would make a replay re-arm recording or recurse). Noise —
+/// hover, mouse move, ticks, resize, toasts — never resolves to a keymap action,
+/// so it is ignored by construction and never reaches the recorder.
 fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
+    let Some(action) = app.keymap.lookup(key.code, key.modifiers) else {
+        return false;
+    };
+    let handled = dispatch_keymap_action_inner(app, agent, key);
+    if handled && is_macro_recordable(action) {
+        app.macro_recorder.note_command(action);
+    }
+    handled
+}
+
+/// True when a committed keymap action should be captured into a recording macro.
+/// The macro-control verbs themselves are excluded: recording the record/replay
+/// toggles would make a replay re-arm recording or recurse into itself.
+fn is_macro_recordable(action: keymap::Action) -> bool {
+    !matches!(
+        action,
+        keymap::Action::ToggleMacroRecord | keymap::Action::ReplayMacro
+    )
+}
+
+fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
     let Some(action) = app.keymap.lookup(key.code, key.modifiers) else {
         return false;
     };
@@ -7075,6 +7249,24 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             toggle_templates(app);
+            true
+        }
+        keymap::Action::ToggleMacroRecord => {
+            // §12.3.7: arm / disarm macro recording. Main-surface verb; the
+            // config/setup screens own their own routing.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_macro_record(app);
+            true
+        }
+        keymap::Action::ReplayMacro => {
+            // §12.3.7: replay the most recently recorded macro. Main-surface verb;
+            // the config/setup screens own their own routing.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            replay_macro(app, agent);
             true
         }
     }
@@ -12896,6 +13088,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
             app.templates.clear();
             app.status = "templates cleared".to_string();
             app.needs_redraw = true;
+        }
+        // A click on the Replayable Interaction Macros (§12.3.7) status strip:
+        // stop / cancel the active recording or replay — the mouse twin of the
+        // `ToggleMacroRecord` verb. Routes to the same `toggle_macro_record`
+        // handler, so keyboard/mouse parity holds by construction.
+        interaction::Action::MacroToggleRecord => {
+            toggle_macro_record(app);
         }
     }
 }
@@ -19146,6 +19345,13 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     // nothing and registers no click target. Drawn after the toast stack so a toast
     // wins the same corner, and before the hover popover so a peek covers it.
     render_first_run_hint(frame, area, app);
+    // The Replayable Interaction Macros (§12.3.7) record/replay status strip is a
+    // NON-modal dim line painted at the top-left of the main surface only — every
+    // fullscreen overlay returns earlier and never reaches here, so the strip never
+    // leaks over a modal. It reserves no layout rows and clips what it overlaps (like
+    // the toast stack); it paints (and registers its click target) ONLY while the
+    // recorder is active (recording or replaying), so an idle session pays nothing.
+    render_macro_strip(frame, area, app);
     // The Hover Preview popover (§12.1.4) is a NON-modal peek painted LAST on the
     // main surface (only — every fullscreen overlay returns earlier and never
     // reaches here, so the popover never leaks over a modal). It is anchored to the
@@ -23103,6 +23309,67 @@ fn render_first_run_hint(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         rect,
         interaction::TargetKey::Chrome(interaction::ChromeKey::FirstRunHint),
         interaction::Action::DismissFirstRunHint,
+    );
+}
+
+/// Render the Replayable Interaction Macros (§12.3.7) record/replay status strip:
+/// a single dim line at the top-left of `area` while the recorder is active. It
+/// shows the live "● REC macro — N step(s)" or "▶ replay macro — done/total"
+/// progress (the spec's "visible progress"), plus a trailing dismissal affordance
+/// so the "click / press to stop" path is discoverable. A complete no-op when the
+/// recorder is idle, so an idle session paints nothing and registers no target.
+fn render_macro_strip(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    use ratatui::{
+        style::{Modifier, Style},
+        text::{Line, Span},
+        widgets::{Clear, Paragraph},
+    };
+    if area.width < 8 || area.height == 0 {
+        return;
+    }
+    let Some(status) = app.macro_recorder.status_line() else {
+        return;
+    };
+    // The strip body plus a trailing stop/cancel affordance so the keyboard twin is
+    // discoverable. The same chord both stops a recording and cancels a replay.
+    let chord = key_hint(app, keymap::Action::ToggleMacroRecord);
+    let verb = if app.macro_recorder.is_recording() {
+        "stop"
+    } else {
+        "cancel"
+    };
+    let label = format!("{status} \u{00b7} {chord} {verb}");
+    // Top-left, on the first row. Clamp the width to the area and leave a one-cell
+    // margin so the line never collides with a right-corner metrics HUD / toast.
+    let max_width = area.width.saturating_sub(1) as usize;
+    let visual: String = label.chars().take(max_width).collect();
+    let line_width = visual.chars().count() as u16;
+    if line_width == 0 {
+        return;
+    }
+    let rect = Rect {
+        x: area.left(),
+        y: area.top(),
+        width: line_width,
+        height: 1,
+    };
+    // Dim bold so it reads as restrained, attention-getting chrome — never as a
+    // transcript entry — while the recorder is active.
+    let style = Style::default()
+        .fg(crate::render::theme::accent())
+        .add_modifier(Modifier::BOLD);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(visual, style))),
+        rect,
+    );
+    // A left click anywhere on the line stops/cancels — keyboard parity with the
+    // `ToggleMacroRecord` verb. Registered last so it wins over whatever a status
+    // row registered beneath it.
+    app.register_click(
+        rect,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::MacroStrip),
+        interaction::Action::MacroToggleRecord,
     );
 }
 
@@ -35210,6 +35477,12 @@ pub(crate) struct TuiApp {
     /// enqueueing; the picker overlay then paints the card + slot editor instead of
     /// the list. Cleared back to `None` when the user backs out (Esc) or enqueues.
     pub(crate) template_card: Option<prompt_template::TemplateCard>,
+    /// Replayable Interaction Macros (§12.3.7): the macro recorder/replayer. Records
+    /// the committed logical-command (keymap action) stream while armed, stores the
+    /// most recent finished macro, and pumps it back through `dispatch_keymap_action`
+    /// on replay. The resting state is idle (neither recording nor replaying), so an
+    /// idle session pays a single enum-tag check and nothing more.
+    pub(crate) macro_recorder: macros::MacroRecorder,
     /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
     /// keyed by stable entry id and grouped by category (user turns, tool calls,
     /// errors, …). Rebuilt incrementally — only when the transcript's
@@ -36107,6 +36380,7 @@ impl TuiApp {
             templates: prompt_template::TemplateStore::with_starters(),
             templates_open: false,
             template_card: None,
+            macro_recorder: macros::MacroRecorder::new(),
             transcript_index: transcript_index::TranscriptIndex::new(),
             transcript_index_open: false,
             transcript_index_selected: 0,

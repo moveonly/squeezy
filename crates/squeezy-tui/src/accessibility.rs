@@ -772,6 +772,11 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         A::TemplateEnqueue => KeyboardPath::Always("templates Enter"),
         A::TemplateDelete(_) => KeyboardPath::Always("templates d"),
         A::TemplateClear => KeyboardPath::Always("templates c"),
+        // Replayable Interaction Macros (§12.3.7) — the record/replay status strip's
+        // click stops/cancels the active recording or replay; the keyboard twin is
+        // `ToggleMacroRecord` (Ctrl+Alt+K default), which drives the same
+        // `toggle_macro_record` handler. Reachable without a mouse.
+        A::MacroToggleRecord => KeyboardPath::Keymap(Action::ToggleMacroRecord),
     })
 }
 

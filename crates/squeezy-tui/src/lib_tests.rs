@@ -23497,6 +23497,237 @@ async fn templates_starter_store_is_nonempty_on_first_open() {
 }
 
 // =====================================================================
+// §12.3.7 Replayable Interaction Macros.
+// End-to-end through `handle_key` (Ctrl+Alt+K record toggle, Ctrl+Alt+J
+// replay, and a recordable verb in between), `handle_mouse` (click the
+// status strip to stop), the real `render()` strip, the empty/edge case
+// (replay with nothing recorded), and a resize where the strip paints.
+// =====================================================================
+
+fn macro_record_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+fn macro_replay_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('j'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// `Alt+r` resolves to `ToggleMinimap` — a simple recordable verb with an
+/// observable effect (`app.show_minimap`) that drives the macro tests.
+fn toggle_minimap_key() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)
+}
+
+#[tokio::test]
+async fn macro_record_then_replay_re_runs_the_logical_command() {
+    // Record a single committed verb (Alt+r → ToggleMinimap), stop, reset the
+    // observable state, then replay: the SAME logical command runs again through
+    // the real dispatcher, flipping the state once more.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(!app.macro_recorder.is_active(), "starts idle");
+    assert!(!app.show_minimap);
+
+    // Arm recording.
+    handle_key(&mut app, &mut agent, macro_record_key())
+        .await
+        .unwrap();
+    assert!(
+        app.macro_recorder.is_recording(),
+        "Ctrl+Alt+K arms recording"
+    );
+
+    // Perform a recordable verb; it both runs (flips the flag) and is captured.
+    handle_key(&mut app, &mut agent, toggle_minimap_key())
+        .await
+        .unwrap();
+    assert!(app.show_minimap, "the verb ran live while recording");
+    assert_eq!(
+        app.macro_recorder.recording_len(),
+        1,
+        "the committed command was captured"
+    );
+
+    // Stop recording — the macro is stored.
+    handle_key(&mut app, &mut agent, macro_record_key())
+        .await
+        .unwrap();
+    assert!(!app.macro_recorder.is_recording(), "second press stops");
+    assert!(app.macro_recorder.has_replayable(), "macro stored");
+
+    // Reset the observable state, then replay: it must flip again.
+    app.show_minimap = false;
+    handle_key(&mut app, &mut agent, macro_replay_key())
+        .await
+        .unwrap();
+    assert!(
+        app.show_minimap,
+        "replay re-ran the recorded ToggleMinimap through the same dispatcher"
+    );
+    assert!(!app.macro_recorder.is_active(), "replay completes to idle");
+}
+
+#[tokio::test]
+async fn macro_record_toggle_is_not_itself_recorded() {
+    // The record/replay control verbs must never land inside the macro — else a
+    // replay would re-arm recording or recurse. Record an empty session: only the
+    // toggle presses happen, so nothing is captured.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, macro_record_key())
+        .await
+        .unwrap();
+    // No recordable verb between the two toggles.
+    handle_key(&mut app, &mut agent, macro_record_key())
+        .await
+        .unwrap();
+    assert!(
+        !app.macro_recorder.has_replayable(),
+        "an empty recording (only the toggle) stores nothing"
+    );
+    assert!(
+        app.status.contains("no steps") || app.status.contains("cancelled"),
+        "honest empty status: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn replay_with_nothing_recorded_is_a_noop_with_hint() {
+    // Edge case: replaying before anything is recorded must not panic or change
+    // state, and must hint how to record one.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(&mut app, &mut agent, macro_replay_key())
+        .await
+        .unwrap();
+    assert!(!app.macro_recorder.is_active());
+    assert!(
+        app.status.contains("no macro recorded"),
+        "hint shown: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn esc_cancels_an_in_progress_recording() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(&mut app, &mut agent, macro_record_key())
+        .await
+        .unwrap();
+    handle_key(&mut app, &mut agent, toggle_minimap_key())
+        .await
+        .unwrap();
+    assert!(app.macro_recorder.is_recording());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !app.macro_recorder.is_active(),
+        "Esc cancelled the recording"
+    );
+    assert!(
+        !app.macro_recorder.has_replayable(),
+        "a cancelled recording is discarded"
+    );
+}
+
+#[tokio::test]
+async fn recording_strip_renders_through_real_render() {
+    // The non-modal status strip paints while recording, drawn through the real
+    // `render()` into a TestBackend buffer.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    // Idle: nothing painted.
+    let idle = render_to_string(&app, 100, 24);
+    assert!(
+        !idle.contains("REC macro"),
+        "idle session paints no macro strip: {idle}"
+    );
+
+    handle_key(&mut app, &mut agent, macro_record_key())
+        .await
+        .unwrap();
+    let recording = render_to_string(&app, 100, 24);
+    assert!(
+        recording.contains("REC macro"),
+        "the record strip paints while armed: {recording}"
+    );
+    assert!(
+        recording.contains("stop"),
+        "the stop affordance is discoverable: {recording}"
+    );
+}
+
+#[tokio::test]
+async fn clicking_the_strip_stops_recording() {
+    // Mouse parity: a left click on the painted strip stops the recording, the
+    // same as the `ToggleMacroRecord` keyboard verb.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(&mut app, &mut agent, macro_record_key())
+        .await
+        .unwrap();
+    handle_key(&mut app, &mut agent, toggle_minimap_key())
+        .await
+        .unwrap();
+    assert!(app.macro_recorder.is_recording());
+
+    // Render so the strip registers its click target (top row, left edge).
+    let _ = render_to_string(&app, 100, 24);
+    let consumed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 1,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(consumed, "the click on the strip is consumed");
+    assert!(
+        !app.macro_recorder.is_recording(),
+        "clicking the strip stopped the recording"
+    );
+    assert!(
+        app.macro_recorder.has_replayable(),
+        "the recorded macro (one step) was stored on stop"
+    );
+}
+
+#[tokio::test]
+async fn recording_strip_survives_narrow_resize() {
+    // The strip clamps to the area width and never panics on a narrow/tiny frame.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(&mut app, &mut agent, macro_record_key())
+        .await
+        .unwrap();
+    for (w, h) in [(8u16, 3u16), (20, 6), (40, 12), (120, 40)] {
+        let out = render_to_string(&app, w, h);
+        // On the wider frames the strip label is present; on the tightest one it
+        // is clamped but must not panic (the render call above already proved it).
+        if w >= 40 {
+            assert!(out.contains("REC"), "strip paints at {w}x{h}: {out}");
+        }
+    }
+}
+
+// =====================================================================
 // §12.1.6 Multi-Cursor-Like Transcript Selection.
 // End-to-end through `handle_key` (Alt+d add, Ctrl+Alt+Y combined copy),
 // `handle_mouse` (modifier-click add/toggle), the real `render()`
