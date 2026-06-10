@@ -1762,6 +1762,411 @@ async fn wheel_scroll_targets_transcript_overlay_when_open() {
     assert_eq!(app.transcript_overlay.expect("overlay").scroll, 0);
 }
 
+// ---- Diff/detail pane (§11G.10) ----
+
+/// Build a Build-mode app whose transcript ends in a bulky tool result, with the
+/// Ctrl+T overlay open and that tool entry focused — the precondition for the
+/// detail pane. The tool output is a tall, distinctive block so the pane content
+/// is easy to assert and obviously larger than the inline preview.
+fn app_with_focused_tool_entry() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    // A few preceding turns so the transcript has real context to preserve.
+    for i in 0..6 {
+        app.push_transcript_item(TranscriptItem::user(format!("question {i}")));
+    }
+    let body = (0..40)
+        .map(|n| format!("DETAILPANE-LINE-{n:02} +++ a long diff/output row"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut result = sample_tool_result("shell", &body);
+    result.content = serde_json::json!({ "output": body });
+    app.push_tool_result(result);
+    let tool_index = app
+        .transcript
+        .iter()
+        .position(|e| matches!(&e.kind, TranscriptEntryKind::ToolResult(_)))
+        .expect("a tool entry was pushed");
+    app.selected_entry = Some(tool_index);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        detail: OverlayDetail::Expanded,
+        ..TranscriptOverlayState::default()
+    });
+    app
+}
+
+#[tokio::test]
+async fn detail_pane_opens_for_focused_tool_entry_via_d_key() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("d toggles the detail pane");
+
+    let pane = app.diff_detail_pane.expect("pane should be open");
+    let focused_id = app.transcript[app.selected_entry.unwrap()].id;
+    assert_eq!(
+        pane.entry_id, focused_id,
+        "the pane must pin the focused entry by its stable id"
+    );
+    assert_eq!(pane.scroll, 0, "a freshly opened pane starts at the top");
+
+    // The split paints the pane title + content alongside the transcript, so the
+    // transcript context is preserved (both sides visible at once).
+    let rendered = render_to_string(&app, 120, 40);
+    assert!(
+        rendered.contains("Tool: shell"),
+        "the pane title names the pinned tool entry:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("DETAILPANE-LINE-00"),
+        "the pane shows the entry's expanded body:\n{rendered}"
+    );
+    // Scroll the transcript to the top so an earlier turn is on-screen, proving
+    // the left column is still the live, scrollable transcript beside the pane —
+    // the context preservation the spec calls for.
+    if let Some(state) = app.transcript_overlay.as_mut() {
+        state.scroll = 0;
+    }
+    let scrolled = render_to_string(&app, 120, 40);
+    assert!(
+        scrolled.contains("question 5"),
+        "the transcript context stays scrollable beside the pane:\n{scrolled}"
+    );
+    assert!(
+        scrolled.contains("Tool: shell"),
+        "the pane keeps painting while the transcript scrolls independently:\n{scrolled}"
+    );
+}
+
+#[tokio::test]
+async fn detail_pane_d_key_toggles_closed_again() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+
+    let d = || KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+    handle_key(&mut app, &mut agent, d()).await.expect("open");
+    assert!(app.diff_detail_pane.is_some(), "first d opens the pane");
+    handle_key(&mut app, &mut agent, d()).await.expect("close");
+    assert!(
+        app.diff_detail_pane.is_none(),
+        "a second d closes the pane again"
+    );
+    assert!(
+        app.diff_detail_pane_rect_cache.get().is_none(),
+        "closing the pane clears its cached hit-test rect"
+    );
+}
+
+#[tokio::test]
+async fn detail_pane_refuses_when_no_entry_is_focused() {
+    let mut app = app_with_focused_tool_entry();
+    app.selected_entry = None;
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("d with no focus");
+
+    assert!(
+        app.diff_detail_pane.is_none(),
+        "no focused entry => no pane"
+    );
+    assert!(
+        app.status.contains("focused entry"),
+        "the status explains why the pane did not open: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn detail_pane_refuses_for_a_one_line_entry() {
+    let mut app = test_app(SessionMode::Build);
+    // A short user message is a one-liner with nothing worth paning.
+    app.push_transcript_item(TranscriptItem::user("hi".to_string()));
+    app.selected_entry = Some(0);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        detail: OverlayDetail::Expanded,
+        ..TranscriptOverlayState::default()
+    });
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("d on a one-liner");
+
+    assert!(
+        app.diff_detail_pane.is_none(),
+        "a one-line entry has no detail to pane"
+    );
+    assert!(
+        app.status.contains("no diff / detail"),
+        "the status explains the refusal: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn detail_pane_scrolls_with_shift_down_and_clamps_at_the_end() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("open pane");
+    // Paint once so the pane's geometry is cached for the scroll clamp.
+    let _ = render_to_string(&app, 120, 40);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift+down scrolls the pane");
+    assert_eq!(
+        app.diff_detail_pane.expect("pane").scroll,
+        1,
+        "Shift+Down moves the pane one row"
+    );
+
+    // The plain (unshifted) Down still scrolls the transcript, never the pane —
+    // the context navigation the spec wants preserved.
+    let before = app.diff_detail_pane.expect("pane").scroll;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("plain down scrolls transcript");
+    assert_eq!(
+        app.diff_detail_pane.expect("pane").scroll,
+        before,
+        "plain Down must not move the pane"
+    );
+
+    // Shift+End slams to the bottom and clamps; further Shift+Down is a no-op.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift+end");
+    let _ = render_to_string(&app, 120, 40);
+    let at_end = app.diff_detail_pane.expect("pane").scroll;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift+down at end");
+    assert_eq!(
+        app.diff_detail_pane.expect("pane").scroll,
+        at_end,
+        "the pane scroll clamps at the end of the body"
+    );
+}
+
+#[tokio::test]
+async fn detail_pane_wheel_over_pane_scrolls_the_pane_not_the_transcript() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("open pane");
+    let overlay_scroll_before = app.transcript_overlay.expect("overlay").scroll;
+    let rect = render_to_string_and_pane_rect(&app, 120, 40);
+
+    // A wheel-down whose column lands inside the pane scrolls the pane.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: rect.x + rect.width / 2,
+            row: rect.y + 1,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(
+        app.diff_detail_pane.expect("pane").scroll,
+        3,
+        "a wheel-down over the pane scrolls the pane by three rows"
+    );
+    assert_eq!(
+        app.transcript_overlay.expect("overlay").scroll,
+        overlay_scroll_before,
+        "a wheel over the pane must not move the transcript"
+    );
+
+    // A wheel-down over the transcript column (far left) scrolls the transcript.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 1,
+            row: rect.y + 1,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(
+        app.diff_detail_pane.expect("pane").scroll,
+        3,
+        "a wheel over the transcript must not move the pane"
+    );
+}
+
+#[tokio::test]
+async fn detail_pane_esc_closes_pane_first_then_overlay() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("open pane");
+
+    let esc = || KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    handle_key(&mut app, &mut agent, esc())
+        .await
+        .expect("esc 1");
+    assert!(
+        app.diff_detail_pane.is_none(),
+        "the first Esc closes the pane"
+    );
+    assert!(
+        app.transcript_overlay.is_some(),
+        "the first Esc must leave the overlay open"
+    );
+    handle_key(&mut app, &mut agent, esc())
+        .await
+        .expect("esc 2");
+    assert!(
+        app.transcript_overlay.is_none(),
+        "a second Esc closes the overlay"
+    );
+}
+
+#[tokio::test]
+async fn detail_pane_closes_when_overlay_closes() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("open pane");
+    assert!(app.diff_detail_pane.is_some());
+
+    // Toggling the overlay shut (Ctrl+T) must also tear down the pane.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl+t closes overlay");
+    assert!(app.transcript_overlay.is_none(), "overlay closed");
+    assert!(
+        app.diff_detail_pane.is_none(),
+        "closing the overlay tears down the detail pane"
+    );
+}
+
+#[tokio::test]
+async fn detail_pane_falls_back_to_full_width_on_a_narrow_terminal() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("open pane");
+
+    // Far below the split threshold: the render must not crash and must paint the
+    // transcript full-width with no pane (graceful no-op), clearing the rect cache.
+    let rendered = render_to_string(&app, 40, 20);
+    assert!(
+        rendered.contains("Transcript"),
+        "the overlay still renders on a narrow terminal:\n{rendered}"
+    );
+    assert!(
+        app.diff_detail_pane.is_some(),
+        "the pane request survives a too-narrow frame (it just paints nothing)"
+    );
+    assert!(
+        app.diff_detail_pane_rect_cache.get().is_none(),
+        "no pane rect is cached when the split is skipped"
+    );
+}
+
+#[tokio::test]
+async fn detail_pane_survives_resize_repaint() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("open pane");
+
+    // Paint at a wide size, then a different wide size: the pane must keep
+    // painting its content and re-cache a rect at the new geometry both times.
+    let wide = render_to_string(&app, 160, 48);
+    assert!(wide.contains("Tool: shell") && wide.contains("DETAILPANE-LINE-00"));
+    let wide_rect = app.diff_detail_pane_rect_cache.get().expect("rect at 160");
+
+    let narrower = render_to_string(&app, 90, 30);
+    assert!(
+        narrower.contains("Tool: shell") && narrower.contains("DETAILPANE-LINE-00"),
+        "the pane re-flows and keeps painting after a resize:\n{narrower}"
+    );
+    let new_rect = app.diff_detail_pane_rect_cache.get().expect("rect at 90");
+    assert_ne!(
+        wide_rect, new_rect,
+        "the cached pane rect tracks the new geometry after resize"
+    );
+}
+
+/// Render once and return the detail pane's cached text rect (panicking if the
+/// pane did not paint). Used by the wheel-routing test to aim a mouse event at
+/// the exact painted pane.
+fn render_to_string_and_pane_rect(app: &TuiApp, width: u16, height: u16) -> Rect {
+    let _ = render_to_string(app, width, height);
+    app.diff_detail_pane_rect_cache
+        .get()
+        .expect("the pane must have painted a rect")
+}
+
 #[tokio::test]
 async fn transcript_overlay_mouse_is_modal() {
     let mut app = test_app(SessionMode::Build);

@@ -87,6 +87,7 @@ mod commands;
 mod commands_style;
 mod config_screen;
 mod copy;
+mod diff_detail_pane;
 mod dogfood;
 mod events;
 mod fuzzy;
@@ -2971,6 +2972,22 @@ fn handle_transcript_overlay_mouse(
     mouse: crossterm::event::MouseEvent,
 ) -> Option<bool> {
     app.transcript_overlay.as_ref()?;
+    // A wheel event over the detail pane scrolls the PANE, not the transcript —
+    // the mouse twin of `Shift`+the scroll keys. The pane's painted text rect is
+    // cached each frame; outside it the wheel keeps scrolling the transcript.
+    if matches!(
+        mouse.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) && app.diff_detail_pane.is_some()
+        && let Some(rect) = app.diff_detail_pane_rect_cache.get()
+        && diff_detail_pane::rect_contains(rect, mouse.column, mouse.row)
+    {
+        let dir = match mouse.kind {
+            MouseEventKind::ScrollUp => VerticalScrollDir::Up,
+            _ => VerticalScrollDir::Down,
+        };
+        return Some(scroll_diff_detail_pane(app, dir, 3));
+    }
     let changed = match mouse.kind {
         MouseEventKind::ScrollUp => {
             adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_sub(3))
@@ -6079,6 +6096,161 @@ fn open_focused_entry_in_detail(app: &mut TuiApp) {
     app.needs_redraw = true;
 }
 
+/// Whether an entry kind is worth pinning into the diff/detail pane (§11G.10):
+/// it carries a large diff, file excerpt, or bulky tool output. Tool results,
+/// `/diff` cards, and plan cards always qualify; messages and reasoning qualify
+/// only once their body is long enough to be awkward to read inline. Echo and
+/// log lines are one-liners with nothing to pane.
+fn entry_has_detail_pane_content(entry: &TranscriptEntry) -> bool {
+    match &entry.kind {
+        TranscriptEntryKind::ToolResult(_)
+        | TranscriptEntryKind::Diff(_)
+        | TranscriptEntryKind::PlanCard(_) => true,
+        TranscriptEntryKind::Message(item) => item.content.chars().count() > LONG_ASSISTANT_CHARS,
+        TranscriptEntryKind::Reasoning(snapshot) => {
+            snapshot.display_text.chars().count() > LONG_ASSISTANT_CHARS
+        }
+        TranscriptEntryKind::Log(_) | TranscriptEntryKind::SlashEcho(_) => false,
+    }
+}
+
+/// Toggle the diff/detail pane (§11G.10) for the currently focused overlay
+/// entry. Opens the pane pinned to the focused entry when one is focused and
+/// carries detail-worthy content; closes it when it is already open. Overlay-
+/// local (handled by `handle_transcript_overlay_key`), so it only runs while the
+/// Ctrl+T overlay is open.
+fn toggle_diff_detail_pane(app: &mut TuiApp) {
+    if app.transcript_overlay.is_none() {
+        return;
+    }
+    if app.diff_detail_pane.is_some() {
+        app.diff_detail_pane = None;
+        app.diff_detail_pane_rect_cache.set(None);
+        app.status = "detail pane closed".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    let entries = active_transcript_entries(app);
+    let Some(index) = active_selected_entry(app) else {
+        app.status = "no focused entry — Ctrl+↑/↓ to focus one, then d".to_string();
+        return;
+    };
+    let Some(entry) = entries.get(index) else {
+        app.status = "no focused entry — Ctrl+↑/↓ to focus one, then d".to_string();
+        return;
+    };
+    if !entry_has_detail_pane_content(entry) {
+        app.status = "focused entry has no diff / detail to pane".to_string();
+        return;
+    }
+    app.diff_detail_pane = Some(diff_detail_pane::DiffDetailPaneState::new(entry.id));
+    app.diff_detail_pane_rect_cache.set(None);
+    app.status = "detail pane opened (Shift+↑/↓ to scroll · d/Esc to close)".to_string();
+    app.needs_redraw = true;
+}
+
+/// The fully-expanded body lines for the entry pinned into the detail pane, or
+/// an empty `Vec` when no pane is open / the pinned id has fallen out of the
+/// transcript. Built with the same expanded formatter the overlay's "see
+/// everything" surface uses, so the pane shows the raw diff/file/tool output.
+fn diff_detail_pane_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
+    let Some(pane) = app.diff_detail_pane else {
+        return Vec::new();
+    };
+    let entries = active_transcript_entries(app);
+    let Some((index, entry)) = entries
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.id == pane.entry_id)
+    else {
+        return Vec::new();
+    };
+    let shortcut = key_hint(app, keymap::Action::ToggleTranscriptOverlay);
+    let logical = format_transcript_entry_expanded(
+        entry,
+        false,
+        ToolDetailMode::Full,
+        message_outcome(entries, index),
+        Some(width),
+        app.show_reasoning_usage,
+        shortcut.as_str(),
+    );
+    wrap_transcript_overlay_rows(&logical, width)
+}
+
+/// Whether the pinned detail-pane entry is still present in the active
+/// transcript. The crate root closes the pane (heals to `None`) when the id has
+/// disappeared so the render path never paints an empty pane.
+fn diff_detail_pane_entry_present(app: &TuiApp) -> bool {
+    let Some(pane) = app.diff_detail_pane else {
+        return false;
+    };
+    active_transcript_entries(app)
+        .iter()
+        .any(|entry| entry.id == pane.entry_id)
+}
+
+/// `(total_rows, viewport_h)` for the detail pane. Prefers the LAST PAINTED text
+/// rect (cached each frame in `diff_detail_pane_rect_cache`) so the scroll clamp
+/// uses the exact geometry the user is looking at; falls back to rebuilding the
+/// rect off-frame from the live terminal size (the way
+/// `transcript_overlay_max_scroll` does) before the first paint. Returns `None`
+/// when no pane is open or the overlay is too narrow to split.
+fn diff_detail_pane_geometry(app: &TuiApp) -> Option<(usize, usize)> {
+    app.diff_detail_pane?;
+    let text_area = match app.diff_detail_pane_rect_cache.get() {
+        Some(rect) if rect.width > 0 && rect.height > 0 => rect,
+        _ => {
+            let (width, height) = terminal_size().ok()?;
+            let full_area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            let (content_area, _) = transcript_overlay_content_and_status_areas(full_area);
+            let inner = transcript_overlay_inner(content_area);
+            let layout = diff_detail_pane::split_overlay_content(inner)?;
+            diff_detail_pane::pane_inner(layout.pane)
+        }
+    };
+    if text_area.width == 0 || text_area.height == 0 {
+        return None;
+    }
+    let rows = diff_detail_pane_lines(app, text_area.width);
+    Some((rows.len(), usize::from(text_area.height)))
+}
+
+/// Scroll the detail pane by `delta` rows in `dir`, clamped to its content.
+/// Returns `true` when the offset changed (so the caller redraws). Used by both
+/// the `Shift`+scroll keyboard path and the wheel-over-pane mouse path.
+fn scroll_diff_detail_pane(app: &mut TuiApp, dir: VerticalScrollDir, delta: usize) -> bool {
+    let Some((total, viewport)) = diff_detail_pane_geometry(app) else {
+        return false;
+    };
+    let Some(pane) = app.diff_detail_pane.as_mut() else {
+        return false;
+    };
+    let next = match dir {
+        VerticalScrollDir::Up => pane.scroll.saturating_sub(delta),
+        VerticalScrollDir::Down => pane.scroll.saturating_add(delta),
+    };
+    let next = diff_detail_pane::clamp_pane_scroll(next, total, viewport);
+    if next == pane.scroll {
+        return false;
+    }
+    pane.scroll = next;
+    app.needs_redraw = true;
+    true
+}
+
+/// Direction for [`scroll_diff_detail_pane`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerticalScrollDir {
+    Up,
+    Down,
+}
+
 /// Current `(line_count, viewport_h)` for the *active* transcript, using the
 /// live terminal width and the transcript area height. Mirrors the geometry
 /// `render_transcript` feeds to `ScrollState::offset` so `scroll_by`/
@@ -8876,6 +9048,10 @@ fn select_next_transcript_entry(app: &mut TuiApp) {
 fn close_transcript_overlay(app: &mut TuiApp) {
     app.transcript_overlay_scrollbar_cache.set(None);
     app.transcript_overlay = None;
+    // The detail pane only lives alongside the overlay; closing the overlay
+    // closes the pane too so it can never linger as orphaned state.
+    app.diff_detail_pane = None;
+    app.diff_detail_pane_rect_cache.set(None);
     if matches!(app.subagent_pane.active, ConversationSource::Subagent(_)) {
         app.subagent_pane.focused = false;
         app.subagent_pane.active = ConversationSource::Main;
@@ -8892,8 +9068,50 @@ fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         return false;
     }
     const PAGE: usize = 10;
+    // Detail pane (§11G.10) scroll. When the pane is open, `Shift`+the scroll
+    // keys move the PANE while the plain keys keep moving the transcript — so
+    // the transcript context the spec wants preserved stays reachable. Matched
+    // before the plain scroll arms (which ignore Shift) so the modifier wins.
+    if app.diff_detail_pane.is_some() && key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Up => {
+                scroll_diff_detail_pane(app, VerticalScrollDir::Up, 1);
+                return true;
+            }
+            KeyCode::Down => {
+                scroll_diff_detail_pane(app, VerticalScrollDir::Down, 1);
+                return true;
+            }
+            KeyCode::PageUp => {
+                scroll_diff_detail_pane(app, VerticalScrollDir::Up, PAGE);
+                return true;
+            }
+            KeyCode::PageDown => {
+                scroll_diff_detail_pane(app, VerticalScrollDir::Down, PAGE);
+                return true;
+            }
+            KeyCode::Home => {
+                scroll_diff_detail_pane(app, VerticalScrollDir::Up, usize::MAX);
+                return true;
+            }
+            KeyCode::End => {
+                scroll_diff_detail_pane(app, VerticalScrollDir::Down, usize::MAX);
+                return true;
+            }
+            _ => {}
+        }
+    }
     match key.code {
         KeyCode::Esc => {
+            // Esc closes the detail pane first (one level at a time) so a user
+            // reading a diff backs out to the transcript before leaving it.
+            if app.diff_detail_pane.is_some() {
+                app.diff_detail_pane = None;
+                app.diff_detail_pane_rect_cache.set(None);
+                app.status = "detail pane closed".to_string();
+                app.needs_redraw = true;
+                return true;
+            }
             close_transcript_overlay(app);
             true
         }
@@ -8942,6 +9160,17 @@ fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             // guard blocks non-toggle actions while the overlay is open).
             let backward = key.modifiers.contains(KeyModifiers::SHIFT);
             cycle_transcript_overlay_filter(app, backward);
+            true
+        }
+        KeyCode::Char('d') | KeyCode::Char('D')
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META) =>
+        {
+            // Open / close the diff/detail pane (§11G.10) for the focused entry.
+            // Like `m`/`f`, an overlay-local key handled here (the global keymap
+            // dispatch guard blocks non-toggle actions while the overlay is up).
+            toggle_diff_detail_pane(app);
             true
         }
         KeyCode::Char('e') | KeyCode::Char('E')
@@ -12682,10 +12911,23 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             format!("· filter: {} (f) ", other.label(&tool_names))
         }
     };
+    // The detail-pane hint only appears when an entry is focused (so `d` is
+    // actionable) or the pane is already open. A stale pinned id that has fallen
+    // out of the transcript is healed to a closed pane right here, so the render
+    // never paints an empty pane or a dangling hint.
+    let pane_open = app.diff_detail_pane.is_some() && diff_detail_pane_entry_present(app);
+    let detail_suffix = if pane_open {
+        "· detail pane: d/Esc close · Shift+↑/↓ scroll "
+    } else if active_selected_entry(app).is_some() {
+        "· d: detail pane "
+    } else {
+        ""
+    };
     let title = format!(
-        " Transcript — {} or Esc to close · PgUp/PgDn or wheel scroll {}",
+        " Transcript — {} or Esc to close · PgUp/PgDn or wheel scroll {}{}",
         key_hint(app, keymap::Action::ToggleTranscriptOverlay),
-        filter_suffix
+        filter_suffix,
+        detail_suffix,
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -12697,8 +12939,25 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 .fg(crate::render::theme::secondary())
                 .add_modifier(Modifier::BOLD),
         ));
-    let inner = transcript_overlay_inner(area);
     frame.render_widget(block, area);
+    let full_inner = transcript_overlay_inner(area);
+    // Carve the detail pane off the right of the inner area when it is open and
+    // the area is wide enough to split (`split_overlay_content` returns `None`
+    // when too narrow — a graceful full-width fallback). The transcript then
+    // renders into the narrowed left column, keeping its context on-screen.
+    let (inner, pane_layout) = match pane_open
+        .then(|| diff_detail_pane::split_overlay_content(full_inner))
+        .flatten()
+    {
+        Some(layout) => (layout.transcript, Some(layout)),
+        None => {
+            app.diff_detail_pane_rect_cache.set(None);
+            (full_inner, None)
+        }
+    };
+    if let Some(layout) = pane_layout {
+        render_diff_detail_pane(frame, layout, app);
+    }
     let (text_area, scrollbar_area) =
         transcript_overlay_text_and_scrollbar_areas(inner).unwrap_or((
             inner,
@@ -12735,6 +12994,93 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             app.transcript_overlay_scrollbar_cache.set(None);
         }
     });
+}
+
+/// Short kind label for the entry pinned into the detail pane, used in the
+/// pane's title (`"Diff"`, `"Tool: shell"`, `"Plan"`, …). `None` when the id is
+/// no longer live (the caller will have already closed the pane).
+fn diff_detail_pane_title(app: &TuiApp) -> Option<String> {
+    let pane = app.diff_detail_pane?;
+    let entries = active_transcript_entries(app);
+    let entry = entries.iter().find(|entry| entry.id == pane.entry_id)?;
+    let label = match &entry.kind {
+        TranscriptEntryKind::ToolResult(tool) => format!("Tool: {}", tool.result.tool_name),
+        TranscriptEntryKind::Diff(_) => "Diff".to_string(),
+        TranscriptEntryKind::PlanCard(_) => "Plan".to_string(),
+        TranscriptEntryKind::Message(item) if item.role == Role::Assistant => {
+            "Assistant".to_string()
+        }
+        TranscriptEntryKind::Message(_) => "Message".to_string(),
+        TranscriptEntryKind::Reasoning(_) => "Reasoning".to_string(),
+        _ => "Detail".to_string(),
+    };
+    Some(label)
+}
+
+/// Paint the diff/detail pane (§11G.10) into the right column carved off the
+/// overlay. Draws a bordered box titled with the pinned entry's kind, the
+/// entry's fully-expanded body inside it (independently scrolled), and a faint
+/// vertical separator between the pane and the transcript. Caches the painted
+/// text rect so a wheel-over-pane event routes to the pane in `handle_mouse`.
+fn render_diff_detail_pane(
+    frame: &mut Frame<'_>,
+    layout: diff_detail_pane::DiffDetailLayout,
+    app: &TuiApp,
+) {
+    // Faint vertical rule between the transcript and the pane.
+    if layout.separator.width > 0 && layout.separator.height > 0 {
+        let rule = vec![
+            Line::from(Span::styled(
+                "│",
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
+            usize::from(layout.separator.height)
+        ];
+        frame.render_widget(Paragraph::new(rule), layout.separator);
+    }
+
+    let title = diff_detail_pane_title(app)
+        .map(|label| format!(" {label} "))
+        .unwrap_or_else(|| " Detail ".to_string());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::render::theme::accent()))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ));
+    frame.render_widget(ratatui::widgets::Clear, layout.pane);
+    frame.render_widget(block, layout.pane);
+
+    let text_area = diff_detail_pane::pane_inner(layout.pane);
+    if text_area.width == 0 || text_area.height == 0 {
+        app.diff_detail_pane_rect_cache.set(None);
+        return;
+    }
+    let rows = diff_detail_pane_lines(app, text_area.width);
+    let scroll = app
+        .diff_detail_pane
+        .map(|pane| {
+            diff_detail_pane::clamp_pane_scroll(
+                pane.scroll,
+                rows.len(),
+                usize::from(text_area.height),
+            )
+        })
+        .unwrap_or(0);
+    let visible = rows
+        .iter()
+        .skip(scroll)
+        .take(usize::from(text_area.height))
+        .cloned()
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), text_area);
+    // Stamp the painted text rect so the wheel hit-test can route a scroll over
+    // the pane to the pane rather than the transcript.
+    app.diff_detail_pane_rect_cache.set(Some(text_area));
 }
 
 #[cfg(test)]
@@ -21911,6 +22257,16 @@ pub(crate) struct TuiApp {
     pub(crate) transcript_overlay_scrollbar_cache:
         std::cell::Cell<Option<TranscriptOverlayScrollbarCache>>,
     pub(crate) transcript_overlay_render_cache: std::cell::RefCell<TranscriptOverlayRenderCache>,
+    /// Diff/detail pane pinned alongside the Ctrl+T overlay (§11G.10). `Some`
+    /// pins one transcript entry (by stable id) into a right-side column that
+    /// shows its fully-expanded body — a large diff, file excerpt, or tool
+    /// output — while the transcript keeps scrolling on the left. `None` =
+    /// closed. Only meaningful while `transcript_overlay` is also `Some`.
+    pub(crate) diff_detail_pane: Option<diff_detail_pane::DiffDetailPaneState>,
+    /// Per-frame snapshot of the detail pane's TEXT rect so a mouse wheel over
+    /// the pane scrolls the pane (not the transcript). Set at the end of the
+    /// overlay render when the pane is painted; `None` otherwise.
+    pub(crate) diff_detail_pane_rect_cache: std::cell::Cell<Option<Rect>>,
     /// Per-frame snapshot of the MAIN transcript scrollbar gutter so a mouse
     /// click/drag can map to a `from_bottom` without re-deriving the layout.
     /// Set at the end of `render_transcript`; `None` when content fits.
@@ -22613,6 +22969,8 @@ impl TuiApp {
             transcript_overlay_render_cache: std::cell::RefCell::new(
                 TranscriptOverlayRenderCache::default(),
             ),
+            diff_detail_pane: None,
+            diff_detail_pane_rect_cache: std::cell::Cell::new(None),
             main_scrollbar_cache: std::cell::Cell::new(None),
             main_text_area_cache: std::cell::Cell::new(None),
             selection: None,
