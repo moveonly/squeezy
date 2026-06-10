@@ -615,6 +615,11 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // row) before the global keymap sees them, reaching the same
         // `resolve_paste_transform` handler a row click drives.
         A::PasteTransformSelect(_) => KeyboardPath::Always("paste menu ↑↓/Enter"),
+        // Large Paste Staging row select (§12.6.3) — the staging overlay's own
+        // key handler owns ↑↓/kj (move the cursor) and Enter (apply the selected
+        // action) before the global keymap sees them, reaching the same
+        // `resolve_paste_staging` handler a row click drives.
+        A::PasteStagingSelect(_) => KeyboardPath::Always("paste staging ↑↓/Enter"),
         // Clipboard-history picker (§12.6.1) — the picker's own key handler owns
         // Up/Down (select), Enter (re-copy), `d` (delete), and `c` (clear) before
         // the global keymap sees them, so every mouse affordance routes to the

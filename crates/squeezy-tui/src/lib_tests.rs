@@ -25627,3 +25627,422 @@ async fn transform_menu_survives_a_tiny_terminal_and_resize() {
     // The menu is still pending after all those renders (rendering is pure).
     assert!(app.paste_transform.is_some());
 }
+
+// ===========================================================================
+// Large Paste Staging (§12.6.3)
+// ===========================================================================
+
+/// A string guaranteed to trip the huge-paste staging gate (well above both the
+/// attachment and the §11G.6 very-large preview thresholds).
+fn huge_paste_text() -> String {
+    "x".repeat(paste_staging::HUGE_PASTE_CHAR_THRESHOLD + 10_000)
+}
+
+#[tokio::test]
+async fn huge_paste_opens_the_staging_overlay_instead_of_inserting() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, huge_paste_text())
+        .await
+        .expect("paste");
+
+    assert!(
+        app.paste_staging.is_some(),
+        "a huge paste should open the staging overlay"
+    );
+    assert!(
+        app.input.is_empty(),
+        "no text should reach the composer before an action is chosen"
+    );
+    assert!(
+        app.prompt_attachments.is_empty(),
+        "no attachment before an action is chosen"
+    );
+    assert!(
+        app.paste_preview.is_none(),
+        "the huge-paste staging overlay supersedes the §11G.6 preview"
+    );
+}
+
+#[tokio::test]
+async fn very_large_but_not_huge_paste_still_uses_the_preview_not_staging() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Over the §11G.6 very-large gate but under the staging gate: the preview
+    // path is untouched (no regression).
+    let between = "y".repeat(paste_preview::VERY_LARGE_PASTE_CHAR_THRESHOLD + 5_000);
+    assert!(!paste_staging::is_huge_paste(&between));
+    handle_paste(&mut app, &mut agent, between)
+        .await
+        .expect("paste");
+
+    assert!(
+        app.paste_staging.is_none(),
+        "a merely very-large paste must not open the staging overlay"
+    );
+    assert!(
+        app.paste_preview.is_some(),
+        "it still parks in the §11G.6 confirm/cancel preview"
+    );
+}
+
+#[tokio::test]
+async fn enter_applies_insert_and_attaches_the_staged_paste() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    let pasted = huge_paste_text();
+    handle_paste(&mut app, &mut agent, pasted.clone())
+        .await
+        .expect("paste");
+    // Clean text pre-selects Insert (index 0).
+    assert_eq!(
+        app.paste_staging.as_ref().unwrap().selected_action(),
+        paste_staging::StagingAction::Insert
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter");
+
+    assert!(app.paste_staging.is_none(), "Enter closes the overlay");
+    assert_eq!(
+        app.prompt_attachments.len(),
+        1,
+        "Insert attaches the staged paste (never types inline)"
+    );
+    match &app.prompt_attachments[0].payload {
+        PromptAttachmentPayload::Text { replacement, kind } => {
+            assert_eq!(*kind, PromptTextAttachmentKind::PastedText);
+            assert_eq!(replacement, &pasted, "attaches the exact staged text");
+        }
+        other => panic!("expected a pasted-text attachment, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn arrow_keys_navigate_to_queue_then_enter_queues_the_paste() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, huge_paste_text())
+        .await
+        .expect("paste");
+    let queue_idx = app
+        .paste_staging
+        .as_ref()
+        .unwrap()
+        .actions()
+        .iter()
+        .position(|a| *a == paste_staging::StagingAction::Queue)
+        .expect("queue action offered");
+    app.paste_staging.as_mut().unwrap().select(queue_idx);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter");
+
+    assert!(app.paste_staging.is_none(), "Enter closes the overlay");
+    assert_eq!(
+        app.prompt_queue.len(),
+        1,
+        "Queue appends the paste as its own pending prompt"
+    );
+    assert!(
+        app.prompt_attachments.is_empty() && app.input.is_empty(),
+        "queuing does not touch the composer line"
+    );
+    assert_eq!(
+        app.prompt_queue_ids.len(),
+        1,
+        "the queue id sidecar stays aligned with the queue"
+    );
+}
+
+#[tokio::test]
+async fn esc_cancels_the_staged_paste_and_discards_it() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, huge_paste_text())
+        .await
+        .expect("paste");
+    assert!(app.paste_staging.is_some());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+
+    assert!(app.paste_staging.is_none(), "Esc closes the overlay");
+    assert!(
+        app.prompt_attachments.is_empty() && app.input.is_empty() && app.prompt_queue.is_empty(),
+        "Esc discards the staged paste entirely"
+    );
+}
+
+#[tokio::test]
+async fn a_stray_key_keeps_the_staging_overlay_open() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, huge_paste_text())
+        .await
+        .expect("paste");
+
+    // A printable key must not leak into the composer nor dismiss the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("stray key");
+
+    assert!(
+        app.paste_staging.is_some(),
+        "a stray key holds the overlay open"
+    );
+    assert!(app.input.is_empty(), "no stray text reaches the composer");
+}
+
+#[tokio::test]
+async fn clicking_an_action_row_selects_and_applies_it() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, huge_paste_text())
+        .await
+        .expect("paste");
+
+    // Render once so the action-row click rects are registered for this frame.
+    let backend = TestBackend::new(110, 30);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| render(frame, &app)).expect("draw");
+
+    // Locate the "Insert" action row and click it: a click both selects and
+    // applies, the mouse twin of ↑↓ + Enter.
+    let buffer = terminal.backend().buffer().clone();
+    let (col, row) = find_text_cell(&buffer, "Insert").expect("Insert row on screen");
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        app.paste_staging.is_none(),
+        "clicking an action row closes the overlay"
+    );
+    assert_eq!(
+        app.prompt_attachments.len(),
+        1,
+        "clicking Insert attaches the staged paste"
+    );
+}
+
+#[tokio::test]
+async fn click_outside_the_action_rows_is_swallowed_not_leaked() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, huge_paste_text())
+        .await
+        .expect("paste");
+
+    let backend = TestBackend::new(110, 30);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| render(frame, &app)).expect("draw");
+
+    // Click the very top-left corner, clear of any action row: the overlay owns
+    // the pointer, so the click is consumed and the overlay stays open.
+    let consumed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(consumed, "the overlay consumes every mouse event");
+    assert!(
+        app.paste_staging.is_some(),
+        "a click off the rows leaves the overlay open"
+    );
+}
+
+#[tokio::test]
+async fn copy_preview_action_copies_without_attaching_or_queuing() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, huge_paste_text())
+        .await
+        .expect("paste");
+    let copy_idx = app
+        .paste_staging
+        .as_ref()
+        .unwrap()
+        .actions()
+        .iter()
+        .position(|a| *a == paste_staging::StagingAction::CopyPreview)
+        .expect("copy preview offered");
+    app.paste_staging.as_mut().unwrap().select(copy_idx);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter");
+
+    assert!(
+        app.paste_staging.is_none(),
+        "Copy preview closes the overlay"
+    );
+    assert!(
+        app.prompt_attachments.is_empty() && app.input.is_empty() && app.prompt_queue.is_empty(),
+        "Copy preview never touches the composer/queue"
+    );
+    // The copy funnel records every landed copy in the in-app history (§12.6.1),
+    // so a recorded entry proves the preview was delivered to the clipboard.
+    assert!(
+        !app.clipboard_history.is_empty(),
+        "the preview copy was recorded in the clipboard history"
+    );
+}
+
+#[tokio::test]
+async fn temp_file_action_writes_a_file_and_inserts_a_reference_token() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, huge_paste_text())
+        .await
+        .expect("paste");
+    let temp_idx = app
+        .paste_staging
+        .as_ref()
+        .unwrap()
+        .actions()
+        .iter()
+        .position(|a| *a == paste_staging::StagingAction::TempFile)
+        .expect("temp file offered");
+    app.paste_staging.as_mut().unwrap().select(temp_idx);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter");
+
+    assert!(app.paste_staging.is_none(), "Temp file closes the overlay");
+    assert_eq!(
+        app.prompt_attachments.len(),
+        1,
+        "Temp file inserts one reference token instead of the body"
+    );
+    // The token references a real file under the platform temp dir; the body is
+    // NOT inlined into the attachment replacement.
+    match &app.prompt_attachments[0].payload {
+        PromptAttachmentPayload::Text { replacement, .. } => {
+            assert!(
+                replacement.starts_with("Staged paste written to "),
+                "the attachment references the file, not the body: {replacement}"
+            );
+            let path = replacement
+                .trim_start_matches("Staged paste written to ")
+                .to_string();
+            let written = fs::read_to_string(&path).expect("temp file exists");
+            assert_eq!(
+                written.len(),
+                huge_paste_text().len(),
+                "full body persisted"
+            );
+            let _ = fs::remove_file(&path);
+        }
+        other => panic!("expected a text token, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn staging_overlay_renders_estimates_and_a_sanitized_escape_dump() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    // A huge ANSI-laden paste: the staging view must show estimates + the
+    // terminal-controls warning, and the preview must render the escapes INERT
+    // (the raw ESC byte never reaches the buffer).
+    let red = "\x1b[31mred\x1b[0m line\n";
+    let huge = red.repeat(paste_staging::HUGE_PASTE_CHAR_THRESHOLD); // far over the gate
+    handle_paste(&mut app, &mut agent, huge)
+        .await
+        .expect("paste");
+    assert!(app.paste_staging.is_some());
+
+    let output = render_to_string(&app, 96, 28);
+    assert!(output.contains("chars"), "estimates are shown: {output}");
+    assert!(
+        output.contains("warnings: terminal control bytes"),
+        "the terminal-controls warning is shown"
+    );
+    assert!(
+        output.contains("red line"),
+        "the escape sequence renders inert as plain text"
+    );
+    // The raw ESC byte must never be painted into the display.
+    assert!(
+        !output.contains('\u{1b}'),
+        "no raw escape byte may reach the rendered buffer"
+    );
+    // The action set is visible.
+    assert!(
+        output.contains("Strip ANSI"),
+        "Strip ANSI offered for an ANSI dump"
+    );
+    assert!(output.contains("Temp file"));
+    assert!(output.contains("Queue"));
+}
+
+#[tokio::test]
+async fn staging_overlay_survives_resize_to_degenerate_sizes() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, huge_paste_text())
+        .await
+        .expect("paste");
+
+    // Render across a range of sizes, including degenerate ones, to prove the
+    // staging layout never panics on resize where the feature paints.
+    for (w, h) in [(96u16, 28u16), (40, 14), (8, 4), (1, 1)] {
+        let painted = render_to_string(&app, w, h);
+        assert!(
+            !painted.is_empty(),
+            "render must produce a frame at {w}x{h}"
+        );
+    }
+    // The overlay is still pending after all those renders (rendering is pure).
+    assert!(app.paste_staging.is_some());
+}

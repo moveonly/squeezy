@@ -456,6 +456,15 @@ impl PasteTransformMenu {
     }
 }
 
+/// Conservative structure classification of `text`, exposed for the Large Paste
+/// Staging view (§12.6.3) so a huge paste's header reports the same kind label
+/// the transform menu would. `line_count` is passed in (already computed by the
+/// caller) to avoid recounting. A thin re-export of [`classify`] so the
+/// classification heuristics live in exactly one place.
+pub(crate) fn classify_text(text: &str, line_count: usize) -> PasteKind {
+    classify(text, line_count)
+}
+
 /// Conservative structure classification of `text`. `line_count` is passed in
 /// (already computed by the payload) to avoid recounting.
 fn classify(text: &str, line_count: usize) -> PasteKind {
