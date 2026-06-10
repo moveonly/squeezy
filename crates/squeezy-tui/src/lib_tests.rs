@@ -13071,6 +13071,12 @@ fn render_transcript_to_string(app: &TuiApp, width: u16, height: u16) -> String 
 /// turn count closely and needles like "turn 137" are unambiguous.
 fn app_with_user_turns(count: usize) -> TuiApp {
     let mut app = test_app(SessionMode::Build);
+    // Seed a deterministic 80x24 viewport so the off-frame transcript geometry
+    // (`active_transcript_geometry` & co.) used by the scroll/jump tests below
+    // measures against a fixed size instead of the host terminal. Tests that
+    // also paint overwrite this with their render size on the first frame; the
+    // ones that drive scroll/jump without painting stay platform-independent.
+    app.set_test_frame_size(80, 24);
     for index in 0..count {
         app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
     }
@@ -21343,8 +21349,9 @@ fn seed_drag_selection(app: &mut TuiApp, x: u16, y: u16) {
 /// count and the page (viewport height in rows). Keyboard extends move the cursor
 /// over this same painted row model and page by exactly this `viewport_h`, so
 /// tests derive their expectations from here rather than from
-/// `active_transcript_geometry` (which re-measures against the real terminal
-/// size, not the test render).
+/// `active_transcript_geometry` (which re-derives the viewport from the
+/// last-painted frame size rather than reading the exact per-surface text-area
+/// cache this records).
 struct PaintedGeometry {
     total_rows: usize,
     viewport_h: usize,
@@ -23778,6 +23785,9 @@ fn main_render_text_selection_changes_paint_but_keeps_rows_cached() {
 /// to the top so a mark records a non-tail position.
 fn jump_marks_app() -> TuiApp {
     let mut app = test_app(SessionMode::Build);
+    // Deterministic 80x24 viewport so the jump-nav geometry these tests exercise
+    // off-frame doesn't depend on the host terminal size (see `wide_block_app`).
+    app.set_test_frame_size(80, 24);
     for index in 0..60 {
         app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
     }
@@ -24173,6 +24183,14 @@ fn minimap_too_narrow_to_host_a_rail_falls_back_gracefully() {
 /// boundaries — it is exactly the wide-block case the feature targets.
 fn wide_block_app() -> TuiApp {
     let mut app = test_app(SessionMode::Build);
+    // Seed a deterministic small viewport so the off-frame transcript geometry
+    // (`active_transcript_geometry` & friends) measures against a fixed 80x24
+    // instead of the host terminal. On a tall console (e.g. the Windows CI
+    // runner) the real height would make the short transcript fit with no
+    // scrollback, so `ScrollUp` would be a no-op and the vertical-scroll
+    // assertions below would spuriously fail. Pinning the size here removes that
+    // platform dependence; the render-based assertions paint at 80x24 to match.
+    app.set_test_frame_size(80, 24);
     // A few filler turns first, then the wide line LAST so it sits at the
     // tail-pinned bottom of the viewport and is reliably painted in the
     // render-based assertions below.

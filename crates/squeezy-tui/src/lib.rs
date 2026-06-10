@@ -3106,7 +3106,7 @@ fn is_transcript_overlay_scroll_key(code: KeyCode, modifiers: KeyModifiers) -> b
 }
 
 fn transcript_overlay_max_scroll(app: &TuiApp) -> Option<usize> {
-    let (width, height) = terminal_size().ok()?;
+    let (width, height) = app.off_frame_terminal_size();
     let full_area = Rect {
         x: 0,
         y: 0,
@@ -5019,7 +5019,7 @@ fn jump_transcript_nav(app: &mut TuiApp, target: JumpTarget, direction: JumpDire
     if app.config_screen.is_some() || app.status_line_setup.is_some() {
         return false;
     }
-    let (width, height) = terminal_size().unwrap_or((80, 24));
+    let (width, height) = app.off_frame_terminal_size();
     let area = Rect {
         x: 0,
         y: 0,
@@ -5067,7 +5067,7 @@ fn jump_transcript_nav(app: &mut TuiApp, target: JumpTarget, direction: JumpDire
 /// path. Returns `None` when there is nothing to navigate (empty transcript or
 /// a degenerate zero-height viewport).
 fn jump_nav_geometry(app: &TuiApp) -> Option<(Vec<usize>, usize, usize)> {
-    let (width, height) = terminal_size().unwrap_or((80, 24));
+    let (width, height) = app.off_frame_terminal_size();
     let area = Rect {
         x: 0,
         y: 0,
@@ -6202,7 +6202,7 @@ fn diff_detail_pane_geometry(app: &TuiApp) -> Option<(usize, usize)> {
     let text_area = match app.diff_detail_pane_rect_cache.get() {
         Some(rect) if rect.width > 0 && rect.height > 0 => rect,
         _ => {
-            let (width, height) = terminal_size().ok()?;
+            let (width, height) = app.off_frame_terminal_size();
             let full_area = Rect {
                 x: 0,
                 y: 0,
@@ -6253,14 +6253,17 @@ enum VerticalScrollDir {
 }
 
 /// Current `(line_count, viewport_h)` for the *active* transcript, using the
-/// live terminal width and the transcript area height. Mirrors the geometry
+/// last-painted-frame width and the transcript area height. Mirrors the geometry
 /// `render_transcript` feeds to `ScrollState::offset` so `scroll_by`/
 /// `scroll_to_top`/`clamp` clamp against the same numbers the renderer uses.
 ///
 /// Recomputed off-frame the same way `transcript_overlay_max_scroll` rebuilds
-/// the overlay `Rect` from `terminal_size()`.
+/// the overlay `Rect`, both sizing from [`TuiApp::off_frame_terminal_size`]
+/// (the size the renderer last painted with) rather than a raw `terminal_size()`
+/// syscall, so the math agrees with the frame on screen and is deterministic in
+/// headless tests.
 fn active_transcript_geometry(app: &TuiApp) -> (usize, usize) {
-    let (width, height) = terminal_size().unwrap_or((80, 24));
+    let (width, height) = app.off_frame_terminal_size();
     let area = Rect {
         x: 0,
         y: 0,
@@ -11164,6 +11167,13 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
 fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     app.begin_frame_clickables();
     let area = frame.area();
+    // Record the size we're painting at so off-frame transcript geometry
+    // (`active_transcript_geometry`, `jump_*_geometry`,
+    // `transcript_overlay_max_scroll`, the diff-detail-pane fallback) measures
+    // against the viewport the renderer used rather than a fresh
+    // `terminal_size()` syscall — keeping scroll/jump math consistent with the
+    // painted frame and deterministic under a headless `TestBackend`.
+    app.stamp_frame_size(area);
     // The large-paste confirmation modal (§11G.6) wins over every other surface
     // while it is open: a paste decision is pending and the user must resolve it
     // before anything else. It only ever opens from the main composer (config /
@@ -22273,6 +22283,21 @@ pub(crate) struct TuiApp {
     /// `selection::Pos`. Set in `render_transcript`; `None` before the first
     /// frame.
     pub(crate) main_text_area_cache: std::cell::Cell<Option<MainTextAreaCache>>,
+    /// Full terminal size `(cols, rows)` of the most recently painted frame,
+    /// stamped from `frame.area()` at the top of `render_surfaces`. `None` before
+    /// the first paint.
+    ///
+    /// The off-frame transcript geometry (`active_transcript_geometry`,
+    /// `jump_*_geometry`, `transcript_overlay_max_scroll`, the diff-detail-pane
+    /// fallback) reads this via [`TuiApp::off_frame_terminal_size`] instead of
+    /// calling `crossterm::terminal::size()` directly: that couples the scroll /
+    /// jump math to the size the renderer actually painted with, and makes those
+    /// paths deterministic under a `TestBackend` (which has no real TTY) so
+    /// geometry-dependent tests don't depend on the host terminal's dimensions.
+    /// On a real terminal it equals the live size, so production behavior is
+    /// unchanged. Falls back to `terminal_size()` / `(80, 24)` only before the
+    /// first frame.
+    pub(crate) last_frame_size: std::cell::Cell<Option<(u16, u16)>>,
     /// Active visual selection over the painted transcript rows (main view or
     /// Ctrl+T overlay), or `None`. Surface-local: the anchor/cursor index the
     /// active surface's wrapped `Vec<Line>`. Drives copy when present and the
@@ -22790,6 +22815,35 @@ impl TuiApp {
         self.clickables.borrow_mut().begin_frame();
     }
 
+    /// Record the size of the frame currently being painted so off-frame
+    /// geometry can later reproduce the renderer's viewport without a fresh
+    /// `crossterm::terminal::size()` syscall. Called once per paint from
+    /// `render_surfaces` with `frame.area()`.
+    pub(crate) fn stamp_frame_size(&self, area: Rect) {
+        self.last_frame_size.set(Some((area.width, area.height)));
+    }
+
+    /// The terminal size off-frame transcript geometry should measure against:
+    /// the size of the most recently painted frame when one exists, otherwise a
+    /// fresh `terminal_size()` (falling back to `(80, 24)`) for the pre-first-
+    /// paint window. On a real terminal the stamped size equals the live size,
+    /// so production behavior is identical to the old direct call; under a
+    /// `TestBackend` it reflects the deterministic render size instead of the
+    /// host TTY (or its absence).
+    pub(crate) fn off_frame_terminal_size(&self) -> (u16, u16) {
+        self.last_frame_size
+            .get()
+            .unwrap_or_else(|| terminal_size().unwrap_or((80, 24)))
+    }
+
+    /// Test-only: seed the last-painted-frame size directly, so geometry-only
+    /// unit tests that never call the renderer still measure against a
+    /// deterministic viewport rather than the host terminal.
+    #[cfg(test)]
+    pub(crate) fn set_test_frame_size(&self, width: u16, height: u16) {
+        self.last_frame_size.set(Some((width, height)));
+    }
+
     /// The OSC 8 hyperlink capability actually in effect (§11G.5): the runtime
     /// `hyperlink_override` when the user has forced a state, otherwise the
     /// startup environment probe. The exit-mirror row emitter reads this to
@@ -22970,6 +23024,7 @@ impl TuiApp {
             diff_detail_pane_rect_cache: std::cell::Cell::new(None),
             main_scrollbar_cache: std::cell::Cell::new(None),
             main_text_area_cache: std::cell::Cell::new(None),
+            last_frame_size: std::cell::Cell::new(None),
             selection: None,
             search: None,
             jump_marks: jump_marks::JumpMarkStack::new(),
