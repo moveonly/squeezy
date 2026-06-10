@@ -1,12 +1,28 @@
 //! Minimal Glyph Mode (§12.7.6).
 //!
 //! A low-fidelity glyph mode that swaps Squeezy's decorative / wide Unicode
-//! *chrome* — spinner frames, rails, fold/disclosure markers, scrollbar blocks,
-//! box-drawing borders, status dots, queue/search markers — for ASCII-safe
-//! equivalents on terminals that cannot render the full set cleanly: legacy
-//! Windows consoles, bare Linux/remote sessions, narrow fonts, and
-//! accessibility setups. Only Squeezy *chrome* changes; user/tool transcript
-//! content is never rewritten (the spec scopes this strictly to chrome).
+//! *chrome* for ASCII-safe equivalents on terminals that cannot render the full
+//! set cleanly: legacy Windows consoles, bare Linux/remote sessions, narrow
+//! fonts, and accessibility setups. Only Squeezy *chrome* changes; user/tool
+//! transcript content is never rewritten (the spec scopes this strictly to
+//! chrome).
+//!
+//! ## Wired consumers (so far)
+//!
+//! The token table below enumerates the full chrome vocabulary the §12.7.6 spec
+//! calls out, but only a subset is *routed through it* today. As of this commit
+//! the mode actually changes:
+//!
+//! * the **terminal / OS title bar** (the working spinner + notification dot,
+//!   via [`GlyphTokens::downgrade`]),
+//! * the **main transcript scrollbar** (thumb / track),
+//! * the **transcript rail** separator, and
+//! * the editor overlay's own **live preview** strip.
+//!
+//! The remaining named tokens — card borders, fold/disclosure markers, status
+//! dots, queue bullets, drag handles, and search markers — are a planned
+//! follow-up: they are defined and previewed here but not yet spliced into their
+//! paint sites, so toggling the mode does not move them yet.
 //!
 //! ## Three sets, not a switch
 //!
@@ -121,8 +137,10 @@ impl GlyphMode {
         GlyphMode::ALL.iter().position(|m| *m == self).unwrap_or(0)
     }
 
-    /// The resolved token table for this mode — the single source of truth the
-    /// renderer reads its chrome glyphs from.
+    /// The resolved token table for this mode. The renderer reads the *wired*
+    /// chrome glyphs (scrollbar thumb/track, transcript rail) from here; the rest
+    /// of the table is a defined-but-not-yet-routed vocabulary (see the module
+    /// docs for the current wired set).
     pub(crate) fn tokens(self) -> GlyphTokens {
         GlyphTokens::resolve(self)
     }
@@ -132,7 +150,10 @@ impl GlyphMode {
 /// `&'static str` so a renderer can splice it into a `Line`/`Span` without
 /// allocating, and so the set is a compile-time table. The fields enumerate the
 /// chrome families the §12.7.6 spec calls out: borders, rails, folds, spinner,
-/// markers, drag handle, scrollbar, status, queue, expand/collapse, search.
+/// markers, drag handle, scrollbar, status, queue, expand/collapse, search. Note
+/// that only a subset is wired into real paint sites today (the scrollbar
+/// thumb/track and the transcript rail's `border_vertical`); the others are
+/// previewed in the editor but not yet routed (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GlyphTokens {
     /// Horizontal box-drawing run (card borders, separators).
@@ -184,12 +205,12 @@ impl GlyphTokens {
                 fold_expanded: "\u{25be}",       // ▾
                 drag_handle: "\u{2059}",         // ⁙ (six-dot, the grip-dots glyph)
                 scrollbar_thumb: "\u{2588}",     // █
-                scrollbar_track: "\u{2502}",     // │
-                status_dot: "\u{25cf}",          // ●
-                queue_bullet: "\u{2022}",        // •
-                expand: "\u{25b6}",              // ▶
-                collapse: "\u{25bc}",            // ▼
-                search_marker: "\u{203a}",       // ›
+                scrollbar_track: "\u{2591}", // ░ (light shade — the main scrollbar's empty channel)
+                status_dot: "\u{25cf}",      // ●
+                queue_bullet: "\u{2022}",    // •
+                expand: "\u{25b6}",          // ▶
+                collapse: "\u{25bc}",        // ▼
+                search_marker: "\u{203a}",   // ›
             },
             GlyphMode::Compact => GlyphTokens {
                 // Compact keeps single-cell box-drawing (broadly portable) but
@@ -291,7 +312,18 @@ impl GlyphTokens {
 /// other decorative glyph to `*`. Total over `char`; only ever called on
 /// non-ASCII input by [`GlyphTokens::downgrade`].
 fn ascii_analogue(glyph: char) -> char {
-    match glyph as u32 {
+    let cp = glyph as u32;
+    match cp {
+        // Braille patterns (U+2800..U+28FF) are the working/title spinner family
+        // (the `⠋⠙⠹…` frames). They have no single static ASCII analogue — a
+        // frozen `*` would kill the animation — so cycle them through the classic
+        // `-\|/` spinner. The phase is the codepoint's low two bits: consecutive
+        // frames have different low bits, so the ASCII spinner keeps rotating
+        // instead of freezing on one glyph.
+        0x2800..=0x28ff => {
+            const SPINNER: [char; 4] = ['-', '\\', '|', '/'];
+            SPINNER[(cp & 0b11) as usize]
+        }
         // Box drawing (U+2500..U+257F): horizontals/verticals/corners/junctions.
         0x2500 | 0x2501 | 0x2504 | 0x2505 | 0x2508 | 0x2509 | 0x254c | 0x254d => '-',
         0x2502 | 0x2503 | 0x2506 | 0x2507 | 0x250a | 0x250b | 0x254e | 0x254f => '|',

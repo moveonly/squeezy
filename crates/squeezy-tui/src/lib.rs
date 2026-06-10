@@ -350,13 +350,18 @@ fn terminal_title_for(
     elapsed_ms: u64,
     glyph_mode: glyph_mode::GlyphMode,
 ) -> Option<String> {
-    // Minimal Glyph Mode (§12.7.6): the title bar is Squeezy chrome, and its
-    // braille spinner frames + the notification dot are exactly the
-    // wide/decorative Unicode a limited terminal mangles, so route the chosen
-    // glyph through `GlyphTokens::downgrade` for the active mode. In Unicode mode
-    // this is the identity (the glyph is returned unchanged); Compact/ASCII swap
-    // it for a single-cell / ASCII stand-in. Only the chrome glyph changes — the
-    // `squeezy · {label}` text is untouched.
+    // Minimal Glyph Mode (§12.7.6): the title bar is Squeezy chrome, so route its
+    // braille spinner frames + the notification dot through `GlyphTokens::downgrade`
+    // for the active mode. The two glyphs downgrade differently, because they sit on
+    // opposite sides of the wide/narrow line:
+    //   * Unicode — identity: both are returned unchanged.
+    //   * Compact — only the *wide* notification dot (●, U+25CF) is swapped for a
+    //     narrow single-cell stand-in; the braille spinner frames are single-cell
+    //     (not in the `is_wide_rendered_glyph` family) and so are left untouched —
+    //     the spinner keeps animating in its braille form.
+    //   * ASCII — both are swapped: the braille spinner rotates as `-\|/` and the
+    //     dot becomes an ASCII stand-in.
+    // Only the chrome glyph changes — the `squeezy · {label}` text is untouched.
     let downgrade = |s: &str| -> String {
         s.chars()
             .map(|c| glyph_mode::GlyphTokens::downgrade(glyph_mode, c))
@@ -7083,6 +7088,18 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
     if app.workspace_profile.is_some() {
         return Ok(());
     }
+    // The remaining §12.7 fullscreen overlays — the Keybinding Editor (§12.7.1),
+    // the Terminal Profile Editor (§12.7.3), the Gesture Settings editor (§12.7.5),
+    // and the Minimal Glyph Mode editor (§12.7.6) — are all modal and have no text
+    // field, so each swallows paste entirely rather than letting it leak into the
+    // composer beneath.
+    if app.keybinding_editor.is_some()
+        || app.terminal_profile_editor.is_some()
+        || app.gesture_settings_editor.is_some()
+        || app.glyph_mode_editor.is_some()
+    {
+        return Ok(());
+    }
     // The Scratchpad Pane (§12.3.3) owns text input while open: a paste lands in
     // the scratch buffer at the caret, never in the composer/context underneath.
     // The scratchpad is the user's own notes, so even a large paste goes straight
@@ -10962,6 +10979,12 @@ fn first_run_hint_suppressed(app: &TuiApp) -> bool {
         || app.editor_handoff.is_some()
         || app.theme_editor.is_some()
         || app.workspace_profile.is_some()
+        // The remaining §12.7 fullscreen overlays own the surface too, so the hint
+        // would paint behind them — suppress for all six consistently.
+        || app.keybinding_editor.is_some()
+        || app.terminal_profile_editor.is_some()
+        || app.gesture_settings_editor.is_some()
+        || app.glyph_mode_editor.is_some()
 }
 
 /// Handle a key while the Universal Command Palette (§12.1.1) is open. Returns
@@ -22750,9 +22773,14 @@ fn render_scratchpad_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let scratch_rect = match diff_detail_pane::split_overlay_content(body) {
         Some(layout) if body.height > 0 => {
             render_scratchpad_context(frame, layout.transcript, app);
-            // The one-cell separator gutter between the columns.
+            // The one-cell separator gutter between the columns is the transcript
+            // rail — Squeezy chrome — so resolve it from the active Minimal Glyph
+            // Mode (§12.7.6) rail token. Unicode mode resolves to the same `│` as
+            // before (default snapshots stay byte-identical); Compact keeps `│` and
+            // ASCII drops to `|`.
             if layout.separator.height > 0 {
-                let sep: String = "\u{2502}".repeat(layout.separator.height as usize);
+                let rail = app.glyph_mode.tokens().border_vertical;
+                let sep: String = rail.repeat(layout.separator.height as usize);
                 let mut sep_lines = Vec::new();
                 for ch in sep.chars() {
                     sep_lines.push(Line::from(Span::styled(
@@ -27641,6 +27669,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
                 scrollbar_area,
                 scroll::to_u16_clamped(geometry.thumb_offset),
                 scroll::to_u16_clamped(geometry.thumb_len),
+                app.glyph_mode,
             );
             app.main_scrollbar_cache.set(Some(MainScrollbarCache {
                 scrollbar_area,
@@ -27933,20 +27962,34 @@ fn transcript_main_text_and_scrollbar_areas(area: Rect) -> (Rect, Option<Rect>) 
 
 /// Draw the main-view scrollbar thumb (`█`, accent bold) on a quiet `░` track.
 /// Shares glyphs/style with `render_transcript_overlay_scrollbar`.
-fn render_main_scrollbar(frame: &mut Frame<'_>, area: Rect, thumb_offset: u16, thumb_len: u16) {
+fn render_main_scrollbar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    thumb_offset: u16,
+    thumb_len: u16,
+    glyph_mode: glyph_mode::GlyphMode,
+) {
+    // Minimal Glyph Mode (§12.7.6): the scrollbar thumb/track are Squeezy chrome,
+    // so resolve them from the active mode's token table. Unicode mode resolves to
+    // the same `█`/`░` blocks as before (default snapshots stay byte-identical);
+    // Compact/ASCII swap in narrower / 7-bit stand-ins.
+    let tokens = glyph_mode.tokens();
     let thumb_end = thumb_offset.saturating_add(thumb_len);
     let lines = (0..area.height)
         .map(|offset| {
             let in_thumb = offset >= thumb_offset && offset < thumb_end;
             let (symbol, style) = if in_thumb {
                 (
-                    "█",
+                    tokens.scrollbar_thumb,
                     Style::default()
                         .fg(crate::render::theme::accent())
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
-                ("░", Style::default().fg(crate::render::theme::quiet()))
+                (
+                    tokens.scrollbar_track,
+                    Style::default().fg(crate::render::theme::quiet()),
+                )
             };
             Line::from(Span::styled(symbol, style))
         })

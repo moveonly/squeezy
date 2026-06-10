@@ -6152,6 +6152,56 @@ async fn deleting_large_paste_token_drops_payload_before_submit() {
 }
 
 #[tokio::test]
+async fn keybinding_editor_swallows_paste_instead_of_leaking_to_composer() {
+    // §12.7 overlay guard: the Keybinding Editor (§12.7.1) is a modal fullscreen
+    // overlay with no text field. A bracketed paste while it is open must be
+    // swallowed — it must NOT leak into the composer beneath, and must not open the
+    // large-paste / transform / staging modals.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    // A half-typed draft already in the composer — the paste must not touch it.
+    app.input = "draft prompt".to_string();
+    app.input_cursor = app.input.len();
+
+    toggle_keybinding_editor(&mut app);
+    assert!(
+        app.keybinding_editor.is_some(),
+        "the keybinding editor is open"
+    );
+
+    // A paste big enough to trip the large-paste/staging paths if it ever reached
+    // them — proving the guard returns before any of that machinery runs.
+    handle_paste(
+        &mut app,
+        &mut agent,
+        "z".repeat(LARGE_PASTE_CHAR_THRESHOLD + 32),
+    )
+    .await
+    .expect("handle paste");
+
+    assert_eq!(
+        app.input, "draft prompt",
+        "the composer draft is unchanged — the paste was swallowed"
+    );
+    assert!(app.input_cursor == "draft prompt".len());
+    assert!(app.paste_preview.is_none(), "no paste-preview modal opened");
+    assert!(
+        app.paste_transform.is_none(),
+        "no paste-transform modal opened"
+    );
+    assert!(app.paste_staging.is_none(), "no paste-staging modal opened");
+    assert!(
+        app.prompt_attachments.is_empty(),
+        "no `[Pasted text]` attachment was created"
+    );
+    assert!(
+        app.keybinding_editor.is_some(),
+        "the overlay stays open across the swallowed paste"
+    );
+}
+
+#[tokio::test]
 async fn immediate_duplicate_large_paste_expands_existing_token() {
     let root = temp_workspace("tui_large_paste_immediate_dupe");
     let config = test_config_with_root(SessionMode::Build, root.clone());
@@ -18341,9 +18391,21 @@ async fn glyph_mode_overlay_paints_on_tiny_and_wide_terminals() {
         .unwrap();
 
     // Edge case: a terminal too small for the modal must not panic and must still
-    // produce a frame (the modal clamps / clips rather than crashing).
+    // produce a *bounded, bordered* frame — the modal clamps to the terminal and
+    // keeps its rounded surface rather than crashing or spilling. Assert something
+    // substantive: the rounded top-left corner glyph is painted (proving the modal
+    // block drew, clamped to the 12-wide area), and no row exceeds the width.
     let tiny = render_to_string(&app, 12, 4);
-    assert!(!tiny.is_empty(), "tiny render produces a frame");
+    assert!(
+        tiny.contains('\u{256d}'),
+        "the modal's rounded top-left corner paints even when clamped tiny: {tiny:?}"
+    );
+    for row in tiny.lines() {
+        assert!(
+            row.chars().count() <= 12,
+            "no row spills past the clamped 12-cell width: {row:?}"
+        );
+    }
 
     // Wide terminal: the full modal paints with every mode row and the preview.
     let wide = render_to_string(&app, 160, 48);
@@ -18351,6 +18413,251 @@ async fn glyph_mode_overlay_paints_on_tiny_and_wide_terminals() {
     assert!(wide.contains("Unicode"), "Unicode row paints wide");
     assert!(wide.contains("ASCII"), "ASCII row paints wide");
     assert!(wide.contains("preview:"), "preview paints wide");
+}
+
+/// Render the main transcript (with an overflowing, scrolled buffer) for a given
+/// glyph mode and collect the symbols painted in the rightmost (scrollbar) column.
+fn main_scrollbar_column_symbols(mode: glyph_mode::GlyphMode) -> Vec<String> {
+    let mut app = test_app(SessionMode::Build);
+    app.glyph_mode = mode;
+    for index in 0..200 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    // Scroll up off the tail so the transcript is genuinely scrolled (and the
+    // scrollbar thumb is not pinned to the bottom).
+    for _ in 0..3 {
+        handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+    }
+    assert!(
+        !app.transcript_scroll.is_following(),
+        "the transcript is scrolled off the tail"
+    );
+
+    let width = 40u16;
+    let height = 16u16;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_transcript(frame, Rect::new(0, 0, width, height), &app, false))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    // The scrollbar lives in the last column (a one-cell gutter at x = width - 1).
+    (0..height)
+        .map(|y| buffer[(width - 1, y)].symbol().to_string())
+        .collect()
+}
+
+#[test]
+fn main_scrollbar_uses_ascii_tokens_in_ascii_mode() {
+    // §12.7.6 P3: the main scrollbar thumb/track are now routed through the active
+    // glyph mode. In ASCII mode the column must contain the ASCII stand-ins
+    // (`#` thumb, `|` track) and no Unicode block glyphs.
+    let symbols = main_scrollbar_column_symbols(glyph_mode::GlyphMode::Ascii);
+    let joined: String = symbols.concat();
+    assert!(
+        symbols.iter().any(|s| s == "#"),
+        "ASCII scrollbar thumb `#` is painted: {symbols:?}"
+    );
+    assert!(
+        symbols.iter().any(|s| s == "|"),
+        "ASCII scrollbar track `|` is painted: {symbols:?}"
+    );
+    assert!(
+        !joined.contains('\u{2588}') && !joined.contains('\u{2591}'),
+        "no Unicode block thumb/track leaks in ASCII mode: {symbols:?}"
+    );
+    assert!(
+        joined.is_ascii(),
+        "the ASCII-mode scrollbar column is pure ASCII: {symbols:?}"
+    );
+}
+
+#[test]
+fn main_scrollbar_keeps_unicode_block_glyphs_in_unicode_mode() {
+    // The default (Unicode) mode must render the SAME glyphs as before this wiring
+    // landed — `█` thumb and `░` track — so existing fullscreen snapshots stay
+    // byte-identical.
+    let symbols = main_scrollbar_column_symbols(glyph_mode::GlyphMode::Unicode);
+    assert!(
+        symbols.iter().any(|s| s == "\u{2588}"),
+        "Unicode scrollbar thumb `█` is painted: {symbols:?}"
+    );
+    assert!(
+        symbols.iter().any(|s| s == "\u{2591}"),
+        "Unicode scrollbar track `░` is painted: {symbols:?}"
+    );
+    // Every cell is one of the two expected block glyphs — nothing else leaks.
+    for s in &symbols {
+        assert!(
+            s == "\u{2588}" || s == "\u{2591}",
+            "unexpected scrollbar cell {s:?} in Unicode mode: {symbols:?}"
+        );
+    }
+}
+
+/// Open the scratchpad on a wide terminal for a given glyph mode and return the
+/// rendered surface as a string. The scratchpad's transcript-context separator is
+/// the wired transcript rail.
+fn scratchpad_rail_surface(mode: glyph_mode::GlyphMode) -> String {
+    let mut app = test_app(SessionMode::Build);
+    app.glyph_mode = mode;
+    for index in 0..12 {
+        app.push_transcript_item(TranscriptItem::user(format!("context line {index}")));
+    }
+    app.scratchpad_open = true;
+    // Wide enough that the detail-pane split fires and the rail separator paints.
+    render_to_string(&app, 120, 24)
+}
+
+#[test]
+fn scratchpad_rail_separator_swaps_to_ascii_in_ascii_mode() {
+    // §12.7.6 P3: the transcript-context rail separator is routed through the glyph
+    // mode. The surrounding rounded modal border legitimately keeps its Unicode `│`
+    // verticals (card borders are out of scope), so prove the *rail* moved by
+    // comparing the two surfaces: ASCII mode must paint at least one `|` rail cell
+    // that Unicode mode painted as `│`, dropping the Unicode `│` count accordingly.
+    let unicode = scratchpad_rail_surface(glyph_mode::GlyphMode::Unicode);
+    let ascii = scratchpad_rail_surface(glyph_mode::GlyphMode::Ascii);
+    assert!(
+        unicode.contains("Scratchpad") && ascii.contains("Scratchpad"),
+        "both scratchpad surfaces painted"
+    );
+
+    let unicode_bars_in_unicode = unicode.matches('\u{2502}').count();
+    let unicode_bars_in_ascii = ascii.matches('\u{2502}').count();
+    let ascii_bars_in_ascii = ascii.matches('|').count();
+    let ascii_bars_in_unicode = unicode.matches('|').count();
+
+    assert!(
+        unicode_bars_in_unicode > unicode_bars_in_ascii,
+        "ASCII mode must convert the rail's `│` cells to `|` (unicode-bar count dropped {unicode_bars_in_unicode} -> {unicode_bars_in_ascii})"
+    );
+    assert!(
+        ascii_bars_in_ascii > ascii_bars_in_unicode,
+        "ASCII mode must paint extra `|` rail cells ({ascii_bars_in_unicode} -> {ascii_bars_in_ascii})"
+    );
+}
+
+#[test]
+fn scratchpad_rail_keeps_unicode_separator_in_unicode_mode() {
+    // The default mode must keep the `│` rail — byte-identical to before the wiring.
+    let unicode = scratchpad_rail_surface(glyph_mode::GlyphMode::Unicode);
+    assert!(
+        unicode.contains('\u{2502}'),
+        "the Unicode rail separator `│` is painted: {unicode}"
+    );
+}
+
+#[test]
+fn ascii_title_spinner_animates_through_classic_frames() {
+    // §12.7.6 P4: the braille TITLE spinner used to collapse to a static `*` in
+    // ASCII mode (the old `_ => '*'` arm). It must now rotate through `-\|/`, so two
+    // consecutive frames differ and each leading glyph is one of the classic four.
+    let frame0 = terminal_title_for(
+        TerminalTitleState::Working,
+        "~/proj",
+        0,
+        glyph_mode::GlyphMode::Ascii,
+    )
+    .expect("working title");
+    let frame1 = terminal_title_for(
+        TerminalTitleState::Working,
+        "~/proj",
+        TITLE_SPINNER_INTERVAL_MS,
+        glyph_mode::GlyphMode::Ascii,
+    )
+    .expect("working title");
+    let lead0 = frame0.chars().next().expect("non-empty title");
+    let lead1 = frame1.chars().next().expect("non-empty title");
+    assert_ne!(
+        lead0, lead1,
+        "the ASCII spinner must advance between frames (animation preserved), got {lead0:?} then {lead1:?}"
+    );
+    for lead in [lead0, lead1] {
+        assert!(
+            matches!(lead, '-' | '\\' | '|' | '/'),
+            "the ASCII spinner glyph must be one of -\\|/, got {lead:?}"
+        );
+    }
+}
+
+#[test]
+fn terminal_title_compact_mode_swaps_wide_dot_but_keeps_braille_spinner() {
+    // §12.7.6 P6 contract: in Compact mode the wide notification dot (●) is swapped
+    // for a narrow stand-in, but the single-cell braille spinner frame is NOT wide
+    // and so survives untouched (it keeps animating in braille).
+    let working = terminal_title_for(
+        TerminalTitleState::Working,
+        "~/proj",
+        0,
+        glyph_mode::GlyphMode::Compact,
+    )
+    .expect("working title");
+    let lead = working.chars().next().expect("non-empty title");
+    assert_eq!(
+        lead,
+        TITLE_SPINNER_FRAMES[0].chars().next().unwrap(),
+        "Compact leaves the single-cell braille spinner frame untouched: {working:?}"
+    );
+
+    let notif = terminal_title_for(
+        TerminalTitleState::Notification,
+        "~/proj",
+        0,
+        glyph_mode::GlyphMode::Compact,
+    )
+    .expect("notification title");
+    assert!(
+        !notif.starts_with(TITLE_NOTIFICATION_GLYPH),
+        "Compact swaps the wide notification dot ●: {notif:?}"
+    );
+    let notif_lead = notif.chars().next().expect("non-empty title");
+    assert!(
+        !crate::is_wide_rendered_glyph(notif_lead),
+        "the Compact notification stand-in must not be a wide glyph: {notif_lead:?}"
+    );
+}
+
+#[test]
+fn read_persisted_glyph_mode_falls_back_to_default_on_malformed_config() {
+    // §12.7.6 P5: a stale / malformed `[tui].glyph_mode` must not panic and must
+    // collapse to the Unicode default rather than guessing. Cover an unknown slug,
+    // a wrong-typed value, and a missing field.
+    for (label, body) in [
+        ("unknown-slug", "[tui]\nglyph_mode = \"fancy\"\n"),
+        ("wrong-type", "[tui]\nglyph_mode = 42\n"),
+        ("missing-field", "[tui]\ntheme = \"default\"\n"),
+        ("missing-table", "name = \"x\"\n"),
+    ] {
+        let mut app = test_app(SessionMode::Build);
+        let (_guard, settings_path) =
+            glyph_mode_scratch(&mut app, &format!("glyph_mode_malformed_{label}"));
+        std::fs::write(&settings_path, body).expect("write settings");
+
+        // The pure read returns None (no override) for every malformed shape.
+        assert_eq!(
+            read_persisted_glyph_mode(&app),
+            None,
+            "{label}: malformed config yields no override"
+        );
+
+        // And `restore_glyph_mode` leaves the built-in Unicode default in place.
+        app.glyph_mode = glyph_mode::GlyphMode::Unicode;
+        restore_glyph_mode(&mut app);
+        assert_eq!(
+            app.glyph_mode,
+            glyph_mode::GlyphMode::Unicode,
+            "{label}: restore keeps the Unicode default, no panic"
+        );
+    }
 }
 
 #[test]
