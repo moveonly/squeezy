@@ -162,6 +162,7 @@ mod status;
 mod status_line_setup;
 mod streaming;
 mod streaming_patch;
+mod subagent_preview;
 mod subagent_timeline;
 mod terminal_profile;
 mod terminal_writer;
@@ -3244,6 +3245,34 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // the peek never fights another surface. Drag/scroll are handled below (they
     // dismiss any live preview).
     if let MouseEventKind::Moved = mouse.kind {
+        // Subagent Hover Preview (§12.8.2): a bare Move over a subagent timeline row
+        // reveals the subagent preview popover after the same hover-intent dwell.
+        // Checked first (and in every active source, since the pane is always
+        // painted in the footer) so a subagent-row hover is honored even while a
+        // subagent conversation is the active source; only outside the fullscreen
+        // overlay / config screen and a live selection. A keyboard-pinned subagent
+        // peek (`Alt+6`) is sticky against incidental drift.
+        if app.transcript_overlay.is_none()
+            && app.config_screen.is_none()
+            && app.selection.is_none()
+        {
+            if let Some((interaction::TargetKey::SubagentRow(index), _)) =
+                app.click_target_at(mouse.column, mouse.row)
+            {
+                if app.subagent_preview.as_ref().map(|p| p.index) != Some(index)
+                    && let Some(preview) =
+                        build_subagent_preview(app, index, hover_preview::PreviewSource::Hover)
+                {
+                    app.subagent_preview = Some(preview);
+                    app.needs_redraw = true;
+                }
+                return app.needs_redraw;
+            }
+            // The pointer left every subagent row: drop a mouse-sourced subagent
+            // preview (a keyboard-pinned one stays). Falls through to the entry
+            // hover path below.
+            dismiss_mouse_subagent_preview(app);
+        }
         if app.transcript_overlay.is_none()
             && app.config_screen.is_none()
             && app.selection.is_none()
@@ -3317,6 +3346,60 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // only forces a redraw when a preview was actually showing, so idle redraw stays
     // zero.
     dismiss_hover_preview(app);
+    // A non-Move event also commits/shifts the surface out from under any live
+    // subagent preview popover (§12.8.2), so it is dismissed alongside the
+    // transcript one. Idle redraw stays zero (only forces one when a preview showed).
+    dismiss_subagent_preview(app);
+
+    // Subagent timeline row affordances (§12.8.2): a single click on a subagent row
+    // selects/pins it; a double-click jumps to its transcript detail (preserving a
+    // return anchor) via the row's `policy_for` primary (`SubagentJump`) — the same
+    // non-destructive verb the `JumpToSubagent` keyboard chord reaches. Hit-tested in
+    // absolute screen coordinates against the `SubagentRow` targets the pane
+    // registered this frame, then run through the gesture recognizer so multi-click
+    // synthesis is keyed on the target, not the cell. The pane is its own footer
+    // surface (not part of the main-text selection rectangle), so a press here is
+    // fully consumed and never falls through to the selection path. Works in every
+    // active source, since the pane is always painted.
+    if app.transcript_overlay.is_none()
+        && app.config_screen.is_none()
+        && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((key @ interaction::TargetKey::SubagentRow(_), action)) =
+            app.click_target_at(mouse.column, mouse.row)
+    {
+        let now = std::time::Instant::now();
+        let gesture = app
+            .gestures
+            .recognize(interaction::Phase::Press, Some((key, action)), now);
+        match gesture {
+            // Single click → select/pin the row (the default registered action).
+            interaction::Gesture::Click {
+                action: Some(interaction::Action::SubagentSelect(index)),
+                ..
+            } => {
+                dispatch_click_action(app, interaction::Action::SubagentSelect(index));
+                return true;
+            }
+            // Double-click → the §12.8.2 jump, routed through the row's
+            // `policy_for` primary so it reaches the same `SubagentJump` handler the
+            // keyboard verb does. `policy_for` keeps every destructive verb out of
+            // this path by construction.
+            interaction::Gesture::DoubleClick {
+                target: Some(interaction::TargetKey::SubagentRow(index)),
+                ..
+            } => {
+                let policy = hover_preview::policy_for(interaction::TargetKey::SubagentRow(index));
+                if let Some(jump) = policy.primary_activate {
+                    dispatch_click_action(app, jump);
+                }
+                return true;
+            }
+            // A triple click (or any other recognized gesture) on a subagent row is
+            // consumed without effect, so the pane never leaks a click to the
+            // selection path beneath it.
+            _ => return true,
+        }
+    }
 
     // Main-view transcript-card affordances: a caret click toggles the entry's
     // fold, a header click focuses it, a double-click on the caret expands a
@@ -6195,6 +6278,12 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             if app.subagent_pane.focused
                 || !matches!(app.subagent_pane.active, ConversationSource::Main) =>
         {
+            // A jump (§12.8.2) left a return anchor: Esc restores the user's prior
+            // reading position rather than resetting to main, so jumping away never
+            // strands them — the spec's "always preserve return state" guarantee.
+            if restore_subagent_return_anchor(app) {
+                return true;
+            }
             app.subagent_pane.focused = false;
             app.subagent_pane.active = ConversationSource::Main;
             app.subagent_pane.selected = 0;
@@ -6457,6 +6546,26 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             if matches!(key.code, KeyCode::Esc) {
                 // Esc's sole job here was to close the preview; consume it so it
                 // does not also clear a selection / close another surface.
+                return Ok(false);
+            }
+        }
+    }
+
+    // The Subagent Hover Preview popover (§12.8.2) is likewise NON-modal: Esc
+    // dismisses it (consumed), the `PreviewSubagent` toggle / the `JumpToSubagent`
+    // jump fall through to their dispatch arms, and ANY other key dismisses the
+    // preview but is then allowed to do its normal job, so a stale subagent peek
+    // never lingers over a surface the next keystroke moves. The jump verb is
+    // exempted so a jump-from-preview reads the popover's row before it closes.
+    if app.subagent_preview.is_some() {
+        let lookup = app.keymap.lookup(key.code, key.modifiers);
+        let is_exempt = matches!(
+            lookup,
+            Some(keymap::Action::PreviewSubagent | keymap::Action::JumpToSubagent)
+        );
+        if !is_exempt {
+            dismiss_subagent_preview(app);
+            if matches!(key.code, KeyCode::Esc) {
                 return Ok(false);
             }
         }
@@ -8567,6 +8676,31 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
             }
             dismiss_first_run_hint(app)
         }
+        keymap::Action::PreviewSubagent => {
+            // Main-surface popover; the config/setup screens own their own routing,
+            // and the Ctrl+T overlay guard above already blocks this while the
+            // overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_subagent_preview(app);
+            true
+        }
+        keymap::Action::JumpToSubagent => {
+            // Main-surface jump; the config/setup screens own their own routing. A
+            // no-op (falls through, returns `false`) when no subagent row is
+            // selected, so the chord never steals a key from the composer.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            match app.subagent_pane.selected.checked_sub(1) {
+                Some(index) => {
+                    jump_to_subagent_index(app, index);
+                    true
+                }
+                None => false,
+            }
+        }
         keymap::Action::ToggleToolActions => {
             // Main-surface overlay; the config/setup screens own their own
             // routing, and the Ctrl+T overlay guard above already blocks this
@@ -10675,6 +10809,213 @@ fn dismiss_hover_preview(app: &mut TuiApp) -> bool {
 fn dismiss_mouse_hover_preview(app: &mut TuiApp) {
     if app.hover_preview.as_ref().is_some_and(|p| !p.is_keyboard()) {
         dismiss_hover_preview(app);
+    }
+}
+
+// ===========================================================================
+// Subagent Hover Preview And Double-Click Jump (§12.8.2)
+// ===========================================================================
+
+/// Distill a record's [`SubagentLifecycle`] into the preview-model
+/// [`subagent_preview::SubagentStatus`]. A pure 1:1 map so the preview module
+/// needn't reach back into `lib.rs`.
+fn subagent_status_of(lifecycle: SubagentLifecycle) -> subagent_preview::SubagentStatus {
+    match lifecycle {
+        SubagentLifecycle::Running => subagent_preview::SubagentStatus::Running,
+        SubagentLifecycle::Completed => subagent_preview::SubagentStatus::Done,
+        SubagentLifecycle::Failed => subagent_preview::SubagentStatus::Failed,
+        SubagentLifecycle::Rejected => subagent_preview::SubagentStatus::Capped,
+    }
+}
+
+/// A short, secret-free metrics summary for a subagent preview (`tools=N ·
+/// bytes=M`), or `None` when the record has reported no metrics yet (the running
+/// / missing-metrics edge). Built off structured `TurnMetrics`, never rendered
+/// terminal cells.
+fn subagent_metrics_summary(record: &SubagentRecord) -> Option<String> {
+    record.metrics.as_ref().map(|metrics| {
+        format!(
+            "tools={} \u{00b7} bytes={}",
+            metrics.subagent_tool_calls.max(metrics.tool_calls),
+            metrics.subagent_bytes_read.max(metrics.bytes_read)
+        )
+    })
+}
+
+/// Build a [`subagent_preview::SubagentPreview`] for the subagent at 0-based pane
+/// `index`, or `None` when no live record holds that index (a prune resolved it
+/// away). Pure read over the pane; the resulting preview is the same whether a
+/// mouse hover or the keyboard verb requested it.
+fn build_subagent_preview(
+    app: &TuiApp,
+    index: usize,
+    source: hover_preview::PreviewSource,
+) -> Option<subagent_preview::SubagentPreview> {
+    let record = app.subagent_pane.records.get(index)?;
+    let name = format!("{} #{}", record.agent, index + 1);
+    let status = subagent_status_of(record.lifecycle);
+    let last_activity = if record.latest.trim().is_empty() {
+        compact_text(&record.prompt, 120)
+    } else {
+        record.latest.clone()
+    };
+    let metrics = subagent_metrics_summary(record);
+    Some(subagent_preview::SubagentPreview::new(
+        index,
+        name,
+        status,
+        last_activity,
+        metrics,
+        source,
+    ))
+}
+
+/// Move the pane cursor onto the subagent at 0-based `index` (pane row `index +
+/// 1`) and reveal a mouse-sourced preview of it — the shared handler the mouse
+/// single-click (`SubagentSelect`) and the live-hover path both reach. Bounds the
+/// index against the live record list so a prune mid-gesture resolves to a no-op.
+/// Returns `true` when it changed anything (so the caller folds a redraw in).
+fn subagent_select_index(app: &mut TuiApp, index: usize) -> bool {
+    if index >= app.subagent_pane.records.len() {
+        return false;
+    }
+    let row = index + 1;
+    let changed = app.subagent_pane.selected != row;
+    app.subagent_pane.selected = row;
+    if let Some(preview) = build_subagent_preview(app, index, hover_preview::PreviewSource::Hover) {
+        app.subagent_preview = Some(preview);
+    }
+    highlight_selected_subagent_row(app);
+    app.needs_redraw = true;
+    changed || app.subagent_preview.is_some()
+}
+
+/// Jump to the subagent at 0-based `index`'s transcript / detail pane (§12.8.2),
+/// preserving the prior conversation + scroll as a return anchor so an Esc back
+/// restores the reading position. The shared handler the mouse double-click
+/// (`SubagentJump`) and the `JumpToSubagent` keyboard verb both reach, so the two
+/// paths are identical by construction. A capped subagent (no transcript)
+/// resolves to a select-only no-op with an honest status. Returns `true` when it
+/// opened a transcript.
+fn jump_to_subagent_index(app: &mut TuiApp, index: usize) -> bool {
+    let Some(record) = app.subagent_pane.records.get(index) else {
+        return false;
+    };
+    let status = subagent_status_of(record.lifecycle);
+    let id = record.id;
+    if !status.has_transcript() {
+        // No transcript to open (a capped subagent never acquired a lease): a
+        // double-click / jump is a select-only no-op, not a jump to an empty pane.
+        subagent_select_index(app, index);
+        app.status = "subagent capped — no transcript to open".to_string();
+        app.needs_redraw = true;
+        return false;
+    }
+    // Capture the return anchor BEFORE mutating the active source, so a back
+    // command restores exactly where the user was.
+    let prior_was_main = matches!(app.subagent_pane.active, ConversationSource::Main);
+    app.subagent_return_anchor = Some(subagent_preview::SubagentReturnAnchor::new(
+        app.subagent_pane.selected,
+        prior_was_main,
+    ));
+    // Pin the cursor + active source onto the jumped-to subagent, then surface its
+    // transcript via the same full-screen overlay the Enter path uses.
+    app.subagent_pane.selected = index + 1;
+    app.subagent_pane.active = ConversationSource::Subagent(id);
+    app.subagent_pane.focused = false;
+    active_transcript_scroll_mut(app).pin_to_bottom();
+    dismiss_subagent_preview(app);
+    open_subagent_transcript_overlay(app);
+    app.status = format!(
+        "jumped to subagent — {} to expand, Esc to return",
+        key_hint(app, keymap::Action::ToggleTranscriptOverlay)
+    );
+    app.needs_redraw = true;
+    true
+}
+
+/// Restore the conversation the user was on before a subagent jump (§12.8.2),
+/// consuming the return anchor. Returns `true` when an anchor was outstanding (so
+/// the caller knows the back command did something). Re-pins the prior pane
+/// selection and active source; a stale anchor (the prior subagent pruned away)
+/// degrades gracefully to the main conversation.
+fn restore_subagent_return_anchor(app: &mut TuiApp) -> bool {
+    let Some(anchor) = app.subagent_return_anchor.take() else {
+        return false;
+    };
+    app.subagent_pane.active = ConversationSource::Main;
+    app.subagent_pane.focused = false;
+    app.subagent_pane.selected = anchor.prior_selected.min(app.subagent_pane.records.len());
+    let _ = anchor.prior_was_main;
+    active_transcript_scroll_mut(app).pin_to_bottom();
+    app.clamp_subagent_selection();
+    app.status = "returned from subagent".to_string();
+    app.needs_redraw = true;
+    true
+}
+
+/// `Alt+6`: toggle the Subagent Hover Preview popover (§12.8.2) for the currently
+/// selected subagent row — the keyboard twin of a stable mouse hover. A second
+/// press dismisses it. A no-op (status hint) when no subagent row is selected
+/// (the cursor is on `main`, or the pane is empty). Sets `needs_redraw` so the
+/// popover paints immediately.
+fn toggle_subagent_preview(app: &mut TuiApp) {
+    // A second press dismisses the open preview — a clean toggle.
+    if app.subagent_preview.is_some() {
+        app.subagent_preview = None;
+        app.status = "subagent preview closed".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    // Pane row 0 is `main`; a subagent lives on row `index + 1`.
+    let Some(index) = app.subagent_pane.selected.checked_sub(1) else {
+        app.status = "no subagent selected — nothing to preview".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    let Some(preview) = build_subagent_preview(app, index, hover_preview::PreviewSource::Keyboard)
+    else {
+        app.status = "no subagent selected — nothing to preview".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    let hint = preview.activate_hint();
+    let verb = if preview.can_jump() {
+        format!("{} jumps", key_hint(app, keymap::Action::JumpToSubagent))
+    } else {
+        "read-only".to_string()
+    };
+    app.subagent_preview = Some(preview);
+    app.status = format!("subagent preview ({verb}) \u{00b7} {hint} \u{00b7} Esc / Alt+6 close");
+    app.needs_redraw = true;
+}
+
+/// Dismiss any live Subagent Hover Preview popover (§12.8.2). Called whenever the
+/// surface shifts out from under it — a scroll, a click, a key that is not the
+/// toggle, or a pane change — so a stale preview can never linger. Returns `true`
+/// when a preview was actually showing (so the caller can fold the dismissal into
+/// its existing redraw decision rather than forcing an extra one when idle).
+fn dismiss_subagent_preview(app: &mut TuiApp) -> bool {
+    if app.subagent_preview.take().is_some() {
+        app.needs_redraw = true;
+        true
+    } else {
+        false
+    }
+}
+
+/// Dismiss a live Subagent Hover Preview popover (§12.8.2) ONLY when it was
+/// revealed by a mouse hover — a keyboard-pinned (`Alt+6`) preview is left alone,
+/// mirroring [`dismiss_mouse_hover_preview`]. Used by the mouse-move hover path so
+/// an incidental pointer drift off the row never yanks a keyboard-only user's
+/// pinned peek away.
+fn dismiss_mouse_subagent_preview(app: &mut TuiApp) {
+    if app
+        .subagent_preview
+        .as_ref()
+        .is_some_and(|p| !p.is_keyboard())
+    {
+        dismiss_subagent_preview(app);
     }
 }
 
@@ -15098,6 +15439,18 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // unreachable in practice. It exists so every `interaction::Action` has a
         // dispatch arm and the accessibility audit's exhaustiveness holds.
         interaction::Action::GlyphModeSelect(_) => {}
+        // §12.8.2: a single click on a subagent timeline row selects/pins it and
+        // reveals a mouse-sourced preview — the same handler the keyboard pane
+        // cursor reaches, so keyboard/mouse parity holds by construction.
+        interaction::Action::SubagentSelect(index) => {
+            subagent_select_index(app, index);
+        }
+        // §12.8.2: a double-click on a subagent row jumps to its transcript /
+        // detail pane (preserving the prior conversation + scroll as a return
+        // anchor) — the same handler the `JumpToSubagent` keyboard verb reaches.
+        interaction::Action::SubagentJump(index) => {
+            jump_to_subagent_index(app, index);
+        }
     }
 }
 
@@ -18764,12 +19117,22 @@ fn close_transcript_overlay(app: &mut TuiApp) {
     app.pinned_compare = None;
     app.pinned_compare_rect_cache.set(None);
     if matches!(app.subagent_pane.active, ConversationSource::Subagent(_)) {
-        app.subagent_pane.focused = false;
-        app.subagent_pane.active = ConversationSource::Main;
-        app.subagent_pane.selected = 0;
-        active_transcript_scroll_mut(app).pin_to_bottom();
-        app.status = "main conversation selected".to_string();
+        // A §12.8.2 jump left a return anchor: restore the user's prior reading
+        // position (selection + active source) rather than resetting to main with a
+        // lost cursor, so jumping away then closing the transcript never strands
+        // them. Falls back to the historical reset when no anchor is outstanding
+        // (e.g. the subagent was surfaced by the Enter path, not a jump).
+        if !restore_subagent_return_anchor(app) {
+            app.subagent_pane.focused = false;
+            app.subagent_pane.active = ConversationSource::Main;
+            app.subagent_pane.selected = 0;
+            active_transcript_scroll_mut(app).pin_to_bottom();
+            app.status = "main conversation selected".to_string();
+        }
     } else {
+        // The overlay was not on a subagent — drop any stale anchor so it can't
+        // surprise a later, unrelated Esc.
+        app.subagent_return_anchor = None;
         app.status = "transcript overlay closed".to_string();
     }
 }
@@ -21419,6 +21782,11 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     // height/width and never steals focus. Off (and zero-cost) unless a hover /
     // `Alt+1` reveal set it.
     render_hover_preview_popover(frame, area, app);
+    // The Subagent Hover Preview popover (§12.8.2) is a NON-modal peek painted LAST
+    // on the main surface, anchored next to the previewed subagent row and clamped
+    // inside `area`, so it never resizes the pane or steals focus. Off (and
+    // zero-cost) unless a hover / `Alt+6` reveal set it.
+    render_subagent_preview_popover(frame, area, app);
     // The Inline Rename Labels editor (§12.1.7) is a small modal painted LAST on the
     // main surface (only — every fullscreen overlay returns earlier and never
     // reaches here, so the editor never leaks over another modal). A one-line
@@ -25732,6 +26100,93 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
         )));
     }
     // Footer hint: honest about whether double-click / Enter activates here.
+    lines.push(Line::from(Span::styled(
+        preview.activate_hint().to_string(),
+        Style::default()
+            .fg(crate::render::theme::secondary())
+            .add_modifier(Modifier::DIM),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Paint the Subagent Hover Preview popover (§12.8.2) as a quiet, fixed-size,
+/// non-modal peek anchored next to the previewed subagent's live pane row. Reuses
+/// the shared [`hover_preview::popover_rect`] geometry (clamped fully inside
+/// `area`), so it never resizes the pane or steals keyboard focus. The styling is
+/// deliberately restrained — a bold accent title, a colored status tag (the
+/// `subagent.hover` / `subagent.attention` semantic emphasis the spec calls for,
+/// carrying lifecycle as both color AND a text word so it survives a monochrome
+/// terminal), a quiet body, and a footer naming the jump verb.
+fn render_subagent_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(preview) = app.subagent_preview.as_ref() else {
+        return;
+    };
+    // Anchor next to the previewed subagent's live row when it is on-screen;
+    // otherwise fall back to the bottom of the area so the peek still appears near
+    // the pane.
+    let anchor_row = app
+        .registered_rect_for(interaction::TargetKey::SubagentRow(preview.index))
+        .map(|rect| rect.y)
+        .unwrap_or_else(|| area.y.saturating_add(area.height.saturating_sub(1)));
+    let body = preview.body();
+    let Some(rect) = hover_preview::popover_rect(area, anchor_row, body.len()) else {
+        return;
+    };
+
+    // Color the status tag by lifecycle (red failed, green done, silver running,
+    // quiet capped) — but always carry the status WORD too, so meaning never
+    // depends on color alone.
+    let status_color = match preview.status {
+        subagent_preview::SubagentStatus::Running => crate::render::theme::muted(),
+        subagent_preview::SubagentStatus::Done => crate::render::theme::green(),
+        subagent_preview::SubagentStatus::Failed => crate::render::theme::red(),
+        subagent_preview::SubagentStatus::Capped => crate::render::theme::quiet(),
+    };
+
+    // Overlay the popover region only (Clear is scoped to `rect`), so the surface
+    // underneath keeps its geometry.
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    let title = Line::from(vec![
+        Span::styled(
+            " Subagent ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("\u{2014} {} ", preview.status.label()),
+            Style::default().fg(status_color),
+        ),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::render::theme::quiet()))
+        .title(title)
+        .title_alignment(ratatui::layout::Alignment::Left);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::with_capacity(body.len() + 2);
+    // Title line: the subagent's name in a stronger (bold) foreground.
+    lines.push(Line::from(Span::styled(
+        preview.name.clone(),
+        Style::default()
+            .fg(crate::render::theme::foreground())
+            .add_modifier(Modifier::BOLD),
+    )));
+    // Body excerpt: last activity + metrics, quiet so the peek reads as ambient
+    // context.
+    for body_line in &body {
+        lines.push(Line::from(Span::styled(
+            body_line.clone(),
+            Style::default().fg(crate::render::theme::quiet()),
+        )));
+    }
+    // Footer hint: honest about whether double-click / jump opens a transcript.
     lines.push(Line::from(Span::styled(
         preview.activate_hint().to_string(),
         Style::default()
@@ -37254,6 +37709,30 @@ fn subagent_pane_summary_row(app: &TuiApp, width: u16) -> Line<'static> {
     )
 }
 
+/// Register a subagent timeline row (§12.8.2) as a hit target so a click/hover on
+/// it reaches the shared pointer machinery. `pane_line` is the 0-based painted
+/// line within `area` (line 0 is `main`); `record_index` is the 0-based index into
+/// the pane's record list. Keyed by index, so a reflow re-registers the same
+/// target at a fresh row. Skips the register when the row would fall outside the
+/// pane height. The default action is `SubagentSelect`; a double-click resolves to
+/// the row's `policy_for` primary (`SubagentJump`).
+fn register_subagent_row_target(app: &TuiApp, area: Rect, pane_line: u16, record_index: usize) {
+    if pane_line >= area.height {
+        return;
+    }
+    let rect = Rect {
+        x: area.x,
+        y: area.y.saturating_add(pane_line),
+        width: area.width,
+        height: 1,
+    };
+    app.register_click(
+        rect,
+        interaction::TargetKey::SubagentRow(record_index),
+        interaction::Action::SubagentSelect(record_index),
+    );
+}
+
 fn render_subagent_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     if area.height == 0 {
         return;
@@ -37272,6 +37751,12 @@ fn render_subagent_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     // header. With room for every record we render the full list.
     let record_slots = visible.saturating_sub(1);
     if record_count <= record_slots || record_slots == 0 {
+        // Register a hit target for each rendered record row (line 0 is `main`,
+        // record N lives on line N + 1), so a click/hover reaches the §12.8.2
+        // pointer machinery.
+        for index in 0..record_count.min(record_slots) {
+            register_subagent_row_target(app, area, (index + 1) as u16, index);
+        }
         frame.render_widget(Paragraph::new(subagent_pane_lines(app, area.width)), area);
         return;
     }
@@ -37296,14 +37781,19 @@ fn render_subagent_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
     let mut lines = Vec::with_capacity(record_slots + 1);
     lines.push(main_row);
-    for (index, record) in app
+    for (pane_line, (index, record)) in app
         .subagent_pane
         .records
         .iter()
         .enumerate()
         .skip(start)
         .take(record_slots)
+        .enumerate()
     {
+        // The visible record on the (`pane_line` + 1)th painted line (line 0 is
+        // `main`) addresses record `index` in the full list — register it keyed by
+        // that stable index so a scroll re-anchors the same target.
+        register_subagent_row_target(app, area, (pane_line + 1) as u16, index);
         lines.push(subagent_record_row(app, index, record, area.width));
     }
     if hidden_below > 0
@@ -39221,6 +39711,20 @@ pub(crate) struct TuiApp {
     /// `ToggleHoverPreview` (`Alt+1`) keyboard verb, and cleared on hover-leave,
     /// any click/key, scroll, or a transcript change so it never goes stale.
     pub(crate) hover_preview: Option<hover_preview::HoverPreview>,
+    /// The live Subagent Hover Preview popover (§12.8.2), or `None` when none is
+    /// showing (the resting state, paints nothing extra and costs nothing idle).
+    /// `Some` holds the previewed subagent's pane index, name, distilled status,
+    /// bounded last-activity / metrics excerpt, and the request source — built
+    /// fresh on a stable mouse hover over a subagent row or the `PreviewSubagent`
+    /// (`Alt+6`) keyboard verb, and cleared on hover-leave, any click/key, scroll,
+    /// or a pane change so it never goes stale.
+    pub(crate) subagent_preview: Option<subagent_preview::SubagentPreview>,
+    /// The return anchor captured when a subagent jump (§12.8.2) opened a
+    /// transcript, or `None` when no jump is outstanding. `Some` records the prior
+    /// pane selection + active-source so an Esc back restores the user's reading
+    /// position — the spec's "always preserve return state" guarantee. Cleared on
+    /// return (or when the pane resets to main).
+    pub(crate) subagent_return_anchor: Option<subagent_preview::SubagentReturnAnchor>,
     /// Universal Command Palette model (§12.1.1). `None` = closed (the resting
     /// state, paints and allocates nothing — zero idle cost); `Some` = the
     /// fullscreen fuzzy-searchable command list owns key/mouse routing. Built fresh
@@ -39927,6 +40431,8 @@ impl TuiApp {
             action_palette: None,
             tool_actions: None,
             hover_preview: None,
+            subagent_preview: None,
+            subagent_return_anchor: None,
             command_palette: None,
             command_palette_pending: None,
             theme_editor_preview_pending: None,

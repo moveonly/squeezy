@@ -546,6 +546,312 @@ async fn delete_clears_finished_subagents_and_keeps_running_ones() {
     assert_eq!(app.status, "cleared finished subagents");
 }
 
+// ---- Subagent Hover Preview And Double-Click Jump (§12.8.2) ----
+
+/// `Alt+6` — the default Subagent Hover Preview verb.
+fn alt_6() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('6'), KeyModifiers::ALT)
+}
+
+/// `Ctrl+Alt+D` — the default Subagent jump verb.
+fn ctrl_alt_d() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('d'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// A build app with one running and one completed subagent, the pane focused on
+/// the first record row (selected == 1).
+fn app_with_two_subagents() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "scan the repo".to_string());
+    app.note_subagent_activity(
+        1,
+        "delegate".to_string(),
+        "running grep over src/".to_string(),
+    );
+    app.note_subagent_started(2, "explore".to_string(), "summarize".to_string());
+    app.note_subagent_completed(
+        2,
+        "explore".to_string(),
+        "explored 12 files".to_string(),
+        TurnMetrics {
+            tool_calls: 4,
+            bytes_read: 2048,
+            ..TurnMetrics::default()
+        },
+    );
+    // Seat the pane cursor on the first record row (row 0 is `main`).
+    app.subagent_pane.focused = true;
+    app.subagent_pane.selected = 1;
+    app
+}
+
+#[test]
+fn subagent_preview_builds_from_record_with_metrics() {
+    let app = app_with_two_subagents();
+    // Record index 1 is the completed `explore` subagent with metrics.
+    let preview = build_subagent_preview(&app, 1, hover_preview::PreviewSource::Hover)
+        .expect("preview for a live record");
+    assert_eq!(preview.index, 1);
+    assert_eq!(preview.name, "explore #2");
+    assert_eq!(preview.status, subagent_preview::SubagentStatus::Done);
+    assert!(preview.can_jump());
+    let body = preview.body();
+    assert!(
+        body.iter().any(|l| l.contains("explored 12 files")),
+        "{body:?}"
+    );
+    assert!(body.iter().any(|l| l.contains("tools=4")), "{body:?}");
+}
+
+#[test]
+fn subagent_preview_running_has_no_metrics_line() {
+    let app = app_with_two_subagents();
+    // Record index 0 is the still-running `delegate` (no metrics yet).
+    let preview = build_subagent_preview(&app, 0, hover_preview::PreviewSource::Hover)
+        .expect("preview for the running record");
+    assert_eq!(preview.status, subagent_preview::SubagentStatus::Running);
+    assert!(
+        preview.can_jump(),
+        "a running subagent has a transcript to jump into"
+    );
+    // Missing-metrics edge: the last-activity line shows, but no metrics line.
+    let body = preview.body();
+    assert!(
+        body.iter().any(|l| l.contains("running grep over src/")),
+        "{body:?}"
+    );
+    assert!(!body.iter().any(|l| l.contains("tools=")), "{body:?}");
+}
+
+#[test]
+fn subagent_preview_out_of_range_index_is_none() {
+    let app = app_with_two_subagents();
+    assert!(build_subagent_preview(&app, 99, hover_preview::PreviewSource::Hover).is_none());
+}
+
+#[tokio::test]
+async fn keyboard_alt6_toggles_subagent_preview_on_selected_row() {
+    let mut app = app_with_two_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    assert!(app.subagent_preview.is_none());
+
+    // Alt+6 reveals a keyboard-sourced preview of the selected (row 1 → index 0)
+    // subagent.
+    let consumed = dispatch_keymap_action(&mut app, &mut agent, alt_6());
+    assert!(consumed, "Alt+6 is consumed by the keymap dispatch");
+    let preview = app.subagent_preview.as_ref().expect("preview revealed");
+    assert_eq!(preview.index, 0);
+    assert!(
+        preview.is_keyboard(),
+        "the keyboard verb pins a keyboard-sourced preview"
+    );
+
+    // A second press toggles it closed.
+    dispatch_keymap_action(&mut app, &mut agent, alt_6());
+    assert!(
+        app.subagent_preview.is_none(),
+        "Alt+6 again closes the preview"
+    );
+}
+
+#[tokio::test]
+async fn keyboard_alt6_on_main_row_is_a_noop_hint() {
+    let mut app = app_with_two_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    // Cursor on the `main` row (row 0): there is no subagent to preview.
+    app.subagent_pane.selected = 0;
+    dispatch_keymap_action(&mut app, &mut agent, alt_6());
+    assert!(app.subagent_preview.is_none());
+    assert!(app.status.contains("no subagent"), "{}", app.status);
+}
+
+#[tokio::test]
+async fn keyboard_jump_opens_overlay_and_esc_restores_return_anchor() {
+    let mut app = app_with_two_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    // Select the completed subagent (record index 1 → row 2) then jump to it.
+    app.subagent_pane.selected = 2;
+    assert!(matches!(app.subagent_pane.active, ConversationSource::Main));
+
+    let consumed = dispatch_keymap_action(&mut app, &mut agent, ctrl_alt_d());
+    assert!(consumed, "Ctrl+Alt+D is consumed");
+    // The jump opens the transcript overlay on the subagent source and stores a
+    // return anchor preserving the prior (main) reading position.
+    assert!(
+        app.transcript_overlay.is_some(),
+        "jump opens the transcript overlay"
+    );
+    assert!(matches!(
+        app.subagent_pane.active,
+        ConversationSource::Subagent(2)
+    ));
+    let anchor = app
+        .subagent_return_anchor
+        .expect("a return anchor is stored");
+    assert_eq!(anchor.prior_selected, 2);
+    assert!(anchor.prior_was_main);
+
+    // Esc closes the overlay AND restores the return state (active source back to
+    // main), so the jump never strands the user.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+    assert!(app.transcript_overlay.is_none(), "esc closes the overlay");
+    assert!(matches!(app.subagent_pane.active, ConversationSource::Main));
+    assert!(
+        app.subagent_return_anchor.is_none(),
+        "the anchor is consumed on return"
+    );
+}
+
+#[tokio::test]
+async fn keyboard_jump_on_capped_subagent_is_select_only() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    app.note_subagent_rejected("delegate".to_string(), "concurrency cap".to_string(), 2, 2);
+    app.subagent_pane.selected = 1; // the capped record
+
+    let consumed = dispatch_keymap_action(&mut app, &mut agent, ctrl_alt_d());
+    assert!(consumed);
+    // A capped subagent has no transcript: the jump degrades to a select-only
+    // no-op, never opening an empty overlay or storing a stranding anchor.
+    assert!(app.transcript_overlay.is_none(), "no transcript to open");
+    assert!(app.subagent_return_anchor.is_none());
+    assert!(app.status.contains("capped"), "{}", app.status);
+}
+
+#[test]
+fn mouse_hover_over_subagent_row_reveals_preview() {
+    let mut app = app_with_two_subagents();
+    // Paint once so the pane registers its `SubagentRow` hit targets.
+    let _ = render_to_string(&app, 120, 24);
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::SubagentRow(1))
+        .expect("the second subagent row registered a hit target");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    let preview = app
+        .subagent_preview
+        .as_ref()
+        .expect("hover reveals a preview");
+    assert_eq!(preview.index, 1);
+    assert!(!preview.is_keyboard(), "a hover is a mouse-sourced preview");
+}
+
+#[test]
+fn mouse_double_click_subagent_row_jumps_to_transcript() {
+    let mut app = app_with_two_subagents();
+    let _ = render_to_string(&app, 120, 24);
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::SubagentRow(1))
+        .expect("the second subagent row registered a hit target");
+    let event = |kind| crossterm::event::MouseEvent {
+        kind,
+        column: rect.x + 1,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    // First click selects/pins the row.
+    handle_mouse(
+        &mut app,
+        event(MouseEventKind::Down(crossterm::event::MouseButton::Left)),
+    );
+    assert_eq!(
+        app.subagent_pane.selected, 2,
+        "click seats the cursor on the row"
+    );
+
+    // Second click within the multi-click window is a double-click → jump.
+    handle_mouse(
+        &mut app,
+        event(MouseEventKind::Down(crossterm::event::MouseButton::Left)),
+    );
+    assert!(
+        app.transcript_overlay.is_some(),
+        "double-click jumps into the subagent transcript"
+    );
+    assert!(matches!(
+        app.subagent_pane.active,
+        ConversationSource::Subagent(2)
+    ));
+    assert!(
+        app.subagent_return_anchor.is_some(),
+        "the jump stores a return anchor"
+    );
+}
+
+#[test]
+fn subagent_preview_popover_paints_through_real_render() {
+    let mut app = app_with_two_subagents();
+    app.subagent_preview = build_subagent_preview(&app, 1, hover_preview::PreviewSource::Keyboard);
+    let output = render_to_string(&app, 120, 24);
+    // The popover names the subagent, its status, and the jump footer.
+    assert!(
+        output.contains("Subagent"),
+        "popover header missing: {output}"
+    );
+    assert!(
+        output.contains("explore #2"),
+        "subagent name missing: {output}"
+    );
+    assert!(output.contains("done"), "status word missing: {output}");
+    assert!(
+        output.contains("jump to open transcript"),
+        "jump footer missing: {output}"
+    );
+}
+
+#[test]
+fn subagent_preview_popover_paints_at_narrow_and_wide_sizes() {
+    let mut app = app_with_two_subagents();
+    app.subagent_preview = build_subagent_preview(&app, 0, hover_preview::PreviewSource::Hover);
+    // Resize where the feature paints: a narrow modal layout and a wide one. The
+    // popover is clamped inside the area, so neither panics and both still name the
+    // subagent.
+    for (w, h) in [(40_u16, 12_u16), (160, 48)] {
+        let output = render_to_string(&app, w, h);
+        assert!(
+            output.contains("delegate #1"),
+            "name missing at {w}x{h}: {output}"
+        );
+    }
+    // A degenerate tiny area must not panic (popover_rect returns None).
+    let _ = render_to_string(&app, 3, 2);
+}
+
+#[test]
+fn no_subagent_preview_means_no_popover_chrome() {
+    // Empty/edge case: no subagents, no preview → the render carries no popover
+    // chrome and no `SubagentRow` targets.
+    let app = test_app(SessionMode::Build);
+    let output = render_to_string(&app, 120, 24);
+    assert!(
+        !output.contains("Subagent \u{2014}"),
+        "no popover when idle: {output}"
+    );
+    assert!(
+        app.registered_rect_for(interaction::TargetKey::SubagentRow(0))
+            .is_none(),
+        "no subagent rows registered when the pane is empty"
+    );
+}
+
 #[tokio::test]
 async fn subagent_pane_folds_to_summary_when_all_finished_and_expands_on_down() {
     let mut agent = test_agent(SessionMode::Build);

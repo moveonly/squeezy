@@ -405,6 +405,21 @@ pub(crate) enum Action {
     /// a key from the composer or transcript. Once every hint is seen the feature is
     /// quiet and this verb does nothing, costing nothing idle.
     DismissFirstRunHint,
+    /// Preview the selected subagent timeline row (`Alt+6` default; §12.8.2). The
+    /// keyboard twin of a stable mouse hover over a subagent row: it shows a quiet,
+    /// noncommittal popover (the subagent's status, last activity, and metrics)
+    /// without resizing the pane or stealing focus. A second press (or any other
+    /// key, click, or scroll) dismisses it. A no-op (status hint) when no subagent
+    /// row is selected. Closed is the resting state, so a session that never opens
+    /// it pays nothing.
+    PreviewSubagent,
+    /// Jump to the selected subagent's transcript / detail pane (`Ctrl+Alt+D`
+    /// default; §12.8.2). The keyboard twin of a double-click on a subagent row: it
+    /// opens that subagent's transcript while preserving the prior conversation +
+    /// scroll as a return anchor (Esc returns). A capped subagent (no transcript)
+    /// resolves to a select-only no-op. When no subagent row is selected it falls
+    /// through, so the chord never steals a key from the composer.
+    JumpToSubagent,
     /// Open / close the Actionable Tool Outputs overlay (`Ctrl+Alt+A` default;
     /// §12.3.1) for the focused (or top-visible) tool result. It scans that result's
     /// output for actionable elements — file paths, URLs, error lines, diff hunks,
@@ -574,6 +589,8 @@ impl Action {
             Self::ToggleBreadcrumbs => "toggle_breadcrumbs",
             Self::RenameFocusedEntry => "rename_focused_entry",
             Self::DismissFirstRunHint => "dismiss_first_run_hint",
+            Self::PreviewSubagent => "preview_subagent",
+            Self::JumpToSubagent => "jump_to_subagent",
             Self::ToggleToolActions => "toggle_tool_actions",
             Self::ToggleScratchpad => "toggle_scratchpad",
             Self::ToggleTemplates => "toggle_templates",
@@ -659,6 +676,8 @@ impl Action {
         Action::ToggleBreadcrumbs,
         Action::RenameFocusedEntry,
         Action::DismissFirstRunHint,
+        Action::PreviewSubagent,
+        Action::JumpToSubagent,
         Action::ToggleToolActions,
         Action::ToggleScratchpad,
         Action::ToggleTemplates,
@@ -849,6 +868,14 @@ impl Action {
             // terminals, tmux, and SSH as the `Ctrl+Alt+H`/`Ctrl+Alt+P` chords
             // above.
             | Self::DismissFirstRunHint
+            // Subagent Hover Preview (§12.8.2): the preview verb is `Alt+6` (an
+            // Alt+digit chord) and the jump verb is `Ctrl+Alt+D` (a Ctrl+Alt /
+            // Meta chord) — both the same Meta/Alt encoding that is unreliable
+            // across Linux terminals, tmux, and SSH as the rest of the
+            // nav/overlay family. The always-available equivalents are the pane's
+            // own ↑↓ select + Enter open keys.
+            | Self::PreviewSubagent
+            | Self::JumpToSubagent
             // Actionable Tool Outputs overlay toggle is `Ctrl+Alt+A` — a Ctrl+Alt
             // (Meta) chord, the same classically-unreliable encoding across Linux
             // terminals, tmux, and SSH as the `Ctrl+Alt+H`/`Ctrl+Alt+P`/
@@ -1195,6 +1222,23 @@ impl Action {
             // steals a key from the surface beneath.
             Self::DismissFirstRunHint => KeyBinding::new(
                 KeyCode::Char('n'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Subagent Hover Preview (§12.8.2). `Alt+6` previews the selected
+            // subagent row — the next free `Alt`+digit after `Alt+4` (scratchpad)
+            // and `Alt+5` (the §12.8.1 subagent-timeline overlay it sits beside);
+            // `Alt+1`/`Alt+2`/`Alt+3` are hover preview / breadcrumbs / save-snippet
+            // and `Alt+8`/`Alt+9`/`Alt+0` are hyperlinks / session timeline /
+            // changes-since. Every bare `Alt` letter in the nav/copy/overlay family
+            // is taken, so the digit is the free, composer-clear pick.
+            Self::PreviewSubagent => KeyBinding::new(KeyCode::Char('6'), KeyModifiers::ALT),
+            // `Ctrl+Alt+D` jumps to the selected subagent's transcript — `D` recalls
+            // "Delegate / Detail" and follows the existing `Ctrl+Alt+letter` style
+            // (`Ctrl+Alt+H`/`Ctrl+Alt+P`/`Ctrl+Alt+R`/`Ctrl+Alt+N`). It is free:
+            // bare `Alt+d` is the multi-cursor add-selection verb, so the Ctrl+Alt
+            // modifier keeps the jump distinct and clear of every composer chord.
+            Self::JumpToSubagent => KeyBinding::new(
+                KeyCode::Char('d'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
             // Actionable Tool Outputs (§12.3.1). `Ctrl+Alt+A` — `A` recalls

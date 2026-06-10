@@ -133,6 +133,18 @@ pub(crate) fn policy_for(key: TargetKey) -> PointerActivationPolicy {
             primary_activate: None,
             secondary_activate: None,
         },
+        // A subagent timeline row (§12.8.2): hover previews its status / last
+        // activity, a single click selects/pins it, a double-click jumps to its
+        // transcript detail — the same non-destructive verb the `JumpToSubagent`
+        // keyboard chord reaches. The jump preserves the prior conversation +
+        // scroll as a return anchor, so it never strands the user (never a
+        // destructive verb).
+        TargetKey::SubagentRow(index) => PointerActivationPolicy {
+            hover_preview: true,
+            select: true,
+            primary_activate: Some(Action::SubagentJump(index)),
+            secondary_activate: None,
+        },
         // Queue items, clipboard entries, and chrome keys keep their own
         // single-click dispatch (which already includes their destructive verbs
         // behind explicit targets); they are inert under the shared

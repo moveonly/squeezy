@@ -69,6 +69,13 @@ pub(crate) enum TargetKey {
     /// by its stable per-template id (NOT its list index) so a delete/drop
     /// mid-gesture never shifts the hit target.
     TemplateEntry(u64),
+    /// A subagent timeline row (§12.8.2), addressed by its 0-based index into the
+    /// pane's record list (row `index + 1`, since pane row 0 is `main`). Keyed by
+    /// index rather than a screen cell so a pane reflow / scroll re-registers the
+    /// same target at a fresh row; resolved against the live record list at
+    /// activation time so a prune mid-gesture resolves to a no-op rather than the
+    /// wrong subagent.
+    SubagentRow(usize),
     /// A chrome affordance that carries no entry/row id.
     Chrome(ChromeKey),
 }
@@ -569,6 +576,18 @@ pub(crate) enum Action {
     /// (§12.7.6). Mouse twin of moving the row focus with ↑↓; a click on a mode
     /// row selects it (and live-previews it).
     GlyphModeSelect(usize),
+    /// Select / pin the given subagent (by 0-based pane index) as the active
+    /// comparison target (§12.8.2). Mouse twin of moving the pane cursor with ↑↓;
+    /// a single click both moves the cursor onto that row and previews it. Routes
+    /// through the same `subagent_select_index` the keyboard path reaches, so
+    /// keyboard/mouse parity holds by construction.
+    SubagentSelect(usize),
+    /// Jump to the given subagent's transcript / detail pane (by 0-based pane
+    /// index; §12.8.2), preserving the prior conversation + scroll as a return
+    /// anchor. Mouse twin of the keyboard `JumpToSubagent` verb; a double-click on
+    /// a subagent row reaches the same `jump_to_subagent_index` handler the verb
+    /// does. A capped subagent (no transcript) resolves to a select-only no-op.
+    SubagentJump(usize),
 }
 
 impl Action {
@@ -649,6 +668,8 @@ impl Action {
         Action::TerminalProfileCycleField(0),
         Action::GestureSettingsStepField(0),
         Action::GlyphModeSelect(0),
+        Action::SubagentSelect(0),
+        Action::SubagentJump(0),
     ];
 }
 

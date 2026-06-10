@@ -818,6 +818,14 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // working mode) before the global keymap sees them, so a mode-row click
         // reaches the same focus/select handler the keyboard verbs drive.
         A::GlyphModeSelect(_) => KeyboardPath::Always("glyph mode ↑↓ ←→"),
+        // Subagent timeline row select/pin (§12.8.2) — the subagent pane's own
+        // ↑↓ cursor + `PreviewSubagent` (Alt+5) verb both seat the cursor on the
+        // row and preview it, the same `subagent_select_index` the click drives.
+        A::SubagentSelect(_) => KeyboardPath::Keymap(Action::PreviewSubagent),
+        // Subagent transcript jump (§12.8.2) — `JumpToSubagent` (Ctrl+Alt+D
+        // default) reaches the same `jump_to_subagent_index` handler the
+        // double-click drives.
+        A::SubagentJump(_) => KeyboardPath::Keymap(Action::JumpToSubagent),
     })
 }
 
