@@ -231,6 +231,17 @@ pub(crate) enum ChromeKey {
     /// stops/cancels the active recording or replay — the mouse twin of the
     /// `ToggleMacroRecord` verb.
     MacroStrip,
+    /// An action row in the Keybinding Editor UI overlay (§12.7.1), keyed by its
+    /// 0-based index in the editor's row list so a click selects (and, on the
+    /// already-selected row, begins capturing) exactly that action.
+    KeybindingRow(usize),
+    /// The "Rebind" button in the Keybinding Editor UI (§12.7.1) — the mouse twin
+    /// of the keyboard Enter verb; begins capturing a new chord for the selected
+    /// row.
+    KeybindingRebind,
+    /// The "Reset" button in the Keybinding Editor UI (§12.7.1) — the mouse twin
+    /// of the keyboard `r`/Delete verb; reverts the selected row to its default.
+    KeybindingReset,
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -482,6 +493,18 @@ pub(crate) enum Action {
     /// keyboard verb; both route to the same `toggle_macro_record` handler, so
     /// keyboard/mouse parity holds by construction.
     MacroToggleRecord,
+    /// Select the given action row (by 0-based index) in the Keybinding Editor UI
+    /// overlay (§12.7.1). Mouse twin of the editor's ↑↓/kj cursor movement; fed by
+    /// a click on a row that is not already selected.
+    KeybindingSelect(usize),
+    /// Begin capturing a new chord for the editor's selected row (§12.7.1). Mouse
+    /// twin of the editor's Enter verb / the "Rebind" button / a click on the
+    /// already-selected row. Routes through the same `begin_capture` the keyboard
+    /// path drives, so keyboard/mouse parity holds by construction.
+    KeybindingRebind,
+    /// Reset the editor's selected row to its compiled-in default (§12.7.1). Mouse
+    /// twin of the editor's `r`/Delete verb / the "Reset" button.
+    KeybindingReset,
 }
 
 impl Action {

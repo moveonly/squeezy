@@ -111,6 +111,7 @@ mod hyperlinks;
 mod input;
 mod interaction;
 mod jump_marks;
+mod keybinding_editor;
 mod keymap;
 mod keymap_config;
 mod lane_fold;
@@ -1826,6 +1827,9 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         // switch would derail the in-flight workflow, so block it like every
         // other modal/overlay context above.
         || app.macro_recorder.is_active()
+        // The Keybinding Editor UI (§12.7.1) is a modal overlay; block the switch
+        // like every other overlay above.
+        || app.keybinding_editor.is_some()
     {
         return false;
     }
@@ -2530,6 +2534,49 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             )
         {
             dispatch_click_action(app, action);
+        }
+        return true;
+    }
+
+    // The Keybinding Editor UI (§12.7.1) owns the pointer while open: a left-click
+    // on an action row selects it, a double-click (or a click on the already-
+    // selected row) begins capturing a new chord, and a click on a button runs its
+    // verb. Every other click is swallowed so a stray press can't fall through to
+    // the surface beneath. Hit-tested in ABSOLUTE screen coordinates against the
+    // targets the editor registered this frame. While capturing, the keyboard owns
+    // the next chord, so clicks are ignored (consumed) — a stray click must not
+    // become a captured binding.
+    if app.keybinding_editor.is_some() {
+        let capturing = app
+            .keybinding_editor
+            .as_ref()
+            .is_some_and(|editor| editor.is_capturing());
+        if !capturing
+            && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((key, action)) = app.click_target_at(mouse.column, mouse.row)
+            && matches!(
+                key,
+                interaction::TargetKey::Chrome(interaction::ChromeKey::KeybindingRow(_))
+                    | interaction::TargetKey::Chrome(interaction::ChromeKey::KeybindingRebind)
+                    | interaction::TargetKey::Chrome(interaction::ChromeKey::KeybindingReset)
+            )
+        {
+            // A second click on the SAME row within the multi-click window promotes
+            // a select into a rebind, so a double-click begins capture — the mouse
+            // twin of Enter. The recognizer keys multiplicity on the target id, so a
+            // 1-cell jitter still counts as a double.
+            let now = std::time::Instant::now();
+            let gesture =
+                app.gestures
+                    .recognize(interaction::Phase::Press, Some((key, action)), now);
+            match (gesture, action) {
+                (
+                    interaction::Gesture::DoubleClick { .. }
+                    | interaction::Gesture::TripleClick { .. },
+                    interaction::Action::KeybindingSelect(_),
+                ) => keybinding_editor_begin_capture(app),
+                _ => dispatch_click_action(app, action),
+            }
         }
         return true;
     }
@@ -5046,6 +5093,18 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
+    // The Keybinding Editor UI (§12.7.1) is modal while open: it owns the keyboard
+    // BEFORE any selection-clear, search, chord, or keymap dispatch, so a stray key
+    // never leaks into the composer underneath. In BROWSE mode it consumes its
+    // navigation/verb keys (↑↓/kj move, Home/End/PageUp/PageDown, Enter rebind,
+    // r/Delete reset, Esc/the toggle chord close); in CAPTURE mode it captures the
+    // NEXT key as the new chord (Esc cancels the capture, a second commit press
+    // confirms). Sits at the front of the loop beside the clipboard picker for the
+    // same reason.
+    if app.keybinding_editor.is_some() && handle_keybinding_editor_key(app, key) {
+        return Ok(false);
+    }
+
     // The Prompt Snippets picker (§12.3.2) is modal while open: it owns the
     // keyboard (↑↓ select, Enter insert, q queue, d delete, c clear, Esc close)
     // BEFORE any selection-clear, search, chord, or keymap dispatch, so a stray
@@ -7269,6 +7328,15 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
             replay_macro(app, agent);
             true
         }
+        keymap::Action::ToggleKeybindingEditor => {
+            // §12.7.1: open / close the Keybinding Editor UI. Main-surface overlay;
+            // the config/setup screens own their own routing.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_keybinding_editor(app);
+            true
+        }
     }
 }
 
@@ -7417,6 +7485,296 @@ fn handle_clipboard_history_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         _ => {}
     }
     true
+}
+
+/// Build the Keybinding Editor UI (§12.7.1) row list straight from the `Action`
+/// registry and the live resolver, so the editor lists *exactly* the actions the
+/// TUI dispatches and a new variant appears for free. One row per
+/// `keymap::Action::ALL` entry, carrying the action's currently-resolved binding
+/// and whether it differs from the compiled-in default.
+fn keybinding_editor_rows(app: &TuiApp) -> Vec<keybinding_editor::EditorRow> {
+    keymap::Action::ALL
+        .iter()
+        .copied()
+        .map(|action| {
+            let binding = app.keymap.binding(action);
+            keybinding_editor::EditorRow {
+                action,
+                binding,
+                is_override: binding != action.default_binding(),
+            }
+        })
+        .collect()
+}
+
+/// `Ctrl+Alt+B` (and the dispatch arm): open / close the Keybinding Editor UI
+/// (§12.7.1). Opening snapshots the current map into a fresh editor state;
+/// closing drops it (the resting `None`). Sets a status confirming the new state
+/// and `needs_redraw` so the toggle paints immediately.
+fn toggle_keybinding_editor(app: &mut TuiApp) {
+    if app.keybinding_editor.is_some() {
+        app.keybinding_editor = None;
+        app.status = "keybinding editor closed".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    let rows = keybinding_editor_rows(app);
+    app.keybinding_editor = Some(keybinding_editor::KeybindingEditorState::new(rows));
+    app.status = keybinding_editor_browse_status(app);
+    app.needs_redraw = true;
+}
+
+/// The status-line hint for the Keybinding Editor UI in browse mode: the selected
+/// action's slug + current binding plus the verb hints.
+fn keybinding_editor_browse_status(app: &TuiApp) -> String {
+    let Some(editor) = app.keybinding_editor.as_ref() else {
+        return String::new();
+    };
+    match editor.selected_row() {
+        Some(row) => format!(
+            "{} = {} — ↑↓ select · Enter rebind · r reset · Esc close",
+            row.action.slug(),
+            row.binding.display(),
+        ),
+        None => "no rebindable actions".to_string(),
+    }
+}
+
+/// The status-line hint for the Keybinding Editor UI while capturing a chord for
+/// the selected row, including any pending-chord verdict (free / conflict /
+/// reserved).
+fn keybinding_editor_capture_status(app: &TuiApp) -> String {
+    let Some(editor) = app.keybinding_editor.as_ref() else {
+        return String::new();
+    };
+    let slug = editor
+        .selected_row()
+        .map(|row| row.action.slug())
+        .unwrap_or("");
+    match editor.pending() {
+        None => format!("press the new chord for {slug} — Esc cancels"),
+        Some(pending) => match &pending.outcome {
+            keybinding_editor::CaptureOutcome::Free => format!(
+                "{} → {} — Enter to confirm · Esc cancels",
+                slug,
+                pending.binding.display(),
+            ),
+            keybinding_editor::CaptureOutcome::Conflict { with } => format!(
+                "{} → {} CONFLICTS with {} — Enter to override anyway · Esc cancels",
+                slug,
+                pending.binding.display(),
+                with,
+            ),
+            keybinding_editor::CaptureOutcome::Reserved { label } => format!(
+                "{} is reserved (recovery key) — press a different chord · Esc cancels",
+                label,
+            ),
+        },
+    }
+}
+
+/// Begin capturing a new chord for the editor's selected row (the keyboard Enter
+/// verb, the "Rebind" button, and a double-click all route here). A no-op when the
+/// editor is closed or already capturing.
+fn keybinding_editor_begin_capture(app: &mut TuiApp) {
+    let began = app
+        .keybinding_editor
+        .as_mut()
+        .is_some_and(|editor| editor.begin_capture());
+    if began {
+        app.status = keybinding_editor_capture_status(app);
+        app.needs_redraw = true;
+    }
+}
+
+/// Reset the editor's selected row to its compiled-in default (the keyboard
+/// `r`/Delete verb and the "Reset" button route here). Drops the override from the
+/// persisted file and rebuilds the resolver; a no-op when the row already holds
+/// its default.
+fn keybinding_editor_reset_selected(app: &mut TuiApp) {
+    let reset = app
+        .keybinding_editor
+        .as_mut()
+        .and_then(|editor| editor.reset_selected());
+    let Some((action, binding)) = reset else {
+        return;
+    };
+    persist_keybinding_change(app);
+    app.status = format!("reset {} to default {}", action.slug(), binding.display());
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Keybinding Editor UI (§12.7.1) is open. Returns `true`
+/// when the key was consumed (so it never leaks to the composer or the global
+/// keymap). In CAPTURE mode the next key is the captured chord (handled first so a
+/// chord like Enter or an arrow is captured rather than treated as navigation); in
+/// BROWSE mode the editor consumes its navigation/verb keys.
+fn handle_keybinding_editor_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if app.keybinding_editor.is_none() {
+        return false;
+    }
+    let capturing = app
+        .keybinding_editor
+        .as_ref()
+        .is_some_and(|editor| editor.is_capturing());
+    if capturing {
+        return handle_keybinding_editor_capture_key(app, key);
+    }
+    handle_keybinding_editor_browse_key(app, key)
+}
+
+/// Browse-mode key handling for the Keybinding Editor UI: cursor movement, the
+/// rebind / reset verbs, and close (Esc or the editor's own toggle chord). Every
+/// unrecognised key is swallowed so the overlay stays modal.
+fn handle_keybinding_editor_browse_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    // The editor's own toggle chord (`Ctrl+Alt+B` by default) closes it, so the
+    // same key both opens and closes — without leaking to the global keymap, which
+    // the modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleKeybindingEditor) {
+        toggle_keybinding_editor(app);
+        return true;
+    }
+    let Some(editor) = app.keybinding_editor.as_mut() else {
+        return true;
+    };
+    let page = 10usize;
+    match key.code {
+        KeyCode::Esc => {
+            app.keybinding_editor = None;
+            app.status = "keybinding editor closed".to_string();
+            app.needs_redraw = true;
+            return true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => editor.select_up(),
+        KeyCode::Down | KeyCode::Char('j') => editor.select_down(),
+        KeyCode::PageUp => editor.page_up(page),
+        KeyCode::PageDown => editor.page_down(page),
+        KeyCode::Home => editor.select_first(),
+        KeyCode::End => editor.select_last(),
+        KeyCode::Enter => {
+            keybinding_editor_begin_capture(app);
+            return true;
+        }
+        KeyCode::Char('r') | KeyCode::Delete => {
+            keybinding_editor_reset_selected(app);
+            return true;
+        }
+        // Swallow every other key so the editor is modal: a stray keystroke cannot
+        // leak into the composer underneath while the overlay owns focus.
+        _ => return true,
+    }
+    app.status = keybinding_editor_browse_status(app);
+    app.needs_redraw = true;
+    true
+}
+
+/// Capture-mode key handling for the Keybinding Editor UI: Esc cancels the
+/// capture (back to browse); a second commit press on a pending free/conflicting
+/// chord confirms it; otherwise the key is normalised and captured as the new
+/// pending chord (with its conflict/reserved verdict shown). The captured chord is
+/// normalised through the SAME `normalise_control_byte` the live keymap lookup
+/// uses, so a captured binding matches exactly what the dispatcher will later see.
+fn handle_keybinding_editor_capture_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    // Esc always cancels the in-flight capture (never the captured chord), so the
+    // user is never trapped mid-rebind — Esc cannot itself be bound (it is a
+    // reserved recovery key), so this is unambiguous.
+    if key.code == KeyCode::Esc {
+        if let Some(editor) = app.keybinding_editor.as_mut() {
+            editor.cancel_capture();
+        }
+        app.status = keybinding_editor_browse_status(app);
+        app.needs_redraw = true;
+        return true;
+    }
+    // Enter confirms a pending, committable chord (free or a warnable conflict).
+    // With no pending chord yet, Enter is itself a capturable chord and falls
+    // through to the capture path below.
+    let has_committable_pending = app.keybinding_editor.as_ref().is_some_and(|editor| {
+        editor
+            .pending()
+            .is_some_and(|pending| pending.outcome.is_committable())
+    });
+    if key.code == KeyCode::Enter && has_committable_pending {
+        let committed = app
+            .keybinding_editor
+            .as_mut()
+            .and_then(|editor| editor.commit());
+        if let Some((action, binding)) = committed {
+            persist_keybinding_change(app);
+            app.status = format!("bound {} to {}", action.slug(), binding.display());
+            app.needs_redraw = true;
+        }
+        return true;
+    }
+    // Capture this key as the new pending chord. Normalise it exactly as the live
+    // lookup path does (META→ALT, control-byte → Ctrl+letter, case-fold) so the
+    // captured binding is the one the dispatcher will resolve.
+    let normalised = normalise_control_byte(key);
+    let binding = keymap::KeyBinding::new(normalised.code, normalised.modifiers);
+    if let Some(editor) = app.keybinding_editor.as_mut() {
+        editor.capture(binding);
+    }
+    app.status = keybinding_editor_capture_status(app);
+    app.needs_redraw = true;
+    true
+}
+
+/// Persist the editor's current map to `~/.squeezy/keybindings.toml` and rebuild
+/// the live resolver so the new binding takes effect immediately. Called after a
+/// commit or a reset. The editor's in-overlay rows already reflect the change; this
+/// writes the delta-only override set the editor accumulated and re-resolves.
+///
+/// Best-effort: a write failure leaves the in-memory editor + resolver updated and
+/// surfaces the error in the status line rather than blocking the rebind — a
+/// rebind that does not survive a restart is still better than a trapped user.
+fn persist_keybinding_change(app: &mut TuiApp) {
+    let Some(editor) = app.keybinding_editor.as_ref() else {
+        return;
+    };
+    // Build the delta-only override map from the editor's rows (the single source
+    // the overlay edited), so the rebuilt resolver and the on-disk file agree.
+    let mut overrides: BTreeMap<String, String> = BTreeMap::new();
+    for row in editor.rows() {
+        if row.is_override {
+            overrides.insert(row.action.slug().to_string(), row.binding.display());
+        }
+    }
+    // Rebuild the live resolver from the editor's overrides so the new binding is
+    // active for the very next keypress (and `/keymap` reads it back).
+    app.keymap = keymap::KeymapResolver::from_overrides(&overrides);
+    // Write the file (best-effort). A missing home dir degrades to "in-memory
+    // only" with a status note.
+    if let Err(err) = write_keybindings_file(&overrides) {
+        app.status = format!("rebind applied (not saved: {err})");
+    }
+}
+
+/// Write the delta-only override map to `~/.squeezy/keybindings.toml` atomically
+/// (write to a sibling temp file, then rename). Serialises each entry as a
+/// `[[bindings]]` row in the same schema `keymap_config::KeybindingsFile` reads,
+/// so the editor's output round-trips through the loader on the next start. The
+/// parent directory is created if missing.
+fn write_keybindings_file(overrides: &BTreeMap<String, String>) -> std::io::Result<()> {
+    let path = keymap_config::default_keybindings_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no home directory for ~/.squeezy/keybindings.toml",
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut body = String::new();
+    body.push_str("# Managed by the Squeezy Keybinding Editor (Ctrl+Alt+B).\n");
+    body.push_str("# Only bindings that differ from the defaults are listed.\n");
+    for (slug, spec) in overrides {
+        body.push_str("\n[[bindings]]\n");
+        body.push_str(&format!("action = {slug:?}\n"));
+        body.push_str(&format!("key = {spec:?}\n"));
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)
 }
 
 /// `Alt+i`: toggle the Local Transcript Index overlay (§12.5.1). The overlay is a
@@ -13095,6 +13453,24 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // handler, so keyboard/mouse parity holds by construction.
         interaction::Action::MacroToggleRecord => {
             toggle_macro_record(app);
+        }
+        // Keybinding Editor UI (§12.7.1). Each routes through the same handler the
+        // keyboard verb drives, so mouse/keyboard parity holds by construction.
+        // Select moves the cursor onto the clicked row; rebind begins capturing a
+        // new chord for the selected row; reset reverts it to its default.
+        interaction::Action::KeybindingSelect(index) => {
+            if let Some(editor) = app.keybinding_editor.as_mut()
+                && editor.select_index(index)
+            {
+                app.status = keybinding_editor_browse_status(app);
+                app.needs_redraw = true;
+            }
+        }
+        interaction::Action::KeybindingRebind => {
+            keybinding_editor_begin_capture(app);
+        }
+        interaction::Action::KeybindingReset => {
+            keybinding_editor_reset_selected(app);
         }
     }
 }
@@ -19097,6 +19473,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_clipboard_history_surface(frame, area, app);
         return;
     }
+    // The Keybinding Editor UI (§12.7.1) paints as a fullscreen overlay over
+    // everything else while open, registering its per-row + button click targets
+    // every frame. Checked beside the clipboard picker so its targets register and
+    // it owns the surface while open.
+    if app.keybinding_editor.is_some() {
+        render_keybinding_editor_surface(frame, area, app);
+        return;
+    }
     // The Prompt Snippets picker (§12.3.2) paints as a fullscreen overlay over
     // everything else while open, registering its per-snippet row + button click
     // targets every frame. Checked beside the clipboard picker so its targets
@@ -20081,6 +20465,236 @@ fn render_clipboard_history_buttons(frame: &mut Frame<'_>, inner: Rect, app: &Tu
                 },
                 interaction::TargetKey::Chrome(interaction::ChromeKey::ClipboardClear),
                 interaction::Action::ClipboardClear,
+            );
+        }
+    }
+}
+
+/// Paint the Keybinding Editor UI (§12.7.1) as a centered modal: a title, a
+/// header (the capture prompt while capturing, else the column legend), the
+/// windowed list of action rows, and a bottom button strip. Each visible row and
+/// each button registers a click target so the mouse path mirrors the keyboard.
+fn render_keybinding_editor_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(editor) = app.keybinding_editor.as_ref() else {
+        return;
+    };
+    let title = Line::from(vec![
+        Span::styled(
+            " Keybindings ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "— view and rebind actions (Ctrl+Alt+B) ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 100, 28, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Header: the capture prompt + verdict while capturing, else the legend.
+    let header = if editor.is_capturing() {
+        let style = match editor.pending().map(|p| &p.outcome) {
+            Some(keybinding_editor::CaptureOutcome::Reserved { .. })
+            | Some(keybinding_editor::CaptureOutcome::Conflict { .. }) => Style::default()
+                .fg(crate::render::theme::warn())
+                .add_modifier(Modifier::BOLD),
+            _ => Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        };
+        Line::from(Span::styled(keybinding_editor_capture_status(app), style))
+    } else {
+        Line::from(Span::styled(
+            "↑↓ select · Enter rebind · r/Del reset to default · Esc close",
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let header_rect = Rect { height: 1, ..inner };
+    frame.render_widget(Paragraph::new(header), header_rect);
+
+    // The list occupies the rows between the header and the bottom button strip
+    // (last inner row, second-to-last a gap).
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height).saturating_sub(2);
+    if list_bottom > list_top {
+        let list_rect = Rect {
+            x: inner.x,
+            y: list_top,
+            width: inner.width,
+            height: list_bottom - list_top,
+        };
+        render_keybinding_editor_list(frame, list_rect, app, editor);
+    }
+
+    render_keybinding_editor_buttons(frame, inner, app, editor);
+}
+
+/// Paint the windowed list of action rows into `list_rect` and register each
+/// visible row's rect as a [`interaction::ChromeKey::KeybindingRow`] click target.
+/// The window scrolls to keep the selected row visible. Each row shows a cursor
+/// marker, the action slug, its current binding, an `(override)` tag when it
+/// differs from the default, and a `[terminal-dependent]` note when the action
+/// carries one.
+fn render_keybinding_editor_list(
+    frame: &mut Frame<'_>,
+    list_rect: Rect,
+    app: &TuiApp,
+    editor: &keybinding_editor::KeybindingEditorState,
+) {
+    let rows = editor.rows();
+    if rows.is_empty() || list_rect.height == 0 {
+        return;
+    }
+    let visible = list_rect.height as usize;
+    let selected = editor.selected_index();
+    // Scroll the window so the selected row stays visible.
+    let start = selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(rows.len().saturating_sub(visible.min(rows.len())));
+    let end = (start + visible).min(rows.len());
+    // Pad the slug column so the bindings line up.
+    let slug_width = rows
+        .iter()
+        .map(|row| row.action.slug().len())
+        .max()
+        .unwrap_or(0);
+
+    for (offset, row) in rows[start..end].iter().enumerate() {
+        let index = start + offset;
+        let is_selected = index == selected;
+        let row_y = list_rect.y + offset as u16;
+        let row_rect = Rect {
+            x: list_rect.x,
+            y: row_y,
+            width: list_rect.width,
+            height: 1,
+        };
+
+        let marker = if is_selected { "› " } else { "  " };
+        let slug_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let mut spans = vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(format!("{:<slug_width$}", row.action.slug()), slug_style),
+            Span::styled(
+                format!("  {}", row.binding.display()),
+                Style::default()
+                    .fg(crate::render::theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if row.is_override {
+            spans.push(Span::styled(
+                "  (override)",
+                Style::default().fg(crate::render::theme::secondary()),
+            ));
+        }
+        if let Some(note) = row.action.terminal_compat_note() {
+            spans.push(Span::styled(
+                format!("  [{note}]"),
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), row_rect);
+
+        // Register the whole row as a click target keyed by its index in the row
+        // list (stable for the open editor — the list never reorders while open).
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::KeybindingRow(index)),
+            interaction::Action::KeybindingSelect(index),
+        );
+    }
+}
+
+/// Paint the `[ Rebind (Enter) ]` / `[ Reset (r) ]` button strip on the modal's
+/// bottom inner row and register each button's rect as a chrome click target.
+/// Split out so the labels, spacing, and registered rects are one place the mouse
+/// hit-test and the rendered glyphs cannot drift. Both buttons act on the
+/// currently-selected row.
+fn render_keybinding_editor_buttons(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    app: &TuiApp,
+    editor: &keybinding_editor::KeybindingEditorState,
+) {
+    const REBIND: &str = "[ Rebind (Enter) ]";
+    const RESET: &str = "[ Reset (r) ]";
+    let row = inner.y + inner.height.saturating_sub(1);
+    let has_rows = !editor.is_empty();
+
+    let accent = crate::render::theme::accent();
+    let quiet = crate::render::theme::quiet();
+    let active = if has_rows { accent } else { quiet };
+    let strip = Line::from(vec![
+        Span::styled(
+            REBIND,
+            Style::default().fg(active).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(RESET, Style::default().fg(active)),
+    ]);
+    let strip_rect = Rect {
+        x: inner.x,
+        y: row,
+        width: inner.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(strip), strip_rect);
+
+    if !has_rows {
+        return;
+    }
+    let mut x = inner.x;
+    let right = inner.x.saturating_add(inner.width);
+
+    let w = (REBIND.chars().count() as u16).min(right.saturating_sub(x));
+    if w > 0 {
+        app.register_click(
+            Rect {
+                x,
+                y: row,
+                width: w,
+                height: 1,
+            },
+            interaction::TargetKey::Chrome(interaction::ChromeKey::KeybindingRebind),
+            interaction::Action::KeybindingRebind,
+        );
+    }
+    x = x
+        .saturating_add(REBIND.chars().count() as u16)
+        .saturating_add(2);
+
+    if x < right {
+        let w = (RESET.chars().count() as u16).min(right.saturating_sub(x));
+        if w > 0 {
+            app.register_click(
+                Rect {
+                    x,
+                    y: row,
+                    width: w,
+                    height: 1,
+                },
+                interaction::TargetKey::Chrome(interaction::ChromeKey::KeybindingReset),
+                interaction::Action::KeybindingReset,
             );
         }
     }
@@ -35483,6 +36097,13 @@ pub(crate) struct TuiApp {
     /// on replay. The resting state is idle (neither recording nor replaying), so an
     /// idle session pays a single enum-tag check and nothing more.
     pub(crate) macro_recorder: macros::MacroRecorder,
+    /// Keybinding Editor UI (§12.7.1): the open editor overlay, or `None` while it
+    /// is closed (the resting state). Holds the row list (sourced from the
+    /// `Action` registry + the live resolver on open), the cursor, the
+    /// browse/capture mode, and the pending captured chord. The overlay does not
+    /// exist until opened, so an idle session allocates nothing and an `is_some`
+    /// check is the whole resting cost.
+    pub(crate) keybinding_editor: Option<keybinding_editor::KeybindingEditorState>,
     /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
     /// keyed by stable entry id and grouped by category (user turns, tool calls,
     /// errors, …). Rebuilt incrementally — only when the transcript's
@@ -36381,6 +37002,7 @@ impl TuiApp {
             templates_open: false,
             template_card: None,
             macro_recorder: macros::MacroRecorder::new(),
+            keybinding_editor: None,
             transcript_index: transcript_index::TranscriptIndex::new(),
             transcript_index_open: false,
             transcript_index_selected: 0,

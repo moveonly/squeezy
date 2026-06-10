@@ -36098,3 +36098,471 @@ async fn scratchpad_esc_closes_but_keeps_the_buffer() {
     assert!(!app.scratchpad_open, "Esc closes the pane");
     assert_eq!(app.scratchpad.text(), "z", "Esc keeps the buffer");
 }
+
+// =====================================================================
+// §12.7.1 Keybinding Editor UI.
+// End-to-end through `handle_key` (Ctrl+Alt+B toggle; ↑↓ nav; Enter
+// capture + commit; r reset; Esc close/cancel), `handle_mouse` (click a
+// row to select, click the Rebind button), the real `render()` overlay,
+// the conflict + reserved-key guardrails, the empty/edge (tiny frame),
+// and a resize where the overlay paints. Persistence writes to
+// `~/.squeezy/keybindings.toml`, so commit/reset tests scope `$HOME` to a
+// temp dir under a process-wide lock to keep them hermetic.
+// =====================================================================
+
+/// Process-wide lock for the keybinding-editor tests that mutate `$HOME` (so the
+/// persisted `~/.squeezy/keybindings.toml` lands in a temp dir, never the dev's
+/// real home, and no two such tests race on the env var).
+static KEYBINDING_HOME_LOCK: StdMutex<()> = StdMutex::new(());
+
+/// Scope `$HOME` to a fresh temp dir for the duration of a test, restoring it on
+/// drop. Holds the global lock so concurrent env mutation is serialized.
+struct ScopedHome {
+    previous: Option<std::ffi::OsString>,
+    dir: PathBuf,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedHome {
+    fn new() -> Self {
+        let lock = KEYBINDING_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = temp_workspace("keybinding_home");
+        let previous = std::env::var_os("HOME");
+        // SAFETY: the global lock above serializes every $HOME mutation in these
+        // tests, so no other thread reads/writes the var concurrently.
+        unsafe { std::env::set_var("HOME", &dir) };
+        Self {
+            previous,
+            dir,
+            _lock: lock,
+        }
+    }
+
+    fn keybindings_path(&self) -> PathBuf {
+        self.dir.join(".squeezy").join("keybindings.toml")
+    }
+}
+
+impl Drop for ScopedHome {
+    fn drop(&mut self) {
+        // SAFETY: see `new`.
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+}
+
+/// `Ctrl+Alt+B`: open / close the Keybinding Editor UI.
+fn keybinding_editor_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('b'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// Render the full app through the real `render()` and return the TestBackend
+/// buffer so a mouse test can locate the painted click targets.
+fn render_full_to_buffer(app: &TuiApp, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| render(frame, app)).expect("draw");
+    terminal.backend().buffer().clone()
+}
+
+#[tokio::test]
+async fn keybinding_editor_toggle_opens_and_closes() {
+    let _home = ScopedHome::new();
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(app.keybinding_editor.is_none(), "starts closed");
+
+    handle_key(&mut app, &mut agent, keybinding_editor_key())
+        .await
+        .unwrap();
+    assert!(app.keybinding_editor.is_some(), "Ctrl+Alt+B opens");
+
+    // The same chord closes it (modal swallows it before the global keymap).
+    handle_key(&mut app, &mut agent, keybinding_editor_key())
+        .await
+        .unwrap();
+    assert!(app.keybinding_editor.is_none(), "second press closes");
+}
+
+#[tokio::test]
+async fn keybinding_editor_renders_every_action_with_its_binding() {
+    let _home = ScopedHome::new();
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(&mut app, &mut agent, keybinding_editor_key())
+        .await
+        .unwrap();
+
+    // A tall frame so the windowed list shows the top rows. The first row is
+    // ToggleConfigScreen → F11 by default.
+    let out = render_to_string(&app, 100, 40);
+    assert!(out.contains("Keybindings"), "title paints: {out}");
+    assert!(
+        out.contains(keymap::Action::ToggleConfigScreen.slug()),
+        "the first action slug paints: {out}"
+    );
+    assert!(out.contains("F11"), "its current binding paints: {out}");
+    assert!(out.contains("Rebind"), "the rebind button paints: {out}");
+}
+
+#[tokio::test]
+async fn keybinding_editor_arrows_move_the_cursor() {
+    let _home = ScopedHome::new();
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(&mut app, &mut agent, keybinding_editor_key())
+        .await
+        .unwrap();
+    assert_eq!(app.keybinding_editor.as_ref().unwrap().selected_index(), 0);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.keybinding_editor.as_ref().unwrap().selected_index(),
+        1,
+        "Down moves the cursor"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.keybinding_editor.as_ref().unwrap().selected_index(),
+        0,
+        "Up moves it back"
+    );
+}
+
+#[tokio::test]
+async fn keybinding_editor_capture_and_commit_rebinds_live() {
+    let _home = ScopedHome::new();
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(&mut app, &mut agent, keybinding_editor_key())
+        .await
+        .unwrap();
+
+    // Move to the ToggleMinimap row (default Alt+r) so we rebind a known action.
+    let target = keymap::Action::ToggleMinimap;
+    let index = keymap::Action::ALL
+        .iter()
+        .position(|a| *a == target)
+        .unwrap();
+    for _ in 0..index {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(app.keymap.binding(target).display(), "Alt+R");
+
+    // Enter begins capture; the next key (an unbound F9) is captured, then a
+    // second Enter commits.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.keybinding_editor.as_ref().unwrap().is_capturing());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    // The pending chord shows in the surface header.
+    let capturing = render_to_string(&app, 100, 40);
+    assert!(
+        capturing.contains("F9"),
+        "the pending chord shows: {capturing}"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(!app.keybinding_editor.as_ref().unwrap().is_capturing());
+
+    // The live resolver now maps F9 to ToggleMinimap and no longer maps Alt+r.
+    assert_eq!(
+        app.keymap.lookup(KeyCode::F(9), KeyModifiers::NONE),
+        Some(target),
+        "the rebind took effect on the live resolver"
+    );
+    assert_ne!(
+        app.keymap.lookup(KeyCode::Char('r'), KeyModifiers::ALT),
+        Some(target),
+        "the old binding no longer resolves to the action"
+    );
+    // It was persisted to the scoped home.
+    let saved = std::fs::read_to_string(_home.keybindings_path()).expect("file written");
+    assert!(saved.contains("toggle_minimap"), "slug persisted: {saved}");
+    assert!(saved.contains("F9"), "spec persisted: {saved}");
+}
+
+#[tokio::test]
+async fn keybinding_editor_capture_esc_cancels_without_rebinding() {
+    let _home = ScopedHome::new();
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(&mut app, &mut agent, keybinding_editor_key())
+        .await
+        .unwrap();
+    let before = app.keymap.binding(keymap::Action::ToggleConfigScreen);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    // Esc cancels the capture (not the editor — it is still open).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.keybinding_editor.is_some(),
+        "Esc in capture cancels the capture, not the editor"
+    );
+    assert!(!app.keybinding_editor.as_ref().unwrap().is_capturing());
+    assert_eq!(
+        app.keymap.binding(keymap::Action::ToggleConfigScreen),
+        before,
+        "no rebind happened"
+    );
+}
+
+#[tokio::test]
+async fn keybinding_editor_warns_on_conflict_in_the_surface() {
+    let _home = ScopedHome::new();
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(&mut app, &mut agent, keybinding_editor_key())
+        .await
+        .unwrap();
+
+    // Capture a chord already bound to another action (Ctrl+T → transcript overlay)
+    // for the first row, and confirm the surface warns about the collision.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .unwrap();
+    let out = render_to_string(&app, 100, 40);
+    assert!(
+        out.contains("CONFLICTS"),
+        "the conflict warning paints: {out}"
+    );
+    assert!(
+        out.contains(keymap::Action::ToggleTranscriptOverlay.slug()),
+        "the conflicting action is named: {out}"
+    );
+}
+
+#[tokio::test]
+async fn keybinding_editor_refuses_a_reserved_recovery_chord() {
+    let _home = ScopedHome::new();
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(&mut app, &mut agent, keybinding_editor_key())
+        .await
+        .unwrap();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    // Capture Ctrl+C — a reserved recovery key. (Esc cannot be captured because it
+    // cancels the capture; Ctrl+C and Ctrl+D reach the capture path.)
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .unwrap();
+    let out = render_to_string(&app, 100, 40);
+    assert!(
+        out.contains("reserved"),
+        "the reserved warning paints: {out}"
+    );
+
+    // A commit press is refused — still capturing, no rebind.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.keybinding_editor.as_ref().unwrap().is_capturing(),
+        "a reserved chord cannot be committed"
+    );
+}
+
+#[tokio::test]
+async fn keybinding_editor_reset_reverts_an_override() {
+    let _home = ScopedHome::new();
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(&mut app, &mut agent, keybinding_editor_key())
+        .await
+        .unwrap();
+
+    // Rebind the first row (ToggleConfigScreen) onto F9, then reset it.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.keymap.lookup(KeyCode::F(9), KeyModifiers::NONE),
+        Some(keymap::Action::ToggleConfigScreen),
+    );
+
+    // r resets the selected row back to its default (F11).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.keymap
+            .binding(keymap::Action::ToggleConfigScreen)
+            .display(),
+        "F11",
+        "reset restores the default binding on the live resolver"
+    );
+    assert_ne!(
+        app.keymap.lookup(KeyCode::F(9), KeyModifiers::NONE),
+        Some(keymap::Action::ToggleConfigScreen),
+    );
+}
+
+#[tokio::test]
+async fn keybinding_editor_click_selects_and_button_begins_capture() {
+    let _home = ScopedHome::new();
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(&mut app, &mut agent, keybinding_editor_key())
+        .await
+        .unwrap();
+
+    // Render so the rows + buttons register their click targets, then click an
+    // early (always-visible) row to move the cursor onto it. `ToggleTaskPanel`
+    // sits near the top of the list so it is within the windowed view at 100x40.
+    let target = keymap::Action::ToggleTaskPanel;
+    let buffer = render_full_to_buffer(&app, 100, 40);
+    let (x, y) = find_text_cell(&buffer, target.slug()).expect("row painted");
+    let consumed = handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    assert!(consumed, "the row click is consumed");
+    assert_eq!(
+        app.keybinding_editor
+            .as_ref()
+            .unwrap()
+            .selected_row()
+            .unwrap()
+            .action,
+        target,
+        "the click selected the clicked action's row"
+    );
+
+    // Click the Rebind button — it begins capturing for the selected row.
+    let buffer = render_full_to_buffer(&app, 100, 40);
+    let (bx, by) = find_text_cell(&buffer, "Rebind").expect("button painted");
+    handle_mouse(&mut app, left_down(bx, by, KeyModifiers::NONE));
+    assert!(
+        app.keybinding_editor.as_ref().unwrap().is_capturing(),
+        "clicking Rebind begins capture"
+    );
+}
+
+#[tokio::test]
+async fn keybinding_editor_survives_tiny_and_resized_frames() {
+    let _home = ScopedHome::new();
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(&mut app, &mut agent, keybinding_editor_key())
+        .await
+        .unwrap();
+    // The overlay clamps to the area and never panics across a range of sizes,
+    // including a frame too small to show the modal interior.
+    for (w, h) in [(4u16, 2u16), (10, 4), (40, 12), (100, 40), (160, 50)] {
+        let out = render_to_string(&app, w, h);
+        if w >= 40 && h >= 12 {
+            assert!(
+                out.contains("Keybindings"),
+                "title paints at {w}x{h}: {out}"
+            );
+        }
+    }
+}

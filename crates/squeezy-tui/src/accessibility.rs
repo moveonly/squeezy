@@ -777,6 +777,14 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // `ToggleMacroRecord` (Ctrl+Alt+K default), which drives the same
         // `toggle_macro_record` handler. Reachable without a mouse.
         A::MacroToggleRecord => KeyboardPath::Keymap(Action::ToggleMacroRecord),
+        // Keybinding Editor UI (§12.7.1) — while the editor is open its own key
+        // handler owns ↑↓/kj (move the action cursor), Enter (begin capturing a new
+        // chord for the selected row), and r/Delete (reset the row to its default)
+        // before the global keymap sees them, so a row click and the Rebind/Reset
+        // button clicks reach the same handlers their keyboard verbs drive.
+        A::KeybindingSelect(_) => KeyboardPath::Always("keybinding editor ↑↓"),
+        A::KeybindingRebind => KeyboardPath::Always("keybinding editor Enter"),
+        A::KeybindingReset => KeyboardPath::Always("keybinding editor r/Delete"),
     })
 }
 

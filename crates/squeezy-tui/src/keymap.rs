@@ -440,6 +440,17 @@ pub(crate) enum Action {
     /// Visible (a progress strip) and cancellable (Esc / the record toggle). A
     /// no-op when no macro has been recorded yet; costs nothing until pressed.
     ReplayMacro,
+    /// Open / close the Keybinding Editor UI overlay (`Ctrl+Alt+B` default;
+    /// §12.7.1). An interactive view of every rebindable action with its current
+    /// binding, override flag, and terminal-compat note — sourced straight from
+    /// this `Action` registry and the live `KeymapResolver` so it lists exactly
+    /// what the TUI dispatches. The cursor (↑↓/kj, Home/End/PageUp/PageDown)
+    /// selects a row; Enter (or a click) captures the next chord as the new
+    /// binding, warning on a collision and refusing a reserved recovery key
+    /// (`Ctrl+C`/`Esc`/`Ctrl+D`); `r`/Delete resets a row to its default. Commits
+    /// persist to `~/.squeezy/keybindings.toml` and rebuild the resolver live. The
+    /// overlay does not exist until opened, so an idle session pays nothing.
+    ToggleKeybindingEditor,
 }
 
 impl Action {
@@ -519,6 +530,7 @@ impl Action {
             Self::ToggleTemplates => "toggle_templates",
             Self::ToggleMacroRecord => "toggle_macro_record",
             Self::ReplayMacro => "replay_macro",
+            Self::ToggleKeybindingEditor => "toggle_keybinding_editor",
         }
     }
 
@@ -597,6 +609,7 @@ impl Action {
         Action::ToggleTemplates,
         Action::ToggleMacroRecord,
         Action::ReplayMacro,
+        Action::ToggleKeybindingEditor,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -793,6 +806,11 @@ impl Action {
             // `Ctrl+Alt+P`/`Ctrl+Alt+T` chords above.
             | Self::ToggleMacroRecord
             | Self::ReplayMacro
+            // Keybinding Editor UI (§12.7.1): the overlay toggle is `Ctrl+Alt+B`
+            // — a Ctrl+Alt (Meta) chord, the same classically-unreliable encoding
+            // across Linux terminals, tmux, and SSH as the `Ctrl+Alt+K`/
+            // `Ctrl+Alt+J`/`Ctrl+Alt+T` chords above.
+            | Self::ToggleKeybindingEditor
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1135,6 +1153,16 @@ impl Action {
             ),
             Self::ReplayMacro => KeyBinding::new(
                 KeyCode::Char('j'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Keybinding Editor UI (§12.7.1). `Ctrl+Alt+B` — `B` recalls
+            // "Bindings" and follows the existing `Ctrl+Alt+letter` style
+            // (`Ctrl+Alt+L`/`M`/`P`/`S`/`A`/`H`/`R`/`N`/`T`/`K`/`J`). It is free:
+            // bare `Alt+b` is the session-bundle build verb, so the Ctrl+Alt
+            // modifier keeps the editor distinct from it while staying clear of
+            // every composer chord.
+            Self::ToggleKeybindingEditor => KeyBinding::new(
+                KeyCode::Char('b'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }
