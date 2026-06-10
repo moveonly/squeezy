@@ -24002,6 +24002,343 @@ async fn theme_editor_survives_tiny_and_resized_frames() {
 }
 
 // =====================================================================
+// §12.7.4 Per-Workspace UI Profile.
+// End-to-end through the real `render()` capture-sink: the keyboard path
+// (Ctrl+Alt+W open, ↑↓ navigate, s save, r restore, x reset, Esc close),
+// the mouse path (click a field row), an empty/idle case, restore-on-
+// launch applying a saved profile, and a resize where the modal paints.
+// =====================================================================
+
+/// `Ctrl+Alt+W`: open / close the Workspace UI Profile overlay.
+fn workspace_profile_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('w'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// Serialize the workspace-profile tests that mutate the process-global
+/// `SQUEEZY_UI_PROFILE_DIR` so concurrent runs don't clobber each other.
+static WORKSPACE_PROFILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Pin the per-workspace profile store to a fresh scratch dir and point the app
+/// at a fresh scratch workspace root, returning the guard plus the workspace root.
+/// The guard restores the prior env on drop and removes the scratch tree.
+struct ScopedWorkspaceProfile {
+    previous: Option<std::ffi::OsString>,
+    dir: PathBuf,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedWorkspaceProfile {
+    fn new(app: &mut TuiApp, name: &str) -> Self {
+        let lock = WORKSPACE_PROFILE_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = temp_workspace(&format!("ui_profile_store_{name}"));
+        let previous = std::env::var_os(crate::workspace_profile::PROFILE_DIR_ENV);
+        // SAFETY: the global mutex above serialises this env mutation.
+        unsafe { std::env::set_var(crate::workspace_profile::PROFILE_DIR_ENV, &dir) };
+        // Each test gets a distinct workspace root so their profile files never
+        // collide on the shared store dir.
+        app.workspace_root = temp_workspace(&format!("ui_profile_root_{name}"));
+        Self {
+            previous,
+            dir,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for ScopedWorkspaceProfile {
+    fn drop(&mut self) {
+        // SAFETY: see `new`.
+        match self.previous.take() {
+            Some(value) => unsafe {
+                std::env::set_var(crate::workspace_profile::PROFILE_DIR_ENV, value)
+            },
+            None => unsafe { std::env::remove_var(crate::workspace_profile::PROFILE_DIR_ENV) },
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[tokio::test]
+async fn workspace_profile_opens_and_paints_fields_through_real_render() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let _scope = ScopedWorkspaceProfile::new(&mut app, "open");
+
+    // Idle: the modal is not painted.
+    let idle = render_to_string(&app, 100, 30);
+    assert!(
+        !idle.contains("Workspace UI profile"),
+        "idle session paints no workspace profile overlay: {idle}"
+    );
+
+    handle_key(&mut app, &mut agent, workspace_profile_key())
+        .await
+        .unwrap();
+    assert!(
+        app.workspace_profile.is_some(),
+        "Ctrl+Alt+W opens the overlay"
+    );
+
+    let open = render_to_string(&app, 100, 30);
+    assert!(
+        open.contains("Workspace UI profile"),
+        "the modal title paints: {open}"
+    );
+    // Each remembered field's label appears in the list.
+    assert!(open.contains("Density"), "field list shows Density: {open}");
+    assert!(
+        open.contains("Transcript detail"),
+        "field list shows Transcript detail: {open}"
+    );
+    assert!(open.contains("Minimap"), "field list shows Minimap: {open}");
+    assert!(open.contains("Theme"), "field list shows Theme: {open}");
+    // The header reports where the profile is stored (the projects-relative
+    // source hint). The exact id/file suffix may be clipped by the modal width on
+    // a long scratch workspace name, so assert on the stable prefix.
+    assert!(
+        open.contains("stored at") && open.contains("projects/"),
+        "the header reports the source path: {open}"
+    );
+}
+
+#[tokio::test]
+async fn workspace_profile_save_persists_live_ui_and_reset_forgets_it() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let _scope = ScopedWorkspaceProfile::new(&mut app, "save");
+
+    // Set a distinctive live UI state.
+    app.tool_output_verbosity = ToolOutputVerbosity::Verbose;
+    app.transcript_default = TranscriptDefault::Expanded;
+    app.show_minimap = true;
+
+    handle_key(&mut app, &mut agent, workspace_profile_key())
+        .await
+        .unwrap();
+    // Save the live UI to this workspace's profile.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.status.contains("saved"),
+        "save reports success: {}",
+        app.status
+    );
+
+    // The file lands in the store, keyed by the workspace root, NOT inside the repo.
+    let path = crate::workspace_profile::profile_path(&app.workspace_root);
+    assert!(
+        path.exists(),
+        "the profile file was written: {}",
+        path.display()
+    );
+    assert!(
+        !path.starts_with(&app.workspace_root),
+        "the profile must not live inside the workspace: {}",
+        path.display()
+    );
+    let saved = crate::workspace_profile::load(&app.workspace_root);
+    assert_eq!(saved.density, Some(ToolOutputVerbosity::Verbose));
+    assert_eq!(saved.transcript_detail, Some(TranscriptDefault::Expanded));
+    assert_eq!(saved.minimap, Some(true));
+
+    // Reset forgets the profile (removes the file) without reverting the live UI.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.status.contains("forgot"),
+        "reset reports it: {}",
+        app.status
+    );
+    assert!(!path.exists(), "reset removed the profile file");
+    assert!(
+        crate::workspace_profile::load(&app.workspace_root).is_empty(),
+        "a reset workspace remembers nothing"
+    );
+}
+
+#[tokio::test]
+async fn workspace_profile_restore_applies_a_saved_profile_to_the_running_session() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let _scope = ScopedWorkspaceProfile::new(&mut app, "restore");
+
+    // Persist a profile that differs from the live state.
+    let saved = crate::workspace_profile::UiProfile::new(
+        ToolOutputVerbosity::Verbose,
+        TranscriptDefault::Expanded,
+        true,
+        agent.config_snapshot().tui.theme.clone(),
+    );
+    crate::workspace_profile::save(&app.workspace_root, &saved).expect("save");
+
+    // The live state starts elsewhere.
+    app.tool_output_verbosity = ToolOutputVerbosity::Compact;
+    app.show_minimap = false;
+
+    handle_key(&mut app, &mut agent, workspace_profile_key())
+        .await
+        .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+
+    // Restore applied the saved values onto the running app + agent config.
+    assert_eq!(app.tool_output_verbosity, ToolOutputVerbosity::Verbose);
+    assert!(app.show_minimap, "restore re-showed the minimap");
+    assert_eq!(
+        agent.config_snapshot().tui.tool_output_verbosity,
+        ToolOutputVerbosity::Verbose,
+        "the agent config mirrors the restored density",
+    );
+    assert!(
+        app.status.contains("restored"),
+        "status reports it: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn workspace_profile_restore_on_launch_applies_the_saved_profile() {
+    // The startup hook (`restore_workspace_profile`) reads the saved profile and
+    // applies it before the first paint.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let _scope = ScopedWorkspaceProfile::new(&mut app, "launch");
+
+    let saved = crate::workspace_profile::UiProfile::new(
+        ToolOutputVerbosity::Verbose,
+        TranscriptDefault::Expanded,
+        true,
+        agent.config_snapshot().tui.theme.clone(),
+    );
+    crate::workspace_profile::save(&app.workspace_root, &saved).expect("save");
+
+    app.tool_output_verbosity = ToolOutputVerbosity::Compact;
+    app.show_minimap = false;
+
+    restore_workspace_profile(&mut app, &mut agent);
+
+    assert_eq!(
+        app.tool_output_verbosity,
+        ToolOutputVerbosity::Verbose,
+        "launch restore re-applied the saved density",
+    );
+    assert!(app.show_minimap, "launch restore re-showed the minimap");
+}
+
+#[tokio::test]
+async fn workspace_profile_keyboard_navigation_and_esc_close() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let _scope = ScopedWorkspaceProfile::new(&mut app, "nav");
+
+    handle_key(&mut app, &mut agent, workspace_profile_key())
+        .await
+        .unwrap();
+    assert_eq!(app.workspace_profile.as_ref().unwrap().field_index(), 0);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.workspace_profile.as_ref().unwrap().field_index(),
+        1,
+        "Down moves the field focus",
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.workspace_profile.is_none(), "Esc closes the overlay");
+}
+
+#[tokio::test]
+async fn workspace_profile_clicking_a_field_row_focuses_it() {
+    // Mouse parity: a left click on a painted field row focuses that field, the
+    // same as moving down with ↑↓.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let _scope = ScopedWorkspaceProfile::new(&mut app, "click");
+
+    handle_key(&mut app, &mut agent, workspace_profile_key())
+        .await
+        .unwrap();
+
+    // Render so the field rows register their click targets, then resolve the
+    // third field's row rect and click it.
+    let _ = render_to_string(&app, 100, 30);
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::WorkspaceProfileField(2),
+        ))
+        .expect("field row 2 registered a click target");
+    let consumed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(consumed, "the click on a field row is consumed");
+    assert_eq!(
+        app.workspace_profile.as_ref().unwrap().field_index(),
+        2,
+        "clicking field row 2 focused it",
+    );
+}
+
+#[tokio::test]
+async fn workspace_profile_survives_tiny_and_resized_frames() {
+    // Edge / resize case: the modal clamps to a tiny frame and never panics, and
+    // paints its title once it has room.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let _scope = ScopedWorkspaceProfile::new(&mut app, "resize");
+
+    handle_key(&mut app, &mut agent, workspace_profile_key())
+        .await
+        .unwrap();
+    for (w, h) in [(4u16, 2u16), (12, 4), (30, 10), (120, 40)] {
+        let out = render_to_string(&app, w, h);
+        if w >= 40 {
+            assert!(
+                out.contains("Workspace UI profile"),
+                "title paints at {w}x{h}: {out}"
+            );
+        }
+    }
+}
+
+// =====================================================================
 // §12.1.6 Multi-Cursor-Like Transcript Selection.
 // End-to-end through `handle_key` (Alt+d add, Ctrl+Alt+Y combined copy),
 // `handle_mouse` (modifier-click add/toggle), the real `render()`

@@ -170,6 +170,7 @@ mod transcript_relations;
 mod transcript_surface;
 mod turn_outline;
 mod wide_block;
+mod workspace_profile;
 // Visual Diff Dashboard (§12.10.4). `cfg(test)`-gated so the dev-only cell-grid
 // diff / HTML-artifact harness never compiles into a shipped TUI binary; every
 // item is exercised by its sibling `visual_diff_tests.rs`, so the module
@@ -893,6 +894,13 @@ async fn run_inner_with_terminal(
         let _ = repo_status_tx.send(RepoStatus::detect_at(&repo_status_root));
     });
     app.repo_status_rx = Some(repo_status_rx);
+    // Per-Workspace UI Profile (§12.7.4): restore the UI preferences remembered
+    // for this workspace path (density, transcript detail, minimap pane, theme)
+    // before the first paint, so the session opens exactly as the user left it
+    // here. A workspace that has never been customized remembers nothing and this
+    // is a no-op; a malformed/newer-schema profile loads as empty and never blocks
+    // launch.
+    restore_workspace_profile(&mut app, &mut agent);
     if let Some(banner) = update_banner.filter(|s| !s.trim().is_empty()) {
         app.push_log(banner);
     }
@@ -1827,6 +1835,9 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         // The Theme Editor overlay (§12.7.2) is modal: block a quick session
         // switch while it owns the surface, like every other overlay above.
         || app.theme_editor.is_some()
+        // The Per-Workspace UI Profile overlay (§12.7.4) is modal: block a quick
+        // session switch while it owns the surface, like every other overlay above.
+        || app.workspace_profile.is_some()
         // While a macro is recording or replaying (§12.3.7) a quick session
         // switch would derail the in-flight workflow, so block it like every
         // other modal/overlay context above.
@@ -2611,6 +2622,28 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             dispatch_click_action(app, action);
         }
         // Pane is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Per-Workspace UI Profile overlay (§12.7.4) owns the pointer while open: a
+    // left-click on a field row focuses that row (the mouse twin of ↑↓). Every
+    // other click is swallowed so a stray press can't fall through to the surface
+    // beneath. Hit-tested in ABSOLUTE screen coordinates against the targets
+    // `render_workspace_profile_surface` registered this frame.
+    if app.workspace_profile.is_some() {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((interaction::TargetKey::Chrome(key), action)) =
+                app.click_target_at(mouse.column, mouse.row)
+            && matches!(key, interaction::ChromeKey::WorkspaceProfileField(_))
+            && let interaction::Action::WorkspaceProfileSelectField(index) = action
+        {
+            if let Some(state) = app.workspace_profile.as_mut() {
+                state.focus_field(index);
+            }
+            app.status = workspace_profile_status(app);
+            app.needs_redraw = true;
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
         return true;
     }
 
@@ -4694,6 +4727,206 @@ fn theme_editor_reset(app: &mut TuiApp, agent: &mut Agent) {
     app.needs_redraw = true;
 }
 
+// ===========================================================================
+// Per-Workspace UI Profile (§12.7.4)
+// ===========================================================================
+
+/// Capture the live UI preferences this feature remembers — transcript/tool
+/// density, transcript detail default, minimap pane visibility, and the active
+/// theme — into a [`workspace_profile::UiProfile`] for persistence. Reads only
+/// in-memory app state, so it never touches the agent or the filesystem.
+fn capture_workspace_profile(app: &TuiApp, agent: &Agent) -> workspace_profile::UiProfile {
+    workspace_profile::UiProfile::new(
+        app.tool_output_verbosity,
+        app.transcript_default,
+        app.show_minimap,
+        agent.config_snapshot().tui.theme.clone(),
+    )
+}
+
+/// Apply a loaded [`workspace_profile::UiProfile`] onto the running app + agent
+/// config. Each remembered (`Some`) field is applied through the same in-memory
+/// knobs the runtime `/verbosity`, transcript-default, minimap-toggle, and
+/// `/theme` paths use; an unremembered (`None`) field is left untouched so a
+/// partial profile never clobbers a knob the user did not customize here. The
+/// theme override also re-applies the runtime palette so the change shows
+/// immediately. Returns the count of fields applied (for the status line / tests).
+fn apply_workspace_profile(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    profile: &workspace_profile::UiProfile,
+) -> usize {
+    let mut applied = 0usize;
+    let mut next = agent.config_snapshot();
+    let mut config_dirty = false;
+
+    if let Some(density) = profile.density {
+        app.tool_output_verbosity = density;
+        next.tui.tool_output_verbosity = density;
+        config_dirty = true;
+        applied += 1;
+    }
+    if let Some(detail) = profile.transcript_detail {
+        app.transcript_default = detail;
+        next.tui.transcript_default = detail;
+        config_dirty = true;
+        applied += 1;
+    }
+    if let Some(minimap) = profile.minimap {
+        app.show_minimap = minimap;
+        applied += 1;
+    }
+    if let Some(theme) = &profile.theme {
+        // Only honour a theme name the active config actually knows, so a stale
+        // profile pointing at a since-removed theme can't blank the palette.
+        if render::theme::theme_exists(&next, theme) {
+            next.tui.theme = theme.clone();
+            config_dirty = true;
+            applied += 1;
+        }
+    }
+
+    if config_dirty {
+        apply_theme_overrides(&next);
+        agent.replace_config(next);
+    }
+    if applied > 0 {
+        app.needs_redraw = true;
+    }
+    applied
+}
+
+/// Restore the saved per-workspace UI profile at launch (§12.7.4). Loads the
+/// profile keyed by the workspace root and applies it; a workspace with no saved
+/// profile is a no-op. Called once from the run loop before the first paint.
+fn restore_workspace_profile(app: &mut TuiApp, agent: &mut Agent) {
+    let profile = workspace_profile::load(&app.workspace_root);
+    if profile.is_empty() {
+        return;
+    }
+    let applied = apply_workspace_profile(app, agent, &profile);
+    if applied > 0 {
+        app.status = format!("restored workspace UI profile ({applied} setting(s))");
+    }
+}
+
+/// `Ctrl+Alt+W`: open / close the Per-Workspace UI Profile overlay (§12.7.4).
+/// Opening resolves the workspace's source label for the header. Sets
+/// `needs_redraw` so the toggle paints immediately, but leaves the idle redraw
+/// cadence untouched once settled.
+fn toggle_workspace_profile(app: &mut TuiApp) {
+    if app.workspace_profile.is_some() {
+        app.workspace_profile = None;
+        app.status = "workspace profile closed".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    let label = workspace_profile::source_label(&app.workspace_root);
+    app.workspace_profile = Some(workspace_profile::WorkspaceProfileState::new(label));
+    app.status = workspace_profile_status(app);
+    app.needs_redraw = true;
+}
+
+/// The status line shown while the Workspace UI Profile overlay is open: the
+/// focused field and the in-overlay verb legend.
+fn workspace_profile_status(app: &TuiApp) -> String {
+    let Some(state) = app.workspace_profile.as_ref() else {
+        return "workspace profile closed".to_string();
+    };
+    format!(
+        "workspace profile: {} — \u{2191}\u{2193} field \u{00b7} s save live \u{00b7} r restore saved \u{00b7} x reset \u{00b7} Esc close",
+        state.current_field().label(),
+    )
+}
+
+/// Handle a key while the Workspace UI Profile overlay (§12.7.4) is open. Returns
+/// `true` when the key was consumed (so it never leaks to the composer or the
+/// global keymap while the overlay owns focus). The overlay is modal: its own
+/// toggle chord and Esc close; ↑/↓ (and k/j) move the field focus; `s` saves the
+/// LIVE preferences to the workspace profile; `r` restores the SAVED profile onto
+/// the running session; `x`/Delete resets (forgets) the workspace profile.
+fn handle_workspace_profile_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
+    if app.workspace_profile.is_none() {
+        return false;
+    }
+    // The overlay's own toggle chord closes it (the same key opens and closes).
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::OpenWorkspaceProfile) {
+        toggle_workspace_profile(app);
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => toggle_workspace_profile(app),
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(state) = app.workspace_profile.as_mut() {
+                state.focus_prev();
+            }
+            app.status = workspace_profile_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(state) = app.workspace_profile.as_mut() {
+                state.focus_next();
+            }
+            app.status = workspace_profile_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Char('s') => workspace_profile_save(app, agent),
+        KeyCode::Char('r') => workspace_profile_restore(app, agent),
+        KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => workspace_profile_reset(app),
+        _ => {}
+    }
+    // The overlay is modal: swallow every key so nothing leaks to the composer
+    // beneath, even keys it does not act on.
+    true
+}
+
+/// Save the LIVE UI preferences to this workspace's profile (§12.7.4). Captures
+/// the current app state and persists it under the Squeezy projects state dir,
+/// keyed by the workspace root — never inside the repo. A failure surfaces in the
+/// status line.
+fn workspace_profile_save(app: &mut TuiApp, agent: &Agent) {
+    let profile = capture_workspace_profile(app, agent);
+    match workspace_profile::save(&app.workspace_root, &profile) {
+        Ok(_) => {
+            app.status = "✓ saved current UI to this workspace's profile".to_string();
+        }
+        Err(err) => {
+            app.status = format!("workspace profile save failed: {err}");
+        }
+    }
+    app.needs_redraw = true;
+}
+
+/// Restore the SAVED workspace profile onto the running session (§12.7.4) — the
+/// keyboard twin of relaunching in this workspace. A workspace with no saved
+/// profile reports so and changes nothing.
+fn workspace_profile_restore(app: &mut TuiApp, agent: &mut Agent) {
+    let profile = workspace_profile::load(&app.workspace_root);
+    if profile.is_empty() {
+        app.status = "no saved profile for this workspace yet".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    let applied = apply_workspace_profile(app, agent, &profile);
+    app.status = format!("restored workspace UI profile ({applied} setting(s))");
+    app.needs_redraw = true;
+}
+
+/// Reset (forget) this workspace's saved UI profile (§12.7.4). Removes the
+/// on-disk file so a future launch falls back to the global config defaults. Does
+/// not revert the live session — the user keeps whatever they have on screen now.
+fn workspace_profile_reset(app: &mut TuiApp) {
+    match workspace_profile::clear(&app.workspace_root) {
+        Ok(()) => {
+            app.status = "forgot this workspace's saved UI profile".to_string();
+        }
+        Err(err) => {
+            app.status = format!("workspace profile reset failed: {err}");
+        }
+    }
+    app.needs_redraw = true;
+}
+
 /// Handle a key while the Prompt Templates picker (§12.3.6) is open. Returns
 /// `true` when the key was consumed (so it never leaks to the composer or the
 /// global keymap). Two modes:
@@ -5593,6 +5826,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
+    // The Per-Workspace UI Profile overlay (§12.7.4) is modal while open: it owns
+    // the keyboard (↑↓/kj move the field focus, s save live, r restore saved, x/
+    // Delete reset, Esc/Ctrl+Alt+W close) BEFORE any selection-clear, search,
+    // chord, or keymap dispatch, so a stray key never leaks into the composer
+    // underneath. Sits beside the other front-of-loop overlays for the same reason.
+    if app.workspace_profile.is_some() && handle_workspace_profile_key(app, agent, key) {
+        return Ok(false);
+    }
+
     // The Entry Annotations overlay (§12.2.5) is modal while open: it owns the
     // keyboard (↑↓/kj/n/p move the annotation cursor, Enter jump, e edit, d/Delete
     // delete, Esc/Alt+\ close — or, in edit mode, free text compose) BEFORE any
@@ -6165,6 +6407,12 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
     // swallows paste entirely rather than letting it leak into the composer
     // beneath. The user adjusts colours with the keyboard/mouse, never by pasting.
     if app.theme_editor.is_some() {
+        return Ok(());
+    }
+    // The Per-Workspace UI Profile overlay (§12.7.4) is modal and has no text
+    // field, so it swallows paste entirely rather than letting it leak into the
+    // composer beneath.
+    if app.workspace_profile.is_some() {
         return Ok(());
     }
     // The Scratchpad Pane (§12.3.3) owns text input while open: a paste lands in
@@ -7657,6 +7905,17 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
                 return false;
             }
             toggle_theme_editor(app, agent);
+            true
+        }
+        keymap::Action::OpenWorkspaceProfile => {
+            // §12.7.4: open / close the Per-Workspace UI Profile overlay.
+            // Main-surface verb; the config/setup screens own their own routing,
+            // and the Ctrl+T overlay guard above already blocks this while the
+            // overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_workspace_profile(app);
             true
         }
     }
@@ -10004,6 +10263,7 @@ fn first_run_hint_suppressed(app: &TuiApp) -> bool {
         || app.breadcrumbs_open
         || app.editor_handoff.is_some()
         || app.theme_editor.is_some()
+        || app.workspace_profile.is_some()
 }
 
 /// Handle a key while the Universal Command Palette (§12.1.1) is open. Returns
@@ -13802,6 +14062,12 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // the accessibility audit's exhaustiveness holds.
         interaction::Action::ThemeEditorSelectRole(_)
         | interaction::Action::ThemeEditorSetChannel(_, _) => {}
+        // §12.7.4: the workspace-profile overlay's own mouse handler in
+        // `handle_mouse` short-circuits this target while the overlay is open, so
+        // this arm is unreachable in practice. It exists so every
+        // `interaction::Action` has a dispatch arm and the accessibility audit's
+        // exhaustiveness holds.
+        interaction::Action::WorkspaceProfileSelectField(_) => {}
     }
 }
 
@@ -19978,6 +20244,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_theme_editor_surface(frame, area, app, state);
         return;
     }
+    // The Per-Workspace UI Profile overlay (§12.7.4) paints as a fullscreen modal
+    // over the main surface while open, registering its per-field click targets
+    // every frame. Checked before the config screen so its targets register and it
+    // owns the surface while open.
+    if let Some(state) = &app.workspace_profile {
+        render_workspace_profile_surface(frame, area, app, state);
+        return;
+    }
     if let Some(state) = &app.config_screen {
         config_screen::render(frame, area, state);
         return;
@@ -22213,6 +22487,152 @@ fn render_theme_editor_panel(
             interaction::Action::ThemeEditorSetChannel(channel_index, value),
         );
         y = y.saturating_add(1);
+    }
+}
+
+/// Build the display [`workspace_profile::UiProfile`] for the overlay from the
+/// LIVE app state plus the runtime theme name. Render-only and agent-free, so the
+/// overlay shows the current on-screen preferences without a config snapshot.
+fn workspace_profile_live(app: &TuiApp) -> workspace_profile::UiProfile {
+    workspace_profile::UiProfile::new(
+        app.tool_output_verbosity,
+        app.transcript_default,
+        app.show_minimap,
+        render::theme::current_theme_name(),
+    )
+}
+
+/// Paint the Per-Workspace UI Profile overlay (§12.7.4) as a centered modal: a
+/// header naming where the profile is stored, a list of the remembered fields
+/// (density, transcript detail, minimap pane, theme) with their LIVE values (the
+/// focused one marked), and a footer with the verb legend. Each field row
+/// registers a [`interaction::ChromeKey::WorkspaceProfileField`] click target so a
+/// click focuses it (the mouse twin of ↑↓). Reads only the live app state, so
+/// painting is constant-time and does no transcript walk.
+fn render_workspace_profile_surface(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    state: &workspace_profile::WorkspaceProfileState,
+) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Workspace UI profile ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} remembered per workspace ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 72, 16, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Header: where this workspace's profile is stored (source label).
+    let header = Line::from(vec![
+        Span::styled(
+            "stored at ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+        Span::styled(
+            state.source_label().to_string(),
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    let live = workspace_profile_live(app);
+    let focused = state.field_index();
+    let rows_top = inner.y.saturating_add(2);
+    let rows_avail = inner
+        .y
+        .saturating_add(inner.height)
+        .saturating_sub(rows_top)
+        .saturating_sub(1); // reserve the last inner row for the footer legend
+    let value_col = inner.x.saturating_add(20).min(inner.x + inner.width);
+
+    for (index, field) in workspace_profile::FIELDS
+        .iter()
+        .enumerate()
+        .take(rows_avail as usize)
+    {
+        let is_focused = index == focused;
+        let row_rect = Rect {
+            x: inner.x,
+            y: rows_top + index as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let marker = if is_focused { "\u{203a} " } else { "  " };
+        let label_style = if is_focused {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let label_line = Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_focused {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(field.label(), label_style),
+        ]);
+        frame.render_widget(Paragraph::new(label_line), row_rect);
+
+        // The current live value, painted in a fixed value column.
+        if value_col < inner.x.saturating_add(inner.width) {
+            let value_rect = Rect {
+                x: value_col,
+                y: row_rect.y,
+                width: inner
+                    .x
+                    .saturating_add(inner.width)
+                    .saturating_sub(value_col),
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    field.value_str(&live),
+                    Style::default().fg(crate::render::theme::foreground()),
+                ))),
+                value_rect,
+            );
+        }
+
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::WorkspaceProfileField(index)),
+            interaction::Action::WorkspaceProfileSelectField(index),
+        );
+    }
+
+    // Footer: the in-overlay verb legend on the last inner row.
+    let footer_y = inner.y.saturating_add(inner.height).saturating_sub(1);
+    if footer_y >= rows_top {
+        let footer_rect = Rect {
+            x: inner.x,
+            y: footer_y,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "\u{2191}\u{2193} field \u{00b7} s save live \u{00b7} r restore saved \u{00b7} x reset \u{00b7} Esc close",
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            footer_rect,
+        );
     }
 }
 
@@ -36748,6 +37168,15 @@ pub(crate) struct TuiApp {
     /// override to the runtime theme immediately; a commit persists it to the
     /// user-scope config.
     pub(crate) theme_editor: Option<theme_editor::ThemeEditorState>,
+    /// Per-Workspace UI Profile (§12.7.4): the workspace UI-profile overlay, or
+    /// `None` when closed (the resting state, which paints nothing extra and
+    /// schedules no redraw). `Some` = the fullscreen overlay owns key/mouse routing
+    /// for viewing/saving/restoring/resetting the UI preferences (density,
+    /// transcript detail, minimap pane, theme) remembered for the current
+    /// workspace path. Opened by the `OpenWorkspaceProfile` keymap action. The
+    /// profile itself is persisted under the Squeezy projects state dir, keyed by
+    /// the resolved workspace root, never inside the repo.
+    pub(crate) workspace_profile: Option<workspace_profile::WorkspaceProfileState>,
     /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
     /// keyed by stable entry id and grouped by category (user turns, tool calls,
     /// errors, …). Rebuilt incrementally — only when the transcript's
@@ -37656,6 +38085,7 @@ impl TuiApp {
             macro_recorder: macros::MacroRecorder::new(),
             keybinding_editor: None,
             theme_editor: None,
+            workspace_profile: None,
             transcript_index: transcript_index::TranscriptIndex::new(),
             transcript_index_open: false,
             transcript_index_selected: 0,

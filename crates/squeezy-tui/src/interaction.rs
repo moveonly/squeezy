@@ -250,6 +250,10 @@ pub(crate) enum ChromeKey {
     /// 0-based channel index (0=R, 1=G, 2=B) so a click on a point along the bar
     /// focuses that channel and sets its value to the clicked position.
     ThemeEditorChannel(usize),
+    /// A field row in the Per-Workspace UI Profile overlay (§12.7.4), keyed by its
+    /// 0-based index in the overlay's field list so a click focuses exactly that
+    /// row (the mouse twin of ↑↓).
+    WorkspaceProfileField(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -524,6 +528,10 @@ pub(crate) enum Action {
     /// focusing a channel with ←→ and nudging it with +/- to the same value, with
     /// the same live preview.
     ThemeEditorSetChannel(usize, u8),
+    /// Focus the given field row (by 0-based index in the overlay's field list) in
+    /// the Per-Workspace UI Profile overlay (§12.7.4). Mouse twin of moving the
+    /// field focus with ↑↓; a click on a row selects it.
+    WorkspaceProfileSelectField(usize),
 }
 
 impl Action {
@@ -600,6 +608,7 @@ impl Action {
         Action::KeybindingReset,
         Action::ThemeEditorSelectRole(0),
         Action::ThemeEditorSetChannel(0, 0),
+        Action::WorkspaceProfileSelectField(0),
     ];
 }
 

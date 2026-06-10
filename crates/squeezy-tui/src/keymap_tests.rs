@@ -816,6 +816,44 @@ fn open_theme_editor_default_does_not_collide_with_other_actions() {
 }
 
 #[test]
+fn open_workspace_profile_round_trips_and_defaults_to_ctrl_alt_w() {
+    // §12.7.4 Per-Workspace UI Profile: slug round-trips, is registered in `ALL`
+    // (so `/keymap` and the command palette list it and overrides can target it),
+    // and defaults to the obscure `Ctrl+Alt+W` chord.
+    assert_eq!(
+        Action::from_slug("open_workspace_profile"),
+        Some(Action::OpenWorkspaceProfile),
+    );
+    assert!(Action::ALL.contains(&Action::OpenWorkspaceProfile));
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.lookup(
+            KeyCode::Char('w'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        ),
+        Some(Action::OpenWorkspaceProfile),
+    );
+    // A Ctrl+Alt (Meta) chord is honestly classified terminal-dependent.
+    assert_eq!(
+        Action::OpenWorkspaceProfile.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+}
+
+#[test]
+fn open_workspace_profile_default_does_not_collide_with_other_actions() {
+    // The `Ctrl+Alt+W` default must not shadow (or be shadowed by) any existing
+    // default binding — notably the bare `Alt+w` soft-wrap toggle verb.
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    for collision in resolver.collisions() {
+        assert!(
+            !collision.1.contains(&Action::OpenWorkspaceProfile),
+            "workspace-profile default collides: {collision:?}",
+        );
+    }
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.

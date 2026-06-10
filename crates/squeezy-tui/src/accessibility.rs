@@ -792,6 +792,11 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // `focus_role` / `set_channel` handlers the keyboard verbs drive.
         A::ThemeEditorSelectRole(_) => KeyboardPath::Always("theme editor ↑↓"),
         A::ThemeEditorSetChannel(_, _) => KeyboardPath::Always("theme editor ←→ +/-"),
+        // Per-Workspace UI Profile overlay (§12.7.4) — while the overlay is open
+        // its own key handler owns ↑↓/kj (move the field focus) before the global
+        // keymap sees them, so a field-row click reaches the same `focus_field`
+        // handler the keyboard verbs drive.
+        A::WorkspaceProfileSelectField(_) => KeyboardPath::Always("workspace profile ↑↓"),
     })
 }
 

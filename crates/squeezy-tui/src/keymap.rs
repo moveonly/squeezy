@@ -457,6 +457,13 @@ pub(crate) enum Action {
     /// with a live preview, persisting each committed override to the user-scope
     /// config. Costs nothing until opened; an idle session never paints it.
     OpenThemeEditor,
+    /// Per-Workspace UI Profile (§12.7.4): open / close the workspace UI-profile
+    /// overlay (`Ctrl+Alt+W` default). A fullscreen overlay that shows the UI
+    /// preferences (density, transcript detail, minimap pane, theme) remembered
+    /// for the current workspace and lets the user save the live ones, restore the
+    /// saved ones, or reset them — persisting per workspace path outside the repo.
+    /// Costs nothing until opened; an idle session never paints it.
+    OpenWorkspaceProfile,
 }
 
 impl Action {
@@ -538,6 +545,7 @@ impl Action {
             Self::ReplayMacro => "replay_macro",
             Self::ToggleKeybindingEditor => "toggle_keybinding_editor",
             Self::OpenThemeEditor => "open_theme_editor",
+            Self::OpenWorkspaceProfile => "open_workspace_profile",
         }
     }
 
@@ -618,6 +626,7 @@ impl Action {
         Action::ReplayMacro,
         Action::ToggleKeybindingEditor,
         Action::OpenThemeEditor,
+        Action::OpenWorkspaceProfile,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -824,6 +833,11 @@ impl Action {
             // terminals, tmux, and SSH as the `Ctrl+Alt+K`/`Ctrl+Alt+J` macro chords
             // and the rest of the Ctrl+Alt overlay/picker family above.
             | Self::OpenThemeEditor
+            // Per-Workspace UI Profile (§12.7.4) opens with `Ctrl+Alt+W` — a
+            // Ctrl+Alt (Meta) chord, the same classically-unreliable encoding
+            // across Linux terminals, tmux, and SSH as the `Ctrl+Alt+E` theme
+            // editor and the rest of the Ctrl+Alt overlay/picker family above.
+            | Self::OpenWorkspaceProfile
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1186,6 +1200,17 @@ impl Action {
             // while staying clear of every composer chord.
             Self::OpenThemeEditor => KeyBinding::new(
                 KeyCode::Char('e'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Per-Workspace UI Profile (§12.7.4). `Ctrl+Alt+W` ("Workspace") is a
+            // free `Ctrl+Alt` letter — `Ctrl+Alt+K`/`J`/`L`/`M`/`P`/`S`/`A`/`H`/
+            // `R`/`N`/`T`/`B`/`E` are taken by the macro/debug/overlay/picker/
+            // keybinding/theme chords above, and the bare `Alt+w` chord is the
+            // soft-wrap toggle, so the Ctrl+Alt modifier keeps the workspace-
+            // profile verb distinct from both while staying clear of every
+            // composer chord.
+            Self::OpenWorkspaceProfile => KeyBinding::new(
+                KeyCode::Char('w'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }

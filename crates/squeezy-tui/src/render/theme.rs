@@ -110,7 +110,8 @@ pub(crate) fn set_active_theme(config: &AppConfig) {
     }
 }
 
-#[cfg(test)]
+/// The active runtime theme's name. Read by the Per-Workspace UI Profile overlay
+/// (§12.7.4) to show the live theme in its field list, and by the theme tests.
 pub(crate) fn current_theme_name() -> String {
     active_theme()
         .read()
