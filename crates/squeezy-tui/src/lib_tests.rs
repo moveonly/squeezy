@@ -12775,6 +12775,201 @@ async fn export_json_writes_event_slice_to_explicit_path() {
     );
 }
 
+// ===========================================================================
+// §12.6.4 — Export Destinations.
+//
+// `/export <fmt> [destination]` routes the same rendered payload to a file
+// path, the clipboard, a stdout-style transcript echo, or a configured
+// directory. These drive the destinations through the real `handle_slash_command`
+// dispatch (the keyboard/command path) and, for the visible ones, through the
+// real `render()` so the integration covers the whole pipeline, not just the
+// pure parser in `export_destination_tests.rs`.
+// ===========================================================================
+
+/// `/export md clipboard` sends the rendered transcript to the injected
+/// clipboard sink (no file is written), reusing the semantic-copy funnel.
+#[tokio::test]
+async fn export_clipboard_sends_payload_to_clipboard_sink() {
+    let root = temp_workspace("export_clip");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = TuiApp::new_with_clipboard(
+        "scripted",
+        &config,
+        SessionMode::Build,
+        None,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::user("question"));
+    app.push_transcript_item(TranscriptItem::assistant("clipboard body"));
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/export md clipboard").await);
+
+    let recorded = writes.lock().unwrap().clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "exactly one clipboard write: {recorded:?}"
+    );
+    assert!(
+        recorded[0].contains("clipboard body"),
+        "clipboard payload carries the transcript: {}",
+        recorded[0]
+    );
+    assert!(
+        app.status.contains("copied"),
+        "status reports a copy: {}",
+        app.status
+    );
+    // The clipboard destination must NOT touch the filesystem.
+    assert!(
+        !root.join(".squeezy").join("exports").exists(),
+        "clipboard export writes no file"
+    );
+    // §12.6.1: a landed copy is recorded once in the in-app history.
+    assert_eq!(
+        app.clipboard_history.len(),
+        1,
+        "copy recorded once in history"
+    );
+}
+
+/// `/export txt stdout` echoes the payload into the transcript (the alt-screen
+/// stdout equivalent) and the echoed body is visible through the real renderer
+/// at multiple sizes, including a tiny/resized one.
+#[tokio::test]
+async fn export_stdout_echoes_into_transcript_and_renders() {
+    let root = temp_workspace("export_stdout");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("stdout marker body"));
+
+    let before = app.transcript.len();
+    assert!(handle_slash_command(&mut app, &mut agent, "/export txt stdout").await);
+    assert!(
+        app.transcript.len() > before,
+        "stdout export pushes a transcript row"
+    );
+    assert!(
+        app.status.contains("stdout"),
+        "status mentions stdout: {}",
+        app.status
+    );
+    // No file on disk for the stdout destination.
+    assert!(
+        !root.join(".squeezy").join("exports").exists(),
+        "stdout export writes no file"
+    );
+
+    // The echoed payload paints through the real render() across sizes,
+    // including a resize down to a small terminal.
+    for (w, h) in [(120u16, 40u16), (80, 24), (40, 20)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("stdout marker"),
+            "echoed export body visible at {w}x{h}"
+        );
+    }
+}
+
+/// `/export md dir:notes` writes a timestamped transcript file under the named
+/// workspace directory (the "configured dir" destination), atomically.
+#[tokio::test]
+async fn export_configured_dir_writes_under_named_workspace_dir() {
+    let root = temp_workspace("export_dir");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("configured dir body"));
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/export md dir:notes").await);
+    assert!(app.status.starts_with("wrote "), "{}", app.status);
+
+    let notes_dir = root.join("notes");
+    let written = walk_files(&notes_dir);
+    assert_eq!(written.len(), 1, "one file under {notes_dir:?}");
+    let file = &written[0];
+    assert_eq!(file.extension().and_then(|e| e.to_str()), Some("md"));
+    let body = std::fs::read_to_string(file).expect("read export");
+    assert!(body.contains("configured dir body"), "body: {body}");
+    // Default session-storage export must NOT also fire for a dir: export.
+    assert!(
+        !root.join(".squeezy").join("exports").exists(),
+        "dir export does not also write under session storage"
+    );
+}
+
+/// A traversal attempt via `dir:` is rejected at the command boundary: no file
+/// is written and the status surfaces the rejection.
+#[tokio::test]
+async fn export_configured_dir_rejects_path_traversal() {
+    let root = temp_workspace("export_dir_traversal");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("body"));
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/export md dir:../escape").await);
+    assert!(
+        app.status.contains(".."),
+        "status reports the traversal rejection: {}",
+        app.status
+    );
+    // The traversal target — a sibling of the workspace root — must never be
+    // created. (The agent may write its own session metadata *inside* the
+    // workspace, so the precise security property is that the `..`-escaped
+    // directory outside the root was never touched.)
+    let escape_target = root
+        .parent()
+        .expect("workspace has a parent")
+        .join("escape");
+    assert!(
+        !escape_target.exists(),
+        "traversal target {escape_target:?} must not be created"
+    );
+    // And no export file landed under a literal `escape` dir inside the root.
+    assert!(
+        walk_files(&root.join("escape")).is_empty(),
+        "no export file under an in-workspace escape dir"
+    );
+}
+
+/// An empty transcript reports "nothing to export" for any destination, and
+/// never writes a file or touches the clipboard.
+#[tokio::test]
+async fn export_empty_transcript_is_a_no_op_for_clipboard() {
+    let root = temp_workspace("export_empty");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = TuiApp::new_with_clipboard(
+        "scripted",
+        &config,
+        SessionMode::Build,
+        None,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/export md clipboard").await);
+    assert!(
+        app.status.contains("nothing to export"),
+        "empty transcript: {}",
+        app.status
+    );
+    assert!(
+        writes.lock().unwrap().is_empty(),
+        "no clipboard write on an empty transcript"
+    );
+}
+
 /// Recursively collect every regular file under `dir` (empty when missing).
 fn walk_files(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();

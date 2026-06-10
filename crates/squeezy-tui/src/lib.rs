@@ -91,6 +91,7 @@ mod copy;
 mod diff_detail_pane;
 mod dogfood;
 mod events;
+mod export_destination;
 mod fuzzy;
 mod history;
 mod hyperlinks;
@@ -9016,32 +9017,85 @@ fn deliver_copy(app: &mut TuiApp, text: &str, label: &str) {
     }
 }
 
-/// Handle `/export <md|txt|json> [path]`: render the full transcript in the
-/// requested format (reusing the same scope resolution + formatters the
-/// clipboard copies use) and write it atomically to a file. With no explicit
-/// path, the file lands under the session-storage default
+/// Handle `/export <md|txt|json> [destination]` (§12.6.4): render the full
+/// transcript in the requested format (reusing the same scope resolution +
+/// formatters the clipboard copies use) and deliver it to the chosen
+/// destination. Destinations: an explicit file path, `clipboard`, `stdout`
+/// (echoed into the transcript so it reaches the terminal + clean-exit
+/// mirror), a `dir:<name>` configured workspace directory, or — with no
+/// destination token — the session-storage default
 /// (`<workspace>/.squeezy/exports/<session_id>/transcript-<ts>.<ext>`).
+///
+/// All file-backed destinations share the same atomic-write pipeline; the
+/// clipboard destination reuses [`deliver_copy`] (provider chain + clipboard
+/// history). The payload is rendered exactly once, then routed.
 fn handle_export_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
-    let args = match commands::parse_export_args(rest) {
-        Ok(args) => args,
+    let request = match export_destination::parse_export_request(rest) {
+        Ok(request) => request,
         Err(usage) => {
             set_status_with_notice(app, usage.clone(), usage);
             return;
         }
     };
 
-    let Some(payload) = build_scope_payload(app, copy::CopyScope::FullTranscript, args.format)
+    let Some(payload) = build_scope_payload(app, copy::CopyScope::FullTranscript, request.format)
     else {
         set_status_notice(app, "nothing to export yet");
         return;
     };
 
-    let target = match args.path {
-        Some(path) => resolve_workspace_path(&app.workspace_root, &path),
-        None => default_export_path(app, agent, args.format),
+    // Resolve the destination to a concrete file target (or `None` for the
+    // non-file destinations), then deliver. Keeping the file target resolution
+    // separate lets clipboard/stdout skip the filesystem entirely.
+    use export_destination::ExportDestination;
+    let file_target = match &request.destination {
+        ExportDestination::Default => Some(default_export_path(app, agent, request.format)),
+        ExportDestination::File(path) => Some(resolve_workspace_path(&app.workspace_root, path)),
+        ExportDestination::ConfiguredDir(dir) => {
+            Some(configured_dir_export_path(app, dir, request.format))
+        }
+        ExportDestination::Clipboard | ExportDestination::Stdout => None,
     };
 
-    match write_export_atomically(&target, &payload) {
+    match (&request.destination, file_target) {
+        (_, Some(target)) => export_to_file(app, &payload, &target, request.format),
+        (ExportDestination::Clipboard, None) => {
+            // Reuse the single semantic-copy funnel: provider chain, status +
+            // toast, and one-time clipboard-history recording (§12.6.1).
+            deliver_copy(app, &payload, "transcript export");
+        }
+        (ExportDestination::Stdout, None) => {
+            // The alt screen owns real stdout, so "stdout" means echo the
+            // payload into the transcript: it appears in-app now and lands in
+            // the native scrollback via the clean-exit mirror.
+            let bytes = payload.len();
+            app.push_transcript_item(TranscriptItem::system(payload));
+            app.status = format!("exported transcript to stdout ({bytes} bytes)");
+            app.toasts.push(
+                format!("exported transcript to stdout ({bytes} bytes)"),
+                toast::ToastVariant::Success,
+            );
+        }
+        // Unreachable: every `None` file target is a clipboard/stdout
+        // destination handled above, and every other destination yields
+        // `Some(target)`. Kept exhaustive so a new destination can't silently
+        // no-op.
+        (
+            ExportDestination::Default
+            | ExportDestination::File(_)
+            | ExportDestination::ConfiguredDir(_),
+            None,
+        ) => {
+            set_status_notice(app, "export failed: could not resolve a destination path");
+        }
+    }
+}
+
+/// Write a rendered `payload` to `target` atomically and surface the outcome on
+/// the status line, a toast, and a transcript system row. Shared by every
+/// file-backed export destination (default, explicit path, configured dir).
+fn export_to_file(app: &mut TuiApp, payload: &str, target: &Path, format: copy::CopyFormat) {
+    match write_export_atomically(target, payload) {
         Ok(()) => {
             let bytes = payload.len();
             app.status = format!("wrote {} ({bytes} bytes)", target.display());
@@ -9051,7 +9105,7 @@ fn handle_export_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
             );
             app.push_transcript_item(TranscriptItem::system(format!(
                 "Exported transcript ({}) to {} ({bytes} bytes).",
-                args.format.file_extension(),
+                format.file_extension(),
                 target.display(),
             )));
         }
@@ -9062,6 +9116,20 @@ fn handle_export_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
             app.push_transcript_item(TranscriptItem::system(message));
         }
     }
+}
+
+/// Destination path for `/export <fmt> dir:<name>`: a timestamped transcript
+/// file under `<workspace>/<name>/`. The `dir` name is already validated
+/// (workspace-relative, no traversal) by `parse_export_request`, so this only
+/// composes the final path.
+fn configured_dir_export_path(app: &TuiApp, dir: &str, format: copy::CopyFormat) -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    app.workspace_root
+        .join(dir)
+        .join(format!("transcript-{ts}.{}", format.file_extension()))
 }
 
 /// Default `/export` destination under session storage:

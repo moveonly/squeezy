@@ -10,41 +10,6 @@ use squeezy_llm::{LimitSource, RequestTokenEstimate};
 use squeezy_store::parse_bug_report_section;
 
 use crate::commands_style as style;
-use crate::copy::CopyFormat;
-
-/// Parsed `/export` invocation: a destination format plus an optional explicit
-/// output path. `/export` writes the whole transcript in the chosen format to a
-/// file (atomically), defaulting under session storage when no path is given.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExportArgs {
-    pub(crate) format: CopyFormat,
-    /// Explicit output path, or `None` to use the session-storage default.
-    pub(crate) path: Option<String>,
-}
-
-/// Parse `/export <md|txt|json> [path]`. The first token is the format
-/// (required); any remaining text is treated as the destination path verbatim
-/// (interior whitespace preserved, so `/export md ./my notes.md` works).
-/// Returns a usage string on error so the caller can surface it unchanged.
-pub(crate) fn parse_export_args(rest: &str) -> std::result::Result<ExportArgs, String> {
-    let trimmed = rest.trim();
-    if trimmed.is_empty() {
-        return Err(EXPORT_USAGE.to_string());
-    }
-    let mut parts = trimmed.splitn(2, char::is_whitespace);
-    let format_token = parts.next().unwrap_or_default();
-    let format = CopyFormat::from_token(format_token)
-        .ok_or_else(|| format!("unknown export format {format_token:?}. {EXPORT_USAGE}"))?;
-    let path = parts
-        .next()
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_string);
-    Ok(ExportArgs { format, path })
-}
-
-/// Shared usage hint for `/export`.
-pub(crate) const EXPORT_USAGE: &str = "usage: /export <md|txt|json> [path]";
 
 pub(crate) fn parse_report_preview_args(
     agent: &Agent,
