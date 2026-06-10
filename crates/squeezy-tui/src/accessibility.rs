@@ -802,6 +802,11 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // focused field's value) before the global keymap sees them, so a field-row
         // click reaches the same focus/cycle handlers the keyboard verbs drive.
         A::TerminalProfileCycleField(_) => KeyboardPath::Always("terminal profile ↑↓ ←→"),
+        // Gesture Settings overlay (§12.7.5) — while the overlay is open its own key
+        // handler owns ↑↓ (move the field focus) and ←→/Space/+/- (step the focused
+        // field's value) before the global keymap sees them, so a field-row click
+        // reaches the same focus/step handlers the keyboard verbs drive.
+        A::GestureSettingsStepField(_) => KeyboardPath::Always("gesture settings ↑↓ ←→"),
     })
 }
 

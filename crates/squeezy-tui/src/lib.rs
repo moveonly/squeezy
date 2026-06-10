@@ -104,6 +104,7 @@ mod events;
 mod export_destination;
 mod first_run_hints;
 mod fuzzy;
+mod gesture_settings;
 mod history;
 mod hover_intent;
 mod hover_preview;
@@ -1842,6 +1843,9 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         // The Per-Terminal Profiles overlay (§12.7.3) is modal: block the switch
         // like every other overlay above.
         || app.terminal_profile_editor.is_some()
+        // The Gesture Settings overlay (§12.7.5) is modal: block the switch like
+        // every other overlay above.
+        || app.gesture_settings_editor.is_some()
         // While a macro is recording or replaying (§12.3.7) a quick session
         // switch would derail the in-flight workflow, so block it like every
         // other modal/overlay context above.
@@ -2718,6 +2722,25 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             )) = app.click_target_at(mouse.column, mouse.row)
         {
             terminal_profile_cycle_field(app, index);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Gesture Settings overlay (§12.7.5) owns the pointer while open: a
+    // left-click on a field row focuses that field and steps its value forward (the
+    // mouse twin of ↑↓ + →/+/Space). Every other click is swallowed so a stray
+    // press can't fall through to the surface beneath. Hit-tested in ABSOLUTE
+    // screen coordinates against the targets `render_gesture_settings_surface`
+    // registered this frame.
+    if app.gesture_settings_editor.is_some() {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::GestureSettingsField(_)),
+                interaction::Action::GestureSettingsStepField(index),
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            gesture_settings_step_field(app, index);
         }
         // Overlay is open: consume every mouse event so nothing leaks below.
         return true;
@@ -5141,6 +5164,198 @@ fn terminal_profile_commit(app: &mut TuiApp, _agent: &mut Agent) {
     app.needs_redraw = true;
 }
 
+/// Open / close the Gesture Settings overlay (§12.7.5). On open, seed the editor
+/// from the in-session override first (a commit/reset this session), then any
+/// override persisted to the user-scope config in a prior session, then the
+/// built-in default (single-sourced from the interaction timing constants).
+fn toggle_gesture_settings_editor(app: &mut TuiApp) {
+    if app.gesture_settings_editor.is_some() {
+        app.gesture_settings_editor = None;
+        app.status = "gesture settings closed".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    let seed = app
+        .gesture_settings_override
+        .or_else(|| read_persisted_gesture_settings(app));
+    let editor = gesture_settings::GestureSettingsEditor::new(seed);
+    app.gesture_settings_editor = Some(editor);
+    app.status = gesture_settings_status(app);
+    app.needs_redraw = true;
+}
+
+/// Read the persisted gesture-settings override from the user-scope settings TOML,
+/// if any (§12.7.5). The override lives under `[tui.gestures]`; an absent file /
+/// table / field collapses to `None` so the editor falls back to the built-in
+/// default. Best-effort: a parse error is treated as "no override" rather than
+/// surfaced. Pure read — touches nothing — so it is safe to call on every open.
+fn read_persisted_gesture_settings(app: &TuiApp) -> Option<gesture_settings::GestureSettings> {
+    let text = std::fs::read_to_string(app.user_settings_path()).ok()?;
+    let doc = text.parse::<toml::Table>().ok()?;
+    let table = doc.get("tui")?.as_table()?.get("gestures")?.as_table()?;
+    gesture_settings::GestureSettings::from_config_lookup(
+        gesture_settings::GestureSettings::DEFAULT,
+        |key| {
+            table.get(key).map(|v| match v {
+                // Accept either a native typed value (integer/bool) or a string,
+                // so a hand-edited file using either form round-trips.
+                toml::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+        },
+    )
+}
+
+/// The status line shown while the Gesture Settings overlay is open: the focused
+/// field + value, the override flag, and the in-overlay verb legend.
+fn gesture_settings_status(app: &TuiApp) -> String {
+    let Some(editor) = app.gesture_settings_editor.as_ref() else {
+        return "gesture settings closed".to_string();
+    };
+    let field = editor.focused_field();
+    let value = field.value_label(editor.working());
+    format!(
+        "gestures: {} = {value}{} — ↑↓ field · ←→/Space/+/- adjust · Enter save · r reset · Esc close",
+        field.label(),
+        if editor.is_overridden() {
+            " (overridden)"
+        } else {
+            ""
+        },
+    )
+}
+
+/// Handle a key while the Gesture Settings overlay (§12.7.5) is open. Returns
+/// `true` when the key was consumed (so it never leaks to the composer or the
+/// global keymap while the overlay owns focus). The overlay is modal: its own
+/// toggle chord and Esc close; ↑/↓ move the field focus; ←/+/Space step the focused
+/// field forward; →/- step it back (toggles flip either way); Enter persists the
+/// working settings to the user-scope config; `r`/Delete resets to the built-in
+/// default.
+fn handle_gesture_settings_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
+    if app.gesture_settings_editor.is_none() {
+        return false;
+    }
+    // The overlay's own toggle chord closes it (the same key opens and closes).
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::OpenGestureSettings) {
+        toggle_gesture_settings_editor(app);
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            toggle_gesture_settings_editor(app);
+        }
+        KeyCode::Up => {
+            if let Some(editor) = app.gesture_settings_editor.as_mut() {
+                editor.focus_prev_field();
+            }
+            app.status = gesture_settings_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down => {
+            if let Some(editor) = app.gesture_settings_editor.as_mut() {
+                editor.focus_next_field();
+            }
+            app.status = gesture_settings_status(app);
+            app.needs_redraw = true;
+        }
+        // Forward step: → / + / Space all advance the focused field (numeric up,
+        // toggle flip, action cycle).
+        KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char(' ') => {
+            if let Some(editor) = app.gesture_settings_editor.as_mut() {
+                editor.adjust_focused(1);
+            }
+            app.status = gesture_settings_status(app);
+            app.needs_redraw = true;
+        }
+        // Back step: ← / - (numeric down; toggles flip regardless of direction).
+        KeyCode::Left | KeyCode::Char('-') | KeyCode::Char('_') => {
+            if let Some(editor) = app.gesture_settings_editor.as_mut() {
+                editor.adjust_focused(-1);
+            }
+            app.status = gesture_settings_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter => gesture_settings_commit(app, agent),
+        KeyCode::Char('r') | KeyCode::Backspace | KeyCode::Delete => {
+            if let Some(editor) = app.gesture_settings_editor.as_mut() {
+                editor.reset_to_default();
+            }
+            app.gesture_settings_override = None;
+            app.status = gesture_settings_status(app);
+            app.needs_redraw = true;
+        }
+        _ => {}
+    }
+    // The overlay is modal: swallow every key so nothing leaks to the composer
+    // beneath, even keys it does not act on.
+    true
+}
+
+/// Step the focused gesture field forward (the mouse twin of →/+/Space, fed by a
+/// click on a field row). Refreshes the status line and requests a redraw.
+fn gesture_settings_step_field(app: &mut TuiApp, index: usize) {
+    if let Some(editor) = app.gesture_settings_editor.as_mut() {
+        editor.focus_field(index);
+        editor.adjust_focused(1);
+    }
+    app.status = gesture_settings_status(app);
+    app.needs_redraw = true;
+}
+
+/// Persist the working gesture settings to the user-scope config (§12.7.5) under
+/// `[tui.gestures]`. Caches the override on the app so a reopen in the same session
+/// shows the committed value. A failure surfaces in the status line; the working
+/// value already took effect in the editor.
+fn gesture_settings_commit(app: &mut TuiApp, _agent: &mut Agent) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    let Some(editor) = app.gesture_settings_editor.as_ref() else {
+        return;
+    };
+    let working = editor.working();
+    let [
+        (scroll_k, scroll_v),
+        (pan_k, pan_v),
+        (dwell_k, dwell_v),
+        (dbl_k, dbl_v),
+        (drag_k, drag_v),
+    ] = working.as_config_pairs();
+
+    // Cache the committed override so a reopen in the same session seeds from it.
+    app.gesture_settings_override = Some(working);
+
+    let target_path = app.user_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    // Persist numeric/bool fields with their native TOML type and the action as a
+    // string, so a hand-read config is self-describing and a round-trip is exact.
+    let edit = SettingsEdit {
+        path: &[],
+        op: EditOp::SetTableEntry {
+            table_path: &["tui"],
+            key: "gestures".to_string(),
+            fields: vec![
+                (scroll_k, EditOp::SetInteger(working.scroll_lines as i64)),
+                (pan_k, EditOp::SetBool(working.shift_wheel_pan)),
+                (dwell_k, EditOp::SetInteger(working.hover_dwell_ms as i64)),
+                (dbl_k, EditOp::SetString(dbl_v.clone())),
+                (drag_k, EditOp::SetBool(working.drag_select)),
+            ],
+        },
+    };
+    match apply_edits(&scope_target, &[edit]) {
+        Ok(_) => {
+            app.status = format!(
+                "✓ saved gesture settings (scroll {scroll_v} · pan {pan_v} · dwell {dwell_v}ms · dbl {dbl_v} · drag {drag_v})"
+            );
+        }
+        Err(err) => {
+            app.status = format!("gesture settings set, but save failed: {err}");
+        }
+    }
+    app.needs_redraw = true;
+}
+
 /// Handle a key while the Prompt Templates picker (§12.3.6) is open. Returns
 /// `true` when the key was consumed (so it never leaks to the composer or the
 /// global keymap). Two modes:
@@ -6055,6 +6270,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // dispatch, so a stray key never leaks into the composer underneath. Sits
     // beside the other front-of-loop overlays for the same reason.
     if app.terminal_profile_editor.is_some() && handle_terminal_profile_key(app, agent, key) {
+        return Ok(false);
+    }
+
+    // The Gesture Settings overlay (§12.7.5) is modal while open: it owns the
+    // keyboard (↑↓ move field, ←→/Space/+/- adjust value, Enter save, r/Delete
+    // reset, Esc/Ctrl+Alt+I close) BEFORE any selection-clear, search, chord, or
+    // keymap dispatch, so a stray key never leaks into the composer underneath.
+    // Sits beside the other front-of-loop overlays for the same reason.
+    if app.gesture_settings_editor.is_some() && handle_gesture_settings_key(app, agent, key) {
         return Ok(false);
     }
 
@@ -8148,6 +8372,15 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
                 return false;
             }
             toggle_terminal_profile_editor(app);
+            true
+        }
+        keymap::Action::OpenGestureSettings => {
+            // §12.7.5: open / close the Gesture Settings overlay.
+            // Main-surface verb; the config/setup screens own their own routing.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_gesture_settings_editor(app);
             true
         }
     }
@@ -14306,6 +14539,12 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // practice. It exists so every `interaction::Action` has a dispatch arm and
         // the accessibility audit's exhaustiveness holds.
         interaction::Action::TerminalProfileCycleField(_) => {}
+        // §12.7.5: the click handler in `handle_mouse` already short-circuits the
+        // gesture-settings targets (it needs the agent for persistence, which this
+        // agent-free dispatcher does not carry), so this arm is unreachable in
+        // practice. It exists so every `interaction::Action` has a dispatch arm and
+        // the accessibility audit's exhaustiveness holds.
+        interaction::Action::GestureSettingsStepField(_) => {}
     }
 }
 
@@ -20498,6 +20737,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_terminal_profile_surface(frame, area, app, editor);
         return;
     }
+    // The Gesture Settings overlay (§12.7.5) paints as a fullscreen modal over the
+    // main surface while open, registering its per-field click targets every frame.
+    // Checked before the config screen so its targets register and it owns the
+    // surface while open.
+    if let Some(editor) = &app.gesture_settings_editor {
+        render_gesture_settings_surface(frame, area, app, editor);
+        return;
+    }
     if let Some(state) = &app.config_screen {
         config_screen::render(frame, area, state);
         return;
@@ -23089,6 +23336,160 @@ fn render_terminal_profile_surface(
         } else {
             (
                 "showing built-in defaults for this terminal".to_string(),
+                crate::render::theme::quiet(),
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color)))),
+            Rect {
+                x: inner.x,
+                y: footer_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+}
+
+/// Paint the Gesture Settings overlay (§12.7.5) as a centered modal: a verb-legend
+/// header, a read-only context line naming the recognizer's double-click window
+/// (single-sourced from [`interaction`]), then one row per editable gesture field
+/// (label, value, description). The focused row is marked; each row is registered
+/// as an [`interaction::ChromeKey::GestureSettingsField`] click target so a click
+/// reaches the same focus+step path as ↑↓ + →/+/Space. A footer shows whether a
+/// manual override is in effect. Reads only the already-built editor model, so
+/// painting is constant-time.
+fn render_gesture_settings_surface(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    editor: &gesture_settings::GestureSettingsEditor,
+) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Gesture settings ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} tune mouse / trackpad behaviour ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 74, 18, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Header: the in-overlay verb legend.
+    let header = Line::from(Span::styled(
+        "\u{2191}\u{2193} field \u{00b7} \u{2190}\u{2192}/Space/+\u{2212} adjust \u{00b7} Enter save \u{00b7} r reset \u{00b7} Esc close",
+        Style::default()
+            .fg(crate::render::theme::secondary())
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    // Read-only context line: the recognizer's double-click window, single-sourced
+    // from `interaction::MULTI_CLICK_MS`, so the user can see the timing their
+    // chosen double-click action fires within.
+    let context_y = inner.y.saturating_add(1);
+    if context_y < inner.y.saturating_add(inner.height) {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "double-click window: ",
+                    Style::default().fg(crate::render::theme::quiet()),
+                ),
+                Span::styled(
+                    format!(
+                        "{} ms",
+                        gesture_settings::GestureSettings::multi_click_window_ms()
+                    ),
+                    Style::default()
+                        .fg(crate::render::theme::foreground())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            Rect {
+                x: inner.x,
+                y: context_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+
+    let working = editor.working();
+    let focused = editor.field_index();
+    let body_top = inner.y.saturating_add(3);
+    let bottom = inner.y.saturating_add(inner.height);
+    for (index, field) in gesture_settings::GestureField::ALL.iter().enumerate() {
+        let y = body_top.saturating_add(index as u16);
+        if y >= bottom {
+            break;
+        }
+        let is_focused = index == focused;
+        let row_rect = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: 1,
+        };
+        let marker = if is_focused { "\u{203a} " } else { "  " };
+        let value_style = if is_focused {
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_focused {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(
+                format!("{:<16}", field.label()),
+                Style::default().fg(crate::render::theme::foreground()),
+            ),
+            Span::styled(format!("{:<14}", field.value_label(working)), value_style),
+            Span::styled(
+                field.description(),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::GestureSettingsField(index)),
+            interaction::Action::GestureSettingsStepField(index),
+        );
+    }
+
+    // Footer: whether a manual override is in effect (vs the built-in default).
+    let footer_y = body_top.saturating_add(gesture_settings::GestureField::ALL.len() as u16 + 1);
+    if footer_y < bottom {
+        let (text, color) = if editor.is_overridden() {
+            // Name the focused field's built-in default so the user can see what
+            // `r` (reset) will restore for the row they are on.
+            let default_value = editor
+                .focused_field()
+                .value_label(editor.default_settings());
+            (
+                format!(
+                    "manual override \u{00b7} default {default_value} \u{00b7} Enter save \u{00b7} r reset"
+                ),
+                crate::render::theme::secondary(),
+            )
+        } else {
+            (
+                "showing built-in gesture defaults".to_string(),
                 crate::render::theme::quiet(),
             )
         };
@@ -37607,6 +38008,21 @@ pub(crate) struct TuiApp {
     /// the user-scope config; this cache keeps the live editor consistent without a
     /// config round-trip mid-session.
     pub(crate) terminal_profile_override: Option<terminal_profile::TerminalProfile>,
+    /// Gesture Settings (§12.7.5): the interactive gesture-settings editor overlay,
+    /// or `None` when closed (the resting state, which paints nothing extra and
+    /// schedules no redraw). `Some` = the fullscreen overlay owns key/mouse routing
+    /// for tuning the mouse/trackpad gesture behaviour (scroll speed, Shift-wheel
+    /// pan, hover dwell, double-click action, drag-select). Opened by the
+    /// `OpenGestureSettings` keymap action; a commit persists the override to the
+    /// user-scope config.
+    pub(crate) gesture_settings_editor: Option<gesture_settings::GestureSettingsEditor>,
+    /// The in-session gesture-settings override (§12.7.5): the last committed or
+    /// reset working settings, used to re-seed the editor when it reopens. `None` =
+    /// no manual override in this session (the editor falls back to the built-in
+    /// default single-sourced from the interaction timing constants). A committed
+    /// value is also persisted to the user-scope config; this cache keeps the live
+    /// editor consistent without a config round-trip mid-session.
+    pub(crate) gesture_settings_override: Option<gesture_settings::GestureSettings>,
     /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
     /// keyed by stable entry id and grouped by category (user turns, tool calls,
     /// errors, …). Rebuilt incrementally — only when the transcript's
@@ -38518,6 +38934,8 @@ impl TuiApp {
             workspace_profile: None,
             terminal_profile_editor: None,
             terminal_profile_override: None,
+            gesture_settings_editor: None,
+            gesture_settings_override: None,
             transcript_index: transcript_index::TranscriptIndex::new(),
             transcript_index_open: false,
             transcript_index_selected: 0,

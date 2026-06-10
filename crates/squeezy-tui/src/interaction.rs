@@ -258,6 +258,10 @@ pub(crate) enum ChromeKey {
     /// its 0-based index in the editor's field list (0=glyphs, 1=mouse, 2=color) so
     /// a click focuses that field and cycles its value.
     TerminalProfileField(usize),
+    /// A gesture-field row in the Gesture Settings overlay (§12.7.5), keyed by its
+    /// 0-based index in the editor's field list so a click focuses that field and
+    /// steps its value forward.
+    GestureSettingsField(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -541,6 +545,11 @@ pub(crate) enum Action {
     /// moving the field focus with ↑↓ and cycling its value with ←→/Space; a click
     /// on a field row both focuses it and advances its value in one go.
     TerminalProfileCycleField(usize),
+    /// Focus + step the given gesture field (by 0-based index in the editor's field
+    /// list) forward in the Gesture Settings overlay (§12.7.5). Mouse twin of moving
+    /// the field focus with ↑↓ and stepping its value with ←→/Space/+/-; a click on a
+    /// field row both focuses it and advances its value in one go.
+    GestureSettingsStepField(usize),
 }
 
 impl Action {
@@ -619,6 +628,7 @@ impl Action {
         Action::ThemeEditorSetChannel(0, 0),
         Action::WorkspaceProfileSelectField(0),
         Action::TerminalProfileCycleField(0),
+        Action::GestureSettingsStepField(0),
     ];
 }
 

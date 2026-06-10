@@ -471,6 +471,15 @@ pub(crate) enum Action {
     /// terminal, user-overridable, persisted to the user-scope config. Costs
     /// nothing until opened; an idle session never paints it.
     OpenTerminalProfile,
+    /// Gesture Settings (§12.7.5): open / close the gesture-settings editor
+    /// (`Ctrl+Alt+I` default). A fullscreen overlay that tunes mouse/trackpad
+    /// gesture behaviour (scroll speed, Shift-wheel pan, hover dwell, double-click
+    /// action, drag-select) — built-in defaults single-sourced from the
+    /// interaction timing constants, user-overridable, persisted to the user-scope
+    /// config. Every value has a keyboard path (↑↓ field, ←→/Space/+/- adjust),
+    /// since mouse reporting may be disabled. Costs nothing until opened; an idle
+    /// session never paints it.
+    OpenGestureSettings,
 }
 
 impl Action {
@@ -554,6 +563,7 @@ impl Action {
             Self::OpenThemeEditor => "open_theme_editor",
             Self::OpenWorkspaceProfile => "open_workspace_profile",
             Self::OpenTerminalProfile => "open_terminal_profile",
+            Self::OpenGestureSettings => "open_gesture_settings",
         }
     }
 
@@ -636,6 +646,7 @@ impl Action {
         Action::OpenThemeEditor,
         Action::OpenWorkspaceProfile,
         Action::OpenTerminalProfile,
+        Action::OpenGestureSettings,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -852,6 +863,11 @@ impl Action {
             // terminals, tmux, and SSH as the `Ctrl+Alt+E`/`Ctrl+Alt+B` editor
             // chords and the rest of the Ctrl+Alt overlay/picker family above.
             | Self::OpenTerminalProfile
+            // Gesture Settings (§12.7.5) opens with `Ctrl+Alt+I` — a Ctrl+Alt
+            // (Meta) chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+G`/`Ctrl+Alt+E`/`Ctrl+Alt+B`
+            // editor chords and the rest of the Ctrl+Alt overlay/picker family above.
+            | Self::OpenGestureSettings
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1234,6 +1250,16 @@ impl Action {
             // verb distinct while staying clear of every composer chord.
             Self::OpenTerminalProfile => KeyBinding::new(
                 KeyCode::Char('g'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Gesture Settings (§12.7.5). `Ctrl+Alt+I` ("Input") is a free
+            // `Ctrl+Alt` letter — `Ctrl+Alt+K`/`J`/`L`/`M`/`P`/`S`/`A`/`H`/`R`/`N`/
+            // `T`/`B`/`E`/`W`/`G`/`Y` are taken by the macro/debug/overlay/picker/
+            // editor/profile chords above, so the Ctrl+Alt modifier keeps the
+            // gesture-settings verb distinct while staying clear of every composer
+            // chord.
+            Self::OpenGestureSettings => KeyBinding::new(
+                KeyCode::Char('i'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }
