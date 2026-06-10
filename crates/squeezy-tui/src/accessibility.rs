@@ -610,6 +610,11 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // handler the buttons click.
         A::ConfirmPaste => KeyboardPath::Always("paste modal Enter/y"),
         A::CancelPaste => KeyboardPath::Always("paste modal Esc/n"),
+        // Paste-transform row select (§12.6.2) — the paste-transform menu's own
+        // key handler owns ↑↓/kj (move the cursor) and Enter (apply the selected
+        // row) before the global keymap sees them, reaching the same
+        // `resolve_paste_transform` handler a row click drives.
+        A::PasteTransformSelect(_) => KeyboardPath::Always("paste menu ↑↓/Enter"),
     })
 }
 

@@ -95,6 +95,9 @@ pub(crate) enum ChromeKey {
     PasteConfirm,
     /// The "Discard" button in the large-paste confirmation modal (§11G.6).
     PasteCancel,
+    /// A row in the paste-transform menu (§12.6.2), keyed by its 0-based index
+    /// in the offered-transform list so a click selects exactly that shape.
+    PasteTransformItem(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -163,6 +166,10 @@ pub(crate) enum Action {
     /// Cancel the pending large paste in the confirmation modal (§11G.6),
     /// discarding it. Mouse twin of the modal's Esc/`n` key.
     CancelPaste,
+    /// Select (move the cursor to) the given row in the paste-transform menu
+    /// (§12.6.2) and apply it. Mouse twin of moving the cursor with ↑↓ and
+    /// pressing Enter; a click both selects and applies the shape in one go.
+    PasteTransformSelect(usize),
 }
 
 impl Action {
@@ -192,6 +199,7 @@ impl Action {
         Action::MinimapJump(EntryId(0)),
         Action::ConfirmPaste,
         Action::CancelPaste,
+        Action::PasteTransformSelect(0),
     ];
 }
 

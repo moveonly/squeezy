@@ -5460,16 +5460,59 @@ fn context_breaks_out_skills_and_mcp_sources() {
 }
 
 #[tokio::test]
-async fn small_paste_stays_in_prompt() {
+async fn small_single_line_paste_stays_in_prompt() {
     let root = temp_workspace("tui_inline_paste");
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let mut agent = test_agent_without_session_log_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
 
-    handle_paste(&mut app, &mut agent, "small\r\npaste".to_string())
+    // A small SINGLE-LINE paste is unstructured: it types straight into the
+    // composer with no menu (the transform menu (§12.6.2) only opens for
+    // structured/multiline pastes).
+    handle_paste(&mut app, &mut agent, "small paste".to_string())
         .await
         .expect("handle paste");
 
+    assert!(app.paste_transform.is_none());
+    assert_eq!(app.input, "small paste");
+    assert!(app.attachments.is_empty());
+    assert!(app.prompt_attachments.is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn small_multiline_paste_opens_the_transform_menu_then_lands_normalized() {
+    let root = temp_workspace("tui_inline_paste_multiline");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    // A small MULTILINE paste (CRLF-normalized) opens the transform menu rather
+    // than landing silently; applying As-is then inserts the normalized text
+    // inline, confirming CRLF→LF normalization survives the menu round-trip.
+    handle_paste(&mut app, &mut agent, "small\r\npaste".to_string())
+        .await
+        .expect("handle paste");
+    assert!(
+        app.paste_transform.is_some(),
+        "multiline paste opens the menu"
+    );
+    assert!(
+        app.input.is_empty(),
+        "nothing lands before a transform is chosen"
+    );
+
+    // As-is is the first row; Enter applies it.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter");
+
+    assert!(app.paste_transform.is_none());
     assert_eq!(app.input, "small\npaste");
     assert!(app.attachments.is_empty());
     assert!(app.prompt_attachments.is_empty());
@@ -24800,4 +24843,357 @@ async fn paste_preview_modal_survives_a_tiny_terminal() {
     }
     // The modal is still pending after all those renders (rendering is pure).
     assert!(app.paste_preview.is_some());
+}
+
+// ===========================================================================
+// Paste Transform Menu (§12.6.2)
+// ===========================================================================
+
+#[tokio::test]
+async fn structured_multiline_paste_opens_the_transform_menu() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    // A small multiline block is "structured" → the menu opens; nothing reaches
+    // the composer until a transform is chosen.
+    handle_paste(&mut app, &mut agent, "alpha\nbeta".to_string())
+        .await
+        .expect("paste");
+
+    assert!(
+        app.paste_transform.is_some(),
+        "a multiline paste should open the transform menu"
+    );
+    assert!(
+        app.input.is_empty(),
+        "no text should reach the composer before a transform is chosen"
+    );
+    assert!(
+        app.paste_preview.is_none(),
+        "this is not the large-paste modal"
+    );
+}
+
+#[tokio::test]
+async fn ansi_paste_opens_the_menu_even_single_line() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    // A single line carrying an ANSI escape is structured enough to offer the
+    // strip-ANSI choice.
+    handle_paste(
+        &mut app,
+        &mut agent,
+        "\x1b[31mred warning\x1b[0m".to_string(),
+    )
+    .await
+    .expect("paste");
+
+    let menu = app
+        .paste_transform
+        .as_ref()
+        .expect("menu open for ANSI paste");
+    assert!(
+        menu.items()
+            .contains(&paste_transform::PasteTransform::StripAnsi),
+        "an ANSI paste must offer the Strip ANSI transform"
+    );
+}
+
+#[tokio::test]
+async fn plain_single_line_paste_skips_the_menu_and_types_inline() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, "/usr/local/bin/thing".to_string())
+        .await
+        .expect("paste");
+
+    assert!(
+        app.paste_transform.is_none(),
+        "an ordinary single-line paste must not open the menu"
+    );
+    assert_eq!(
+        app.input, "/usr/local/bin/thing",
+        "a plain single-line paste types straight into the composer"
+    );
+}
+
+#[tokio::test]
+async fn arrow_keys_navigate_then_enter_applies_the_chosen_transform() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, "alpha\nbeta".to_string())
+        .await
+        .expect("paste");
+    // Clean text starts on As-is (index 0).
+    assert_eq!(app.paste_transform.as_ref().unwrap().selected(), 0);
+
+    // Down once → Quote (index 1).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down");
+    assert_eq!(
+        app.paste_transform.as_ref().unwrap().selected_transform(),
+        paste_transform::PasteTransform::Quote
+    );
+
+    // Enter applies Quote: the menu closes and the quoted text lands inline.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter");
+
+    assert!(app.paste_transform.is_none(), "Enter closes the menu");
+    assert_eq!(
+        app.input, "> alpha\n> beta",
+        "applying Quote prefixes each pasted line"
+    );
+}
+
+#[tokio::test]
+async fn code_block_transform_wraps_the_paste_in_a_fence() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, "let x = 1;\nlet y = 2;".to_string())
+        .await
+        .expect("paste");
+
+    // Move to Code block (As-is, Quote, Code block, Cancel) and apply.
+    let code_idx = app
+        .paste_transform
+        .as_ref()
+        .unwrap()
+        .items()
+        .iter()
+        .position(|t| *t == paste_transform::PasteTransform::CodeBlock)
+        .expect("code block offered");
+    app.paste_transform.as_mut().unwrap().select(code_idx);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter");
+
+    assert!(app.paste_transform.is_none());
+    assert_eq!(app.input, "```\nlet x = 1;\nlet y = 2;\n```");
+}
+
+#[tokio::test]
+async fn esc_cancels_the_transform_menu_and_discards_the_paste() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, "alpha\nbeta".to_string())
+        .await
+        .expect("paste");
+    assert!(app.paste_transform.is_some());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+
+    assert!(app.paste_transform.is_none(), "Esc closes the menu");
+    assert!(
+        app.input.is_empty(),
+        "cancelling discards the paste entirely"
+    );
+    assert_eq!(app.status, "paste discarded");
+}
+
+#[tokio::test]
+async fn selecting_cancel_row_then_enter_discards_the_paste() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, "alpha\nbeta".to_string())
+        .await
+        .expect("paste");
+    let cancel_idx = app
+        .paste_transform
+        .as_ref()
+        .unwrap()
+        .items()
+        .iter()
+        .position(|t| *t == paste_transform::PasteTransform::Cancel)
+        .expect("cancel offered");
+    app.paste_transform.as_mut().unwrap().select(cancel_idx);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter");
+
+    assert!(app.paste_transform.is_none());
+    assert!(
+        app.input.is_empty(),
+        "applying Cancel discards rather than inserting"
+    );
+}
+
+#[tokio::test]
+async fn stray_key_does_not_dismiss_or_leak_through_the_transform_menu() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, "alpha\nbeta".to_string())
+        .await
+        .expect("paste");
+    assert!(app.paste_transform.is_some());
+
+    // A plain character (not k/j) is swallowed: the menu stays open and the
+    // composer does not receive it.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("char");
+
+    assert!(
+        app.paste_transform.is_some(),
+        "an unrelated key must not dismiss the menu"
+    );
+    assert!(
+        app.input.is_empty(),
+        "an unrelated key must not leak into the composer while the menu is open"
+    );
+}
+
+#[tokio::test]
+async fn transform_menu_renders_summary_rows_and_hint() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, "let x = 1;\nlet y = 2;".to_string())
+        .await
+        .expect("paste");
+
+    // Drive the real render() through a TestBackend and assert the menu chrome
+    // is on screen: the title, the size/kind summary, the transform rows, and
+    // the key hint.
+    let painted = render_to_string(&app, 90, 24);
+    assert!(
+        painted.contains("Paste"),
+        "the menu title should paint:\n{painted}"
+    );
+    assert!(
+        painted.contains("chars"),
+        "the size summary should paint:\n{painted}"
+    );
+    assert!(
+        painted.contains("As-is"),
+        "the As-is row should paint:\n{painted}"
+    );
+    assert!(
+        painted.contains("Quote"),
+        "the Quote row should paint:\n{painted}"
+    );
+    assert!(
+        painted.contains("Code block"),
+        "the Code block row should paint:\n{painted}"
+    );
+    assert!(
+        painted.contains("Cancel"),
+        "the Cancel row should paint:\n{painted}"
+    );
+    assert!(
+        painted.contains("Enter apply"),
+        "the key hint should paint:\n{painted}"
+    );
+}
+
+#[tokio::test]
+async fn clicking_a_transform_row_selects_and_applies_it() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, "alpha\nbeta".to_string())
+        .await
+        .expect("paste");
+
+    // Render once so the row click rects register for this frame.
+    let backend = TestBackend::new(90, 24);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| render(frame, &app)).expect("draw");
+
+    // Click the "Quote" row: it both selects and applies that shape.
+    let buffer = terminal.backend().buffer().clone();
+    let (col, row) = find_text_cell(&buffer, "Quote").expect("Quote row on screen");
+    let consumed = handle_mouse(&mut app, left_down(col, row, KeyModifiers::NONE));
+
+    assert!(consumed, "the open menu must consume the click");
+    assert!(
+        app.paste_transform.is_none(),
+        "clicking a row closes the menu"
+    );
+    assert_eq!(
+        app.input, "> alpha\n> beta",
+        "clicking Quote applies the quote transform"
+    );
+}
+
+#[tokio::test]
+async fn click_off_the_transform_rows_is_swallowed_not_leaked() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, "alpha\nbeta".to_string())
+        .await
+        .expect("paste");
+
+    let backend = TestBackend::new(90, 24);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| render(frame, &app)).expect("draw");
+
+    // Click the top-left corner, well clear of any row: the menu owns the
+    // pointer, so the click is consumed and the menu stays open.
+    let consumed = handle_mouse(&mut app, left_down(0, 0, KeyModifiers::NONE));
+    assert!(consumed, "the open menu must consume the click");
+    assert!(
+        app.paste_transform.is_some(),
+        "a click off the rows leaves the choice pending"
+    );
+    assert!(app.input.is_empty());
+}
+
+#[tokio::test]
+async fn transform_menu_survives_a_tiny_terminal_and_resize() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_paste(&mut app, &mut agent, "alpha\nbeta\ngamma".to_string())
+        .await
+        .expect("paste");
+
+    // Render across a range of sizes, including degenerate ones, to prove the
+    // menu layout never panics on resize where the feature paints.
+    for (w, h) in [(90u16, 24u16), (40, 12), (8, 4), (1, 1)] {
+        let painted = render_to_string(&app, w, h);
+        assert!(
+            !painted.is_empty(),
+            "render must produce a frame at {w}x{h}"
+        );
+    }
+    // The menu is still pending after all those renders (rendering is pure).
+    assert!(app.paste_transform.is_some());
 }

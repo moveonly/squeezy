@@ -109,6 +109,7 @@ mod modal;
 mod notification;
 mod overlay;
 mod paste_preview;
+mod paste_transform;
 mod prompt_history;
 mod prompt_queue;
 mod prompt_queue_multiselect;
@@ -1753,6 +1754,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.status_line_setup.is_some()
         || app.overlay.is_some()
         || app.paste_preview.is_some()
+        || app.paste_transform.is_some()
         || app.transcript_overlay.is_some()
     {
         return false;
@@ -2241,6 +2243,24 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                 key,
                 interaction::ChromeKey::PasteConfirm | interaction::ChromeKey::PasteCancel
             )
+        {
+            dispatch_click_action(app, action);
+        }
+        // Modal is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The paste-transform menu (§12.6.2) likewise owns the pointer while open: a
+    // left-click on a menu row selects + applies that shape; any other click is
+    // swallowed so a stray press can't fall through to the transcript beneath.
+    // Hit-tested in ABSOLUTE screen coordinates against the row targets
+    // `render_paste_transform_surface` registered this frame.
+    if app.paste_transform.is_some() {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::PasteTransformItem(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
         {
             dispatch_click_action(app, action);
         }
@@ -3405,6 +3425,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
+    // The paste-transform menu (§12.6.2) is fully modal while open: it owns the
+    // keyboard (↑↓/kj move, Enter apply, Esc cancel) BEFORE any selection-clear,
+    // search, chord, or keymap dispatch can claim a key. A stray keystroke must
+    // not slip a half-shaped paste into the composer, so this guard sits beside
+    // the large-paste guard at the very front.
+    if app.paste_transform.is_some() && handle_paste_transform_key(app, key) {
+        return Ok(false);
+    }
+
     // Esc clears an active visual selection BEFORE the turn-interrupt / bare-Esc
     // no-op below: a first Esc drops the selection, only a second reaches the
     // interrupt. Selection is MAIN-view only (the overlay/statusline/queue
@@ -3947,8 +3976,106 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
         return Ok(());
     }
 
+    // Paste Transform Menu (§12.6.2): a *structured but not large* paste —
+    // multiline, ANSI-laden, or a recognized diff/JSON/code/log block — opens a
+    // transform menu so the user can choose a shape (as-is, quote, code block,
+    // strip ANSI) before it enters the composer, instead of always landing
+    // verbatim. The gate is deliberately narrow: it only fires for pastes BELOW
+    // the attachment threshold ([`LARGE_PASTE_CHAR_THRESHOLD`]). A merely-large
+    // paste keeps its existing `[Pasted text #N]` attachment behavior (the menu
+    // would be the wrong affordance for a multi-screen dump), and an ordinary
+    // single-line paste is not structured and flows straight through untouched.
+    if !is_large_prompt_paste(&normalized) {
+        let payload = paste_transform::PastePayload::new(normalized);
+        if paste_transform::should_open_transform_menu(&payload) {
+            open_paste_transform(app, payload);
+            return Ok(());
+        }
+        commit_pasted_text(app, payload.apply(paste_transform::PasteTransform::AsIs));
+        return Ok(());
+    }
+
     commit_pasted_text(app, normalized);
     Ok(())
+}
+
+/// Park a structured paste in the transform menu. The text does not touch the
+/// composer until the user picks a transform; cancelling discards it.
+fn open_paste_transform(app: &mut TuiApp, payload: paste_transform::PastePayload) {
+    let menu = paste_transform::PasteTransformMenu::new(payload);
+    app.status = format!(
+        "structured paste · {} · ↑↓ choose · Enter apply · Esc cancel",
+        menu.payload().summary()
+    );
+    app.paste_transform = Some(menu);
+    app.needs_redraw = true;
+}
+
+/// Resolve the open paste-transform menu by applying the currently selected
+/// transform. On a text transform the result runs through the normal insertion
+/// path ([`commit_pasted_text`]); on cancel it is discarded. A no-op when no
+/// menu is open. Returns `true` when a menu was actually resolved (so the
+/// caller can mark the key/click consumed).
+fn resolve_paste_transform(app: &mut TuiApp) -> bool {
+    let Some(menu) = app.paste_transform.take() else {
+        return false;
+    };
+    match menu.resolve() {
+        Some(text) => {
+            let label = menu.selected_transform().label();
+            commit_pasted_text(app, text);
+            app.status = format!("paste · {label}");
+        }
+        None => {
+            app.status = "paste discarded".to_string();
+        }
+    }
+    app.needs_redraw = true;
+    true
+}
+
+/// Cancel the open paste-transform menu without applying any transform,
+/// discarding the pending paste. A no-op when no menu is open. Returns whether
+/// a menu was closed.
+fn cancel_paste_transform(app: &mut TuiApp) -> bool {
+    if app.paste_transform.take().is_none() {
+        return false;
+    }
+    app.status = "paste discarded".to_string();
+    app.needs_redraw = true;
+    true
+}
+
+/// Keyboard handler for the open paste-transform menu (§12.6.2). Up/Down (and
+/// `k`/`j`) move the cursor; Enter applies the selected transform; Esc cancels
+/// and discards. Every other key is swallowed so the menu stays fully modal —
+/// no keystroke leaks into the composer while a transform choice is pending.
+/// Returns `true` when the key was consumed (always, while open), the keyboard
+/// twin of clicking a menu row.
+fn handle_paste_transform_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    let Some(menu) = app.paste_transform.as_mut() else {
+        return false;
+    };
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            menu.move_up();
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            menu.move_down();
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter => {
+            resolve_paste_transform(app);
+        }
+        KeyCode::Esc => {
+            cancel_paste_transform(app);
+        }
+        // Hold the menu open for any other key — a transform must be chosen
+        // explicitly, never dismissed by a stray keystroke.
+        _ => {}
+    }
+    true
 }
 
 /// Insert a paste that has cleared the safety gate into the composer: the
@@ -6007,6 +6134,15 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         }
         interaction::Action::CancelPaste => {
             resolve_paste_preview(app, paste_preview::PasteDecision::Cancel);
+        }
+        // Paste-transform menu row click (§12.6.2): select that row, then apply
+        // it — the same `resolve_paste_transform` the Enter key calls, so the
+        // mouse and keyboard verbs are identical by construction.
+        interaction::Action::PasteTransformSelect(index) => {
+            if let Some(menu) = app.paste_transform.as_mut() {
+                menu.select(index);
+            }
+            resolve_paste_transform(app);
         }
     }
 }
@@ -9703,6 +9839,7 @@ fn prompt_queue_drain_blocked(app: &TuiApp) -> bool {
         || app.transcript_overlay.is_some()
         || app.overlay.is_some()
         || app.paste_preview.is_some()
+        || app.paste_transform.is_some()
         || app.pending_approval.is_some()
         || app.pending_mcp_elicitation.is_some()
         || app.pending_request_user_input.is_some()
@@ -11183,6 +11320,15 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_paste_preview_surface(frame, area, app, preview);
         return;
     }
+    // The paste-transform menu (§12.6.2) wins over every other surface while it
+    // is open: a structured paste is pending and the user must pick a shape (or
+    // cancel) before anything else. It only ever opens from the main composer,
+    // but checking it here keeps the contract unambiguous and registers its row
+    // click targets every frame.
+    if let Some(menu) = app.paste_transform.as_ref() {
+        render_paste_transform_surface(frame, area, app, menu);
+        return;
+    }
     if app.transcript_overlay.is_some() {
         render_transcript_overlay_surface(frame, area, app);
         return;
@@ -11401,6 +11547,122 @@ fn render_paste_preview_buttons(frame: &mut Frame<'_>, inner: Rect, app: &TuiApp
             discard_rect,
             interaction::TargetKey::Chrome(interaction::ChromeKey::PasteCancel),
             interaction::Action::CancelPaste,
+        );
+    }
+}
+
+/// Render the paste-transform menu (§12.6.2) as a centered modal: a header that
+/// summarizes the captured paste (kind · lines · chars), a hint line, then one
+/// selectable row per offered transform with the selected row highlighted and a
+/// `›` caret. Each transform row registers a
+/// [`interaction::ChromeKey::PasteTransformItem`] click target carrying its
+/// index so a click selects + applies that shape — the mouse twin of moving the
+/// cursor and pressing Enter. Row rects are registered in absolute screen
+/// coordinates because the modal paints fullscreen (matching [`handle_mouse`]).
+fn render_paste_transform_surface(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    menu: &paste_transform::PasteTransformMenu,
+) {
+    let payload = menu.payload();
+    let title = Line::from(vec![
+        Span::styled(
+            " Paste ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "— choose how it enters the composer ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    // Cap the modal so it stays readable on big terminals but shrinks to fit
+    // small ones (the shared `centered` clamps to the frame).
+    let inner = modal::surface(frame, area, 78, 14, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Header row (summary) + hint row, then one row per offered transform.
+    let header = Rect {
+        height: inner.height.min(1),
+        ..inner
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            payload.summary(),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))),
+        header,
+    );
+
+    // The menu rows start two rows down (header + one blank gap), leaving the
+    // last inner row for the hint. Solver-free split so a tiny terminal still
+    // degrades gracefully rather than panicking.
+    let rows_top = inner.y.saturating_add(2);
+    let rows_bottom = inner.y.saturating_add(inner.height); // exclusive
+    let hint_row = rows_bottom.saturating_sub(1);
+    let accent = crate::render::theme::accent();
+    let foreground = crate::render::theme::foreground();
+    let quiet = crate::render::theme::quiet();
+
+    for (index, transform) in menu.items().iter().enumerate() {
+        let row_y = rows_top.saturating_add(index as u16);
+        // Stop before the hint row so the menu never paints over it.
+        if row_y >= hint_row {
+            break;
+        }
+        let selected = index == menu.selected();
+        let caret = if selected { "› " } else { "  " };
+        let label = transform.label();
+        let style = if selected {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(foreground)
+        };
+        let mut spans = vec![
+            Span::styled(caret, style),
+            Span::styled(format!("{label:<12}"), style),
+        ];
+        // Append the description for the selected row so the user sees what the
+        // highlighted shape does without moving the cursor.
+        if selected {
+            spans.push(Span::styled(
+                transform.description(),
+                Style::default().fg(quiet),
+            ));
+        }
+        let row_rect = Rect {
+            x: inner.x,
+            y: row_y,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(Line::from(spans)), row_rect);
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::PasteTransformItem(index)),
+            interaction::Action::PasteTransformSelect(index),
+        );
+    }
+
+    if hint_row >= inner.y {
+        let hint_rect = Rect {
+            x: inner.x,
+            y: hint_row,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "↑↓ choose · Enter apply · Esc cancel",
+                Style::default().fg(quiet),
+            ))),
+            hint_rect,
         );
     }
 }
@@ -22256,6 +22518,14 @@ pub(crate) struct TuiApp {
     /// `None` the rest of the time, so it is a zero-cost slot when no oversized
     /// paste is in flight.
     pub(crate) paste_preview: Option<paste_preview::PastePreview>,
+    /// Pending structured paste awaiting a transform choice (§12.6.2). `Some`
+    /// while the paste-transform menu is open: bracketed paste captured a
+    /// *structured* block (multiline, ANSI-laden, or a recognized diff/JSON/
+    /// code/log) below the very-large safety threshold and is offering the
+    /// user a shape (as-is / quote / code block / strip ANSI / cancel) before
+    /// it enters the composer. `None` the rest of the time, so it is a
+    /// zero-cost slot when no structured paste is in flight.
+    pub(crate) paste_transform: Option<paste_transform::PasteTransformMenu>,
     /// Full-screen transcript overlay (Ctrl+T) that renders every entry
     /// in its uncapped form. `None` = closed; `Some(state)` = open with
     /// a scroll offset. Acts as the escape hatch from the aggressive
@@ -23015,6 +23285,7 @@ impl TuiApp {
             overlay_next_id: 0,
             overlay_active_id: None,
             paste_preview: None,
+            paste_transform: None,
             transcript_overlay: None,
             transcript_overlay_scrollbar_cache: std::cell::Cell::new(None),
             transcript_overlay_render_cache: std::cell::RefCell::new(
