@@ -126,6 +126,7 @@ mod resume_picker;
 mod scroll;
 mod search;
 mod selection;
+mod semantic_filter;
 mod session_bundle;
 mod settings_watcher;
 mod signal_teardown;
@@ -2418,6 +2419,23 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         let before = active_transcript_scroll(app);
         dispatch_click_action(app, action);
         return active_transcript_scroll(app) != before;
+    }
+
+    // Main-view Semantic Filter badge (§12.5.2): a left-click cycles the filter
+    // forward — the mouse twin of `Alt+f`. The badge is painted in ABSOLUTE
+    // screen coordinates over the transcript text area's top-left (not the
+    // footer-relative space the `Chrome` block above translates into), so it is
+    // hit-tested in absolute coordinates here, mirroring the minimap arm. Routed
+    // before the card-affordance / selection arms so a click on the badge never
+    // doubles as a transcript selection.
+    if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::SemanticFilterBadge),
+            action,
+        )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
     }
 
     // Prompt-queue reorder overlay: per-item delete + drag-reorder. Gated on
@@ -5175,7 +5193,40 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             open_composer_in_editor(app);
             true
         }
+        keymap::Action::CycleSemanticFilter => {
+            // Main-surface inline filter (§12.5.2); the config/setup screens own
+            // their own routing, and the Ctrl+T overlay guard above already blocks
+            // this while the overlay (which has its own local `f` filter) is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            cycle_main_semantic_filter(app, false);
+            true
+        }
     }
+}
+
+/// `Alt+f` (and the active-filter badge click): step the main-view Semantic
+/// Filter (§12.5.2) forward (`backward == false`) or backward through its
+/// category cycle, wrapping around. The cycle's `Tool(i)` entries are derived
+/// from the live transcript, so a transcript with multiple tools offers one step
+/// per tool; a single-tool (or no-tool) transcript cycles only the always-present
+/// categories. Sets a status line naming the new category and requests a redraw
+/// so the filtered view paints immediately.
+fn cycle_main_semantic_filter(app: &mut TuiApp, backward: bool) {
+    let tool_names = distinct_overlay_tool_names(active_transcript_entries(app));
+    let next = semantic_filter::step(app.main_semantic_filter, &tool_names, backward);
+    app.main_semantic_filter = next;
+    let key = key_hint(app, keymap::Action::CycleSemanticFilter);
+    app.status = if next.is_active() {
+        format!(
+            "filter: {} — {key} to cycle (all to clear)",
+            next.label(&tool_names)
+        )
+    } else {
+        "filter cleared — showing all entries".to_string()
+    };
+    app.needs_redraw = true;
 }
 
 /// `Alt+8`: cycle the OSC 8 hyperlink mode (§11G.5) auto → on → off and surface
@@ -5771,6 +5822,47 @@ fn entry_matches_overlay_filter(
                 if tool_names.get(i).is_some_and(|name| name == &tool.result.tool_name))
         }
         OverlayFilter::CurrentTurn => index >= turn_start,
+    }
+}
+
+/// True when entry `index` survives the active MAIN-view semantic `category`
+/// (§12.5.2). Pure over the entry slice; reuses the SAME classifiers the overlay
+/// filter and jump-nav use, so the main inline view, the Ctrl+T overlay, and the
+/// jump keys all agree on what "an error" / "a tool call" / "this tool" is.
+///
+/// Categories that have a [`OverlayFilter`] twin delegate to
+/// [`entry_matches_overlay_filter`] (so there is one matcher, not two);
+/// `UserTurns`/`Assistant` — which the overlay lumps into `Conversation` — apply
+/// the message-role test directly, the same one
+/// [`entry_matches_jump_target`] uses for `JumpTarget::UserTurn`/`Assistant`.
+fn entry_matches_semantic_category(
+    entries: &[TranscriptEntry],
+    index: usize,
+    category: semantic_filter::SemanticCategory,
+    coalesce_tool_runs: bool,
+    tool_names: &[String],
+    turn_start: usize,
+) -> bool {
+    match category.to_overlay_filter() {
+        Some(filter) => entry_matches_overlay_filter(
+            entries,
+            index,
+            filter,
+            coalesce_tool_runs,
+            tool_names,
+            turn_start,
+        ),
+        None => match category {
+            semantic_filter::SemanticCategory::UserTurns => {
+                entry_matches_jump_target(entries, index, JumpTarget::UserTurn, coalesce_tool_runs)
+            }
+            semantic_filter::SemanticCategory::Assistant => {
+                entry_matches_jump_target(entries, index, JumpTarget::Assistant, coalesce_tool_runs)
+            }
+            // `to_overlay_filter` only returns `None` for the two role
+            // categories above; any other category took the `Some` arm.
+            _ => true,
+        },
     }
 }
 
@@ -6841,6 +6933,12 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
                 review.select(index);
             }
             apply_editor_handoff_review(app);
+        }
+        // Main-view Semantic Filter badge (§12.5.2): a click cycles the filter
+        // forward through the same `cycle_main_semantic_filter` the `Alt+f`
+        // keyboard verb drives, so mouse/keyboard parity holds by construction.
+        interaction::Action::CycleSemanticFilter => {
+            cycle_main_semantic_filter(app, false);
         }
     }
 }
@@ -14304,6 +14402,11 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
         render_scrolled_indicator(frame, text_area, app, logical_from_bottom);
     }
 
+    // Active main-view Semantic Filter (§12.5.2) badge on the top-left. Painted
+    // (and its click target registered) only while a filter narrows the view; a
+    // no-op at the resting `All` state.
+    render_semantic_filter_badge(frame, text_area, app);
+
     // Minimap turn rail in its reserved column (when toggled on). Painted last
     // so it draws over the body; it registers one frame-local hit target per
     // occupied cell so a click jumps to that turn (keyboard parity via the
@@ -14575,6 +14678,58 @@ fn render_scrolled_indicator(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, fr
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(visual, style))),
         rect,
+    );
+}
+
+/// Paint the main-view Semantic Filter (§12.5.2) badge at the top-LEFT of the
+/// transcript text `area` while a filter is active, and register it as a
+/// clickable target that cycles the filter forward (mouse twin of `Alt+f`). A
+/// no-op while the filter is `All` (the resting state) — nothing paints and no
+/// target registers — so an unfiltered/idle session is byte-identical to before
+/// this landed. The active-filter UI is deliberately unmistakable (the spec
+/// requires it: a hidden filter must not look like data loss): a bold, colored
+/// badge naming the category sits over the top row, mirroring the
+/// `render_scrolled_indicator` badge on the opposite corner.
+fn render_semantic_filter_badge(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if !app.main_semantic_filter.is_active() || area.width < 8 || area.height == 0 {
+        return;
+    }
+    let tool_names = distinct_overlay_tool_names(active_transcript_entries(app));
+    let key = key_hint(app, keymap::Action::CycleSemanticFilter);
+    let label = format!(
+        "⧩ filter: {} · {key}",
+        app.main_semantic_filter.label(&tool_names)
+    );
+    let max_width = area.width.saturating_sub(1);
+    let visual: String = label.chars().take(max_width as usize).collect();
+    let line_width = visual.chars().count() as u16;
+    if line_width == 0 {
+        return;
+    }
+    let rect = Rect {
+        x: area.left(),
+        y: area.top(),
+        width: line_width.min(area.width),
+        height: 1,
+    };
+    if rect.width == 0 {
+        return;
+    }
+    let style = Style::default()
+        .fg(crate::render::theme::accent())
+        .add_modifier(Modifier::BOLD);
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(visual, style))),
+        rect,
+    );
+    // Register the painted badge as a clickable target keyed by stable chrome
+    // identity (recomputed every frame from the live `rect`), so a click cycles
+    // the filter — the mouse twin of the `Alt+f` keyboard verb.
+    app.register_click(
+        rect,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::SemanticFilterBadge),
+        interaction::Action::CycleSemanticFilter,
     );
 }
 
@@ -16414,7 +16569,22 @@ fn main_render_key(
             key_hint(app, keymap::Action::ToggleTranscriptOverlay).as_str(),
         ),
         include_startup_card,
+        semantic_filter_hash: main_semantic_filter_hash(app),
     }
+}
+
+/// Fold the active main-view Semantic Filter (§12.5.2) into the
+/// [`main_render_cache::MainRenderKey`] dimension. Held at a constant `0` while
+/// the filter is `All` (the resting state) so an unfiltered transcript hits the
+/// cache exactly as it did before the filter existed; any active category folds
+/// its `Hash` so a filter flip (or a `Tool(i)` index change) invalidates.
+fn main_semantic_filter_hash(app: &TuiApp) -> u64 {
+    if !app.main_semantic_filter.is_active() {
+        return 0;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    app.main_semantic_filter.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The animation phase folded into [`main_render_cache::MainRenderKey`] for the
@@ -16474,12 +16644,46 @@ fn transcript_lines_and_entry_offsets_uncached(
     let turn_divider = transcript_turn_divider_snapshot(app);
     let turn_divider_width = width.unwrap_or(SETTLE_MEASURE_WIDTH);
     let mut turn_divider_pushed = false;
+    // Main-view Semantic Filter (§12.5.2). When a category is active the inline
+    // view shows only entries that survive it — the complement of the Ctrl+T
+    // overlay's `f` filter. `All` (the resting state) matches every entry, so the
+    // unfiltered view is byte-identical to before this landed. `tool_names` /
+    // `turn_start` are derived once over the unfiltered slice so a `Tool(i)` /
+    // role test keeps the right basis even while filtering (mirrors `wrap_entries`).
+    let semantic_filter = app.main_semantic_filter;
+    let semantic_filter_active = semantic_filter.is_active();
+    let semantic_tool_names = if semantic_filter_active {
+        distinct_overlay_tool_names(entries)
+    } else {
+        Vec::new()
+    };
+    let semantic_turn_start = if semantic_filter_active {
+        current_turn_start(entries)
+    } else {
+        0
+    };
     for (index, item) in entries.iter().enumerate() {
         // Record the logical-line offset of this entry's block before anything
         // (including a `prev_work` rail connector) is pushed for it. Suppressed
         // run members never push lines, so their offset stays at the position
         // they would have occupied — close enough for "jump near this entry".
         entry_line_starts[index] = lines.len();
+        // A filtered-out entry emits nothing — no block, no rail connector, no
+        // turn divider — but still keeps its `entry_line_starts` slot (set above)
+        // at the position it would have occupied, so jump-nav offsets stay
+        // indexable by entry index even while filtered.
+        if semantic_filter_active
+            && !entry_matches_semantic_category(
+                entries,
+                index,
+                semantic_filter,
+                app.coalesce_tool_runs,
+                &semantic_tool_names,
+                semantic_turn_start,
+            )
+        {
+            continue;
+        }
         // A finished work node that is mid settle-fold renders folded —
         // its expanded block truncated to an eased height that descends to
         // the collapsed preview — instead of from the line cache (whose key
@@ -24149,6 +24353,14 @@ pub(crate) struct TuiApp {
     /// so an idle session paints nothing extra; clickable to jump when mouse
     /// capture is on.
     pub(crate) show_minimap: bool,
+    /// Main-view Semantic Filter (§12.5.2): the category the inline transcript is
+    /// narrowed to (errors, tool calls, one tool, user turns, assistant). `All`
+    /// (the default) shows everything, so an idle session is byte-identical to
+    /// before this landed. Cycled in place with `Alt+f` (or a click on the
+    /// active-filter badge); the complement of the Ctrl+T overlay's local `f`
+    /// filter. Lives on the app (not the overlay state) because it scopes the
+    /// main view.
+    pub(crate) main_semantic_filter: semantic_filter::SemanticCategory,
     /// Horizontal navigation for wide blocks (§11.2 / 11G.4): the main view's
     /// soft-wrap toggle plus its clamped horizontal pan offset. `Alt+w` flips
     /// wrap; `Alt+h`/`Alt+l` and Shift+wheel pan the no-wrap view so wide
@@ -24887,6 +25099,7 @@ impl TuiApp {
             search: None,
             jump_marks: jump_marks::JumpMarkStack::new(),
             show_minimap: false,
+            main_semantic_filter: semantic_filter::SemanticCategory::All,
             wide_block: wide_block::WideBlockView::new(),
             // Probe OSC 8 hyperlink support once from the real environment, the
             // same env-closure style the clipboard chain uses. An unknown

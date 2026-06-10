@@ -26472,3 +26472,239 @@ async fn staging_overlay_survives_resize_to_degenerate_sizes() {
     // The overlay is still pending after all those renders (rendering is pure).
     assert!(app.paste_staging.is_some());
 }
+
+// ===========================================================================
+// Main-view Semantic Filters (§12.5.2)
+// ===========================================================================
+
+/// Seed a transcript with one user turn, one assistant answer, a successful
+/// `grep` tool result, and a FAILED `edit` tool result — one of each semantic
+/// category the main-view filter isolates.
+fn app_with_mixed_semantic_transcript() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("USERQUESTION about the crash"));
+    app.push_transcript_item(TranscriptItem::assistant("ASSISTANTANSWER explaining it"));
+    app.push_tool_result(sample_tool_result("grep", "GREPHIT in file"));
+    let mut failed = sample_tool_result("edit", "EDITFAILED: patch did not apply");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+    app
+}
+
+#[test]
+fn semantic_filter_keyboard_cycle_narrows_the_main_view_to_errors() {
+    let mut app = app_with_mixed_semantic_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Unfiltered: the resting state shows every category and paints no badge.
+    let all = render_to_string(&app, 80, 30);
+    assert!(
+        all.contains("USERQUESTION"),
+        "unfiltered shows the user turn"
+    );
+    assert!(
+        all.contains("ASSISTANTANSWER"),
+        "unfiltered shows the assistant answer"
+    );
+    assert!(all.contains("GREPHIT"), "unfiltered shows the tool output");
+    assert!(
+        !all.contains("filter:"),
+        "no active-filter badge at the resting All state: {all}"
+    );
+    assert_eq!(
+        app.main_semantic_filter,
+        semantic_filter::SemanticCategory::All
+    );
+
+    // Cycle forward to the first real category. With no per-tool entries the
+    // cycle is All → UserTurns → Assistant → ToolCalls → Errors → All; step
+    // four times to reach Errors.
+    for _ in 0..4 {
+        assert!(dispatch_keymap_action(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+        ));
+    }
+    assert_eq!(
+        app.main_semantic_filter,
+        semantic_filter::SemanticCategory::Errors
+    );
+
+    let errors = render_to_string(&app, 80, 30);
+    // The failed tool result survives; the success/user/assistant entries are
+    // filtered out of the inline view.
+    assert!(
+        errors.contains("EDITFAILED"),
+        "errors filter keeps the failed tool result: {errors}"
+    );
+    assert!(
+        !errors.contains("USERQUESTION"),
+        "errors filter hides the user turn: {errors}"
+    );
+    assert!(
+        !errors.contains("GREPHIT"),
+        "errors filter hides the successful tool output: {errors}"
+    );
+    // The active-filter UI is unmistakable: a badge names the category.
+    assert!(
+        errors.contains("filter:") && errors.contains("errors"),
+        "active errors filter paints a naming badge: {errors}"
+    );
+}
+
+#[test]
+fn semantic_filter_keyboard_cycle_isolates_assistant_then_clears() {
+    let mut app = app_with_mixed_semantic_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // All → UserTurns → Assistant: two forward steps.
+    dispatch_keymap_action(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+    );
+    dispatch_keymap_action(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+    );
+    assert_eq!(
+        app.main_semantic_filter,
+        semantic_filter::SemanticCategory::Assistant
+    );
+    let assistant = render_to_string(&app, 80, 30);
+    assert!(
+        assistant.contains("ASSISTANTANSWER"),
+        "assistant filter keeps the answer: {assistant}"
+    );
+    assert!(
+        !assistant.contains("USERQUESTION"),
+        "assistant filter hides the user turn: {assistant}"
+    );
+
+    // Cycle forward until it wraps back to All (the transcript has two distinct
+    // tools, so the cycle includes per-tool entries; loop until the wrap rather
+    // than counting exact steps). The cycle is finite, so this terminates.
+    for _ in 0..16 {
+        if app.main_semantic_filter == semantic_filter::SemanticCategory::All {
+            break;
+        }
+        dispatch_keymap_action(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+        );
+    }
+    assert_eq!(
+        app.main_semantic_filter,
+        semantic_filter::SemanticCategory::All
+    );
+    let cleared = render_to_string(&app, 80, 30);
+    assert!(cleared.contains("USERQUESTION"), "{cleared}");
+    assert!(
+        !cleared.contains("filter:"),
+        "cleared filter paints no badge: {cleared}"
+    );
+}
+
+#[test]
+fn semantic_filter_badge_click_cycles_the_filter() {
+    let mut app = app_with_mixed_semantic_transcript();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Activate a filter so the badge paints and registers a click target.
+    dispatch_keymap_action(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+    );
+    assert_eq!(
+        app.main_semantic_filter,
+        semantic_filter::SemanticCategory::UserTurns
+    );
+
+    // Render through the real `render()` so the badge's click target registers,
+    // then locate its rect from the registry and click it.
+    let backend = TestBackend::new(80, 30);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| render(frame, &app)).expect("draw");
+
+    let mut badge_cell = None;
+    'scan: for row in 0..30u16 {
+        for col in 0..80u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::SemanticFilterBadge),
+                interaction::Action::CycleSemanticFilter,
+            )) = app.click_target_at(col, row)
+            {
+                badge_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = badge_cell.expect("the active-filter badge registers a click target");
+
+    let consumed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(consumed, "a click on the badge is consumed");
+    // The click advanced the filter one step (UserTurns → Assistant), exactly
+    // like the Alt+f keyboard verb.
+    assert_eq!(
+        app.main_semantic_filter,
+        semantic_filter::SemanticCategory::Assistant
+    );
+}
+
+#[test]
+fn semantic_filter_no_match_paints_badge_but_no_entries() {
+    // A transcript with NO failing entry, filtered to Errors: the no-match state
+    // must still paint the (unmistakable) badge so the empty view never reads as
+    // data loss, and must never panic.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("a question with no error"));
+    app.push_transcript_item(TranscriptItem::assistant("a clean answer"));
+    app.main_semantic_filter = semantic_filter::SemanticCategory::Errors;
+
+    let painted = render_to_string(&app, 80, 30);
+    assert!(
+        painted.contains("filter:") && painted.contains("errors"),
+        "no-match still shows the active-filter badge: {painted}"
+    );
+    assert!(
+        !painted.contains("a question with no error"),
+        "no-match hides the non-error entries: {painted}"
+    );
+}
+
+#[test]
+fn semantic_filter_renders_without_panic_across_sizes() {
+    // Resize where the feature paints (the badge sits over the transcript top):
+    // every category at a range of sizes, including degenerate ones, must render
+    // a frame without panicking.
+    let mut app = app_with_mixed_semantic_transcript();
+    let categories = [
+        semantic_filter::SemanticCategory::All,
+        semantic_filter::SemanticCategory::UserTurns,
+        semantic_filter::SemanticCategory::Assistant,
+        semantic_filter::SemanticCategory::ToolCalls,
+        semantic_filter::SemanticCategory::Errors,
+    ];
+    for category in categories {
+        app.main_semantic_filter = category;
+        for (w, h) in [(100u16, 30u16), (40, 14), (8, 4), (1, 1)] {
+            let painted = render_to_string(&app, w, h);
+            assert!(
+                !painted.is_empty(),
+                "render must produce a frame at {w}x{h} for {category:?}"
+            );
+        }
+    }
+}

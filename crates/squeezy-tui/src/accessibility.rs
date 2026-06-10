@@ -634,6 +634,10 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // button click and the keyboard reach the same `apply_editor_handoff_review`
         // handler.
         A::EditorHandoffSelect(_) => KeyboardPath::Always("editor handoff ↑↓/Enter"),
+        // Main-view Semantic Filter badge (§12.5.2) — `CycleSemanticFilter`
+        // (Alt+f default). The badge click and the keyboard verb both drive the
+        // same `cycle_main_semantic_filter` handler.
+        A::CycleSemanticFilter => KeyboardPath::Keymap(Action::CycleSemanticFilter),
     })
 }
 

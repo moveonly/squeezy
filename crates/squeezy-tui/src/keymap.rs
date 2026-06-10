@@ -184,6 +184,14 @@ pub(crate) enum Action {
     /// editor is configured, and degrades to the same hint off Unix where the
     /// spawn/terminal-restore plumbing is not wired. Records nothing at idle.
     OpenComposerInEditor,
+    /// Cycle the main-view Semantic Filter (§12.5.2) forward through its
+    /// categories — all → user turns → assistant → tool calls → errors → (per
+    /// tool, when more than one) → all (`Alt+f` default). Narrows the inline
+    /// transcript to one semantic category in place, the complement of the Ctrl+T
+    /// overlay's local `f` filter. Paired with a click on the active-filter badge,
+    /// which dispatches the same forward cycle. A main-surface action; off (`All`)
+    /// by default so an idle session paints nothing extra.
+    CycleSemanticFilter,
 }
 
 impl Action {
@@ -231,6 +239,7 @@ impl Action {
             Self::ToggleClipboardHistory => "toggle_clipboard_history",
             Self::BuildSessionBundle => "build_session_bundle",
             Self::OpenComposerInEditor => "open_composer_in_editor",
+            Self::CycleSemanticFilter => "cycle_semantic_filter",
         }
     }
 
@@ -277,6 +286,7 @@ impl Action {
         Action::ToggleClipboardHistory,
         Action::BuildSessionBundle,
         Action::OpenComposerInEditor,
+        Action::CycleSemanticFilter,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -357,6 +367,8 @@ impl Action {
             // External-editor handoff is `Alt+e` — the same Meta/Alt encoding
             // case as the rest of the nav/copy family.
             | Self::OpenComposerInEditor
+            // Semantic-filter cycle is `Alt+f` — the same Meta/Alt encoding case.
+            | Self::CycleSemanticFilter
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -493,6 +505,10 @@ impl Action {
             // Bare `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/r/w/h/l/p)
             // are taken; `e` is free.
             Self::OpenComposerInEditor => KeyBinding::new(KeyCode::Char('e'), KeyModifiers::ALT),
+            // Main-view Semantic Filter cycle (§12.5.2). `Alt+f` — `f` recalls
+            // "filter". Bare `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/
+            // r/w/h/l/p/b/e) are taken; `f` is free.
+            Self::CycleSemanticFilter => KeyBinding::new(KeyCode::Char('f'), KeyModifiers::ALT),
         }
     }
 }

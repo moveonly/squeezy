@@ -135,6 +135,12 @@ pub(crate) struct MainRenderKey {
     pub(crate) tail_anim_phase: u64,
     /// Main-only input: the startup card flips the leading lines.
     pub(crate) include_startup_card: bool,
+    /// Main-view Semantic Filter (§12.5.2) folded to a `u64`. A filter change
+    /// hides/reveals entries, so it must invalidate the assembled-rows cache or a
+    /// hit would serve the pre-filter row set. Held at a constant `0` while the
+    /// filter is `All` (the resting state) so an unfiltered transcript still hits
+    /// exactly as before this dimension existed.
+    pub(crate) semantic_filter_hash: u64,
 }
 
 /// Hit/miss counters for the assembled main-render cache. Surfaced as plain

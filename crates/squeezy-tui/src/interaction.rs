@@ -115,6 +115,10 @@ pub(crate) enum ChromeKey {
     /// (§12.6.5), keyed by its 0-based index in the accept/reopen/discard list so
     /// a click selects exactly that action.
     EditorHandoffItem(usize),
+    /// The main-view Semantic Filter badge (§12.5.2) painted at the top-left of
+    /// the transcript while a filter is active. A click cycles the filter forward
+    /// — the mouse twin of the `Alt+f` keyboard verb.
+    SemanticFilterBadge,
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -211,6 +215,10 @@ pub(crate) enum Action {
     /// the cursor with ↑↓ and pressing Enter; a click both selects and applies
     /// the accept/reopen/discard action in one go.
     EditorHandoffSelect(usize),
+    /// Cycle the main-view Semantic Filter (§12.5.2) forward one category. Mouse
+    /// twin of the `Alt+f` keyboard verb / a click on the active-filter badge;
+    /// both step the filter through its cycle and request a redraw.
+    CycleSemanticFilter,
 }
 
 impl Action {
@@ -247,6 +255,7 @@ impl Action {
         Action::ClipboardDelete(0),
         Action::ClipboardClear,
         Action::EditorHandoffSelect(0),
+        Action::CycleSemanticFilter,
     ];
 }
 
