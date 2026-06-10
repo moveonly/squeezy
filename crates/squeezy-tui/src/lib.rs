@@ -118,6 +118,7 @@ mod overlay;
 mod paste_preview;
 mod paste_staging;
 mod paste_transform;
+mod pinned_compare;
 mod prompt_history;
 mod prompt_queue;
 mod prompt_queue_multiselect;
@@ -3247,6 +3248,45 @@ fn handle_transcript_overlay_mouse(
     mouse: crossterm::event::MouseEvent,
 ) -> Option<bool> {
     app.transcript_overlay.as_ref()?;
+    // Pinned Compare View (§12.2.3). When it is open it owns the overlay's inner
+    // area, so a wheel scrolls whichever pane the pointer is over (focusing it
+    // first, the mouse twin of `Tab` + scroll) and a left-click focuses the pane
+    // under the pointer. The two panes' painted text rects are cached active-pane-
+    // first each frame; a click/wheel outside both is swallowed (the view is
+    // modal). Handled before the detail-pane / transcript routing below.
+    if let Some(state) = app.pinned_compare {
+        if let Some((first, second)) = app.pinned_compare_rect_cache.get() {
+            // `first` is the active pane, `second` the other (see the render).
+            let active = state.focus;
+            let other = active.toggled();
+            let hit = if pinned_compare::rect_contains(first, mouse.column, mouse.row) {
+                Some(active)
+            } else if pinned_compare::rect_contains(second, mouse.column, mouse.row) {
+                Some(other)
+            } else {
+                None
+            };
+            if let Some(pane) = hit {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        focus_pinned_compare_pane(app, pane);
+                        return Some(scroll_pinned_compare(app, VerticalScrollDir::Up, 3));
+                    }
+                    MouseEventKind::ScrollDown => {
+                        focus_pinned_compare_pane(app, pane);
+                        return Some(scroll_pinned_compare(app, VerticalScrollDir::Down, 3));
+                    }
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        return Some(focus_pinned_compare_pane(app, pane));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Modal: a compare-view frame swallows every other overlay mouse event so
+        // it never leaks to the (hidden) transcript scroll/selection paths.
+        return Some(false);
+    }
     // A wheel event over the detail pane scrolls the PANE, not the transcript —
     // the mouse twin of `Shift`+the scroll keys. The pane's painted text rect is
     // cached each frame; outside it the wheel keeps scrolling the transcript.
@@ -5018,6 +5058,10 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
         && action != keymap::Action::OpenSearch
         && action != keymap::Action::ToggleLatencyOverlay
         && action != keymap::Action::ToggleDogfoodMetrics
+        // The Pinned Compare View (§12.2.3) lives INSIDE the Ctrl+T overlay (it
+        // compares against what the overlay shows), so — like the overlay toggle
+        // itself — it must pass this guard while the overlay is open.
+        && action != keymap::Action::TogglePinnedCompare
     {
         return false;
     }
@@ -5489,6 +5533,17 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             toggle_lane_fold(app);
+            true
+        }
+        keymap::Action::TogglePinnedCompare => {
+            // The compare view lives inside the Ctrl+T overlay; the config/setup
+            // screens own their own routing. Unlike the other overlays this
+            // action is allowed through the overlay guard above (see the
+            // allowlist), so it can open the compare view while the overlay is up.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_pinned_compare(app);
             true
         }
     }
@@ -9012,6 +9067,296 @@ enum VerticalScrollDir {
     Down,
 }
 
+// ---- Pinned Compare View (§12.2.3) ----
+
+/// Open / close the Pinned Compare View (§12.2.3) for the currently focused
+/// overlay entry. Opens it pinned to the focused entry — comparing against the
+/// live transcript — when one is focused and carries comparable content; closes
+/// it when already open. Like the detail pane this is meaningful only while the
+/// Ctrl+T overlay is open (the compare view compares against what the overlay
+/// shows), but unlike the detail pane it is reached through a rebindable keymap
+/// action (`Alt+t`) that the overlay guard lets through.
+fn toggle_pinned_compare(app: &mut TuiApp) {
+    if app.transcript_overlay.is_none() {
+        app.status =
+            "open the transcript overlay first (Ctrl+T), then Alt+t to compare".to_string();
+        return;
+    }
+    if app.pinned_compare.is_some() {
+        app.pinned_compare = None;
+        app.pinned_compare_rect_cache.set(None);
+        app.status = "compare view closed".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    let entries = active_transcript_entries(app);
+    let Some(index) = active_selected_entry(app) else {
+        app.status = "no focused entry — Ctrl+↑/↓ to focus one, then Alt+t".to_string();
+        return;
+    };
+    let Some(entry) = entries.get(index) else {
+        app.status = "no focused entry — Ctrl+↑/↓ to focus one, then Alt+t".to_string();
+        return;
+    };
+    if !entry_has_detail_pane_content(entry) {
+        app.status = "focused entry has no body worth comparing".to_string();
+        return;
+    }
+    app.pinned_compare = Some(pinned_compare::PinnedCompareState::new(entry.id));
+    app.pinned_compare_rect_cache.set(None);
+    app.status =
+        "compare view: Tab focus · scroll keys move active pane · x diff · Alt+t/Esc close"
+            .to_string();
+    app.needs_redraw = true;
+}
+
+/// Whether every entry the compare view pins is still present in the active
+/// transcript. The pinned entry must be live; the compare target (when one is
+/// pinned, rather than the live transcript) must be too. The crate root closes
+/// the view when an id has disappeared so the render path never paints an empty
+/// pane.
+fn pinned_compare_entries_present(app: &TuiApp) -> bool {
+    let Some(state) = app.pinned_compare else {
+        return false;
+    };
+    let entries = active_transcript_entries(app);
+    let pinned_live = entries.iter().any(|entry| entry.id == state.pinned_id);
+    let compare_live = match state.compare_id {
+        Some(id) => entries.iter().any(|entry| entry.id == id),
+        None => true,
+    };
+    pinned_live && compare_live
+}
+
+/// The fully-expanded body lines for a transcript entry addressed by stable id,
+/// at `width`. Built with the same expanded formatter the overlay and the detail
+/// pane use, so the compare pane shows the raw diff/file/tool/message body. Empty
+/// when the id has fallen out of the transcript.
+fn pinned_compare_entry_lines(app: &TuiApp, entry_id: u64, width: u16) -> Vec<Line<'static>> {
+    let entries = active_transcript_entries(app);
+    let Some((index, entry)) = entries
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.id == entry_id)
+    else {
+        return Vec::new();
+    };
+    let shortcut = key_hint(app, keymap::Action::ToggleTranscriptOverlay);
+    let logical = format_transcript_entry_expanded(
+        entry,
+        false,
+        ToolDetailMode::Full,
+        message_outcome(entries, index),
+        Some(width),
+        app.show_reasoning_usage,
+        shortcut.as_str(),
+    );
+    wrap_transcript_overlay_rows(&logical, width)
+}
+
+/// The content rows a compare pane paints, at `width`. The pinned pane shows the
+/// pinned entry's expanded body; the compare pane shows either the second pinned
+/// entry's body or — the spec's default — the live transcript rows the overlay
+/// itself paints, so the comparison is genuinely "pinned vs. live".
+fn pinned_compare_pane_lines(
+    app: &TuiApp,
+    pane: pinned_compare::ComparePane,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let Some(state) = app.pinned_compare else {
+        return Vec::new();
+    };
+    match pane {
+        pinned_compare::ComparePane::Pinned => {
+            pinned_compare_entry_lines(app, state.pinned_id, width)
+        }
+        pinned_compare::ComparePane::Compare => match state.compare_id {
+            Some(id) => pinned_compare_entry_lines(app, id, width),
+            None => with_transcript_overlay_rows(app, width, |rows| rows.to_vec()),
+        },
+    }
+}
+
+/// The plain text of a compare pane (one `String` per row), used to feed the
+/// line-based clean-text diff. Strips styling and the per-row spans down to their
+/// concatenated content, then trims trailing whitespace so a cosmetic gutter
+/// difference does not register as a content change.
+fn pinned_compare_pane_plain(
+    app: &TuiApp,
+    pane: pinned_compare::ComparePane,
+    width: u16,
+) -> Vec<String> {
+    pinned_compare_pane_lines(app, pane, width)
+        .iter()
+        .map(|line| {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            text.trim_end().to_string()
+        })
+        .collect()
+}
+
+/// The rendered rows for the diff mode: a single column of `+`/`-`/` `-gutter
+/// lines from [`pinned_compare::clean_text_diff`] (pinned = old, compare = new).
+/// Falls back to a one-line notice when either side is too large to diff (the
+/// spec's size-limit mitigation).
+fn pinned_compare_diff_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
+    // The gutter eats one cell; diff the panes at the narrower body width so the
+    // wrapped rows line up with what each side would have shown.
+    let body_width = width.saturating_sub(2).max(1);
+    let old = pinned_compare_pane_plain(app, pinned_compare::ComparePane::Pinned, body_width);
+    let new = pinned_compare_pane_plain(app, pinned_compare::ComparePane::Compare, body_width);
+    let Some(diff) = pinned_compare::clean_text_diff(&old, &new) else {
+        return vec![Line::from(Span::styled(
+            format!(
+                "diff skipped — output too large (> {} lines per side)",
+                pinned_compare::DIFF_LINE_LIMIT
+            ),
+            Style::default().fg(crate::render::theme::quiet()),
+        ))];
+    };
+    diff.into_iter()
+        .map(|line| {
+            let color = match line.tag {
+                pinned_compare::DiffTag::Same => crate::render::theme::quiet(),
+                pinned_compare::DiffTag::Added => crate::render::theme::green(),
+                pinned_compare::DiffTag::Removed => crate::render::theme::red(),
+            };
+            Line::from(Span::styled(
+                format!("{} {}", line.tag.marker(), line.text),
+                Style::default().fg(color),
+            ))
+        })
+        .collect()
+}
+
+/// `(total_rows, viewport_h)` for one compare pane. Prefers the LAST PAINTED text
+/// rect (cached each frame in `pinned_compare_rect_cache`) so the scroll clamp
+/// uses the geometry the user is looking at; falls back to rebuilding the rect
+/// off-frame from the live terminal size before the first paint. Returns `None`
+/// when no compare view is open or the overlay is too small to split.
+fn pinned_compare_geometry(
+    app: &TuiApp,
+    pane: pinned_compare::ComparePane,
+) -> Option<(usize, usize)> {
+    let state = app.pinned_compare?;
+    // The cached rects are stored active-pane-first; resolve which slot this pane
+    // is in for this frame.
+    let text_area = match app.pinned_compare_rect_cache.get() {
+        Some((first, second)) => {
+            if pane == state.focus {
+                first
+            } else {
+                second
+            }
+        }
+        None => {
+            let (width, height) = app.off_frame_terminal_size();
+            let full_area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            let (content_area, _) = transcript_overlay_content_and_status_areas(full_area);
+            let inner = transcript_overlay_inner(content_area);
+            let layout = pinned_compare::split_overlay_content(inner)?;
+            // Off-frame both panes share the same inner size, so either slot's
+            // inset rect is a fine proxy for the clamp.
+            let (first, _) = layout.panes();
+            pinned_compare::pane_inner(first)
+        }
+    };
+    if text_area.width == 0 || text_area.height == 0 {
+        return None;
+    }
+    let rows = if state.mode == pinned_compare::CompareMode::Diff {
+        pinned_compare_diff_lines(app, text_area.width)
+    } else {
+        pinned_compare_pane_lines(app, pane, text_area.width)
+    };
+    Some((rows.len(), usize::from(text_area.height)))
+}
+
+/// Scroll the *focused* compare pane by `delta` rows in `dir`, clamped to its
+/// content. Returns `true` when the offset changed (so the caller redraws). Used
+/// by both the keyboard scroll path and the wheel-over-pane mouse path. In diff
+/// mode the two panes share one column, so whichever pane is focused scrolls the
+/// same diff body.
+fn scroll_pinned_compare(app: &mut TuiApp, dir: VerticalScrollDir, delta: usize) -> bool {
+    let Some(focus) = app.pinned_compare.map(|state| state.focus) else {
+        return false;
+    };
+    let Some((total, viewport)) = pinned_compare_geometry(app, focus) else {
+        return false;
+    };
+    let Some(state) = app.pinned_compare.as_mut() else {
+        return false;
+    };
+    let current = state.focused_scroll();
+    let next = match dir {
+        VerticalScrollDir::Up => current.saturating_sub(delta),
+        VerticalScrollDir::Down => current.saturating_add(delta),
+    };
+    let next = pinned_compare::clamp_pane_scroll(next, total, viewport);
+    if next == current {
+        return false;
+    }
+    state.set_focused_scroll(next);
+    app.needs_redraw = true;
+    true
+}
+
+/// Flip which compare pane the keyboard / wheel drives (the `Tab` key and a click
+/// on a pane). Returns `true` when a view was open (so the caller redraws).
+fn toggle_pinned_compare_focus(app: &mut TuiApp) -> bool {
+    let Some(state) = app.pinned_compare.as_mut() else {
+        return false;
+    };
+    state.focus = state.focus.toggled();
+    let label = state.focus.label();
+    // The cached rects are active-pane-first, so a focus flip invalidates them
+    // until the next paint re-stamps the new ordering.
+    app.pinned_compare_rect_cache.set(None);
+    app.status = format!("compare focus: {label} pane");
+    app.needs_redraw = true;
+    true
+}
+
+/// Focus a specific compare pane (the mouse twin of `Tab`): a click inside a pane
+/// makes it the active one. Returns `true` when the focus actually changed.
+fn focus_pinned_compare_pane(app: &mut TuiApp, pane: pinned_compare::ComparePane) -> bool {
+    let Some(state) = app.pinned_compare.as_mut() else {
+        return false;
+    };
+    if state.focus == pane {
+        return false;
+    }
+    state.focus = pane;
+    let label = pane.label();
+    app.pinned_compare_rect_cache.set(None);
+    app.status = format!("compare focus: {label} pane");
+    app.needs_redraw = true;
+    true
+}
+
+/// Toggle the compare view between verbatim content and a line-based clean-text
+/// diff (the `x` key). Returns `true` when a view was open.
+fn toggle_pinned_compare_mode(app: &mut TuiApp) -> bool {
+    let Some(state) = app.pinned_compare.as_mut() else {
+        return false;
+    };
+    state.mode = state.mode.toggled();
+    // The diff column has a different total height than either content pane, so
+    // reset both offsets to the top to avoid stranding past the end.
+    state.pinned_scroll = 0;
+    state.compare_scroll = 0;
+    let label = state.mode.label();
+    app.pinned_compare_rect_cache.set(None);
+    app.status = format!("compare mode: {label}");
+    app.needs_redraw = true;
+    true
+}
+
 /// Current `(line_count, viewport_h)` for the *active* transcript, using the
 /// last-painted-frame width and the transcript area height. Mirrors the geometry
 /// `render_transcript` feeds to `ScrollState::offset` so `scroll_by`/
@@ -12102,6 +12447,10 @@ fn close_transcript_overlay(app: &mut TuiApp) {
     // closes the pane too so it can never linger as orphaned state.
     app.diff_detail_pane = None;
     app.diff_detail_pane_rect_cache.set(None);
+    // The Pinned Compare View (§12.2.3) likewise lives only alongside the
+    // overlay; tear it down so it can never linger as orphaned state.
+    app.pinned_compare = None;
+    app.pinned_compare_rect_cache.set(None);
     if matches!(app.subagent_pane.active, ConversationSource::Subagent(_)) {
         app.subagent_pane.focused = false;
         app.subagent_pane.active = ConversationSource::Main;
@@ -12118,6 +12467,61 @@ fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         return false;
     }
     const PAGE: usize = 10;
+    // Pinned Compare View (§12.2.3). When it is open it OWNS the overlay's inner
+    // area (the single transcript is replaced by two panes), so it claims the
+    // overlay keys: the scroll keys move the ACTIVE pane, `Tab` flips focus, `x`
+    // toggles the clean-text diff, and `Esc` closes the compare view first (one
+    // level at a time). The `Alt+t` toggle itself flows through the global keymap
+    // dispatch before this handler. Handled before the detail-pane and plain
+    // scroll arms so the compare view wins while it is up.
+    if app.pinned_compare.is_some() {
+        match key.code {
+            KeyCode::Tab | KeyCode::BackTab => {
+                toggle_pinned_compare_focus(app);
+                return true;
+            }
+            KeyCode::Char('x') | KeyCode::Char('X')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META) =>
+            {
+                toggle_pinned_compare_mode(app);
+                return true;
+            }
+            KeyCode::Up => {
+                scroll_pinned_compare(app, VerticalScrollDir::Up, 1);
+                return true;
+            }
+            KeyCode::Down => {
+                scroll_pinned_compare(app, VerticalScrollDir::Down, 1);
+                return true;
+            }
+            KeyCode::PageUp => {
+                scroll_pinned_compare(app, VerticalScrollDir::Up, PAGE);
+                return true;
+            }
+            KeyCode::PageDown => {
+                scroll_pinned_compare(app, VerticalScrollDir::Down, PAGE);
+                return true;
+            }
+            KeyCode::Home => {
+                scroll_pinned_compare(app, VerticalScrollDir::Up, usize::MAX);
+                return true;
+            }
+            KeyCode::End => {
+                scroll_pinned_compare(app, VerticalScrollDir::Down, usize::MAX);
+                return true;
+            }
+            KeyCode::Esc => {
+                app.pinned_compare = None;
+                app.pinned_compare_rect_cache.set(None);
+                app.status = "compare view closed".to_string();
+                app.needs_redraw = true;
+                return true;
+            }
+            _ => return true, // modal: swallow everything else
+        }
+    }
     // Detail pane (§11G.10) scroll. When the pane is open, `Shift`+the scroll
     // keys move the PANE while the plain keys keep moving the transcript — so
     // the transcript context the spec wants preserved stays reachable. Matched
@@ -17691,10 +18095,15 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     // out of the transcript is healed to a closed pane right here, so the render
     // never paints an empty pane or a dangling hint.
     let pane_open = app.diff_detail_pane.is_some() && diff_detail_pane_entry_present(app);
-    let detail_suffix = if pane_open {
+    // The Pinned Compare View (§12.2.3) takes over the whole inner area when open,
+    // so its hint takes precedence over the detail-pane hint.
+    let compare_open = app.pinned_compare.is_some() && pinned_compare_entries_present(app);
+    let detail_suffix = if compare_open {
+        "· compare: Tab focus · x diff · Alt+t/Esc close "
+    } else if pane_open {
         "· detail pane: d/Esc close · Shift+↑/↓ scroll "
     } else if active_selected_entry(app).is_some() {
-        "· d: detail pane "
+        "· d: detail pane · Alt+t: compare "
     } else {
         ""
     };
@@ -17716,6 +18125,19 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         ));
     frame.render_widget(block, area);
     let full_inner = transcript_overlay_inner(area);
+    // The Pinned Compare View (§12.2.3) owns the whole inner area when open: it
+    // shows two equal panes (pinned vs. live, or two pinned entries) instead of
+    // the single scrolling transcript. Render it and return — the detail pane and
+    // the normal transcript rows are mutually exclusive with it.
+    if compare_open {
+        // Closing the (mutually exclusive) detail pane's cache here keeps a stale
+        // wheel hit-test rect from routing into the compare layout.
+        app.diff_detail_pane_rect_cache.set(None);
+        app.transcript_overlay_scrollbar_cache.set(None);
+        render_pinned_compare(frame, full_inner, app);
+        return;
+    }
+    app.pinned_compare_rect_cache.set(None);
     // Carve the detail pane off the right of the inner area when it is open and
     // the area is wide enough to split (`split_overlay_content` returns `None`
     // when too narrow — a graceful full-width fallback). The transcript then
@@ -17856,6 +18278,162 @@ fn render_diff_detail_pane(
     // Stamp the painted text rect so the wheel hit-test can route a scroll over
     // the pane to the pane rather than the transcript.
     app.diff_detail_pane_rect_cache.set(Some(text_area));
+}
+
+/// Short kind label for a transcript entry addressed by stable id, used in the
+/// compare panes' titles. `None` when the id is no longer live.
+fn pinned_compare_entry_title(app: &TuiApp, entry_id: u64) -> Option<String> {
+    let entries = active_transcript_entries(app);
+    let entry = entries.iter().find(|entry| entry.id == entry_id)?;
+    let label = match &entry.kind {
+        TranscriptEntryKind::ToolResult(tool) => format!("Tool: {}", tool.result.tool_name),
+        TranscriptEntryKind::Diff(_) => "Diff".to_string(),
+        TranscriptEntryKind::PlanCard(_) => "Plan".to_string(),
+        TranscriptEntryKind::Message(item) if item.role == Role::Assistant => {
+            "Assistant".to_string()
+        }
+        TranscriptEntryKind::Message(_) => "Message".to_string(),
+        TranscriptEntryKind::Reasoning(_) => "Reasoning".to_string(),
+        _ => "Detail".to_string(),
+    };
+    Some(label)
+}
+
+/// Paint the Pinned Compare View (§12.2.3) into the overlay's full inner area. The
+/// two surfaces — the pinned entry and either a second pinned entry or the live
+/// transcript — sit as equal panes (side-by-side when wide, stacked when narrow),
+/// the active one prominent (left/top). In diff mode a single clean-text diff
+/// column replaces both. Each pane is independently scrolled and its painted text
+/// rect is cached (active-pane-first) so a wheel / click routes to the right pane.
+/// A too-small area is a graceful no-op (paints a hint, clears the cache).
+fn render_pinned_compare(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(state) = app.pinned_compare else {
+        return;
+    };
+    let Some(layout) = pinned_compare::split_overlay_content(area) else {
+        // Too small to show two panes: clear the cache and leave a hint so the
+        // view never paints a corrupted squeeze.
+        app.pinned_compare_rect_cache.set(None);
+        let hint = Paragraph::new(Line::from(Span::styled(
+            "compare view needs a larger terminal",
+            Style::default().fg(crate::render::theme::quiet()),
+        )));
+        frame.render_widget(hint, area);
+        return;
+    };
+
+    // Separator rule (vertical when split, horizontal when stacked).
+    let separator = layout.separator();
+    if separator.width > 0 && separator.height > 0 {
+        let glyph = if layout.is_stacked() { "─" } else { "│" };
+        let rule = if layout.is_stacked() {
+            vec![Line::from(Span::styled(
+                glyph.repeat(usize::from(separator.width)),
+                Style::default().fg(crate::render::theme::quiet()),
+            ))]
+        } else {
+            vec![
+                Line::from(Span::styled(
+                    glyph,
+                    Style::default().fg(crate::render::theme::quiet()),
+                ));
+                usize::from(separator.height)
+            ]
+        };
+        frame.render_widget(Paragraph::new(rule), separator);
+    }
+
+    // `first` always holds the ACTIVE pane (the focus model gives it the
+    // prominent slot); `second` holds the other.
+    let (first_rect, second_rect) = layout.panes();
+    let active = state.focus;
+    let other = active.toggled();
+
+    let first_text = render_pinned_compare_pane(frame, first_rect, app, active, true, state.mode);
+    let second_text = render_pinned_compare_pane(frame, second_rect, app, other, false, state.mode);
+
+    // Stamp the painted text rects (active first) so the wheel/click hit-test in
+    // `handle_transcript_overlay_mouse` routes to the right pane. When either pane
+    // was too small to paint a body the cache is cleared (no routing target).
+    match (first_text, second_text) {
+        (Some(first), Some(second)) => {
+            app.pinned_compare_rect_cache.set(Some((first, second)));
+        }
+        _ => app.pinned_compare_rect_cache.set(None),
+    }
+}
+
+/// Paint one compare pane into `pane_rect`: a bordered box titled with the pane's
+/// role + pinned entry kind, the pane's body (content or, in diff mode for the
+/// active pane, the clean-text diff) inside it, independently scrolled. The active
+/// pane's border is accented so the focus is visible. Returns the painted text
+/// rect, or `None` when the pane was too small to hold a body.
+fn render_pinned_compare_pane(
+    frame: &mut Frame<'_>,
+    pane_rect: Rect,
+    app: &TuiApp,
+    pane: pinned_compare::ComparePane,
+    is_active: bool,
+    mode: pinned_compare::CompareMode,
+) -> Option<Rect> {
+    let state = app.pinned_compare?;
+    let diff = mode == pinned_compare::CompareMode::Diff;
+    // Title: role + (in content mode) the pinned entry kind / "live transcript".
+    let role = pane.label();
+    let detail = if diff {
+        "diff".to_string()
+    } else {
+        match pane {
+            pinned_compare::ComparePane::Pinned => {
+                pinned_compare_entry_title(app, state.pinned_id).unwrap_or_else(|| "—".to_string())
+            }
+            pinned_compare::ComparePane::Compare => match state.compare_id {
+                Some(id) => pinned_compare_entry_title(app, id).unwrap_or_else(|| "—".to_string()),
+                None => "live transcript".to_string(),
+            },
+        }
+    };
+    let title = format!(" {role}: {detail} ");
+    let border_color = if is_active {
+        crate::render::theme::accent()
+    } else {
+        crate::render::theme::quiet()
+    };
+    let mut title_style = Style::default().fg(border_color);
+    if is_active {
+        title_style = title_style.add_modifier(Modifier::BOLD);
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(title, title_style));
+    frame.render_widget(ratatui::widgets::Clear, pane_rect);
+    frame.render_widget(block, pane_rect);
+
+    let text_area = pinned_compare::pane_inner(pane_rect);
+    if text_area.width == 0 || text_area.height == 0 {
+        return None;
+    }
+    let rows = if diff {
+        pinned_compare_diff_lines(app, text_area.width)
+    } else {
+        pinned_compare_pane_lines(app, pane, text_area.width)
+    };
+    let raw_scroll = match pane {
+        pinned_compare::ComparePane::Pinned => state.pinned_scroll,
+        pinned_compare::ComparePane::Compare => state.compare_scroll,
+    };
+    let scroll =
+        pinned_compare::clamp_pane_scroll(raw_scroll, rows.len(), usize::from(text_area.height));
+    let visible = rows
+        .iter()
+        .skip(scroll)
+        .take(usize::from(text_area.height))
+        .cloned()
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), text_area);
+    Some(text_area)
 }
 
 #[cfg(test)]
@@ -27105,6 +27683,17 @@ pub(crate) struct TuiApp {
     /// the pane scrolls the pane (not the transcript). Set at the end of the
     /// overlay render when the pane is painted; `None` otherwise.
     pub(crate) diff_detail_pane_rect_cache: std::cell::Cell<Option<Rect>>,
+    /// Pinned Compare View (§12.2.3). `Some` pins one transcript entry (by stable
+    /// id) into a pane and shows it side-by-side / stacked against the live
+    /// transcript (or a second pinned entry) so old and new content can be
+    /// compared, each pane keeping its own scroll. `None` = closed. Only
+    /// meaningful while `transcript_overlay` is also `Some`.
+    pub(crate) pinned_compare: Option<pinned_compare::PinnedCompareState>,
+    /// Per-frame snapshot of the two compare panes' TEXT rects (`(first,
+    /// second)`, active pane first) so a mouse wheel / click over a pane routes
+    /// to that pane. Set at the end of the overlay render when the compare view
+    /// paints; `None` otherwise.
+    pub(crate) pinned_compare_rect_cache: std::cell::Cell<Option<(Rect, Rect)>>,
     /// Per-frame snapshot of the MAIN transcript scrollbar gutter so a mouse
     /// click/drag can map to a `from_bottom` without re-deriving the layout.
     /// Set at the end of `render_transcript`; `None` when content fits.
@@ -28020,6 +28609,8 @@ impl TuiApp {
             ),
             diff_detail_pane: None,
             diff_detail_pane_rect_cache: std::cell::Cell::new(None),
+            pinned_compare: None,
+            pinned_compare_rect_cache: std::cell::Cell::new(None),
             main_scrollbar_cache: std::cell::Cell::new(None),
             main_text_area_cache: std::cell::Cell::new(None),
             last_frame_size: std::cell::Cell::new(None),

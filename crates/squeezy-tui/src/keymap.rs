@@ -256,6 +256,15 @@ pub(crate) enum Action {
     /// only on a focused-entry / revision / collapse change, so an idle session
     /// pays nothing.
     ToggleLaneFold,
+    /// Open / close the Pinned Compare View (`Alt+t` default; §12.2.3). Pins the
+    /// focused transcript entry into one pane and shows it side-by-side (or
+    /// stacked, on a narrow terminal) against the live transcript — or a second
+    /// pinned entry — so old and new content can be compared. Each pane keeps its
+    /// own scroll; `Tab` (or a click) flips which pane the keyboard/wheel drives;
+    /// `x` toggles a line-based clean-text diff. The view lives inside the Ctrl+T
+    /// overlay (it compares against what the overlay shows) and paints nothing at
+    /// idle. Reuses the §11G.10 detail-pane split machinery.
+    TogglePinnedCompare,
 }
 
 impl Action {
@@ -312,6 +321,7 @@ impl Action {
             Self::ToggleHealthMarkers => "toggle_health_markers",
             Self::ToggleTurnOutline => "toggle_turn_outline",
             Self::ToggleLaneFold => "toggle_lane_fold",
+            Self::TogglePinnedCompare => "toggle_pinned_compare",
         }
     }
 
@@ -367,6 +377,7 @@ impl Action {
         Action::ToggleHealthMarkers,
         Action::ToggleTurnOutline,
         Action::ToggleLaneFold,
+        Action::TogglePinnedCompare,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -474,6 +485,9 @@ impl Action {
             // Collapsible-Reasoning/Tool-Lanes overlay toggle is `Alt+z` — the
             // same Meta/Alt encoding case as the rest of the nav/overlay family.
             | Self::ToggleLaneFold
+            // Pinned-Compare-View overlay toggle is `Alt+t` — the same Meta/Alt
+            // encoding case as the rest of the nav/overlay family.
+            | Self::TogglePinnedCompare
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -648,6 +662,12 @@ impl Action {
             // higher reading altitude by collapsing lanes); `z` is free among the
             // overlay Alt letters.
             Self::ToggleLaneFold => KeyBinding::new(KeyCode::Char('z'), KeyModifiers::ALT),
+            // Pinned Compare View (§12.2.3). `Alt+t` — `t` recalls "Two panes" /
+            // "compare Transcript". `Alt+d` (the other free letter) collides with
+            // the composer's delete-word-forward; among the remaining free Alt
+            // letters `t` is the mnemonic pick. Distinct from `Ctrl+T` (the
+            // transcript-overlay toggle); the modifier disambiguates them.
+            Self::TogglePinnedCompare => KeyBinding::new(KeyCode::Char('t'), KeyModifiers::ALT),
         }
     }
 }

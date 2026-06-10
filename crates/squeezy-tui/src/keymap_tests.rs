@@ -435,6 +435,44 @@ fn hyperlink_toggle_action_is_registered_and_defaults_to_alt_8() {
 }
 
 #[test]
+fn pinned_compare_toggle_action_is_registered_and_defaults_to_alt_t() {
+    // §12.2.3: the Pinned Compare View toggle resolves from its slug, is in
+    // `ALL`, defaults to `Alt+t`, and is honestly terminal-dependent (Meta).
+    assert_eq!(
+        Action::from_slug("toggle_pinned_compare"),
+        Some(Action::TogglePinnedCompare)
+    );
+    assert!(Action::ALL.contains(&Action::TogglePinnedCompare));
+
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.binding(Action::TogglePinnedCompare),
+        KeyBinding::new(KeyCode::Char('t'), KeyModifiers::ALT),
+    );
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('t'), KeyModifiers::ALT),
+        Some(Action::TogglePinnedCompare),
+    );
+    assert_eq!(
+        Action::TogglePinnedCompare.terminal_compat_note(),
+        Some("terminal-dependent"),
+    );
+    // Distinct from the `Ctrl+T` transcript-overlay toggle — the modifier
+    // disambiguates the two.
+    assert_ne!(
+        resolver.lookup(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        Some(Action::TogglePinnedCompare),
+    );
+    // The default must not collide with any other action's default.
+    for collision in resolver.collisions() {
+        assert!(
+            !collision.1.contains(&Action::TogglePinnedCompare),
+            "pinned-compare default collides: {collision:?}",
+        );
+    }
+}
+
+#[test]
 fn all_actions_have_unique_slugs() {
     // A duplicate slug would let one action silently shadow another in the
     // `[tui.keymap]` table; guard against it as new verbs land.

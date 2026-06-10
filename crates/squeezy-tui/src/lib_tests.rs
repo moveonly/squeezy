@@ -2383,6 +2383,372 @@ fn render_to_string_and_pane_rect(app: &TuiApp, width: u16, height: u16) -> Rect
         .expect("the pane must have painted a rect")
 }
 
+// ---- Pinned Compare View (§12.2.3) ----
+
+/// `Alt+t` — the default Pinned Compare View toggle.
+fn alt_t() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT)
+}
+
+#[tokio::test]
+async fn pinned_compare_opens_against_live_for_focused_tool_entry_via_alt_t() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, alt_t())
+        .await
+        .expect("Alt+t opens the compare view");
+
+    let state = app.pinned_compare.expect("compare view should be open");
+    let focused_id = app.transcript[app.selected_entry.unwrap()].id;
+    assert_eq!(
+        state.pinned_id, focused_id,
+        "the view pins the focused entry by its stable id"
+    );
+    assert_eq!(
+        state.compare_id, None,
+        "it defaults to comparing against the live transcript"
+    );
+    assert_eq!(state.focus, pinned_compare::ComparePane::Pinned);
+    assert_eq!(state.mode, pinned_compare::CompareMode::Content);
+
+    // The split paints both panes at once: the pinned tool body on one side and
+    // the live transcript (an earlier turn) on the other.
+    let rendered = render_to_string(&app, 140, 40);
+    assert!(
+        rendered.contains("pinned: Tool: shell"),
+        "the pinned pane is titled with the entry kind:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("compare: live transcript"),
+        "the compare pane is titled as the live transcript:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("DETAILPANE-LINE-00"),
+        "the pinned pane shows the entry's expanded body:\n{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn pinned_compare_alt_t_toggles_closed_again() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, alt_t())
+        .await
+        .expect("open");
+    assert!(app.pinned_compare.is_some(), "first Alt+t opens");
+    handle_key(&mut app, &mut agent, alt_t())
+        .await
+        .expect("close");
+    assert!(
+        app.pinned_compare.is_none(),
+        "a second Alt+t closes the compare view"
+    );
+    assert!(
+        app.pinned_compare_rect_cache.get().is_none(),
+        "closing clears the cached hit-test rects"
+    );
+}
+
+#[tokio::test]
+async fn pinned_compare_refuses_when_no_entry_is_focused() {
+    let mut app = app_with_focused_tool_entry();
+    app.selected_entry = None;
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, alt_t())
+        .await
+        .expect("Alt+t with no focus");
+    assert!(
+        app.pinned_compare.is_none(),
+        "no focused entry => no compare view"
+    );
+    assert!(
+        app.status.contains("no focused entry"),
+        "the status explains the refusal: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn pinned_compare_tab_flips_focus_and_scroll_targets_the_active_pane() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(&mut app, &mut agent, alt_t())
+        .await
+        .expect("open");
+    // Paint so each pane's geometry is cached for the scroll clamp.
+    let _ = render_to_string(&app, 140, 40);
+
+    // The pinned pane is active: a Down scrolls it, leaving the compare pane at 0.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down scrolls the active (pinned) pane");
+    let state = app.pinned_compare.expect("open");
+    assert_eq!(state.pinned_scroll, 1, "the active pinned pane scrolled");
+    assert_eq!(state.compare_scroll, 0, "the inactive pane is untouched");
+
+    // Tab flips focus to the compare pane.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+    )
+    .await
+    .expect("tab flips focus");
+    assert_eq!(
+        app.pinned_compare.expect("open").focus,
+        pinned_compare::ComparePane::Compare
+    );
+    // Re-paint so the (now active) compare pane has fresh cached geometry, then a
+    // Down scrolls IT, leaving the pinned pane's independent offset intact.
+    let _ = render_to_string(&app, 140, 40);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down scrolls the now-active compare pane");
+    let state = app.pinned_compare.expect("open");
+    assert_eq!(
+        state.pinned_scroll, 1,
+        "the pinned pane keeps its independent offset after focus flip"
+    );
+    assert_eq!(
+        state.compare_scroll, 1,
+        "the compare pane scrolled on its own"
+    );
+}
+
+#[tokio::test]
+async fn pinned_compare_x_toggles_a_clean_text_diff() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(&mut app, &mut agent, alt_t())
+        .await
+        .expect("open");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("x toggles diff mode");
+    assert_eq!(
+        app.pinned_compare.expect("open").mode,
+        pinned_compare::CompareMode::Diff,
+        "x switches to the clean-text diff"
+    );
+    // Diff mode titles both panes "diff" and paints gutter markers (the pinned
+    // tool body is absent from the live transcript, so its lines read as
+    // removals). The diff text keeps the entry's own rail prefix, so a removed
+    // body row renders as `-` + (rail) + the line, e.g. `-   │ DETAILPANE-LINE-…`.
+    let rendered = render_to_string(&app, 140, 40);
+    assert!(
+        rendered.contains("pinned: diff"),
+        "the pane title flips to diff:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("DETAILPANE-LINE-06"),
+        "the pinned body still shows in diff mode:\n{rendered}"
+    );
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line.contains("- ") && line.contains("DETAILPANE-LINE")),
+        "a removed body row carries a '-' gutter marker in the diff column:\n{rendered}"
+    );
+
+    // x again returns to content mode.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("x toggles back");
+    assert_eq!(
+        app.pinned_compare.expect("open").mode,
+        pinned_compare::CompareMode::Content
+    );
+}
+
+#[tokio::test]
+async fn pinned_compare_closes_when_overlay_closes() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(&mut app, &mut agent, alt_t())
+        .await
+        .expect("open");
+    assert!(app.pinned_compare.is_some());
+
+    // Toggling the overlay shut (Ctrl+T) must also tear down the compare view.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl+t closes overlay");
+    assert!(app.transcript_overlay.is_none(), "overlay closed");
+    assert!(
+        app.pinned_compare.is_none(),
+        "closing the overlay tears down the compare view"
+    );
+    assert!(app.pinned_compare_rect_cache.get().is_none());
+}
+
+#[tokio::test]
+async fn pinned_compare_esc_closes_compare_first_then_overlay() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(&mut app, &mut agent, alt_t())
+        .await
+        .expect("open");
+
+    let esc = || KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    handle_key(&mut app, &mut agent, esc())
+        .await
+        .expect("esc 1");
+    assert!(
+        app.pinned_compare.is_none(),
+        "the first Esc closes the compare view"
+    );
+    assert!(
+        app.transcript_overlay.is_some(),
+        "the overlay stays open after the compare view closes"
+    );
+    handle_key(&mut app, &mut agent, esc())
+        .await
+        .expect("esc 2");
+    assert!(
+        app.transcript_overlay.is_none(),
+        "a second Esc closes the overlay"
+    );
+}
+
+#[tokio::test]
+async fn pinned_compare_stacks_on_a_narrow_terminal() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(&mut app, &mut agent, alt_t())
+        .await
+        .expect("open");
+
+    // Narrow but tall: the panes stack instead of splitting, and BOTH still paint.
+    let rendered = render_to_string(&app, 50, 40);
+    assert!(
+        rendered.contains("pinned: Tool: shell"),
+        "the pinned pane paints when stacked:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("compare: live transcript"),
+        "the compare pane paints when stacked:\n{rendered}"
+    );
+    assert!(
+        app.pinned_compare.is_some(),
+        "the view survives a narrow frame"
+    );
+}
+
+#[tokio::test]
+async fn pinned_compare_falls_back_to_a_hint_on_a_tiny_terminal() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(&mut app, &mut agent, alt_t())
+        .await
+        .expect("open");
+
+    // Too small for either a split or a stack: a graceful hint, no crash, no
+    // cached rects (so a stray wheel has nothing to route to).
+    let rendered = render_to_string(&app, 40, 6);
+    assert!(
+        rendered.contains("larger terminal"),
+        "a tiny terminal shows a hint:\n{rendered}"
+    );
+    assert!(
+        app.pinned_compare.is_some(),
+        "the view request survives a too-small frame"
+    );
+    assert!(
+        app.pinned_compare_rect_cache.get().is_none(),
+        "no pane rects are cached when nothing was painted"
+    );
+}
+
+#[tokio::test]
+async fn pinned_compare_survives_resize_repaint() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(&mut app, &mut agent, alt_t())
+        .await
+        .expect("open");
+
+    let wide = render_to_string(&app, 160, 48);
+    assert!(wide.contains("pinned: Tool: shell") && wide.contains("DETAILPANE-LINE-00"));
+    let wide_rects = app.pinned_compare_rect_cache.get().expect("rects at 160");
+
+    let narrower = render_to_string(&app, 96, 30);
+    assert!(
+        narrower.contains("pinned: Tool: shell") && narrower.contains("DETAILPANE-LINE-00"),
+        "the compare view re-flows and keeps painting after a resize:\n{narrower}"
+    );
+    let new_rects = app.pinned_compare_rect_cache.get().expect("rects at 96");
+    assert_ne!(
+        wide_rects, new_rects,
+        "the cached pane rects track the new geometry after resize"
+    );
+}
+
+#[tokio::test]
+async fn pinned_compare_wheel_over_a_pane_focuses_and_scrolls_it() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(&mut app, &mut agent, alt_t())
+        .await
+        .expect("open");
+    // Render so both panes' rects are cached (active pane first).
+    let _ = render_to_string(&app, 140, 40);
+    let (first, second) = app
+        .pinned_compare_rect_cache
+        .get()
+        .expect("rects cached after paint");
+    // The active pane is the pinned one; the SECOND rect is the compare pane.
+    // A wheel-down over it focuses the compare pane and scrolls it.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: second.x + second.width / 2,
+            row: second.y + 1,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    let state = app.pinned_compare.expect("open");
+    assert_eq!(
+        state.focus,
+        pinned_compare::ComparePane::Compare,
+        "a wheel over the compare pane focuses it"
+    );
+    assert_eq!(
+        state.compare_scroll, 3,
+        "the wheel scrolled the compare pane by three rows"
+    );
+    assert_eq!(
+        state.pinned_scroll, 0,
+        "the pinned pane is untouched by a wheel over the other pane"
+    );
+    // The first rect's existence proves the active pane painted a body too.
+    assert!(first.width > 0 && first.height > 0);
+}
+
 #[tokio::test]
 async fn transcript_overlay_mouse_is_modal() {
     let mut app = test_app(SessionMode::Build);
