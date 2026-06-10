@@ -34239,3 +34239,378 @@ fn first_run_hint_does_not_paint_on_a_too_narrow_surface() {
         "the hint refuses to paint on a too-narrow surface:\n{out}",
     );
 }
+
+// ===========================================================================
+// Scratchpad Pane (§12.3.3) — integration tests driving the real `render()` /
+// `handle_key` / `handle_mouse` / `handle_paste` paths through the TestBackend.
+// ===========================================================================
+
+/// The `Alt+4` toggle chord for the Scratchpad Pane.
+fn scratchpad_chord() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT)
+}
+
+/// Seed a small two-message transcript and a deterministic viewport so the
+/// scratchpad's left context column and the `Ctrl+L` source-link verb have a
+/// focused entry to work with.
+fn app_with_scratchpad_context() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(120, 28);
+    app.push_transcript_item(TranscriptItem::user("design the side pane".to_string()));
+    app.push_transcript_item(TranscriptItem::assistant(
+        "here is a draft of the layout".to_string(),
+    ));
+    app
+}
+
+#[tokio::test]
+async fn scratchpad_chord_opens_a_side_pane_and_paints_its_chrome() {
+    let mut app = app_with_scratchpad_context();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, scratchpad_chord())
+        .await
+        .expect("Alt+4 opens the scratchpad");
+    assert!(app.scratchpad_open, "the pane opened");
+
+    let out = render_to_string(&app, 120, 28);
+    assert!(out.contains("Scratchpad"), "header present:\n{out}");
+    // The empty-state hint and the in-pane verb legend paint.
+    assert!(out.contains("Empty"), "empty-state hint:\n{out}");
+    assert!(out.contains("Insert"), "Insert button:\n{out}");
+    assert!(out.contains("Clear"), "Clear button:\n{out}");
+    // The split shows the transcript-context column on the left at a wide size.
+    assert!(
+        out.contains("transcript (context)"),
+        "context column header at a wide size:\n{out}",
+    );
+}
+
+#[tokio::test]
+async fn scratchpad_typing_edits_the_persistent_buffer_and_survives_close() {
+    let mut app = app_with_scratchpad_context();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, scratchpad_chord())
+        .await
+        .expect("open scratchpad");
+    for ch in "hi".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type into the pad");
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("newline");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("type more");
+
+    assert_eq!(app.scratchpad.text(), "hi\n!");
+    let out = render_to_string(&app, 120, 28);
+    assert!(out.contains("hi"), "typed text paints:\n{out}");
+
+    // Closing the pane preserves the buffer (session-scoped, survives across
+    // turns) — re-opening returns the same content.
+    handle_key(&mut app, &mut agent, scratchpad_chord())
+        .await
+        .expect("Alt+4 closes");
+    assert!(!app.scratchpad_open, "the pane closed");
+    assert_eq!(
+        app.scratchpad.text(),
+        "hi\n!",
+        "the buffer survives the pane close (session-scoped)",
+    );
+    // The buffer is NOT in the composer / transcript — it stays out of model context.
+    assert!(
+        app.input.is_empty(),
+        "the scratchpad never leaks into the composer"
+    );
+}
+
+#[tokio::test]
+async fn scratchpad_backspace_and_arrows_edit_in_place() {
+    let mut app = app_with_scratchpad_context();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, scratchpad_chord())
+        .await
+        .expect("open");
+    for ch in "abc".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type");
+    }
+    // Left then Backspace deletes the 'b', leaving "ac".
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+    )
+    .await
+    .expect("left");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+    )
+    .await
+    .expect("backspace");
+    assert_eq!(app.scratchpad.text(), "ac");
+}
+
+#[tokio::test]
+async fn scratchpad_ctrl_i_inserts_the_buffer_into_the_composer_and_closes() {
+    let mut app = app_with_scratchpad_context();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, scratchpad_chord())
+        .await
+        .expect("open");
+    for ch in "draft prompt".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type");
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("Ctrl+I inserts");
+
+    assert!(
+        app.input.contains("draft prompt"),
+        "the buffer landed in the composer: {:?}",
+        app.input,
+    );
+    assert!(!app.scratchpad_open, "inserting closes the pane");
+    // The buffer is left intact so the note can be reused.
+    assert_eq!(app.scratchpad.text(), "draft prompt");
+}
+
+#[tokio::test]
+async fn scratchpad_ctrl_q_queues_the_buffer_as_a_prompt() {
+    let mut app = app_with_scratchpad_context();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, scratchpad_chord())
+        .await
+        .expect("open");
+    for ch in "queued note".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type");
+    }
+    let before = app.prompt_queue.len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("Ctrl+Q queues");
+
+    assert_eq!(
+        app.prompt_queue.len(),
+        before + 1,
+        "the buffer was staged onto the prompt queue",
+    );
+    // The pane stays open so several drafts can be queued in a row.
+    assert!(app.scratchpad_open);
+}
+
+#[tokio::test]
+async fn scratchpad_ctrl_l_with_no_selection_appends_a_source_link() {
+    let mut app = app_with_scratchpad_context();
+    // Focus the assistant entry so the source link points at a real entry.
+    app.selected_entry = Some(app.transcript.len() - 1);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, scratchpad_chord())
+        .await
+        .expect("open");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("Ctrl+L appends a source link");
+
+    assert_eq!(app.scratchpad.links().len(), 1, "a breadcrumb was recorded");
+    assert!(
+        app.scratchpad.text().contains("[source:"),
+        "a reference line was spliced into the buffer: {:?}",
+        app.scratchpad.text(),
+    );
+}
+
+#[tokio::test]
+async fn scratchpad_paste_lands_in_the_pad_not_the_composer() {
+    let mut app = app_with_scratchpad_context();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, scratchpad_chord())
+        .await
+        .expect("open");
+    handle_paste(&mut app, &mut agent, "pasted notes".to_string())
+        .await
+        .expect("paste while the pad is open");
+
+    assert!(
+        app.scratchpad.text().contains("pasted notes"),
+        "a paste lands in the scratch buffer: {:?}",
+        app.scratchpad.text(),
+    );
+    assert!(
+        app.input.is_empty(),
+        "the paste never leaked into the composer underneath",
+    );
+}
+
+#[tokio::test]
+async fn scratchpad_clear_button_click_empties_the_buffer() {
+    let mut app = app_with_scratchpad_context();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, scratchpad_chord())
+        .await
+        .expect("open");
+    for ch in "scratch".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type");
+    }
+    // Render registers the in-pane button click targets for this frame.
+    let _ = render_to_string(&app, 120, 28);
+
+    // Scan the painted frame for the Clear button target and click it.
+    let mut hit = None;
+    'scan: for row in 0..28u16 {
+        for col in 0..120u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ScratchpadClear),
+                _,
+            )) = app.click_target_at(col, row)
+            {
+                hit = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit.expect("a Clear button target is registered");
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert!(
+        app.scratchpad.is_empty(),
+        "the Clear button emptied the buffer"
+    );
+    assert!(app.scratchpad_open, "the pane stays open after a clear");
+}
+
+#[tokio::test]
+async fn scratchpad_renders_at_narrow_medium_and_wide_sizes_without_panicking() {
+    let mut app = app_with_scratchpad_context();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, scratchpad_chord())
+        .await
+        .expect("open");
+    for ch in "resize me".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type");
+    }
+
+    // Narrow (too tight to split — graceful single-column fallback), medium, and
+    // wide. The header must paint at every size and the buffer text survives.
+    for (w, h) in [(40u16, 12u16), (90, 24), (160, 48)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Scratchpad"),
+            "header paints at {w}x{h}:\n{out}",
+        );
+        assert_eq!(
+            app.scratchpad.text(),
+            "resize me",
+            "a resize never mutates the buffer",
+        );
+    }
+    // At the narrowest width the split does NOT happen (the context column is
+    // dropped), so the editor takes the full inner width — never a corrupted
+    // squeeze.
+    let narrow = render_to_string(&app, 40, 12);
+    assert!(
+        !narrow.contains("transcript (context)"),
+        "the context column is dropped when too narrow to split:\n{narrow}",
+    );
+}
+
+#[tokio::test]
+async fn scratchpad_esc_closes_but_keeps_the_buffer() {
+    let mut app = app_with_scratchpad_context();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(&mut app, &mut agent, scratchpad_chord())
+        .await
+        .expect("open");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("type");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("Esc closes");
+
+    assert!(!app.scratchpad_open, "Esc closes the pane");
+    assert_eq!(app.scratchpad.text(), "z", "Esc keeps the buffer");
+}

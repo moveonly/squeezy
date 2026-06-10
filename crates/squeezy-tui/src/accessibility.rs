@@ -747,6 +747,15 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // so a row click and the keyboard reach the same `tool_actions_copy_selected`
         // handler.
         A::ToolActionRun(_) => KeyboardPath::Always("tool actions ↑↓/Enter"),
+        // Scratchpad Pane (§12.3.3) — while the pane is open its own key handler
+        // owns Ctrl+I (insert into the composer), Ctrl+Q (queue), Ctrl+L (append
+        // selection / source link), and Ctrl+K (clear) before the global keymap
+        // sees them, so every in-pane button click routes to the same handler its
+        // keyboard verb drives.
+        A::ScratchpadInsertCompose => KeyboardPath::Always("scratchpad Ctrl+I"),
+        A::ScratchpadEnqueue => KeyboardPath::Always("scratchpad Ctrl+Q"),
+        A::ScratchpadAppend => KeyboardPath::Always("scratchpad Ctrl+L"),
+        A::ScratchpadClear => KeyboardPath::Always("scratchpad Ctrl+K"),
     })
 }
 

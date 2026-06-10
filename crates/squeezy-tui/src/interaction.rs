@@ -203,6 +203,14 @@ pub(crate) enum ChromeKey {
     /// 0-based index in the detected-item list so a click selects + runs the item's
     /// primary action (copy) on exactly that element.
     ToolActionsRow(usize),
+    /// The "Insert to composer" button in the Scratchpad Pane (§12.3.3).
+    ScratchpadInsert,
+    /// The "Queue" button in the Scratchpad Pane (§12.3.3).
+    ScratchpadQueue,
+    /// The "Append selection / source link" button in the Scratchpad Pane (§12.3.3).
+    ScratchpadAppend,
+    /// The "Clear" button in the Scratchpad Pane (§12.3.3).
+    ScratchpadClear,
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -412,6 +420,18 @@ pub(crate) enum Action {
     /// twin of moving the cursor with ↑↓ and pressing Enter; a click both selects and
     /// copies in one go. The index is into the detected-item list.
     ToolActionRun(usize),
+    /// Insert the whole scratchpad buffer into the composer (§12.3.3). Mouse twin
+    /// of the pane's `Ctrl+I` verb / the "Insert to composer" button.
+    ScratchpadInsertCompose,
+    /// Queue the whole scratchpad buffer as a prompt (§12.3.3). Mouse twin of the
+    /// pane's `Ctrl+Q` verb / the "Queue" button.
+    ScratchpadEnqueue,
+    /// Append the active selection / a source link to the scratchpad (§12.3.3).
+    /// Mouse twin of the pane's `Ctrl+L` verb / the "Append" button.
+    ScratchpadAppend,
+    /// Clear the scratchpad buffer and its source links (§12.3.3). Mouse twin of
+    /// the pane's `Ctrl+K` verb / the "Clear" button.
+    ScratchpadClear,
 }
 
 impl Action {
@@ -472,6 +492,10 @@ impl Action {
         Action::SnippetDelete(0),
         Action::SnippetClear,
         Action::ToolActionRun(0),
+        Action::ScratchpadInsertCompose,
+        Action::ScratchpadEnqueue,
+        Action::ScratchpadAppend,
+        Action::ScratchpadClear,
     ];
 }
 

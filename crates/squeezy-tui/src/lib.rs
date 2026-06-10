@@ -139,6 +139,7 @@ mod quote_compose;
 mod rename_labels;
 mod render;
 mod resume_picker;
+mod scratchpad;
 mod scroll;
 mod search;
 mod selection;
@@ -1799,6 +1800,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.paste_staging.is_some()
         || app.clipboard_history_open
         || app.snippets_open
+        || app.scratchpad_open
         || app.transcript_index_open
         || app.related_links_open
         || app.duplicate_folds_open
@@ -2485,6 +2487,29 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                 _ => dispatch_click_action(app, action),
             }
         }
+        return true;
+    }
+
+    // The Scratchpad Pane (§12.3.3) owns the pointer while open: a left-click on
+    // one of its in-pane buttons runs that verb; every other click is swallowed so
+    // a stray press can't fall through to the surface beneath. Hit-tested in
+    // ABSOLUTE screen coordinates against the button targets
+    // `render_scratchpad_surface` registered this frame.
+    if app.scratchpad_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((interaction::TargetKey::Chrome(_), action)) =
+                app.click_target_at(mouse.column, mouse.row)
+            && matches!(
+                action,
+                interaction::Action::ScratchpadInsertCompose
+                    | interaction::Action::ScratchpadEnqueue
+                    | interaction::Action::ScratchpadAppend
+                    | interaction::Action::ScratchpadClear
+            )
+        {
+            dispatch_click_action(app, action);
+        }
+        // Pane is open: consume every mouse event so nothing leaks below.
         return true;
     }
 
@@ -3925,6 +3950,199 @@ fn delete_selected_snippet(app: &mut TuiApp) {
     }
 }
 
+/// `Alt+4`: open / close the Scratchpad Pane (§12.3.3). The buffer itself lives
+/// in `app.scratchpad` and PERSISTS across opens/closes/turns — this only flips
+/// the visibility/focus flag, so reopening always returns the user to whatever
+/// they last typed. The status line names the in-pane verbs on open.
+fn toggle_scratchpad(app: &mut TuiApp) {
+    app.scratchpad_open = !app.scratchpad_open;
+    app.status = if app.scratchpad_open {
+        scratchpad_open_status(app)
+    } else {
+        "scratchpad closed".to_string()
+    };
+    app.needs_redraw = true;
+}
+
+/// The status line shown while the scratchpad is open: an empty-state hint when
+/// the buffer is blank, else a count plus the in-pane verb legend.
+fn scratchpad_open_status(app: &TuiApp) -> String {
+    if app.scratchpad.is_empty() {
+        "scratchpad (empty) — type notes · Ctrl+L append selection · Esc/Alt+4 close".to_string()
+    } else {
+        format!(
+            "scratchpad: {} chars, {} lines — Ctrl+I insert to composer · Ctrl+Q queue · Esc close",
+            app.scratchpad.char_count(),
+            app.scratchpad.line_count(),
+        )
+    }
+}
+
+/// Handle a key while the Scratchpad Pane (§12.3.3) is open. Returns `true` when
+/// the key was consumed (so it never leaks to the composer or global keymap while
+/// the pane owns focus). The pane is modal-for-editing: its own toggle chord and
+/// Esc close; `Ctrl+I` sends the buffer to the composer; `Ctrl+Q` queues it as a
+/// prompt; `Ctrl+L` appends the active main-view selection (or a source link to
+/// the focused entry when there is no live selection); `Ctrl+K` clears it; the
+/// arrows / Backspace / Delete / Home / End / Enter and printable characters edit
+/// the buffer through the composer-style primitives.
+fn handle_scratchpad_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.scratchpad_open {
+        return false;
+    }
+    // The pane's own toggle chord closes it, so the same key both opens and
+    // closes without leaking to the global keymap, which the modal swallows.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleScratchpad) {
+        app.scratchpad_open = false;
+        app.status = "scratchpad closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            app.scratchpad_open = false;
+            app.status = "scratchpad closed".to_string();
+            app.needs_redraw = true;
+        }
+        // Ctrl+I: send the whole buffer to the composer (the spec's "send to
+        // composer"). The buffer is left intact so the note can be reused.
+        KeyCode::Char('i') if ctrl => scratchpad_insert_into_composer(app),
+        // Ctrl+Q: queue the whole buffer as a prompt (the spec's "queue as
+        // prompt"). The buffer is left intact.
+        KeyCode::Char('q') if ctrl => scratchpad_enqueue(app),
+        // Ctrl+L: append the active main-view selection as a quote block, or — with
+        // no live selection — a source-link breadcrumb to the focused entry (the
+        // spec's "append quote" / "insert source link").
+        KeyCode::Char('l') if ctrl => scratchpad_append_context(app),
+        // Ctrl+K: clear the buffer and its source links (the spec's "clear").
+        KeyCode::Char('k') if ctrl => {
+            app.scratchpad.clear();
+            app.status = scratchpad_open_status(app);
+            app.needs_redraw = true;
+        }
+        // Editing primitives — composer-style, reused from the scratchpad model.
+        KeyCode::Left => {
+            app.scratchpad.move_left();
+            app.needs_redraw = true;
+        }
+        KeyCode::Right => {
+            app.scratchpad.move_right();
+            app.needs_redraw = true;
+        }
+        KeyCode::Home => {
+            app.scratchpad.move_home();
+            app.needs_redraw = true;
+        }
+        KeyCode::End => {
+            app.scratchpad.move_end();
+            app.needs_redraw = true;
+        }
+        KeyCode::Backspace => {
+            app.scratchpad.delete_back();
+            app.needs_redraw = true;
+        }
+        KeyCode::Delete => {
+            app.scratchpad.delete_forward();
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter => {
+            app.scratchpad.insert_char('\n');
+            app.needs_redraw = true;
+        }
+        // A printable character (no Ctrl/Alt modifier) types into the buffer; Shift
+        // is folded into the produced glyph already, so it is allowed through.
+        KeyCode::Char(ch)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            app.scratchpad.insert_char(ch);
+            app.needs_redraw = true;
+        }
+        // Swallow every other key so the pane is modal: a stray chord cannot leak
+        // into the composer underneath while the pane owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Send the whole scratchpad buffer to the composer at the caret (§12.3.3 "send
+/// to composer"). Closes the pane and marks the buffer clean (delivered). A no-op
+/// status hint when the buffer is empty; the buffer is otherwise left intact so
+/// the note can be reused.
+fn scratchpad_insert_into_composer(app: &mut TuiApp) {
+    let text = app.scratchpad.text().to_string();
+    if text.trim().is_empty() {
+        app.status = "scratchpad is empty — nothing to insert".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    input::insert_input_text(app, &text);
+    app.scratchpad.mark_clean();
+    app.scratchpad_open = false;
+    app.status = format!("inserted scratchpad into composer ({} chars)", text.len());
+    app.needs_redraw = true;
+}
+
+/// Queue the whole scratchpad buffer as a prompt (§12.3.3 "queue as prompt").
+/// Leaves the pane open so several drafts can be staged, marks the buffer clean.
+/// A no-op status hint when the buffer is empty.
+fn scratchpad_enqueue(app: &mut TuiApp) {
+    let text = app.scratchpad.text().to_string();
+    if text.trim().is_empty() {
+        app.status = "scratchpad is empty — nothing to queue".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    app.prompt_queue.push_back(text);
+    app.scratchpad.mark_clean();
+    app.status = format!("queued scratchpad ({} in queue)", app.prompt_queue.len());
+    app.needs_redraw = true;
+}
+
+/// `Ctrl+L` inside the pane: append the active main-view selection as a quote
+/// block (§12.3.3 "append quote"), or — with no live selection — a source-link
+/// breadcrumb to the focused (or top-visible) transcript entry (§12.3.3 "insert
+/// source link"). The breadcrumb retains the stable entry id internally even
+/// though only a concise reference line is spliced into the visible buffer.
+fn scratchpad_append_context(app: &mut TuiApp) {
+    if let Some(sel) = app.selection.clone()
+        && !sel.is_empty()
+    {
+        let rows = selection_surface_rows(app, sel.surface);
+        let text = selection::selection_clean_text(&rows, &sel);
+        if !text.trim().is_empty() {
+            app.scratchpad.append_block(text.trim_end());
+            app.selection = None;
+            app.status = format!(
+                "appended selection to scratchpad ({} chars total)",
+                app.scratchpad.char_count(),
+            );
+            app.needs_redraw = true;
+            return;
+        }
+    }
+    // No usable selection: drop a source-link breadcrumb to the focused entry so
+    // the note remembers where the user was looking.
+    let Some(entry_id) = annotation_target_entry_id(app) else {
+        app.status = "scratchpad: select transcript text first, or focus an entry".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    let label = active_transcript_entries(app)
+        .iter()
+        .find(|entry| entry.id == entry_id)
+        .map(outline_title_of)
+        .unwrap_or_default();
+    app.scratchpad.append_source_link(entry_id, &label);
+    app.status = format!(
+        "added source link to scratchpad ({} links)",
+        app.scratchpad.links().len(),
+    );
+    app.needs_redraw = true;
+}
+
 fn handle_transcript_overlay_mouse(
     app: &mut TuiApp,
     mouse: crossterm::event::MouseEvent,
@@ -4589,6 +4807,17 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
+    // The Scratchpad Pane (§12.3.3) is modal-for-editing while open: it owns the
+    // keyboard (printable chars / Enter / Backspace / Delete / arrows / Home / End
+    // edit the buffer; Ctrl+I insert to composer, Ctrl+Q queue, Ctrl+L append
+    // selection / source link, Ctrl+K clear, Esc/Alt+4 close) BEFORE any
+    // selection-clear, search, chord, or keymap dispatch, so a stray key never
+    // leaks into the composer underneath. Sits beside the other front-of-loop
+    // overlays for the same reason.
+    if app.scratchpad_open && handle_scratchpad_key(app, key) {
+        return Ok(false);
+    }
+
     // The Entry Annotations overlay (§12.2.5) is modal while open: it owns the
     // keyboard (↑↓/kj/n/p move the annotation cursor, Enter jump, e edit, d/Delete
     // delete, Esc/Alt+\ close — or, in edit mode, free text compose) BEFORE any
@@ -5136,6 +5365,16 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
     // instead of attaching it as transcript context when the screen is up.
     if let Some(state) = app.config_screen.as_mut() {
         config_screen::handle_paste(state, &normalized);
+        return Ok(());
+    }
+    // The Scratchpad Pane (§12.3.3) owns text input while open: a paste lands in
+    // the scratch buffer at the caret, never in the composer/context underneath.
+    // The scratchpad is the user's own notes, so even a large paste goes straight
+    // in (no staging/preview gate) — it never enters model context from here.
+    if app.scratchpad_open {
+        app.scratchpad.insert_text(&normalized);
+        app.status = scratchpad_open_status(app);
+        app.needs_redraw = true;
         return Ok(());
     }
     if app
@@ -6528,6 +6767,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 return false;
             }
             toggle_tool_actions(app);
+            true
+        }
+        keymap::Action::ToggleScratchpad => {
+            // §12.3.3: open / close the Scratchpad Pane. Main-surface overlay; the
+            // config/setup screens own their own routing, and the Ctrl+T overlay
+            // guard above already blocks this while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_scratchpad(app);
             true
         }
     }
@@ -8563,6 +8812,7 @@ fn first_run_hint_suppressed(app: &TuiApp) -> bool {
         || app.paste_staging.is_some()
         || app.clipboard_history_open
         || app.snippets_open
+        || app.scratchpad_open
         || app.search.is_some()
         || app.pending_approval.is_some()
         || app.pending_request_user_input.is_some()
@@ -12073,6 +12323,16 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
                 actions.select(index);
             }
             tool_actions_copy_selected(app);
+        }
+        // Scratchpad Pane (§12.3.3). Each routes through the same handler the
+        // keyboard verb drives, so mouse/keyboard parity holds by construction.
+        interaction::Action::ScratchpadInsertCompose => scratchpad_insert_into_composer(app),
+        interaction::Action::ScratchpadEnqueue => scratchpad_enqueue(app),
+        interaction::Action::ScratchpadAppend => scratchpad_append_context(app),
+        interaction::Action::ScratchpadClear => {
+            app.scratchpad.clear();
+            app.status = scratchpad_open_status(app);
+            app.needs_redraw = true;
         }
     }
 }
@@ -18059,6 +18319,17 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_tool_actions_surface(frame, area, app);
         return;
     }
+    // The Scratchpad Pane (§12.3.3) paints as a side pane over everything else
+    // while open: the live transcript on the left, the editable scratch buffer on
+    // the right (reusing the §11G.10 detail-pane split machinery), falling back to
+    // a centered overlay when the terminal is too narrow to split. It registers
+    // its in-pane button click targets every frame. Checked beside the other
+    // main-surface overlays so its targets register and it owns the surface while
+    // open.
+    if app.scratchpad_open {
+        render_scratchpad_surface(frame, area, app);
+        return;
+    }
     // The Entry Annotations overlay (§12.2.5) paints as a fullscreen jump-list /
     // composer over everything else while open, registering its per-annotation row
     // click targets every frame. Checked beside the bookmarks overlay so its
@@ -19162,6 +19433,286 @@ fn render_snippets_buttons(frame: &mut Frame<'_>, inner: Rect, app: &TuiApp) {
             );
         }
     }
+}
+
+/// Paint the Scratchpad Pane (§12.3.3) over the whole frame.
+///
+/// Clears the surface and draws a bordered block, then reuses the §11G.10
+/// detail-pane split machinery ([`diff_detail_pane::split_overlay_content`]) to
+/// carve the inner area into a LEFT transcript-context column (read-only, so the
+/// user keeps their bearings while jotting notes) and a RIGHT editable scratch
+/// column. When the terminal is too narrow to split usefully the scratch column
+/// takes the full inner width — a graceful fallback, never a corrupted squeeze.
+/// The bottom inner row holds the `[ Insert ]` / `[ Queue ]` / `[ Append ]` /
+/// `[ Clear ]` button strip whose rects register as chrome click targets (the
+/// mouse twins of `Ctrl+I` / `Ctrl+Q` / `Ctrl+L` / `Ctrl+K`).
+fn render_scratchpad_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let dirty = if app.scratchpad.is_dirty() { " *" } else { "" };
+    let title = format!(
+        " Scratchpad{dirty} — session notes (never sent unless inserted) · {} or Esc to close ",
+        key_hint(app, keymap::Action::ToggleScratchpad),
+    );
+    frame.render_widget(ratatui::widgets::Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::render::theme::accent()))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Reserve the bottom inner row for the button strip; the columns get the rest.
+    let body = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+
+    // Reuse the detail-pane split: transcript context on the left, scratch on the
+    // right. Too narrow to split → scratch takes the whole body (graceful no-op).
+    let scratch_rect = match diff_detail_pane::split_overlay_content(body) {
+        Some(layout) if body.height > 0 => {
+            render_scratchpad_context(frame, layout.transcript, app);
+            // The one-cell separator gutter between the columns.
+            if layout.separator.height > 0 {
+                let sep: String = "\u{2502}".repeat(layout.separator.height as usize);
+                let mut sep_lines = Vec::new();
+                for ch in sep.chars() {
+                    sep_lines.push(Line::from(Span::styled(
+                        ch.to_string(),
+                        Style::default().fg(crate::render::theme::quiet()),
+                    )));
+                }
+                frame.render_widget(Paragraph::new(sep_lines), layout.separator);
+            }
+            layout.pane
+        }
+        _ => body,
+    };
+    render_scratchpad_editor(frame, scratch_rect, app);
+    render_scratchpad_buttons(frame, inner, app);
+}
+
+/// Paint the read-only transcript-context column on the LEFT of the scratchpad
+/// split: a quiet header plus the tail of the live transcript so the user keeps
+/// their place while jotting notes. Reuses the cached overlay row projection, so
+/// it does no extra transcript walk; shows the LAST rows that fit (the most
+/// recent context). Read-only — it registers no click targets and paints no
+/// selection/cursor.
+fn render_scratchpad_context(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let header = Line::from(Span::styled(
+        "transcript (context)",
+        Style::default()
+            .fg(crate::render::theme::quiet())
+            .add_modifier(Modifier::BOLD),
+    ));
+    let header_rect = Rect { height: 1, ..area };
+    frame.render_widget(Paragraph::new(header), header_rect);
+    let rows_h = area.height.saturating_sub(1);
+    if rows_h == 0 {
+        return;
+    }
+    let rows_rect = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: rows_h,
+    };
+    with_transcript_overlay_rows(app, rows_rect.width, |rows| {
+        // Show the TAIL of the transcript (the most recent rows) so the context
+        // column tracks where the conversation is now.
+        let take = (rows_rect.height as usize).min(rows.len());
+        let start = rows.len().saturating_sub(take);
+        let shown: Vec<Line<'static>> = rows[start..].to_vec();
+        frame.render_widget(Paragraph::new(shown), rows_rect);
+    });
+}
+
+/// Paint the editable scratch buffer into `area`: a quiet header, then the buffer
+/// text windowed vertically to keep the caret line in view, with a block cursor
+/// painted at the caret's `(line, column)`. The buffer is plain text with
+/// embedded newlines, exactly like the composer; long lines are clipped to the
+/// column width (the pane is for notes, not wide code).
+fn render_scratchpad_editor(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let header = Line::from(Span::styled(
+        "notes (Ctrl+I → composer · Ctrl+Q → queue · Ctrl+L append · Ctrl+K clear)",
+        Style::default().fg(crate::render::theme::secondary()),
+    ));
+    let header_rect = Rect { height: 1, ..area };
+    frame.render_widget(Paragraph::new(header), header_rect);
+    let body_h = area.height.saturating_sub(1);
+    if body_h == 0 {
+        return;
+    }
+    let body_rect = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: body_h,
+    };
+
+    if app.scratchpad.is_empty() {
+        // The caret block leads, then the dim placeholder hint — so the block
+        // never clobbers the hint's first glyph (which it would at column 0).
+        let hint = Line::from(vec![
+            Span::styled(
+                "\u{2588}",
+                Style::default().fg(crate::render::theme::accent()),
+            ),
+            Span::styled(
+                "Empty — type notes, or Ctrl+L to append the selection.",
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(hint), body_rect);
+        return;
+    }
+
+    let lines = app.scratchpad.lines();
+    let (cursor_line, cursor_col) = app.scratchpad.cursor_line_col();
+    let viewport = body_rect.height as usize;
+    // Scroll the window so the caret line stays visible (keep it on the last row
+    // when the buffer overflows downward).
+    let start = cursor_line.saturating_sub(viewport.saturating_sub(1));
+    let width = body_rect.width as usize;
+    let mut painted = Vec::with_capacity(viewport);
+    for line in lines.iter().skip(start).take(viewport) {
+        // Clip each display line to the column width so a long note never spills.
+        let clipped: String = line.chars().take(width).collect();
+        painted.push(Line::from(Span::styled(
+            clipped,
+            Style::default().fg(crate::render::theme::foreground()),
+        )));
+    }
+    frame.render_widget(Paragraph::new(painted), body_rect);
+
+    // Paint the block cursor at the caret, clamped into the visible window.
+    if cursor_line >= start && cursor_line < start + viewport {
+        let row = (cursor_line - start) as u16;
+        let col = (cursor_col.min(width.saturating_sub(1))) as u16;
+        paint_scratchpad_cursor(frame, body_rect, row, col);
+    }
+}
+
+/// Paint a single block-cursor cell at `(row, col)` offset inside `body_rect`,
+/// clamped to the rect so it never paints out of bounds. Shared by the empty and
+/// populated editor paths so the caret always reads as a live text cursor.
+fn paint_scratchpad_cursor(frame: &mut Frame<'_>, body_rect: Rect, row: u16, col: u16) {
+    if row >= body_rect.height || col >= body_rect.width {
+        return;
+    }
+    let cell = Rect {
+        x: body_rect.x + col,
+        y: body_rect.y + row,
+        width: 1,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "\u{2588}",
+            Style::default().fg(crate::render::theme::accent()),
+        ))),
+        cell,
+    );
+}
+
+/// Paint the `[ Insert ]` / `[ Queue ]` / `[ Append ]` / `[ Clear ]` button strip
+/// on the scratchpad's bottom inner row and register each button's rect as a
+/// chrome click target (the mouse twins of `Ctrl+I` / `Ctrl+Q` / `Ctrl+L` /
+/// `Ctrl+K`). Insert/Queue grey out on an empty buffer and register no target
+/// then; Append and Clear always register (Append works off a selection even when
+/// the buffer is empty; Clear is a safe no-op on an empty buffer).
+fn render_scratchpad_buttons(frame: &mut Frame<'_>, inner: Rect, app: &TuiApp) {
+    const INSERT: &str = "[ Insert (Ctrl+I) ]";
+    const QUEUE: &str = "[ Queue (Ctrl+Q) ]";
+    const APPEND: &str = "[ Append (Ctrl+L) ]";
+    const CLEAR: &str = "[ Clear (Ctrl+K) ]";
+    let row = inner.y + inner.height.saturating_sub(1);
+    let has_text = !app.scratchpad.is_empty();
+
+    let accent = crate::render::theme::accent();
+    let quiet = crate::render::theme::quiet();
+    let active = if has_text { accent } else { quiet };
+    let strip = Line::from(vec![
+        Span::styled(
+            INSERT,
+            Style::default().fg(active).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(QUEUE, Style::default().fg(active)),
+        Span::raw("  "),
+        Span::styled(APPEND, Style::default().fg(accent)),
+        Span::raw("  "),
+        Span::styled(CLEAR, Style::default().fg(accent)),
+    ]);
+    let strip_rect = Rect {
+        x: inner.x,
+        y: row,
+        width: inner.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(strip), strip_rect);
+
+    // Register button rects left-to-right, clamped to the inner width.
+    let mut x = inner.x;
+    let right = inner.x.saturating_add(inner.width);
+    let mut place =
+        |label: &str, key: interaction::ChromeKey, action: interaction::Action, enabled: bool| {
+            let span = label.chars().count() as u16;
+            if enabled && x < right {
+                let w = span.min(right.saturating_sub(x));
+                if w > 0 {
+                    app.register_click(
+                        Rect {
+                            x,
+                            y: row,
+                            width: w,
+                            height: 1,
+                        },
+                        interaction::TargetKey::Chrome(key),
+                        action,
+                    );
+                }
+            }
+            x = x.saturating_add(span).saturating_add(2);
+        };
+    place(
+        INSERT,
+        interaction::ChromeKey::ScratchpadInsert,
+        interaction::Action::ScratchpadInsertCompose,
+        has_text,
+    );
+    place(
+        QUEUE,
+        interaction::ChromeKey::ScratchpadQueue,
+        interaction::Action::ScratchpadEnqueue,
+        has_text,
+    );
+    place(
+        APPEND,
+        interaction::ChromeKey::ScratchpadAppend,
+        interaction::Action::ScratchpadAppend,
+        true,
+    );
+    place(
+        CLEAR,
+        interaction::ChromeKey::ScratchpadClear,
+        interaction::Action::ScratchpadClear,
+        true,
+    );
 }
 
 /// Paint the Local Transcript Index overlay (§12.5.1) as a centered modal: a
@@ -33496,6 +34047,17 @@ pub(crate) struct TuiApp {
     /// picker owns key/mouse routing. Toggled by the `ToggleSnippets` keymap
     /// action.
     pub(crate) snippets_open: bool,
+    /// Scratchpad Pane (§12.3.3): a persistent, session-scoped editable notes
+    /// buffer. Always present (never `None`) so the buffer SURVIVES across turns —
+    /// the spec's "session-scoped, survives but is excluded from prompts" — and is
+    /// only ever delivered into model context when the user explicitly inserts it
+    /// into the composer or queues it. Starts empty and costs nothing at idle.
+    pub(crate) scratchpad: scratchpad::Scratchpad,
+    /// Whether the Scratchpad Pane (§12.3.3) is open. `false` = closed (the
+    /// resting state, paints nothing extra and schedules no redraw); `true` = the
+    /// pane owns key/mouse routing for editing. Toggled by the `ToggleScratchpad`
+    /// keymap action. The buffer persists across opens/closes/turns regardless.
+    pub(crate) scratchpad_open: bool,
     /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
     /// keyed by stable entry id and grouped by category (user turns, tool calls,
     /// errors, …). Rebuilt incrementally — only when the transcript's
@@ -34363,6 +34925,8 @@ impl TuiApp {
             clipboard_history_open: false,
             snippets: snippet_store::SnippetStore::new(),
             snippets_open: false,
+            scratchpad: scratchpad::Scratchpad::new(),
+            scratchpad_open: false,
             transcript_index: transcript_index::TranscriptIndex::new(),
             transcript_index_open: false,
             transcript_index_selected: 0,

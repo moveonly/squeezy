@@ -404,6 +404,17 @@ pub(crate) enum Action {
     /// or an approval gate. The items are a one-shot snapshot taken on open, so the
     /// resting state stores nothing and an idle session pays nothing.
     ToggleToolActions,
+    /// Open / close the Scratchpad Pane (`Alt+4` default; §12.3.3). A persistent,
+    /// session-scoped notes/composition side-pane: the live transcript stays on
+    /// the left while an editable scratch buffer collects observations, quotes,
+    /// and draft prompts. The buffer survives across turns (it lives in session UI
+    /// state, never the model transcript) and never enters model context unless
+    /// the user explicitly inserts it into the composer (`Ctrl+I`) or queues it as
+    /// a prompt (`Ctrl+Q`). While open the pane owns the keyboard for editing
+    /// (composer-style insert/delete/cursor/newline); a quote-append and a clear
+    /// verb fill it. Keyboard- and mouse-driven; closed is the resting state, so a
+    /// session that never opens it pays nothing.
+    ToggleScratchpad,
 }
 
 impl Action {
@@ -479,6 +490,7 @@ impl Action {
             Self::RenameFocusedEntry => "rename_focused_entry",
             Self::DismissFirstRunHint => "dismiss_first_run_hint",
             Self::ToggleToolActions => "toggle_tool_actions",
+            Self::ToggleScratchpad => "toggle_scratchpad",
         }
     }
 
@@ -553,6 +565,7 @@ impl Action {
         Action::RenameFocusedEntry,
         Action::DismissFirstRunHint,
         Action::ToggleToolActions,
+        Action::ToggleScratchpad,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -733,6 +746,10 @@ impl Action {
             // terminals, tmux, and SSH as the `Ctrl+Alt+H`/`Ctrl+Alt+P`/
             // `Ctrl+Alt+R`/`Ctrl+Alt+N` chords above.
             | Self::ToggleToolActions
+            // Scratchpad Pane toggle is `Alt+4` — an Alt+digit chord, the same
+            // Meta/Alt encoding that is unreliable across Linux terminals, tmux,
+            // and SSH as the rest of the nav/copy/overlay family.
+            | Self::ToggleScratchpad
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1040,6 +1057,16 @@ impl Action {
                 KeyCode::Char('a'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
+            // Scratchpad Pane (§12.3.3). `Alt+4` — the next free `Alt`+digit after
+            // `Alt+3` (save-snippet-from-selection); `Alt+1`/`Alt+2` are hover
+            // preview / breadcrumbs and `Alt+8`/`Alt+9`/`Alt+0` are hyperlinks /
+            // session timeline / changes-since. Every bare `Alt` letter in the
+            // nav/copy/overlay family is taken, so the digit is the free,
+            // composer-clear pick; it sits beside the snippets save chord it
+            // complements (capture a bit, stash it in the pad). The in-pane
+            // send-to-composer / queue verbs use `Ctrl+I` / `Ctrl+Q` (handled by
+            // the pane's own modal key handler, not rebindable here).
+            Self::ToggleScratchpad => KeyBinding::new(KeyCode::Char('4'), KeyModifiers::ALT),
         }
     }
 }
