@@ -30214,6 +30214,330 @@ async fn action_palette_renders_across_resizes() {
     );
 }
 
+// ---- Hover Preview And Double-Click Activation (§12.1.4) ----
+
+/// Build a transcript with a user prompt, a tool result (detail-worthy, so it
+/// offers the double-click/Enter open-in-detail verb), and a final assistant
+/// message, then focus a chosen entry so the preview's target is deterministic.
+/// Seeds a deterministic viewport so geometry is host-independent.
+fn app_with_hover_preview(focus: usize) -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    app.push_transcript_item(TranscriptItem::user("inspect the build output".to_string()));
+    app.push_tool_result(sample_tool_result(
+        "shell",
+        "cargo build\nFinished in 5.2s\nwarnings: 0",
+    ));
+    app.push_transcript_item(TranscriptItem::assistant("The build is clean.".to_string()));
+    app.selected_entry = Some(focus);
+    app
+}
+
+/// Find a screen cell whose registered hit target is the caret of the entry with
+/// stable `entry_id` (the `ToggleEntryCollapsed` zone), after a render populated
+/// the registry. The caret is the non-text affordance the §12.1.4 double-click
+/// activation rides.
+fn caret_cell_for_entry(
+    app: &TuiApp,
+    entry_id: u64,
+    width: u16,
+    height: u16,
+) -> Option<(u16, u16)> {
+    for row in 0..height {
+        for col in 0..width {
+            if let Some((
+                interaction::TargetKey::Entry(id),
+                interaction::Action::ToggleEntryCollapsed(_),
+            )) = app.click_target_at(col, row)
+                && id.0 == entry_id
+            {
+                return Some((col, row));
+            }
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn hover_preview_alt_1_opens_popover_for_focused_unit() {
+    // Focus the tool result (detail-worthy -> the preview offers open-in-detail).
+    let mut app = app_with_hover_preview(1);
+    let mut agent = test_agent(SessionMode::Build);
+
+    assert!(
+        app.hover_preview.is_none(),
+        "the preview is closed (zero cost) until requested",
+    );
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+1 opens the preview");
+
+    let preview = app.hover_preview.as_ref().expect("preview is live");
+    assert_eq!(
+        preview.kind,
+        hover_preview::PreviewKind::ToolOutput,
+        "the focused tool result previews as tool output",
+    );
+    assert!(preview.is_keyboard(), "the keyboard verb sourced it");
+    assert!(
+        preview.can_activate(),
+        "a detail-worthy tool result offers open-in-detail",
+    );
+
+    // The popover paints over the main surface through the real render() path.
+    let out = render_to_string(&app, 100, 30);
+    assert!(out.contains("Preview"), "popover header paints:\n{out}");
+    assert!(out.contains("tool output"), "kind tag paints:\n{out}");
+    assert!(
+        out.contains("double-click / Enter to open"),
+        "activation hint paints:\n{out}",
+    );
+}
+
+#[tokio::test]
+async fn hover_preview_alt_1_toggles_closed_and_esc_dismisses() {
+    let mut app = app_with_hover_preview(2);
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT);
+
+    handle_key(&mut app, &mut agent, chord).await.expect("open");
+    assert!(app.hover_preview.is_some());
+    let _ = render_to_string(&app, 100, 30);
+    // A second Alt+1 toggles the peek closed.
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("close");
+    assert!(
+        app.hover_preview.is_none(),
+        "Alt+1 toggles the preview closed"
+    );
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+
+    // Re-open, then Esc dismisses it (and is consumed: nothing leaks).
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("reopen");
+    assert!(app.hover_preview.is_some());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc dismisses");
+    assert!(app.hover_preview.is_none(), "Esc dismisses the preview");
+    assert!(app.input.is_empty(), "Esc did not leak");
+}
+
+#[tokio::test]
+async fn hover_preview_any_other_key_dismisses_then_acts() {
+    // A non-preview key dismisses the peek but is then allowed to do its job (the
+    // peek is transient, not modal). Typing 'x' lands in the composer.
+    let mut app = app_with_hover_preview(2);
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open preview");
+    assert!(app.hover_preview.is_some());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("type a normal key");
+    assert!(
+        app.hover_preview.is_none(),
+        "a normal key dismisses the transient preview",
+    );
+    assert!(
+        app.input.contains('x'),
+        "the dismissing key still reached the composer: {:?}",
+        app.input,
+    );
+}
+
+#[tokio::test]
+async fn hover_preview_empty_transcript_is_a_no_op() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+1 on an empty transcript");
+
+    assert!(
+        app.hover_preview.is_none(),
+        "no entry to preview -> the popover stays closed",
+    );
+    assert!(
+        app.status.contains("nothing to preview"),
+        "honest no-op status: {}",
+        app.status,
+    );
+    // And the empty-surface render must not panic / paint a popover.
+    let out = render_to_string(&app, 100, 30);
+    assert!(
+        !out.contains("Preview"),
+        "no popover on an empty session:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn hover_preview_double_click_caret_opens_detail() {
+    // An EXPANDED entry's caret double-click is the §12.1.4 primary-activation
+    // path: it opens the entry in the Ctrl+T detail overlay — the same
+    // non-destructive verb the keyboard `Ctrl+Enter` reaches. No timing flake: a
+    // double-click is two immediate presses within the 400ms multi-click window.
+    let mut app = app_with_hover_preview(1);
+    let entry_id = active_transcript_entries(&app)[1].id;
+
+    // Render once so the entry's caret hit target is registered this frame.
+    let _ = render_to_string(&app, 100, 30);
+    let (col, row) =
+        caret_cell_for_entry(&app, entry_id, 100, 30).expect("the entry's caret is registered");
+
+    assert!(
+        app.transcript_overlay.is_none(),
+        "no detail overlay before the double-click",
+    );
+    for _ in 0..2 {
+        handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: col,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+    }
+
+    assert!(
+        app.transcript_overlay.is_some(),
+        "double-clicking an expanded entry's caret opens it in detail",
+    );
+    assert_eq!(
+        app.selected_entry,
+        Some(1),
+        "the activated entry is the one under the caret",
+    );
+}
+
+#[tokio::test]
+async fn hover_preview_mouse_hover_reveals_after_intent_delay() {
+    // The mouse path: a stable hover over an entry header (two Moves separated by
+    // the hover-intent delay) reveals the preview. A real sleep crosses the
+    // 150ms HOVER_INTENT_MS threshold the recognizer keys on Instant::now().
+    let mut app = app_with_hover_preview(1);
+    let entry_id = active_transcript_entries(&app)[1].id;
+
+    // Render so the header hit targets are registered, then aim at the entry's
+    // header-remainder (focus) cell — a hover-previewable Entry target.
+    let _ = render_to_string(&app, 100, 30);
+    let mut hover_cell = None;
+    'scan: for row in 0..30u16 {
+        for col in 0..100u16 {
+            if let Some((interaction::TargetKey::Entry(id), interaction::Action::FocusEntry(_))) =
+                app.click_target_at(col, row)
+                && id.0 == entry_id
+            {
+                hover_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hover_cell.expect("the entry header registers a focus target");
+
+    let moved = |col, row| crossterm::event::MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    // First move arms the intent clock; no reveal yet.
+    handle_mouse(&mut app, moved(col, row));
+    assert!(
+        app.hover_preview.is_none(),
+        "the preview waits out the hover-intent delay (no flicker on a sweep)",
+    );
+    // Wait past the intent delay, then a second move on the same cell reveals it.
+    tokio::time::sleep(std::time::Duration::from_millis(
+        (hover_preview_intent_ms() + 40) as u64,
+    ))
+    .await;
+    handle_mouse(&mut app, moved(col, row));
+
+    let preview = app
+        .hover_preview
+        .as_ref()
+        .expect("a settled hover reveals the preview");
+    assert!(!preview.is_keyboard(), "the mouse sourced this preview");
+    assert_eq!(preview.entry_id, entry_id, "previews the hovered entry");
+
+    // A move OFF every target dismisses the mouse-sourced preview.
+    handle_mouse(&mut app, moved(99, 29));
+    handle_mouse(&mut app, moved(99, 28));
+    assert!(
+        app.hover_preview.is_none(),
+        "leaving every target dismisses the hover preview",
+    );
+}
+
+/// Expose the recognizer's hover-intent window to the timing-sensitive hover test.
+fn hover_preview_intent_ms() -> u128 {
+    interaction::HOVER_INTENT_MS
+}
+
+#[tokio::test]
+async fn hover_preview_renders_across_resizes_without_overflow() {
+    let mut app = app_with_hover_preview(1);
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open preview");
+
+    let entry_id = app.hover_preview.as_ref().unwrap().entry_id;
+    // The previewed entry's stable id is width-independent; the popover paints
+    // (or, on a too-narrow surface, simply omits) but never panics or overflows.
+    for (w, h) in [(100u16, 30u16), (140, 44), (24, 12), (8, 6)] {
+        let out = render_to_string(&app, w, h);
+        // Every painted line is exactly `w` wide (render_to_string pads rows), so
+        // a popover that overflowed would corrupt the line grid — the draw call
+        // itself panics on an out-of-bounds rect, so reaching here proves it fit.
+        for line in out.lines() {
+            assert_eq!(
+                line.chars().count(),
+                w as usize,
+                "row stays exactly {w} wide at {w}x{h} (popover never overflows)",
+            );
+        }
+    }
+    assert_eq!(
+        app.hover_preview.as_ref().unwrap().entry_id,
+        entry_id,
+        "the previewed entry's stable id survives every resize",
+    );
+}
+
 // ---- Collapsible Reasoning/Tool Lanes (§12.2.2) ----
 
 /// Build a transcript whose tail is a tool result carrying a call (so it

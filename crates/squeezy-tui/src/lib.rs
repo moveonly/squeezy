@@ -103,6 +103,7 @@ mod events;
 mod export_destination;
 mod fuzzy;
 mod history;
+mod hover_preview;
 mod hyperlinks;
 mod input;
 mod interaction;
@@ -2767,6 +2768,61 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         return consumed;
     }
 
+    // Hover Preview (§12.1.4): a bare pointer Move (delivered only while mouse
+    // capture is on) over a hover-previewable main-transcript target reveals a
+    // quiet preview popover after the hover-intent delay, and a move OFF every
+    // target dismisses it. The recognizer keys hover intent on the target id and
+    // only arms after `HOVER_INTENT_MS`, so a sweep across rows never flickers and
+    // a settled pointer schedules no redraw loop. Suppressed while a fullscreen
+    // overlay / config screen owns the surface or a selection drag is in flight, so
+    // the peek never fights another surface. Drag/scroll are handled below (they
+    // dismiss any live preview).
+    if let MouseEventKind::Moved = mouse.kind {
+        if app.transcript_overlay.is_none()
+            && app.config_screen.is_none()
+            && app.selection.is_none()
+            && matches!(app.subagent_pane.active, ConversationSource::Main)
+        {
+            let now = std::time::Instant::now();
+            let hit = app.click_target_at(mouse.column, mouse.row);
+            let previewable = hit.filter(|(key, _)| hover_preview::policy_for(*key).hover_preview);
+            let gesture = app
+                .gestures
+                .recognize(interaction::Phase::Move, previewable, now);
+            match gesture {
+                interaction::Gesture::HoverEnter {
+                    target: interaction::TargetKey::Entry(id),
+                } => {
+                    if let Some(preview) =
+                        build_entry_preview(app, id.0, hover_preview::PreviewSource::Hover)
+                    {
+                        app.hover_preview = Some(preview);
+                        app.needs_redraw = true;
+                    }
+                }
+                // A HoverLeave, or a HoverEnter onto a non-entry previewable target
+                // (a code-block RowSpan, with no popover content model yet), clears a
+                // mouse-sourced preview. A keyboard-pinned preview (`Alt+1`) is sticky
+                // — an incidental mouse drift must not yank it from a keyboard-only
+                // user — so only the mouse-sourced one leaves here.
+                interaction::Gesture::HoverLeave | interaction::Gesture::HoverEnter { .. } => {
+                    dismiss_mouse_hover_preview(app);
+                }
+                _ => {}
+            }
+        }
+        // A Move never falls through to the click/selection paths below.
+        return app.needs_redraw;
+    }
+
+    // Every NON-Move mouse event (a press, drag, release, or wheel scroll) commits
+    // or shifts the surface, so any live Hover Preview popover (§12.1.4) is
+    // dismissed first — the spec's "hover preview suppression during scroll / drag /
+    // selection". A double-click activation re-dismisses harmlessly; the dismissal
+    // only forces a redraw when a preview was actually showing, so idle redraw stays
+    // zero.
+    dismiss_hover_preview(app);
+
     // Main-view transcript-card affordances: a caret click toggles the entry's
     // fold, a header click focuses it, a double-click on the caret expands a
     // collapsed card. Hit-tested in ABSOLUTE screen coordinates (the main text
@@ -4000,6 +4056,25 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // overlays for the same reason.
     if app.changes_since_open && handle_changes_since_key(app, key) {
         return Ok(false);
+    }
+
+    // The Hover Preview popover (§12.1.4) is NON-modal — a quiet, transient peek
+    // that never steals the keyboard. So it does not own routing: Esc dismisses it
+    // (and is consumed so it does not also clear a selection), the `Alt+1` toggle
+    // chord falls through to its dispatch arm (which closes it), and ANY other key
+    // dismisses the preview but is then allowed to do its normal job. This keeps the
+    // preview from lingering stale over a surface the next keystroke moves.
+    if app.hover_preview.is_some() {
+        let is_toggle =
+            app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleHoverPreview);
+        if !is_toggle {
+            dismiss_hover_preview(app);
+            if matches!(key.code, KeyCode::Esc) {
+                // Esc's sole job here was to close the preview; consume it so it
+                // does not also clear a selection / close another surface.
+                return Ok(false);
+            }
+        }
     }
 
     // The Contextual Action Palette (§12.1.2) is modal while open: it owns the
@@ -5848,6 +5923,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_command_palette(app);
             true
         }
+        keymap::Action::ToggleHoverPreview => {
+            // Main-surface popover; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_hover_preview(app);
+            true
+        }
     }
 }
 
@@ -7101,6 +7186,136 @@ fn open_action_palette(app: &mut TuiApp) {
         kind.noun(),
     );
     app.needs_redraw = true;
+}
+
+/// Classify a transcript entry into the small [`hover_preview::PreviewKind`] set
+/// the popover body keys on. Tool results read as `ToolOutput` (their body is the
+/// captured output), a `/diff` card or a plan reads as `Path`-style detail target,
+/// and everything else reads as a generic `Entry`. Total over the entry-kind set;
+/// reuses the same kind distinctions the action palette / index already draw.
+fn hover_preview_kind(entry: &TranscriptEntry) -> hover_preview::PreviewKind {
+    use hover_preview::PreviewKind;
+    match &entry.kind {
+        TranscriptEntryKind::ToolResult(_) => PreviewKind::ToolOutput,
+        TranscriptEntryKind::Diff(_) | TranscriptEntryKind::PlanCard(_) => PreviewKind::Path,
+        TranscriptEntryKind::SlashEcho(_) => PreviewKind::Link,
+        TranscriptEntryKind::Message(_)
+        | TranscriptEntryKind::Reasoning(_)
+        | TranscriptEntryKind::Log(_) => PreviewKind::Entry,
+    }
+}
+
+/// A bounded, secret-free body excerpt for an entry's hover preview: the first few
+/// non-empty lines of its title source (`outline_title_of`), each trimmed — the
+/// quiet "what does this row hold" the preview shows beneath the title. Built off
+/// transcript metadata, never rendered terminal cells, and bounded so the popover
+/// stays a fixed-size affordance.
+fn hover_preview_body(entry: &TranscriptEntry) -> Vec<String> {
+    outline_title_of(entry)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(hover_preview::PREVIEW_BODY_LINES)
+        .map(|line| line.to_string())
+        .collect()
+}
+
+/// Build a [`hover_preview::HoverPreview`] for the entry with stable `entry_id`,
+/// or `None` when no live entry carries that id. The primary activation verb is
+/// the entry's [`hover_preview::policy_for`] primary (open-in-detail) only when
+/// the entry actually has detail-pane content — so a double-click / Enter on a
+/// one-liner previews without offering an empty detail view. Pure read over the
+/// active transcript; the resulting preview is the same whether a mouse hover or
+/// the keyboard verb requested it.
+fn build_entry_preview(
+    app: &TuiApp,
+    entry_id: u64,
+    source: hover_preview::PreviewSource,
+) -> Option<hover_preview::HoverPreview> {
+    let entry = active_transcript_entries(app)
+        .iter()
+        .find(|entry| entry.id == entry_id)?;
+    let kind = hover_preview_kind(entry);
+    let title = action_palette_title(entry, action_palette_unit_kind(entry));
+    let body = hover_preview_body(entry);
+    // The primary (double-click / Enter) verb mirrors the keyboard `Ctrl+Enter`
+    // detail path, but only when the entry has detail-worthy content; otherwise
+    // the preview is read-only. `policy_for` keeps every destructive verb out of
+    // this path by construction.
+    let primary = if entry_has_detail_pane_content(entry) {
+        hover_preview::policy_for(interaction::TargetKey::Entry(transcript_surface::EntryId(
+            entry_id,
+        )))
+        .primary_activate
+    } else {
+        None
+    };
+    Some(hover_preview::HoverPreview::new(
+        entry_id, kind, title, body, primary, source,
+    ))
+}
+
+/// `Alt+1`: toggle the Hover Preview popover (§12.1.4) for the currently focused
+/// transcript unit — the focused entry (`Ctrl+↑/↓`) when one is focused, else the
+/// top-visible entry (the same reading-position anchor the action-palette /
+/// annotate / bookmark verbs use). The keyboard twin of a stable mouse hover: it
+/// reveals a quiet, noncommittal preview without stealing focus. A second press
+/// (or any other key, a click, or a scroll) dismisses it. A no-op (status hint)
+/// on an empty transcript. Sets `needs_redraw` so the popover paints immediately.
+fn toggle_hover_preview(app: &mut TuiApp) {
+    // A second press dismisses the open preview — a clean toggle.
+    if app.hover_preview.is_some() {
+        app.hover_preview = None;
+        app.status = "preview closed".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    let Some(entry_id) = annotation_target_entry_id(app) else {
+        app.hover_preview = None;
+        app.status = "no transcript entry — nothing to preview".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    let Some(preview) = build_entry_preview(app, entry_id, hover_preview::PreviewSource::Keyboard)
+    else {
+        app.hover_preview = None;
+        app.status = "no transcript entry — nothing to preview".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    let hint = preview.activate_hint();
+    let verb = if preview.can_activate() {
+        "Enter opens"
+    } else {
+        "read-only"
+    };
+    app.hover_preview = Some(preview);
+    app.status = format!("preview ({verb}) \u{00b7} {hint} \u{00b7} Esc / Alt+1 close");
+    app.needs_redraw = true;
+}
+
+/// Dismiss any live Hover Preview popover (§12.1.4). Called whenever the surface
+/// shifts out from under it — a scroll, a click, a key that is not the toggle, or
+/// a transcript change — so a stale preview can never linger. Returns `true` when
+/// a preview was actually showing (so the caller can fold the dismissal into its
+/// existing redraw decision rather than forcing an extra one when idle).
+fn dismiss_hover_preview(app: &mut TuiApp) -> bool {
+    if app.hover_preview.take().is_some() {
+        app.needs_redraw = true;
+        true
+    } else {
+        false
+    }
+}
+
+/// Dismiss a live Hover Preview popover (§12.1.4) ONLY when it was revealed by a
+/// mouse hover — a keyboard-pinned (`Alt+1`) preview is left alone. Used by the
+/// mouse-move hover path so an incidental pointer drift off the target never yanks
+/// a keyboard-only user's pinned peek away (only an explicit key/click does).
+fn dismiss_mouse_hover_preview(app: &mut TuiApp) {
+    if app.hover_preview.as_ref().is_some_and(|p| !p.is_keyboard()) {
+        dismiss_hover_preview(app);
+    }
 }
 
 /// Handle a key while the Contextual Action Palette (§12.1.2) is open. Returns
@@ -10675,14 +10890,37 @@ fn dispatch_card_gesture(app: &mut TuiApp, gesture: interaction::Gesture) -> Car
             dispatch_click_action(app, action);
             CardPress::FocusedThenFallThrough
         }
-        // Double-click on the *caret* expands a collapsed card and is consumed.
-        // A header double/triple click is left to the selection path (word/row
-        // select), so we only act on the caret's `ToggleEntryCollapsed` here.
+        // Double-click on the *caret* (keyed on its `ToggleEntryCollapsed` action,
+        // a dedicated non-text zone, so it fully owns the click — a header TEXT
+        // double-click registers `FocusEntry` and is left to the selection path for
+        // word-select). This is the §12.1.4 double-click-activation path: a
+        // collapsed card expands (the natural primary action when there is more to
+        // see); an already-expanded card opens in the Ctrl+T detail overlay via the
+        // entry's `PointerActivationPolicy::primary_activate` — the SAME
+        // non-destructive verb the `Ctrl+Enter` keyboard chord and the action
+        // palette's "open in detail" both reach. `policy_for` keeps every
+        // destructive verb out of this path, so a double-click can never delete /
+        // clear / retry by accident.
         interaction::Gesture::DoubleClick {
             action: Some(interaction::Action::ToggleEntryCollapsed(id)),
             ..
         } => {
-            dispatch_click_action(app, interaction::Action::ExpandEntry(id));
+            // A live preview is dismissed the moment a gesture activates.
+            dismiss_hover_preview(app);
+            let collapsed = active_transcript_entries(app)
+                .iter()
+                .find(|entry| entry.id == id.0)
+                .is_some_and(|entry| entry.collapsed);
+            let policy = hover_preview::policy_for(interaction::TargetKey::Entry(id));
+            if collapsed {
+                dispatch_click_action(app, interaction::Action::ExpandEntry(id));
+            } else if policy.activates_on_double_click()
+                && let Some(action) = policy.primary_activate
+            {
+                // `OpenEntryInDetail` focuses the entry itself before opening the
+                // detail overlay, so no separate focus dispatch is needed.
+                dispatch_click_action(app, action);
+            }
             CardPress::Consumed
         }
         _ => CardPress::Ignored,
@@ -16672,6 +16910,13 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     // instead of pinning it to the terminal bottom.
     let _ = chunks[index];
     render_toast_overlay(frame, area, app);
+    // The Hover Preview popover (§12.1.4) is a NON-modal peek painted LAST on the
+    // main surface (only — every fullscreen overlay returns earlier and never
+    // reaches here, so the popover never leaks over a modal). It is anchored to the
+    // previewed entry's row and clamped inside `area`, so it never changes a row's
+    // height/width and never steals focus. Off (and zero-cost) unless a hover /
+    // `Alt+1` reveal set it.
+    render_hover_preview_popover(frame, area, app);
 }
 
 /// Render the large-paste confirmation modal (§11G.6) over the whole frame.
@@ -18468,6 +18713,84 @@ fn render_action_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp
             interaction::Action::PaletteActionRun(offset),
         );
     }
+}
+
+/// Paint the Hover Preview popover (§12.1.4) when one is live. A quiet, fixed-size
+/// bordered peek anchored next to the previewed entry's on-screen row (resolved
+/// from the id-keyed hit registry the entry header registered this frame); when the
+/// entry is scrolled off-screen the popover falls back to the top of `area`. The
+/// popover never changes any row's geometry (it overlays, via `Clear`, a
+/// [`hover_preview::popover_rect`] that is clamped fully inside `area`) and never
+/// steals keyboard focus. The styling is deliberately restrained — a bold
+/// foreground title, a silver/secondary kind tag, and a quiet body/footer — the
+/// "noncommittal preview" the spec calls for.
+fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(preview) = app.hover_preview.as_ref() else {
+        return;
+    };
+    // Anchor next to the previewed entry's live header row when it is on-screen;
+    // otherwise fall back to the top of the area so the peek still appears.
+    let anchor_row = app
+        .registered_rect_for(interaction::TargetKey::Entry(transcript_surface::EntryId(
+            preview.entry_id,
+        )))
+        .map(|rect| rect.y)
+        .unwrap_or(area.y);
+    let Some(rect) = hover_preview::popover_rect(area, anchor_row, preview.body.len()) else {
+        return;
+    };
+
+    // Overlay the popover region only (Clear is scoped to `rect`, never the whole
+    // frame), so the transcript underneath keeps its geometry.
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    let title = Line::from(vec![
+        Span::styled(
+            " Preview ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("\u{2014} {} ", preview.kind.noun()),
+            Style::default().fg(crate::render::theme::secondary()),
+        ),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(crate::render::theme::quiet()))
+        .title(title)
+        .title_alignment(ratatui::layout::Alignment::Left);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Title line: stronger (bold) foreground — the spec's "stronger foreground"
+    // emphasis — naming WHICH unit is under the pointer.
+    let mut lines: Vec<Line> = Vec::with_capacity(preview.body.len() + 2);
+    lines.push(Line::from(Span::styled(
+        preview.title.clone(),
+        Style::default()
+            .fg(crate::render::theme::foreground())
+            .add_modifier(Modifier::BOLD),
+    )));
+    // Body excerpt: quiet, so the peek reads as ambient context, not chrome.
+    for body_line in &preview.body {
+        lines.push(Line::from(Span::styled(
+            body_line.clone(),
+            Style::default().fg(crate::render::theme::quiet()),
+        )));
+    }
+    // Footer hint: honest about whether double-click / Enter activates here.
+    lines.push(Line::from(Span::styled(
+        preview.activate_hint().to_string(),
+        Style::default()
+            .fg(crate::render::theme::secondary())
+            .add_modifier(Modifier::DIM),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The default keyboard chord that drives the same handler a palette action runs,
@@ -31168,6 +31491,13 @@ pub(crate) struct TuiApp {
     /// `OpenActionPalette` (`Alt+Enter`); a session that never opens it costs
     /// nothing.
     pub(crate) action_palette: Option<action_palette::ActionPalette>,
+    /// The live Hover Preview popover (§12.1.4), or `None` when none is showing
+    /// (the resting state, paints nothing extra and costs nothing idle). `Some`
+    /// holds the previewed unit's stable id, kind, bounded title/body, and the
+    /// primary activation verb — built fresh on a stable mouse hover or the
+    /// `ToggleHoverPreview` (`Alt+1`) keyboard verb, and cleared on hover-leave,
+    /// any click/key, scroll, or a transcript change so it never goes stale.
+    pub(crate) hover_preview: Option<hover_preview::HoverPreview>,
     /// Universal Command Palette model (§12.1.1). `None` = closed (the resting
     /// state, paints and allocates nothing — zero idle cost); `Some` = the
     /// fullscreen fuzzy-searchable command list owns key/mouse routing. Built fresh
@@ -31473,6 +31803,16 @@ impl TuiApp {
         row: u16,
     ) -> Option<(interaction::TargetKey, interaction::Action)> {
         self.clickables.borrow().hit_test(column, row)
+    }
+
+    /// The rect of the first target registered this frame whose key equals
+    /// `key`, if any. The Hover Preview popover (§12.1.4) uses it to anchor next
+    /// to the previewed entry's live on-screen row (the entry header registers a
+    /// `TargetKey::Entry` rect each frame), resolving the screen position from the
+    /// same id-keyed registry as the click path. `None` when the entry is
+    /// scrolled off-screen this frame.
+    pub(crate) fn registered_rect_for(&self, key: interaction::TargetKey) -> Option<Rect> {
+        self.clickables.borrow().rect_for_key(key)
     }
 
     /// Session id to use for plan IO. Falls back to
@@ -31784,6 +32124,7 @@ impl TuiApp {
             changes_since_open: false,
             changes_since_selected: 0,
             action_palette: None,
+            hover_preview: None,
             command_palette: None,
             command_palette_pending: None,
             editor_handoff: None,

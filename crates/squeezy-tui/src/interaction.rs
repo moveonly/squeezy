@@ -457,6 +457,16 @@ impl Registry {
     pub(crate) fn len(&self) -> usize {
         self.hits.len()
     }
+
+    /// The rect of the FIRST target registered this frame whose key equals
+    /// `key`, if any. Used by the Hover Preview popover (§12.1.4) to anchor itself
+    /// next to the previewed entry's on-screen row — the entry header registers a
+    /// `TargetKey::Entry` rect each frame, so this resolves the live screen row
+    /// from the same id-keyed registry the click path uses (never a stale
+    /// coordinate). Returns `None` when the entry is scrolled off-screen.
+    pub(crate) fn rect_for_key(&self, key: TargetKey) -> Option<Rect> {
+        self.hits.iter().find(|h| h.key == key).map(|h| h.rect)
+    }
 }
 
 /// Half-open containment: `column ∈ [x, x+width)` and `row ∈ [y, y+height)`.

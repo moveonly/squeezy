@@ -337,6 +337,15 @@ pub(crate) enum Action {
     /// parameter are handed back to the composer as a second step. The palette is
     /// built only on open, so an unopened session pays nothing.
     ToggleCommandPalette,
+    /// Open / close the Hover Preview popover (`Alt+1` default; §12.1.4) for the
+    /// currently focused transcript unit — the focused entry (`Ctrl+↑/↓`) when one
+    /// is focused, else the top-visible entry. The keyboard twin of a stable mouse
+    /// hover: it shows a quiet, noncommittal preview (the entry's title + a bounded
+    /// excerpt) without stealing focus or changing layout. The same focused entry's
+    /// primary action (open in detail) stays on its own `Ctrl+Enter` chord — this
+    /// verb only previews. Closed is the resting state, so a session that never
+    /// opens it pays nothing.
+    ToggleHoverPreview,
 }
 
 impl Action {
@@ -402,6 +411,7 @@ impl Action {
             Self::ToggleChangesSince => "toggle_changes_since",
             Self::OpenActionPalette => "open_action_palette",
             Self::ToggleCommandPalette => "toggle_command_palette",
+            Self::ToggleHoverPreview => "toggle_hover_preview",
         }
     }
 
@@ -466,6 +476,7 @@ impl Action {
         Action::ToggleChangesSince,
         Action::OpenActionPalette,
         Action::ToggleCommandPalette,
+        Action::ToggleHoverPreview,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -605,6 +616,10 @@ impl Action {
             // terminals, tmux, and SSH as the `Ctrl+Alt+L`/`Ctrl+Alt+M` debug
             // chords above.
             | Self::ToggleCommandPalette
+            // Hover Preview popover toggle is `Alt+1` — an Alt+digit chord, the
+            // same Meta/Alt encoding that is unreliable across Linux terminals,
+            // tmux, and SSH as the rest of the nav/overlay family.
+            | Self::ToggleHoverPreview
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -828,6 +843,13 @@ impl Action {
                 KeyCode::Char('p'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
+            // Hover Preview popover (§12.1.4). `Alt+1` — the first free `Alt`+digit
+            // (`Alt+8`/`Alt+9`/`Alt+0` are hyperlinks / session timeline / changes-
+            // since); every bare `Alt` letter in the nav/copy/overlay family is
+            // taken. The `1` reads as "level-1 / quick peek". It stays clear of every
+            // composer chord and of the `Alt+Enter` action palette / `Ctrl+Enter`
+            // detail chords.
+            Self::ToggleHoverPreview => KeyBinding::new(KeyCode::Char('1'), KeyModifiers::ALT),
         }
     }
 }
