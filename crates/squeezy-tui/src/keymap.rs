@@ -164,6 +164,12 @@ pub(crate) enum Action {
     /// (force click-to-open escapes) → off (force plain text), so a user whose
     /// terminal was mis-detected either way can correct it without restarting.
     ToggleHyperlinks,
+    /// Open / close the in-app clipboard-history picker (`Alt+p` default;
+    /// §12.6.1). A bounded ring of Squeezy's own recent copies — never the OS
+    /// clipboard — that the user can re-copy, pin, delete, or clear from a
+    /// fullscreen overlay. Records every copy through the same provider chain and
+    /// records nothing at idle, so an unopened picker costs zero.
+    ToggleClipboardHistory,
 }
 
 impl Action {
@@ -208,6 +214,7 @@ impl Action {
             Self::ScrollBlockLeft => "scroll_block_left",
             Self::ScrollBlockRight => "scroll_block_right",
             Self::ToggleHyperlinks => "toggle_hyperlinks",
+            Self::ToggleClipboardHistory => "toggle_clipboard_history",
         }
     }
 
@@ -251,6 +258,7 @@ impl Action {
         Action::ScrollBlockLeft,
         Action::ScrollBlockRight,
         Action::ToggleHyperlinks,
+        Action::ToggleClipboardHistory,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -323,6 +331,9 @@ impl Action {
             | Self::ScrollBlockRight
             // Hyperlink-mode toggle is `Alt+8` — the same Meta/Alt encoding case.
             | Self::ToggleHyperlinks
+            // Clipboard-history picker toggle is `Alt+p` — the same Meta/Alt
+            // encoding that is unreliable across Linux terminals, tmux, and SSH.
+            | Self::ToggleClipboardHistory
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -446,6 +457,11 @@ impl Action {
             // "OSC 8". Bare `Alt` letters in the nav/copy family are taken;
             // `Alt`+digit is free and mnemonic.
             Self::ToggleHyperlinks => KeyBinding::new(KeyCode::Char('8'), KeyModifiers::ALT),
+            // Clipboard-history picker (§12.6.1). `Alt+p` — `p` recalls "paste
+            // history". Bare `Alt` letters in the nav/copy family (c/o/k/v/a/y/m/
+            // r/w/h/l) are taken; `p` is free (`Ctrl+P` is the task-panel toggle,
+            // a distinct chord).
+            Self::ToggleClipboardHistory => KeyBinding::new(KeyCode::Char('p'), KeyModifiers::ALT),
         }
     }
 }

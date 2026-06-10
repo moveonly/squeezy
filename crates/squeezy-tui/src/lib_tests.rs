@@ -12468,6 +12468,241 @@ async fn alt_c_copies_focused_entry_through_row_model() {
     assert!(app.status.contains("copied entry"), "{}", app.status);
 }
 
+// ---------------------------------------------------------------------------
+// Clipboard history (§12.6.1)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn copy_records_into_clipboard_history() {
+    // The single copy funnel (`deliver_copy`) records every landed copy into the
+    // in-app history. Drive a real copy chord and assert the store grew.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("ask"));
+    app.push_transcript_item(TranscriptItem::assistant("the answer text"));
+
+    assert!(app.clipboard_history.is_empty(), "starts empty");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.clipboard_history.len(), 1, "the copy was recorded");
+    assert!(
+        app.clipboard_history.entries()[0]
+            .text
+            .contains("the answer text"),
+        "the recorded payload is the copied entry"
+    );
+}
+
+#[tokio::test]
+async fn alt_p_toggles_clipboard_history_picker() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(!app.clipboard_history_open, "starts closed");
+
+    let toggle = || KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT);
+    handle_key(&mut app, &mut agent, toggle()).await.unwrap();
+    assert!(app.clipboard_history_open, "Alt+p opens the picker");
+    handle_key(&mut app, &mut agent, toggle()).await.unwrap();
+    assert!(!app.clipboard_history_open, "Alt+p again closes it");
+}
+
+#[tokio::test]
+async fn clipboard_history_picker_renders_entries_and_empty_state() {
+    let mut app = test_app(SessionMode::Build);
+
+    // Empty-state line renders when there is no history.
+    app.clipboard_history_open = true;
+    let empty = render_to_string(&app, 100, 24);
+    assert!(
+        empty.contains("Clipboard history"),
+        "title renders: {empty}"
+    );
+    assert!(
+        empty.contains("No copies yet"),
+        "empty-state hint renders: {empty}"
+    );
+
+    // With entries, the labels and previews render.
+    app.clipboard_history.record("first payload", "entry");
+    app.clipboard_history
+        .record("second payload here", "viewport");
+    let listed = render_to_string(&app, 100, 24);
+    assert!(
+        listed.contains("viewport"),
+        "newest label renders: {listed}"
+    );
+    assert!(
+        listed.contains("second payload here"),
+        "newest preview renders: {listed}"
+    );
+    assert!(listed.contains("entry"), "older label renders: {listed}");
+}
+
+#[tokio::test]
+async fn clipboard_history_keyboard_recopy_writes_clipboard() {
+    // The keyboard path: open the picker, navigate, and Enter re-copies the
+    // selected entry through the same clipboard sink any copy uses.
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.clipboard_history.record("older copy", "entry");
+    app.clipboard_history.record("newest copy", "viewport");
+    app.clipboard_history_open = true;
+    // A pre-existing record from `record` does not write the clipboard; clear the
+    // sink's expectations by snapshotting its length.
+    let before = writes.lock().unwrap().len();
+
+    // Move down to the older entry, then re-copy it.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+
+    let copied = writes.lock().unwrap().clone();
+    assert_eq!(copied.len(), before + 1, "exactly one new clipboard write");
+    assert_eq!(
+        copied.last().map(String::as_str),
+        Some("older copy"),
+        "Enter re-copied the selected (older) entry"
+    );
+}
+
+#[tokio::test]
+async fn clipboard_history_keyboard_delete_and_clear() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.clipboard_history.record("a", "entry");
+    app.clipboard_history.record("b", "entry");
+    app.clipboard_history.record("c", "entry");
+    app.clipboard_history_open = true;
+
+    // `d` deletes the selected (newest) entry.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.clipboard_history.len(), 2, "one entry deleted");
+
+    // `c` clears the rest.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(app.clipboard_history.is_empty(), "the history was cleared");
+    assert_eq!(app.status, "clipboard history cleared");
+}
+
+#[tokio::test]
+async fn clipboard_history_esc_closes_without_leaking_to_composer() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.clipboard_history.record("x", "entry");
+    app.clipboard_history_open = true;
+    app.input.clear();
+
+    // A character key inside the open picker is swallowed (modal), not typed.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.input, "", "keys are swallowed while the picker is open");
+
+    // Esc closes the picker.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(!app.clipboard_history_open, "Esc closes the picker");
+}
+
+#[tokio::test]
+async fn clipboard_history_mouse_click_selects_row() {
+    // The mouse path: render the picker (populating the click registry), find a
+    // history row's cell, and click it to select that entry.
+    let mut app = test_app(SessionMode::Build);
+    app.clipboard_history.record("oldest", "entry");
+    app.clipboard_history.record("newest", "viewport");
+    app.clipboard_history_open = true;
+
+    // Render through the real `render()` so the picker registers its row targets.
+    let _ = render_to_string(&app, 100, 24);
+
+    // Find the registered cell for the OLDER entry and click it.
+    let older_id = app.clipboard_history.entries()[1].id;
+    let cell = queue_cell_for(
+        &app,
+        100,
+        24,
+        interaction::TargetKey::ClipboardEntry(older_id),
+        interaction::Action::ClipboardSelect(older_id),
+    )
+    .expect("older entry row should be a registered click target");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: cell.0,
+            row: cell.1,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(
+        app.clipboard_history.selected_entry().map(|e| e.id),
+        Some(older_id),
+        "clicking the older row selected it"
+    );
+}
+
+#[tokio::test]
+async fn clipboard_history_picker_survives_narrow_resize() {
+    // The picker paints at a narrow size without panicking and still shows its
+    // title (modal shrinks to fit per `modal::centered`).
+    let mut app = test_app(SessionMode::Build);
+    app.clipboard_history.record("payload one", "entry");
+    app.clipboard_history.record("payload two", "viewport");
+    app.clipboard_history_open = true;
+
+    for (w, h) in [(20u16, 6u16), (40, 10), (120, 40)] {
+        let out = render_to_string(&app, w, h);
+        assert!(out.contains("Clipboard"), "title visible at {w}x{h}: {out}");
+    }
+}
+
 #[tokio::test]
 async fn export_md_writes_transcript_under_session_storage() {
     let root = temp_workspace("export_md");

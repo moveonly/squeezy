@@ -57,6 +57,10 @@ pub(crate) enum TargetKey {
     /// A prompt-queue item, addressed by its stable per-item id, NOT its Vec
     /// index — so a reorder/delete mid-gesture never shifts the hit target.
     QueueItem(u64),
+    /// A clipboard-history entry in the picker overlay (§12.6.1), addressed by
+    /// its stable per-entry id (NOT its list index) so an eviction mid-gesture
+    /// never shifts the hit target.
+    ClipboardEntry(u64),
     /// A chrome affordance that carries no entry/row id.
     Chrome(ChromeKey),
 }
@@ -98,6 +102,12 @@ pub(crate) enum ChromeKey {
     /// A row in the paste-transform menu (§12.6.2), keyed by its 0-based index
     /// in the offered-transform list so a click selects exactly that shape.
     PasteTransformItem(usize),
+    /// The "Re-copy" button in the clipboard-history picker (§12.6.1).
+    ClipboardRecopy,
+    /// The "Delete" button in the clipboard-history picker (§12.6.1).
+    ClipboardDelete,
+    /// The "Clear all" button in the clipboard-history picker (§12.6.1).
+    ClipboardClear,
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -170,6 +180,21 @@ pub(crate) enum Action {
     /// (§12.6.2) and apply it. Mouse twin of moving the cursor with ↑↓ and
     /// pressing Enter; a click both selects and applies the shape in one go.
     PasteTransformSelect(usize),
+    /// Select the given clipboard-history entry (by stable id) in the picker
+    /// (§12.6.1). Mouse twin of the picker's Up/Down arrows. Fed by a single
+    /// click on a history row.
+    ClipboardSelect(u64),
+    /// Re-copy the given clipboard-history entry (by stable id) back to the
+    /// clipboard (§12.6.1). Mouse twin of the picker's Enter verb / the
+    /// "Re-copy" button. Fed by a double-click on a history row.
+    ClipboardRecopy(u64),
+    /// Delete the given clipboard-history entry (by stable id) from the in-app
+    /// history (§12.6.1). Mouse twin of the picker's `d` verb / the "Delete"
+    /// button.
+    ClipboardDelete(u64),
+    /// Clear the entire in-app clipboard history (§12.6.1). Mouse twin of the
+    /// picker's `c` verb / the "Clear all" button.
+    ClipboardClear,
 }
 
 impl Action {
@@ -200,6 +225,10 @@ impl Action {
         Action::ConfirmPaste,
         Action::CancelPaste,
         Action::PasteTransformSelect(0),
+        Action::ClipboardSelect(0),
+        Action::ClipboardRecopy(0),
+        Action::ClipboardDelete(0),
+        Action::ClipboardClear,
     ];
 }
 

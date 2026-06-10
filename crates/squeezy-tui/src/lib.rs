@@ -83,6 +83,7 @@ mod approval;
 #[cfg(test)]
 mod bench_render;
 mod clipboard;
+mod clipboard_history;
 mod commands;
 mod commands_style;
 mod config_screen;
@@ -1755,6 +1756,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.overlay.is_some()
         || app.paste_preview.is_some()
         || app.paste_transform.is_some()
+        || app.clipboard_history_open
         || app.transcript_overlay.is_some()
     {
         return false;
@@ -2265,6 +2267,42 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             dispatch_click_action(app, action);
         }
         // Modal is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The clipboard-history picker (§12.6.1) owns the pointer while open: a
+    // left-click on a history row selects it (a double-click re-copies it), and
+    // a click on a button runs its verb. Every other click is swallowed so a
+    // stray press can't fall through to the surface underneath. Hit-tested in
+    // ABSOLUTE screen coordinates against the targets the picker registered.
+    if app.clipboard_history_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((key, action)) = app.click_target_at(mouse.column, mouse.row)
+            && matches!(
+                key,
+                interaction::TargetKey::ClipboardEntry(_) | interaction::TargetKey::Chrome(_)
+            )
+        {
+            // A second click on the SAME row within the multi-click window
+            // promotes a select into a re-copy, so a double-click re-copies — the
+            // mouse twin of Enter. The gesture recognizer keys multiplicity on the
+            // target id, so a 1-cell jitter still counts as a double.
+            let now = std::time::Instant::now();
+            let gesture =
+                app.gestures
+                    .recognize(interaction::Phase::Press, Some((key, action)), now);
+            match (gesture, action) {
+                (
+                    interaction::Gesture::DoubleClick { .. }
+                    | interaction::Gesture::TripleClick { .. },
+                    interaction::Action::ClipboardSelect(id),
+                ) => {
+                    app.clipboard_history.select_id(id);
+                    recopy_clipboard_entry(app, id);
+                }
+                _ => dispatch_click_action(app, action),
+            }
+        }
         return true;
     }
 
@@ -3431,6 +3469,15 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // not slip a half-shaped paste into the composer, so this guard sits beside
     // the large-paste guard at the very front.
     if app.paste_transform.is_some() && handle_paste_transform_key(app, key) {
+        return Ok(false);
+    }
+
+    // The clipboard-history picker (§12.6.1) is modal while open: it owns the
+    // keyboard (↑↓ select, Enter re-copy, d delete, p pin, c clear, Esc close)
+    // BEFORE any selection-clear, search, chord, or keymap dispatch, so a stray
+    // key never leaks into the composer underneath. Sits beside the paste modal
+    // at the front for the same reason.
+    if app.clipboard_history_open && handle_clipboard_history_key(app, key) {
         return Ok(false);
     }
 
@@ -4868,6 +4915,16 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             toggle_hyperlinks(app);
             true
         }
+        keymap::Action::ToggleClipboardHistory => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_clipboard_history(app);
+            true
+        }
     }
 }
 
@@ -4907,6 +4964,147 @@ fn toggle_minimap(app: &mut TuiApp) {
         "minimap rail off".to_string()
     };
     app.needs_redraw = true;
+}
+
+/// `Alt+p`: toggle the in-app clipboard-history picker (§12.6.1). The picker is a
+/// fullscreen overlay listing Squeezy's own recent copies; opening it lets the
+/// user re-copy, pin, delete, or clear an entry, and it never reads the OS
+/// clipboard. Flipping the open flag is all the state change needed — the next
+/// frame paints (or stops painting) the overlay — plus a status line confirming
+/// the new state. Sets `needs_redraw` so the toggle paints immediately.
+fn toggle_clipboard_history(app: &mut TuiApp) {
+    app.clipboard_history_open = !app.clipboard_history_open;
+    app.status = if app.clipboard_history_open {
+        if app.clipboard_history.is_empty() {
+            "clipboard history (empty) — Esc to close".to_string()
+        } else {
+            format!(
+                "clipboard history: {} — ↑↓ select · Enter re-copy · d delete · c clear · Esc close",
+                count_label_entries(app.clipboard_history.len()),
+            )
+        }
+    } else {
+        "clipboard history closed".to_string()
+    };
+    app.needs_redraw = true;
+}
+
+/// `"N entries"` / `"1 entry"` for the clipboard-history status line.
+fn count_label_entries(count: usize) -> String {
+    if count == 1 {
+        "1 entry".to_string()
+    } else {
+        format!("{count} entries")
+    }
+}
+
+/// Handle a key while the clipboard-history picker (§12.6.1) is open. Returns
+/// `true` when the key was consumed by the picker (so it never leaks to the
+/// composer or the global keymap). Mirrors the paste-preview modal's
+/// before-the-global-keymap consumption: Esc/Alt+p close, Up/Down move the
+/// selection, Enter re-copies the selected entry, `d` deletes it, `p` toggles its
+/// pin, and `c` clears the whole history.
+fn handle_clipboard_history_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.clipboard_history_open {
+        return false;
+    }
+    // The picker's own toggle chord (`Alt+p` by default) closes it, so the same
+    // key both opens and closes — without leaking to the global keymap, which the
+    // modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleClipboardHistory) {
+        app.clipboard_history_open = false;
+        app.status = "clipboard history closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.clipboard_history_open = false;
+            app.status = "clipboard history closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up => {
+            app.clipboard_history.select_up();
+            app.needs_redraw = true;
+        }
+        KeyCode::Down => {
+            app.clipboard_history.select_down();
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter => {
+            recopy_selected_clipboard_entry(app);
+        }
+        KeyCode::Char('d') | KeyCode::Delete => {
+            delete_selected_clipboard_entry(app);
+        }
+        KeyCode::Char('p') => {
+            toggle_pin_selected_clipboard_entry(app);
+        }
+        KeyCode::Char('c') => {
+            app.clipboard_history.clear();
+            app.status = "clipboard history cleared".to_string();
+            app.needs_redraw = true;
+        }
+        // Swallow every other key so the picker is modal: a stray keystroke
+        // cannot leak into the composer underneath while the overlay owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Re-copy the picker's selected entry back to the clipboard through the same
+/// `deliver_copy` service every copy uses (so it re-records, re-toasts, and lands
+/// via the provider chain identically). A no-op on an empty history. Resolves the
+/// entry by its stable id so a concurrent eviction can never re-copy the wrong
+/// row.
+fn recopy_selected_clipboard_entry(app: &mut TuiApp) {
+    let Some(entry) = app.clipboard_history.selected_entry() else {
+        return;
+    };
+    let id = entry.id;
+    recopy_clipboard_entry(app, id);
+}
+
+/// Re-copy the clipboard-history entry with `id` (the shared keyboard/mouse
+/// path). Clones the payload out first so the immutable `&str` borrow ends before
+/// `deliver_copy` takes `&mut app`.
+fn recopy_clipboard_entry(app: &mut TuiApp, id: u64) {
+    let Some(text) = app.clipboard_history.text_of(id).map(str::to_string) else {
+        return;
+    };
+    deliver_copy(app, &text, "clipboard history");
+    app.needs_redraw = true;
+}
+
+/// Delete the picker's selected entry. A no-op on an empty history.
+fn delete_selected_clipboard_entry(app: &mut TuiApp) {
+    let Some(id) = app.clipboard_history.selected_entry().map(|e| e.id) else {
+        return;
+    };
+    if app.clipboard_history.delete(id) {
+        app.status = if app.clipboard_history.is_empty() {
+            "clipboard history (empty)".to_string()
+        } else {
+            "clipboard entry deleted".to_string()
+        };
+        app.needs_redraw = true;
+    }
+}
+
+/// Toggle the pinned flag of the picker's selected entry (a pinned entry is
+/// exempt from cap eviction). A no-op on an empty history.
+fn toggle_pin_selected_clipboard_entry(app: &mut TuiApp) {
+    let Some(id) = app.clipboard_history.selected_entry().map(|e| e.id) else {
+        return;
+    };
+    if let Some(pinned) = app.clipboard_history.toggle_pin(id) {
+        app.status = if pinned {
+            "clipboard entry pinned".to_string()
+        } else {
+            "clipboard entry unpinned".to_string()
+        };
+        app.needs_redraw = true;
+    }
 }
 
 /// Direction for a wide-block horizontal pan (§11G.4). `Left` pans toward the
@@ -6143,6 +6341,28 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
                 menu.select(index);
             }
             resolve_paste_transform(app);
+        }
+        // Clipboard-history picker (§12.6.1). Each routes through the same handler
+        // the keyboard verb drives, so mouse/keyboard parity holds by
+        // construction. Select resolves the row by its stable id; re-copy/delete
+        // act on it; clear wipes the whole history.
+        interaction::Action::ClipboardSelect(id) => {
+            if app.clipboard_history.select_id(id) {
+                app.needs_redraw = true;
+            }
+        }
+        interaction::Action::ClipboardRecopy(id) => {
+            app.clipboard_history.select_id(id);
+            recopy_clipboard_entry(app, id);
+        }
+        interaction::Action::ClipboardDelete(id) => {
+            app.clipboard_history.select_id(id);
+            delete_selected_clipboard_entry(app);
+        }
+        interaction::Action::ClipboardClear => {
+            app.clipboard_history.clear();
+            app.status = "clipboard history cleared".to_string();
+            app.needs_redraw = true;
         }
     }
 }
@@ -8739,6 +8959,10 @@ fn deliver_copy(app: &mut TuiApp, text: &str, label: &str) {
                 format!("copied {label} ({chars} chars)"),
                 toast::ToastVariant::Success,
             );
+            // In-app clipboard history (§12.6.1): record every copy that actually
+            // landed so the user can recover/re-copy it from the picker. Recorded
+            // here in the single copy funnel, never by scraping the OS clipboard.
+            app.clipboard_history.record(text, label);
         }
         Err(primary_err) => {
             // Only an oversized payload (past the OSC 52 cap) benefits from the
@@ -8767,12 +8991,19 @@ fn deliver_copy(app: &mut TuiApp, text: &str, label: &str) {
                     // bounded provider kind that serviced it (never the bytes).
                     app.dogfood_metrics
                         .record_copy(dogfood_copy_provider(*provider));
+                    // In-app clipboard history (§12.6.1): the large-payload chain
+                    // landed it too, so record it for recovery just like the
+                    // fast-path success above.
+                    app.clipboard_history.record(text, label);
                 }
                 clipboard::CopyOutcome::WroteTempFile { .. } => {
                     app.status = toast_msg.clone();
                     // The temp-file fallback is itself a (degraded) copy outcome.
                     app.dogfood_metrics
                         .record_copy(dogfood::CopyProvider::TempFile);
+                    // Still a delivered payload (to a durable file); record it so
+                    // the user can re-copy it from the in-app history (§12.6.1).
+                    app.clipboard_history.record(text, label);
                 }
                 _ => {
                     // Even the fallback chain failed: surface the original
@@ -11329,6 +11560,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_paste_transform_surface(frame, area, app, menu);
         return;
     }
+    // The clipboard-history picker (§12.6.1) paints as a fullscreen overlay over
+    // everything else while open. Checked after the paste modal (a pending paste
+    // decision still wins) but before the transcript overlay / config screens so
+    // its click targets register every frame and it owns the surface.
+    if app.clipboard_history_open {
+        render_clipboard_history_surface(frame, area, app);
+        return;
+    }
     if app.transcript_overlay.is_some() {
         render_transcript_overlay_surface(frame, area, app);
         return;
@@ -11664,6 +11903,241 @@ fn render_paste_transform_surface(
             ))),
             hint_rect,
         );
+    }
+}
+
+/// Render the in-app clipboard-history picker (§12.6.1) over the whole frame.
+///
+/// Lays out a centered bordered modal (via the shared [`modal::surface`])
+/// containing: a one-line header (entry count · total bytes), a scrollable list
+/// of recent copies (newest first, the selected row highlighted, each row's rect
+/// registered as a [`interaction::TargetKey::ClipboardEntry`] click target so a
+/// click selects/re-copies it), and a `[ Re-copy ]` / `[ Delete ]` / `[ Clear ]`
+/// button strip whose rects are registered as chrome targets — giving the mouse
+/// path the same reach as the picker's Enter/`d`/`c` keyboard verbs. An empty
+/// history shows an explanatory line instead of a list. Every registered rect is
+/// in absolute screen coordinates because the modal paints fullscreen (matching
+/// the hit-test in [`handle_mouse`]).
+fn render_clipboard_history_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Clipboard history ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "— Squeezy's recent copies (never the OS clipboard) ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 100, 24, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Header line: count + total bytes (or an empty-state hint).
+    let header = if app.clipboard_history.is_empty() {
+        Line::from(Span::styled(
+            "No copies yet — copy something (Ctrl+Y, Alt+c, …) and it lands here.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} · {} bytes total · ↑↓ select · Enter re-copy · d delete · p pin · c clear",
+                count_label_entries(app.clipboard_history.len()),
+                app.clipboard_history.total_bytes(),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let header_rect = Rect { height: 1, ..inner };
+    frame.render_widget(Paragraph::new(header), header_rect);
+
+    // The list occupies the rows between the header and the bottom button strip
+    // (last inner row, second-to-last a gap).
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height).saturating_sub(2);
+    if list_bottom > list_top {
+        let list_rect = Rect {
+            x: inner.x,
+            y: list_top,
+            width: inner.width,
+            height: list_bottom - list_top,
+        };
+        render_clipboard_history_list(frame, list_rect, app);
+    }
+
+    render_clipboard_history_buttons(frame, inner, app);
+}
+
+/// Paint the windowed list of history rows into `list_rect` and register each
+/// visible row's rect as a [`interaction::TargetKey::ClipboardEntry`] click
+/// target. The window scrolls to keep the selected row visible; each row shows a
+/// pin marker, the copy label, and a bounded one-line preview of the payload.
+fn render_clipboard_history_list(frame: &mut Frame<'_>, list_rect: Rect, app: &TuiApp) {
+    let entries = app.clipboard_history.entries();
+    if entries.is_empty() || list_rect.height == 0 {
+        return;
+    }
+    let rows = list_rect.height as usize;
+    let selected = app.clipboard_history.selected_index();
+    // Scroll the window so the selected row stays visible.
+    let start = selected
+        .saturating_sub(rows.saturating_sub(1))
+        .min(entries.len().saturating_sub(rows.min(entries.len())));
+    let end = (start + rows).min(entries.len());
+
+    for (offset, entry) in entries[start..end].iter().enumerate() {
+        let index = start + offset;
+        let is_selected = index == selected;
+        let row_y = list_rect.y + offset as u16;
+        let row_rect = Rect {
+            x: list_rect.x,
+            y: row_y,
+            width: list_rect.width,
+            height: 1,
+        };
+
+        let marker = if is_selected { "› " } else { "  " };
+        // ASCII pin tag (not an emoji) so the marker is terminal-safe, fixed
+        // width, and screen-reader-friendly — matching the rest of Squeezy's
+        // chrome, which spells "pins" rather than using a glyph.
+        let pin = if entry.pinned { "[pin] " } else { "" };
+        let label_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(format!("{pin}{}", entry.label), label_style),
+            Span::styled(
+                format!("  {}", entry.preview()),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole row as a click target keyed by the entry's stable
+        // id (NOT its index), so a click selects/re-copies the right entry even
+        // after an eviction reshuffles the list.
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::ClipboardEntry(entry.id),
+            interaction::Action::ClipboardSelect(entry.id),
+        );
+    }
+}
+
+/// Paint the `[ Re-copy ]` / `[ Delete ]` / `[ Clear all ]` button strip on the
+/// modal's bottom inner row and register each button's rect as a chrome click
+/// target. Split out so the labels, spacing, and registered rects are one place
+/// the mouse hit-test and the rendered glyphs cannot drift. The re-copy / delete
+/// buttons act on the currently-selected entry (resolved by id at click time);
+/// they are still painted (greyed) on an empty history but register no target.
+fn render_clipboard_history_buttons(frame: &mut Frame<'_>, inner: Rect, app: &TuiApp) {
+    const RECOPY: &str = "[ Re-copy (Enter) ]";
+    const DELETE: &str = "[ Delete (d) ]";
+    const CLEAR: &str = "[ Clear all (c) ]";
+    let row = inner.y + inner.height.saturating_sub(1);
+    let has_entries = !app.clipboard_history.is_empty();
+
+    let accent = crate::render::theme::accent();
+    let quiet = crate::render::theme::quiet();
+    let active = if has_entries { accent } else { quiet };
+    let strip = Line::from(vec![
+        Span::styled(
+            RECOPY,
+            Style::default().fg(active).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(DELETE, Style::default().fg(active)),
+        Span::raw("  "),
+        Span::styled(CLEAR, Style::default().fg(quiet)),
+    ]);
+    let strip_rect = Rect {
+        x: inner.x,
+        y: row,
+        width: inner.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(strip), strip_rect);
+
+    // Register button rects left-to-right, clamped to the inner width. The
+    // re-copy / delete buttons only register when there is a selected entry to
+    // act on; clear-all always registers (it is valid on any non-empty history,
+    // and a no-op otherwise).
+    let selected_id = app.clipboard_history.selected_entry().map(|e| e.id);
+    let mut x = inner.x;
+    let right = inner.x.saturating_add(inner.width);
+
+    if let Some(id) = selected_id {
+        let w = (RECOPY.chars().count() as u16).min(right.saturating_sub(x));
+        if w > 0 {
+            app.register_click(
+                Rect {
+                    x,
+                    y: row,
+                    width: w,
+                    height: 1,
+                },
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ClipboardRecopy),
+                interaction::Action::ClipboardRecopy(id),
+            );
+        }
+    }
+    x = x
+        .saturating_add(RECOPY.chars().count() as u16)
+        .saturating_add(2);
+
+    if let Some(id) = selected_id
+        && x < right
+    {
+        let w = (DELETE.chars().count() as u16).min(right.saturating_sub(x));
+        if w > 0 {
+            app.register_click(
+                Rect {
+                    x,
+                    y: row,
+                    width: w,
+                    height: 1,
+                },
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ClipboardDelete),
+                interaction::Action::ClipboardDelete(id),
+            );
+        }
+    }
+    x = x
+        .saturating_add(DELETE.chars().count() as u16)
+        .saturating_add(2);
+
+    if has_entries && x < right {
+        let w = (CLEAR.chars().count() as u16).min(right.saturating_sub(x));
+        if w > 0 {
+            app.register_click(
+                Rect {
+                    x,
+                    y: row,
+                    width: w,
+                    height: 1,
+                },
+                interaction::TargetKey::Chrome(interaction::ChromeKey::ClipboardClear),
+                interaction::Action::ClipboardClear,
+            );
+        }
     }
 }
 
@@ -22875,6 +23349,15 @@ pub(crate) struct TuiApp {
     /// rather than silently failing. The legacy `clipboard` field above
     /// stays the source for any pre-existing call site not yet migrated.
     pub(crate) clipboard_chain: clipboard::ClipboardChain<Box<dyn clipboard::ClipboardSink + Send>>,
+    /// Bounded in-app clipboard history (§12.6.1): a ring of Squeezy's own recent
+    /// copies recorded by the single copy service (`deliver_copy`), never the OS
+    /// clipboard. Drives the picker overlay; starts empty and stays cheap at idle.
+    pub(crate) clipboard_history: clipboard_history::ClipboardHistoryStore,
+    /// Whether the clipboard-history picker overlay (§12.6.1) is open. `false` =
+    /// closed (the resting state, paints nothing extra); `true` = the fullscreen
+    /// picker owns key/mouse routing. Toggled by the `ToggleClipboardHistory`
+    /// keymap action.
+    pub(crate) clipboard_history_open: bool,
     /// Persistent main-view focus cursor for entry/tool/code copies, as a
     /// `RowId` into the freshly built transcript row list. `None` defaults to
     /// the live tail (the last entry-owned row), so "copy current entry"
@@ -23415,6 +23898,8 @@ impl TuiApp {
             pending_report: None,
             clipboard,
             clipboard_chain: build_clipboard_chain(Box::new(clipboard::RealSink)),
+            clipboard_history: clipboard_history::ClipboardHistoryStore::new(),
+            clipboard_history_open: false,
             copy_focus: None,
             copy_format: copy::CopyFormat::default_format(),
             main_text_width: std::cell::Cell::new(0),

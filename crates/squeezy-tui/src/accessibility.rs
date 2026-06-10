@@ -615,6 +615,14 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // row) before the global keymap sees them, reaching the same
         // `resolve_paste_transform` handler a row click drives.
         A::PasteTransformSelect(_) => KeyboardPath::Always("paste menu ↑↓/Enter"),
+        // Clipboard-history picker (§12.6.1) — the picker's own key handler owns
+        // Up/Down (select), Enter (re-copy), `d` (delete), and `c` (clear) before
+        // the global keymap sees them, so every mouse affordance routes to the
+        // same handler its picker key drives.
+        A::ClipboardSelect(_) => KeyboardPath::Always("clipboard history Up/Down"),
+        A::ClipboardRecopy(_) => KeyboardPath::Always("clipboard history Enter"),
+        A::ClipboardDelete(_) => KeyboardPath::Always("clipboard history d"),
+        A::ClipboardClear => KeyboardPath::Always("clipboard history c"),
     })
 }
 
