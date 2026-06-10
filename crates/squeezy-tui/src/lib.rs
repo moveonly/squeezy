@@ -105,6 +105,7 @@ mod export_destination;
 mod first_run_hints;
 mod fuzzy;
 mod gesture_settings;
+mod glyph_mode;
 mod history;
 mod hover_intent;
 mod hover_preview;
@@ -343,17 +344,38 @@ pub(crate) enum TerminalTitleState {
     Notification,
 }
 
-fn terminal_title_for(state: TerminalTitleState, label: &str, elapsed_ms: u64) -> Option<String> {
+fn terminal_title_for(
+    state: TerminalTitleState,
+    label: &str,
+    elapsed_ms: u64,
+    glyph_mode: glyph_mode::GlyphMode,
+) -> Option<String> {
+    // Minimal Glyph Mode (§12.7.6): the title bar is Squeezy chrome, and its
+    // braille spinner frames + the notification dot are exactly the
+    // wide/decorative Unicode a limited terminal mangles, so route the chosen
+    // glyph through `GlyphTokens::downgrade` for the active mode. In Unicode mode
+    // this is the identity (the glyph is returned unchanged); Compact/ASCII swap
+    // it for a single-cell / ASCII stand-in. Only the chrome glyph changes — the
+    // `squeezy · {label}` text is untouched.
+    let downgrade = |s: &str| -> String {
+        s.chars()
+            .map(|c| glyph_mode::GlyphTokens::downgrade(glyph_mode, c))
+            .collect()
+    };
     match state {
         TerminalTitleState::Cleared => None,
         TerminalTitleState::Working => {
             let idx =
                 ((elapsed_ms / TITLE_SPINNER_INTERVAL_MS) as usize) % TITLE_SPINNER_FRAMES.len();
-            Some(format!("{} squeezy · {label}", TITLE_SPINNER_FRAMES[idx]))
+            Some(format!(
+                "{} squeezy · {label}",
+                downgrade(TITLE_SPINNER_FRAMES[idx])
+            ))
         }
-        TerminalTitleState::Notification => {
-            Some(format!("{TITLE_NOTIFICATION_GLYPH} squeezy · {label}"))
-        }
+        TerminalTitleState::Notification => Some(format!(
+            "{} squeezy · {label}",
+            downgrade(TITLE_NOTIFICATION_GLYPH)
+        )),
     }
 }
 
@@ -903,6 +925,12 @@ async fn run_inner_with_terminal(
     // is a no-op; a malformed/newer-schema profile loads as empty and never blocks
     // launch.
     restore_workspace_profile(&mut app, &mut agent);
+    // Minimal Glyph Mode (§12.7.6): restore the chrome glyph fidelity the user
+    // picked in a prior session from the user-scope config before the first paint,
+    // so a limited terminal opens in ASCII/compact chrome without re-toggling. A
+    // session that never picked one keeps the built-in Unicode default; a malformed
+    // value is ignored.
+    restore_glyph_mode(&mut app);
     if let Some(banner) = update_banner.filter(|s| !s.trim().is_empty()) {
         app.push_log(banner);
     }
@@ -1846,6 +1874,9 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         // The Gesture Settings overlay (§12.7.5) is modal: block the switch like
         // every other overlay above.
         || app.gesture_settings_editor.is_some()
+        // The Minimal Glyph Mode overlay (§12.7.6) is modal: block the switch like
+        // every other overlay above.
+        || app.glyph_mode_editor.is_some()
         // While a macro is recording or replaying (§12.3.7) a quick session
         // switch would derail the in-flight workflow, so block it like every
         // other modal/overlay context above.
@@ -2741,6 +2772,24 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             )) = app.click_target_at(mouse.column, mouse.row)
         {
             gesture_settings_step_field(app, index);
+        }
+        // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Minimal Glyph Mode overlay (§12.7.6) owns the pointer while open: a
+    // left-click on a mode row selects (and live-previews) that mode (the mouse
+    // twin of ↑↓). Every other click is swallowed so a stray press can't fall
+    // through to the surface beneath. Hit-tested in ABSOLUTE screen coordinates
+    // against the targets `render_glyph_mode_surface` registered this frame.
+    if app.glyph_mode_editor.is_some() {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::GlyphModeRow(_)),
+                interaction::Action::GlyphModeSelect(index),
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            glyph_mode_select_row(app, index);
         }
         // Overlay is open: consume every mouse event so nothing leaks below.
         return true;
@@ -5356,6 +5405,163 @@ fn gesture_settings_commit(app: &mut TuiApp, _agent: &mut Agent) {
     app.needs_redraw = true;
 }
 
+/// `Ctrl+Alt+U`: open / close the Minimal Glyph Mode picker (§12.7.6). Opening
+/// seeds the editor with the currently-active mode (already restored from config
+/// at startup). Sets `needs_redraw` so the toggle paints immediately, but leaves
+/// the idle redraw cadence untouched once settled.
+fn toggle_glyph_mode_editor(app: &mut TuiApp) {
+    if app.glyph_mode_editor.is_some() {
+        app.glyph_mode_editor = None;
+        app.status = "glyph mode closed".to_string();
+        app.needs_redraw = true;
+        return;
+    }
+    let editor = glyph_mode::GlyphModeEditor::new(app.glyph_mode);
+    app.glyph_mode_editor = Some(editor);
+    app.status = glyph_mode_status(app);
+    app.needs_redraw = true;
+}
+
+/// Read the persisted Minimal Glyph Mode (§12.7.6) from the user-scope settings
+/// TOML, if any. The pick lives at `[tui].glyph_mode` as one of the bounded slugs
+/// (`unicode` / `compact` / `ascii`); an absent file / table / field, or an
+/// unrecognised slug, collapses to `None` so the session keeps the built-in
+/// default. Best-effort: a parse error is treated as "no override". Pure read —
+/// touches nothing — so it is safe to call at startup.
+fn read_persisted_glyph_mode(app: &TuiApp) -> Option<glyph_mode::GlyphMode> {
+    let text = std::fs::read_to_string(app.user_settings_path()).ok()?;
+    let doc = text.parse::<toml::Table>().ok()?;
+    let slug = doc.get("tui")?.as_table()?.get("glyph_mode")?.as_str()?;
+    glyph_mode::GlyphMode::from_str(slug)
+}
+
+/// Restore the persisted Minimal Glyph Mode (§12.7.6) onto a freshly-built app at
+/// startup, so a mode the user picked in a prior session survives a restart. A
+/// no-op when nothing is persisted (the app keeps the built-in Unicode default).
+fn restore_glyph_mode(app: &mut TuiApp) {
+    if let Some(mode) = read_persisted_glyph_mode(app) {
+        app.glyph_mode = mode;
+    }
+}
+
+/// The status line shown while the Minimal Glyph Mode overlay is open: the focused
+/// mode + the in-overlay verb legend.
+fn glyph_mode_status(app: &TuiApp) -> String {
+    let Some(editor) = app.glyph_mode_editor.as_ref() else {
+        return "glyph mode closed".to_string();
+    };
+    format!(
+        "glyph mode: {}{} \u{2014} \u{2191}\u{2193} mode \u{00b7} \u{2190}\u{2192}/Space cycle \u{00b7} Enter save \u{00b7} r reset \u{00b7} Esc close",
+        editor.working().label(),
+        if editor.is_changed() {
+            " (changed)"
+        } else {
+            ""
+        },
+    )
+}
+
+/// Handle a key while the Minimal Glyph Mode overlay (§12.7.6) is open. Returns
+/// `true` when the key was consumed (so it never leaks to the composer or the
+/// global keymap while the overlay owns focus). The overlay is modal: its own
+/// toggle chord and Esc close; ↑/↓ (and k/j) move the mode focus; ←/→/Space cycle
+/// the working mode; Enter persists the working mode to the user-scope config and
+/// applies it; `r`/Delete resets to the mode the overlay opened with.
+fn handle_glyph_mode_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
+    if app.glyph_mode_editor.is_none() {
+        return false;
+    }
+    // The overlay's own toggle chord closes it (the same key opens and closes).
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::OpenGlyphMode) {
+        toggle_glyph_mode_editor(app);
+        return true;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            toggle_glyph_mode_editor(app);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(editor) = app.glyph_mode_editor.as_mut() {
+                editor.focus_prev();
+            }
+            app.status = glyph_mode_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(editor) = app.glyph_mode_editor.as_mut() {
+                editor.focus_next();
+            }
+            app.status = glyph_mode_status(app);
+            app.needs_redraw = true;
+        }
+        // ←/→ and Space all cycle the working mode (a three-way toggle), so the
+        // mode is adjustable without arrows colliding with row movement.
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
+            if let Some(editor) = app.glyph_mode_editor.as_mut() {
+                editor.cycle();
+            }
+            app.status = glyph_mode_status(app);
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter => glyph_mode_commit(app, agent),
+        KeyCode::Char('r') | KeyCode::Backspace | KeyCode::Delete => {
+            if let Some(editor) = app.glyph_mode_editor.as_mut() {
+                editor.reset();
+            }
+            app.status = glyph_mode_status(app);
+            app.needs_redraw = true;
+        }
+        _ => {}
+    }
+    // The overlay is modal: swallow every key so nothing leaks to the composer
+    // beneath, even keys it does not act on.
+    true
+}
+
+/// Select a glyph mode by its [`glyph_mode::GlyphMode::ALL`] index (the mouse twin
+/// of ↑↓ over a mode row, fed by a click on a row). Refreshes the status line and
+/// requests a redraw.
+fn glyph_mode_select_row(app: &mut TuiApp, index: usize) {
+    if let Some(editor) = app.glyph_mode_editor.as_mut() {
+        editor.focus_row(index);
+    }
+    app.status = glyph_mode_status(app);
+    app.needs_redraw = true;
+}
+
+/// Persist the working Minimal Glyph Mode to the user-scope config (§12.7.6) at
+/// `[tui].glyph_mode` and apply it to the live session immediately. A failure
+/// surfaces in the status line; the working value already took effect in-session.
+fn glyph_mode_commit(app: &mut TuiApp, _agent: &mut Agent) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    let Some(editor) = app.glyph_mode_editor.as_ref() else {
+        return;
+    };
+    let working = editor.working();
+    // Apply in-session immediately so the next frame's chrome reflects the pick.
+    app.glyph_mode = working;
+
+    let target_path = app.user_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    let edit = SettingsEdit {
+        path: &["tui", "glyph_mode"],
+        op: EditOp::SetString(working.as_str().to_string()),
+    };
+    match apply_edits(&scope_target, &[edit]) {
+        Ok(_) => {
+            app.status = format!("\u{2713} saved glyph mode: {}", working.label());
+        }
+        Err(err) => {
+            app.status = format!("glyph mode set, but save failed: {err}");
+        }
+    }
+    // Reseed the open editor so its "(changed)" marker clears against the new
+    // baseline (the just-saved mode is now what a reset would restore).
+    app.glyph_mode_editor = Some(glyph_mode::GlyphModeEditor::new(working));
+    app.needs_redraw = true;
+}
+
 /// Handle a key while the Prompt Templates picker (§12.3.6) is open. Returns
 /// `true` when the key was consumed (so it never leaks to the composer or the
 /// global keymap). Two modes:
@@ -6279,6 +6485,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // keymap dispatch, so a stray key never leaks into the composer underneath.
     // Sits beside the other front-of-loop overlays for the same reason.
     if app.gesture_settings_editor.is_some() && handle_gesture_settings_key(app, agent, key) {
+        return Ok(false);
+    }
+
+    // The Minimal Glyph Mode overlay (§12.7.6) is modal while open: it owns the
+    // keyboard (↑↓/kj move the mode focus, ←→/Space cycle the working mode, Enter
+    // save, r/Delete reset, Esc/Ctrl+Alt+U close) BEFORE any selection-clear,
+    // search, chord, or keymap dispatch, so a stray key never leaks into the
+    // composer underneath. Sits beside the other front-of-loop overlays for the
+    // same reason.
+    if app.glyph_mode_editor.is_some() && handle_glyph_mode_key(app, agent, key) {
         return Ok(false);
     }
 
@@ -8381,6 +8597,15 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
                 return false;
             }
             toggle_gesture_settings_editor(app);
+            true
+        }
+        keymap::Action::OpenGlyphMode => {
+            // §12.7.6: open / close the Minimal Glyph Mode picker.
+            // Main-surface verb; the config/setup screens own their own routing.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_glyph_mode_editor(app);
             true
         }
     }
@@ -14545,6 +14770,11 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // practice. It exists so every `interaction::Action` has a dispatch arm and
         // the accessibility audit's exhaustiveness holds.
         interaction::Action::GestureSettingsStepField(_) => {}
+        // §12.7.6: the glyph-mode overlay's own mouse handler in `handle_mouse`
+        // short-circuits this target while the overlay is open, so this arm is
+        // unreachable in practice. It exists so every `interaction::Action` has a
+        // dispatch arm and the accessibility audit's exhaustiveness holds.
+        interaction::Action::GlyphModeSelect(_) => {}
     }
 }
 
@@ -20745,6 +20975,14 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_gesture_settings_surface(frame, area, app, editor);
         return;
     }
+    // The Minimal Glyph Mode overlay (§12.7.6) paints as a fullscreen modal over the
+    // main surface while open, registering its per-mode-row click targets every
+    // frame. Checked before the config screen so its targets register and it owns
+    // the surface while open.
+    if let Some(editor) = &app.glyph_mode_editor {
+        render_glyph_mode_surface(frame, area, app, editor);
+        return;
+    }
     if let Some(state) = &app.config_screen {
         config_screen::render(frame, area, state);
         return;
@@ -23490,6 +23728,158 @@ fn render_gesture_settings_surface(
         } else {
             (
                 "showing built-in gesture defaults".to_string(),
+                crate::render::theme::quiet(),
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color)))),
+            Rect {
+                x: inner.x,
+                y: footer_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+}
+
+/// Paint the Minimal Glyph Mode overlay (§12.7.6) as a centered modal: a header
+/// with the in-overlay verb legend, one selectable row per [`glyph_mode::GlyphMode`]
+/// (showing its label, slug, and description), and a live preview strip of the
+/// chrome token glyphs the focused/working mode resolves to. Each mode row is
+/// registered as an [`interaction::ChromeKey::GlyphModeRow`] click target so a
+/// click reaches the same select path as ↑↓. Reads only the editor's working mode,
+/// so painting is constant-time and does no transcript walk.
+fn render_glyph_mode_surface(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &TuiApp,
+    editor: &glyph_mode::GlyphModeEditor,
+) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Glyph mode ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} ASCII-safe chrome for limited terminals ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 72, 14, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Header: the in-overlay verb legend.
+    let header = Line::from(Span::styled(
+        "\u{2191}\u{2193} mode \u{00b7} \u{2190}\u{2192}/Space cycle \u{00b7} Enter save \u{00b7} r reset \u{00b7} Esc close",
+        Style::default()
+            .fg(crate::render::theme::secondary())
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    let working = editor.working();
+    let cursor = editor.cursor();
+    let bottom = inner.y.saturating_add(inner.height);
+    let body_top = inner.y.saturating_add(2);
+    for (index, mode) in glyph_mode::GlyphMode::ALL.iter().enumerate() {
+        let y = body_top.saturating_add(index as u16);
+        if y >= bottom {
+            break;
+        }
+        let is_focused = index == cursor;
+        let is_active = *mode == working;
+        let row_rect = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: 1,
+        };
+        let marker = if is_focused { "\u{203a} " } else { "  " };
+        let label_style = if is_focused {
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_focused {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            Span::styled(format!("{:<10}", mode.label()), label_style),
+            Span::styled(
+                if is_active { "[active] " } else { "         " },
+                Style::default().fg(crate::render::theme::secondary()),
+            ),
+            Span::styled(
+                mode.description(),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::GlyphModeRow(index)),
+            interaction::Action::GlyphModeSelect(index),
+        );
+    }
+
+    // Live preview strip: the chrome token glyphs the working mode resolves to, so
+    // the user can see the swap before committing.
+    let preview_y = body_top.saturating_add(glyph_mode::GlyphMode::ALL.len() as u16 + 1);
+    if preview_y < bottom {
+        let tokens = working.tokens();
+        let preview: String = tokens
+            .labelled()
+            .iter()
+            .map(|(_, glyph)| *glyph)
+            .collect::<Vec<_>>()
+            .join(" ");
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "preview: ",
+                    Style::default().fg(crate::render::theme::quiet()),
+                ),
+                Span::styled(
+                    preview,
+                    Style::default().fg(crate::render::theme::foreground()),
+                ),
+            ])),
+            Rect {
+                x: inner.x,
+                y: preview_y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+
+    // Footer: whether the working mode differs from the one the overlay opened
+    // with (an unsaved change), so the user knows Enter has something to save.
+    let footer_y = preview_y.saturating_add(2);
+    if footer_y < bottom {
+        let (text, color) = if editor.is_changed() {
+            (
+                format!(
+                    "unsaved \u{00b7} was {} \u{00b7} Enter save \u{00b7} r reset",
+                    editor.opened_with().label()
+                ),
+                crate::render::theme::secondary(),
+            )
+        } else {
+            (
+                "only Squeezy chrome changes; transcript content is untouched".to_string(),
                 crate::render::theme::quiet(),
             )
         };
@@ -38023,6 +38413,19 @@ pub(crate) struct TuiApp {
     /// value is also persisted to the user-scope config; this cache keeps the live
     /// editor consistent without a config round-trip mid-session.
     pub(crate) gesture_settings_override: Option<gesture_settings::GestureSettings>,
+    /// Minimal Glyph Mode (§12.7.6): the interactive glyph-mode picker overlay, or
+    /// `None` when closed (the resting state, which paints nothing extra and
+    /// schedules no redraw). `Some` = the fullscreen overlay owns key/mouse routing
+    /// for picking the chrome glyph fidelity (Unicode / Compact / ASCII). Opened by
+    /// the `OpenGlyphMode` keymap action; a commit persists the mode to the
+    /// user-scope config and applies it to [`Self::glyph_mode`].
+    pub(crate) glyph_mode_editor: Option<glyph_mode::GlyphModeEditor>,
+    /// The active Minimal Glyph Mode (§12.7.6): the chrome glyph fidelity the
+    /// renderer would resolve its chrome tokens from. Defaults to
+    /// [`glyph_mode::GlyphMode::DEFAULT`] (full Unicode); a committed pick (or a
+    /// value restored from the user-scope config at startup) lowers it for limited
+    /// terminals. An idle session pays one enum-tag read.
+    pub(crate) glyph_mode: glyph_mode::GlyphMode,
     /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
     /// keyed by stable entry id and grouped by category (user turns, tool calls,
     /// errors, …). Rebuilt incrementally — only when the transcript's
@@ -38936,6 +39339,8 @@ impl TuiApp {
             terminal_profile_override: None,
             gesture_settings_editor: None,
             gesture_settings_override: None,
+            glyph_mode_editor: None,
+            glyph_mode: glyph_mode::GlyphMode::DEFAULT,
             transcript_index: transcript_index::TranscriptIndex::new(),
             transcript_index_open: false,
             transcript_index_selected: 0,
@@ -41420,7 +41825,12 @@ impl TerminalGuard {
 
     fn apply_terminal_title(&mut self, app: &mut TuiApp) -> Result<()> {
         let elapsed_ms = prompt_elapsed_ms(app);
-        let desired = terminal_title_for(app.terminal_title_state, &app.directory, elapsed_ms);
+        let desired = terminal_title_for(
+            app.terminal_title_state,
+            &app.directory,
+            elapsed_ms,
+            app.glyph_mode,
+        );
         if desired == app.last_terminal_title {
             return Ok(());
         }

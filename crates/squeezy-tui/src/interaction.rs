@@ -262,6 +262,10 @@ pub(crate) enum ChromeKey {
     /// 0-based index in the editor's field list so a click focuses that field and
     /// steps its value forward.
     GestureSettingsField(usize),
+    /// A mode row in the Minimal Glyph Mode overlay (§12.7.6), keyed by its 0-based
+    /// index in [`crate::glyph_mode::GlyphMode::ALL`] (0=Unicode, 1=Compact,
+    /// 2=ASCII) so a click selects exactly that mode (the mouse twin of ↑↓).
+    GlyphModeRow(usize),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -550,6 +554,11 @@ pub(crate) enum Action {
     /// the field focus with ↑↓ and stepping its value with ←→/Space/+/-; a click on a
     /// field row both focuses it and advances its value in one go.
     GestureSettingsStepField(usize),
+    /// Select the given glyph mode (by 0-based index in
+    /// [`crate::glyph_mode::GlyphMode::ALL`]) in the Minimal Glyph Mode overlay
+    /// (§12.7.6). Mouse twin of moving the row focus with ↑↓; a click on a mode
+    /// row selects it (and live-previews it).
+    GlyphModeSelect(usize),
 }
 
 impl Action {
@@ -629,6 +638,7 @@ impl Action {
         Action::WorkspaceProfileSelectField(0),
         Action::TerminalProfileCycleField(0),
         Action::GestureSettingsStepField(0),
+        Action::GlyphModeSelect(0),
     ];
 }
 

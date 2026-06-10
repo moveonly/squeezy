@@ -17934,19 +17934,30 @@ fn mcp_form_schema_preview_is_bounded() {
 #[test]
 fn terminal_title_for_clears_when_idle() {
     assert_eq!(
-        terminal_title_for(TerminalTitleState::Cleared, "~/proj", 0),
+        terminal_title_for(
+            TerminalTitleState::Cleared,
+            "~/proj",
+            0,
+            glyph_mode::GlyphMode::Unicode
+        ),
         None
     );
 }
 
 #[test]
 fn terminal_title_for_animates_spinner_while_working() {
-    let early = terminal_title_for(TerminalTitleState::Working, "~/proj", 0)
-        .expect("working state always renders a title");
+    let early = terminal_title_for(
+        TerminalTitleState::Working,
+        "~/proj",
+        0,
+        glyph_mode::GlyphMode::Unicode,
+    )
+    .expect("working state always renders a title");
     let later = terminal_title_for(
         TerminalTitleState::Working,
         "~/proj",
         TITLE_SPINNER_INTERVAL_MS,
+        glyph_mode::GlyphMode::Unicode,
     )
     .expect("working state always renders a title");
     assert!(early.contains("squeezy · ~/proj"), "got: {early}");
@@ -17960,13 +17971,350 @@ fn terminal_title_for_animates_spinner_while_working() {
 
 #[test]
 fn terminal_title_for_uses_notification_glyph_when_done() {
-    let title = terminal_title_for(TerminalTitleState::Notification, "~/proj", 0)
-        .expect("notification state always renders a title");
+    let title = terminal_title_for(
+        TerminalTitleState::Notification,
+        "~/proj",
+        0,
+        glyph_mode::GlyphMode::Unicode,
+    )
+    .expect("notification state always renders a title");
     assert!(
         title.starts_with(TITLE_NOTIFICATION_GLYPH),
         "expected notification glyph prefix, got: {title}"
     );
     assert!(title.contains("~/proj"), "got: {title}");
+}
+
+#[test]
+fn terminal_title_for_downgrades_chrome_glyphs_in_ascii_mode() {
+    // §12.7.6: in ASCII mode the spinner's braille frame and the notification dot
+    // are wide/decorative Squeezy chrome and must drop to a pure-ASCII stand-in
+    // (the leading glyph), while the `squeezy` text and the `{label}` are untouched.
+    let working = terminal_title_for(
+        TerminalTitleState::Working,
+        "~/proj",
+        0,
+        glyph_mode::GlyphMode::Ascii,
+    )
+    .expect("working title");
+    let lead = working.chars().next().expect("non-empty title");
+    assert!(
+        lead.is_ascii(),
+        "the spinner glyph must be ASCII in ASCII mode, got leading {lead:?} in {working:?}"
+    );
+    assert!(
+        working.contains("squeezy"),
+        "label text preserved: {working}"
+    );
+
+    let notif = terminal_title_for(
+        TerminalTitleState::Notification,
+        "~/proj",
+        0,
+        glyph_mode::GlyphMode::Ascii,
+    )
+    .expect("notification title");
+    // The notification dot (●, wide) became an ASCII stand-in, not the literal dot.
+    assert!(
+        !notif.starts_with(TITLE_NOTIFICATION_GLYPH),
+        "notification glyph should be downgraded in ASCII mode, got: {notif}"
+    );
+    assert!(
+        notif.chars().next().is_some_and(|c| c.is_ascii()),
+        "the notification glyph must be ASCII in ASCII mode, got: {notif}"
+    );
+
+    // Unicode mode is the identity — the wide glyphs are preserved.
+    let unicode = terminal_title_for(
+        TerminalTitleState::Notification,
+        "~/proj",
+        0,
+        glyph_mode::GlyphMode::Unicode,
+    )
+    .expect("notification title");
+    assert!(
+        unicode.starts_with(TITLE_NOTIFICATION_GLYPH),
+        "Unicode mode keeps the wide notification glyph, got: {unicode}"
+    );
+}
+
+// ===========================================================================
+// Minimal Glyph Mode (§12.7.6) — capture-sink integration through real render()
+// ===========================================================================
+
+/// `Ctrl+Alt+U`: open / close the Minimal Glyph Mode overlay.
+fn glyph_mode_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// Pin the user-scope settings to a scratch file so the persist round-trip is
+/// isolated, returning the guard plus the scratch path.
+fn glyph_mode_scratch(app: &mut TuiApp, name: &str) -> (ScopedSettingsPath, PathBuf) {
+    let dir = temp_workspace(name);
+    let settings_path = dir.join("settings.toml");
+    let guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path.clone()));
+    (guard, settings_path)
+}
+
+#[tokio::test]
+async fn glyph_mode_overlay_opens_paints_modes_and_preview() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = glyph_mode_scratch(&mut app, "glyph_mode_open");
+
+    // Idle: the modal is not painted (zero idle cost — nothing extra renders).
+    let idle = render_to_string(&app, 100, 30);
+    assert!(
+        !idle.contains("Glyph mode"),
+        "idle session paints no glyph-mode overlay: {idle}"
+    );
+
+    // Open it via the real key path.
+    handle_key(&mut app, &mut agent, glyph_mode_key())
+        .await
+        .unwrap();
+    assert!(
+        app.glyph_mode_editor.is_some(),
+        "Ctrl+Alt+U opens the overlay"
+    );
+
+    let open = render_to_string(&app, 100, 30);
+    assert!(
+        open.contains("Glyph mode"),
+        "the modal title paints: {open}"
+    );
+    // Every mode row paints.
+    assert!(open.contains("Unicode"), "Unicode row paints: {open}");
+    assert!(open.contains("Compact"), "Compact row paints: {open}");
+    assert!(open.contains("ASCII"), "ASCII row paints: {open}");
+    // The live preview strip paints.
+    assert!(open.contains("preview:"), "preview strip paints: {open}");
+    // The default-mode row is marked active.
+    assert!(
+        open.contains("[active]"),
+        "the active mode is marked: {open}"
+    );
+}
+
+#[tokio::test]
+async fn glyph_mode_keyboard_cycle_changes_working_mode_and_preview() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = glyph_mode_scratch(&mut app, "glyph_mode_cycle");
+
+    handle_key(&mut app, &mut agent, glyph_mode_key())
+        .await
+        .unwrap();
+    // Opens seeded on the active (default Unicode) mode.
+    assert_eq!(
+        app.glyph_mode_editor.as_ref().unwrap().working(),
+        glyph_mode::GlyphMode::Unicode
+    );
+
+    // Right cycles to the next mode (Compact) and live-previews it.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.glyph_mode_editor.as_ref().unwrap().working(),
+        glyph_mode::GlyphMode::Compact
+    );
+    assert!(
+        app.glyph_mode_editor.as_ref().unwrap().is_changed(),
+        "cycling marks the working mode changed"
+    );
+
+    // Down moves the focus onto the ASCII row, making it the working mode.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.glyph_mode_editor.as_ref().unwrap().working(),
+        glyph_mode::GlyphMode::Ascii
+    );
+
+    // The ASCII preview strip's token glyphs are pure ASCII (no box-drawing /
+    // dingbats). Extract just the preview content after "preview: " and before the
+    // modal's own right border `│` — the surrounding modal block legitimately keeps
+    // its Unicode border, only the chrome *tokens* the mode resolves are downgraded.
+    let ascii = render_to_string(&app, 100, 30);
+    let preview_line = ascii
+        .lines()
+        .find(|l| l.contains("preview:"))
+        .expect("preview line present");
+    let after = preview_line
+        .split_once("preview: ")
+        .map(|(_, rest)| rest)
+        .expect("preview prefix present");
+    let tokens = after.split('\u{2502}').next().unwrap_or(after);
+    assert!(
+        tokens.is_ascii(),
+        "ASCII-mode preview tokens must be pure ASCII: {tokens:?}"
+    );
+    // Sanity: the ASCII border/scrollbar stand-ins are present.
+    assert!(
+        tokens.contains('+'),
+        "ASCII corner token present: {tokens:?}"
+    );
+    assert!(
+        tokens.contains('#'),
+        "ASCII scrollbar token present: {tokens:?}"
+    );
+
+    // `r` resets back to the mode the overlay opened with.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.glyph_mode_editor.as_ref().unwrap().working(),
+        glyph_mode::GlyphMode::Unicode
+    );
+    assert!(!app.glyph_mode_editor.as_ref().unwrap().is_changed());
+}
+
+#[tokio::test]
+async fn glyph_mode_mouse_click_selects_mode_row() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = glyph_mode_scratch(&mut app, "glyph_mode_click");
+
+    handle_key(&mut app, &mut agent, glyph_mode_key())
+        .await
+        .unwrap();
+
+    // Render so the per-mode-row click targets register for this frame.
+    let _ = render_to_string(&app, 100, 30);
+
+    // The ASCII row is index 2 in GlyphMode::ALL; find its registered rect and
+    // click it — the mouse twin of ↑↓ onto that row.
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::GlyphModeRow(2),
+        ))
+        .expect("ASCII mode row rect registered");
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(
+        app.glyph_mode_editor.as_ref().unwrap().working(),
+        glyph_mode::GlyphMode::Ascii,
+        "clicking the ASCII row selects (and previews) it"
+    );
+}
+
+#[tokio::test]
+async fn glyph_mode_save_persists_and_survives_restart() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, settings_path) = glyph_mode_scratch(&mut app, "glyph_mode_save");
+
+    handle_key(&mut app, &mut agent, glyph_mode_key())
+        .await
+        .unwrap();
+    // Cycle to ASCII (Unicode -> Compact -> Ascii).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.glyph_mode_editor.as_ref().unwrap().working(),
+        glyph_mode::GlyphMode::Ascii
+    );
+
+    // Save: persists `[tui].glyph_mode = "ascii"` and applies it in-session.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.status.contains("saved"),
+        "save reports success: {}",
+        app.status
+    );
+    assert_eq!(
+        app.glyph_mode,
+        glyph_mode::GlyphMode::Ascii,
+        "the saved mode applies to the live session immediately"
+    );
+    let written = std::fs::read_to_string(&settings_path).expect("settings written");
+    assert!(
+        written.contains("glyph_mode = \"ascii\""),
+        "the mode was persisted under [tui]: {written}"
+    );
+
+    // Persistence round-trip: a fresh session restores the pinned mode at startup
+    // (the same read `restore_glyph_mode` does), so the pick survives a restart.
+    let mut fresh = test_app(SessionMode::Build);
+    fresh.set_settings_path_override(Some(settings_path.clone()));
+    assert_eq!(
+        fresh.glyph_mode,
+        glyph_mode::GlyphMode::Unicode,
+        "a fresh app starts on the default before restore runs"
+    );
+    restore_glyph_mode(&mut fresh);
+    assert_eq!(
+        fresh.glyph_mode,
+        glyph_mode::GlyphMode::Ascii,
+        "the persisted mode is restored at startup"
+    );
+}
+
+#[tokio::test]
+async fn glyph_mode_overlay_paints_on_tiny_and_wide_terminals() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = glyph_mode_scratch(&mut app, "glyph_mode_resize");
+
+    handle_key(&mut app, &mut agent, glyph_mode_key())
+        .await
+        .unwrap();
+
+    // Edge case: a terminal too small for the modal must not panic and must still
+    // produce a frame (the modal clamps / clips rather than crashing).
+    let tiny = render_to_string(&app, 12, 4);
+    assert!(!tiny.is_empty(), "tiny render produces a frame");
+
+    // Wide terminal: the full modal paints with every mode row and the preview.
+    let wide = render_to_string(&app, 160, 48);
+    assert!(wide.contains("Glyph mode"), "title paints wide: {wide}");
+    assert!(wide.contains("Unicode"), "Unicode row paints wide");
+    assert!(wide.contains("ASCII"), "ASCII row paints wide");
+    assert!(wide.contains("preview:"), "preview paints wide");
 }
 
 #[test]

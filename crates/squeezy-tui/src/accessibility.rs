@@ -807,6 +807,11 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // field's value) before the global keymap sees them, so a field-row click
         // reaches the same focus/step handlers the keyboard verbs drive.
         A::GestureSettingsStepField(_) => KeyboardPath::Always("gesture settings ↑↓ ←→"),
+        // Minimal Glyph Mode overlay (§12.7.6) — while the overlay is open its own
+        // key handler owns ↑↓/kj (move the mode focus) and ←→/Space (cycle the
+        // working mode) before the global keymap sees them, so a mode-row click
+        // reaches the same focus/select handler the keyboard verbs drive.
+        A::GlyphModeSelect(_) => KeyboardPath::Always("glyph mode ↑↓ ←→"),
     })
 }
 

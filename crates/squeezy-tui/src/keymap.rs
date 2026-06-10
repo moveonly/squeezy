@@ -480,6 +480,14 @@ pub(crate) enum Action {
     /// since mouse reporting may be disabled. Costs nothing until opened; an idle
     /// session never paints it.
     OpenGestureSettings,
+    /// Minimal Glyph Mode (§12.7.6): open / close the glyph-mode picker
+    /// (`Ctrl+Alt+U` default). A fullscreen overlay that lets the user swap
+    /// Squeezy's decorative / wide-Unicode chrome (spinners, rails, fold markers,
+    /// scrollbar, box-drawing) for ASCII-safe equivalents on limited terminals —
+    /// three fidelity levels (Unicode / Compact / ASCII), togglable and persisted
+    /// to the user-scope config. Costs nothing until opened; an idle session never
+    /// paints it.
+    OpenGlyphMode,
 }
 
 impl Action {
@@ -564,6 +572,7 @@ impl Action {
             Self::OpenWorkspaceProfile => "open_workspace_profile",
             Self::OpenTerminalProfile => "open_terminal_profile",
             Self::OpenGestureSettings => "open_gesture_settings",
+            Self::OpenGlyphMode => "open_glyph_mode",
         }
     }
 
@@ -647,6 +656,7 @@ impl Action {
         Action::OpenWorkspaceProfile,
         Action::OpenTerminalProfile,
         Action::OpenGestureSettings,
+        Action::OpenGlyphMode,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -868,6 +878,11 @@ impl Action {
             // terminals, tmux, and SSH as the `Ctrl+Alt+G`/`Ctrl+Alt+E`/`Ctrl+Alt+B`
             // editor chords and the rest of the Ctrl+Alt overlay/picker family above.
             | Self::OpenGestureSettings
+            // Minimal Glyph Mode (§12.7.6) opens with `Ctrl+Alt+U` — a Ctrl+Alt
+            // (Meta) chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the `Ctrl+Alt+G`/`Ctrl+Alt+W` profile
+            // chords and the rest of the Ctrl+Alt overlay/picker family above.
+            | Self::OpenGlyphMode
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1260,6 +1275,16 @@ impl Action {
             // chord.
             Self::OpenGestureSettings => KeyBinding::new(
                 KeyCode::Char('i'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Minimal Glyph Mode (§12.7.6). `Ctrl+Alt+U` (mnemonic: Unicode) is a
+            // free `Ctrl+Alt` letter — `Ctrl+Alt+K`/`J`/`L`/`M`/`P`/`S`/`A`/`H`/`R`/
+            // `N`/`T`/`B`/`E`/`W`/`Y`/`G`/`D`/`I` are taken by the macro/debug/
+            // overlay/picker/editor/workspace/terminal/gesture chords above, so the
+            // Ctrl+Alt modifier keeps the glyph-mode verb distinct while staying clear
+            // of every composer chord.
+            Self::OpenGlyphMode => KeyBinding::new(
+                KeyCode::Char('u'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }
