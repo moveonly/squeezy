@@ -34454,6 +34454,375 @@ async fn session_timeline_renders_across_resizes() {
     );
 }
 
+// ---- Subagent Timeline Panel (§12.8.1) ----
+
+/// Build an app with a spread of subagent records — one completed (with cost +
+/// tool metrics), one still running, one failed, and one cap-rejected — the shape
+/// the Subagent Timeline Panel tests reuse. Frame size is set so the panel's
+/// hit-test registry lands in absolute coordinates.
+fn app_with_subagents() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(96, 24);
+
+    // A completed subagent carrying structured child metrics (tools + cost).
+    app.note_subagent_started(1, "explore".to_string(), "inspect the parser".to_string());
+    let completed_metrics = TurnMetrics {
+        subagent_tool_calls: 4,
+        subagent_provider: CostSnapshot {
+            estimated_usd_micros: Some(1_500_000),
+            ..CostSnapshot::default()
+        },
+        ..TurnMetrics::default()
+    };
+    app.note_subagent_completed(
+        1,
+        "explore".to_string(),
+        "found the bug".to_string(),
+        completed_metrics,
+    );
+
+    // A still-running subagent.
+    app.note_subagent_started(2, "delegate".to_string(), "run the tests".to_string());
+    app.note_subagent_activity(2, "delegate".to_string(), "running cargo test".to_string());
+
+    // A failed subagent.
+    app.note_subagent_started(3, "reviewer".to_string(), "review the diff".to_string());
+    app.note_subagent_failed(
+        3,
+        "reviewer".to_string(),
+        "could not reach host".to_string(),
+        TurnMetrics::default(),
+    );
+
+    // A cap-rejected subagent (synthetic id, never ran).
+    app.note_subagent_rejected("delegate".to_string(), "concurrency cap".to_string(), 3, 3);
+
+    app
+}
+
+#[tokio::test]
+async fn subagent_timeline_alt_5_opens_panel_and_lists_subagents() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+5 opens the subagent-timeline panel");
+
+    assert!(app.subagent_timeline_open, "Alt+5 opens the panel");
+    let out = render_to_string(&app, 96, 24);
+    assert!(out.contains("Subagent timeline"), "header present:\n{out}");
+
+    // One row per record: completed, running, failed, capped.
+    assert_eq!(app.subagent_timeline.len(), 4, "one row per subagent");
+    assert_eq!(
+        app.subagent_timeline
+            .count_of(subagent_timeline::SubagentTimelineStatus::Completed),
+        1,
+    );
+    assert_eq!(
+        app.subagent_timeline
+            .count_of(subagent_timeline::SubagentTimelineStatus::Running),
+        1,
+    );
+    assert_eq!(
+        app.subagent_timeline
+            .count_of(subagent_timeline::SubagentTimelineStatus::Failed),
+        1,
+    );
+    assert_eq!(
+        app.subagent_timeline
+            .count_of(subagent_timeline::SubagentTimelineStatus::Rejected),
+        1,
+    );
+    // Failed + capped both want attention.
+    assert_eq!(app.subagent_timeline.attention_count(), 2);
+
+    // The role labels, status tags, tool count, cost, and a latest-activity label
+    // all paint (color *and* text for status, never color-only).
+    assert!(out.contains("explore"), "role label:\n{out}");
+    assert!(out.contains("done"), "completed status tag:\n{out}");
+    assert!(out.contains("running"), "running status tag:\n{out}");
+    assert!(out.contains("failed"), "failed status tag:\n{out}");
+    assert!(out.contains("capped"), "cap-rejected status tag:\n{out}");
+    assert!(out.contains("tools 4"), "child tool count:\n{out}");
+    assert!(out.contains("$1.500000"), "child-reported cost:\n{out}");
+    // The cap-rejected row has no honest timing/cost: a dash, never a fake number.
+    assert!(out.contains('-'), "dash for missing metrics:\n{out}");
+}
+
+#[tokio::test]
+async fn subagent_timeline_keyboard_navigates_and_opens_conversation() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open panel");
+    let _ = render_to_string(&app, 96, 24);
+    // The panel opens parked on the last visible row (the freshest subagent).
+    assert_eq!(
+        app.subagent_timeline_selected,
+        app.subagent_timeline.visible_len() - 1,
+        "cursor parks on the most recent subagent",
+    );
+
+    // Up retreats the cursor; Down advances it.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("up moves cursor");
+    assert_eq!(
+        app.subagent_timeline_selected,
+        app.subagent_timeline.visible_len() - 2,
+        "Up retreats the cursor",
+    );
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down moves cursor");
+    assert_eq!(
+        app.subagent_timeline_selected,
+        app.subagent_timeline.visible_len() - 1,
+        "Down advances the cursor",
+    );
+
+    // Park on the first row, then Enter opens that subagent's conversation.
+    for _ in 0..app.subagent_timeline.visible_len() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        )
+        .await
+        .expect("up");
+    }
+    assert_eq!(app.subagent_timeline_selected, 0, "cursor at the first row");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter opens the conversation");
+    // Opening the conversation makes that subagent the active source, opens the
+    // transcript overlay, and closes the panel (the overlay now owns the surface).
+    assert!(
+        matches!(app.subagent_pane.active, ConversationSource::Subagent(1)),
+        "the first subagent (id 1) is now the active conversation: {:?}",
+        app.subagent_pane.active,
+    );
+    assert!(
+        app.transcript_overlay.is_some(),
+        "the conversation overlay opens"
+    );
+    assert!(
+        !app.subagent_timeline_open,
+        "the panel closes behind the overlay"
+    );
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn subagent_timeline_filter_cycles_and_renders_filtered() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open panel");
+    let _ = render_to_string(&app, 96, 24);
+    assert_eq!(app.subagent_timeline.filter(), None, "starts unfiltered");
+    assert_eq!(app.subagent_timeline.visible_len(), 4);
+
+    // `f` narrows to the first present status (Running).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("f cycles filter");
+    assert_eq!(
+        app.subagent_timeline.filter(),
+        Some(subagent_timeline::SubagentTimelineStatus::Running),
+    );
+    assert_eq!(
+        app.subagent_timeline.visible_len(),
+        1,
+        "one running subagent"
+    );
+
+    let filtered = render_to_string(&app, 96, 24);
+    assert!(
+        filtered.contains("filter [running]"),
+        "active filter in title:\n{filtered}",
+    );
+
+    // The cursor is re-parked inside the filtered list, never past its end.
+    assert!(
+        app.subagent_timeline_selected < app.subagent_timeline.visible_len(),
+        "cursor stays within the filtered list",
+    );
+}
+
+#[tokio::test]
+async fn subagent_timeline_alt_5_toggles_closed_without_leaking() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    let chord = KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT);
+
+    handle_key(&mut app, &mut agent, chord).await.expect("open");
+    assert!(app.subagent_timeline_open);
+    let _ = render_to_string(&app, 96, 24);
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("close");
+    assert!(!app.subagent_timeline_open, "Alt+5 toggles closed");
+    assert!(app.input.is_empty(), "no key leaked into the composer");
+}
+
+#[tokio::test]
+async fn subagent_timeline_mouse_click_selects_and_opens() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open panel");
+    let _ = render_to_string(&app, 96, 24);
+
+    // Scan for the registered first-row target so the click lands on subagent id 1.
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..96u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::SubagentTimelineRow(idx)),
+                _,
+            )) = app.click_target_at(col, row)
+                && idx == 0
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("a subagent row target is registered");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    // The click selects + opens exactly that subagent (no auto-advance), makes it
+    // the active conversation, and opens the overlay onto it.
+    assert!(
+        matches!(app.subagent_pane.active, ConversationSource::Subagent(1)),
+        "clicking the first row opens subagent id 1: {:?}",
+        app.subagent_pane.active,
+    );
+    assert!(
+        app.transcript_overlay.is_some(),
+        "the conversation overlay opens"
+    );
+}
+
+#[tokio::test]
+async fn subagent_timeline_empty_shows_empty_state() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(96, 24);
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open panel with no subagents");
+
+    assert!(app.subagent_timeline_open);
+    assert!(app.subagent_timeline.is_empty());
+    let out = render_to_string(&app, 96, 24);
+    assert!(
+        out.contains("Subagent timeline"),
+        "header still paints:\n{out}",
+    );
+    assert!(out.contains("No subagents"), "empty-state line:\n{out}");
+
+    // Enter and f on an empty panel are harmless no-ops (no panic, nothing opens,
+    // no filter strands the cursor).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter on empty panel");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("f on empty panel");
+    assert!(app.subagent_timeline.is_empty());
+    assert_eq!(app.subagent_timeline.filter(), None);
+    assert!(app.transcript_overlay.is_none(), "nothing opened");
+}
+
+#[tokio::test]
+async fn subagent_timeline_renders_across_resizes() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open panel");
+
+    // The header and the rows paint at every size; the panel never panics on a
+    // narrow or wide frame.
+    for (w, h) in [(96u16, 24u16), (140, 40), (60, 16)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("Subagent timeline"),
+            "header paints at {w}x{h}:\n{out}",
+        );
+    }
+    // The subagent ids are width-independent: the same four rows survive resize.
+    assert_eq!(app.subagent_timeline.len(), 4, "rows stable across resize");
+}
+
 // ---- Universal Command Palette (§12.1.1) ----
 
 /// Open the Universal Command Palette via its `Ctrl+Alt+P` default chord. Returns a

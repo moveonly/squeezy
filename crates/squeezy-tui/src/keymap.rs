@@ -309,6 +309,17 @@ pub(crate) enum Action {
     /// rebuilds incrementally only on a transcript revision bump, so an idle
     /// session pays nothing.
     ToggleSessionTimeline,
+    /// Open / close the Subagent Timeline Panel (`Alt+5` default; §12.8.1). A
+    /// persistent, navigable list of the session's running and completed
+    /// subagents/tasks on a timeline — each row carrying the subagent's id/name,
+    /// role, lifecycle status (running/done/failed/capped), latest activity,
+    /// elapsed time, tool count, cost (where the child reported it), and an
+    /// attention flag for failures and cap rejections. The cursor (↑↓/kj, plus
+    /// n/p for next/previous) selects a row and Enter/→/l jumps the main view to
+    /// that subagent's conversation; `f` cycles a per-status filter. The panel is
+    /// projected from the live subagent-pane records and rebuilds incrementally
+    /// only on a subagent event, so an idle session pays nothing.
+    ToggleSubagentTimeline,
     /// Annotate the focused (or top-visible) transcript entry with a short private
     /// note (`Alt+/` default; §12.2.5). The note is attached to the stable
     /// transcript entry id and stored only in session UI metadata, never in the
@@ -552,6 +563,7 @@ impl Action {
             Self::DropBookmark => "drop_bookmark",
             Self::ToggleBookmarks => "toggle_bookmarks",
             Self::ToggleSessionTimeline => "toggle_session_timeline",
+            Self::ToggleSubagentTimeline => "toggle_subagent_timeline",
             Self::AnnotateEntry => "annotate_entry",
             Self::ToggleAnnotations => "toggle_annotations",
             Self::ToggleChangesSince => "toggle_changes_since",
@@ -636,6 +648,7 @@ impl Action {
         Action::DropBookmark,
         Action::ToggleBookmarks,
         Action::ToggleSessionTimeline,
+        Action::ToggleSubagentTimeline,
         Action::AnnotateEntry,
         Action::ToggleAnnotations,
         Action::ToggleChangesSince,
@@ -790,6 +803,10 @@ impl Action {
             // the same Meta/Alt encoding that is unreliable across Linux
             // terminals, tmux, and SSH as the rest of the nav/overlay family.
             | Self::ToggleSessionTimeline
+            // Subagent Timeline Panel toggle is `Alt+5` — an Alt+digit chord,
+            // the same Meta/Alt encoding that is unreliable across Linux
+            // terminals, tmux, and SSH as the rest of the nav/overlay family.
+            | Self::ToggleSubagentTimeline
             // Entry Annotations (§12.2.5): annotate is `Alt+/`, the list overlay
             // is `Alt+\` — both Meta/Alt chords, the same terminal-dependent
             // encoding case as the rest of the nav/overlay family.
@@ -1102,6 +1119,7 @@ impl Action {
             // free `Alt`+digit after `Alt+8` (hyperlinks). `9` is mnemonic-free
             // but unambiguous and stays clear of every composer chord.
             Self::ToggleSessionTimeline => KeyBinding::new(KeyCode::Char('9'), KeyModifiers::ALT),
+            Self::ToggleSubagentTimeline => KeyBinding::new(KeyCode::Char('5'), KeyModifiers::ALT),
             // Entry Annotations (§12.2.5). `Alt+/` annotates the focused entry
             // (`/` is a free punctuation key — the "note" slash; the bare Alt
             // letters c/o/k/v/a/y/m/r/w/h/l/p/b/e/f/i/g/u/x/n/s/z/t/q are taken),

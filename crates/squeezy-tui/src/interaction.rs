@@ -163,6 +163,10 @@ pub(crate) enum ChromeKey {
     /// 0-based index in the *visible* (filtered) event list so a click selects +
     /// jumps the main view to the transcript row the event stands for.
     TimelineRow(usize),
+    /// A subagent row in the Subagent Timeline Panel (§12.8.1), keyed by its
+    /// 0-based index in the *visible* (filtered) subagent list so a click selects +
+    /// jumps the main view to that subagent's conversation.
+    SubagentTimelineRow(usize),
     /// An annotation row in the Entry Annotations overlay (§12.2.5), keyed by its
     /// 0-based index in the annotation list so a click selects + jumps the main
     /// view to the entry that exact annotation anchors.
@@ -418,6 +422,12 @@ pub(crate) enum Action {
     /// click both selects and jumps in one go. The index is into the *visible*
     /// (filtered) event list.
     TimelineSelectJump(usize),
+    /// Select the given subagent row in the Subagent Timeline Panel (§12.8.1):
+    /// move the cursor onto it and jump the main view to that subagent's
+    /// conversation. Mouse twin of moving the cursor with ↑↓ and pressing Enter; a
+    /// click both selects and jumps in one go. The index is into the *visible*
+    /// (filtered) subagent list.
+    SubagentTimelineSelectJump(usize),
     /// Select the given annotation row in the Entry Annotations overlay (§12.2.5):
     /// move the cursor onto it and jump the main view to the entry that annotation
     /// anchors. Mouse twin of moving the cursor with ↑↓ and pressing Enter; a click

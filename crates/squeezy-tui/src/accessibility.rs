@@ -697,6 +697,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // before the global keymap sees them, so a row click and the keyboard
         // reach the same `session_timeline_jump_to_selected` handler.
         A::TimelineSelectJump(_) => KeyboardPath::Always("session timeline ↑↓/Enter"),
+        // Subagent Timeline Panel (§12.8.1) — the panel's own key handler owns
+        // ↑↓/kj/n/p (move the subagent cursor / next-previous), f (cycle the
+        // per-status filter), and Enter/→/l (open the selected subagent's
+        // conversation) before the global keymap sees them, so a row click and the
+        // keyboard reach the same `subagent_timeline_jump_to_selected` handler.
+        A::SubagentTimelineSelectJump(_) => KeyboardPath::Always("subagent timeline ↑↓/Enter"),
         // Entry Annotations overlay (§12.2.5) — the overlay's own key handler owns
         // ↑↓/kj/n/p (move the annotation cursor / next-previous) and Enter (jump to
         // the entry behind the selected annotation) before the global keymap sees

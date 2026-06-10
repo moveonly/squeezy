@@ -162,6 +162,7 @@ mod status;
 mod status_line_setup;
 mod streaming;
 mod streaming_patch;
+mod subagent_timeline;
 mod terminal_profile;
 mod terminal_writer;
 mod theme_editor;
@@ -1860,6 +1861,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.lane_fold_open
         || app.bookmarks_open
         || app.session_timeline_open
+        || app.subagent_timeline_open
         || app.annotations_open
         || app.changes_since_open
         || app.action_palette.is_some()
@@ -2966,6 +2968,25 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             dispatch_click_action(app, action);
         }
         // Overlay is open: consume every mouse event so nothing leaks below.
+        return true;
+    }
+
+    // The Subagent Timeline Panel (§12.8.1) owns the pointer while open: a
+    // left-click on a subagent row selects it and jumps the main view to that
+    // subagent's conversation; every other click is swallowed so a stray press
+    // can't fall through to the surface beneath. Hit-tested in ABSOLUTE screen
+    // coordinates against the row targets `render_subagent_timeline_surface`
+    // registered this frame.
+    if app.subagent_timeline_open {
+        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+            && let Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::SubagentTimelineRow(_)),
+                action,
+            )) = app.click_target_at(mouse.column, mouse.row)
+        {
+            dispatch_click_action(app, action);
+        }
+        // Panel is open: consume every mouse event so nothing leaks below.
         return true;
     }
 
@@ -6402,6 +6423,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
+    // The Subagent Timeline Panel (§12.8.1) is modal while open: it owns the
+    // keyboard (↑↓/kj/n/p move the subagent cursor, Enter/→/l open the selected
+    // subagent's conversation, f cycles the per-status filter, Esc/Alt+5 close)
+    // BEFORE any selection-clear, search, chord, or keymap dispatch, so a stray
+    // key never leaks into the composer underneath. Sits beside the other
+    // front-of-loop overlays for the same reason.
+    if app.subagent_timeline_open && handle_subagent_timeline_key(app, key) {
+        return Ok(false);
+    }
+
     // The What Changed Since Here? overlay (§12.2.7) is modal while open: it owns
     // the keyboard (↑↓/kj/n/p move the change cursor, Enter/→/l jump to the
     // change's entry, m re-marks the anchor, Esc/Alt+0 close) BEFORE any
@@ -8427,6 +8458,16 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
             toggle_session_timeline(app);
             true
         }
+        keymap::Action::ToggleSubagentTimeline => {
+            // Main-surface overlay; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay is open.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_subagent_timeline(app);
+            true
+        }
         keymap::Action::AnnotateEntry => {
             // Main-surface verb; the config/setup screens own their own routing,
             // and the Ctrl+T overlay guard above already blocks this while an
@@ -10067,6 +10108,168 @@ fn session_timeline_jump_to_selected(app: &mut TuiApp, advance: bool) {
     }
 }
 
+// ---- Subagent Timeline Panel (§12.8.1) ----
+
+/// Open / close the Subagent Timeline Panel (§12.8.1). On open it refreshes the
+/// panel from the live subagent-pane records and parks the cursor on the last
+/// visible row (the freshest subagent), then reports a one-line summary; on close
+/// it just notes the close. Both directions request a redraw.
+fn toggle_subagent_timeline(app: &mut TuiApp) {
+    app.subagent_timeline_open = !app.subagent_timeline_open;
+    if app.subagent_timeline_open {
+        refresh_subagent_timeline(app);
+        // Park the cursor on the last visible row so the panel opens at the
+        // freshest end of the session (where the user just was).
+        let visible = app.subagent_timeline.visible_len();
+        app.subagent_timeline_selected = visible.saturating_sub(1);
+        app.status = if app.subagent_timeline.is_empty() {
+            "subagent timeline (no subagents yet) — Esc to close".to_string()
+        } else {
+            // Lead with the live count so a glance at the status line shows how
+            // many subagents are still in flight without reading the rows.
+            let running = app.subagent_timeline.running_count();
+            let running_note = if running > 0 {
+                format!(" ({running} running)")
+            } else {
+                String::new()
+            };
+            format!(
+                "subagent timeline: {}{running_note} — \u{2191}\u{2193} select \u{00b7} Enter open \u{00b7} f filter \u{00b7} Esc close",
+                app.subagent_timeline.summary(),
+            )
+        };
+    } else {
+        app.status = "subagent timeline closed".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// Handle a key while the Subagent Timeline Panel (§12.8.1) is open. Returns
+/// `true` when the key was consumed (so it never leaks to the composer or global
+/// keymap). The toggle chord (`Alt+5`) and Esc close; Up/Down (and k/j, plus n/p)
+/// move the cursor over the *visible* (filtered) list; `f` cycles the per-status
+/// filter (re-parking the cursor on the new visible tail); Enter (and l/→) jumps
+/// the main view to the selected subagent's conversation.
+fn handle_subagent_timeline_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if !app.subagent_timeline_open {
+        return false;
+    }
+    // The panel's own toggle chord (`Alt+5` by default) closes it, so the same
+    // key both opens and closes — without leaking to the global keymap, which the
+    // modal swallows below.
+    if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleSubagentTimeline) {
+        app.subagent_timeline_open = false;
+        app.status = "subagent timeline closed".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    let count = app.subagent_timeline.visible_len();
+    match key.code {
+        KeyCode::Esc => {
+            app.subagent_timeline_open = false;
+            app.status = "subagent timeline closed".to_string();
+            app.needs_redraw = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('p') => {
+            app.subagent_timeline_selected = app.subagent_timeline_selected.saturating_sub(1);
+            app.needs_redraw = true;
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('n') => {
+            if count > 0 {
+                app.subagent_timeline_selected =
+                    (app.subagent_timeline_selected + 1).min(count - 1);
+            }
+            app.needs_redraw = true;
+        }
+        // `f` cycles the per-status filter (the spec's running/completed/failed/
+        // capped facets): show-all → each non-empty status → show-all. Re-park the
+        // cursor on the new visible tail so a narrowed list never strands it.
+        KeyCode::Char('f') => {
+            app.subagent_timeline.cycle_filter();
+            let visible = app.subagent_timeline.visible_len();
+            app.subagent_timeline_selected = visible.saturating_sub(1);
+            app.status = match app.subagent_timeline.filter() {
+                Some(status) => format!(
+                    "subagent timeline: filter [{}] ({} shown) — f next \u{00b7} Esc close",
+                    status.label(),
+                    visible,
+                ),
+                None => format!(
+                    "subagent timeline: filter off ({} subagents) — f filter \u{00b7} Esc close",
+                    app.subagent_timeline.len(),
+                ),
+            };
+            app.needs_redraw = true;
+        }
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            subagent_timeline_jump_to_selected(app, true);
+        }
+        // Swallow every other key so the panel is modal: a stray keystroke cannot
+        // leak into the composer underneath while the panel owns focus.
+        _ => {}
+    }
+    true
+}
+
+/// Jump the main view to the conversation behind the Subagent Timeline Panel's
+/// selected row (§12.8.1). Resolves the visible row at the cursor to its subagent
+/// id, makes that subagent the active conversation (selecting its pane row and
+/// pinning its scroll), opens the transcript overlay on it (the committed
+/// subagent conversation lives in scrollback that can't be repainted in place),
+/// and reports the row in the status line. A no-op (status hint) when there is
+/// nothing to jump to or the subagent's record has gone.
+///
+/// `advance` controls the cursor afterward: the keyboard Enter verb passes `true`
+/// so a *repeated* Enter walks forward through the panel (wrapping at the end);
+/// the mouse click passes `false` because a click is a precise pick that should
+/// land and stay on exactly the clicked row.
+fn subagent_timeline_jump_to_selected(app: &mut TuiApp, advance: bool) {
+    let Some((id, status)) = app
+        .subagent_timeline
+        .visible_get(app.subagent_timeline_selected)
+        .map(|entry| (entry.id, entry.status))
+    else {
+        app.status = "subagent timeline: nothing to open".to_string();
+        return;
+    };
+    // Resolve the id to its pane row (row 0 is `main`; record N lives on row
+    // N + 1). A vanished record (pruned/cleared) means nothing to open.
+    let Some(pos) = app
+        .subagent_pane
+        .records
+        .iter()
+        .position(|record| record.id == id)
+    else {
+        app.status = "subagent timeline: that subagent is no longer tracked".to_string();
+        return;
+    };
+    app.subagent_pane.selected = pos + 1;
+    app.subagent_pane.active = ConversationSource::Subagent(id);
+    active_transcript_scroll_mut(app).pin_to_bottom();
+    open_subagent_transcript_overlay(app);
+    // Opening the transcript overlay closes the panel: it now owns the surface, so
+    // leaving the panel open behind it would fight for key/mouse routing.
+    app.subagent_timeline_open = false;
+    let position = app.subagent_timeline_selected + 1;
+    let total = app.subagent_timeline.visible_len();
+    app.status = format!(
+        "subagent {position}/{total} [{}] — {} to expand, Esc to close",
+        status.label(),
+        key_hint(app, keymap::Action::ToggleTranscriptOverlay),
+    );
+    // Walk the cursor forward to the next visible row so a re-open of the panel
+    // resumes after the row just opened. The mouse path skips this so a click
+    // stays put on the row it picked.
+    if advance
+        && let Some(next) = app
+            .subagent_timeline
+            .next_index(Some(app.subagent_timeline_selected))
+    {
+        app.subagent_timeline_selected = next;
+    }
+    app.needs_redraw = true;
+}
+
 // ---- What Changed Since Here? (§12.2.7) ----
 
 /// The "since here" anchor the toggle marks: the focused entry when one is
@@ -10973,6 +11176,7 @@ fn first_run_hint_suppressed(app: &TuiApp) -> bool {
         || app.lane_fold_open
         || app.bookmarks_open
         || app.session_timeline_open
+        || app.subagent_timeline_open
         || app.changes_since_open
         || app.annotations_open
         || app.breadcrumbs_open
@@ -13193,6 +13397,86 @@ fn refresh_change_summary(app: &mut TuiApp) {
     app.change_summary.rebuild_if_stale(fingerprint, &sources);
 }
 
+/// Map the private [`SubagentLifecycle`] onto the pure timeline module's
+/// [`subagent_timeline::SubagentTimelineStatus`]. Total and standalone so the
+/// timeline module never depends on `lib.rs`.
+fn subagent_timeline_status(
+    lifecycle: SubagentLifecycle,
+) -> subagent_timeline::SubagentTimelineStatus {
+    use subagent_timeline::SubagentTimelineStatus as S;
+    match lifecycle {
+        SubagentLifecycle::Running => S::Running,
+        SubagentLifecycle::Completed => S::Completed,
+        SubagentLifecycle::Failed => S::Failed,
+        SubagentLifecycle::Rejected => S::Rejected,
+    }
+}
+
+/// Project the live subagent-pane records into the structured
+/// [`subagent_timeline::SubagentTimelineSource`] rows the Subagent Timeline Panel
+/// (§12.8.1) consumes. Pure data extraction: each row carries the subagent's id,
+/// role label, lifecycle status, latest activity line, elapsed seconds (computed
+/// from the record's monotonic `started` instant via a *saturating* duration — no
+/// back-dated subtraction that could underflow a fresh clock), tool count, and
+/// the child-reported cost in USD micros (the subagent provider's spend, falling
+/// back to the main provider's). A cap-rejected record has no start time and so
+/// reports `None` elapsed/cost — the spec's "accurate cost depends on child
+/// metrics" / cap-rejection cases, rendered honestly downstream.
+fn build_subagent_timeline_sources(app: &TuiApp) -> Vec<subagent_timeline::SubagentTimelineSource> {
+    let now = std::time::Instant::now();
+    app.subagent_pane
+        .records
+        .iter()
+        .map(|record| {
+            let elapsed_secs = record
+                .started
+                .map(|started| now.saturating_duration_since(started).as_secs());
+            let (tool_count, cost_micros) = match record.metrics.as_ref() {
+                Some(metrics) => {
+                    let tools = metrics.subagent_tool_calls.max(metrics.tool_calls);
+                    // Prefer the child's own provider spend; fall back to the
+                    // main provider snapshot when the subagent ledger is empty.
+                    let cost = metrics
+                        .subagent_provider
+                        .estimated_usd_micros
+                        .or(metrics.provider.estimated_usd_micros);
+                    (tools, cost)
+                }
+                None => (0, None),
+            };
+            subagent_timeline::SubagentTimelineSource {
+                id: record.id,
+                agent: record.agent.clone(),
+                status: subagent_timeline_status(record.lifecycle),
+                latest: record.latest.clone(),
+                elapsed_secs,
+                tool_count,
+                cost_micros,
+            }
+        })
+        .collect()
+}
+
+/// Refresh the Subagent Timeline Panel (§12.8.1) against the live subagent-pane
+/// records, rebuilding **only** when the records' fingerprint has moved since the
+/// last refresh. Called lazily — right before the panel opens or renders — so an
+/// idle session that never opens the panel pays nothing, and an open panel
+/// re-builds only on a real subagent event (start, activity, tool result,
+/// completion, failure, cap rejection) rather than every frame. The active status
+/// filter is preserved across the rebuild.
+///
+/// Note the running-elapsed wrinkle: a running subagent's `elapsed_secs` advances
+/// once per wall-clock second, so the fingerprint moves (and the panel re-paints)
+/// at most once a second while a subagent runs — never per frame — and an idle
+/// (all-finished) session's fingerprint is stable, so it pays a single `u64`
+/// comparison.
+fn refresh_subagent_timeline(app: &mut TuiApp) {
+    let sources = build_subagent_timeline_sources(app);
+    let fingerprint = subagent_timeline::SubagentTimeline::fingerprint_of(sources.iter());
+    app.subagent_timeline
+        .rebuild_if_stale(fingerprint, &sources);
+}
+
 /// Count the non-blank lines in a text blob — the body row count a lane header
 /// advertises ("tool output (12 lines)"). Bounded by counting only what is
 /// present; an empty/blank blob yields 0.
@@ -14641,6 +14925,14 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::TimelineSelectJump(index) => {
             app.session_timeline_selected = index;
             session_timeline_jump_to_selected(app, false);
+        }
+        // A click on a Subagent Timeline Panel row (§12.8.1): move the cursor onto
+        // it and jump the main view to that subagent's conversation — the mouse
+        // twin of ↑↓ + Enter, in one go. The index is into the visible (filtered)
+        // subagent list, matching what the row registered.
+        interaction::Action::SubagentTimelineSelectJump(index) => {
+            app.subagent_timeline_selected = index;
+            subagent_timeline_jump_to_selected(app, false);
         }
         // A click on an Entry Annotations row (§12.2.5): move the cursor onto it
         // and jump the main view to the entry that annotation anchors — the mouse
@@ -20903,6 +21195,15 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         render_session_timeline_surface(frame, area, app);
         return;
     }
+    // The Subagent Timeline Panel (§12.8.1) paints as a fullscreen navigable
+    // subagent rail/list over everything else while open, registering its
+    // per-subagent row click targets every frame. Checked beside the session-
+    // timeline overlay (its sibling: the session's events vs. its subagents) so
+    // its targets register and it owns the surface while open.
+    if app.subagent_timeline_open {
+        render_subagent_timeline_surface(frame, area, app);
+        return;
+    }
     // The What Changed Since Here? overlay (§12.2.7) paints as a fullscreen grouped
     // delta list over everything else while open, registering its per-change row
     // click targets every frame. Checked beside the session-timeline overlay (its
@@ -24779,6 +25080,165 @@ fn render_session_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             row_rect,
             interaction::TargetKey::Chrome(interaction::ChromeKey::TimelineRow(index)),
             interaction::Action::TimelineSelectJump(index),
+        );
+    }
+}
+
+/// The accent style for a subagent row's status tag: failed/capped rows pop in
+/// red/quiet (color *and* the status word, never color-only), a running row reads
+/// silver, a completed row green. Kept beside the render surface so the panel and
+/// any future summary share one mapping.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn subagent_timeline_status_style(status: subagent_timeline::SubagentTimelineStatus) -> Style {
+    use subagent_timeline::SubagentTimelineStatus as S;
+    let color = match status {
+        S::Running => crate::render::theme::muted(),
+        S::Completed => crate::render::theme::green(),
+        S::Failed => crate::render::theme::red(),
+        S::Rejected => crate::render::theme::quiet(),
+    };
+    let base = Style::default().fg(color);
+    if status.is_attention() {
+        base.add_modifier(Modifier::BOLD)
+    } else {
+        base
+    }
+}
+
+/// Paint the Subagent Timeline Panel (§12.8.1) as a fullscreen navigable list: a
+/// title, a one-line summary / navigation header (or an honest empty-state line),
+/// then one selectable row per visible (filtered) subagent — a caret on the
+/// selected row, a lifecycle status tag (color *and* text, never color-only), the
+/// subagent's `agent #ordinal` label, its elapsed clock, tool count, cost, and a
+/// short deterministic latest-activity label. Each row is a
+/// [`interaction::ChromeKey::SubagentTimelineRow`] click target keyed by its
+/// visible index so a click reaches the same `subagent_timeline_jump_to_selected`
+/// path as ↑↓+Enter. Reads the already-refreshed panel (kept current by the run
+/// loop while open), so painting is constant-time and does no record walk.
+fn render_subagent_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let filter_note = match app.subagent_timeline.filter() {
+        Some(status) => format!("\u{2014} filter [{}] ", status.label()),
+        None => "\u{2014} running + completed subagents ".to_string(),
+    };
+    let title = Line::from(vec![
+        Span::styled(
+            " Subagent timeline ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            filter_note,
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 96, 26, title);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let total = app.subagent_timeline.len();
+    let visible = app.subagent_timeline.visible();
+    let visible_count = visible.len();
+
+    // Header: summary + navigation hint, or an empty-state line. A non-empty
+    // timeline that the active filter has emptied gets its own honest line.
+    let header = if total == 0 {
+        Line::from(Span::styled(
+            "No subagents in this session yet.",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else if visible_count == 0 {
+        Line::from(Span::styled(
+            "No subagents match the active filter \u{00b7} f to cycle \u{00b7} Esc close",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!(
+                "{} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter open \u{00b7} f filter \u{00b7} Esc close",
+                app.subagent_timeline.summary(),
+            ),
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    if visible_count == 0 {
+        return;
+    }
+
+    // Clamp the cursor to the visible count so a subagent that vanished (e.g.
+    // after a filter change, prune, or clear) can never leave the cursor past the
+    // end.
+    let selected = app.subagent_timeline_selected.min(visible_count - 1);
+    let list_top = inner.y.saturating_add(2);
+    let list_bottom = inner.y.saturating_add(inner.height);
+    let rows = list_bottom.saturating_sub(list_top) as usize;
+
+    // Scroll the list so the selected subagent stays visible when the panel is
+    // taller than the available rows — the rail must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (offset, entry) in visible.iter().enumerate().skip(first).take(rows) {
+        let index = offset;
+        let is_selected = index == selected;
+        let row_rect = Rect {
+            x: inner.x,
+            y: list_top + (offset - first) as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let caret = if is_selected { "\u{203a} " } else { "  " };
+        let label_style = if is_selected {
+            Style::default()
+                .fg(crate::render::theme::secondary())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(crate::render::theme::foreground())
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                caret,
+                Style::default().fg(if is_selected {
+                    crate::render::theme::secondary()
+                } else {
+                    crate::render::theme::quiet()
+                }),
+            ),
+            // Status tag carries run state in color *and* the status word, so a
+            // monochrome terminal still reads it.
+            Span::styled(
+                format!("{:<8} ", entry.status.label()),
+                subagent_timeline_status_style(entry.status),
+            ),
+            Span::styled(
+                format!("{:<16} ", format!("{} #{}", entry.agent, entry.ordinal)),
+                label_style,
+            ),
+            Span::styled(
+                format!("{:>6} ", entry.elapsed_clock()),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(
+                format!("{:<9} ", format!("tools {}", entry.tool_count)),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(
+                format!("{:<13} ", entry.cost_label()),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(entry.latest.clone(), label_style),
+        ]);
+        frame.render_widget(Paragraph::new(line), row_rect);
+
+        // Register the whole row as a click target keyed by its VISIBLE index so a
+        // click selects + opens exactly that subagent (matching the cursor model).
+        app.register_click(
+            row_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::SubagentTimelineRow(index)),
+            interaction::Action::SubagentTimelineSelectJump(index),
         );
     }
 }
@@ -37873,6 +38333,13 @@ struct SubagentRecord {
     scroll: scroll::ScrollState,
     metrics: Option<TurnMetrics>,
     transcript: Vec<TranscriptEntry>,
+    /// When this subagent started, used by the Subagent Timeline Panel
+    /// (§12.8.1) to compute elapsed time. Captured at record creation (a real
+    /// monotonic `Instant::now()`, never a back-dated one — so the elapsed math
+    /// is just `now.saturating_duration_since(started)`, with no subtraction
+    /// that could underflow a fresh monotonic clock). A cap-rejected record sets
+    /// `None`: it never ran, so it has no honest elapsed time.
+    started: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -38656,6 +39123,25 @@ pub(crate) struct TuiApp {
     /// (§12.2.6). Clamped to the visible count each render. Only meaningful while
     /// the overlay is open.
     pub(crate) session_timeline_selected: usize,
+    /// Subagent Timeline Panel model (§12.8.1): the navigable list of the
+    /// session's running and completed subagents/tasks on a timeline — one row
+    /// per subagent record (id/name, role, lifecycle status, latest activity,
+    /// elapsed time, tool count, cost, attention state), projected from the live
+    /// `subagent_pane` records. Rebuilt incrementally — only when the records'
+    /// `(id, status, elapsed, tool_count, cost, latest, agent)` fingerprint
+    /// moves — by `refresh_subagent_timeline`, so an idle session pays one `u64`
+    /// comparison per refresh. Drives the panel's rail/list and selection; the
+    /// active status filter lives inside it.
+    pub(crate) subagent_timeline: subagent_timeline::SubagentTimeline,
+    /// Whether the Subagent Timeline Panel (§12.8.1) is open. `false` = closed
+    /// (the resting state, paints nothing extra); `true` = the fullscreen
+    /// rail/list owns key/mouse routing. Toggled by the `ToggleSubagentTimeline`
+    /// keymap action.
+    pub(crate) subagent_timeline_open: bool,
+    /// Cursor into the subagent timeline panel's *visible* (filtered) row list
+    /// (§12.8.1). Clamped to the visible count each render. Only meaningful while
+    /// the panel is open.
+    pub(crate) subagent_timeline_selected: usize,
     /// Entry Annotations (§12.2.5): the durable set of private notes the user has
     /// attached to transcript entries, each keyed by a stable transcript entry id
     /// so it survives appends, resize, folds, and filters. Lives here (session UI
@@ -39425,6 +39911,9 @@ impl TuiApp {
             session_timeline: session_timeline::SessionTimeline::new(),
             session_timeline_open: false,
             session_timeline_selected: 0,
+            subagent_timeline: subagent_timeline::SubagentTimeline::new(),
+            subagent_timeline_open: false,
+            subagent_timeline_selected: 0,
             annotations: annotations::AnnotationStore::new(),
             annotations_open: false,
             annotations_selected: 0,
@@ -39910,6 +40399,9 @@ impl TuiApp {
             record.scroll = scroll::ScrollState::pinned();
             record.metrics = None;
             record.transcript = transcript;
+            // Re-arm the clock for a restarted subagent so the timeline's
+            // elapsed column counts from this fresh run, not the prior one.
+            record.started = Some(std::time::Instant::now());
         } else {
             self.subagent_pane.records.push(SubagentRecord {
                 id,
@@ -39919,6 +40411,7 @@ impl TuiApp {
                 latest: "starting".to_string(),
                 scroll: scroll::ScrollState::pinned(),
                 metrics: None,
+                started: Some(std::time::Instant::now()),
                 transcript,
             });
         }
@@ -40070,6 +40563,9 @@ impl TuiApp {
             scroll: scroll::ScrollState::pinned(),
             metrics: None,
             transcript,
+            // A cap-rejected subagent never ran, so it has no honest start time:
+            // the timeline renders its elapsed column as "-".
+            started: None,
         });
         self.prune_subagent_records();
         self.clamp_subagent_selection();
@@ -41739,6 +42235,16 @@ impl TerminalGuard {
         // skipped entirely).
         if app.session_timeline_open {
             refresh_session_timeline(app);
+        }
+
+        // Keep the Subagent Timeline Panel (§12.8.1) current while its panel is
+        // open, on the same no-op-when-unchanged terms: an open-but-idle (all
+        // subagents finished) panel costs one `u64` comparison and a closed panel
+        // costs nothing (this branch is skipped entirely). A running subagent's
+        // elapsed column advances at most once a wall-clock second, so the panel
+        // re-paints at most once a second while a subagent runs — never per frame.
+        if app.subagent_timeline_open {
+            refresh_subagent_timeline(app);
         }
 
         // Keep the What Changed Since Here? delta (§12.2.7) current while its
