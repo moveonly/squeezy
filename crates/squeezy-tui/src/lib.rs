@@ -2087,6 +2087,16 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             // from the new (empty) record set on its next refresh.
             app.review_board_open = false;
             app.review_board_cursor = None;
+            // Session Auto-Save Checkpoints (§12.9.5) key every capture/restore
+            // off `app.session_id`, which is set once at launch and otherwise
+            // never re-synced. Without this the debounced auto-save would write
+            // the switched-to session's UI state under the OLD id (corrupting
+            // the prior session's checkpoint) and the new session's checkpoint
+            // would never restore. Re-point the id at the resumed session and
+            // reset the dedup store so the first write isn't mis-gated by the
+            // prior session's fingerprint.
+            app.session_id = agent.session_id();
+            app.session_checkpoint = session_checkpoint::CheckpointStore::new();
             app.status = format!("resumed session {session_id}");
         }
         Err(error) => {
@@ -5431,11 +5441,16 @@ fn workspace_profile_reset(app: &mut TuiApp) {
 /// [`session_checkpoint::UiStateCheckpoint`] keyed by the live session id. Reads
 /// only in-memory app state; returns `None` when the session has no id yet (a
 /// fresh boot before the agent minted one), so a checkpoint is never written
-/// without an owning session. The scroll value is the MAIN view's anchor (the
-/// overlay's own scroll is transient and not checkpointed).
+/// without an owning session. The scroll value is the MAIN transcript's anchor
+/// (`app.transcript_scroll`) — read directly, NOT through
+/// `active_transcript_scroll`, so it always pairs with the MAIN `transcript.len()`
+/// and `selected_entry` it is checkpointed alongside. A focused subagent pane's
+/// own scroll is transient and must not be checkpointed against the main
+/// transcript (otherwise its `from_bottom` restores onto the wrong content on
+/// relaunch).
 fn capture_session_checkpoint(app: &TuiApp) -> Option<session_checkpoint::UiStateCheckpoint> {
     let session_id = app.session_id.clone()?;
-    let scroll = active_transcript_scroll(app);
+    let scroll = app.transcript_scroll;
     let search_query = app
         .search
         .as_ref()
@@ -5488,15 +5503,40 @@ fn apply_session_checkpoint(
     let clamped = checkpoint.clamped_for(app.transcript.len());
     let mut applied = 0usize;
 
-    // Minimap pane visibility (a "pinned pane" in the spec's terms).
+    // Minimap pane visibility (a "pinned pane" in the spec's terms). Count it
+    // toward `applied` ONLY when it actually changed, so the `if applied > 0`
+    // guard on the launch-restore status is real (matches `apply_workspace_profile`).
     if app.show_minimap != clamped.show_minimap {
         app.show_minimap = clamped.show_minimap;
+        applied += 1;
     }
-    applied += 1;
 
     // Focused entry — already clamped to the live transcript length.
     app.selected_entry = clamped.selected_entry;
     applied += 1;
+
+    // Search query. The query is captured + persisted + shown in the overlay, so
+    // restore it too: reopen a fresh search session on the active surface and seed
+    // it with the saved query, then run the find pass so the match positions /
+    // highlight are rebuilt against the live painted rows. An empty/absent query
+    // leaves search closed.
+    if let Some(query) = clamped
+        .search_query
+        .as_ref()
+        .filter(|query| !query.is_empty())
+    {
+        let surface = active_selection_surface(app);
+        let width = app
+            .main_text_area_cache
+            .get()
+            .map(|c| c.text_area.width)
+            .unwrap_or_else(|| main_text_width(app));
+        let mut state = search::SearchState::open(surface, width.max(1));
+        state.query = query.clone();
+        app.search = Some(state);
+        refresh_search(app);
+        applied += 1;
+    }
 
     // Scroll anchor. A following view re-pins to the tail; otherwise restore the
     // `from_bottom` distance, re-clamped against the live content height through
@@ -7452,7 +7492,14 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // keymap dispatch, so a breadcrumb arrow never leaks into the main view. Every
     // OTHER key falls through (`handle_breadcrumbs_key` returns false), so normal
     // composer typing keeps working while the orienting strip is visible.
-    if app.breadcrumbs_open && handle_breadcrumbs_key(app, key) {
+    //
+    // Zen Mode suppresses the chrome (the strip is never painted and registers no
+    // click targets under `chrome_suppressed`), so the interceptor must NOT eat
+    // breadcrumb keys there — otherwise ←/→/Enter would drive an invisible strip
+    // (Enter silently jumping the transcript) with no on-screen cue. Gate it the
+    // same way the dock/minimap suppression does; the strip reappears unchanged on
+    // zen exit.
+    if app.breadcrumbs_open && !app.zen.chrome_suppressed() && handle_breadcrumbs_key(app, key) {
         return Ok(false);
     }
 
@@ -11823,10 +11870,11 @@ fn jump_to_attention(app: &mut TuiApp) {
         app.needs_redraw = true;
         return;
     }
-    app.subagent_pane.selected = pos + 1;
-    app.subagent_pane.active = ConversationSource::Subagent(id);
-    active_transcript_scroll_mut(app).pin_to_bottom();
-    open_subagent_transcript_overlay(app);
+    // Route through the canonical jump so the return anchor + pane cleanup
+    // (subagent_return_anchor / focused = false / dismiss_subagent_preview) are
+    // set exactly as the timeline Enter / double-click jump does — the two jump
+    // paths can't drift. Then layer the attention-specific status on top.
+    jump_to_subagent_index(app, pos);
     app.status = format!(
         "attention: {agent} [{}]{more_note} — {} to expand, Esc to close",
         kind.label(),

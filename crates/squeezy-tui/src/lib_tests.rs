@@ -23177,6 +23177,81 @@ async fn alt_one_resumes_most_recent_non_active_session() {
 }
 
 #[tokio::test]
+async fn quick_switch_resyncs_session_id_so_auto_save_keys_off_the_new_session() {
+    // §12.9.5 SC1 regression: every checkpoint op keys off `app.session_id`, which
+    // is set once at launch. Without re-syncing it on a session switch, the
+    // debounced auto-save would write the switched-to session's UI state under the
+    // OLD id (corrupting the prior session's checkpoint). Assert the switch
+    // re-points `app.session_id` at the resumed session, resets the dedup store,
+    // and that an auto-save then keys off the NEW id (and never the old one).
+    let root = temp_workspace("quick_switch_checkpoint_resync");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let store = squeezy_store::SessionStore::open(&config);
+    store
+        .start_session_eager(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .expect("seed peer session");
+
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = app_with_user_turns(4);
+    // Pin the checkpoint store to a scratch dir (and hold the shared env lock); the
+    // scope's session-id override is harmless — the switch re-points it below.
+    let _scope = ScopedSessionCheckpoint::new(&mut app, "resync");
+    let old_session_id = app.session_id.clone().expect("an old session id");
+
+    // Pre-seed the dedup store as if the OLD session had already auto-saved, so we
+    // can prove the switch resets it (a stale fingerprint must not gate the first
+    // write of the new session).
+    let now = std::time::Instant::now();
+    auto_save_session_checkpoint(&mut app, now);
+    assert!(
+        app.session_checkpoint.has_saved(),
+        "precondition: the old session recorded a save",
+    );
+
+    assert!(
+        handle_session_quick_switch(&mut app, &mut agent, 1).await,
+        "Alt+1 should claim the press when a peer session exists",
+    );
+
+    let new_session_id = agent.session_id().expect("the resumed session id");
+    assert_ne!(
+        new_session_id, old_session_id,
+        "the switch must land on a different session",
+    );
+    assert_eq!(
+        app.session_id.as_deref(),
+        Some(new_session_id.as_str()),
+        "app.session_id must re-sync to the resumed session",
+    );
+    assert!(
+        !app.session_checkpoint.has_saved(),
+        "the dedup store must reset on switch so the new session's first write is not mis-gated",
+    );
+
+    // An auto-save now keys off the NEW session id, and never re-touches the old.
+    let before_old = crate::session_checkpoint::load(&old_session_id);
+    app.selected_entry = Some(1);
+    let later = now
+        .checked_add(crate::session_checkpoint::SAVE_DEBOUNCE + std::time::Duration::from_millis(1))
+        .unwrap_or(now);
+    auto_save_session_checkpoint(&mut app, later);
+
+    let new_saved = crate::session_checkpoint::load(&new_session_id)
+        .expect("auto-save wrote a checkpoint under the new session id");
+    assert_eq!(
+        new_saved.session_id, new_session_id,
+        "the checkpoint is keyed by the new session id",
+    );
+    assert_eq!(
+        crate::session_checkpoint::load(&old_session_id),
+        before_old,
+        "the old session's checkpoint must be untouched by the switched session's auto-save",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn quick_switch_clears_stale_subagent_pane() {
     // Subagent records belong to the session being left; they are never
     // persisted or rehydrated. Switching sessions must reset the pane so the
@@ -26826,6 +26901,12 @@ async fn restore_on_launch_applies_a_saved_checkpoint_clamped_to_the_transcript(
     assert!(
         !app.transcript_scroll.is_following(),
         "the restored non-following scroll anchor was applied"
+    );
+    // The persisted search query was reopened + seeded into the live search.
+    assert_eq!(
+        app.search.as_ref().map(|s| s.query.as_str()),
+        Some("needle"),
+        "the persisted search query was restored into the live search"
     );
     assert!(
         app.status.contains("restored UI state"),
@@ -35556,6 +35637,74 @@ async fn breadcrumbs_keyboard_traverses_and_jumps() {
     .await
     .expect("right moves focus");
     assert_eq!(app.breadcrumbs_focus, 1, "Right advances the focus");
+}
+
+#[tokio::test]
+async fn breadcrumbs_keys_fall_through_to_main_view_under_zen() {
+    // §12.4 Z1 regression: zen suppresses the breadcrumb chrome (it never paints
+    // and registers no click targets), so the key interceptor must NOT eat
+    // breadcrumb nav keys there — otherwise ←/→/Enter would drive an invisible
+    // strip (Enter silently jumping the transcript) with no on-screen cue.
+    let mut app = app_with_breadcrumbs();
+    app.selected_entry = Some(1);
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Open the strip, focus a non-root crumb, then enter zen.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("show strip");
+    let _ = render_to_string(&app, 80, 24);
+    let focus_before = app.breadcrumbs_focus;
+    assert!(focus_before >= 1, "starts on a non-root crumb");
+
+    handle_key(&mut app, &mut agent, toggle_zen_key())
+        .await
+        .expect("enter zen");
+    assert!(app.zen.is_active(), "zen is active");
+    assert!(
+        app.breadcrumbs_open,
+        "the strip is still open (zen only suppresses its chrome, not the flag)",
+    );
+    let status_before = app.status.clone();
+
+    // Left/Right must NOT drive the (invisible) breadcrumb focus under zen.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+    )
+    .await
+    .expect("left handled by main view");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    )
+    .await
+    .expect("right handled by main view");
+    assert_eq!(
+        app.breadcrumbs_focus, focus_before,
+        "breadcrumb focus must not move while the strip is suppressed under zen",
+    );
+
+    // Enter must NOT trigger a breadcrumb jump (the main view handles it instead).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter handled by main view");
+    assert!(
+        !app.status.contains("breadcrumbs"),
+        "Enter under zen must not report a breadcrumb jump: {} (was {})",
+        app.status,
+        status_before,
+    );
 }
 
 #[tokio::test]
