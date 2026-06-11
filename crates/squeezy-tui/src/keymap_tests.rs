@@ -173,6 +173,32 @@ fn settings_keymap_override_cannot_bind_reserved_recovery_keys() {
 }
 
 #[test]
+fn bare_letter_binding_round_trips_through_display_and_overrides() {
+    // deep-review #31: the keybinding editor persists each row via
+    // `binding.display()` and rebuilds the resolver from those strings. A bare
+    // lowercase letter must survive that display() -> parse_keyspec round trip and
+    // resolve to the same action; the old unconditional uppercase emitted "U" for
+    // a `Char('u')` binding, which parsed back as `Char('U')` and never matched
+    // the live `Char('u')` key event (silently dropping the rebind).
+    let captured = KeyBinding::new(KeyCode::Char('u'), KeyModifiers::NONE);
+    // The editor serialises the captured chord exactly this way.
+    let spec = captured.display();
+
+    let mut overrides = BTreeMap::new();
+    // `quote_to_compose` is a convenient existing action to rebind onto bare `u`.
+    overrides.insert("transcript_overlay".to_string(), spec);
+    let resolver = KeymapResolver::from_overrides(&overrides);
+
+    assert_eq!(
+        resolver.lookup(KeyCode::Char('u'), KeyModifiers::NONE),
+        Some(Action::ToggleTranscriptOverlay),
+        "a bare 'u' rebind must resolve after a display() -> parse round trip",
+    );
+    // And the display itself must be the real (lowercase) char, not "U".
+    assert_eq!(captured.display(), "u");
+}
+
+#[test]
 fn queue_undo_action_round_trips_and_defaults_to_u() {
     // Slug round-trips and is registered in `ALL` (so `/keymap` lists it and
     // an override can target it).

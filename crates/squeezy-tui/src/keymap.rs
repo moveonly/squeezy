@@ -2015,7 +2015,7 @@ fn eq_any_ignore_ascii_case(token: &str, candidates: &[&str]) -> bool {
 }
 
 fn format_binding(code: KeyCode, modifiers: KeyModifiers) -> String {
-    let key = format_keycode(code);
+    let key = format_keycode(code, modifiers);
     let mut out = String::new();
     if modifiers.contains(KeyModifiers::CONTROL) {
         out.push_str("Ctrl");
@@ -2048,7 +2048,7 @@ fn format_binding(code: KeyCode, modifiers: KeyModifiers) -> String {
     }
 }
 
-fn format_keycode(code: KeyCode) -> String {
+fn format_keycode(code: KeyCode, modifiers: KeyModifiers) -> String {
     match code {
         KeyCode::Enter => "Enter".to_string(),
         KeyCode::Tab => "Tab".to_string(),
@@ -2067,10 +2067,25 @@ fn format_keycode(code: KeyCode) -> String {
         KeyCode::Down => "Down".to_string(),
         KeyCode::F(n) => format!("F{n}"),
         KeyCode::Char(' ') => "Space".to_string(),
-        KeyCode::Char(ch) => {
-            let upper = ch.to_ascii_uppercase();
-            upper.to_string()
+        // For a BARE char (no Ctrl/Alt/Shift) emit the REAL char so `display()`
+        // round-trips through `parse_keyspec`/`KeyBinding::new` identically
+        // (deep-review #31). The old unconditional uppercase turned a bare
+        // `Char('u')` into `"U"`, which parsed back as `Char('U')` and never
+        // matched the live `Char('u')` key event — silently dropping the rebind
+        // (`KeyBinding::new` only case-folds when Ctrl/Alt is present, so a bare
+        // uppercase letter stays uppercased and misses).
+        //
+        // A modified letter keeps the uppercase convention ("Ctrl+O", "Alt+K",
+        // "Shift+A"): a Ctrl/Alt letter is lowercased again by `KeyBinding::new`
+        // on parse-back so it round-trips regardless of case, and a Shift+letter
+        // genuinely is the uppercase glyph.
+        KeyCode::Char(ch)
+            if modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+        {
+            ch.to_ascii_uppercase().to_string()
         }
+        KeyCode::Char(ch) => ch.to_string(),
         other => format!("{other:?}"),
     }
 }
