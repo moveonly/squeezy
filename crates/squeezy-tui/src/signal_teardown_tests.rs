@@ -285,3 +285,44 @@ fn drop_restores_panic_hook_on_non_alt_exit() {
         "Drop must restore the previous panic hook on a non-alt / error-path exit"
     );
 }
+
+/// (deep-review #116) Pins the real panic-hook-then-`Drop` interleaving that no
+/// existing test exercised. A `panic!` runs the panic hook's
+/// `run_emergency_teardown` FIRST — which read-and-clears the shared
+/// `ALT_SCREEN_ACTIVE` static (the `swap(false)`) and leaves the alternate screen
+/// once on the real stdout — and THEN the stack unwinds into `TerminalGuard::Drop`,
+/// whose guard-LOCAL `alt_screen_active` is still `true`. Before the
+/// deep-review #27 fix, `Drop` left the screen off its local field and so emitted
+/// a SECOND `LeaveAlternateScreen`. Now `Drop` consults the shared read-and-clear,
+/// so the captured `Drop` stream contains NO `\x1b[?1049l` (the hook already left
+/// it). This test drives the real `run_emergency_teardown`, not a hand-fed flag.
+#[test]
+fn drop_after_emergency_teardown_does_not_re_leave_alt_screen() {
+    // Serialize against the process-global alt-screen flag: a concurrent test
+    // building/dropping a capture guard would otherwise perturb the swap.
+    let _flag_guard = super::ALT_SCREEN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // The capture guard publishes the shared flag (as the real `enter` does); make
+    // the precondition explicit to match the production interleaving.
+    super::set_alt_screen_active(true);
+    let (guard, sink) = crate::TerminalGuard::for_capture_test(80, 24);
+
+    // Panic-hook equivalent: read-and-clears the shared static and leaves the
+    // alternate screen exactly once — on the REAL stdout, not the capture sink.
+    super::run_emergency_teardown();
+
+    // Now the guard drops. With the #27 fix it sees the shared flag already
+    // cleared and must NOT re-leave the alternate screen into the capture sink.
+    drop(guard);
+    let bytes = sink.lock().expect("capture sink lock").clone();
+    let captured = String::from_utf8(bytes).expect("captured ANSI is valid utf8");
+    let leave_count = captured.matches("\x1b[?1049l").count();
+    assert_eq!(
+        leave_count, 0,
+        "after the panic hook already left the alternate screen (shared flag \
+         cleared), Drop must not re-leave it — expected 0 LeaveAlternateScreen in \
+         the Drop stream, got {leave_count}: {captured:?}"
+    );
+}
