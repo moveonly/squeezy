@@ -263,6 +263,19 @@ pub(crate) fn run_scenario(
     backend: BenchBackend,
     size: BenchSize,
 ) -> Result<BenchSummary, BenchInvariantError> {
+    run_scenario_into_sink(scenario, backend, size, Arc::new(Mutex::new(Vec::new())))
+}
+
+/// Like [`run_scenario`] but renders into the caller-supplied capture `sink`, so
+/// a test can assert which leg actually touched the stream — the `Cells` backend
+/// must leave the sink empty (it never draws the capture leg), while the
+/// `CaptureStream` backend fills it.
+pub(crate) fn run_scenario_into_sink(
+    scenario: BenchScenario,
+    backend: BenchBackend,
+    size: BenchSize,
+    sink: Arc<Mutex<Vec<u8>>>,
+) -> Result<BenchSummary, BenchInvariantError> {
     let app = scenario.build_app(size);
     let viewport = Rect::new(0, 0, size.width, size.height);
 
@@ -270,7 +283,6 @@ pub(crate) fn run_scenario(
     // Capture-stream terminal (real bytes). Built once and reused across
     // frames so the diffing renderer sees the same steady-state it would in
     // production: frame 1 is a full paint, later frames diff against it.
-    let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     let mut stream_terminal = Terminal::with_options(
         CrosstermBackend::new(TerminalWriter::capture(Arc::clone(&sink))),
         TerminalOptions {
@@ -285,29 +297,40 @@ pub(crate) fn run_scenario(
     for frame_idx in 0..FRAMES_PER_RUN {
         // Cell leg: render and read the buffer for invariant checks. Always
         // re-render (force a paint) so a frame is materialized even when the
-        // diff would otherwise be empty.
+        // diff would otherwise be empty. When `backend == Cells` this is also the
+        // *measured* leg, so it is timed below; otherwise it only feeds the
+        // backend-independent invariant checks and stays untimed.
+        let cell_start = Instant::now();
         cell_terminal
             .draw(|frame| render(frame, &app))
             .expect("cell draw");
+        let cell_elapsed = cell_start.elapsed();
         let cell_buffer = cell_terminal.backend().buffer().clone();
         check_frame_invariants(scenario, frame_idx, &app, &cell_buffer, size)?;
 
-        // Capture leg: measure real bytes + latency for the same frame.
-        let before = sink.lock().unwrap_or_else(|p| p.into_inner()).len();
-        let start = Instant::now();
-        stream_terminal
-            .draw(|frame| render(frame, &app))
-            .expect("stream draw");
-        let elapsed = start.elapsed();
-        let after = sink.lock().unwrap_or_else(|p| p.into_inner()).len();
-        let bytes = match backend {
-            BenchBackend::CaptureStream => (after - before) as u64,
-            // The cell leg reports no bytes — it has no byte stream — so its
-            // summary focuses on latency and invariant coverage.
-            BenchBackend::Cells => 0,
+        // Each frame times and (for the stream leg) measures *only* the backend
+        // the cell selects, so a `Cells` summary reports the cell renderer's
+        // latency — not a second sample of the capture-stream draw — and never
+        // touches the capture sink.
+        let (render_micros, bytes) = match backend {
+            BenchBackend::CaptureStream => {
+                // Capture leg: measure real bytes + latency for the same frame.
+                let before = sink.lock().unwrap_or_else(|p| p.into_inner()).len();
+                let start = Instant::now();
+                stream_terminal
+                    .draw(|frame| render(frame, &app))
+                    .expect("stream draw");
+                let elapsed = start.elapsed();
+                let after = sink.lock().unwrap_or_else(|p| p.into_inner()).len();
+                (elapsed.as_micros(), (after - before) as u64)
+            }
+            // The cell leg's own draw is the measured one; it has no byte stream,
+            // so the summary focuses on latency and invariant coverage and the
+            // capture stream is left untouched.
+            BenchBackend::Cells => (cell_elapsed.as_micros(), 0),
         };
         frames.push(BenchFrameRecord {
-            render_micros: elapsed.as_micros(),
+            render_micros,
             bytes,
         });
     }

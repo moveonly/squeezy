@@ -149,6 +149,44 @@ fn cells_backend_reports_no_bytes_but_full_frames() {
 }
 
 #[test]
+fn cells_backend_never_touches_the_capture_stream() {
+    // The `cells` backend must time and read *its own* (TestBackend) draw, so it
+    // must never render the capture-stream leg. If it did, the `cells` summary's
+    // latency would be a second sample of the capture-stream backend rather than
+    // the cell renderer's. We observe this from the empty capture sink: a `Cells`
+    // run leaves it untouched.
+    let sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let summary = run_scenario_into_sink(
+        BenchScenario::ShortChat,
+        BenchBackend::Cells,
+        BenchSize::new(80, 24),
+        Arc::clone(&sink),
+    )
+    .expect("cells leg must pass invariants");
+    assert_eq!(summary.backend, "cells");
+    assert_eq!(
+        sink.lock().unwrap().len(),
+        0,
+        "the cells backend must not draw the capture-stream leg"
+    );
+
+    // Sanity contrast: the capture-stream backend *does* fill the same sink, so
+    // the assertion above is meaningful (the scenario genuinely emits bytes).
+    let stream_sink: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    run_scenario_into_sink(
+        BenchScenario::ShortChat,
+        BenchBackend::CaptureStream,
+        BenchSize::new(80, 24),
+        Arc::clone(&stream_sink),
+    )
+    .expect("capture leg must pass invariants");
+    assert!(
+        !stream_sink.lock().unwrap().is_empty(),
+        "the capture-stream backend must fill the sink"
+    );
+}
+
+#[test]
 fn empty_scenario_passes_invariants_at_every_size() {
     // Edge case: an empty transcript still paints exactly one composer at
     // every size, including the tiny 40x10.
