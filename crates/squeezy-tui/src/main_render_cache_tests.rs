@@ -268,6 +268,44 @@ fn entry_wrap_cache_busts_on_revision_width_detail_and_theme() {
 }
 
 #[test]
+fn entry_wrap_two_widths_mint_separate_slots() {
+    // Regression for deep-review #47: `width` and `detail_hash` are part of the
+    // EntryWrapKey, NOT validity tags — so the same entry wrapped at two widths
+    // occupies TWO slots that coexist, contradicting the old doc's claim that a
+    // re-wrap "replaces its one slot". Proven session-locally (race-free under
+    // the shared process-wide LRU, which a sibling test could otherwise grow or
+    // evict mid-check): after wrapping the same entry at width 80 then width 100,
+    // re-requesting BOTH widths must HIT (no recompute), which is only possible
+    // if neither slot replaced the other.
+    let _guard = lock_cache();
+    let session = next_session_id();
+    let id = 31;
+
+    let _ = get_or_compute_entry_wrap(session, id, 0, 80, 0, 0, || vec![Line::from("w80")]);
+    let _ = get_or_compute_entry_wrap(session, id, 0, 100, 0, 0, || vec![Line::from("w100")]);
+
+    // The width-80 slot survived the width-100 wrap: re-requesting it is a hit
+    // that still returns the width-80 content (not "w100"), proving the two
+    // widths coexist as separate slots rather than one replacing the other.
+    let computes = Cell::new(0u32);
+    let at80 = get_or_compute_entry_wrap(session, id, 0, 80, 0, 0, || {
+        computes.set(computes.get() + 1);
+        vec![Line::from("MISS-80")]
+    });
+    let at100 = get_or_compute_entry_wrap(session, id, 0, 100, 0, 0, || {
+        computes.set(computes.get() + 1);
+        vec![Line::from("MISS-100")]
+    });
+    assert_eq!(line_text(&at80[0]), "w80");
+    assert_eq!(line_text(&at100[0]), "w100");
+    assert_eq!(
+        computes.get(),
+        0,
+        "neither width's slot was replaced by the other — both stay resident"
+    );
+}
+
+#[test]
 fn entry_wrap_cache_bounded_under_thousands_of_entries_and_resizes() {
     let _guard = lock_cache();
     let session = next_session_id();

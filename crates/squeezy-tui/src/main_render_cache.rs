@@ -209,12 +209,18 @@ pub(crate) fn get_or_compute_main(
     computed
 }
 
-/// Per-entry wrapped-row cache key. `(session, entry_id)` identifies the slot;
-/// the value is validated against `(entry_revision, width, detail_hash,
-/// palette_generation)`. Keeping `(session, entry_id)` as the map key (rather
-/// than folding revision/width into it) means a re-wrap of the *same* entry at
-/// a *new* width replaces its one slot instead of leaking a second — the cache
-/// holds at most one wrapped form per entry per `(width, detail)` working set.
+/// Per-entry wrapped-row cache key: `(session_id, entry_id, width, detail_hash)`
+/// (see the tuple ordering at the `get_or_compute_entry_wrap` call site). `width`
+/// and `detail_hash` are part of the *key*, not validity tags, so a re-wrap of
+/// the same entry at a *new* width or detail mode mints a SEPARATE slot rather
+/// than replacing the old one — the cache holds one wrapped form per
+/// `(entry, width, detail)` in the recent working set, all bounded by the
+/// [`ENTRY_WRAP_CAPACITY`] LRU cap. (Only `entry_revision` and
+/// `palette_generation` are validity tags, re-checked on a hit so a stale
+/// content/theme variant recomputes in place.) This differs from
+/// `render::cache`'s per-entry render cache, which keys on `(session_id,
+/// entry_id)` ALONE and demotes its `context_hash` to a validity tag, so a
+/// re-render at a new context overwrites that entry's single slot.
 type EntryWrapKey = (u64, u64, u16, u64);
 
 #[derive(Clone)]

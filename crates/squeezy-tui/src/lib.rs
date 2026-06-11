@@ -35217,9 +35217,12 @@ fn format_transcript_entry_expanded(
 ///
 /// `expanded = true` selects the overlay (`Ctrl+T`) variant which
 /// forces `entry.collapsed = false`; `expanded = false` honours
-/// `entry.collapsed`. The flag is folded into `context_hash` so the
-/// overlay's expanded copy and the inline collapsed copy live as
-/// separate cache lines under the same entry id.
+/// `entry.collapsed`. The flag is folded into `context_hash`, which
+/// `render::cache::get_or_compute_entry` treats as a *validity tag*, not a
+/// key dimension — the slot is keyed on `(session_id, entry_id)` alone — so
+/// the overlay's expanded copy and the inline collapsed copy do NOT coexist:
+/// whichever was rendered last OVERWRITES the entry's single slot, and the
+/// other variant recomputes (a miss) the next time it is requested.
 ///
 /// The 8 parameters mirror the surface of the two underlying formatters
 /// plus the `session_id` discriminator and the `expanded` switch; we

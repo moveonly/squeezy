@@ -249,6 +249,59 @@ fn entry_misses_on_context_change() {
 }
 
 #[test]
+fn entry_context_variants_overwrite_one_slot() {
+    // Regression for deep-review #47: the per-entry render cache keys on
+    // `(session_id, entry_id)` ALONE and treats `context_hash` as a validity
+    // tag — so the overlay-expanded copy and the inline-collapsed copy of one
+    // entry do NOT "live as separate cache lines under the same entry id"
+    // (the lib.rs claim this pins as false). They share ONE slot: rendering the
+    // second context OVERWRITES the first, and re-requesting the first then
+    // MISSES. Proven via a private `session_id` so it is race-free against
+    // sibling tests sharing the process-wide LRU (a global-`entry_len` delta
+    // would be perturbed by a concurrent insert/eviction).
+    let calls = AtomicUsize::new(0);
+    let session = next_session_id();
+    let id = 4242;
+
+    let _ = get_or_compute_entry(session, id, 0, 0, 0xc1, || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        vec![Line::from("ctx-1")]
+    });
+    let _ = get_or_compute_entry(session, id, 0, 0, 0xc2, || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        vec![Line::from("ctx-2")]
+    });
+
+    // Re-requesting the FIRST context misses (recomputes), proving the second
+    // context overwrote it in the single `(session, entry)` slot rather than
+    // coexisting as a "separate cache line".
+    let again = get_or_compute_entry(session, id, 0, 0, 0xc1, || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        vec![Line::from("ctx-1-recomputed")]
+    });
+    assert_eq!(line_text(&again[0]), "ctx-1-recomputed");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "the first context was overwritten by the second, so it recomputes",
+    );
+
+    // And the just-recomputed first context now occupies the single slot, so the
+    // SECOND context in turn misses — confirming one-slot-overwrite, not two
+    // coexisting lines (which would let both hit).
+    let ctx2_again = get_or_compute_entry(session, id, 0, 0, 0xc2, || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        vec![Line::from("ctx-2-recomputed")]
+    });
+    assert_eq!(line_text(&ctx2_again[0]), "ctx-2-recomputed");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "context variants never coexist: each request evicts the other's slot",
+    );
+}
+
+#[test]
 fn entry_sessions_isolate_identical_ids() {
     // Two independent sessions reusing entry_id=0 (every TuiApp starts
     // at 0) must not collide through the global cache. Otherwise the
