@@ -198,6 +198,13 @@ pub(crate) fn restore_previous_panic_hook() {
 pub(crate) fn install_signal_handlers() {
     use tokio::signal::unix::{SignalKind, signal};
 
+    // (deep-review #25) Record the install call site relative to the resume
+    // picker so a test can pin that handlers are armed BEFORE the blocking
+    // picker. Recorded on every call (even the install-once early-return below)
+    // so the ORDER of the call reflects the caller, not the guard.
+    #[cfg(test)]
+    record_startup_milestone("install_signal_handlers");
+
     // Install exactly once per process, mirroring the panic hook's
     // `HOOKS_INSTALLED` guard. The CLI BackToSetup / model-switch loop re-invokes
     // `run_inner_with_terminal` in the same process; without this each re-entry
@@ -325,7 +332,12 @@ pub(crate) fn reraise_sigtstp_default() {
 /// hook (cross-platform) and `Drop` remain the recovery paths. Kept as a named
 /// no-op so the call site in the event loop is unconditional and `cfg`-free.
 #[cfg(not(unix))]
-pub(crate) fn install_signal_handlers() {}
+pub(crate) fn install_signal_handlers() {
+    // (deep-review #25) Record the call site for the ordering test even off Unix,
+    // where this is a no-op but the startup-ordering contract still holds.
+    #[cfg(test)]
+    record_startup_milestone("install_signal_handlers");
+}
 
 /// Test-only: read whether the panic hook is currently installed (the
 /// `HOOKS_INSTALLED` guard). Lets a test prove that a guard's `Drop` restores the
@@ -343,6 +355,25 @@ pub(crate) fn panic_hook_installed_for_test() -> bool {
 #[cfg(test)]
 pub(crate) fn is_alt_screen_active() -> bool {
     ALT_SCREEN_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Test-only ordered log of startup-sequence milestones, used to pin that the
+/// signal handlers are armed BEFORE the blocking resume picker runs
+/// (deep-review #25). `run_inner_with_terminal` records `"install_signal_handlers"`
+/// at the top (before the picker) and `maybe_pick_resume_session` records
+/// `"picker"` at entry; a test asserts the install event precedes the picker
+/// event. Lives behind `#[cfg(test)]` so production never allocates or records.
+#[cfg(test)]
+pub(crate) static STARTUP_ORDER: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+/// Test-only: append a startup-sequence milestone to [`STARTUP_ORDER`]. A poisoned
+/// lock is recovered (this is best-effort instrumentation, never a hard failure).
+#[cfg(test)]
+pub(crate) fn record_startup_milestone(label: &'static str) {
+    STARTUP_ORDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(label);
 }
 
 /// Test-only serialization lock for any test that asserts on the SHARED

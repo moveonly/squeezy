@@ -825,6 +825,18 @@ async fn run_inner_with_terminal(
     telemetry: Option<TelemetryClient>,
 ) -> Result<(StartupRunOutcome, Option<TerminalGuard>)> {
     let startup_started = Instant::now();
+    // Crash safety (Phase 9): install the SIGTERM/SIGHUP/SIGTSTP handlers NOW —
+    // the terminal guard handed to us is already in raw mode / the alternate
+    // screen, and the resume picker below blocks on `event::read`. A SIGTERM /
+    // SIGHUP arriving DURING the picker (or the subsequent agent build) would
+    // otherwise kill the process with `Drop` never running, stranding the
+    // terminal in raw mode + the alternate screen + mouse/kitty flags. Installing
+    // here — before `maybe_pick_resume_session` — arms the emergency teardown for
+    // those blocking phases too. We are already inside the tokio runtime, so the
+    // Unix listener tasks can spawn. `install_signal_handlers` is install-once
+    // guarded, so installing here (and not again after the loop is entered) is
+    // correct and idempotent. (deep-review #25)
+    signal_teardown::install_signal_handlers();
     let direct_resume_requested = resume_session_id.is_some();
     let picker_route_enabled = !startup.skip_resume_picker && !direct_resume_requested;
     // Apply the persisted theme preference before the first render so the
@@ -1028,14 +1040,11 @@ async fn run_inner_with_terminal(
     let mut frame_limiter = FrameRateLimiter::default();
     let mut interactive_marked = false;
 
-    // Crash safety (Phase 9): on Unix, register SIGTERM/SIGHUP handlers that run
-    // the emergency teardown and exit, so a killed process (where `Drop` never
-    // runs) does not leave the terminal in raw mode / the alternate screen. The
-    // panic hook is installed earlier in `TerminalGuard::enter`. Best-effort and
-    // additive — a failed registration just falls back to the panic hook + Drop;
-    // a no-op on non-Unix. Installed here, inside the tokio runtime, because the
-    // Unix handlers spawn listener tasks.
-    signal_teardown::install_signal_handlers();
+    // Crash safety (Phase 9): the SIGTERM/SIGHUP/SIGTSTP handlers are installed at
+    // the TOP of this function (right after entry, before the resume picker) so
+    // they cover the blocking picker + agent-build phases too (deep-review #25),
+    // not just the loop below. `install_signal_handlers` is install-once guarded,
+    // so they are already armed here — no second install is needed.
 
     loop {
         // Cooperative SIGTSTP (Ctrl+Z) suspend, handled at the top of the loop
@@ -1329,6 +1338,12 @@ fn maybe_pick_resume_session(
     resume_session_id: Option<String>,
     startup: &StartupProfile,
 ) -> Result<ResumeStartup> {
+    // (deep-review #25) Record that the picker is running, so a test can assert
+    // the signal handlers were already installed before this (potentially
+    // blocking on `event::read`) picker — i.e. a SIGTERM/SIGHUP here would run
+    // the emergency teardown rather than strand the terminal.
+    #[cfg(test)]
+    signal_teardown::record_startup_milestone("picker");
     if let Some(id) = resume_session_id {
         // Explicit `--resume <id>` bypasses the picker entirely.
         return Ok(ResumeStartup::Use(id));

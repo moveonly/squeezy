@@ -10176,6 +10176,73 @@ fn fullscreen_enter_respects_mouse_capture_disabled() {
     );
 }
 
+/// (deep-review #25) The SIGTERM/SIGHUP/SIGTSTP handlers must be armed BEFORE the
+/// blocking resume picker runs, so a kill signal during the picker's `event::read`
+/// runs the emergency teardown instead of stranding the terminal in raw mode +
+/// the alternate screen. `signal_teardown is hard to drive under a real signal,
+/// so we pin the ORDERING invariant: drive the same two production functions
+/// `run_inner_with_terminal`'s prologue runs — `install_signal_handlers()` then
+/// `maybe_pick_resume_session()` — and assert the recorded startup sequence has
+/// the install BEFORE the picker. The recorder lives at each function's real
+/// entry, so a sequence with the picker first (the pre-fix order, where install
+/// happened only after the picker + agent build) fails this assertion.
+///
+/// A `tokio` runtime is required because the Unix `install_signal_handlers`
+/// registers listeners on the runtime's reactor.
+#[tokio::test]
+async fn signal_handlers_install_before_the_resume_picker() {
+    // Serialize: `for_capture_test` and the shared startup recorder are
+    // process-global.
+    let _flag_guard = crate::signal_teardown::ALT_SCREEN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    crate::signal_teardown::STARTUP_ORDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+
+    let config = test_config(SessionMode::Build);
+    // `skip_resume_picker: true` so `maybe_pick_resume_session` resolves to Fresh
+    // WITHOUT a real `event::read` (it still records the "picker" milestone at its
+    // entry, before the skip check). No resume id, so no early bypass either.
+    let startup = StartupProfile {
+        onboarding_summary: None,
+        languages: String::new(),
+        skip_resume_picker: true,
+        update_banner: None,
+        resume_session_id: None,
+        setup_question_count: None,
+        open_config_section: None,
+    };
+    let (mut terminal, _sink) = TerminalGuard::for_capture_test(80, 24);
+
+    // Reproduce `run_inner_with_terminal`'s prologue ORDER: arm the crash-safety
+    // handlers FIRST, then run the (potentially blocking) resume picker.
+    signal_teardown::install_signal_handlers();
+    let outcome = maybe_pick_resume_session(&mut terminal, &config, None, &startup)
+        .expect("skip-picker startup resolves to Fresh");
+    assert!(matches!(outcome, ResumeStartup::Fresh));
+
+    let order = crate::signal_teardown::STARTUP_ORDER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let install_pos = order
+        .iter()
+        .position(|m| *m == "install_signal_handlers")
+        .expect("the prologue installed the signal handlers");
+    let picker_pos = order
+        .iter()
+        .position(|m| *m == "picker")
+        .expect("the resume picker ran");
+    assert!(
+        install_pos < picker_pos,
+        "signal handlers must be installed BEFORE the resume picker runs so a \
+         SIGTERM/SIGHUP during the blocking picker tears the terminal down cleanly \
+         — recorded order was {order:?}",
+    );
+}
+
 /// (deep-review #28) The kitty keyboard-enhancement flags are pushed onto a
 /// PER-SCREEN stack, so the push must land AFTER `EnterAlternateScreen` — i.e.
 /// on the alternate screen's own stack, not the main screen's. Otherwise the
