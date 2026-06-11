@@ -43169,6 +43169,37 @@ fn keybinding_editor_key() -> KeyEvent {
     )
 }
 
+/// deep-review #77: the keybindings LOAD path at app construction must be
+/// pinnable WITHOUT mutating process-global `$HOME` (the old `ScopedHome` did
+/// unsafe `set_var("HOME")`, racing every other test that reads `$HOME` — UB on
+/// POSIX). With a thread-local load-path override pointing at a scratch
+/// keybindings file, `test_app` (which calls `build_keymap_resolver`) must pick
+/// up the override's binding. Before the fix the resolver ignored any override
+/// and read only `$HOME`, so the ToggleMinimap binding stayed at its default.
+#[test]
+fn build_keymap_resolver_honors_injected_load_path_without_touching_home() {
+    let root = temp_workspace("keybind_load_override");
+    let path = root.join("keybindings.toml");
+    // Rebind toggle_minimap (default Alt+R) to F9 in the scratch file.
+    fs::write(
+        &path,
+        "# scratch\n\n[[bindings]]\naction = \"toggle_minimap\"\nkey = \"F9\"\n",
+    )
+    .expect("write scratch keybindings");
+
+    set_keybindings_load_path_override_for_test(Some(path));
+    let app = test_app(SessionMode::Build);
+    set_keybindings_load_path_override_for_test(None); // clear before asserting
+
+    assert_eq!(
+        app.keymap.binding(keymap::Action::ToggleMinimap).display(),
+        "F9",
+        "the injected load-path override must seed the resolver (no $HOME mutation)"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// Render the full app through the real `render()` and return the TestBackend
 /// buffer so a mouse test can locate the painted click targets.
 fn render_full_to_buffer(app: &TuiApp, width: u16, height: u16) -> ratatui::buffer::Buffer {

@@ -44432,6 +44432,37 @@ pub(crate) struct PendingDiffResult {
     pub(crate) card: Option<DiffCardData>,
 }
 
+// Test-only override for the keybindings file `build_keymap_resolver` LOADS at
+// construction. Lets the keybinding-editor tests pin a scratch path WITHOUT
+// mutating process-global `$HOME` (the old `ScopedHome` did unsafe
+// `set_var("HOME")`, which races every other test reading `$HOME` and is UB on
+// POSIX — see deep-review #77). Production never touches this.
+#[cfg(test)]
+thread_local! {
+    static KEYBINDINGS_LOAD_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Pin (or clear) the keybindings load-path override for the current test
+/// thread. Production never calls this; it only affects the
+/// `build_keymap_resolver` LOAD path so a test can avoid mutating `$HOME`.
+#[cfg(test)]
+pub(crate) fn set_keybindings_load_path_override_for_test(path: Option<PathBuf>) {
+    KEYBINDINGS_LOAD_PATH_OVERRIDE.with(|slot| *slot.borrow_mut() = path);
+}
+
+/// Resolve the keybindings file `build_keymap_resolver` loads: the test-only
+/// thread-local override when set, else the production `$HOME`-derived path.
+fn keybindings_load_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Some(path) = KEYBINDINGS_LOAD_PATH_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return Some(path);
+        }
+    }
+    keymap_config::default_keybindings_path()
+}
+
 /// Build the runtime [`keymap::KeymapResolver`] by layering the optional
 /// user-editable `~/.squeezy/keybindings.toml` on top of the
 /// `[tui.keymap]` overrides from `settings.toml`. The home directory is
@@ -44441,7 +44472,7 @@ pub(crate) struct PendingDiffResult {
 /// warning and fall back to the base overrides so a broken keybindings
 /// file never prevents the TUI from starting.
 fn build_keymap_resolver(base: &BTreeMap<String, String>) -> keymap::KeymapResolver {
-    let user_path = keymap_config::default_keybindings_path();
+    let user_path = keybindings_load_path();
     match keymap_config::merge_user_overrides(base.clone(), user_path.as_deref()) {
         Ok(merged) => keymap::KeymapResolver::from_overrides(&merged),
         Err(err) => {
