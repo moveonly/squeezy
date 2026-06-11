@@ -25,11 +25,6 @@ ansi-to-tui.workspace = true
 crossterm.workspace = true
 ignore.workspace = true
 lru.workspace = true
-# Unix-only: re-raising SIGTSTP with the default disposition so Ctrl+Z (job
-# control) actually suspends squeezy after we restore the terminal. Pulled in on
-# all targets for a single `[dependencies]` entry; every `libc` use site is
-# `#[cfg(unix)]`, so it is dead weight (no calls) on Windows.
-libc.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true
 serde.workspace = true
@@ -73,6 +68,13 @@ tree-sitter-typescript.workspace = true
 tree-sitter-yaml.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+
+# Unix-only: re-raising SIGTSTP with the default disposition so Ctrl+Z (job
+# control) actually suspends squeezy after we restore the terminal. Every `libc`
+# use site lives in `#[cfg(unix)]` items in `signal_teardown.rs`, so the
+# dependency is scoped to Unix targets and never compiled into Windows builds.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 futures-util.workspace = true
