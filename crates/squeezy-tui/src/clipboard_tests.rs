@@ -117,59 +117,57 @@ fn osc52_payload_exactly_at_limit_still_single_write() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Chunking over the limit
+// 2. Over the limit: never a wire-level "chunk" no-op that claims success
 // ---------------------------------------------------------------------------
 
+/// An oversized OSC 52 payload must NEVER claim success via the terminal, even
+/// with the (now inert) chunk toggle ON: a wire-level split still emits one
+/// escape the terminal drops, so the chain must fall through to the platform
+/// command. With a `[Osc52, PlatformCommand]` chain the outcome is `Copied` via
+/// `Platform`, NOT via `Osc52`.
 #[test]
-fn osc52_chunks_over_limit_and_roundtrips() {
-    let sink = RecordingSink::new();
-    let calls = sink.handle();
-    let mut chain = ClipboardChain::with_providers(sink, osc52_provider_list(&[PBCOPY]));
-    chain.set_osc52_max_bytes(4).set_osc52_chunk(true);
+fn osc52_over_cap_with_chunk_falls_through_to_platform_not_osc52() {
+    let sink = RecordingSink::new(); // terminal write succeeds by default
+    let mut chain = ClipboardChain::with_providers(
+        sink,
+        vec![
+            ClipboardProvider::Osc52,
+            ClipboardProvider::PlatformCommand(PBCOPY),
+        ],
+    );
+    chain.set_osc52_max_bytes(4).set_osc52_chunk(true); // chunk ON, payload blows past cap
 
-    let payload = "the quick brown fox jumps"; // b64 well over 4 chars
-    let expected_b64 = crate::base64_encode(payload.as_bytes());
-    let req = CopyRequest::new(payload, "x");
+    let req = CopyRequest::new("the quick brown fox jumps", "x");
     let outcome = chain.copy(&req);
 
-    assert!(matches!(
-        outcome,
-        CopyOutcome::Copied {
-            provider: ClipboardProviderKind::Osc52,
-            ..
-        }
-    ));
-
-    let recorded = calls.lock().unwrap().clone();
-    // More than one terminal write (chunked), no platform command.
+    // Falls through to the platform provider, not a false Osc52 "success".
     assert!(
-        recorded.len() > 1,
-        "expected multiple chunked writes, got {}",
-        recorded.len()
+        matches!(
+            outcome,
+            CopyOutcome::Copied {
+                provider: ClipboardProviderKind::Platform("pbcopy"),
+                ..
+            }
+        ),
+        "over-cap chunked OSC52 must fall through to platform, got {outcome:?}"
     );
+}
+
+/// With an OSC-52-only chain and the chunk toggle ON, an over-cap payload yields
+/// `Failed` (no provider left), never a false `Copied`.
+#[test]
+fn osc52_over_cap_with_chunk_only_chain_yields_failed_not_copied() {
+    let sink = RecordingSink::new();
+    let mut chain = ClipboardChain::with_providers(sink, vec![ClipboardProvider::Osc52]);
+    chain.set_osc52_max_bytes(4).set_osc52_chunk(true);
+
+    let req = CopyRequest::new("the quick brown fox jumps", "x");
+    let outcome = chain.copy(&req);
+
     assert!(
-        recorded
-            .iter()
-            .all(|c| matches!(c, SinkCall::Terminal { .. })),
-        "chunked OSC52 must not spawn a command"
+        matches!(outcome, CopyOutcome::Failed { .. }),
+        "over-cap chunked OSC52-only chain must fail, got {outcome:?}"
     );
-
-    // First chunk carries the prefix; last chunk carries the ST terminator.
-    if let SinkCall::Terminal { bytes } = &recorded[0] {
-        assert!(
-            bytes.starts_with(b"\x1b]52;c;"),
-            "first chunk must carry prefix"
-        );
-    }
-    if let SinkCall::Terminal { bytes } = recorded.last().unwrap() {
-        assert!(
-            bytes.ends_with(b"\x1b\\"),
-            "last chunk must carry ST terminator"
-        );
-    }
-
-    // Reassembled base64 round-trips to the encoder output.
-    assert_eq!(osc52_b64_from_terminal_calls(&recorded), expected_b64);
 }
 
 #[test]

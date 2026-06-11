@@ -12,8 +12,9 @@
 //! walked by [`ClipboardChain::copy`]:
 //!
 //! 1. **OSC 52** — base64-encode the payload and write the escape to the
-//!    terminal. Honours a configurable byte cap; oversized payloads either
-//!    chunk (when enabled) or fall through.
+//!    terminal. Honours a configurable byte cap; an oversized payload is
+//!    refused up front so the chain falls through to the next provider rather
+//!    than emitting one escape the terminal would silently drop.
 //! 2. **Platform command** — pipe the payload to the host's clipboard binary.
 //! 3. **Temp file** — write the payload to a file under the temp dir and
 //!    surface the path so the caller can tell the user where it landed.
@@ -495,11 +496,12 @@ pub(crate) struct ClipboardChain<S: ClipboardSink> {
     providers: Vec<ClipboardProvider>,
     /// Configurable OSC 52 payload cap (defaults to [`DEFAULT_OSC52_MAX_BYTES`]).
     osc52_max_bytes: usize,
-    /// When set, write an oversized OSC 52 payload as a SINGLE escape split
-    /// across several `write_terminal` calls (so no one write exceeds the cap),
-    /// rather than failing over to the platform command. This is not the
-    /// multi-escape OSC 52 chunking protocol — it is one
-    /// `ESC ] 52 ; c ; <b64> ST` sequence emitted piecewise.
+    /// Retained, INERT toggle. It once enabled a wire-level "chunked" OSC 52
+    /// write for oversized payloads, but that emitted one escape the terminal
+    /// still dropped while falsely reporting success. `try_osc52` now ignores
+    /// it: an over-cap payload always fails over to the next provider whether
+    /// this is set or not. Kept only so callers (and the regression test) can
+    /// still toggle it without changing the now-correct fall-through behavior.
     osc52_chunk: bool,
     /// When set, any payload larger than this requires `request.confirmed`.
     confirm_threshold: Option<usize>,
@@ -541,6 +543,9 @@ impl<S: ClipboardSink> ClipboardChain<S> {
         self
     }
 
+    /// INERT toggle, retained for API/test compatibility. See the `osc52_chunk`
+    /// field doc: an over-cap OSC 52 payload always falls through to the next
+    /// provider now, so this no longer changes behavior.
     pub(crate) fn set_osc52_chunk(&mut self, chunk: bool) -> &mut Self {
         self.osc52_chunk = chunk;
         self
@@ -623,47 +628,16 @@ impl<S: ClipboardSink> ClipboardChain<S> {
                 .map_err(|err| format!("terminal clipboard write failed: {err}"));
         }
 
-        if !self.osc52_chunk {
-            // Over the cap and chunking disabled: do not claim success — let
-            // the chain fall through to the platform command.
-            return Err(format!(
-                "payload {} bytes exceeds terminal clipboard cap of {} bytes",
-                encoded.len(),
-                self.osc52_max_bytes,
-            ));
-        }
-
-        // Over the cap, chunking enabled: emit ONE OSC 52 escape split across
-        // several writes so no single `write_terminal` exceeds the cap. The
-        // opening write carries the `ESC ] 52 ; c ;` prefix, the middle writes
-        // are bare base64 continuations of the same sequence, and the final
-        // write closes with `ESC \` (ST). This is not the multi-escape OSC 52
-        // chunking protocol; concatenating the recorded writes round-trips to
-        // the single full sequence terminals already accept.
-        let chunk_size = self.osc52_max_bytes.max(1);
-        let bytes = encoded.as_bytes();
-        let mut offset = 0;
-        let mut first = true;
-        while offset < bytes.len() {
-            let end = (offset + chunk_size).min(bytes.len());
-            let part = &bytes[offset..end];
-            let is_last = end == bytes.len();
-
-            let mut seq = Vec::new();
-            if first {
-                seq.extend_from_slice(b"\x1b]52;c;");
-                first = false;
-            }
-            seq.extend_from_slice(part);
-            if is_last {
-                seq.extend_from_slice(b"\x1b\\");
-            }
-            self.sink
-                .write_terminal(&seq)
-                .map_err(|err| format!("terminal clipboard write failed: {err}"))?;
-            offset = end;
-        }
-        Ok(())
+        // Over the cap: never claim success. A wire-level split would still emit
+        // one oversized `ESC ] 52 ; c ; <b64> ST` sequence that the terminal (or
+        // tmux/SSH `set-clipboard` buffer) drops, so chunking is not a real
+        // protocol here. Fail so the chain falls through to the platform-command
+        // / temp-file providers instead of silently dropping the copy.
+        Err(format!(
+            "payload {} bytes exceeds terminal clipboard cap of {} bytes",
+            encoded.len(),
+            self.osc52_max_bytes,
+        ))
     }
 
     /// Attempt one platform clipboard command.
