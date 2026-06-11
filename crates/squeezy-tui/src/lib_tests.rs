@@ -41016,3 +41016,258 @@ fn density_survives_tiny_and_resized_frames() {
         }
     }
 }
+
+// ===========================================================================
+// Dockable Panels (§12.4.4)
+// ===========================================================================
+
+/// `Ctrl+Alt+F` — the default Dockable Panels cycle verb.
+fn cycle_dock_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('f'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// Point the app's persisted-settings path at a scratch file and return the
+/// guard + path, mirroring `density_scratch`.
+fn dock_scratch(app: &mut TuiApp, name: &str) -> (ScopedSettingsPath, PathBuf) {
+    let dir = temp_workspace(name);
+    let settings_path = dir.join("settings.toml");
+    let guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path.clone()));
+    (guard, settings_path)
+}
+
+#[test]
+fn dock_default_is_undocked_and_paints_no_panel() {
+    // A fresh app starts undocked; the render is byte-identical to a build
+    // without the feature — no dock header / separator chrome appears.
+    let app = test_app(SessionMode::Build);
+    assert!(!app.dock.is_active());
+
+    let out = render_to_string(&app, 120, 40);
+    assert!(
+        !out.contains("scratchpad \u{00b7} right")
+            && !out.contains("scratchpad \u{00b7} left")
+            && !out.contains("scratchpad \u{00b7} bottom"),
+        "an undocked session paints no dock header:\n{out}"
+    );
+    // No header click target is registered when nothing is docked.
+    assert!(
+        app.registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::DockPanelHeader,
+        ))
+        .is_none(),
+        "no dock header target without a dock"
+    );
+}
+
+#[tokio::test]
+async fn dock_cycle_key_docks_persists_and_survives_restart() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, settings_path) = dock_scratch(&mut app, "dock_cycle");
+    app.set_test_frame_size(120, 40);
+
+    // Undocked -> scratchpad:left (the first cycle step). The status reports the
+    // new dock and it is persisted to `[tui].dock`.
+    handle_key(&mut app, &mut agent, cycle_dock_key())
+        .await
+        .unwrap();
+    assert_eq!(app.dock.panel(), dock::DockPanel::Scratchpad);
+    assert_eq!(app.dock.edge(), Some(dock::DockEdge::Left));
+    assert!(
+        app.status.contains("dock: scratchpad docked left"),
+        "status reports the new dock: {}",
+        app.status
+    );
+    let written = std::fs::read_to_string(&settings_path).expect("settings written");
+    assert!(
+        written.contains("dock = \"scratchpad:left\""),
+        "the dock persists under [tui]: {written}"
+    );
+
+    // Next two steps stay on the scratchpad: left -> right -> bottom.
+    handle_key(&mut app, &mut agent, cycle_dock_key())
+        .await
+        .unwrap();
+    assert_eq!(app.dock.edge(), Some(dock::DockEdge::Right));
+    handle_key(&mut app, &mut agent, cycle_dock_key())
+        .await
+        .unwrap();
+    assert_eq!(app.dock.edge(), Some(dock::DockEdge::Bottom));
+
+    // Persistence round-trip: a fresh session restores the last-saved dock.
+    let mut fresh = test_app(SessionMode::Build);
+    fresh.set_settings_path_override(Some(settings_path.clone()));
+    assert!(
+        !fresh.dock.is_active(),
+        "a fresh app starts undocked before restore runs"
+    );
+    restore_dock(&mut fresh);
+    assert_eq!(fresh.dock.panel(), dock::DockPanel::Scratchpad);
+    assert_eq!(
+        fresh.dock.edge(),
+        Some(dock::DockEdge::Bottom),
+        "the persisted dock is restored at startup"
+    );
+}
+
+#[tokio::test]
+async fn dock_cycle_unsets_the_key_when_it_returns_to_undocked() {
+    // Walking the full cycle back to undocked must remove the `[tui].dock` key so
+    // the next session opens undocked rather than re-reading a stale edge.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, settings_path) = dock_scratch(&mut app, "dock_unset");
+    app.set_test_frame_size(120, 40);
+
+    // One full lap: 3 panels x 3 edges + 1 step back to undocked.
+    let lap = dock::DockPanel::ALL.len() * dock::DockEdge::ALL.len() + 1;
+    for _ in 0..lap {
+        handle_key(&mut app, &mut agent, cycle_dock_key())
+            .await
+            .unwrap();
+    }
+    assert!(!app.dock.is_active(), "a full lap ends undocked");
+    let written = std::fs::read_to_string(&settings_path).unwrap_or_default();
+    assert!(
+        !written.contains("dock ="),
+        "undocking removes the persisted key: {written}"
+    );
+}
+
+#[test]
+fn dock_render_carves_panel_and_registers_header_click() {
+    // A right dock on a wide terminal carves the panel off and paints its header;
+    // the header registers a click target so a click can cycle the dock.
+    let mut app = test_app(SessionMode::Build);
+    app.dock = dock::DockState::from_slug("scratchpad:right").unwrap();
+    app.set_test_frame_size(120, 40);
+
+    let out = render_to_string(&app, 120, 40);
+    assert!(
+        out.contains("scratchpad \u{00b7} right"),
+        "the docked panel header paints:\n{out}"
+    );
+
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::DockPanelHeader,
+        ))
+        .expect("the header registers a click target while painted");
+    // The header sits on the panel's top row, to the right of the transcript.
+    assert!(rect.width > 0 && rect.height == 1);
+}
+
+#[test]
+fn dock_header_click_cycles_the_dock_forward() {
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = dock_scratch(&mut app, "dock_click");
+    app.dock = dock::DockState::from_slug("scratchpad:left").unwrap();
+    app.set_test_frame_size(120, 40);
+
+    // Render so the header click target registers.
+    let _ = render_to_string(&app, 120, 40);
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::DockPanelHeader,
+        ))
+        .expect("header target registered");
+
+    // A click on the header cycles the dock forward (left -> right), the mouse
+    // twin of the keyboard verb.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(
+        app.dock.edge(),
+        Some(dock::DockEdge::Right),
+        "clicking the header cycles the dock forward",
+    );
+}
+
+#[test]
+fn dock_scratchpad_body_shows_buffer_text() {
+    // The docked scratchpad body reflects its live buffer contents.
+    let mut app = test_app(SessionMode::Build);
+    app.scratchpad.insert_text("docked note one");
+    app.dock = dock::DockState::from_slug("scratchpad:right").unwrap();
+    app.set_test_frame_size(140, 40);
+
+    let out = render_to_string(&app, 140, 40);
+    assert!(
+        out.contains("docked note one"),
+        "the docked scratchpad shows its buffer:\n{out}"
+    );
+}
+
+#[test]
+fn dock_subagent_panel_empty_state_and_roster() {
+    // Empty roster shows the empty state; a populated roster shows the count and
+    // an agent row. (Edge case + content.)
+    let mut empty = test_app(SessionMode::Build);
+    empty.dock = dock::DockState::from_slug("subagents:bottom").unwrap();
+    empty.set_test_frame_size(120, 40);
+    let out = render_to_string(&empty, 120, 40);
+    assert!(
+        out.contains("no subagents"),
+        "empty roster shows its empty state:\n{out}"
+    );
+
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "inspect crates".to_string());
+    app.dock = dock::DockState::from_slug("subagents:bottom").unwrap();
+    app.set_test_frame_size(120, 40);
+    let out = render_to_string(&app, 120, 40);
+    assert!(
+        out.contains("subagent(s)") && out.contains("delegate"),
+        "populated roster shows the count and an agent row:\n{out}"
+    );
+}
+
+#[test]
+fn dock_survives_resize_for_every_panel_and_edge() {
+    // Every (panel, edge) renders without panic across a range of sizes, including
+    // frames too small to split (the dock degrades to a single column there).
+    for panel in dock::DockPanel::ALL.iter().copied() {
+        for edge in dock::DockEdge::ALL.iter().copied() {
+            let slug = format!("{}:{}", panel.as_str(), edge.as_str());
+            let mut app = test_app(SessionMode::Build);
+            app.scratchpad.insert_text("note");
+            app.note_subagent_started(1, "delegate".to_string(), "task".to_string());
+            app.dock = dock::DockState::from_slug(&slug).unwrap();
+            for (w, h) in [(3u16, 2u16), (20, 6), (64, 8), (120, 40), (200, 60)] {
+                let _ = render_to_string(&app, w, h);
+            }
+        }
+    }
+}
+
+#[test]
+fn dock_restore_ignores_a_malformed_config() {
+    // An unrecognised slug collapses to None so a fresh session stays undocked.
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, settings_path) = dock_scratch(&mut app, "dock_malformed");
+    std::fs::write(&settings_path, "[tui]\ndock = \"scratchpad:middle\"\n")
+        .expect("write malformed settings");
+    assert_eq!(
+        read_persisted_dock(&app),
+        None,
+        "an unrecognised edge reads as no dock",
+    );
+    restore_dock(&mut app);
+    assert!(!app.dock.is_active(), "restore leaves the undocked default");
+
+    // A bare panel with no edge is also rejected.
+    std::fs::write(&settings_path, "[tui]\ndock = \"scratchpad\"\n")
+        .expect("write bare-panel settings");
+    assert_eq!(read_persisted_dock(&app), None);
+}

@@ -198,6 +198,11 @@ pub(crate) enum ChromeKey {
     /// override `auto → compact → default → expanded → auto` — the mouse twin of
     /// the `CycleDensity` (`Ctrl+Alt+X`) verb.
     DensityIndicator,
+    /// The header of a docked auxiliary panel (§12.4.4). A single affordance with
+    /// no identity of its own; a click cycles the panel's dock position
+    /// `left → right → bottom → undocked` — the mouse twin of the `CycleDockPanel`
+    /// (`Ctrl+Alt+F`) verb.
+    DockPanelHeader,
     /// An annotation row in the Entry Annotations overlay (§12.2.5), keyed by its
     /// 0-based index in the annotation list so a click selects + jumps the main
     /// view to the entry that exact annotation anchors.
@@ -423,6 +428,11 @@ pub(crate) enum Action {
     /// density indicator; both step the override `auto → compact → default →
     /// expanded → auto`, persist it, and request a redraw.
     CycleDensity,
+    /// Cycle the active Dockable Panel's dock position (§12.4.4). Mouse twin of
+    /// the `CycleDockPanel` (`Ctrl+Alt+F`) keyboard verb / a click on the docked
+    /// panel's header; both step the panel `left → right → bottom → undocked`,
+    /// persist it, and request a redraw.
+    CycleDockPanel,
     /// Select the given category row in the Local Transcript Index overlay
     /// (§12.5.1) and jump the main view to the next entry in it. Mouse twin of
     /// moving the cursor with ↑↓ and pressing Enter; a click both selects and
@@ -740,6 +750,7 @@ impl Action {
         Action::JumpToAttention,
         Action::SmartSplitAdjustField(0),
         Action::CycleDensity,
+        Action::CycleDockPanel,
     ];
 }
 

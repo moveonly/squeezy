@@ -98,6 +98,7 @@ mod copy;
 mod copy_code;
 mod density;
 mod diff_detail_pane;
+mod dock;
 mod dogfood;
 mod duplicate_fold;
 mod editor_handoff;
@@ -950,6 +951,11 @@ async fn run_inner_with_terminal(
     // re-cycling. A session that never set one keeps `Auto`; a malformed value is
     // ignored.
     restore_density(&mut app);
+    // Dockable Panels (§12.4.4): restore the docked panel + edge the user pinned
+    // in a prior session from the user-scope config before the first paint, so a
+    // session opens with the panel already docked. A session that never docked
+    // keeps the undocked default; a malformed value is ignored.
+    restore_dock(&mut app);
     if let Some(banner) = update_banner.filter(|s| !s.trim().is_empty()) {
         app.push_log(banner);
     }
@@ -3305,6 +3311,22 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
         && let Some((
             interaction::TargetKey::Chrome(interaction::ChromeKey::DensityIndicator),
+            action,
+        )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
+    }
+
+    // Docked auxiliary panel header (§12.4.4): a left-click on the docked panel's
+    // header cycles its dock position — the mouse twin of the `CycleDockPanel`
+    // (`Ctrl+Alt+F`) keyboard verb. The header is a dedicated non-text affordance
+    // painted in ABSOLUTE screen coordinates (the panel rect is carved off the
+    // frame), so it is hit-tested in absolute coordinates here, before the
+    // card/selection arms, so a click on it never doubles as a card focus.
+    if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::DockPanelHeader),
             action,
         )) = app.click_target_at(mouse.column, mouse.row)
     {
@@ -6022,6 +6044,78 @@ fn read_persisted_density(app: &TuiApp) -> Option<density::DensityMode> {
 fn restore_density(app: &mut TuiApp) {
     if let Some(mode) = read_persisted_density(app) {
         app.density_override = mode;
+    }
+}
+
+/// Cycle the active Dockable Panel's dock position (§12.4.4) one step
+/// (`undocked → left → right → bottom → undocked`), apply it in-session, persist
+/// the new state to the user-scope config, and surface the dock in the status
+/// line. The mouse twin (a click on the docked panel's header) routes here too.
+/// Docking only carves a panel rect off the main view via the §12.4.2 split
+/// solver — it never touches the transcript's scroll, selection, focus, the
+/// queue, or the composer.
+fn cycle_dock_panel(app: &mut TuiApp) {
+    app.dock.cycle();
+    // Persist first; a write failure overwrites the status with its own note, so
+    // set the success status *after* the persist attempt only when it did not
+    // already report an error.
+    persist_dock(app, app.dock);
+    if !app.status.contains("save failed") {
+        // Name the new edge when docked, or report the panel undocked — the
+        // `describe()` readout already covers both, but reading the edge here keeps
+        // the status verb explicit about whether the panel is now on-screen.
+        let verb = match app.dock.edge() {
+            Some(_) => "\u{2713} dock",
+            None => "\u{2717} dock",
+        };
+        app.status = format!("{verb}: {}", app.dock.describe());
+    }
+    app.needs_redraw = true;
+}
+
+/// Persist the Dockable Panels (§12.4.4) state to the user-scope config at
+/// `[tui].dock`. An active dock writes its `panel:edge` slug; undocking removes
+/// the key so a restored session is undocked. Best-effort: a write failure
+/// leaves the in-session value in place and notes it in the status line,
+/// mirroring the density commit path.
+fn persist_dock(app: &mut TuiApp, dock: dock::DockState) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    let target_path = app.user_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    // An active dock writes its slug; an undocked dock clears the key so the next
+    // session opens undocked rather than re-reading a stale edge.
+    let op = match dock.to_slug() {
+        Some(slug) => EditOp::SetString(slug),
+        None => EditOp::Unset,
+    };
+    let edit = SettingsEdit {
+        path: &["tui", "dock"],
+        op,
+    };
+    if let Err(err) = apply_edits(&scope_target, &[edit]) {
+        app.status = format!("dock set, but save failed: {err}");
+    }
+}
+
+/// Read the persisted Dockable Panels (§12.4.4) state from the user-scope
+/// settings TOML, if any. The pick lives at `[tui].dock` as a `panel:edge` slug
+/// (e.g. `scratchpad:right`); an absent file / table / field, or a malformed
+/// slug, collapses to `None` so the session keeps the undocked default.
+/// Best-effort, pure read — safe to call at startup.
+fn read_persisted_dock(app: &TuiApp) -> Option<dock::DockState> {
+    let text = std::fs::read_to_string(app.user_settings_path()).ok()?;
+    let doc = text.parse::<toml::Table>().ok()?;
+    let slug = doc.get("tui")?.as_table()?.get("dock")?.as_str()?;
+    dock::DockState::from_slug(slug)
+}
+
+/// Restore the persisted Dockable Panels (§12.4.4) state onto a freshly-built app
+/// at startup, so a dock the user pinned in a prior session survives a restart. A
+/// no-op when nothing is persisted (the app keeps the undocked default).
+fn restore_dock(app: &mut TuiApp) {
+    if let Some(state) = read_persisted_dock(app) {
+        app.dock = state;
     }
 }
 
@@ -8800,6 +8894,17 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
                 return false;
             }
             cycle_density(app);
+            true
+        }
+        keymap::Action::CycleDockPanel => {
+            // Main-surface layout setting; the config/setup screens own their own
+            // routing, and the Ctrl+T overlay guard above already blocks this
+            // while the overlay (which has its own native layout) is open. Docking
+            // only carves a panel off the main surface.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            cycle_dock_panel(app);
             true
         }
         keymap::Action::ToggleHyperlinks => {
@@ -16506,6 +16611,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::CycleDensity => {
             cycle_density(app);
         }
+        // A click on the docked panel's header (§12.4.4): cycle the panel's dock
+        // position forward — the mouse twin of the `CycleDockPanel` (`Ctrl+Alt+F`)
+        // keyboard verb, driving the same `cycle_dock_panel` handler so
+        // mouse/keyboard parity holds by construction.
+        interaction::Action::CycleDockPanel => {
+            cycle_dock_panel(app);
+        }
         // A click on a Local Transcript Index category row (§12.5.1): move the
         // cursor onto it and jump the main view to the next entry in it — the
         // mouse twin of ↑↓ + Enter, in one go. Selecting a *different* category
@@ -23076,13 +23188,22 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
         config_screen::render(frame, area, state);
         return;
     }
+    // Dockable Panels (§12.4.4): carve the docked auxiliary panel off the frame
+    // BEFORE the main-view layout, so the transcript/composer block lays out
+    // inside the reduced `main_area` and the panel takes its own rect. When the
+    // dock is inactive (the default) or the terminal is too small to split, the
+    // placement degrades to a single column and `main_area == area`, so a session
+    // that never docks paints exactly as before. The panel itself is painted
+    // after the main block below, so its border never underlaps the transcript.
+    let dock_placement = app.dock.placement(area);
+    let main_area = dock_placement.main();
     // Adaptive Density (§12.4.1): the welcome / startup card is informational
     // chrome, so its minimum-height gate scales with density — a compact (short)
     // terminal drops it sooner to spend rows on content, an expanded one keeps it
     // even on a slightly shorter window. `Default` keeps the renderer's prior
     // hard-coded `>= 16` threshold, so the default-density build is unchanged.
-    let include_startup_card = include_startup_card_for(app, area);
-    let layout = main_transcript_layout(app, area, include_startup_card);
+    let include_startup_card = include_startup_card_for(app, main_area);
+    let layout = main_transcript_layout(app, main_area, include_startup_card);
     let MainTranscriptLayout {
         task_height,
         approval_height,
@@ -23122,7 +23243,7 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
-        .split(area);
+        .split(main_area);
     let mut index = 0;
     if transcript_height > 0 {
         render_transcript(frame, chunks[index], app, include_startup_card);
@@ -23158,6 +23279,15 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     // Flexible filler keeps the prompt/status block attached to the transcript
     // instead of pinning it to the terminal bottom.
     let _ = chunks[index];
+    // Dockable Panels (§12.4.4): paint the docked auxiliary panel into its carved
+    // rect (and its one-cell separator), AFTER the main block so its border never
+    // underlaps the transcript. Skipped entirely on the common undocked path so an
+    // inactive dock pays nothing; when active, `render_dock_panel` itself still
+    // no-ops if the terminal was too small to split. Painting registers the header
+    // click target so a click cycles the dock — the mouse twin of `Ctrl+Alt+F`.
+    if app.dock.is_active() {
+        render_dock_panel(frame, app, dock_placement);
+    }
     render_toast_overlay(frame, area, app);
     // The Gentle First-Run Interaction Hint (§12.1.8) is a NON-modal dim line
     // painted on the main surface only — every fullscreen overlay returns earlier
@@ -23258,6 +23388,172 @@ fn render_rename_editor(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         ),
     ]);
     frame.render_widget(Paragraph::new(line), inner);
+}
+
+/// Render the docked auxiliary panel (§12.4.4) into the rect the dock solver
+/// carved off the frame, plus the one-cell separator between it and the
+/// transcript. A complete no-op when the dock is inactive or the layout degraded
+/// to a single column (`placement.panel()` is `None`), so a session that never
+/// docks pays nothing here.
+///
+/// The panel is a bordered box: row 0 is a clickable HEADER (the panel label +
+/// the edge it is pinned to + a hint), and the body below is a concise,
+/// panel-specific summary (scratchpad text, the subagent roster count, or the
+/// focused-entry detail). The header registers a [`interaction::ChromeKey::
+/// DockPanelHeader`] click target so a click cycles the dock — the mouse twin of
+/// the `CycleDockPanel` (`Ctrl+Alt+F`) keyboard verb.
+fn render_dock_panel(frame: &mut Frame<'_>, app: &TuiApp, placement: dock::DockPlacement) {
+    // No-op when the dock degraded to a single column (inactive dock, or a
+    // terminal too small to split) — nothing to paint this frame.
+    if !placement.is_docked() {
+        return;
+    }
+    let Some(panel) = placement.panel() else {
+        return;
+    };
+    if panel.width < 2 || panel.height < 2 {
+        return;
+    }
+    // The one-cell separator rule between the transcript and the panel, drawn in
+    // the quiet border colour so the split reads as a seam, not a focus border.
+    if let Some(sep) = placement.separator() {
+        frame.render_widget(
+            ratatui::widgets::Block::default()
+                .style(Style::default().fg(crate::render::theme::quiet())),
+            sep,
+        );
+    }
+    let dock_panel = app.dock.panel();
+    let edge = placement.edge();
+    // A bordered box titled with the panel + edge. `Clear` underneath so the
+    // panel never shows transcript bleed-through on a partial repaint.
+    frame.render_widget(ratatui::widgets::Clear, panel);
+    let title = format!(" {} \u{00b7} {} ", dock_panel.label(), edge.label());
+    let block = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_style(Style::default().fg(crate::render::theme::quiet()))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(panel);
+    frame.render_widget(block, panel);
+    // The header row is the click affordance: clicking it cycles the dock the same
+    // way `Ctrl+Alt+F` does. Register it over the panel's TOP border row (the
+    // title), in absolute screen coordinates, so the hit-test in `handle_mouse`
+    // routes there. Registered only when the panel actually painted, so an
+    // undocked session registers nothing.
+    let header_rect = Rect {
+        x: panel.x,
+        y: panel.y,
+        width: panel.width,
+        height: 1,
+    };
+    app.register_click(
+        header_rect,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::DockPanelHeader),
+        interaction::Action::CycleDockPanel,
+    );
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let body = dock_panel_body_lines(app, dock_panel, inner.width, inner.height as usize);
+    frame.render_widget(Paragraph::new(body), inner);
+}
+
+/// The body lines for a docked panel (§12.4.4): a concise, panel-specific summary
+/// sized to `(width, max_rows)`. Pure text assembly — the docked panel mirrors
+/// each auxiliary's live state without re-implementing its full interactive UI,
+/// so a click on the header (or `Ctrl+Alt+F`) is the way to move it and the body
+/// just reflects the current contents.
+fn dock_panel_body_lines(
+    app: &TuiApp,
+    panel: dock::DockPanel,
+    width: u16,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let avail = width as usize;
+    match panel {
+        dock::DockPanel::Scratchpad => {
+            if app.scratchpad.is_empty() {
+                lines.push(dock_quiet_line("(scratchpad empty)"));
+            } else {
+                for raw in app.scratchpad.lines() {
+                    lines.push(dock_text_line(raw, avail));
+                    if lines.len() >= max_rows {
+                        break;
+                    }
+                }
+            }
+        }
+        dock::DockPanel::SubagentTimeline => {
+            let count = app.subagent_pane.records.len();
+            if count == 0 {
+                lines.push(dock_quiet_line("(no subagents)"));
+            } else {
+                lines.push(dock_text_line(&format!("{count} subagent(s)"), avail));
+                for record in app
+                    .subagent_pane
+                    .records
+                    .iter()
+                    .take(max_rows.saturating_sub(1))
+                {
+                    let summary = first_line(&record.latest);
+                    lines.push(dock_text_line(
+                        &format!("{}: {summary}", record.agent),
+                        avail,
+                    ));
+                }
+            }
+        }
+        dock::DockPanel::Detail => match focused_entry_summary(app) {
+            Some(summary) => lines.push(dock_text_line(&summary, avail)),
+            None => lines.push(dock_quiet_line("(no focused entry)")),
+        },
+    }
+    lines.truncate(max_rows.max(1));
+    lines
+}
+
+/// A single docked-panel body line, clipped to `avail` columns so a wide line
+/// never paints past the panel border.
+fn dock_text_line(text: &str, avail: usize) -> Line<'static> {
+    let clipped: String = text.chars().take(avail).collect();
+    Line::from(Span::styled(
+        clipped,
+        Style::default().fg(crate::render::theme::foreground()),
+    ))
+}
+
+/// A quiet empty-state line for a docked panel body.
+fn dock_quiet_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(crate::render::theme::quiet()),
+    ))
+}
+
+/// A one-line summary of the currently-focused transcript entry, for the docked
+/// detail panel (§12.4.4). Reuses the §12.2.1 outline title source so the docked
+/// detail names an entry exactly the way the turn outline does. `None` when
+/// nothing is selected or the index is out of range.
+fn focused_entry_summary(app: &TuiApp) -> Option<String> {
+    let idx = app.selected_entry?;
+    let entry = app.transcript.get(idx)?;
+    Some(first_line(&outline_title_of(entry)))
+}
+
+/// The first non-empty visual line of `text`, with surrounding whitespace
+/// trimmed — a one-line preview for a docked panel body row.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Render the large-paste confirmation modal (§11G.6) over the whole frame.
@@ -41740,6 +42036,15 @@ pub(crate) struct TuiApp {
     /// when cycled), so an idle session pays nothing — one enum-tag read on
     /// resolve, no background work.
     pub(crate) density_override: density::DensityMode,
+    /// Dockable Panels (§12.4.4): which auxiliary panel (scratchpad / subagent
+    /// timeline / detail) is pinned, and to which edge (left / right / bottom) —
+    /// or undocked. Defaults to undocked (the transcript keeps the whole content,
+    /// so a fresh session is byte-identical to one without the feature);
+    /// `Ctrl+Alt+F` cycles the active panel's edge, and a value restored from
+    /// `[tui].dock` at startup pins it across restarts. Resolved against the live
+    /// render `area` via [`dock::DockState::placement`] only while a frame is laid
+    /// out (and when cycled), so an idle session pays nothing.
+    pub(crate) dock: dock::DockState,
     /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
     /// keyed by stable entry id and grouped by category (user turns, tool calls,
     /// errors, …). Rebuilt incrementally — only when the transcript's
@@ -42747,6 +43052,7 @@ impl TuiApp {
             smart_split: None,
             smart_split_rect_cache: std::cell::Cell::new(None),
             density_override: density::DensityMode::default(),
+            dock: dock::DockState::default(),
             transcript_index: transcript_index::TranscriptIndex::new(),
             transcript_index_open: false,
             transcript_index_selected: 0,

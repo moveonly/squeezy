@@ -191,6 +191,15 @@ pub(crate) enum Action {
     /// The pick is persisted to `[tui].density` so it survives a restart. The
     /// mouse twin is a click on the status-line density indicator.
     CycleDensity,
+    /// Cycle the Dockable Panels dock (`Ctrl+Alt+F` default; §12.4.4). One verb
+    /// walks every auxiliary panel (scratchpad / subagent timeline / detail) on
+    /// every edge and back to undocked — `undocked → scratchpad left/right/bottom
+    /// → subagents … → detail bottom → undocked`. Reuses the §12.4.2 split-pane
+    /// solver to carve the panel off the main view (degrading to a single
+    /// transcript column when the terminal is too small). The pick is persisted to
+    /// `[tui].dock` so it survives a restart. The mouse twin is a click on the
+    /// docked panel's header.
+    CycleDockPanel,
     /// Cycle the OSC 8 hyperlink mode for rendered URLs/file paths (`Alt+8`
     /// default; §11.5 / 11G.5). Rotates auto (the startup terminal probe) → on
     /// (force click-to-open escapes) → off (force plain text), so a user whose
@@ -622,6 +631,7 @@ impl Action {
             Self::ScrollBlockLeft => "scroll_block_left",
             Self::ScrollBlockRight => "scroll_block_right",
             Self::CycleDensity => "cycle_density",
+            Self::CycleDockPanel => "cycle_dock_panel",
             Self::ToggleHyperlinks => "toggle_hyperlinks",
             Self::ToggleClipboardHistory => "toggle_clipboard_history",
             Self::BuildSessionBundle => "build_session_bundle",
@@ -715,6 +725,7 @@ impl Action {
         Action::ScrollBlockLeft,
         Action::ScrollBlockRight,
         Action::CycleDensity,
+        Action::CycleDockPanel,
         Action::ToggleHyperlinks,
         Action::ToggleClipboardHistory,
         Action::BuildSessionBundle,
@@ -853,6 +864,12 @@ impl Action {
             // family. The always-available equivalent is a click on the
             // status-line density indicator.
             | Self::CycleDensity
+            // Dockable Panels cycle (§12.4.4) is `Ctrl+Alt+F` — a Ctrl+Alt/Meta
+            // chord, the same classically-unreliable Meta encoding across Linux
+            // terminals, tmux, and SSH as the rest of the Ctrl+Alt overlay/picker
+            // family. The always-available equivalent is a click on the docked
+            // panel's header.
+            | Self::CycleDockPanel
             // Hyperlink-mode toggle is `Alt+8` — the same Meta/Alt encoding case.
             | Self::ToggleHyperlinks
             // Clipboard-history picker toggle is `Alt+p` — the same Meta/Alt
@@ -1191,6 +1208,15 @@ impl Action {
             // are the only ones left) while staying clear of every composer chord.
             Self::CycleDensity => KeyBinding::new(
                 KeyCode::Char('x'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Dockable Panels cycle (§12.4.4). `Ctrl+Alt+F` — `F` recalls "fix to
+            // an edge". With `Ctrl+Alt+X` now taken by Adaptive Density, `C` and
+            // `F` are the last free `Ctrl+Alt` letters; `F` is the more mnemonic
+            // of the two for a dock affordance and stays clear of every composer
+            // chord.
+            Self::CycleDockPanel => KeyBinding::new(
+                KeyCode::Char('f'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
             // Hyperlink-mode cycle (§11.5 / 11G.5). `Alt+8` — the `8` recalls
