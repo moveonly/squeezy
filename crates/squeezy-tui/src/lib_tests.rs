@@ -19871,24 +19871,13 @@ fn test_app(mode: SessionMode) -> TuiApp {
 
 fn test_app_with_clipboard(mode: SessionMode, clipboard: Box<dyn Clipboard>) -> TuiApp {
     let config = test_config(mode);
-    let mut app = TuiApp::new_with_clipboard("scripted", &config, mode, None, clipboard);
-    // Pin a host-independent OSC 52-capable chain so `deliver_copy`'s funnel
-    // (`!clipboard_chain.has_osc52()` guard) takes the observable
-    // `app.clipboard` fast path. The production chain only includes the Osc52
-    // provider when the host terminal probes OSC 52-capable: true on a dev Mac
-    // (so the injected `RecordingClipboard` is used and copy tests pass) but
-    // FALSE on headless CI (caps.osc52 == false), where the copy would route to
-    // an unobserved platform sink and leave the recording clipboard empty.
-    // Pinning Osc52 here makes copy-funnel tests pass identically everywhere.
-    // Tests that intentionally exercise the NO-OSC 52 path call
-    // `set_clipboard_chain_for_test` themselves after this helper and override it.
-    let chain = crate::clipboard::ClipboardChain::with_providers(
-        Box::new(crate::clipboard::RecordingSink::new())
-            as Box<dyn crate::clipboard::ClipboardSink + Send>,
-        vec![crate::clipboard::ClipboardProvider::Osc52],
-    );
-    app.set_clipboard_chain_for_test(chain);
-    app
+    // The OSC 52 capability is now forced on at the `build_clipboard_chain`
+    // funnel under `cfg(test)`, so every app built here (and every direct
+    // `new_with_clipboard` caller) gets a host-independent OSC 52-capable chain
+    // and `deliver_copy` takes the observable `app.clipboard` fast path. Tests
+    // that model an OSC 52-ignoring terminal override it with
+    // `set_clipboard_chain_for_test` after construction.
+    TuiApp::new_with_clipboard("scripted", &config, mode, None, clipboard)
 }
 
 fn test_app_with_config(config: &AppConfig, mode: SessionMode) -> TuiApp {

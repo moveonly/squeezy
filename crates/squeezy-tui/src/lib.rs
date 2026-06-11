@@ -21445,7 +21445,23 @@ fn build_clipboard_chain(
     sink: Box<dyn clipboard::ClipboardSink + Send>,
 ) -> clipboard::ClipboardChain<Box<dyn clipboard::ClipboardSink + Send>> {
     let env_get = |key: &str| std::env::var_os(key);
-    let caps = clipboard::detect_clipboard_capabilities_from_env(env_get);
+    #[cfg_attr(not(test), allow(unused_mut))]
+    let mut caps = clipboard::detect_clipboard_capabilities_from_env(env_get);
+    // Under the crate's own `cfg(test)` build, force an OSC 52-capable chain so
+    // every copy-funnel test is host-independent. `deliver_copy` takes the
+    // observable `app.clipboard` fast path only when `clipboard_chain.has_osc52()`
+    // is true; that flag is set from the env probe, which is true on a dev Mac
+    // but FALSE on headless CI — so without this the copy would route to an
+    // unobserved platform sink and leave an injected `RecordingClipboard` empty.
+    // Pinning the capability at this single chain-construction funnel fixes the
+    // `test_app_with_clipboard` helper AND every direct `new_with_clipboard` /
+    // `set_clipboard_sink_for_test` caller at once. Tests that intentionally
+    // model an OSC 52-ignoring terminal call `set_clipboard_chain_for_test`
+    // after construction, replacing this whole chain, so they still override it.
+    #[cfg(test)]
+    {
+        caps.osc52 = true;
+    }
     let platform = clipboard::platform_commands(env_get);
     // TODO(copy-confirm): the chain supports a large-payload confirmation gate
     // (`set_confirm_threshold` → `CopyOutcome::NeedsConfirmation`), but wiring an
