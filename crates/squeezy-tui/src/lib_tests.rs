@@ -31359,9 +31359,12 @@ fn undo_reorder_survives_a_front_drain() {
 }
 
 #[test]
-fn undo_reorder_reports_nothing_when_moved_item_drained() {
-    // If the reordered item itself drains out before the undo, queue_undo must
-    // report "nothing to undo" rather than falsely claiming success.
+fn undo_reorder_defers_and_keeps_record_when_moved_item_drained() {
+    // deep-review #104: if the reordered item itself drains out before the undo,
+    // queue_undo must NOT falsely claim success — but it also must not silently
+    // discard the record for a mutation that demonstrably existed. It defers:
+    // the record is pushed back so a later `u` retries it (the stack stays
+    // sequenced) and the status reports the stale-skip honestly.
     let mut app = queue_app(&["a", "b", "c"]);
     let id_a = queue_id_at(&app, 0);
     let drag = QueueDrag {
@@ -31372,14 +31375,86 @@ fn undo_reorder_reports_nothing_when_moved_item_drained() {
     queue_move_indices(&mut app, 0, 2);
     app.prompt_queue_drag = Some(drag);
     finalize_queue_drag(&mut app); // [b,c,a]
+    let undo_depth = app.prompt_queue_undo.len();
+    assert_eq!(undo_depth, 1, "the reorder was recorded");
     // Drain twice so "a" (the moved item) pops out.
     for _ in 0..3 {
         app.prompt_queue.pop_front();
         app.prompt_queue_ids.pop_front();
     }
     assert!(app.prompt_queue.is_empty());
+
+    // The undo can't apply (the moved item is gone), so it defers rather than
+    // claiming success or reporting an empty stack.
     assert!(!queue_undo(&mut app));
-    assert_eq!(app.status, "nothing to undo");
+    assert_eq!(app.status, "skipped (stale) — try undo again");
+    // The record was NOT discarded: it stayed on the stack for a retry.
+    assert_eq!(
+        app.prompt_queue_undo.len(),
+        undo_depth,
+        "the stale reorder record is kept for a later retry, not dropped"
+    );
+    assert!(
+        matches!(
+            app.prompt_queue_undo.last(),
+            Some(QueueMutation::Reordered { id, .. }) if *id == id_a
+        ),
+        "the exact deferred record is preserved at the top of the stack"
+    );
+}
+
+#[test]
+fn deferred_group_move_undo_retries_successfully_once_queue_settles() {
+    // deep-review #104: the whole point of deferring (not discarding) a stale
+    // reorder record is that a later `u` succeeds once the queue settles. Pin
+    // that: a group move whose first undo is blocked by a transient enqueue
+    // applies cleanly on the retry after that extra item drains.
+    let mut app = queue_app(&["a", "b", "c"]);
+    // Tag a + b and group-move them down one slot → c moves to the front.
+    let id_a = queue_id_at(&app, 0);
+    let id_b = queue_id_at(&app, 1);
+    app.prompt_queue_multiselect.toggle(id_a);
+    app.prompt_queue_multiselect.toggle(id_b);
+    assert!(queue_group_move(
+        &mut app,
+        prompt_queue_multiselect::MoveDir::Down
+    ));
+    assert_eq!(queue_texts(&app), vec!["c", "a", "b"]);
+    assert_eq!(
+        app.prompt_queue_undo.len(),
+        1,
+        "the group move was recorded"
+    );
+
+    // A transient enqueue grows the queue so the first undo can't restore it.
+    app.prompt_queue.push_back("d".to_string());
+    enqueue_queue_id(&mut app);
+    assert!(!queue_undo(&mut app), "first undo defers (queue grew)");
+    assert_eq!(app.status, "skipped (stale) — try undo again");
+    assert_eq!(
+        app.prompt_queue_undo.len(),
+        1,
+        "the deferred record is still on the stack"
+    );
+
+    // The transient item drains as a turn runs; the retry now succeeds.
+    app.prompt_queue.pop_back();
+    app.prompt_queue_ids.pop_back();
+    assert_eq!(queue_texts(&app), vec!["c", "a", "b"]);
+    assert!(
+        queue_undo(&mut app),
+        "the retry applies once the queue settles"
+    );
+    assert!(app.status.contains("undid group move"));
+    assert_eq!(
+        queue_texts(&app),
+        vec!["a", "b", "c"],
+        "pre-move order restored"
+    );
+    assert!(
+        app.prompt_queue_undo.is_empty(),
+        "the record is consumed by the successful retry"
+    );
 }
 
 #[tokio::test]
@@ -31907,10 +31982,12 @@ async fn group_move_undo_restores_survivor_order_after_front_drain() {
 }
 
 #[tokio::test]
-async fn group_move_undo_refuses_when_queue_grew() {
-    // If the queue grew (a fresh enqueue) after the move, the snapshot can no
-    // longer describe the whole queue; undo refuses rather than dropping the
-    // new item.
+async fn group_move_undo_defers_when_queue_grew() {
+    // deep-review #104: if the queue grew (a fresh enqueue) after the move, the
+    // snapshot can no longer describe the whole queue; undo refuses to mangle
+    // the order rather than dropping the new item — and instead of discarding
+    // the record, it defers it (pushes it back) so a later `u` retries it once
+    // the new item drains, keeping the stack sequenced.
     let (mut app, mut agent) = queue_app_with_tags(&["a", "b", "c"], &[0, 1]).await;
     handle_key(
         &mut app,
@@ -31920,13 +31997,31 @@ async fn group_move_undo_refuses_when_queue_grew() {
     .await
     .expect("group move down");
     assert_eq!(queue_texts(&app), vec!["c", "a", "b"]);
+    let undo_depth = app.prompt_queue_undo.len();
+    assert_eq!(undo_depth, 1, "the group move was recorded");
     // A new prompt is queued while the overlay sits open.
     app.prompt_queue.push_back("d".to_string());
     enqueue_queue_id(&mut app);
+
+    // The undo defers (can't faithfully restore the grown queue) rather than
+    // claiming success or reporting an empty stack.
     assert!(!queue_undo(&mut app));
-    assert_eq!(app.status, "nothing to undo");
-    // The queue is untouched by the refused undo.
+    assert_eq!(app.status, "skipped (stale) — try undo again");
+    // The queue is untouched by the deferred undo.
     assert_eq!(queue_texts(&app), vec!["c", "a", "b", "d"]);
+    // The record was NOT discarded: it stayed on the stack for a retry.
+    assert_eq!(
+        app.prompt_queue_undo.len(),
+        undo_depth,
+        "the stale group-move record is kept for a later retry, not dropped"
+    );
+    assert!(
+        matches!(
+            app.prompt_queue_undo.last(),
+            Some(QueueMutation::BlockReordered { .. })
+        ),
+        "the deferred group-move record is preserved at the top of the stack"
+    );
 }
 
 #[tokio::test]

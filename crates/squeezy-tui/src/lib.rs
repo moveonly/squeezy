@@ -16857,8 +16857,12 @@ fn queue_move_indices(app: &mut TuiApp, from: usize, to: usize) -> bool {
 /// returns to its former position (with its original id); a reorder moves the
 /// item (by stable id) back to immediately after its recorded left-neighbour.
 /// Sets a status message; safe on an empty stack ("nothing to undo"). Returns
-/// true if anything was undone. A reorder whose ids have since drained out
-/// reports "nothing to undo" rather than falsely claiming success.
+/// true if anything was undone. A reorder whose ids cannot currently be applied
+/// (an anchor drained, or the queue drifted past the snapshot) is *deferred*,
+/// not discarded: the record is pushed back onto the undo stack and reported as
+/// "skipped (stale) — try undo again" so a later `u` retries it once the queue
+/// settles, and the stack stays sequenced (deep-review #104). It never falsely
+/// claims success.
 fn queue_undo(app: &mut TuiApp) -> bool {
     sync_queue_ids(app);
     let Some(mutation) = app.prompt_queue_undo.pop() else {
@@ -16866,11 +16870,11 @@ fn queue_undo(app: &mut TuiApp) -> bool {
         app.needs_redraw = true;
         return false;
     };
-    match mutation {
+    match &mutation {
         QueueMutation::Deleted { index, id, text } => {
-            let at = index.min(app.prompt_queue.len());
-            app.prompt_queue.insert(at, text);
-            app.prompt_queue_ids.insert(at, id);
+            let at = (*index).min(app.prompt_queue.len());
+            app.prompt_queue.insert(at, text.clone());
+            app.prompt_queue_ids.insert(at, *id);
             app.next_queue_id = app.next_queue_id.max(id + 1);
             app.status = "undid delete".to_string();
         }
@@ -16878,28 +16882,28 @@ fn queue_undo(app: &mut TuiApp) -> bool {
             // Restore the moved item to immediately after its recorded
             // left-neighbour (resolved live via id, so a front-drain can't
             // stale it). If it can't apply — the item or its anchor drained
-            // out — surface "nothing to undo" instead of claiming success.
-            if !queue_move_id_after(app, id, prev) {
-                app.status = "nothing to undo".to_string();
-                app.needs_redraw = true;
-                return false;
+            // out — push the record back so a later `u` retries it (the stack
+            // stays sequenced) instead of discarding it and claiming there is
+            // nothing to undo for a record that demonstrably existed.
+            if !queue_move_id_after(app, *id, *prev) {
+                return defer_stale_queue_undo(app, mutation);
             }
             app.status = "undid reorder".to_string();
         }
         QueueMutation::BlockReordered { order } => {
             // Restore the snapshotted id order, filtered to ids still live (a
-            // drained id silently drops). If nothing of the snapshot survives,
-            // report "nothing to undo" instead of clearing the queue.
+            // drained id silently drops). If the surviving ids no longer span
+            // the whole queue the snapshot can't faithfully restore it, so push
+            // the record back for a later retry rather than clearing the queue.
             let live: Vec<u64> = order
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|id| queue_index_for_id(app, *id).is_some())
                 .collect();
             if live.len() != app.prompt_queue.len() {
                 // The queue drifted (a drain/enqueue) past what the snapshot can
-                // faithfully restore; refuse rather than mangle the order.
-                app.status = "nothing to undo".to_string();
-                app.needs_redraw = true;
-                return false;
+                // faithfully restore; defer rather than mangle the order.
+                return defer_stale_queue_undo(app, mutation);
             }
             apply_queue_id_order(app, &live);
             app.status = "undid group move".to_string();
@@ -16908,6 +16912,19 @@ fn queue_undo(app: &mut TuiApp) -> bool {
     clamp_queue_focus(app);
     app.needs_redraw = true;
     true
+}
+
+/// A reorder undo could not be applied against the queue's current shape (an
+/// anchor drained, or the queue drifted past the snapshot). Push the record
+/// back onto the undo stack so a later `u` retries it once the queue settles —
+/// the stack stays sequenced and the record is never silently lost — and report
+/// the deferral honestly rather than as "nothing to undo" (deep-review #104).
+/// Returns `false`: this invocation undid nothing.
+fn defer_stale_queue_undo(app: &mut TuiApp, mutation: QueueMutation) -> bool {
+    app.prompt_queue_undo.push(mutation);
+    app.status = "skipped (stale) — try undo again".to_string();
+    app.needs_redraw = true;
+    false
 }
 
 /// Clamp the overlay focus cursor into range after the queue shrank or
