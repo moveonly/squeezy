@@ -2030,8 +2030,12 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         .filter(|meta| active.as_deref() != Some(meta.session_id.as_str()))
         .nth(slot - 1);
     let Some(target) = target else {
-        app.status = format!("no recent session at slot {slot}");
-        return true;
+        // No peer session occupies this slot. Fall through (claim nothing, leave no
+        // side effect) so the Alt+digit chord reaches the keymap dispatch and its
+        // overlay-toggle action still fires (deep-review #7 / #45). Quick-switch is
+        // probed before dispatch, so it must defer cleanly when it has no target —
+        // otherwise an empty slot would swallow e.g. Alt+2 (ToggleBreadcrumbs).
+        return false;
     };
     let session_id = target.session_id.clone();
     switch_to_session(app, agent, &session_id).await;
@@ -7859,6 +7863,23 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
+    // Session quick-switch (Alt+1-9) is probed BEFORE `dispatch_keymap_action`
+    // so the session slots keep their chords even though several §12.1.x overlay
+    // toggles now default to Alt+digit (deep-review #7 / #45). `handle_session_
+    // quick_switch` carries its own comprehensive modal/overlay guards (it returns
+    // false in every context where a switch would be wrong), so probing it up here
+    // only claims a bare-main-surface Alt+digit; in a guarded context it falls
+    // through to the keymap dispatch and the overlay toggle still fires. The
+    // overlay toggles remain rebindable keymap actions reachable via the editor.
+    if key.modifiers == KeyModifiers::ALT
+        && let KeyCode::Char(ch) = key.code
+        && let Some(slot) = ch.to_digit(10)
+        && (1..=9).contains(&slot)
+        && handle_session_quick_switch(app, agent, slot as usize).await
+    {
+        return Ok(false);
+    }
+
     // Rebindable actions (F11/Ctrl+T/Ctrl+P/Ctrl+Y/Ctrl+R/PageUp/PageDown/
     // Home/End by default) resolve through the keymap before the legacy
     // hardcoded handlers below get a look. The Home/End actions only fire
@@ -8031,15 +8052,6 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
 
     if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('d') {
         delete_next_word(app);
-        return Ok(false);
-    }
-
-    if key.modifiers == KeyModifiers::ALT
-        && let KeyCode::Char(ch) = key.code
-        && let Some(slot) = ch.to_digit(10)
-        && (1..=9).contains(&slot)
-        && handle_session_quick_switch(app, agent, slot as usize).await
-    {
         return Ok(false);
     }
 

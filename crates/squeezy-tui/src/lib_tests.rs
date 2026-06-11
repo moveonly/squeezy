@@ -23655,6 +23655,58 @@ async fn alt_one_resumes_most_recent_non_active_session() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// deep-review #7 / #45: the Alt+1-9 session quick-switch slots must keep their
+/// chords even though several §12.1.x overlay toggles now default to Alt+digit
+/// (Alt+1 = ToggleHoverPreview). Driving Alt+1 through the FULL handle_key
+/// dispatch (not the helper directly) with a peer session present must switch the
+/// active session — proving quick-switch is probed before the overlay toggle.
+#[tokio::test]
+async fn alt_one_through_handle_key_switches_session_not_hover_preview() {
+    let root = temp_workspace("quick_switch_handle_key");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let store = squeezy_store::SessionStore::open(&config);
+
+    let older = store
+        .start_session_eager(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .expect("seed older session");
+    let newer = store
+        .start_session_eager(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .expect("seed newer session");
+    older
+        .update_metadata(|metadata| metadata.started_at_ms = 1_000)
+        .expect("backdate older");
+    newer
+        .update_metadata(|metadata| metadata.started_at_ms = 2_000)
+        .expect("backdate newer");
+
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let active_before = agent.session_id();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt-1 through full dispatch");
+
+    assert_ne!(
+        agent.session_id(),
+        active_before,
+        "Alt+1 must switch the active session (not be consumed by the hover-preview toggle); status={}",
+        app.status,
+    );
+    assert_eq!(
+        agent.session_id().as_deref(),
+        Some(newer.session_id()),
+        "Alt+1 lands on the newer peer; status={}",
+        app.status,
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn quick_switch_resyncs_session_id_so_auto_save_keys_off_the_new_session() {
     // §12.9.5 SC1 regression: every checkpoint op keys off `app.session_id`, which
@@ -23786,10 +23838,12 @@ async fn quick_switch_clears_stale_subagent_pane() {
 }
 
 #[tokio::test]
-async fn alt_nine_reports_no_session_when_slot_is_empty() {
-    // With only one peer session in the store, Alt+9 has nothing to land
-    // on; the handler still claims the keypress (so it doesn't fall
-    // through to other Alt handlers) but reports the empty slot.
+async fn alt_nine_falls_through_when_slot_is_empty() {
+    // deep-review #7 / #45: quick-switch is probed BEFORE the keymap dispatch, so
+    // an empty slot must fall through (claim nothing, leave no side effect) rather
+    // than swallow the chord — otherwise an unused Alt+digit would block its
+    // overlay-toggle keymap action. With only one peer session, Alt+9 has nothing
+    // to land on, so the handler declines and leaves the status untouched.
     let root = temp_workspace("quick_switch_empty");
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let store = squeezy_store::SessionStore::open(&config);
@@ -23801,19 +23855,20 @@ async fn alt_nine_reports_no_session_when_slot_is_empty() {
     let mut agent = test_agent_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
     let active_before = agent.session_id();
+    let status_before = app.status.clone();
 
     assert!(
-        handle_session_quick_switch(&mut app, &mut agent, 9).await,
-        "Alt+9 must claim the press even when no slot 9 exists"
+        !handle_session_quick_switch(&mut app, &mut agent, 9).await,
+        "Alt+9 must fall through (not claim) when no slot 9 exists"
     );
     assert_eq!(
         agent.session_id(),
         active_before,
         "agent must stay on its current session when slot 9 is empty",
     );
-    assert!(
-        app.status.contains("no recent session"),
-        "status should surface the empty-slot message: {}",
+    assert_eq!(
+        app.status, status_before,
+        "an empty-slot decline must leave no status side effect: {}",
         app.status,
     );
     // Sanity check that the seeded peer actually exists; otherwise the
