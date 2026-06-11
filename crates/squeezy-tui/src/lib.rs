@@ -185,6 +185,7 @@ mod transcript_surface;
 mod turn_outline;
 mod wide_block;
 mod workspace_profile;
+mod zen;
 // Visual Diff Dashboard (§12.10.4). `cfg(test)`-gated so the dev-only cell-grid
 // diff / HTML-artifact harness never compiles into a shipped TUI binary; every
 // item is exercised by its sibling `visual_diff_tests.rs`, so the module
@@ -964,6 +965,12 @@ async fn run_inner_with_terminal(
     // it keeps the off-default; the one-shot reveal is never persisted, so a
     // restored mode always starts with metadata hidden.
     restore_presentation(&mut app);
+    // Zen Mode (§12.4.5): restore the distraction-free latch the user left set in
+    // a prior session from the user-scope config before the first paint, so a
+    // session reopens in zen (secondary chrome hidden) without re-toggling. A
+    // session that never enabled zen keeps the chrome-on default; a malformed
+    // value is ignored.
+    restore_zen(&mut app);
     if let Some(banner) = update_banner.filter(|s| !s.trim().is_empty()) {
         app.push_log(banner);
     }
@@ -3324,6 +3331,19 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             interaction::TargetKey::Chrome(interaction::ChromeKey::DensityIndicator),
             action,
         )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
+    }
+
+    // Zen Mode minimal status line (§12.4.5): a left-click anywhere on the terse
+    // status line zen paints leaves zen — the mouse twin of the `ToggleZenMode`
+    // (`Ctrl+Alt+.`) keyboard verb. Like the density / attention indicators above,
+    // the line is painted on the footer status row in ABSOLUTE screen coordinates,
+    // so it is hit-tested in absolute coordinates here.
+    if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((interaction::TargetKey::Chrome(interaction::ChromeKey::ZenStatusLine), action)) =
+            app.click_target_at(mouse.column, mouse.row)
     {
         dispatch_click_action(app, action);
         return true;
@@ -6216,6 +6236,70 @@ fn restore_dock(app: &mut TuiApp) {
     if let Some(state) = read_persisted_dock(app) {
         app.dock = state;
     }
+}
+
+/// Toggle Zen Mode (§12.4.5): flip the distraction-free latch, persist it to the
+/// user-scope config (`[tui].zen`), and surface the new state in the status line.
+/// The mouse twin (a click on the minimal zen status line) routes here too. Zen is
+/// pure layout policy — it suppresses secondary chrome and condenses the status
+/// block but never touches the transcript's scroll, selection, focus, the queue,
+/// or the composer; the next frame just relays out the same model with the chrome
+/// hidden (or restored). Sets `needs_redraw` so the toggle paints immediately.
+fn toggle_zen_mode(app: &mut TuiApp) {
+    let now_active = app.zen.toggle();
+    // Persist first; a write failure overwrites the status with its own note, so
+    // set the success status *after* the persist attempt only when it did not
+    // already report an error.
+    persist_zen(app);
+    if !app.status.contains("save failed") {
+        app.status = if now_active {
+            "\u{2713} zen on — Ctrl+Alt+. / click to exit".to_string()
+        } else {
+            "\u{2713} zen off — chrome restored".to_string()
+        };
+    }
+    app.needs_redraw = true;
+}
+
+/// Persist the Zen Mode (§12.4.5) latch to the user-scope config at `[tui].zen`.
+/// An active mode writes `true`; an inactive mode clears the key so the next
+/// session opens with chrome restored rather than re-reading a stale `true`.
+/// Best-effort: a write failure leaves the in-session value in place and notes it
+/// in the status line, mirroring the density / dock commit paths.
+fn persist_zen(app: &mut TuiApp) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    let target_path = app.user_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    let op = match app.zen.as_persist_bool() {
+        Some(value) => EditOp::SetBool(value),
+        None => EditOp::Unset,
+    };
+    let edit = SettingsEdit {
+        path: &["tui", zen::PERSIST_KEY],
+        op,
+    };
+    if let Err(err) = apply_edits(&scope_target, &[edit]) {
+        app.status = format!("zen set, but save failed: {err}");
+    }
+}
+
+/// Read the persisted Zen Mode (§12.4.5) latch from the user-scope settings TOML,
+/// if any. The flag lives at `[tui].zen` as a bool; an absent file / table /
+/// field, or a non-bool value, collapses to `None` so the session keeps the
+/// chrome-on default. Best-effort, pure read — safe to call at startup.
+fn read_persisted_zen(app: &TuiApp) -> Option<bool> {
+    let text = std::fs::read_to_string(app.user_settings_path()).ok()?;
+    let doc = text.parse::<toml::Table>().ok()?;
+    doc.get("tui")?.as_table()?.get(zen::PERSIST_KEY)?.as_bool()
+}
+
+/// Restore the persisted Zen Mode (§12.4.5) latch onto a freshly-built app at
+/// startup, so a session the user left in zen reopens in zen before the first
+/// paint. A no-op when nothing is persisted (the app keeps the chrome-on default);
+/// a malformed value is ignored.
+fn restore_zen(app: &mut TuiApp) {
+    app.zen = zen::ZenMode::from_persisted(read_persisted_zen(app));
 }
 
 /// Handle a key while the Prompt Templates picker (§12.3.6) is open. Returns
@@ -9470,6 +9554,18 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
                 return false;
             }
             toggle_smart_split(app);
+            true
+        }
+        keymap::Action::ToggleZenMode => {
+            // §12.4.5: toggle the distraction-free Zen layout. Main-surface layout
+            // policy; the config/setup screens own their own routing, and the
+            // Ctrl+T overlay guard above already blocks this while the overlay
+            // (which has its own native layout) is open. Zen only hides secondary
+            // chrome on the main surface.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_zen_mode(app);
             true
         }
     }
@@ -12994,6 +13090,10 @@ fn first_run_hint_suppressed(app: &TuiApp) -> bool {
         // The Smart Split Panes inspector (§12.4.2) owns the surface too, so the
         // hint would paint behind it — suppress.
         || app.smart_split.is_some()
+        // Zen Mode (§12.4.5) is the distraction-free layout; the gentle teaching
+        // hint is exactly the secondary noise zen exists to hide, so suppress it
+        // while zen is on.
+        || app.zen.chrome_suppressed()
 }
 
 /// Handle a key while the Universal Command Palette (§12.1.1) is open. Returns
@@ -16750,6 +16850,13 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // mouse/keyboard parity holds by construction.
         interaction::Action::CycleDockPanel => {
             cycle_dock_panel(app);
+        }
+        // A click on the Zen Mode minimal status line (§12.4.5): toggle the
+        // distraction-free layout back off — the mouse twin of the `ToggleZenMode`
+        // (`Ctrl+Alt+.`) keyboard verb, driving the same `toggle_zen_mode` handler
+        // so mouse/keyboard parity holds by construction.
+        interaction::Action::ToggleZenMode => {
+            toggle_zen_mode(app);
         }
         // A click on a Local Transcript Index category row (§12.5.1): move the
         // cursor onto it and jump the main view to the next entry in it — the
@@ -23430,7 +23537,21 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     // placement degrades to a single column and `main_area == area`, so a session
     // that never docks paints exactly as before. The panel itself is painted
     // after the main block below, so its border never underlaps the transcript.
-    let dock_placement = app.dock.placement(area);
+    // Zen Mode (§12.4.5) suppresses the docked auxiliary panel (a secondary
+    // panel): the dock is treated as undocked for this frame so the placement
+    // degrades to a single column and the transcript/composer reclaim the whole
+    // width. `app.dock` itself is untouched, so leaving zen restores the dock as it
+    // was. `dock_active` below is read from the same suppressed view so the panel
+    // is neither painted nor click-registered while zen is on.
+    let dock_active = app.dock.is_active() && !app.zen.chrome_suppressed();
+    let dock_placement = if dock_active {
+        app.dock.placement(area)
+    } else {
+        // The default (undocked) dock state placement degrades to a single column
+        // with `main == area`, so zen — or an already-undocked session — hands the
+        // whole content rect to the transcript/composer.
+        dock::DockState::default().placement(area)
+    };
     let main_area = dock_placement.main();
     // Adaptive Density (§12.4.1): the welcome / startup card is informational
     // chrome, so its minimum-height gate scales with density — a compact (short)
@@ -23520,7 +23641,9 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     // inactive dock pays nothing; when active, `render_dock_panel` itself still
     // no-ops if the terminal was too small to split. Painting registers the header
     // click target so a click cycles the dock — the mouse twin of `Ctrl+Alt+F`.
-    if app.dock.is_active() {
+    // Zen Mode (§12.4.5) folds into `dock_active` above, so the panel is neither
+    // painted nor click-registered while zen is on.
+    if dock_active {
         render_dock_panel(frame, app, dock_placement);
     }
     render_toast_overlay(frame, area, app);
@@ -31109,7 +31232,11 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
     // edge BEFORE the scrollbar split, so the rail sits just left of the
     // scrollbar gutter and the text wraps one column narrower. Off (or too thin
     // to host both a rail and a gutter) leaves the layout exactly as it was.
-    let (body_area, rail_area) = transcript_main_body_and_rail_areas(area, app.show_minimap);
+    // Zen Mode (§12.4.5) suppresses the minimap turn rail (a secondary
+    // chrome/marker rail), so the transcript reclaims the column. The toggle leaves
+    // `show_minimap` untouched, so leaving zen restores the rail exactly as it was.
+    let show_minimap = app.show_minimap && !app.zen.chrome_suppressed();
+    let (body_area, rail_area) = transcript_main_body_and_rail_areas(area, show_minimap);
     // Reserve a 1-cell right gutter for the scrollbar; the text wraps to the
     // narrower column. When the area is too thin to split, fall back to the
     // full width with no gutter.
@@ -40176,7 +40303,47 @@ fn mode_status_color(mode: SessionMode) -> Color {
     }
 }
 
+/// Paint the Zen Mode (§12.4.5) minimal one-line state where the detailed status
+/// block would sit, and register the line itself as a click target that leaves
+/// zen. The line names the mode plus the session's `provider:model` label and the
+/// way out (the keyboard verb + the click), so the exit is always on screen — the
+/// spec's "minimal one-line state" with the mouse twin of `Ctrl+Alt+.`. Clipped to
+/// the row width; a no-op on a zero-height status area.
+fn render_zen_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    // The single status line lives on the block's first row so a taller status
+    // area (e.g. when an approval is not eating rows) leaves the rest blank rather
+    // than spreading the terse line out.
+    let row = Rect { height: 1, ..area };
+    let label = format!("{}:{}", app.provider_name, app.model);
+    let text = app.zen.minimal_status(&label);
+    let line = Line::from(Span::styled(
+        text,
+        Style::default().fg(crate::render::theme::quiet()),
+    ));
+    frame.render_widget(Paragraph::new(line), row);
+    // The whole line is the exit affordance: a left click anywhere on it toggles
+    // zen back off — the mouse twin of the `ToggleZenMode` keyboard verb, driving
+    // the same `toggle_zen_mode` handler so parity holds by construction.
+    app.register_click(
+        row,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::ZenStatusLine),
+        interaction::Action::ToggleZenMode,
+    );
+}
+
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    // Zen Mode (§12.4.5): the detailed multi-line status block (and the
+    // breadcrumbs strip that borrows its top row) is secondary chrome, so zen
+    // condenses it to a single terse line naming the mode and the way out. Drawn
+    // here in place of `format_status_lines`; the line is itself the mouse
+    // affordance — a click anywhere on it leaves zen, the twin of `Ctrl+Alt+.`.
+    if app.zen.chrome_suppressed() {
+        render_zen_status(frame, area, app);
+        return;
+    }
     // The Clickable Breadcrumbs strip (§12.1.5) borrows the status block's TOP row
     // while shown, registering its per-crumb click targets there; the status text
     // then condenses onto the remaining row(s). Hidden, the status block keeps its
@@ -42382,6 +42549,14 @@ pub(crate) struct TuiApp {
     /// when cycled), so an idle session pays nothing — one enum-tag read on
     /// resolve, no background work.
     pub(crate) density_override: density::DensityMode,
+    /// Zen Mode (§12.4.5): the distraction-free layout latch. Defaults to off
+    /// (every chrome element paints as it always has); `Ctrl+Alt+.` (or a click on
+    /// the minimal zen status line) toggles it, and a value restored from
+    /// `[tui].zen` at startup pins it across restarts. While on, the minimap rail,
+    /// breadcrumbs strip, and dock panel suppress and the status block condenses to
+    /// one terse line — the transcript, composer, and blocking approvals/errors stay
+    /// live. Pure layout policy: one `bool` read per painted frame, no idle redraw.
+    pub(crate) zen: zen::ZenMode,
     /// Dockable Panels (§12.4.4): which auxiliary panel (scratchpad / subagent
     /// timeline / detail) is pinned, and to which edge (left / right / bottom) —
     /// or undocked. Defaults to undocked (the transcript keeps the whole content,
@@ -43413,6 +43588,7 @@ impl TuiApp {
             smart_split: None,
             smart_split_rect_cache: std::cell::Cell::new(None),
             density_override: density::DensityMode::default(),
+            zen: zen::ZenMode::default(),
             dock: dock::DockState::default(),
             presentation: presentation::PresentationState::default(),
             transcript_index: transcript_index::TranscriptIndex::new(),

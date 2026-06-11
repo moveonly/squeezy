@@ -315,6 +315,11 @@ pub(crate) enum ChromeKey {
     /// 2=split ratio) so a click focuses + adjusts exactly that row (the mouse twin
     /// of ↑↓ + ←→/Space).
     SmartSplitField(usize),
+    /// The Zen Mode (§12.4.5) minimal status line painted where the detailed
+    /// status block would sit while zen is on. A single affordance with no identity
+    /// of its own; a click anywhere on it leaves zen — the mouse twin of the
+    /// `ToggleZenMode` (`Ctrl+Alt+C`) verb.
+    ZenStatusLine,
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -442,6 +447,10 @@ pub(crate) enum Action {
     /// panel's header; both step the panel `left → right → bottom → undocked`,
     /// persist it, and request a redraw.
     CycleDockPanel,
+    /// Toggle Zen Mode (§12.4.5). Mouse twin of the `ToggleZenMode` (`Ctrl+Alt+C`)
+    /// keyboard verb / a click on the minimal zen status line; both flip the
+    /// distraction-free latch, persist it, and request a redraw.
+    ToggleZenMode,
     /// Select the given category row in the Local Transcript Index overlay
     /// (§12.5.1) and jump the main view to the next entry in it. Mouse twin of
     /// moving the cursor with ↑↓ and pressing Enter; a click both selects and
@@ -761,6 +770,7 @@ impl Action {
         Action::CycleDensity,
         Action::TogglePresentation,
         Action::CycleDockPanel,
+        Action::ToggleZenMode,
     ];
 }
 

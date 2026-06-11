@@ -659,6 +659,10 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // default). The docked panel's header click and the keyboard verb both
         // drive the same `cycle_dock_panel` handler.
         A::CycleDockPanel => KeyboardPath::Keymap(Action::CycleDockPanel),
+        // Zen Mode minimal status line (§12.4.5) — `ToggleZenMode` (`Ctrl+Alt+C`
+        // default). The status-line click and the keyboard verb both drive the same
+        // `toggle_zen_mode` handler.
+        A::ToggleZenMode => KeyboardPath::Keymap(Action::ToggleZenMode),
         // Local Transcript Index overlay (§12.5.1) — the overlay's own key
         // handler owns ↑↓/kj (move the category cursor) and Enter/→/l (jump to the
         // next entry in the selected category) before the global keymap sees them,

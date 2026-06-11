@@ -594,6 +594,16 @@ pub(crate) enum Action {
     /// reveal is never persisted). The mouse twin is a click on the status-line
     /// `[present]` indicator.
     TogglePresentation,
+    /// Toggle Zen Mode (§12.4.5): the distraction-free layout (`Ctrl+Alt+.`
+    /// default). Hides the secondary chrome — the minimap turn rail, the
+    /// breadcrumbs strip, the docked auxiliary panel, and the detailed status block
+    /// (condensed to one terse line) — to focus the surface on the transcript and
+    /// composer, while blocking approvals/errors and every reachable command
+    /// (search / copy / queue / help) stay live. The pick is persisted to
+    /// `[tui].zen` so it survives a restart. The mouse twin is a click on the
+    /// minimal zen status line. Pure layout policy: one `bool` per painted frame,
+    /// no idle redraw.
+    ToggleZenMode,
 }
 
 impl Action {
@@ -690,6 +700,7 @@ impl Action {
             Self::OpenGlyphMode => "open_glyph_mode",
             Self::ToggleSmartSplit => "toggle_smart_split",
             Self::TogglePresentation => "toggle_presentation",
+            Self::ToggleZenMode => "toggle_zen_mode",
         }
     }
 
@@ -785,6 +796,7 @@ impl Action {
         Action::OpenGlyphMode,
         Action::ToggleSmartSplit,
         Action::TogglePresentation,
+        Action::ToggleZenMode,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -1073,6 +1085,12 @@ impl Action {
             // family above. The always-available equivalent is a click on the
             // status-line `[present]` indicator.
             | Self::TogglePresentation
+            // Zen Mode toggle (§12.4.5) is `Ctrl+Alt+.` — a Ctrl+Alt (Meta) chord,
+            // the same classically-unreliable encoding across Linux terminals,
+            // tmux, and SSH as the rest of the Ctrl+Alt overlay/policy family above.
+            // The always-available equivalent is a click on the minimal zen status
+            // line that the mode itself paints.
+            | Self::ToggleZenMode
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1572,6 +1590,17 @@ impl Action {
             // from it while staying clear of every composer chord.
             Self::TogglePresentation => KeyBinding::new(
                 KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Zen Mode (§12.4.5). Every `Ctrl+Alt` LETTER is taken (the §12.4.6
+            // Presentation toggle above claimed the last free one, `Ctrl+Alt+C`),
+            // and every `Alt`+letter / `Alt`+digit chord is a copy/nav/overlay verb,
+            // so Zen takes `Ctrl+Alt+.` — a free `Ctrl+Alt` punctuation chord (no
+            // other action binds `Ctrl+Alt`+punctuation). It stays in the same
+            // Ctrl+Alt overlay/policy family while colliding with nothing; the
+            // always-available equivalent is a click on the minimal zen status line.
+            Self::ToggleZenMode => KeyBinding::new(
+                KeyCode::Char('.'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }

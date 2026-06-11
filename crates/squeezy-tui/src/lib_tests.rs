@@ -17101,6 +17101,163 @@ fn deliver_copy_routes_oversized_payload_to_injected_recording_sink() {
     );
 }
 
+// ===========================================================================
+// Zen Mode (§12.4.5)
+// ===========================================================================
+
+/// `Ctrl+Alt+.` resolves to `ToggleZenMode`.
+fn toggle_zen_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('.'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// A test app seeded with transcript content and the secondary chrome (minimap
+/// rail + breadcrumbs strip) turned on, so a render shows the chrome zen hides.
+fn zen_test_app() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.push_log("hello transcript world".to_string());
+    app.show_minimap = true;
+    app.breadcrumbs_open = true;
+    app
+}
+
+#[tokio::test]
+async fn zen_keyboard_toggle_hides_chrome_but_keeps_transcript() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = zen_test_app();
+
+    // Before zen: the breadcrumbs strip paints its `session ▸ …` trail and the
+    // detailed status block is up; the transcript content is visible.
+    let before = render_to_string(&app, 120, 24);
+    assert!(before.contains("hello transcript world"), "{before}");
+    assert!(
+        before.contains('\u{25b8}'),
+        "breadcrumbs strip paints its ▸ trail before zen: {before}"
+    );
+    assert!(
+        !before.contains("click to exit"),
+        "the zen exit hint is absent before zen: {before}"
+    );
+
+    // Toggle zen on through the real key dispatcher.
+    handle_key(&mut app, &mut agent, toggle_zen_key())
+        .await
+        .unwrap();
+    assert!(app.zen.is_active(), "Ctrl+Alt+. turned zen on");
+
+    let after = render_to_string(&app, 120, 24);
+    // The transcript and composer survive — zen is layout policy, not a content
+    // filter.
+    assert!(
+        after.contains("hello transcript world"),
+        "transcript stays visible in zen: {after}"
+    );
+    // The minimal one-line state replaces the detailed status block, and names the
+    // way out so the exit is always on screen.
+    assert!(
+        after.contains("click to exit"),
+        "zen paints its minimal exit line: {after}"
+    );
+    // Secondary chrome is gone: the breadcrumbs strip no longer paints its trail.
+    assert!(
+        !after.contains('\u{25b8}'),
+        "breadcrumbs strip is suppressed in zen: {after}"
+    );
+
+    // Toggling again restores the chrome (idempotent round-trip).
+    handle_key(&mut app, &mut agent, toggle_zen_key())
+        .await
+        .unwrap();
+    assert!(!app.zen.is_active(), "second Ctrl+Alt+. turned zen off");
+    let restored = render_to_string(&app, 120, 24);
+    assert!(
+        restored.contains('\u{25b8}'),
+        "breadcrumbs strip returns when zen is off: {restored}"
+    );
+    assert!(
+        !restored.contains("click to exit"),
+        "the zen exit hint is gone when zen is off: {restored}"
+    );
+}
+
+#[test]
+fn zen_minimal_status_line_click_exits_zen() {
+    let mut app = zen_test_app();
+    // Enter zen, then paint so the minimal status line registers its click target.
+    app.zen.toggle();
+    assert!(app.zen.is_active());
+    let _ = render_to_string(&app, 120, 24);
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::ZenStatusLine,
+        ))
+        .expect("the zen minimal status line registered a click target");
+
+    // A left-click anywhere on the line is the mouse twin of Ctrl+Alt+.: it leaves
+    // zen, driving the same handler.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        !app.zen.is_active(),
+        "clicking the minimal zen status line exits zen",
+    );
+}
+
+#[test]
+fn zen_renders_on_empty_transcript_and_tiny_terminal_without_panicking() {
+    // Edge case: an empty transcript in zen on a terminal too small for most
+    // chrome must still paint a frame (the minimal status line clips, never
+    // panics).
+    let mut app = test_app(SessionMode::Build);
+    app.zen.toggle();
+    assert!(app.transcript.is_empty());
+    for (w, h) in [(3u16, 2u16), (1, 1), (20, 4)] {
+        let _ = render_to_string(&app, w, h);
+    }
+    // A roomier empty-transcript zen frame still names the way out.
+    let output = render_to_string(&app, 80, 12);
+    assert!(
+        output.contains("click to exit"),
+        "empty-transcript zen still paints the exit line: {output}"
+    );
+}
+
+#[test]
+fn zen_survives_resize_where_the_minimal_status_paints() {
+    // The minimal status line must keep painting (and re-registering its click
+    // target) across a width/height change — the spec's "resize while in zen".
+    let mut app = zen_test_app();
+    app.zen.toggle();
+    for (w, h) in [(120u16, 24u16), (60, 40), (200, 10)] {
+        let output = render_to_string(&app, w, h);
+        assert!(
+            output.contains("click to exit"),
+            "zen exit line survives resize to {w}x{h}: {output}"
+        );
+        assert!(
+            app.registered_rect_for(interaction::TargetKey::Chrome(
+                interaction::ChromeKey::ZenStatusLine,
+            ))
+            .is_some(),
+            "the zen click target re-registers after resize to {w}x{h}",
+        );
+        // The transcript content keeps painting through every reflow.
+        assert!(
+            output.contains("hello transcript world"),
+            "transcript survives resize to {w}x{h}: {output}"
+        );
+    }
+}
+
 fn test_app(mode: SessionMode) -> TuiApp {
     test_app_with_clipboard(mode, Box::new(NoopClipboard))
 }
