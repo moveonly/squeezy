@@ -38535,6 +38535,65 @@ async fn health_markers_alt_n_opens_overlay_and_lists_markers() {
     assert!(out.contains("important"), "severity tag row:\n{out}");
 }
 
+// Regression (deep-review #44): `refresh_health_markers` guards the heaviest build
+// of the overlay class — `build_health_candidates` re-renders every tool output's
+// detail lines via `tool_elided_line_count` — behind a CHEAP source fingerprint
+// folding the raw `(id, revision)` sequence with the tool-output verbosity and the
+// transcript shortcut. So an open-but-idle health overlay does NOT re-render every
+// tool's detail lines every painted frame. The build must run once, be skipped on
+// an unchanged repaint, and re-run when the transcript OR the verbosity changes.
+#[tokio::test]
+async fn health_markers_refresh_skips_rebuild_when_inputs_unchanged() {
+    let mut app = app_with_health_markers();
+    app.health_markers_open = true;
+
+    // First refresh builds the candidates once.
+    reset_health_candidates_builds();
+    refresh_health_markers(&mut app);
+    assert_eq!(
+        health_candidates_builds(),
+        1,
+        "the first refresh measures elision once"
+    );
+
+    // Repeated refreshes with no transcript / verbosity / shortcut change skip the
+    // build entirely — the open overlay pays only a `u64` comparison per frame.
+    refresh_health_markers(&mut app);
+    refresh_health_markers(&mut app);
+    assert_eq!(
+        health_candidates_builds(),
+        1,
+        "an unchanged session reuses the prior markers without re-measuring elision"
+    );
+
+    // A verbosity change feeds the elision count, so it must invalidate the cheap
+    // gate even though the transcript itself is untouched.
+    app.tool_output_verbosity = squeezy_core::ToolOutputVerbosity::Verbose;
+    refresh_health_markers(&mut app);
+    assert_eq!(
+        health_candidates_builds(),
+        2,
+        "a verbosity change re-measures elision"
+    );
+
+    // And an actual transcript change rebuilds too.
+    refresh_health_markers(&mut app);
+    assert_eq!(
+        health_candidates_builds(),
+        2,
+        "still idle after the verbosity bump"
+    );
+    let mut failed = sample_tool_result("shell", "a second failure");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+    refresh_health_markers(&mut app);
+    assert_eq!(
+        health_candidates_builds(),
+        3,
+        "appending a failed tool re-measures the transcript"
+    );
+}
+
 #[tokio::test]
 async fn health_markers_keyboard_navigates_and_jumps() {
     let mut app = app_with_health_markers();

@@ -16145,6 +16145,33 @@ fn tool_elided_line_count(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-thread count of how many times [`build_health_candidates`] actually ran,
+    /// so a test can prove `refresh_health_markers`'s cheap pre-build gate skips the
+    /// detail-line-rendering build on an unchanged repaint (deep-review #44).
+    /// Thread-local so parallel `cargo test` threads never race a global atomic.
+    static HEALTH_CANDIDATES_BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: record one [`build_health_candidates`] pass.
+#[cfg(test)]
+fn note_health_candidates_build() {
+    HEALTH_CANDIDATES_BUILDS.with(|c| c.set(c.get() + 1));
+}
+
+/// Test-only: reset this thread's [`build_health_candidates`] build counter.
+#[cfg(test)]
+pub(crate) fn reset_health_candidates_builds() {
+    HEALTH_CANDIDATES_BUILDS.with(|c| c.set(0));
+}
+
+/// Test-only: this thread's [`build_health_candidates`] build count since reset.
+#[cfg(test)]
+pub(crate) fn health_candidates_builds() -> u64 {
+    HEALTH_CANDIDATES_BUILDS.with(|c| c.get())
+}
+
 /// Build the per-entry Transcript Health Markers candidate slice from the active
 /// transcript (§12.5.7). Reuses the renderer/jump-nav classifications
 /// (`entry_is_error`, the structured tool status, `LogKind::Subagent`,
@@ -16158,6 +16185,8 @@ fn build_health_candidates(
     verbosity: ToolOutputVerbosity,
     transcript_shortcut: &str,
 ) -> Vec<transcript_health::HealthCandidate> {
+    #[cfg(test)]
+    note_health_candidates_build();
     let mut out: Vec<transcript_health::HealthCandidate> = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         let (title, tool_failed, subagent_failed, turn_failed, elided, hidden_lines, output_bytes) =
@@ -16229,10 +16258,29 @@ fn build_health_candidates(
 fn refresh_health_markers(app: &mut TuiApp) {
     let shortcut = key_hint(app, keymap::Action::ToggleTranscriptOverlay);
     let verbosity = app.tool_output_verbosity;
+    // Cheap pre-build gate (deep-review #44, the heaviest of this class):
+    // `build_health_candidates` re-renders every tool output's detail lines via
+    // `tool_elided_line_count` on every painted frame, so an open-but-idle health
+    // overlay on a long shell/read session can visibly lag the whole TUI. Skip the
+    // whole build when nothing it depends on has moved. Its inputs are the raw
+    // `(id, revision)` transcript sequence PLUS the preview-cap inputs — the tool-
+    // output verbosity and the transcript shortcut (both feed the elision count) —
+    // so fold all three into the cheap source fingerprint.
+    let source_fp = {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        transcript_source_fingerprint(active_transcript_entries(app)).hash(&mut hasher);
+        verbosity.as_str().hash(&mut hasher);
+        shortcut.hash(&mut hasher);
+        hasher.finish()
+    };
+    if app.health_markers_source_fp.get() == Some(source_fp) {
+        return;
+    }
     let candidates = build_health_candidates(active_transcript_entries(app), verbosity, &shortcut);
     let fingerprint = transcript_health::HealthMarkers::fingerprint_of(candidates.iter());
     app.health_markers
         .rebuild_if_stale(fingerprint, &candidates);
+    app.health_markers_source_fp.set(Some(source_fp));
 }
 
 /// Fold one transcript entry's primary [`transcript_index::EntryCategory`] (reused
@@ -44855,6 +44903,14 @@ pub(crate) struct TuiApp {
     /// session pays one `u64` comparison per refresh. Drives the health-markers
     /// overlay's list and quick-jump navigation.
     pub(crate) health_markers: transcript_health::HealthMarkers,
+    /// CHEAP pre-build staleness gate for the Transcript Health Markers (§12.5.7):
+    /// folds the raw `(id, revision)` transcript fingerprint with the tool-output
+    /// verbosity and transcript shortcut (both feed the elision count) at the last
+    /// refresh. `refresh_health_markers` compares against it and skips the heaviest
+    /// build of this class — `build_health_candidates` re-renders every tool's
+    /// detail lines — entirely when unchanged (deep-review #44). `None` until the
+    /// first refresh.
+    pub(crate) health_markers_source_fp: std::cell::Cell<Option<u64>>,
     /// Whether the Transcript Health Markers overlay (§12.5.7) is open. `false` =
     /// closed (the resting state, paints nothing extra); `true` = the fullscreen
     /// list owns key/mouse routing. Toggled by the `ToggleHealthMarkers` keymap
@@ -45925,6 +45981,7 @@ impl TuiApp {
             error_lens_open: false,
             error_lens_selected: 0,
             health_markers: transcript_health::HealthMarkers::new(),
+            health_markers_source_fp: std::cell::Cell::new(None),
             health_markers_open: false,
             health_markers_selected: 0,
             turn_outline: turn_outline::OutlineIndex::new(),
