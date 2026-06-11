@@ -34207,10 +34207,20 @@ fn minimap_rail_paints_markers_in_its_reserved_column() {
 
     let output = render_into_terminal(&app, 80, 24);
     let buffer = output.backend().buffer();
-    // Walk the rightmost column (the rail's reserved column) and confirm at
-    // least one marker glyph painted there.
+    // Walk the rightmost column (the rail's reserved column) and confirm at least
+    // one ENTRY marker glyph painted there. The quiet `│` track glyph is
+    // deliberately excluded: it paints on every unoccupied rail row regardless of
+    // whether any entry projected onto the rail, so accepting it let the assertion
+    // pass with zero real markers (the test-gap behind deep-review #112). The
+    // marker glyphs are sourced from `RailMarker` so this set can never silently
+    // drift back to including the track glyph.
     let rail_col = 80 - 1;
-    let marker_glyphs = ["●", "◦", "▲", "·", "│"];
+    let marker_glyphs = [
+        minimap::RailMarker::UserTurn.glyph(),
+        minimap::RailMarker::ToolCall.glyph(),
+        minimap::RailMarker::Error.glyph(),
+        minimap::RailMarker::Other.glyph(),
+    ];
     let mut painted_marker = false;
     for y in 0..24 {
         let sym = buffer[(rail_col, y)].symbol();
@@ -34220,7 +34230,57 @@ fn minimap_rail_paints_markers_in_its_reserved_column() {
     }
     assert!(
         painted_marker,
-        "the rail column must paint at least one rail/marker glyph"
+        "the rail column must paint at least one entry marker glyph"
+    );
+}
+
+/// The original `minimap_rail_paints_markers_in_its_reserved_column` asserted
+/// only that *some* glyph painted, so the width-unit projection bug
+/// (deep-review #10) slipped past it: even with every marker wrongly clamped to
+/// the bottom rail row, one real glyph still paints there. This is the missing
+/// positional assertion (deep-review #112): with several entries spread down a
+/// tall transcript and the whole rail in view, their markers must occupy MORE
+/// than one rail row. Pre-fix, the rail's entry offsets were built at the 1-cell
+/// rail width, so every offset dwarfed the body-width `total_rows` and
+/// `project_row`'s `offset.min(span)` collapsed every marker onto the single
+/// bottom row — which this test now catches.
+#[test]
+fn minimap_rail_spreads_markers_across_multiple_rows() {
+    let mut app = test_app(SessionMode::Build);
+    // A long leading assistant line: ~20 rows at the body text width, ~1500 rows
+    // at the 1-cell rail width. It pushes the width-1 header offsets of every
+    // following entry far past the body-width `total_rows`, so the buggy
+    // projection clamps them all to the bottom rail row.
+    let long_line: String = std::iter::repeat_n("squeezy ", 200).collect();
+    app.push_transcript_item(TranscriptItem::assistant(long_line));
+    // Several user turns interleaved through a short tail. Correctly projected
+    // they fan out across the rail; buggily projected they all pile on the bottom.
+    for index in 0..12 {
+        app.push_transcript_item(TranscriptItem::user(format!("question {index}")));
+        app.push_transcript_item(TranscriptItem::assistant(format!("reply {index}")));
+    }
+    app.show_minimap = true;
+    // Scroll fully up so the whole transcript projects across the rail.
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(10_000);
+
+    let width = 80u16;
+    let height = 30u16;
+    let output = render_into_terminal(&app, width, height);
+    let buffer = output.backend().buffer();
+    let rail_col = width - 1;
+    // Look specifically at the user-turn `●` markers: the 12 user turns are spread
+    // through the transcript, so correctly projected they occupy several distinct
+    // rail rows. Pre-fix they all clamp onto the single bottom row, collapsing to
+    // exactly one row. (Counting every marker kind would be fooled by entry 0's
+    // `·`, which sits at offset 0 → rail row 0 either way.)
+    let user_marker = minimap::RailMarker::UserTurn.glyph();
+    let user_rows: Vec<u16> = (0..height)
+        .filter(|&y| buffer[(rail_col, y)].symbol() == user_marker)
+        .collect();
+    assert!(
+        user_rows.len() > 1,
+        "user-turn rail markers must spread across multiple rail rows, not clamp \
+         onto one (painted `●` rows: {user_rows:?})"
     );
 }
 
