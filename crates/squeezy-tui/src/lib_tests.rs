@@ -34224,6 +34224,69 @@ fn minimap_rail_paints_markers_in_its_reserved_column() {
     );
 }
 
+/// The minimap rail must project each entry's marker onto a rail row that
+/// reflects the entry's RELATIVE position in the transcript — the same wrapped-row
+/// units `total_rows` is measured in. Building the rail's entry offsets at the
+/// 1-cell rail width (the pre-fix bug, deep-review #10) inflates every offset far
+/// past `total_rows`, so `project_row`'s `offset.min(span)` clamps every marker
+/// onto the bottom rail row. This renders a tall transcript whose body-width row
+/// total is modest while its width-1 wrap would balloon, scrolls the whole rail
+/// into view, and asserts an early user-turn marker lands in the UPPER half of the
+/// rail rows rather than clamped to the bottom.
+#[test]
+fn minimap_rail_projects_early_entries_into_the_upper_rail() {
+    let mut app = test_app(SessionMode::Build);
+    // Entry 0 is a single very long assistant line. At the body text width it
+    // wraps to ~20 rows; at the 1-cell rail width it wraps to ~1500 rows. So the
+    // early user turn that follows it has a body-width header offset of ~20 but a
+    // width-1 offset of ~1500 — and the body-width `total_rows` the rail projects
+    // against is only ~100. Pre-fix (width-1 offsets) that ~1500 dwarfs
+    // `total_rows` and `project_row`'s `offset.min(span)` clamps the marker to the
+    // bottom rail row; post-fix the ~20 body offset lands it high.
+    let long_line: String = std::iter::repeat_n("squeezy ", 200).collect();
+    app.push_transcript_item(TranscriptItem::assistant(long_line));
+    // The early user turn (entry index 1) sits near the top. Its `●` user-turn
+    // glyph is unique among the markers painted here, so we can find its rail row
+    // unambiguously.
+    app.push_transcript_item(TranscriptItem::user("the early question".to_string()));
+    // A modest tail of short assistant turns so the body-width row total stays far
+    // below the width-1 offsets above.
+    for index in 0..30 {
+        app.push_transcript_item(TranscriptItem::assistant(format!(
+            "tail assistant paragraph number {index}"
+        )));
+    }
+    app.show_minimap = true;
+    // Scroll fully up so the rail's viewport top sits at row 0 and the whole
+    // transcript projects across the rail.
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(10_000);
+
+    let width = 80u16;
+    let height = 30u16;
+    let output = render_into_terminal(&app, width, height);
+    let buffer = output.backend().buffer();
+    let rail_col = width - 1;
+    // Find the rail row carrying the early user turn's `●` marker.
+    let user_marker = minimap::RailMarker::UserTurn.glyph();
+    let mut user_rows: Vec<u16> = Vec::new();
+    for y in 0..height {
+        if buffer[(rail_col, y)].symbol() == user_marker {
+            user_rows.push(y);
+        }
+    }
+    assert!(
+        !user_rows.is_empty(),
+        "the early user turn must paint a `●` marker on the rail"
+    );
+    let top_user_row = *user_rows.iter().min().expect("a user marker row");
+    assert!(
+        top_user_row < height / 2,
+        "an early user turn must project into the UPPER half of the rail \
+         (row {top_user_row} of {height}); pre-fix the width-1 offsets clamp \
+         every marker onto the bottom rail row"
+    );
+}
+
 #[test]
 fn clicking_a_rail_cell_jumps_the_transcript() {
     let mut app = minimap_app();

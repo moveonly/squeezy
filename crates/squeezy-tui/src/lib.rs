@@ -33141,6 +33141,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
             frame,
             rail_area,
             app,
+            build_width,
             include_startup_card,
             total_rows,
             top_row,
@@ -33215,10 +33216,12 @@ fn minimap_rail_entries(app: &TuiApp, entry_offsets: &[usize]) -> Vec<minimap::R
 /// entry id (resolved against the live transcript at click time), so the rail is
 /// clickable when mouse capture is on and the same jump is reachable from the
 /// keyboard via the jump-nav keys.
+#[allow(clippy::too_many_arguments)]
 fn render_minimap_rail(
     frame: &mut Frame<'_>,
     rail_area: Rect,
     app: &TuiApp,
+    build_width: Option<u16>,
     include_startup_card: bool,
     total_rows: usize,
     top_row: usize,
@@ -33227,8 +33230,16 @@ fn render_minimap_rail(
     if rail_area.width == 0 || rail_area.height == 0 {
         return;
     }
+    // Build the entry offsets at the SAME width that produced `total_rows`/`top_row`
+    // (`build_width`, the body text width the main paint and
+    // `register_transcript_card_targets` use) — NOT the 1-cell rail width. The rail
+    // projects these offsets against `total_rows`, so the units must match; building
+    // at the rail width (1) inflates every offset far past `total_rows`, and
+    // `project_row`'s `offset.min(span)` then clamps every marker onto the bottom
+    // rail row (deep-review #10). Reusing `build_width` also hits the warm
+    // text-width row-model cache instead of forcing a per-frame width-1 re-wrap.
     let (_lines, entry_offsets) =
-        transcript_lines_and_entry_offsets(app, Some(rail_area.width), include_startup_card);
+        transcript_lines_and_entry_offsets(app, build_width, include_startup_card);
     let rail_entries = minimap_rail_entries(app, &entry_offsets);
     let layout = minimap::build_layout(
         &rail_entries,
