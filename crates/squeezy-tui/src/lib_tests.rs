@@ -36257,22 +36257,26 @@ async fn breadcrumbs_keyboard_traverses_and_jumps() {
     }
     assert_eq!(app.breadcrumbs_focus, 0, "Left clamps at the session root");
 
-    // Enter on the root jumps home and reports it; the strip stays shown.
+    // deep-review #6: bare Enter must NOT be consumed by the non-modal strip — it
+    // is prompt submission. With an empty composer it falls through to the global
+    // Enter handler, and crucially never reports a breadcrumb jump. The crumb's
+    // "activate" verb is reachable by mouse click (see
+    // breadcrumbs_mouse_click_focuses_and_jumps), not by stealing Enter.
     handle_key(
         &mut app,
         &mut agent,
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     )
     .await
-    .expect("enter jumps");
+    .expect("enter falls through");
     assert!(
-        app.status.contains("breadcrumbs"),
-        "status reflects the jump: {}",
+        !app.status.contains("breadcrumbs"),
+        "bare Enter must NOT trigger a breadcrumb jump: {}",
         app.status,
     );
     assert!(
         app.breadcrumbs_open,
-        "Enter jumps within the strip, not closes it"
+        "Enter falls through without closing the strip"
     );
 
     // Right walks the focus back toward the deepest crumb.
@@ -36395,6 +36399,58 @@ async fn breadcrumbs_typing_falls_through_while_strip_shown() {
         app.input,
     );
     assert!(app.breadcrumbs_open, "typing does not hide the strip");
+}
+
+/// deep-review #6: the breadcrumbs strip used to eat bare `h`/`l` (and Enter),
+/// turning typed "hello" into "eo" and stealing prompt submission. Typing every
+/// letter of "hello" with the strip open must land the full word in the composer,
+/// and a following bare Enter must NOT report a breadcrumb jump.
+#[tokio::test]
+async fn breadcrumbs_does_not_eat_h_l_or_enter_while_typing() {
+    let mut app = app_with_breadcrumbs();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("show strip");
+    let _ = render_to_string(&app, 80, 24);
+    assert!(app.breadcrumbs_open, "precondition: strip shown");
+
+    for ch in ['h', 'e', 'l', 'l', 'o'] {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type a letter");
+    }
+
+    assert_eq!(
+        app.input, "hello",
+        "every letter (including h/l) reached the composer with the strip open",
+    );
+
+    // A following bare Enter must not be hijacked into a breadcrumb jump; it is
+    // the composer's submission key.
+    let status_before = app.status.clone();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter");
+    assert!(
+        !app.status.contains("nothing to jump to") && !app.status.contains("breadcrumbs: "),
+        "bare Enter must NOT call breadcrumbs_activate_focused: {} (was {})",
+        app.status,
+        status_before,
+    );
 }
 
 #[tokio::test]

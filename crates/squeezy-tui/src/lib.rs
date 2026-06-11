@@ -11283,14 +11283,18 @@ fn toggle_breadcrumbs(app: &mut TuiApp) {
 
 /// Handle a key while the Clickable Breadcrumbs strip (§12.1.5) is shown. Returns
 /// `true` when the key was consumed so it never leaks to the composer or global
-/// keymap. The strip's own toggle chord (`Alt+2`) and Esc hide it; Left/Right (and
-/// h/l) move the breadcrumb focus along the trail (clamped, no wrap); Enter
-/// activates the focused crumb (jump to its location).
+/// keymap. The strip's own toggle chord (`Alt+2`) hides it; bare Left/Right move
+/// the breadcrumb focus along the trail (clamped, no wrap).
 ///
-/// Unlike the fullscreen overlays this is a *non-modal* strip: it only claims the
-/// small set of keys it needs (the arrows it owns, Enter, Esc, its toggle) and
-/// lets every other key fall through to the composer, so typing is unaffected
-/// while the orienting strip is visible.
+/// Unlike the fullscreen overlays this is a *non-modal* strip: it claims ONLY the
+/// keys that can never collide with composer text entry — its toggle chord and
+/// bare Left/Right (which are not printable and have no composer-typing meaning).
+/// Crucially it does NOT eat bare `Enter` (prompt submission), bare letters like
+/// `h`/`l` (composer typing — eating them turned "hello" into "eo"), or bare `Esc`
+/// (global dismiss / turn interrupt): those fall through so typing and submission
+/// keep working while the orienting strip is visible (deep-review #6). The strip
+/// is still dismissable via its toggle chord, and a crumb is still activatable by
+/// mouse click.
 fn handle_breadcrumbs_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if !app.breadcrumbs_open {
         return false;
@@ -11302,16 +11306,16 @@ fn handle_breadcrumbs_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         app.needs_redraw = true;
         return true;
     }
+    // Only bare (unmodified) arrows steer the strip; a modified arrow (e.g.
+    // Alt+Left word-motion / Shift+Left selection) and every printable key fall
+    // through to the composer/global handling untouched.
+    if !key.modifiers.is_empty() {
+        return false;
+    }
     let model = breadcrumbs::BreadcrumbModel::build(&build_breadcrumb_context(app));
     let count = model.len();
     match key.code {
-        KeyCode::Esc => {
-            app.breadcrumbs_open = false;
-            app.status = "breadcrumbs hidden".to_string();
-            app.needs_redraw = true;
-            true
-        }
-        KeyCode::Left | KeyCode::Char('h') => {
+        KeyCode::Left => {
             if let Some(prev) = model.prev_index(app.breadcrumbs_focus.min(count.saturating_sub(1)))
             {
                 app.breadcrumbs_focus = prev;
@@ -11319,7 +11323,7 @@ fn handle_breadcrumbs_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             app.needs_redraw = true;
             true
         }
-        KeyCode::Right | KeyCode::Char('l') => {
+        KeyCode::Right => {
             if let Some(next) = model.next_index(app.breadcrumbs_focus.min(count.saturating_sub(1)))
             {
                 app.breadcrumbs_focus = next;
@@ -11327,12 +11331,8 @@ fn handle_breadcrumbs_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             app.needs_redraw = true;
             true
         }
-        KeyCode::Enter => {
-            breadcrumbs_activate_focused(app);
-            true
-        }
         // Every other key falls through: the strip is non-modal, so normal
-        // composer input keeps working while it is shown.
+        // composer input (letters, Enter, Esc) keeps working while it is shown.
         _ => false,
     }
 }
