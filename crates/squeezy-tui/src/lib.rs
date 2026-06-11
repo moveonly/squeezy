@@ -10161,6 +10161,15 @@ fn cycle_main_semantic_filter(app: &mut TuiApp, backward: bool) {
     let tool_names = distinct_overlay_tool_names(active_transcript_entries(app));
     let next = semantic_filter::step(app.main_semantic_filter, &tool_names, backward);
     app.main_semantic_filter = next;
+    // The filter swaps the entire visible row list, so every row-indexed anchor
+    // now points at shifted content. Invalidate selections and re-anchor search
+    // to the new row model — mirroring the resize arm — so a stale highlight band
+    // or k-of-N count can't survive the filter change (deep-review #72).
+    app.selection = None;
+    app.selection_set.clear();
+    if app.search.is_some() {
+        refresh_search(app);
+    }
     let key = key_hint(app, keymap::Action::CycleSemanticFilter);
     app.status = if next.is_active() {
         format!(

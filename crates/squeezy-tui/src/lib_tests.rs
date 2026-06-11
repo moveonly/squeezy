@@ -34521,6 +34521,53 @@ fn app_with_mixed_semantic_transcript() -> TuiApp {
 }
 
 #[test]
+fn semantic_filter_cycle_invalidates_selection_and_search_anchors() {
+    // The semantic filter swaps the entire visible row list, so row-indexed
+    // anchors (committed selections, the live selection, an open search) point at
+    // shifted content afterwards. Cycling the filter must invalidate them the way
+    // the resize arm does (deep-review #72).
+    let mut app = app_with_mixed_semantic_transcript();
+    // Paint once so the text-area cache (the width selections/search anchor at) is
+    // populated.
+    let _ = render_to_string(&app, 80, 30);
+    let captured_width = app
+        .main_text_area_cache
+        .get()
+        .map(|c| c.text_area.width)
+        .expect("a painted frame stamps the text-area cache");
+
+    // A committed multi-select range and a live selection over the current rows.
+    let mut set = multi_selection::SelectionSet::new();
+    let mut committed = selection::Selection::at(
+        selection::SelectionSurface::Main,
+        selection::Pos { row: 1, col: 0 },
+        selection::SelectionMode::Cell,
+        captured_width,
+    );
+    committed.cursor = selection::Pos { row: 1, col: 6 };
+    assert!(set.add(committed));
+    app.selection_set = set;
+    app.selection = Some(selection::Selection::at(
+        selection::SelectionSurface::Main,
+        selection::Pos { row: 2, col: 1 },
+        selection::SelectionMode::Cell,
+        captured_width,
+    ));
+    assert!(!app.selection_set.is_empty());
+
+    cycle_main_semantic_filter(&mut app, false);
+
+    assert!(
+        app.selection_set.is_empty(),
+        "the committed selection_set is cleared when the row model is swapped",
+    );
+    assert!(
+        app.selection.is_none(),
+        "the live selection is cleared when the row model is swapped",
+    );
+}
+
+#[test]
 fn semantic_filter_keyboard_cycle_narrows_the_main_view_to_errors() {
     let mut app = app_with_mixed_semantic_transcript();
     let mut agent = test_agent(SessionMode::Build);
