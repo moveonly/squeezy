@@ -43739,6 +43739,68 @@ fn app_with_transcript_for_density() -> TuiApp {
     app
 }
 
+/// Three identical user turns whose content straddles the gutter boundary: at a
+/// frame width of 23 the content occupies fewer rows than at the painted text
+/// width of 22 (scrollbar gutter) — so a height counted at the full frame width
+/// under-reserves the transcript viewport (deep-review #14).
+fn app_with_gutter_straddling_turns() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    for _ in 0..3 {
+        app.push_transcript_item(TranscriptItem::user("y".repeat(21)));
+    }
+    app
+}
+
+#[test]
+fn transcript_height_reserved_at_the_painted_gutter_width_not_full_frame() {
+    // `render_transcript` carves a 1-cell scrollbar gutter off the right edge, so
+    // the text wraps at `area.width - 1`. The layout must count the transcript
+    // height at THAT painted width, not the full frame width, or it reserves too
+    // few rows and a tail-pinned view clips its top while blank space shows below
+    // the composer.
+    let app = app_with_gutter_straddling_turns();
+    // Frame 23 wide, tall enough that the transcript is NOT height-clamped.
+    let area = Rect::new(0, 0, 23, 60);
+    // The content wraps to MORE rows at the painted width (22) than at the full
+    // frame width (23) — that gap is the bug.
+    let at_full_frame = transcript_visual_line_count(&app, 23, false);
+    let at_painted_width = transcript_visual_line_count(&app, 22, false);
+    assert!(
+        at_painted_width > at_full_frame,
+        "the seeded content must straddle the gutter boundary \
+         (painted {at_painted_width} > full {at_full_frame})",
+    );
+
+    let layout = main_transcript_layout(&app, area, false);
+    assert_eq!(
+        layout.transcript_height, at_painted_width,
+        "transcript_height reserves the painted-width (gutter) row count",
+    );
+}
+
+#[test]
+fn transcript_height_reserved_at_painted_width_with_minimap_rail() {
+    // With the minimap rail ON the renderer carves TWO columns (rail + gutter),
+    // so the text wraps at `area.width - 2`. The reserved height must follow.
+    let mut app = app_with_gutter_straddling_turns();
+    app.show_minimap = true;
+    // Frame 24 wide => painted text width 22 (rail + gutter), tall and unclamped.
+    let area = Rect::new(0, 0, 24, 60);
+    let at_full_frame = transcript_visual_line_count(&app, 24, false);
+    let at_painted_width = transcript_visual_line_count(&app, 22, false);
+    assert!(
+        at_painted_width > at_full_frame,
+        "content straddles the rail+gutter boundary \
+         (painted {at_painted_width} > full {at_full_frame})",
+    );
+
+    let layout = main_transcript_layout(&app, area, false);
+    assert_eq!(
+        layout.transcript_height, at_painted_width,
+        "transcript_height reserves the rail+gutter row count with the minimap on",
+    );
+}
+
 #[test]
 fn density_default_is_auto_and_pays_no_idle_cost() {
     // A fresh app starts in Auto; an idle session resolves to whatever the

@@ -24073,8 +24073,18 @@ fn main_transcript_layout(
     let requested_transcript_gap_height =
         transcript_prompt_gap_height(app).saturating_mul(density.transcript_prompt_gap());
     let reserved_height = required_height.saturating_add(attachment_height);
+    // Count the transcript height at the SAME width `render_transcript` wraps to,
+    // not the full frame width: it carves the 1-cell minimap rail (when the rail
+    // is shown) and the 1-cell scrollbar gutter off the right edge before
+    // wrapping (so text is `area.width - 1`, or `- 2` with the minimap). Sizing
+    // at the wider full width undercounts wrapped rows, under-reserving
+    // `transcript_height` so a tail-pinned view clips its top while a blank
+    // filler band shows below the composer (deep-review #14).
+    let show_minimap = app.show_minimap && !app.zen.chrome_suppressed();
+    let (body_area, _rail) = transcript_main_body_and_rail_areas(area, show_minimap);
+    let (text_area, _scrollbar) = transcript_main_text_and_scrollbar_areas(body_area);
     let transcript_visual_height =
-        transcript_visual_line_count(app, area.width, include_startup_card);
+        transcript_visual_line_count(app, text_area.width, include_startup_card);
     let available_without_gap = area.height.saturating_sub(reserved_height);
     let transcript_prompt_gap_height = if requested_transcript_gap_height > 0
         && transcript_visual_height < available_without_gap
