@@ -285,7 +285,10 @@ fn platform_selected_when_osc52_absent_from_chain() {
     // Capability probe says no OSC52 -> default_chain omits it.
     let sink = RecordingSink::new();
     let calls = sink.handle();
-    let caps = ClipboardCapabilities { osc52: false };
+    let caps = ClipboardCapabilities {
+        osc52: false,
+        ..Default::default()
+    };
     let mut chain = ClipboardChain::default_chain(sink, caps, vec![PBCOPY]);
 
     let req = CopyRequest::new("clipboard please", "transcript");
@@ -590,6 +593,21 @@ fn capability_probe_false_for_unknown_terminal() {
     assert!(!caps.osc52);
 }
 
+#[test]
+fn capability_probe_detects_ssh_session() {
+    // Either standard SSH marker flips `ssh` on.
+    let caps = detect_clipboard_capabilities_from_env(env_map(&[("SSH_TTY", "/dev/pts/3")]));
+    assert!(caps.ssh, "SSH_TTY marks a remote session");
+    let caps = detect_clipboard_capabilities_from_env(env_map(&[(
+        "SSH_CONNECTION",
+        "10.0.0.1 5000 10.0.0.2 22",
+    )]));
+    assert!(caps.ssh, "SSH_CONNECTION marks a remote session");
+    // No SSH markers -> local session.
+    let caps = detect_clipboard_capabilities_from_env(env_map(&[("TERM_PROGRAM", "iTerm.app")]));
+    assert!(!caps.ssh, "no SSH markers -> local session");
+}
+
 // ---------------------------------------------------------------------------
 // Platform command selection
 // ---------------------------------------------------------------------------
@@ -620,11 +638,20 @@ fn platform_commands_are_nonempty_and_consult_env_on_linux() {
 // default_chain ordering
 // ---------------------------------------------------------------------------
 
+/// REMOTE/SSH session: OSC 52 leads (it is the only sink that reaches the
+/// user's *local* clipboard), then the platform command, then temp-file. The
+/// fast OSC 52-only path is trusted here (`prefers_osc52()` is true).
 #[test]
-fn default_chain_orders_osc52_then_platform_then_tempfile() {
+fn default_chain_ssh_orders_osc52_then_platform_then_tempfile() {
     let sink = RecordingSink::new();
-    let chain =
-        ClipboardChain::default_chain(sink, ClipboardCapabilities { osc52: true }, vec![PBCOPY]);
+    let chain = ClipboardChain::default_chain(
+        sink,
+        ClipboardCapabilities {
+            osc52: true,
+            ssh: true,
+        },
+        vec![PBCOPY],
+    );
     assert_eq!(
         chain.providers,
         vec![
@@ -632,6 +659,66 @@ fn default_chain_orders_osc52_then_platform_then_tempfile() {
             ClipboardProvider::PlatformCommand(PBCOPY),
             ClipboardProvider::TempFile,
         ]
+    );
+    assert!(
+        chain.prefers_osc52(),
+        "over SSH, OSC 52 is the preferred provider"
+    );
+}
+
+/// LOCAL session WITH a platform command: the verifiable platform command leads
+/// so the copy actually lands even on OSC 52-ignoring terminals; OSC 52 trails
+/// as a fallback, then temp-file. `prefers_osc52()` is false, so `deliver_copy`
+/// routes through the chain instead of taking the unobservable OSC 52 fast path.
+#[test]
+fn default_chain_local_orders_platform_then_osc52_then_tempfile() {
+    let sink = RecordingSink::new();
+    let chain = ClipboardChain::default_chain(
+        sink,
+        ClipboardCapabilities {
+            osc52: true,
+            ssh: false,
+        },
+        vec![PBCOPY],
+    );
+    assert_eq!(
+        chain.providers,
+        vec![
+            ClipboardProvider::PlatformCommand(PBCOPY),
+            ClipboardProvider::Osc52,
+            ClipboardProvider::TempFile,
+        ]
+    );
+    assert!(
+        !chain.prefers_osc52(),
+        "locally, the verifiable platform command is preferred over OSC 52"
+    );
+    assert!(
+        chain.has_osc52(),
+        "OSC 52 is still in the chain as a fallback"
+    );
+}
+
+/// LOCAL session with NO platform command: OSC 52 is the only real sink, so it
+/// leads (and is preferred) even without SSH; temp-file trails.
+#[test]
+fn default_chain_local_without_platform_keeps_osc52_first() {
+    let sink = RecordingSink::new();
+    let chain = ClipboardChain::default_chain(
+        sink,
+        ClipboardCapabilities {
+            osc52: true,
+            ssh: false,
+        },
+        vec![],
+    );
+    assert_eq!(
+        chain.providers,
+        vec![ClipboardProvider::Osc52, ClipboardProvider::TempFile],
+    );
+    assert!(
+        chain.prefers_osc52(),
+        "with no platform command, OSC 52 is preferred even locally"
     );
 }
 

@@ -247,6 +247,12 @@ pub(crate) struct ClipboardCapabilities {
     /// writes. When `false` the chain skips OSC 52 entirely and goes straight
     /// to the platform command.
     pub osc52: bool,
+    /// Whether this looks like a remote (SSH) session. On a remote session OSC
+    /// 52 is the only sink that reaches the *user's local* clipboard, so the
+    /// chain keeps it first. On a LOCAL session a platform command
+    /// (`pbcopy`/`wl-copy`/…) is verifiable (exit status) and reliable even on
+    /// terminals that silently drop OSC 52 writes, so it is preferred first.
+    pub ssh: bool,
 }
 
 /// Pure capability heuristic for OSC 52 clipboard support based on
@@ -261,7 +267,27 @@ where
 {
     ClipboardCapabilities {
         osc52: detect_osc52_from_env(&env_get),
+        ssh: is_ssh_session(&env_get),
     }
+}
+
+/// Whether the current session looks remote (SSH). True when either `SSH_TTY`
+/// or `SSH_CONNECTION` is present in the environment — the standard markers an
+/// SSH server exports into the login session.
+///
+/// Drives clipboard provider ORDER: on a remote session a platform command
+/// would only touch the *server's* clipboard, so OSC 52 (which the outer local
+/// terminal can honour) stays first; on a LOCAL session the verifiable platform
+/// command (`pbcopy`/`wl-copy`/…) is preferred so copies actually land even on
+/// terminals that silently drop OSC 52.
+///
+/// Env-closure-driven (rather than reading real env) so the decision is
+/// testable, exactly like the capability probe.
+fn is_ssh_session<F>(env_get: &F) -> bool
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    env_get("SSH_TTY").is_some() || env_get("SSH_CONNECTION").is_some()
 }
 
 fn detect_osc52_from_env<F>(env_get: &F) -> bool
@@ -520,19 +546,33 @@ impl<S: ClipboardSink> ClipboardChain<S> {
     }
 
     /// Build the default chain from resolved capabilities and platform
-    /// command candidates: OSC 52 first (only if `caps.osc52`), then each
-    /// platform command, then the temp-file fallback (always last).
+    /// command candidates, ordering OSC 52 vs the platform commands by session
+    /// LOCALITY, then the temp-file fallback (always last):
+    ///
+    /// - LOCAL session (`!caps.ssh`) WITH at least one platform command: the
+    ///   platform command(s) go FIRST and OSC 52 (if `caps.osc52`) LAST. A
+    ///   platform command (`pbcopy`/`wl-copy`/…) is *verifiable* (exit status)
+    ///   and reliable even on terminals that silently drop OSC 52 writes, so a
+    ///   local copy actually lands; OSC 52 is only a fallback.
+    /// - REMOTE session (`caps.ssh`) OR no platform command: OSC 52 (if
+    ///   `caps.osc52`) goes FIRST — over SSH it is the only sink that reaches
+    ///   the user's *local* clipboard; a platform command would only touch the
+    ///   server's clipboard.
     pub(crate) fn default_chain(
         sink: S,
         caps: ClipboardCapabilities,
         platform: Vec<PlatformCommand>,
     ) -> Self {
         let mut providers = Vec::new();
-        if caps.osc52 {
+        let prefer_platform = !caps.ssh && !platform.is_empty();
+        if caps.osc52 && !prefer_platform {
             providers.push(ClipboardProvider::Osc52);
         }
         for cmd in platform {
             providers.push(ClipboardProvider::PlatformCommand(cmd));
+        }
+        if caps.osc52 && prefer_platform {
+            providers.push(ClipboardProvider::Osc52);
         }
         providers.push(ClipboardProvider::TempFile);
         Self::with_providers(sink, providers)
@@ -571,6 +611,20 @@ impl<S: ClipboardSink> ClipboardChain<S> {
         self.providers
             .iter()
             .any(|p| matches!(p, ClipboardProvider::Osc52))
+    }
+
+    /// Whether OSC 52 is this chain's *preferred* (first) provider, i.e. the
+    /// session is remote/SSH or there is no verifiable local platform command.
+    ///
+    /// `deliver_copy` consults this to decide whether the fast OSC 52-only
+    /// write may be trusted as the primary path: it is only safe when OSC 52 is
+    /// genuinely preferred (over SSH it reaches the user's local clipboard).
+    /// When a LOCAL platform command (`pbcopy`/…) leads the chain instead, the
+    /// copy must route THROUGH the chain so it lands on the verifiable sink —
+    /// the OSC 52-only fast path's `Ok` is unobservable and would falsely
+    /// report success while the system clipboard stays empty.
+    pub(crate) fn prefers_osc52(&self) -> bool {
+        matches!(self.providers.first(), Some(ClipboardProvider::Osc52))
     }
 
     /// The single entry point. Walks the provider chain in order, returning on

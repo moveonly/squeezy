@@ -21465,20 +21465,25 @@ fn build_clipboard_chain(
     let env_get = |key: &str| std::env::var_os(key);
     #[cfg_attr(not(test), allow(unused_mut))]
     let mut caps = clipboard::detect_clipboard_capabilities_from_env(env_get);
-    // Under the crate's own `cfg(test)` build, force an OSC 52-capable chain so
+    // Under the crate's own `cfg(test)` build, force an OSC 52-PREFERRED chain so
     // every copy-funnel test is host-independent. `deliver_copy` takes the
-    // observable `app.clipboard` fast path only when `clipboard_chain.has_osc52()`
-    // is true; that flag is set from the env probe, which is true on a dev Mac
-    // but FALSE on headless CI — so without this the copy would route to an
-    // unobserved platform sink and leave an injected `RecordingClipboard` empty.
-    // Pinning the capability at this single chain-construction funnel fixes the
-    // `test_app_with_clipboard` helper AND every direct `new_with_clipboard` /
-    // `set_clipboard_sink_for_test` caller at once. Tests that intentionally
-    // model an OSC 52-ignoring terminal call `set_clipboard_chain_for_test`
-    // after construction, replacing this whole chain, so they still override it.
+    // observable `app.clipboard` fast path only when `clipboard_chain.prefers_osc52()`
+    // is true; that depends on the env probe (`caps.osc52` true on a dev Mac but
+    // FALSE on headless CI) AND on locality (a LOCAL Mac now prefers the platform
+    // command over OSC 52 — see `default_chain`). So we pin BOTH signals here:
+    // `osc52 = true` makes OSC 52 capable, and `ssh = true` keeps it the PREFERRED
+    // (first) provider so the fast path is taken regardless of host platform
+    // commands — otherwise the copy would route to an unobserved platform sink and
+    // leave an injected `RecordingClipboard` empty. Pinning at this single
+    // chain-construction funnel fixes the `test_app_with_clipboard` helper AND
+    // every direct `new_with_clipboard` / `set_clipboard_sink_for_test` caller at
+    // once. Tests that intentionally model a LOCAL OSC 52-ignoring terminal call
+    // `set_clipboard_chain_for_test` after construction, replacing this whole
+    // chain, so they still override it.
     #[cfg(test)]
     {
         caps.osc52 = true;
+        caps.ssh = true;
     }
     let platform = clipboard::platform_commands(env_get);
     // TODO(copy-confirm): the chain supports a large-payload confirmation gate
@@ -21690,17 +21695,25 @@ pub(crate) fn main_text_width(app: &TuiApp) -> u16 {
 ///
 /// CRITICAL (deep-review #11): the fast OSC 52-only write reports `Ok` as soon
 /// as the escape is flushed to stdout — it cannot observe whether the terminal
-/// honoured it. On a terminal that ignores OSC 52 (Apple Terminal, GNOME/VTE)
-/// that would surface a false "copied N chars" while the clipboard stays empty
-/// and the `pbcopy`/`xclip`/`wl-copy` sinks this PR added are never consulted.
-/// So when the env probe says the host is *not* believed to honour OSC 52
-/// (`!clipboard_chain.has_osc52()`), we skip the OSC 52 fast path entirely and
-/// route every payload — including the common ≤8 KiB case — through the
-/// capability-aware chain, which goes straight to the platform sink.
+/// honoured it. On a terminal that ignores OSC 52 (Apple Terminal, GNOME/VTE,
+/// or iTerm2 with its default OSC 52 clipboard-write block) that would surface a
+/// false "copied N chars" while the clipboard stays empty and the
+/// `pbcopy`/`xclip`/`wl-copy` sinks this PR added are never consulted.
+///
+/// So the fast OSC 52-only path is taken ONLY when OSC 52 is the chain's
+/// *preferred* provider (`clipboard_chain.prefers_osc52()`): a remote/SSH
+/// session (where OSC 52 is the only sink that reaches the user's local
+/// clipboard) or a host with no platform command. On a LOCAL session with a
+/// verifiable platform command (`pbcopy`/`wl-copy`/…) the chain prefers that
+/// command first, so we route every payload — including the common ≤8 KiB case
+/// — through the capability-aware chain, which lands the copy on the platform
+/// sink and confirms it via the command's exit status.
 fn deliver_copy(app: &mut TuiApp, text: &str, label: &str) {
-    // On OSC 52-ignoring terminals the fast path's `Ok` is unobservable and
-    // would falsely report success; route through the platform-sink chain.
-    if !app.clipboard_chain.has_osc52() {
+    // Take the fast OSC 52-only path only when OSC 52 is the chain's preferred
+    // provider (SSH/remote, or no platform command). Otherwise the fast path's
+    // `Ok` is unobservable and would falsely report success; route through the
+    // chain so the verifiable local platform sink (`pbcopy`/…) actually lands it.
+    if !app.clipboard_chain.prefers_osc52() {
         deliver_copy_via_chain(app, text, label, None);
         return;
     }

@@ -19597,6 +19597,145 @@ fn deliver_copy_routes_small_payload_to_platform_sink_when_osc52_unsupported() {
     assert_eq!(app.clipboard_history.len(), 1, "the copy was recorded");
 }
 
+/// LOCAL clipboard bug (non-SSH): on a local macOS/Linux session the chain
+/// prefers the *verifiable* platform command (`pbcopy`/`wl-copy`/…) over OSC 52,
+/// so a small copy must route THROUGH the chain to that platform sink — even
+/// though the host terminal is OSC 52-capable and the primary OSC 52 sink
+/// reports a (unobservable, often false) success. This is the exact case where
+/// copying reported "copied" but nothing landed: OSC 52 was written and
+/// silently dropped by the terminal. Now the platform command lands it and the
+/// command's exit status confirms it.
+#[test]
+fn deliver_copy_prefers_local_platform_sink_over_osc52_on_non_ssh_session() {
+    // Primary OSC 52 sink reports success unconditionally — the false-success
+    // the bug relied on. If the fast path were taken, pbcopy would never run.
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: Arc::new(StdMutex::new(Vec::new())),
+            error: None,
+        }),
+    );
+
+    // A LOCAL, OSC 52-capable default chain: the production ordering for a Mac
+    // terminal with no SSH markers. `default_chain` puts pbcopy FIRST and OSC 52
+    // LAST, so `prefers_osc52()` is false and `deliver_copy` routes through it.
+    let sink = crate::clipboard::RecordingSink::new();
+    let calls = sink.handle();
+    let chain = crate::clipboard::ClipboardChain::default_chain(
+        Box::new(sink) as Box<dyn crate::clipboard::ClipboardSink + Send>,
+        crate::clipboard::ClipboardCapabilities {
+            osc52: true,
+            ssh: false,
+        },
+        vec![crate::clipboard::PlatformCommand {
+            program: "pbcopy",
+            args: &[],
+        }],
+    );
+    assert!(
+        chain.has_osc52(),
+        "the local chain is OSC 52-capable (terminal honours it) ..."
+    );
+    assert!(
+        !chain.prefers_osc52(),
+        "... but on a LOCAL session the verifiable platform command is preferred"
+    );
+    app.set_clipboard_chain_for_test(chain);
+
+    let payload = "local clipboard payload";
+    deliver_copy(&mut app, payload, "selection");
+
+    // It reported a copied status, AND the exact bytes reached the platform sink
+    // (a verifiable Command call) — not an unobservable OSC 52-only terminal
+    // write that the terminal silently drops.
+    assert!(
+        app.status.starts_with("copied selection"),
+        "expected a copied-status from the platform sink, got {:?}",
+        app.status
+    );
+    let recorded = calls.lock().unwrap().clone();
+    let landed_on_platform = recorded.iter().any(|call| match call {
+        crate::clipboard::SinkCall::Command { payload: p, .. } => p == payload.as_bytes(),
+        _ => false,
+    });
+    assert!(
+        landed_on_platform,
+        "the local copy must land on the verifiable platform sink, not OSC 52; \
+         recorded calls: {recorded:?}"
+    );
+    // No OSC 52 terminal write happened on the chain sink: the platform command
+    // succeeded first and short-circuited the chain.
+    let touched_osc52 = recorded
+        .iter()
+        .any(|call| matches!(call, crate::clipboard::SinkCall::Terminal { .. }));
+    assert!(
+        !touched_osc52,
+        "the platform sink wins first; OSC 52 must not be attempted, calls: {recorded:?}"
+    );
+    assert_eq!(app.clipboard_history.len(), 1, "the copy was recorded");
+}
+
+/// SSH/remote session: OSC 52 is the only sink that reaches the user's *local*
+/// clipboard (a platform command would touch only the server's), so the chain
+/// keeps OSC 52 first and `deliver_copy` takes the fast OSC 52-only path via the
+/// primary `app.clipboard`. The platform sink is a fallback only.
+#[test]
+fn deliver_copy_prefers_osc52_first_on_ssh_session() {
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+
+    // A REMOTE (SSH) OSC 52-capable default chain: OSC 52 leads, platform command
+    // trails. `prefers_osc52()` is true so the fast `app.clipboard` path is used.
+    let sink = crate::clipboard::RecordingSink::new();
+    let calls = sink.handle();
+    let chain = crate::clipboard::ClipboardChain::default_chain(
+        Box::new(sink) as Box<dyn crate::clipboard::ClipboardSink + Send>,
+        crate::clipboard::ClipboardCapabilities {
+            osc52: true,
+            ssh: true,
+        },
+        vec![crate::clipboard::PlatformCommand {
+            program: "pbcopy",
+            args: &[],
+        }],
+    );
+    assert!(
+        chain.prefers_osc52(),
+        "over SSH, OSC 52 is the preferred provider"
+    );
+    app.set_clipboard_chain_for_test(chain);
+
+    let payload = "remote clipboard payload";
+    deliver_copy(&mut app, payload, "selection");
+
+    // The fast path used the primary OSC 52 clipboard (recorded in `writes`),
+    // and the chain's platform sink was NOT consulted.
+    assert!(
+        app.status.starts_with("copied selection"),
+        "expected a copied-status, got {:?}",
+        app.status
+    );
+    let primary_writes = writes.lock().unwrap().clone();
+    assert!(
+        primary_writes.iter().any(|w| w.as_str() == payload),
+        "the OSC 52 primary clipboard must carry the payload over SSH; got {primary_writes:?}"
+    );
+    let chain_calls = calls.lock().unwrap().clone();
+    assert!(
+        chain_calls.is_empty(),
+        "the platform-sink chain must NOT be consulted on the OSC 52 fast path; \
+         calls: {chain_calls:?}"
+    );
+    assert_eq!(app.clipboard_history.len(), 1, "the copy was recorded");
+}
+
 // ===========================================================================
 // Zen Mode (§12.4.5)
 // ===========================================================================
