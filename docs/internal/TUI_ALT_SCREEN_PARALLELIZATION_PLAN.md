@@ -202,8 +202,12 @@ lifecycle → Wave 4 deletion — is the irreducible serial critical path. Every
 5. **`lib_tests.rs` is a serialized tail.** All `render_to_string` (86) / `render_inline_to_string`
    (8) retargeting happens in one pass in Wave 4, bottom-up. No lane touches it mid-migration except
    to *add* fullscreen/surface tests in new test modules.
-6. **`SQUEEZY_INLINE_REPRO=1`** keeps the inline path alive *only* until the xterm.js oracle proves
-   the old bug and fullscreen is dogfood-stable; deleted in Wave 4. Never a user-facing mode.
+6. **`SQUEEZY_INLINE_REPRO=1`** *(planned migration switch — never shipped)*. The idea was to keep
+   the inline path alive only until the xterm.js oracle proved the old bug and fullscreen was
+   dogfood-stable, then delete it in Wave 4. In practice the inline renderer was removed wholesale in
+   Phase 10 and this flag was never wired into product code (`grep -rn INLINE_REPRO crates --include='*.rs'`
+   returns nothing). There is no inline escape hatch at HEAD: the enter path emits `EnterAlternateScreen`
+   unconditionally. This bullet is retained only for migration history.
 
 ---
 

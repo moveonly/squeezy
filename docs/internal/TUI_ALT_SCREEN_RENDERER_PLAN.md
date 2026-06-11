@@ -261,8 +261,9 @@ the minimal xterm.js oracle from Phase 0A is required first.
 
 Make fullscreen the real terminal lifecycle. A flag may exist only as a temporary migration switch.
 
-- Add `RenderMode` only if it reduces patch risk. If practical, move directly to fullscreen and keep
-  a short-lived `SQUEEZY_INLINE_REPRO=1` path in tests/tools rather than product code.
+- Add `RenderMode` only if it reduces patch risk. If practical, move directly to fullscreen.
+  (A short-lived `SQUEEZY_INLINE_REPRO=1` path was considered but never shipped: the inline renderer
+  was deleted outright in Phase 10 and no such flag exists in product code at HEAD.)
 - In `TerminalGuard::enter` (`lib.rs:~18036`), build `Terminal::new` / `Viewport::Fullscreen`.
 - Emit `EnterAlternateScreen`, `EnableAlternateScroll`, `Clear(All)`, `MoveTo(0,0)`,
   `EnableBracketedPaste`, `EnableFocusChange`, `Hide`, and keyboard enhancement setup.
@@ -765,9 +766,11 @@ This is not a plan to maintain two renderers.
    fullscreen complete.
 4. Delete inline once fullscreen has passed the resize, copy, exit, and signal gates. Do not keep an
    end-user inline fallback after that point.
-5. If an emergency kill switch remains temporarily, name it like a temporary escape hatch
+5. ~~If an emergency kill switch remains temporarily, name it like a temporary escape hatch
    (`SQUEEZY_INLINE_REPRO=1`), document that it is unsupported, and keep it out of normal CI except
-   for the legacy-failure harness.
+   for the legacy-failure harness.~~ *(Not done: no kill switch was kept. Inline was deleted in
+   Phase 10 and `SQUEEZY_INLINE_REPRO` was never wired into product code, so there is no inline
+   fallback to gate.)*
 6. Update docs/help to describe Squeezy as an app-owned fullscreen TUI with in-app scroll/search/copy,
    not as a native scrollback append-mode terminal program.
 
