@@ -37130,6 +37130,48 @@ async fn transcript_index_alt_i_opens_overlay_and_renders_categories() {
     );
 }
 
+// Regression (deep-review #43): `refresh_transcript_index` guards the
+// O(transcript-bytes) `build_index_entries` pass behind a CHEAP raw `(id, revision)`
+// source fingerprint, so an open-but-idle index overlay does NOT re-classify the
+// whole transcript every painted frame — it pays one `u64` comparison and rebuilds
+// nothing. The build must run once, be skipped on an unchanged repaint, and re-run
+// only when the transcript actually changes.
+#[tokio::test]
+async fn transcript_index_refresh_skips_rebuild_when_transcript_unchanged() {
+    let mut app = app_with_mixed_transcript();
+    app.transcript_index_open = true;
+
+    // First refresh builds the index entries once.
+    reset_index_entries_builds();
+    refresh_transcript_index(&mut app);
+    assert_eq!(
+        index_entries_builds(),
+        1,
+        "the first refresh classifies the transcript once"
+    );
+
+    // Repeated refreshes with NO transcript change must skip the build entirely:
+    // the cheap source fingerprint is unchanged, so the open overlay costs only a
+    // `u64` comparison and never re-walks the transcript.
+    refresh_transcript_index(&mut app);
+    refresh_transcript_index(&mut app);
+    assert_eq!(
+        index_entries_builds(),
+        1,
+        "an unchanged transcript reuses the prior index without rebuilding"
+    );
+
+    // A real transcript change (a new entry) moves the source fingerprint, so the
+    // next refresh rebuilds.
+    app.push_transcript_item(TranscriptItem::user("a brand new question".to_string()));
+    refresh_transcript_index(&mut app);
+    assert_eq!(
+        index_entries_builds(),
+        2,
+        "appending an entry re-classifies the transcript"
+    );
+}
+
 #[tokio::test]
 async fn transcript_index_keyboard_navigates_and_jumps() {
     let mut app = app_with_mixed_transcript();

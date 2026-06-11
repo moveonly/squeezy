@@ -15816,11 +15816,61 @@ fn index_category_of(entries: &[TranscriptEntry], index: usize) -> transcript_in
     }
 }
 
+/// A CHEAP staleness fingerprint folded over the raw transcript's `(id, revision)`
+/// sequence — O(entries) with no string clones, no per-entry classification, and
+/// no detail-line rendering. The sequence of `(id, revision)` fully determines
+/// every derived per-entry fact the overlay models build (category, error flag,
+/// tool name, elision counts), because those are pure functions of the entry
+/// content (captured by `revision`) and its neighbors (captured by sequence
+/// position). So an unchanged value means an unchanged built candidate set, and a
+/// `refresh_*` site can skip its expensive `build_*` pass entirely on this cheap
+/// `u64` comparison — the "one u64 comparison per idle frame" contract the overlay
+/// docs promise (deep-review #43/#44). Verbosity- or keybinding-dependent models
+/// (health markers) fold those extra inputs in on top of this.
+fn transcript_source_fingerprint(entries: &[TranscriptEntry]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entries.len().hash(&mut hasher);
+    for entry in entries {
+        entry.id.hash(&mut hasher);
+        entry.revision.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread count of how many times [`build_index_entries`] actually ran,
+    /// so a test can prove `refresh_transcript_index`'s cheap pre-build gate skips
+    /// the O(transcript-bytes) build on an unchanged repaint (deep-review #43).
+    /// Thread-local so parallel `cargo test` threads never race a global atomic.
+    static INDEX_ENTRIES_BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: record one [`build_index_entries`] pass.
+#[cfg(test)]
+fn note_index_entries_build() {
+    INDEX_ENTRIES_BUILDS.with(|c| c.set(c.get() + 1));
+}
+
+/// Test-only: reset this thread's [`build_index_entries`] build counter.
+#[cfg(test)]
+pub(crate) fn reset_index_entries_builds() {
+    INDEX_ENTRIES_BUILDS.with(|c| c.set(0));
+}
+
+/// Test-only: this thread's [`build_index_entries`] build count since the reset.
+#[cfg(test)]
+pub(crate) fn index_entries_builds() -> u64 {
+    INDEX_ENTRIES_BUILDS.with(|c| c.get())
+}
+
 /// Build the per-entry classification slice the index consumes from the active
 /// transcript. Each entry contributes its stable id, content revision (so a
 /// mutation re-indexes), primary category, error cross-cut flag, and — for tool
 /// results — its tool name (for per-tool lookup). Pure over the entry slice.
 fn build_index_entries(entries: &[TranscriptEntry]) -> Vec<transcript_index::IndexedEntry> {
+    #[cfg(test)]
+    note_index_entries_build();
     entries
         .iter()
         .enumerate()
@@ -15848,9 +15898,20 @@ fn build_index_entries(entries: &[TranscriptEntry]) -> Vec<transcript_index::Ind
 /// transcript change (append, stream settle, revision bump, clear, compaction,
 /// fold toggle, resume) rather than every frame.
 fn refresh_transcript_index(app: &mut TuiApp) {
+    // Cheap pre-build gate (deep-review #43): the per-frame `build_index_entries`
+    // is O(transcript-bytes) (it clones every tool name and re-classifies every
+    // entry), so skip it entirely when the raw `(id, revision)` sequence is
+    // unchanged — the actual "one u64 comparison per idle frame" the overlay docs
+    // promise. Only when the cheap fingerprint moves do we pay the build + the
+    // model's own finer-grained `rebuild_if_stale` guard.
+    let source_fp = transcript_source_fingerprint(active_transcript_entries(app));
+    if app.transcript_index_source_fp.get() == Some(source_fp) {
+        return;
+    }
     let entries = build_index_entries(active_transcript_entries(app));
     let fingerprint = transcript_index::TranscriptIndex::fingerprint_of(entries.iter());
     app.transcript_index.rebuild_if_stale(fingerprint, &entries);
+    app.transcript_index_source_fp.set(Some(source_fp));
 }
 
 /// Classify one transcript entry into its [`transcript_relations::RelationEntryKind`]
@@ -44711,6 +44772,13 @@ pub(crate) struct TuiApp {
     /// so an idle session pays one `u64` comparison per refresh and rebuilds
     /// nothing. Drives the index overlay's summary and navigation.
     pub(crate) transcript_index: transcript_index::TranscriptIndex,
+    /// CHEAP pre-build staleness gate for the Local Transcript Index (§12.5.1):
+    /// the raw `(id, revision)` transcript fingerprint at the last index refresh.
+    /// `refresh_transcript_index` compares against it and skips the O(transcript-
+    /// bytes) `build_index_entries` pass entirely when unchanged, so an open-but-
+    /// idle overlay truly costs one `u64` comparison (deep-review #43). `None`
+    /// until the first refresh.
+    pub(crate) transcript_index_source_fp: std::cell::Cell<Option<u64>>,
     /// Whether the Local Transcript Index overlay (§12.5.1) is open. `false` =
     /// closed (the resting state, paints nothing extra); `true` = the fullscreen
     /// summary owns key/mouse routing. Toggled by the `ToggleTranscriptIndex`
@@ -45842,6 +45910,7 @@ impl TuiApp {
             dock: dock::DockState::default(),
             presentation: presentation::PresentationState::default(),
             transcript_index: transcript_index::TranscriptIndex::new(),
+            transcript_index_source_fp: std::cell::Cell::new(None),
             transcript_index_open: false,
             transcript_index_selected: 0,
             transcript_index_anchor: None,
