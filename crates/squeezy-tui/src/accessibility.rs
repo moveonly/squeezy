@@ -781,6 +781,11 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // drive the same `dismiss_degraded_suggestion` handler.
         A::AcceptDegradedSuggestion => KeyboardPath::Keymap(Action::AcceptDegradedSuggestion),
         A::DismissDegradedSuggestion => KeyboardPath::Keymap(Action::DismissDegradedSuggestion),
+        // Session Auto-Save Checkpoints overlay (§12.9.5) — the `[restore]`
+        // affordance click and the overlay's `r` verb both drive the same
+        // `restore_session_checkpoint` handler. Reachable without a mouse while the
+        // overlay is open.
+        A::CheckpointRestore => KeyboardPath::Always("checkpoint overlay r"),
         // Prompt Snippets picker (§12.3.2) — the picker's own key handler owns
         // Up/Down (select), Enter (insert into the composer), `q` (queue), `d`
         // (delete), and `c` (clear) before the global keymap sees them, so every

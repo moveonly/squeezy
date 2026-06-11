@@ -328,6 +328,11 @@ pub(crate) enum ChromeKey {
     /// of its own; a click anywhere on it leaves zen — the mouse twin of the
     /// `ToggleZenMode` (`Ctrl+Alt+C`) verb.
     ZenStatusLine,
+    /// The `[restore]` affordance painted in the Session Auto-Save Checkpoints
+    /// overlay (§12.9.5). A single affordance with no identity of its own; a click
+    /// on it restores the saved checkpoint onto the running session — the mouse
+    /// twin of the overlay's `r` verb.
+    CheckpointRestore,
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -697,6 +702,11 @@ pub(crate) enum Action {
     /// ←→/Space; a click on a field row both focuses it and steps its value forward
     /// in one go (cycle the pane kind / orientation, or widen the split).
     SmartSplitAdjustField(usize),
+    /// Restore the saved UI-state checkpoint onto the running session (§12.9.5).
+    /// Mouse twin of the Session Auto-Save Checkpoints overlay's `r` verb, driving
+    /// the same `restore_session_checkpoint` handler so keyboard/mouse parity holds
+    /// by construction. A click on the overlay's `[restore]` affordance reaches it.
+    CheckpointRestore,
 }
 
 impl Action {
@@ -790,6 +800,7 @@ impl Action {
         Action::TogglePresentation,
         Action::CycleDockPanel,
         Action::ToggleZenMode,
+        Action::CheckpointRestore,
     ];
 }
 

@@ -638,6 +638,16 @@ pub(crate) enum Action {
     /// suggestion is showing. The mouse twin is a click on the banner's `[dismiss]`
     /// affordance. Costs nothing until a degraded terminal is detected.
     DismissDegradedSuggestion,
+    /// Session Auto-Save Checkpoints For UI State (§12.9.5): open / close the
+    /// read-only checkpoint status overlay (`Ctrl+Alt+[` default). The session's
+    /// UI state (scroll anchor, focused entry, active search, minimap pane) is
+    /// auto-saved on a debounced cadence and restored on relaunch / after a
+    /// crash; this overlay shows the last saved checkpoint and lets the user
+    /// manually restore it (`r`) or forget it (`x`). The mouse twin is a click on
+    /// the overlay's `[restore]` affordance. Costs nothing until opened; the
+    /// background auto-save adds only a fingerprint check on iterations the UI
+    /// already changed on, so an idle session pays nothing.
+    OpenSessionCheckpoint,
 }
 
 impl Action {
@@ -739,6 +749,7 @@ impl Action {
             Self::ToggleLayoutFallbackDiag => "toggle_layout_fallback_diag",
             Self::AcceptDegradedSuggestion => "accept_degraded_suggestion",
             Self::DismissDegradedSuggestion => "dismiss_degraded_suggestion",
+            Self::OpenSessionCheckpoint => "open_session_checkpoint",
         }
     }
 
@@ -839,6 +850,7 @@ impl Action {
         Action::ToggleLayoutFallbackDiag,
         Action::AcceptDegradedSuggestion,
         Action::DismissDegradedSuggestion,
+        Action::OpenSessionCheckpoint,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -1155,6 +1167,14 @@ impl Action {
             // `[accept]` / `[dismiss]` affordances.
             | Self::AcceptDegradedSuggestion
             | Self::DismissDegradedSuggestion
+            // Session Auto-Save Checkpoints (§12.9.5) opens with `Ctrl+Alt+[` — a
+            // Ctrl+Alt (Meta) punctuation chord, the same classically-unreliable
+            // encoding across Linux terminals, tmux, and SSH as the Zen / Restore /
+            // Layout-Fallback / degraded-mode policy chords above (and `Ctrl+Alt+[`
+            // can collide with the CSI/`ESC` prefix on some terminals). The
+            // always-available equivalent is a click on the overlay's `[restore]`
+            // affordance once opened; the auto-save itself needs no key at all.
+            | Self::OpenSessionCheckpoint
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1705,6 +1725,19 @@ impl Action {
             ),
             Self::DismissDegradedSuggestion => KeyBinding::new(
                 KeyCode::Char('\''),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Session Auto-Save Checkpoints (§12.9.5). `Ctrl+Alt+[` is a free
+            // `Ctrl+Alt` punctuation chord — every `Ctrl+Alt` LETTER is taken by
+            // the overlay / picker / editor / policy family, the Zen / Restore /
+            // Layout-Fallback / degraded-mode verbs claimed `Ctrl+Alt+.` /
+            // `Ctrl+Alt+,` / `Ctrl+Alt+/` / `Ctrl+Alt+;` / `Ctrl+Alt+'`, and bare
+            // `Alt+[` is the previous-error nav verb (distinct from the Ctrl+Alt
+            // chord) — so this stays clear of every other binding while sitting
+            // alongside the §12.9 recovery family. The overlay's `[restore]` click
+            // affordance is the always-available twin.
+            Self::OpenSessionCheckpoint => KeyBinding::new(
+                KeyCode::Char('['),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }

@@ -26597,6 +26597,463 @@ async fn workspace_profile_survives_tiny_and_resized_frames() {
 }
 
 // =====================================================================
+// §12.9.5 Session Auto-Save Checkpoints For UI State.
+// End-to-end through `handle_key` (Ctrl+Alt+[ open, r restore, x forget,
+// Esc close), `handle_mouse` ([restore] click), the real `render()`, the
+// debounced auto-save tick (`auto_save_session_checkpoint`), and the
+// restore-on-launch hook (`restore_session_checkpoint_on_launch`), with the
+// store pinned to a scratch dir.
+// =====================================================================
+
+/// `Ctrl+Alt+[`: open / close the Session Auto-Save Checkpoints overlay.
+fn session_checkpoint_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('['),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// Pin the per-session checkpoint store to a fresh scratch dir and give the app a
+/// distinct session id, returning the guard. The guard restores the prior env on
+/// drop and removes the scratch tree.
+struct ScopedSessionCheckpoint {
+    previous: Option<std::ffi::OsString>,
+    dir: PathBuf,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedSessionCheckpoint {
+    fn new(app: &mut TuiApp, name: &str) -> Self {
+        // Share the SAME process-global lock the unit tests in
+        // `session_checkpoint_tests.rs` hold, so the two suites never clobber the
+        // env dir out from under each other on the test runner's threads.
+        let lock = crate::session_checkpoint::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = temp_workspace(&format!("ui_checkpoint_store_{name}"));
+        let previous = std::env::var_os(crate::session_checkpoint::CHECKPOINT_DIR_ENV);
+        // SAFETY: the global mutex above serialises this env mutation.
+        unsafe { std::env::set_var(crate::session_checkpoint::CHECKPOINT_DIR_ENV, &dir) };
+        // Each test gets a distinct session id so their checkpoint files never
+        // collide on the shared store dir.
+        app.session_id = Some(format!("checkpoint-session-{name}"));
+        Self {
+            previous,
+            dir,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for ScopedSessionCheckpoint {
+    fn drop(&mut self) {
+        // SAFETY: see `new`.
+        match self.previous.take() {
+            Some(value) => unsafe {
+                std::env::set_var(crate::session_checkpoint::CHECKPOINT_DIR_ENV, value)
+            },
+            None => unsafe { std::env::remove_var(crate::session_checkpoint::CHECKPOINT_DIR_ENV) },
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Construct an `Instant` `offset` in the PAST without ever back-dating with bare
+/// subtraction (`Instant::now() - offset` PANICS on a fresh Windows monotonic
+/// clock younger than the offset). Fall back to an ever-smaller safe offset, then
+/// to `now` itself, so the first `checked_sub` succeeds on every platform.
+fn checkpoint_earlier(now: std::time::Instant, offset: std::time::Duration) -> std::time::Instant {
+    now.checked_sub(offset)
+        .or_else(|| now.checked_sub(std::time::Duration::from_millis(1)))
+        .unwrap_or(now)
+}
+
+#[tokio::test]
+async fn session_checkpoint_overlay_opens_and_paints_state_through_real_render() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let _scope = ScopedSessionCheckpoint::new(&mut app, "open");
+
+    // Idle: the modal is not painted.
+    let idle = render_to_string(&app, 100, 30);
+    assert!(
+        !idle.contains("Session checkpoint"),
+        "idle session paints no checkpoint overlay: {idle}"
+    );
+
+    handle_key(&mut app, &mut agent, session_checkpoint_key())
+        .await
+        .unwrap();
+    assert!(
+        app.session_checkpoint_overlay.is_some(),
+        "Ctrl+Alt+[ opens the overlay"
+    );
+
+    let open = render_to_string(&app, 100, 30);
+    assert!(
+        open.contains("Session checkpoint"),
+        "the modal title paints: {open}"
+    );
+    // The read-only field rows paint their labels.
+    assert!(open.contains("Scroll"), "field list shows Scroll: {open}");
+    assert!(
+        open.contains("Focused entry"),
+        "field list shows Focused entry: {open}"
+    );
+    assert!(open.contains("Search"), "field list shows Search: {open}");
+    assert!(
+        open.contains("Minimap pane"),
+        "field list shows Minimap pane: {open}"
+    );
+    // With nothing saved yet, the header says so and no [restore] affordance shows.
+    assert!(
+        open.contains("no checkpoint saved yet"),
+        "empty header reports no checkpoint: {open}"
+    );
+}
+
+#[tokio::test]
+async fn auto_save_writes_a_debounced_checkpoint_and_load_round_trips() {
+    let mut app = app_with_user_turns(8);
+    let _scope = ScopedSessionCheckpoint::new(&mut app, "autosave");
+    let session_id = app.session_id.clone().unwrap();
+
+    // A distinctive live UI state.
+    app.show_minimap = true;
+    app.selected_entry = Some(3);
+
+    // First eligible change saves immediately (no debounce gate to clear).
+    let now = std::time::Instant::now();
+    auto_save_session_checkpoint(&mut app, now);
+
+    let saved = crate::session_checkpoint::load(&session_id).expect("checkpoint persisted");
+    assert_eq!(saved.session_id, session_id);
+    assert!(saved.show_minimap, "the minimap pane state was captured");
+    assert_eq!(
+        saved.selected_entry,
+        Some(3),
+        "the focused entry was captured"
+    );
+    assert_eq!(
+        saved.transcript_revision, 8,
+        "the transcript revision (entry count) was captured"
+    );
+
+    // The file lives OUTSIDE the repo, under the dedicated checkpoint store.
+    let path = crate::session_checkpoint::checkpoint_path(&session_id);
+    assert!(path.exists());
+    assert!(
+        !path.starts_with(&app.workspace_root),
+        "the checkpoint must not live inside the workspace: {}",
+        path.display()
+    );
+
+    // A change immediately afterwards is HELD BACK by the debounce window: the
+    // last save was just recorded, so a second save inside the window is skipped.
+    app.selected_entry = Some(5);
+    auto_save_session_checkpoint(&mut app, now);
+    let still = crate::session_checkpoint::load(&session_id).unwrap();
+    assert_eq!(
+        still.selected_entry,
+        Some(3),
+        "the debounce held back the second save inside the window"
+    );
+
+    // Once the debounce window has elapsed, the changed state is written.
+    let later = now
+        .checked_add(crate::session_checkpoint::SAVE_DEBOUNCE + std::time::Duration::from_millis(1))
+        .unwrap_or(now);
+    auto_save_session_checkpoint(&mut app, later);
+    let updated = crate::session_checkpoint::load(&session_id).unwrap();
+    assert_eq!(
+        updated.selected_entry,
+        Some(5),
+        "the changed state is written after the debounce window elapses"
+    );
+}
+
+#[tokio::test]
+async fn auto_save_is_a_noop_without_a_session_id() {
+    // Edge case: a fresh boot before the agent minted a session id must never
+    // write a checkpoint (there is no owning session to key it by).
+    let mut app = app_with_user_turns(3);
+    let _scope = ScopedSessionCheckpoint::new(&mut app, "no_session");
+    // Override the scope's session id back to None for this edge case.
+    app.session_id = None;
+    auto_save_session_checkpoint(&mut app, std::time::Instant::now());
+    // Nothing was recorded in the store.
+    assert!(
+        !app.session_checkpoint.has_saved(),
+        "no checkpoint is written without a session id"
+    );
+}
+
+#[tokio::test]
+async fn restore_on_launch_applies_a_saved_checkpoint_clamped_to_the_transcript() {
+    // A tall transcript (well over the 80x24 viewport) so a non-following scroll
+    // anchor of a few lines up actually has content to apply against.
+    let mut app = app_with_user_turns(60);
+    let _scope = ScopedSessionCheckpoint::new(&mut app, "launch");
+    let session_id = app.session_id.clone().unwrap();
+
+    // Persist a checkpoint whose focused entry is PAST the current 60-entry
+    // transcript and that pins a non-following scroll anchor + a shown minimap.
+    let saved = crate::session_checkpoint::UiStateCheckpoint::new(
+        session_id.clone(),
+        99,
+        2,
+        false,
+        Some(200),
+        Some("needle".to_string()),
+        true,
+    );
+    crate::session_checkpoint::save(&saved).expect("save");
+
+    // Live state starts elsewhere.
+    app.show_minimap = false;
+    app.selected_entry = None;
+
+    restore_session_checkpoint_on_launch(&mut app);
+
+    // The minimap pane state was restored.
+    assert!(app.show_minimap, "restore re-showed the minimap pane");
+    // The out-of-range focused entry (8) was CLAMPED away rather than misapplied.
+    assert_eq!(
+        app.selected_entry, None,
+        "a stale focused entry past the transcript is dropped on restore"
+    );
+    // The scroll anchor was applied (no longer following the tail).
+    assert!(
+        !app.transcript_scroll.is_following(),
+        "the restored non-following scroll anchor was applied"
+    );
+    assert!(
+        app.status.contains("restored UI state"),
+        "status reports the restore: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn restore_on_launch_ignores_a_checkpoint_for_a_different_session() {
+    let mut app = app_with_user_turns(4);
+    let _scope = ScopedSessionCheckpoint::new(&mut app, "foreign");
+
+    // Persist a checkpoint under a DIFFERENT session id than the live one.
+    let foreign = crate::session_checkpoint::UiStateCheckpoint::new(
+        "some-other-session".to_string(),
+        2,
+        0,
+        true,
+        Some(1),
+        None,
+        true,
+    );
+    crate::session_checkpoint::save(&foreign).expect("save");
+
+    app.show_minimap = false;
+    restore_session_checkpoint_on_launch(&mut app);
+    assert!(
+        !app.show_minimap,
+        "a checkpoint for a different session is never applied"
+    );
+}
+
+#[tokio::test]
+async fn overlay_restore_via_keyboard_and_click_apply_the_saved_checkpoint() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = app_with_user_turns(6);
+    let _scope = ScopedSessionCheckpoint::new(&mut app, "restore_verb");
+    let session_id = app.session_id.clone().unwrap();
+
+    // Persist a checkpoint that turns the minimap ON.
+    let saved = crate::session_checkpoint::UiStateCheckpoint::new(
+        session_id.clone(),
+        6,
+        0,
+        true,
+        None,
+        None,
+        true,
+    );
+    crate::session_checkpoint::save(&saved).expect("save");
+
+    // Live state has the minimap off; open the overlay and restore via `r`.
+    app.show_minimap = false;
+    handle_key(&mut app, &mut agent, session_checkpoint_key())
+        .await
+        .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.show_minimap,
+        "the `r` verb restored the saved checkpoint"
+    );
+    assert!(
+        app.status.contains("restored UI state from checkpoint"),
+        "status reports the restore: {}",
+        app.status
+    );
+
+    // Now the mouse twin: flip the minimap off again, render so the [restore]
+    // target registers, and click it.
+    app.show_minimap = false;
+    let _ = render_to_string(&app, 100, 30);
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::CheckpointRestore,
+        ))
+        .expect("[restore] registered a click target");
+    let consumed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(consumed, "the click on [restore] is consumed");
+    assert!(
+        app.show_minimap,
+        "the [restore] click restored the saved checkpoint (mouse twin of `r`)"
+    );
+}
+
+#[tokio::test]
+async fn overlay_forget_removes_the_saved_checkpoint() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = app_with_user_turns(2);
+    let _scope = ScopedSessionCheckpoint::new(&mut app, "forget");
+    let session_id = app.session_id.clone().unwrap();
+
+    let saved = crate::session_checkpoint::UiStateCheckpoint::new(
+        session_id.clone(),
+        2,
+        0,
+        true,
+        None,
+        None,
+        false,
+    );
+    let path = crate::session_checkpoint::save(&saved).expect("save");
+    assert!(path.exists());
+
+    handle_key(&mut app, &mut agent, session_checkpoint_key())
+        .await
+        .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.status.contains("forgot"),
+        "forget reports it: {}",
+        app.status
+    );
+    assert!(!path.exists(), "forget removed the checkpoint file");
+}
+
+#[tokio::test]
+async fn overlay_keyboard_esc_closes_and_chord_toggles() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let _scope = ScopedSessionCheckpoint::new(&mut app, "esc");
+
+    handle_key(&mut app, &mut agent, session_checkpoint_key())
+        .await
+        .unwrap();
+    assert!(app.session_checkpoint_overlay.is_some(), "chord opens it");
+    // The same chord closes it.
+    handle_key(&mut app, &mut agent, session_checkpoint_key())
+        .await
+        .unwrap();
+    assert!(
+        app.session_checkpoint_overlay.is_none(),
+        "the same chord closes it"
+    );
+    // Reopen and close with Esc.
+    handle_key(&mut app, &mut agent, session_checkpoint_key())
+        .await
+        .unwrap();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.session_checkpoint_overlay.is_none(),
+        "Esc closes the overlay"
+    );
+}
+
+#[tokio::test]
+async fn overlay_survives_tiny_and_resized_frames() {
+    // Edge / resize case: the modal clamps to a tiny frame and never panics, and
+    // paints its title once it has room.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let _scope = ScopedSessionCheckpoint::new(&mut app, "resize");
+
+    handle_key(&mut app, &mut agent, session_checkpoint_key())
+        .await
+        .unwrap();
+    for (w, h) in [(4u16, 2u16), (12, 4), (30, 10), (120, 40)] {
+        let out = render_to_string(&app, w, h);
+        if w >= 40 {
+            assert!(
+                out.contains("Session checkpoint"),
+                "title paints at {w}x{h}: {out}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn auto_save_skips_an_unchanged_redraw_after_the_debounce_window() {
+    // Idle-cost guard: two auto-saves of the SAME state never produce a second
+    // write, even across the debounce window, so a redraw that changed nothing
+    // checkpointable costs no disk churn.
+    let mut app = app_with_user_turns(4);
+    let _scope = ScopedSessionCheckpoint::new(&mut app, "unchanged");
+    let session_id = app.session_id.clone().unwrap();
+
+    let now = std::time::Instant::now();
+    auto_save_session_checkpoint(&mut app, now);
+    let path = crate::session_checkpoint::checkpoint_path(&session_id);
+    let first_written = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .expect("first save mtime");
+
+    // A later tick well past the debounce window, but with identical state.
+    let later = now
+        .checked_add(crate::session_checkpoint::SAVE_DEBOUNCE + std::time::Duration::from_secs(1))
+        .unwrap_or(now);
+    auto_save_session_checkpoint(&mut app, later);
+    let second_written = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .expect("mtime still present");
+    assert_eq!(
+        first_written, second_written,
+        "an unchanged candidate is never re-written"
+    );
+
+    // Sanity: `checkpoint_earlier` builds a safe past instant on every platform
+    // (it never panics on a young Windows monotonic clock).
+    let _safe_past = checkpoint_earlier(now, std::time::Duration::from_secs(30));
+}
+
+// =====================================================================
 // §12.7.3 Per-Terminal Profiles.
 // End-to-end through `handle_key` (Ctrl+Alt+G open, ↑↓ field, ←→/Space
 // cycle, Enter save, r reset, Esc close), `handle_mouse` (click a field
