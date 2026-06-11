@@ -8536,6 +8536,27 @@ fn resolve_paste_staging(app: &mut TuiApp) -> bool {
 /// keeps a multi-megabyte block out of the prompt while leaving a durable,
 /// inspectable copy on disk. On a write failure the status reports it and
 /// nothing enters the composer.
+/// Create `path` exclusively and write `bytes`.
+///
+/// `create_new(true)` (O_CREAT|O_EXCL) refuses a pre-existing file or symlink at
+/// the predictable temp path with `AlreadyExists` instead of following/
+/// truncating it (closes the CWE-59 symlink + clobber holes the old `fs::write`
+/// left open); on Unix the file is forced to 0o600 so the staged paste is not
+/// world-readable (CWE-377).
+fn write_new_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(bytes)?;
+    file.flush()
+}
+
 fn stage_paste_to_temp_file(app: &mut TuiApp, paste: paste_staging::StagedPaste) {
     let text = paste.into_text();
     // Dedicated monotonic counter bumped per staging so two consecutive
@@ -8546,7 +8567,7 @@ fn stage_paste_to_temp_file(app: &mut TuiApp, paste: paste_staging::StagedPaste)
     app.next_temp_file_nonce += 1;
     let file_name = format!("squeezy_paste_{}_{}.txt", std::process::id(), seq);
     let path = std::env::temp_dir().join(file_name);
-    match std::fs::write(&path, text.as_bytes()) {
+    match write_new_private_file(&path, text.as_bytes()) {
         Ok(()) => {
             let display = path.display().to_string();
             let placeholder = insert_prompt_text_token(

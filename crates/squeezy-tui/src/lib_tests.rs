@@ -34007,6 +34007,10 @@ async fn temp_file_action_writes_a_file_and_inserts_a_reference_token() {
 #[test]
 fn consecutive_temp_file_stagings_write_distinct_files() {
     let mut app = test_app(SessionMode::Build);
+    // Pin a unique starting nonce so this test's predictable leaves cannot
+    // collide with another staging test running under the shared pid (now that
+    // staging creates files exclusively with create_new).
+    app.next_temp_file_nonce = unique_staging_nonce();
 
     let body_a = "AAAA paste A body".to_string();
     let body_b = "BBBB a different paste B body, longer".to_string();
@@ -34031,6 +34035,22 @@ fn consecutive_temp_file_stagings_write_distinct_files() {
     let _ = fs::remove_file(&path_b);
 }
 
+/// A process-unique starting nonce for a staging test, so the predictable
+/// `squeezy_paste_<pid>_<nonce>.txt` leaves it produces never collide with
+/// another test staging under the shared pid (staging now creates files
+/// exclusively via `create_new`, so a stale collision would fail the write).
+fn unique_staging_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static BUMP: AtomicU64 = AtomicU64::new(0);
+    let base = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    // Mix in a per-call bump so two tests entering within the same nanosecond
+    // still diverge.
+    base.wrapping_add(BUMP.fetch_add(1, Ordering::Relaxed) * 1000)
+}
+
 /// Pull the on-disk path out of the Nth inserted "Staged paste → <path>"
 /// reference token's attachment replacement.
 fn staged_paste_path(app: &TuiApp, idx: usize) -> String {
@@ -34040,6 +34060,79 @@ fn staged_paste_path(app: &TuiApp, idx: usize) -> String {
             .to_string(),
         other => panic!("expected a text token, got {other:?}"),
     }
+}
+
+/// deep-review #53 (CWE-377): a staged-paste temp file must be private (0o600),
+/// not the umask-derived 0o644 the old `fs::write` produced, so a staged paste
+/// secret is not readable by other local users.
+#[cfg(unix)]
+#[test]
+fn staged_paste_temp_file_is_mode_0600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut app = test_app(SessionMode::Build);
+    app.next_temp_file_nonce = unique_staging_nonce();
+    stage_paste_to_temp_file(
+        &mut app,
+        paste_staging::StagedPaste::new("secret staged body".to_string()),
+    );
+    let path = staged_paste_path(&app, 0);
+    let mode = fs::metadata(&path)
+        .expect("staged file exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    let _ = fs::remove_file(&path);
+    assert_eq!(
+        mode, 0o600,
+        "staged paste temp file must be 0o600, got {mode:o}"
+    );
+}
+
+/// deep-review #53 (CWE-59): staging must create its temp file exclusively. A
+/// pre-planted file/symlink at the predictable path must cause the staging to
+/// FAIL (status reports it) rather than the old `fs::write` following/clobbering
+/// it. We pre-plant the exact first leaf and assert the sentinel survives.
+#[cfg(unix)]
+#[test]
+fn staged_paste_refuses_to_clobber_a_preplanted_path() {
+    let mut app = test_app(SessionMode::Build);
+    // Pin a UNIQUE nonce so the predictable leaf this test plants cannot collide
+    // with another test staging its own first paste under the shared pid.
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    app.next_temp_file_nonce = nonce;
+    let planted = std::env::temp_dir().join(format!(
+        "squeezy_paste_{}_{}.txt",
+        std::process::id(),
+        nonce
+    ));
+    fs::write(&planted, b"SENTINEL").expect("plant sentinel");
+
+    stage_paste_to_temp_file(
+        &mut app,
+        paste_staging::StagedPaste::new("payload that must NOT overwrite".to_string()),
+    );
+
+    // No attachment was inserted (the write was refused) and the status reports
+    // the failure.
+    assert!(
+        app.prompt_attachments.is_empty(),
+        "a refused staging inserts no reference token"
+    );
+    assert!(
+        app.status.contains("temp-file staging failed"),
+        "the refusal is surfaced in the status: {}",
+        app.status
+    );
+    let survived = fs::read(&planted).expect("sentinel still readable");
+    let _ = fs::remove_file(&planted);
+    assert_eq!(
+        survived, b"SENTINEL",
+        "the pre-planted file must not be clobbered"
+    );
 }
 
 #[tokio::test]
