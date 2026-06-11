@@ -47859,6 +47859,14 @@ fn emit_finish_fullscreen_restore<W: Write>(writer: &mut W) -> io::Result<()> {
 /// then the resume/exit hint. Assumes [`emit_finish_fullscreen_restore`] already
 /// left the alternate screen, so every write here becomes native scrollback. Raw
 /// mode is still on, so rows are CRLF-terminated (a bare `\n` would stair-step).
+/// Buffer-input variant of the clean-exit mirror emission, retained for the
+/// byte-level `Capture` composer [`emit_finish_fullscreen`] which pre-builds a
+/// single mirror buffer. Production drives [`emit_finish_fullscreen_mirror_streamed`]
+/// instead (which streams the already-wrapped lines a chunk at a time); for an input
+/// that fits one chunk the two emit byte-identical rows, since the streamed path runs
+/// the same `render_lines_to_owned_buffer` + `emit_buffer_row_styled` on that one
+/// chunk. (deep-review #69)
+#[cfg(test)]
 fn emit_finish_fullscreen_mirror<W: Write>(
     writer: &mut W,
     mirror_rows: &Buffer,
@@ -47866,13 +47874,57 @@ fn emit_finish_fullscreen_mirror<W: Write>(
     exit_hint: Option<&str>,
     links: hyperlinks::HyperlinkCapabilities,
 ) -> io::Result<()> {
-    // 3: the collapsed transcript mirror as plain CRLF normal-buffer rows. OSC 8
-    // hyperlinks (§11G.5) light up URLs/paths in the persisted scrollback when
-    // the terminal is capable; otherwise the rows emit exactly as before.
     for y in 0..mirror_rows.area.height {
         writer.write_all(b"\r")?;
         emit_buffer_row_styled(writer, mirror_rows, y, width, links)?;
         writer.write_all(b"\r\n")?;
+    }
+    if let Some(hint) = exit_hint {
+        writer.write_all(b"\r\n")?;
+        writer.write_all(hint.as_bytes())?;
+        writer.write_all(b"\r\n")?;
+    }
+    Ok(())
+}
+
+/// Number of already-wrapped mirror rows materialized into the scratch buffer at a
+/// time by [`emit_finish_fullscreen_mirror_streamed`]. The clean-exit mirror feeds
+/// `transcript_lines_for_render` rows that are ALREADY wrapped to the mirror width
+/// (cache-hitting), so the chunk only needs to be wide enough to amortize the
+/// per-chunk `Paragraph`/`Buffer` setup; a small bound keeps the scratch buffer
+/// tiny regardless of session length (deep-review #69).
+const MIRROR_STREAM_CHUNK_ROWS: usize = 256;
+
+/// Stream the collapsed transcript mirror into native scrollback row-by-row,
+/// materializing the already-wrapped lines a bounded CHUNK at a time rather than
+/// allocating one full-transcript [`Buffer`] and re-wrapping the whole session a
+/// second time (deep-review #69). The input `lines` come from
+/// `transcript_lines_for_render(.., Some(mirror_width), ..)`, so they are already
+/// wrapped to `width` through the warm Main/EntryWrap caches; each chunk is rendered
+/// through the SAME `render_lines_to_owned_buffer` (so the rare over-long line still
+/// wraps exactly as the renderer would) and emitted through the SAME
+/// `emit_buffer_row_styled` (so wide-glyph clipping and OSC 8 hyperlinks stay
+/// byte-identical to the prior whole-buffer path). Because the whole session streams
+/// chunk-by-chunk, the old single-`Buffer` `u16::MAX` row cap no longer truncates the
+/// scrollback record — every row, newest included, persists.
+fn emit_finish_fullscreen_mirror_streamed<W: Write>(
+    writer: &mut W,
+    lines: &[Line<'static>],
+    width: u16,
+    exit_hint: Option<&str>,
+    links: hyperlinks::HyperlinkCapabilities,
+) -> io::Result<()> {
+    // 3: the collapsed transcript mirror as plain CRLF normal-buffer rows, streamed
+    // a bounded chunk at a time. OSC 8 hyperlinks (§11G.5) light up URLs/paths in the
+    // persisted scrollback when the terminal is capable; otherwise the rows emit
+    // exactly as before.
+    for chunk in lines.chunks(MIRROR_STREAM_CHUNK_ROWS) {
+        let mirror_rows = render_lines_to_owned_buffer(chunk, width);
+        for y in 0..mirror_rows.area.height {
+            writer.write_all(b"\r")?;
+            emit_buffer_row_styled(writer, &mirror_rows, y, width, links)?;
+            writer.write_all(b"\r\n")?;
+        }
     }
     // 4: the resume/exit hint, set off by a blank line, persisted in scrollback.
     if let Some(hint) = exit_hint {
@@ -48195,13 +48247,21 @@ impl TerminalGuard {
             width
         };
         let lines = transcript_lines_for_render(app, Some(mirror_width), true);
-        let mirror = render_lines_to_owned_buffer(&lines, mirror_width);
         let backend = self.term().backend_mut();
         // Emit the mirror into the now-restored normal buffer: the CRLF mirror
         // rows (with OSC 8 hyperlinks when capable) and the resume hint, all
-        // becoming native scrollback. Emit at the mirror buffer's own (painted)
-        // width so the per-row column scan matches the buffer it built.
-        emit_finish_fullscreen_mirror(backend, &mirror, mirror_width, exit_hint.as_deref(), links)?;
+        // becoming native scrollback. The rows are ALREADY wrapped to `mirror_width`
+        // by the cache-hitting line pipeline above, so stream them a bounded chunk
+        // at a time instead of allocating one full-transcript buffer + re-wrapping
+        // the whole session a second time (deep-review #69). Emit at the painted
+        // width so the per-row column scan matches the rows it built.
+        emit_finish_fullscreen_mirror_streamed(
+            backend,
+            &lines,
+            mirror_width,
+            exit_hint.as_deref(),
+            links,
+        )?;
         // NOTE: the alt-screen flags were already cleared right after the restore
         // above (deep-review #93), shrinking the crash re-leave race to the
         // restore bytes rather than the whole mirror emission below.

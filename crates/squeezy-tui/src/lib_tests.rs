@@ -12748,6 +12748,72 @@ fn render_lines_to_owned_buffer_keeps_the_tail_past_the_u16_ceiling() {
     );
 }
 
+// Regression (deep-review #69): the clean-exit transcript mirror streams its
+// already-wrapped rows into native scrollback a bounded CHUNK at a time instead of
+// allocating one full-transcript buffer + re-wrapping the whole session. The
+// streamed emission must (a) be byte-identical to the prior single-buffer emission
+// (a faithful refactor — same `render_lines_to_owned_buffer` + `emit_buffer_row_styled`
+// per chunk) and (b) emit EVERY row across chunk boundaries, so no row is dropped at
+// a chunk seam — including rows past the first chunk.
+#[test]
+fn finish_fullscreen_streamed_mirror_emits_every_row_across_chunks() {
+    // More rows than one chunk so the stream crosses at least one chunk boundary,
+    // with a per-row sentinel that fits the width on one row (so wrapping never
+    // splits it). Each line is already wrapped to the mirror width.
+    let width = 16u16;
+    let total = MIRROR_STREAM_CHUNK_ROWS * 2 + 7;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(total);
+    for i in 0..total {
+        lines.push(Line::from(format!("ROW{i:05}")));
+    }
+
+    // Streamed (production) emission.
+    let mut streamed = Vec::new();
+    emit_finish_fullscreen_mirror_streamed(
+        &mut streamed,
+        &lines,
+        width,
+        None,
+        hyperlinks::HyperlinkCapabilities::disabled(),
+    )
+    .expect("streamed emit");
+
+    // Single whole-transcript buffer emission (the prior path) as ground truth.
+    let mirror = render_lines_to_owned_buffer(&lines, width);
+    let mut buffered = Vec::new();
+    emit_finish_fullscreen_mirror(
+        &mut buffered,
+        &mirror,
+        width,
+        None,
+        hyperlinks::HyperlinkCapabilities::disabled(),
+    )
+    .expect("buffered emit");
+
+    assert_eq!(
+        streamed, buffered,
+        "streamed chunked emission must be byte-identical to the whole-buffer emission",
+    );
+
+    // Every row survives the stream — the first row, a row in the middle chunk, the
+    // last row of one chunk, and the first row of the next, none dropped at a seam.
+    let visible: String = strip_ansi(&String::from_utf8(streamed).expect("utf8"))
+        .chars()
+        .filter(|c| *c != '\r' && *c != '\n')
+        .collect();
+    for i in [
+        0,
+        MIRROR_STREAM_CHUNK_ROWS - 1,
+        MIRROR_STREAM_CHUNK_ROWS,
+        total - 1,
+    ] {
+        assert!(
+            visible.contains(&format!("ROW{i:05}")),
+            "row {i} must survive the chunked stream",
+        );
+    }
+}
+
 /// Finding-1 height fix: `visual_line_count`'s `chars().count().div_ceil(width)`
 /// estimate UNDER-counts a logical line that (a) word-wraps a too-long word and
 /// (b) contains wide CJK glyphs measured as one column but rendered as two. The
