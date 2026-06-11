@@ -170,6 +170,29 @@ fn remove_at_outside_any_range_is_a_noop() {
 }
 
 #[test]
+fn remove_at_hits_row_mode_left_of_anchor_col() {
+    // A `Row`-mode member painted/copied edge to edge whose raw anchor keeps a
+    // mid-row column (as `extend_by_row` leaves it). A toggle-off click left of
+    // that anchor column, but inside the visible edge-to-edge highlight, must
+    // still match the member and remove it.
+    let mut sel = Selection::at(
+        SelectionSurface::Main,
+        Pos::new(0, 4),
+        SelectionMode::Row,
+        80,
+    );
+    sel.cursor = Pos::new(2, 0);
+
+    let mut set = SelectionSet::new();
+    assert!(set.add(sel));
+    assert!(
+        set.remove_at(SelectionSurface::Main, Pos::new(0, 1)),
+        "a click left of the anchor column is still inside the edge-to-edge Row highlight"
+    );
+    assert!(set.is_empty());
+}
+
+#[test]
 fn clear_drops_every_member() {
     let mut set = SelectionSet::new();
     assert!(set.add(cell(0, 0, 4)));

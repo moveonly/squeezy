@@ -254,6 +254,13 @@ fn range_contains(sel: &Selection, pos: Pos) -> bool {
     if pos.row < start.row || pos.row > end.row {
         return false;
     }
+    // Row mode covers each row edge to edge (mirrors `col_span_for_row`'s
+    // `0..row_len`), and `extend_by_row` flips to Row without resetting the raw
+    // anchor/cursor columns. Match any cell on a covered row, ignoring columns,
+    // so a toggle-off click left of the anchor still hits the visible highlight.
+    if sel.mode == selection::SelectionMode::Row {
+        return true;
+    }
     if start.row == end.row {
         return pos.col >= start.col && pos.col < end.col.max(start.col + 1);
     }
