@@ -46493,36 +46493,30 @@ fn emit_terminal_emergency_teardown<W: Write>(
     Ok(())
 }
 
-/// Emit the clean-exit (`TerminalGuard::finish_fullscreen`) byte sequence into
-/// `writer`, in the exact shutdown order Phase 2 mandates:
+/// Compose the full clean-exit byte stream (terminal restore + transcript
+/// mirror) into `writer` for the byte-level `Capture` tests, in the same order
+/// the production driver [`TerminalGuard::finish_fullscreen`] now emits it:
 ///
-///   1. Disable mouse reporting (`DISABLE_MOUSE_MODES`) and alternate-scroll —
-///      BEFORE leaving the alternate screen, matching the
-///      `leave_transcript_overlay_screen` / `emit_terminal_emergency_teardown`
-///      ordering.
-///   2. `LeaveAlternateScreen` ONLY — restoring the pre-launch normal buffer
-///      with the user's pre-launch scrollback intact. Deliberately NEVER emits
-///      `\x1b[3J` (the scrollback purge is reserved for `/clear`), so closing
-///      squeezy can't wipe the terminal's prior history. Every subsequent write
-///      lands in the normal buffer and becomes native scrollback — which is the
-///      whole reason the mirror is written here, after the leave.
-///   3. The collapsed transcript mirror, row by row, each terminated by `\r\n`
-///      (CRLF, because raw mode is still on — a bare `\n` would not return the
-///      column and would stair-step the mirror).
-///   4. The exit/resume hint, if any: a blank `\r\n` separator, the hint, then
-///      `\r\n`. Plain normal-buffer text, so it persists in scrollback.
-///   5. The mode restores that mirror `emit_terminal_enter_setup` / the
-///      emergency teardown — keyboard enhancement flags off, bracketed paste
-///      off, focus reporting off, alternate-scroll off, mouse off, and the title
-///      reset `\x1b]0;\x07`. (`LeaveAlternateScreen` is NOT re-emitted; step 2
-///      already did it.) The hardware cursor (`show_cursor`) and `raw mode`
-///      (`disable_raw_mode`) are restored by the caller, since those are
-///      ratatui/crossterm calls rather than bytes, and raw mode must stay on
-///      through the CRLF writes above.
+///   1. The terminal RESTORE: mouse/alt-scroll off, `LeaveAlternateScreen`
+///      (never `\x1b[3J`, the scrollback purge is reserved for `/clear`), then
+///      every mode restore (keyboard-enhancement flags, bracketed paste, focus,
+///      alternate-scroll, mouse, title reset). See
+///      [`emit_finish_fullscreen_restore`]. The hardware cursor (`show_cursor`)
+///      and raw mode (`disable_raw_mode`) are restored by the driver, since
+///      those are ratatui/crossterm calls rather than bytes, and raw mode must
+///      stay on through the CRLF mirror rows below.
+///   2. The transcript MIRROR into the now-restored normal buffer: the collapsed
+///      transcript row by row, each `\r\n`-terminated (CRLF, because raw mode is
+///      still on — a bare `\n` would stair-step), then the exit/resume hint. See
+///      [`emit_finish_fullscreen_mirror`].
 ///
-/// Factored out so a `Capture`-backed test can assert the exact stream:
-/// `LeaveAlternateScreen` precedes the first CRLF mirror row, no `\x1b[3J`
-/// appears, the hint follows the rows, and the mode restores follow the hint.
+/// Production restores the terminal (step 1) and FLUSHES it before it allocates
+/// the heavy mirror buffer, so an alloc-failure abort while building the mirror
+/// still leaves a restored terminal — hence the split into the two free helpers
+/// above. This wrapper exists only so a `Capture`-backed test can assert the
+/// composed stream: `LeaveAlternateScreen` precedes the first CRLF mirror row,
+/// no `\x1b[3J` appears, and the hint follows the rows.
+#[cfg(test)]
 fn emit_finish_fullscreen<W: Write>(
     writer: &mut W,
     mirror_rows: &Buffer,
@@ -46530,24 +46524,32 @@ fn emit_finish_fullscreen<W: Write>(
     exit_hint: Option<&str>,
     links: hyperlinks::HyperlinkCapabilities,
 ) -> io::Result<()> {
+    // The terminal-restore bytes (leave alt-screen + every mode restore) are
+    // emitted FIRST, before the mirror rows, so the restored normal buffer is
+    // already in a sane state before any heavy mirror work — see
+    // `emit_finish_fullscreen_restore`. The mirror rows + hint then land in that
+    // restored normal buffer as native scrollback.
+    emit_finish_fullscreen_restore(writer)?;
+    emit_finish_fullscreen_mirror(writer, mirror_rows, width, exit_hint, links)
+}
+
+/// Emit the terminal-RESTORE half of the clean exit: leave the alternate screen
+/// (restoring the pre-launch normal buffer, never `\x1b[3J`) and put every mode
+/// back the way `emit_terminal_enter_setup` found it — keyboard-enhancement
+/// flags, bracketed paste, focus, alternate-scroll, mouse, and the title reset.
+///
+/// This is split out from the mirror so the clean-exit driver
+/// ([`TerminalGuard::finish_fullscreen`]) can flush these bytes BEFORE it
+/// allocates the heavy collapsed-transcript mirror: if that allocation aborts
+/// (alloc-error / OOM) the terminal has already been restored, instead of the
+/// user being stranded in a raw alternate screen. Emits NO mirror and NO hint;
+/// the caller follows with [`emit_finish_fullscreen_mirror`]. Raw mode stays on
+/// (the caller disables it last, after the CRLF mirror rows).
+fn emit_finish_fullscreen_restore<W: Write>(writer: &mut W) -> io::Result<()> {
     // 1 + 2: alternate-scroll + mouse off, then leave the alternate screen.
     // `restore_mouse_capture = false`: on a clean exit the TUI is shutting down,
     // so leave mouse reporting disabled rather than re-arming click capture.
     leave_transcript_overlay_screen(writer, false)?;
-    // 3: the collapsed transcript mirror as plain CRLF normal-buffer rows. OSC 8
-    // hyperlinks (§11G.5) light up URLs/paths in the persisted scrollback when
-    // the terminal is capable; otherwise the rows emit exactly as before.
-    for y in 0..mirror_rows.area.height {
-        writer.write_all(b"\r")?;
-        emit_buffer_row_styled(writer, mirror_rows, y, width, links)?;
-        writer.write_all(b"\r\n")?;
-    }
-    // 4: the resume/exit hint, set off by a blank line, persisted in scrollback.
-    if let Some(hint) = exit_hint {
-        writer.write_all(b"\r\n")?;
-        writer.write_all(hint.as_bytes())?;
-        writer.write_all(b"\r\n")?;
-    }
     // 5: restore terminal modes (no second `LeaveAlternateScreen`, no `\x1b[3J`).
     // Keyboard progressive enhancement is unsupported on the legacy Windows
     // console (crossterm returns `Unsupported`), so pop it best-effort — matching
@@ -46566,6 +46568,35 @@ fn emit_finish_fullscreen<W: Write>(
         Print(DISABLE_MOUSE_MODES),
         Print("\x1b]0;\x07")
     )
+}
+
+/// Emit the transcript-MIRROR half of the clean exit into the already-restored
+/// normal buffer: the collapsed transcript as plain CRLF normal-buffer rows,
+/// then the resume/exit hint. Assumes [`emit_finish_fullscreen_restore`] already
+/// left the alternate screen, so every write here becomes native scrollback. Raw
+/// mode is still on, so rows are CRLF-terminated (a bare `\n` would stair-step).
+fn emit_finish_fullscreen_mirror<W: Write>(
+    writer: &mut W,
+    mirror_rows: &Buffer,
+    width: u16,
+    exit_hint: Option<&str>,
+    links: hyperlinks::HyperlinkCapabilities,
+) -> io::Result<()> {
+    // 3: the collapsed transcript mirror as plain CRLF normal-buffer rows. OSC 8
+    // hyperlinks (§11G.5) light up URLs/paths in the persisted scrollback when
+    // the terminal is capable; otherwise the rows emit exactly as before.
+    for y in 0..mirror_rows.area.height {
+        writer.write_all(b"\r")?;
+        emit_buffer_row_styled(writer, mirror_rows, y, width, links)?;
+        writer.write_all(b"\r\n")?;
+    }
+    // 4: the resume/exit hint, set off by a blank line, persisted in scrollback.
+    if let Some(hint) = exit_hint {
+        writer.write_all(b"\r\n")?;
+        writer.write_all(hint.as_bytes())?;
+        writer.write_all(b"\r\n")?;
+    }
+    Ok(())
 }
 
 /// Mark the app so the very next loop frame repaints EVERYTHING from model state
@@ -46792,23 +46823,34 @@ impl TerminalGuard {
             Ok((w, _)) if w > 0 => w,
             _ => MIRROR_FALLBACK_WIDTH,
         };
-        // Collapsed-by-default mirror over the WHOLE transcript, opened by the
-        // startup/session card, built through the same fullscreen line pipeline
-        // `render()` draws — so the mirrored rows match what the user saw.
-        let lines = transcript_lines_for_render(app, Some(width), true);
-        let mirror = render_lines_to_owned_buffer(&lines, width);
-
         let exit_hint = self.exit_hint.clone();
         // Snapshot the effective hyperlink capability before borrowing the
         // backend (the call needs `&mut self` for `term()`, so the read can't
         // straddle that borrow).
         let links = app.effective_hyperlink_caps();
+        // RESTORE the terminal FIRST — leave the alternate screen (never
+        // `\x1b[3J`) and put every mode back — then flush, all BEFORE allocating
+        // the heavy collapsed-transcript mirror below. If that allocation aborts
+        // (alloc-error / OOM-kill), the user is left in a restored normal buffer
+        // rather than stranded in a raw alternate screen. Raw mode stays on so
+        // the CRLF mirror rows that follow do not stair-step; it is disabled last.
+        {
+            let backend = self.term().backend_mut();
+            emit_finish_fullscreen_restore(backend)?;
+            backend.flush()?;
+        }
+        // Collapsed-by-default mirror over the WHOLE transcript, opened by the
+        // startup/session card, built through the same fullscreen line pipeline
+        // `render()` draws — so the mirrored rows match what the user saw. Built
+        // AFTER the restore above so an allocation failure here cannot strand the
+        // terminal.
+        let lines = transcript_lines_for_render(app, Some(width), true);
+        let mirror = render_lines_to_owned_buffer(&lines, width);
         let backend = self.term().backend_mut();
-        // Emit the whole clean-exit sequence through the shared free helper:
-        // mouse/alt-scroll off, `LeaveAlternateScreen` (never `\x1b[3J`), the
-        // CRLF mirror rows (with OSC 8 hyperlinks when capable), the resume
-        // hint, and the mode restores.
-        emit_finish_fullscreen(backend, &mirror, width, exit_hint.as_deref(), links)?;
+        // Emit the mirror into the now-restored normal buffer: the CRLF mirror
+        // rows (with OSC 8 hyperlinks when capable) and the resume hint, all
+        // becoming native scrollback.
+        emit_finish_fullscreen_mirror(backend, &mirror, width, exit_hint.as_deref(), links)?;
         // The alternate screen has been left; record it so `Drop` won't leave it
         // again. Set BEFORE the trailing fallible calls so an error here still
         // prevents a double-leave. Mirror the same fact into the crash-path flag

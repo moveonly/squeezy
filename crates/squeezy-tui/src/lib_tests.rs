@@ -12088,6 +12088,57 @@ fn clean_exit_mirror() {
     );
 }
 
+/// Deep-review #67: the clean-exit driver must RESTORE the terminal — leave the
+/// alternate screen AND emit every mode restore — BEFORE it builds and prints the
+/// heavy collapsed-transcript mirror, so an alloc-failure abort while allocating
+/// the mirror buffer still leaves the user in a restored normal buffer rather than
+/// stranded in a raw alternate screen. We assert the load-bearing ordering
+/// invariant on the captured byte stream: every terminal-restore byte (the
+/// `LeaveAlternateScreen` and the final title-reset mode restore) precedes the
+/// first mirror row. Pre-fix the mode restores trailed the mirror (built first,
+/// restores emitted last); post-fix they lead it.
+#[test]
+fn finish_fullscreen_restores_terminal_before_building_the_mirror() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("summarize the change"));
+    app.push_transcript_item(TranscriptItem::assistant(
+        "Renamed the helper and updated its callers.",
+    ));
+
+    let (mut guard, sink) = TerminalGuard::for_capture_test(100, 40);
+    guard
+        .finish_fullscreen(&app)
+        .expect("clean exit mirrors the settled transcript");
+    let ansi = sink_to_string(&sink);
+
+    // The first mirror row is the earliest user-facing scrollback text.
+    let mirror_pos = ansi
+        .find("Renamed the helper and updated its callers.")
+        .expect("clean exit must mirror the committed assistant response");
+    // Leave-alt-screen is a terminal-restore byte and must precede the mirror.
+    let leave_pos = ansi
+        .find(LEAVE_ALT_SCREEN)
+        .expect("clean exit must leave the alternate screen");
+    assert!(
+        leave_pos < mirror_pos,
+        "LeaveAlternateScreen (offset {leave_pos}) must precede the first mirror row \
+         (offset {mirror_pos})",
+    );
+    // The title-reset `\x1b]0;\x07` is the LAST mode-restore byte. It is emitted
+    // by the restore half, so it too must land before the mirror — proving the
+    // whole restore sequence (not just the leave) completes before the heavy
+    // mirror is built and printed.
+    let title_reset_pos = ansi
+        .find("\x1b]0;\x07")
+        .expect("clean exit must reset the terminal title as part of the restore");
+    assert!(
+        title_reset_pos < mirror_pos,
+        "the title-reset mode restore (offset {title_reset_pos}) must precede the \
+         first mirror row (offset {mirror_pos}) so the terminal is fully restored \
+         before the heavy mirror allocation",
+    );
+}
+
 #[test]
 fn transcript_render_wraps_long_shell_cards_on_the_rail() {
     let mut app = test_app(SessionMode::Build);
