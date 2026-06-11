@@ -46936,11 +46936,6 @@ fn high_contrast_requested() -> bool {
 /// paste, focus reporting, and a hidden hardware cursor (the caret is a rendered
 /// glyph; Drop shows it again).
 fn emit_terminal_enter_setup<W: Write>(writer: &mut W, mouse_capture: bool) -> io::Result<()> {
-    let _ = execute!(
-        writer,
-        DisableModifyOtherKeys,
-        PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
-    );
     // Fullscreen: enter the alternate screen, clear it, home the cursor,
     // and enable bracketed paste / focus reporting. The hardware cursor
     // stays hidden (the caret is a rendered glyph); Drop shows it again.
@@ -46955,6 +46950,18 @@ fn emit_terminal_enter_setup<W: Write>(writer: &mut W, mouse_capture: bool) -> i
         EnableFocusChange,
         Hide
     )?;
+    // Push the kitty keyboard-enhancement flags AFTER EnterAlternateScreen so
+    // the per-screen keyboard-mode stack push lands on the alternate screen's
+    // own stack — not the main screen's. The kitty protocol keeps a separate
+    // enhancement-flag stack per screen buffer; pushing before the alt-screen
+    // swap leaves the entry stranded on the main screen, where the matching pop
+    // (now emitted before LeaveAlternateScreen on teardown) cannot reach it,
+    // corrupting the main screen's keyboard mode on exit. (deep-review #28)
+    let _ = execute!(
+        writer,
+        DisableModifyOtherKeys,
+        PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
+    );
     if mouse_capture {
         execute!(writer, Print(ENABLE_MOUSE_CLICK_CAPTURE))?;
     }
@@ -46977,8 +46984,19 @@ fn emit_terminal_emergency_teardown<W: Write>(
     alt_screen_active: bool,
 ) -> io::Result<()> {
     // Leave the alternate screen iff we are still in it (a clean exit or a
-    // prior teardown may already have left it).
+    // prior teardown may already have left it). Pop the kitty keyboard-
+    // enhancement stack entry FIRST, while still on the alternate screen, so the
+    // pop matches the push `emit_terminal_enter_setup` issued AFTER
+    // EnterAlternateScreen — i.e. on the alt screen's own per-screen stack.
+    // Popping after LeaveAlternateScreen would target the main screen's stack
+    // instead, underflowing it and corrupting the main screen's keyboard mode.
+    // (deep-review #28)
     if alt_screen_active {
+        // Keyboard progressive enhancement is unsupported on the legacy Windows
+        // console (crossterm returns `Unsupported`), so pop it best-effort —
+        // matching the best-effort push in `emit_terminal_enter_setup` — rather
+        // than failing the whole teardown on Windows.
+        let _ = execute!(writer, PopKeyboardEnhancementFlags);
         execute!(
             writer,
             DisableAlternateScroll,
@@ -46986,13 +47004,6 @@ fn emit_terminal_emergency_teardown<W: Write>(
             LeaveAlternateScreen
         )?;
     }
-    // Keyboard progressive enhancement is unsupported on the legacy Windows
-    // console (crossterm returns `Unsupported`), so pop it best-effort — matching
-    // the best-effort push in `emit_terminal_enter_setup` — rather than failing
-    // the whole teardown on Windows. Every other restore here is ANSI-only
-    // (`Print`) or a custom command with a no-op `execute_winapi`, so they stay
-    // fallible. Byte order is unchanged on platforms where the pop succeeds.
-    let _ = execute!(writer, PopKeyboardEnhancementFlags);
     execute!(
         writer,
         Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
@@ -47069,18 +47080,22 @@ fn emit_finish_fullscreen<W: Write>(
 /// the caller follows with [`emit_finish_fullscreen_mirror`]. Raw mode stays on
 /// (the caller disables it last, after the CRLF mirror rows).
 fn emit_finish_fullscreen_restore<W: Write>(writer: &mut W) -> io::Result<()> {
+    // Pop the kitty keyboard-enhancement stack entry FIRST, while still on the
+    // alternate screen, so the pop matches the push `emit_terminal_enter_setup`
+    // issued AFTER EnterAlternateScreen — on the alt screen's own per-screen
+    // stack. Popping after the leave would underflow the main screen's stack.
+    // Keyboard progressive enhancement is unsupported on the legacy Windows
+    // console (crossterm returns `Unsupported`), so pop it best-effort — matching
+    // the best-effort push in `emit_terminal_enter_setup` — rather than failing
+    // the whole teardown on Windows. (deep-review #28)
+    let _ = execute!(writer, PopKeyboardEnhancementFlags);
     // 1 + 2: alternate-scroll + mouse off, then leave the alternate screen.
     // `restore_mouse_capture = false`: on a clean exit the TUI is shutting down,
     // so leave mouse reporting disabled rather than re-arming click capture.
     leave_transcript_overlay_screen(writer, false)?;
     // 5: restore terminal modes (no second `LeaveAlternateScreen`, no `\x1b[3J`).
-    // Keyboard progressive enhancement is unsupported on the legacy Windows
-    // console (crossterm returns `Unsupported`), so pop it best-effort — matching
-    // the best-effort push in `emit_terminal_enter_setup` — rather than failing
-    // the whole teardown on Windows. Every other restore here is ANSI-only
-    // (`Print`) or a custom command with a no-op `execute_winapi`, so they stay
-    // fallible. Byte order is unchanged on platforms where the pop succeeds.
-    let _ = execute!(writer, PopKeyboardEnhancementFlags);
+    // Every restore here is ANSI-only (`Print`) or a custom command with a no-op
+    // `execute_winapi`, so they stay fallible.
     execute!(
         writer,
         Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),

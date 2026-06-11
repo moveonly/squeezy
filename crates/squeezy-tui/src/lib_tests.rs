@@ -10176,6 +10176,39 @@ fn fullscreen_enter_respects_mouse_capture_disabled() {
     );
 }
 
+/// (deep-review #28) The kitty keyboard-enhancement flags are pushed onto a
+/// PER-SCREEN stack, so the push must land AFTER `EnterAlternateScreen` — i.e.
+/// on the alternate screen's own stack, not the main screen's. Otherwise the
+/// matching pop on teardown underflows the main screen's stack and corrupts its
+/// keyboard mode. Assert the byte offset of `EnterAlternateScreen` precedes the
+/// `PushKeyboardEnhancementFlags` CSI in the emitted enter-setup stream.
+#[test]
+fn fullscreen_enter_pushes_keyboard_flags_after_alt_screen() {
+    let mut bytes = Vec::new();
+    emit_terminal_enter_setup(&mut bytes, /* mouse_capture = */ true)
+        .expect("emit fullscreen enter setup");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+
+    // Render the exact push CSI from the live flags rather than hardcoding the
+    // bit total, so the assertion tracks `keyboard_enhancement_flags()`.
+    let mut push = String::new();
+    PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
+        .write_ansi(&mut push)
+        .expect("render push CSI");
+
+    let enter_pos = ansi
+        .find("\x1b[?1049h")
+        .expect("enter setup must emit EnterAlternateScreen");
+    let push_pos = ansi
+        .find(&push)
+        .expect("enter setup must push the keyboard-enhancement flags");
+    assert!(
+        enter_pos < push_pos,
+        "EnterAlternateScreen must precede PushKeyboardEnhancementFlags so the \
+         push lands on the alternate screen's per-screen kitty stack"
+    );
+}
+
 #[test]
 fn mouse_capture_defaults_on_unless_disabled() {
     // Default ON when the var is unset.
