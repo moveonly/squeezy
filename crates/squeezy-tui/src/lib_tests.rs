@@ -16096,6 +16096,64 @@ fn smooth_scroll_anim_eases_from_start_to_target() {
     assert!(!anim.is_done(0));
 }
 
+#[test]
+fn re_triggering_a_jump_mid_ease_samples_start_from_the_displayed_position() {
+    // Re-triggering a jump while a prior ease is in flight must ease from where
+    // the paint actually IS (the mid-ease displayed offset), not from the prior
+    // ease's logical destination — otherwise the paint snaps to the old target
+    // first, then eases to the new one (deep-review #125).
+    let mut app = app_with_user_turns(200);
+    app.set_test_frame_size(80, 24);
+    app.smooth_scroll_enabled = true;
+    // Start pinned to the tail, then arm a long jump to the top.
+    assert!(app.transcript_scroll.is_following());
+    jump_main_to_top_animated(&mut app);
+    let first = app.main_scroll_anim.expect("a long jump arms an ease");
+    assert!(
+        first.target > first.start + MAIN_SCROLL_ANIM_MIN_DISTANCE,
+        "the jump-to-top is a large jump that eases",
+    );
+
+    // Advance the ease to its midpoint by back-dating its start clock (clock-safe
+    // on Windows). The displayed offset is now strictly between start and target.
+    let now = std::time::Instant::now();
+    let half = std::time::Duration::from_millis(MAIN_SCROLL_ANIM_MS / 2);
+    if let Some(anim) = app.main_scroll_anim.as_mut() {
+        anim.started_at = checkpoint_earlier(now, half);
+    }
+    let (line_count, viewport_h) = active_transcript_geometry(&app);
+    let displayed_mid = displayed_main_from_bottom(
+        &app,
+        app.transcript_scroll,
+        line_count,
+        viewport_h,
+    );
+    assert!(
+        displayed_mid > first.start && displayed_mid < first.target,
+        "the ease is genuinely partway (displayed {displayed_mid} between \
+         {} and {})",
+        first.start,
+        first.target,
+    );
+
+    // Re-trigger: commit a new (different) target while the ease is in flight.
+    let new_target = 0; // re-pin to the tail
+    commit_main_from_bottom_animated(&mut app, new_target);
+    let second = app
+        .main_scroll_anim
+        .expect("the re-trigger arms a fresh ease");
+    assert_eq!(
+        second.start, displayed_mid,
+        "the new ease starts from the mid-ease displayed position, not the prior \
+         ease's logical target ({})",
+        first.target,
+    );
+    assert_ne!(
+        second.start, first.target,
+        "the start is NOT the previous ease's destination (the bug)",
+    );
+}
+
 // =====================================================================
 // Phase 4: scroll-command wiring, follow-tail transitions, jump-nav,
 // wheel accumulation, scrollbar click-to-jump, and resize anchoring.

@@ -18770,7 +18770,17 @@ fn cancel_main_scroll_anim(app: &mut TuiApp) {
 /// reduced-motion / instant-scroll switch (`smooth_scroll_enabled`).
 fn commit_main_from_bottom_animated(app: &mut TuiApp, target_from_bottom: usize) {
     let (line_count, viewport_h) = active_transcript_geometry(app);
-    let start = active_transcript_scroll(app).offset_from_bottom(line_count, viewport_h);
+    // Sample the start from the DISPLAYED position, not the logical/committed
+    // offset: while a prior ease is in flight the logical offset already equals
+    // that ease's destination, so easing from it would snap the paint back to the
+    // old target before easing forward. `displayed_main_from_bottom` returns the
+    // live mid-ease position when an anim is active (deep-review #125).
+    let start = displayed_main_from_bottom(
+        app,
+        active_transcript_scroll(app),
+        line_count,
+        viewport_h,
+    );
     active_transcript_scroll_mut(app).set_from_bottom(target_from_bottom, line_count, viewport_h);
     arm_main_scroll_anim_from(app, start);
 }
@@ -18780,7 +18790,15 @@ fn commit_main_from_bottom_animated(app: &mut TuiApp, target_from_bottom: usize)
 /// `usize::MAX` sentinel), keeping it meaningful for a later `clamp`.
 fn jump_main_to_top_animated(app: &mut TuiApp) {
     let (line_count, viewport_h) = active_transcript_geometry(app);
-    let start = active_transcript_scroll(app).offset_from_bottom(line_count, viewport_h);
+    // Sample the start from the DISPLAYED (mid-ease) position so re-triggering a
+    // jump while a prior ease is in flight eases from where the paint actually is,
+    // not from the prior ease's logical destination (deep-review #125).
+    let start = displayed_main_from_bottom(
+        app,
+        active_transcript_scroll(app),
+        line_count,
+        viewport_h,
+    );
     active_transcript_scroll_mut(app).scroll_to_top(line_count, viewport_h);
     arm_main_scroll_anim_from(app, start);
 }
