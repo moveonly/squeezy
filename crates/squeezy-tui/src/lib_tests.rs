@@ -10999,6 +10999,77 @@ fn emergency_teardown_leaves_alt_screen_and_restores_modes_without_mirror() {
     );
 }
 
+/// Count the kitty keyboard-enhancement STACK-POP sequences (`CSI < … u`) in a
+/// stream. The push (`CSI > … u`) and the non-stack set/reset (`CSI = … u`) are
+/// NOT stack pops and are excluded. Used to prove a teardown pops exactly once
+/// per push, never underflowing the per-screen stack. (deep-review #94)
+fn count_keyboard_stack_pops(ansi: &str) -> usize {
+    let bytes = ansi.as_bytes();
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i + 2 < bytes.len() {
+        // A CSI introducer `\x1b[` followed by `<` is a stack-pop selector.
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' && bytes[i + 2] == b'<' {
+            // Walk to the CSI final byte; a `u` terminator confirms a keyboard
+            // stack pop (`CSI < [n] u`).
+            let mut j = i + 3;
+            while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'u' {
+                count += 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    count
+}
+
+/// (deep-review #94) Each teardown path pushed the kitty keyboard-enhancement
+/// flags exactly ONCE (`emit_terminal_enter_setup`), so it must pop exactly
+/// once. The teardown used to emit `PopKeyboardEnhancementFlags` (a stack pop)
+/// AND `RESET_KEYBOARD_ENHANCEMENT_FLAGS` when that constant was the raw `\x1b[<u`
+/// default-1 pop — popping TWICE and underflowing the stack. The reset is now the
+/// non-stack set form (`CSI = 0 ; 1 u`), so exactly one stack pop remains.
+#[test]
+fn teardown_pops_keyboard_enhancement_stack_exactly_once() {
+    // Emergency teardown (panic hook / SIGTERM / SIGHUP / Drop / suspend) path.
+    let mut emergency = Vec::new();
+    emit_terminal_emergency_teardown(&mut emergency, /* alt_screen_active = */ true)
+        .expect("emit emergency teardown");
+    let emergency = String::from_utf8(emergency).expect("ansi");
+    assert_eq!(
+        count_keyboard_stack_pops(&emergency),
+        1,
+        "emergency teardown must pop the keyboard-enhancement stack exactly once \
+         (one push ⇒ one pop), not twice: {emergency:?}"
+    );
+
+    // Clean-exit (finish_fullscreen) path.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("history"));
+    let width = 80u16;
+    let mirror = mirror_buffer_for(&app, width);
+    let mut clean = Vec::new();
+    emit_finish_fullscreen(
+        &mut clean,
+        &mirror,
+        width,
+        None,
+        hyperlinks::HyperlinkCapabilities::disabled(),
+    )
+    .expect("emit finish_fullscreen");
+    let clean = String::from_utf8(clean).expect("ansi");
+    assert_eq!(
+        count_keyboard_stack_pops(&clean),
+        1,
+        "clean-exit teardown must pop the keyboard-enhancement stack exactly once, \
+         not twice: {clean:?}"
+    );
+}
+
 /// Phase 9 SIGTSTP (Ctrl+Z) suspend/resume — byte contract.
 ///
 /// `TerminalGuard::suspend_and_resume` performs three steps around the actual

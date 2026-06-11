@@ -308,7 +308,18 @@ const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1006h";
 // The matching disable sequence (1000l, 1006l) is already part of
 // `DISABLE_MOUSE_MODES`, so the Drop tear-down covers undoing this
 // without needing a dedicated constant.
-const RESET_KEYBOARD_ENHANCEMENT_FLAGS: &str = "\x1b[<u";
+/// Belt-and-braces keyboard-enhancement reset, emitted alongside the single
+/// `PopKeyboardEnhancementFlags` stack pop on the teardown paths. This is the
+/// kitty protocol's NON-stack "set flags" form (`CSI = flags ; mode u` with
+/// flags 0, mode 1 = set-all), which zeroes the current enhancement flags
+/// WITHOUT touching the per-screen push/pop stack. The previous value `\x1b[<u`
+/// was itself a default-1 stack POP, so pairing it with `PopKeyboardEnhancementFlags`
+/// popped TWICE against the single push `emit_terminal_enter_setup` issues —
+/// underflowing the stack. The set form here cannot underflow: it is a direct
+/// "clear flags" for terminals where the matching pop missed (e.g. the push was
+/// dropped), while the explicit pop still unwinds the stack entry normally.
+/// (deep-review #94)
+const RESET_KEYBOARD_ENHANCEMENT_FLAGS: &str = "\x1b[=0;1u";
 /// DEC private mode 2026 — Begin Synchronized Update. Capable terminals
 /// buffer subsequent output and flip the cell grid atomically when they
 /// see the matching End Synchronized Update sequence. Terminals that do
