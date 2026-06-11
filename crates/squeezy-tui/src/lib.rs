@@ -4034,6 +4034,20 @@ fn main_surface_rows(app: &TuiApp) -> Vec<Line<'static>> {
 }
 
 /// The painted wrapped rows of the active selection surface (main or overlay).
+/// The column count the Ctrl+T transcript overlay wraps its rows at — the width
+/// recorded by `render_transcript_overlay` (the inner text split, narrower again
+/// with the diff-detail pane open). Falls back to the main text-area cache width,
+/// then the configured main width, before the overlay's first paint. Overlay-
+/// surface search must anchor its rows to THIS width, not the main width, or the
+/// painted highlight lands on the wrong overlay row (deep-review #16).
+fn overlay_text_width(app: &TuiApp) -> u16 {
+    app.transcript_overlay_text_width
+        .get()
+        .or_else(|| app.main_text_area_cache.get().map(|c| c.text_area.width))
+        .unwrap_or_else(|| main_text_width(app))
+        .max(1)
+}
+
 fn selection_surface_rows(
     app: &TuiApp,
     surface: selection::SelectionSurface,
@@ -4041,12 +4055,8 @@ fn selection_surface_rows(
     match surface {
         selection::SelectionSurface::Main => main_surface_rows(app),
         selection::SelectionSurface::Overlay => {
-            let width = app
-                .main_text_area_cache
-                .get()
-                .map(|c| c.text_area.width)
-                .unwrap_or_else(|| main_text_width(app));
-            with_transcript_overlay_rows(app, width.max(1), |rows| rows.to_vec())
+            let width = overlay_text_width(app);
+            with_transcript_overlay_rows(app, width, |rows| rows.to_vec())
         }
     }
 }
@@ -20368,6 +20378,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 app.auto_drain_queue = false;
                 app.transcript_overlay = None;
                 app.transcript_overlay_scrollbar_cache.set(None);
+                app.transcript_overlay_text_width.set(None);
                 app.overlay = None;
                 app.overlay_active_id = None;
                 app.mention_popup = None;
@@ -22099,6 +22110,7 @@ fn select_next_transcript_entry(app: &mut TuiApp) {
 /// conversation in one step, mirroring the pane's own Esc.
 fn close_transcript_overlay(app: &mut TuiApp) {
     app.transcript_overlay_scrollbar_cache.set(None);
+    app.transcript_overlay_text_width.set(None);
     app.transcript_overlay = None;
     // The detail pane only lives alongside the overlay; closing the overlay
     // closes the pane too so it can never linger as orphaned state.
@@ -32315,11 +32327,18 @@ fn search_row_kinds(
     surface: selection::SelectionSurface,
     painted_len: usize,
 ) -> Vec<search::RowKind> {
-    let width = app
-        .main_text_area_cache
-        .get()
-        .map(|c| c.text_area.width)
-        .unwrap_or_else(|| main_text_width(app));
+    // Wrap at the width the surface is actually painted at: the overlay text
+    // split for the overlay surface (deep-review #16), the main cache width for
+    // the main surface.
+    let width = match surface {
+        selection::SelectionSurface::Overlay => overlay_text_width(app),
+        selection::SelectionSurface::Main => app
+            .main_text_area_cache
+            .get()
+            .map(|c| c.text_area.width)
+            .unwrap_or_else(|| main_text_width(app))
+            .max(1),
+    };
     let (detail, filter) = match surface {
         selection::SelectionSurface::Overlay => (
             transcript_surface::DetailPolicy::from(overlay_detail(app)),
@@ -32330,8 +32349,7 @@ fn search_row_kinds(
             OverlayFilter::All,
         ),
     };
-    let model =
-        transcript_surface::build_transcript_rows_filtered(app, width.max(1), detail, filter);
+    let model = transcript_surface::build_transcript_rows_filtered(app, width, detail, filter);
     if model.len() != painted_len {
         return vec![search::RowKind::Normal; painted_len];
     }
@@ -32354,16 +32372,20 @@ fn refresh_search(app: &mut TuiApp) {
     };
     let rows = selection_surface_rows(app, surface);
     let kinds = search_row_kinds(app, surface, rows.len());
-    // The painted width both surfaces wrap at: the live text-area cache, falling
-    // back to the configured main width. `selection_surface_rows` wrapped at the
-    // same value, so the matches it produces are anchored to this width — record
-    // it on the state so `SearchState.width` tracks reality.
-    let width = app
-        .main_text_area_cache
-        .get()
-        .map(|c| c.text_area.width)
-        .unwrap_or_else(|| main_text_width(app))
-        .max(1);
+    // The width the active surface is painted at: the overlay text split for the
+    // overlay surface (deep-review #16), the main text-area cache for the main
+    // surface. `selection_surface_rows` wrapped at this same value, so the matches
+    // it produced are anchored to this width — record it on the state so
+    // `SearchState.width` tracks reality.
+    let width = match surface {
+        selection::SelectionSurface::Overlay => overlay_text_width(app),
+        selection::SelectionSurface::Main => app
+            .main_text_area_cache
+            .get()
+            .map(|c| c.text_area.width)
+            .unwrap_or_else(|| main_text_width(app))
+            .max(1),
+    };
     if let Some(state) = app.search.as_mut() {
         search::rebuild(state, &rows, &kinds, width);
     }
@@ -32430,12 +32452,8 @@ fn scroll_search_match_into_view(app: &mut TuiApp) {
             );
         }
         selection::SelectionSurface::Overlay => {
-            let width = app
-                .main_text_area_cache
-                .get()
-                .map(|c| c.text_area.width)
-                .unwrap_or_else(|| main_text_width(app));
-            let row_count = with_transcript_overlay_rows(app, width.max(1), |rows| rows.len());
+            let width = overlay_text_width(app);
+            let row_count = with_transcript_overlay_rows(app, width, |rows| rows.len());
             let viewport_h = app
                 .transcript_overlay_scrollbar_cache
                 .get()
@@ -33712,6 +33730,9 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 height: 0,
             },
         ));
+    // Record the width the overlay actually wraps its rows at so overlay-surface
+    // search re-anchors against the same coordinate space (deep-review #16).
+    app.transcript_overlay_text_width.set(Some(text_area.width));
     with_transcript_overlay_rows(app, text_area.width, |rows| {
         let row_count = rows.len();
         let scroll =
@@ -43740,6 +43761,15 @@ pub(crate) struct TuiApp {
     pub(crate) transcript_overlay: Option<TranscriptOverlayState>,
     pub(crate) transcript_overlay_scrollbar_cache:
         std::cell::Cell<Option<TranscriptOverlayScrollbarCache>>,
+    /// Per-frame snapshot of the overlay's painted TEXT width (the column count
+    /// the overlay rows are wrapped at). This is `area.width - 3` for the inner
+    /// text split, and narrower again when the diff-detail pane is open — so it
+    /// is generally NOT the main view's `main_text_area_cache.width`. Search on
+    /// the overlay surface must wrap/anchor its rows at THIS width, not the main
+    /// width, or the highlighted (row, col) lands on the wrong overlay row
+    /// (deep-review #16). Set in `render_transcript_overlay`; `None` before the
+    /// overlay's first paint (callers fall back to the main width).
+    pub(crate) transcript_overlay_text_width: std::cell::Cell<Option<u16>>,
     pub(crate) transcript_overlay_render_cache: std::cell::RefCell<TranscriptOverlayRenderCache>,
     /// Diff/detail pane pinned alongside the Ctrl+T overlay (§11G.10). `Some`
     /// pins one transcript entry (by stable id) into a right-side column that
@@ -45233,6 +45263,7 @@ impl TuiApp {
             paste_staging: None,
             transcript_overlay: None,
             transcript_overlay_scrollbar_cache: std::cell::Cell::new(None),
+            transcript_overlay_text_width: std::cell::Cell::new(None),
             transcript_overlay_render_cache: std::cell::RefCell::new(
                 TranscriptOverlayRenderCache::default(),
             ),

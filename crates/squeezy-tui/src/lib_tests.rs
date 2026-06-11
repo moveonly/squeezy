@@ -46356,3 +46356,81 @@ fn dock_restore_ignores_a_malformed_config() {
         .expect("write bare-panel settings");
     assert_eq!(read_persisted_dock(&app), None);
 }
+
+#[test]
+fn overlay_search_rows_wrap_at_the_overlay_width_not_the_main_width() {
+    // deep-review #16: the overlay-search surface must build/anchor its row model
+    // at the OVERLAY's painted text width, not the MAIN view's cached width. With
+    // the diff-detail pane open the overlay carves ~2/5 of the inner width off for
+    // the pane, so the overlay text column is far narrower than the main column —
+    // a long logical line wraps onto a DIFFERENT number of rows. If search reads
+    // the main width, every match (row, col) is anchored to the wrong row.
+    let mut app = app_with_wrapping_turns(8);
+
+    // Paint the main view first so `main_text_area_cache` holds the (wide) main
+    // text width.
+    let _ = render_to_string(&app, 100, 24);
+    let main_width = app
+        .main_text_area_cache
+        .get()
+        .map(|c| c.text_area.width)
+        .expect("a painted main frame stamps the text-area cache");
+
+    // Open the overlay with the diff-detail pane pinned to the last entry, then
+    // paint it: this stamps `transcript_overlay_text_width` at the narrowed
+    // overlay text column.
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+    let last = active_transcript_entries(&app).len().saturating_sub(1);
+    let entry_id = active_transcript_entries(&app)[last].id;
+    app.selected_entry = Some(last);
+    app.diff_detail_pane = Some(diff_detail_pane::DiffDetailPaneState::new(entry_id));
+    let _ = render_to_string(&app, 100, 24);
+    let overlay_width = app
+        .transcript_overlay_text_width
+        .get()
+        .expect("a painted overlay stamps the overlay text width");
+
+    // The pane really does narrow the overlay relative to main, and the narrower
+    // wrap yields a different row count — otherwise this test would prove nothing.
+    assert!(
+        overlay_width < main_width,
+        "the detail pane narrows the overlay text column ({overlay_width}) \
+         below the main width ({main_width})",
+    );
+    let rows_at_overlay_width =
+        with_transcript_overlay_rows(&app, overlay_width.max(1), |rows| rows.len());
+    let rows_at_main_width =
+        with_transcript_overlay_rows(&app, main_width.max(1), |rows| rows.len());
+    assert_ne!(
+        rows_at_overlay_width, rows_at_main_width,
+        "the narrower overlay column must wrap the content onto more rows than \
+         the wide main column",
+    );
+
+    // The surface row model search anchors against must match the overlay width.
+    let surface_rows = selection_surface_rows(&app, selection::SelectionSurface::Overlay).len();
+    assert_eq!(
+        surface_rows, rows_at_overlay_width,
+        "overlay-surface rows must wrap at the overlay text width",
+    );
+    assert_ne!(
+        surface_rows, rows_at_main_width,
+        "overlay-surface rows must NOT wrap at the main width (deep-review #16)",
+    );
+
+    // refresh_search records the same overlay width onto the live search state, so
+    // its match (row, col) anchoring tracks the overlay's reality.
+    app.search = Some(search::SearchState::open(
+        selection::SelectionSurface::Overlay,
+        main_width.max(1),
+    ));
+    if let Some(state) = app.search.as_mut() {
+        state.query = "turn".to_string();
+    }
+    refresh_search(&mut app);
+    assert_eq!(
+        app.search.as_ref().map(|s| s.width),
+        Some(overlay_width.max(1)),
+        "refresh_search anchors the overlay search at the overlay text width",
+    );
+}
