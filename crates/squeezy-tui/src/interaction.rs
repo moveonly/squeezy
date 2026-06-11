@@ -239,6 +239,14 @@ pub(crate) enum ChromeKey {
     /// affordance with no identity of its own; a left click anywhere on the line
     /// dismisses the shown hint — the mouse twin of the `DismissFirstRunHint` verb.
     FirstRunHint,
+    /// The Automatic Degraded-Mode Suggestions banner's `[accept]` affordance
+    /// (§12.9.4). A click applies the suggested degraded modes — the mouse twin of
+    /// the `AcceptDegradedSuggestion` verb.
+    DegradedSuggestionAccept,
+    /// The Automatic Degraded-Mode Suggestions banner's `[dismiss]` affordance
+    /// (§12.9.4). A click latches the suggestion dismissed — the mouse twin of the
+    /// `DismissDegradedSuggestion` verb.
+    DegradedSuggestionDismiss,
     /// The "Insert" button in the Prompt Snippets picker (§12.3.2).
     SnippetInsert,
     /// The "Queue" button in the Prompt Snippets picker (§12.3.2).
@@ -563,6 +571,15 @@ pub(crate) enum Action {
     /// the `DismissFirstRunHint` keyboard verb; a click on the dim hint strip retires
     /// the hint (latched seen for the session) so it never returns.
     DismissFirstRunHint,
+    /// Accept the shown Automatic Degraded-Mode Suggestion (§12.9.4). Mouse twin of
+    /// the `AcceptDegradedSuggestion` keyboard verb; a click on the banner's
+    /// `[accept]` affordance applies the suggested ASCII chrome / compact density /
+    /// mouse-off modes to the live session and latches the suggestion.
+    AcceptDegradedSuggestion,
+    /// Dismiss the shown Automatic Degraded-Mode Suggestion (§12.9.4). Mouse twin of
+    /// the `DismissDegradedSuggestion` keyboard verb; a click on the banner's
+    /// `[dismiss]` affordance latches it for the session so it never returns.
+    DismissDegradedSuggestion,
     /// Select the given snippet (by stable id) in the Prompt Snippets picker
     /// (§12.3.2). Mouse twin of the picker's Up/Down arrows. Fed by a single click
     /// on a snippet row.
@@ -735,6 +752,8 @@ impl Action {
         Action::BreadcrumbActivate(0),
         Action::OpenRenameForEntry(EntryId(0)),
         Action::DismissFirstRunHint,
+        Action::AcceptDegradedSuggestion,
+        Action::DismissDegradedSuggestion,
         Action::SnippetSelect(0),
         Action::SnippetInsertCompose(0),
         Action::SnippetEnqueue(0),

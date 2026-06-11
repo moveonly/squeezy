@@ -774,6 +774,13 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // (Ctrl+Alt+N default). The dim hint strip's click and the keyboard verb both
         // drive the same `dismiss_first_run_hint` handler.
         A::DismissFirstRunHint => KeyboardPath::Keymap(Action::DismissFirstRunHint),
+        // Automatic Degraded-Mode Suggestions banner (§12.9.4) — the `[accept]`
+        // affordance click and `AcceptDegradedSuggestion` (Ctrl+Alt+; default) both
+        // drive the same `accept_degraded_suggestion` handler; the `[dismiss]`
+        // affordance click and `DismissDegradedSuggestion` (Ctrl+Alt+' default) both
+        // drive the same `dismiss_degraded_suggestion` handler.
+        A::AcceptDegradedSuggestion => KeyboardPath::Keymap(Action::AcceptDegradedSuggestion),
+        A::DismissDegradedSuggestion => KeyboardPath::Keymap(Action::DismissDegradedSuggestion),
         // Prompt Snippets picker (§12.3.2) — the picker's own key handler owns
         // Up/Down (select), Enter (insert into the composer), `q` (queue), `d`
         // (delete), and `c` (clear) before the global keymap sees them, so every

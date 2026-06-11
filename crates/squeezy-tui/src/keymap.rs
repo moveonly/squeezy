@@ -624,6 +624,20 @@ pub(crate) enum Action {
     /// its status. There is no mouse affordance — like the latency / dogfood debug
     /// overlays it lives on the keyboard/command surface only.
     ToggleLayoutFallbackDiag,
+    /// Automatic Degraded-Mode Suggestions (§12.9.4): accept the proactively-shown
+    /// degraded-mode suggestion (`Ctrl+Alt+;` default), applying the suggested
+    /// minimal-glyph chrome / compact density / mouse-off modes to the live session
+    /// in one keystroke. A no-op fall-through when no suggestion is showing, so the
+    /// chord never steals a key from the composer. The mouse twin is a click on the
+    /// banner's `[accept]` affordance. Costs nothing until a degraded terminal is
+    /// detected; an idle, non-degraded session never paints the banner.
+    AcceptDegradedSuggestion,
+    /// Automatic Degraded-Mode Suggestions (§12.9.4): dismiss the proactively-shown
+    /// degraded-mode suggestion (`Ctrl+Alt+'` default), latching it for the session
+    /// so the same suggestion never nags again. A no-op fall-through when no
+    /// suggestion is showing. The mouse twin is a click on the banner's `[dismiss]`
+    /// affordance. Costs nothing until a degraded terminal is detected.
+    DismissDegradedSuggestion,
 }
 
 impl Action {
@@ -723,6 +737,8 @@ impl Action {
             Self::ToggleZenMode => "toggle_zen_mode",
             Self::RestoreTerminal => "restore_terminal",
             Self::ToggleLayoutFallbackDiag => "toggle_layout_fallback_diag",
+            Self::AcceptDegradedSuggestion => "accept_degraded_suggestion",
+            Self::DismissDegradedSuggestion => "dismiss_degraded_suggestion",
         }
     }
 
@@ -821,6 +837,8 @@ impl Action {
         Action::ToggleZenMode,
         Action::RestoreTerminal,
         Action::ToggleLayoutFallbackDiag,
+        Action::AcceptDegradedSuggestion,
+        Action::DismissDegradedSuggestion,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -1129,6 +1147,14 @@ impl Action {
             // mouse twin (a hidden debug surface), so it is honestly flagged
             // terminal-dependent.
             | Self::ToggleLayoutFallbackDiag
+            // Automatic Degraded-Mode Suggestions (§12.9.4) accept/dismiss are
+            // `Ctrl+Alt+;` / `Ctrl+Alt+'` — Ctrl+Alt (Meta) punctuation chords, the
+            // same classically-unreliable encoding across Linux terminals, tmux, and
+            // SSH as the Zen `Ctrl+Alt+.` / Restore `Ctrl+Alt+,` policy chords above.
+            // The always-available equivalent is a click on the banner's
+            // `[accept]` / `[dismiss]` affordances.
+            | Self::AcceptDegradedSuggestion
+            | Self::DismissDegradedSuggestion
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1662,6 +1688,23 @@ impl Action {
             // other binding while sitting alongside the other hidden debug toggles.
             Self::ToggleLayoutFallbackDiag => KeyBinding::new(
                 KeyCode::Char('/'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Automatic Degraded-Mode Suggestions (§12.9.4). Every `Ctrl+Alt` LETTER
+            // is taken (the §12.4.6 Presentation toggle claimed the last free one,
+            // `Ctrl+Alt+C`), and the Zen / Restore / Layout-Fallback policy chords
+            // claimed `Ctrl+Alt+.` / `Ctrl+Alt+,` / `Ctrl+Alt+/`, so accept/dismiss
+            // take the next two free `Ctrl+Alt` punctuation chords: `Ctrl+Alt+;`
+            // (accept) and `Ctrl+Alt+'` (dismiss). No other action binds
+            // `Ctrl+Alt`+`;`/`'`, so they stay in the same Ctrl+Alt overlay/policy
+            // family while colliding with nothing; the always-available equivalents
+            // are clicks on the banner affordances.
+            Self::AcceptDegradedSuggestion => KeyBinding::new(
+                KeyCode::Char(';'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            Self::DismissDegradedSuggestion => KeyBinding::new(
+                KeyCode::Char('\''),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }

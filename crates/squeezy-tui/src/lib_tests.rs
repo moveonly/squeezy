@@ -40808,6 +40808,277 @@ fn first_run_hint_does_not_paint_on_a_too_narrow_surface() {
 }
 
 // ===========================================================================
+// Automatic Degraded-Mode Suggestions (§12.9.4) — integration tests driving the
+// real `render()` / `handle_key` / `handle_mouse` paths through the TestBackend.
+// The deterministic, env-independent driver is the TINY-SIZE signal: a render
+// at/under the tiny floor (≤48×12) is detected as degraded regardless of the host
+// terminal, so the banner can be settled and asserted without mutating process env.
+// ===========================================================================
+
+/// A stable substring of the degraded-mode banner body, used to assert it painted.
+/// Terse because the banner only ever appears on a tiny terminal (≤48 cols), where
+/// width is scarce; the full impact/confidence detail is covered by the pure unit
+/// tests, which are not width-bound.
+const DEGRADED_BANNER_MARKER: &str = "degraded";
+
+/// A fresh app with a small transcript. The banner is driven by the render SIZE
+/// (tiny ⇒ degraded), so no env mutation is needed.
+fn app_for_degraded_suggestion() -> TuiApp {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("hello".to_string()));
+    app.push_transcript_item(TranscriptItem::assistant("hi".to_string()));
+    app
+}
+
+#[test]
+fn degraded_banner_paints_on_a_tiny_terminal_once_settled() {
+    let app = app_for_degraded_suggestion();
+    // Before the settle window the banner paints nothing (no instant flash) — the
+    // first render only stamps the eligibility clock.
+    let before = render_to_string(&app, 44, 11);
+    assert!(
+        !before.contains(DEGRADED_BANNER_MARKER),
+        "no banner flashes before the settle delay:\n{before}",
+    );
+    // Force the suggestion past its settle window, then render at a tiny size: the
+    // dim banner paints, naming the impact, a confidence badge, the modes accepting
+    // would apply, and accept/dismiss affordances.
+    app.degraded_suggestion.force_settle_for_test();
+    let out = render_to_string(&app, 44, 11);
+    assert!(
+        out.contains(DEGRADED_BANNER_MARKER),
+        "the settled banner paints on a tiny terminal:\n{out}",
+    );
+    // The actionable affordances are budgeted first, so they always render whole
+    // even at the tiny width that triggers the banner.
+    assert!(
+        out.contains("[accept]"),
+        "offers an accept affordance:\n{out}"
+    );
+    assert!(
+        out.contains("[dismiss]"),
+        "offers a dismiss affordance:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn degraded_banner_keyboard_accept_applies_the_modes_and_latches() {
+    let mut app = app_for_degraded_suggestion();
+    // Accepting persists the modes; pin the settings writes at a tempfile so the
+    // test never touches HOME.
+    let dir = temp_workspace("degraded_accept_kbd");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+    app.set_settings_path_override(Some(dir.join("settings.toml")));
+    app.degraded_suggestion.force_settle_for_test();
+    // Paint it so the banner is "showing" and the accept verb has something to apply.
+    let shown = render_to_string(&app, 44, 11);
+    assert!(
+        shown.contains(DEGRADED_BANNER_MARKER),
+        "banner shows first:\n{shown}",
+    );
+    // It suggests compact density on a tiny terminal; the knob is not compact yet.
+    assert_ne!(app.density_override, density::DensityMode::Compact);
+
+    let mut agent = test_agent(SessionMode::Build);
+    // Ctrl+Alt+; accepts the suggestion (the keyboard twin of the [accept] click).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char(';'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("Ctrl+Alt+; accepts the degraded-mode suggestion");
+
+    // The suggested modes took effect in-session…
+    assert_eq!(
+        app.density_override,
+        density::DensityMode::Compact,
+        "accepting pins compact density",
+    );
+    assert_eq!(
+        app.glyph_mode,
+        glyph_mode::GlyphMode::Ascii,
+        "accepting switches to ASCII chrome",
+    );
+    // …the suggestion is latched, so it never paints again even on a tiny terminal.
+    assert!(app.degraded_suggestion.is_dismissed());
+    let after = render_to_string(&app, 44, 11);
+    assert!(
+        !after.contains(DEGRADED_BANNER_MARKER),
+        "the accepted suggestion never returns:\n{after}",
+    );
+}
+
+#[tokio::test]
+async fn degraded_banner_keyboard_dismiss_retires_it_without_changing_modes() {
+    let mut app = app_for_degraded_suggestion();
+    app.degraded_suggestion.force_settle_for_test();
+    let shown = render_to_string(&app, 44, 11);
+    assert!(
+        shown.contains(DEGRADED_BANNER_MARKER),
+        "banner shows:\n{shown}",
+    );
+    let density_before = app.density_override;
+    let glyph_before = app.glyph_mode;
+
+    let mut agent = test_agent(SessionMode::Build);
+    // Ctrl+Alt+' dismisses the suggestion (the keyboard twin of the [dismiss] click).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('\''),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("Ctrl+Alt+' dismisses the degraded-mode suggestion");
+
+    assert!(app.degraded_suggestion.is_dismissed());
+    // Dismissing applies NOTHING — the modes are untouched.
+    assert_eq!(
+        app.density_override, density_before,
+        "dismiss changes no mode"
+    );
+    assert_eq!(app.glyph_mode, glyph_before, "dismiss changes no mode");
+    assert_eq!(app.status, "degraded-mode suggestion dismissed");
+    let after = render_to_string(&app, 44, 11);
+    assert!(
+        !after.contains(DEGRADED_BANNER_MARKER),
+        "the dismissed suggestion never returns:\n{after}",
+    );
+}
+
+#[test]
+fn degraded_banner_accept_and_dismiss_register_distinct_click_targets() {
+    let app = app_for_degraded_suggestion();
+    app.degraded_suggestion.force_settle_for_test();
+    // Render so the banner registers its accept/dismiss click targets.
+    let out = render_to_string(&app, 44, 11);
+    assert!(out.contains(DEGRADED_BANNER_MARKER), "banner shows:\n{out}");
+    // The banner paints on the row ABOVE the bottom (height 11 ⇒ y = 9). Scan that
+    // row for the two distinct affordance targets.
+    let y = 9u16;
+    let mut accept_hit = None;
+    let mut dismiss_hit = None;
+    for x in 0..44u16 {
+        match app.click_target_at(x, y) {
+            Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::DegradedSuggestionAccept),
+                interaction::Action::AcceptDegradedSuggestion,
+            )) => accept_hit = Some(x),
+            Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::DegradedSuggestionDismiss),
+                interaction::Action::DismissDegradedSuggestion,
+            )) => dismiss_hit = Some(x),
+            _ => {}
+        }
+    }
+    assert!(
+        accept_hit.is_some(),
+        "an [accept] click target is registered on the banner row",
+    );
+    assert!(
+        dismiss_hit.is_some(),
+        "a [dismiss] click target is registered on the banner row",
+    );
+}
+
+#[test]
+fn degraded_banner_mouse_accept_applies_the_modes() {
+    let mut app = app_for_degraded_suggestion();
+    let dir = temp_workspace("degraded_accept_mouse");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+    app.set_settings_path_override(Some(dir.join("settings.toml")));
+    app.degraded_suggestion.force_settle_for_test();
+    let _ = render_to_string(&app, 44, 11);
+    // Find the [accept] target cell on the banner row (y = 9 for height 11).
+    let y = 9u16;
+    let accept_x = (0..44u16).find(|&x| {
+        matches!(
+            app.click_target_at(x, y),
+            Some((
+                interaction::TargetKey::Chrome(interaction::ChromeKey::DegradedSuggestionAccept),
+                interaction::Action::AcceptDegradedSuggestion,
+            ))
+        )
+    });
+    let accept_x = accept_x.expect("an [accept] target exists");
+    let consumed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: accept_x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(consumed, "the click on [accept] is consumed");
+    assert_eq!(
+        app.density_override,
+        density::DensityMode::Compact,
+        "the [accept] click applies the suggested compact density",
+    );
+    assert!(app.degraded_suggestion.is_dismissed());
+}
+
+#[test]
+fn degraded_banner_is_suppressed_while_an_overlay_owns_the_surface() {
+    let mut app = app_for_degraded_suggestion();
+    app.degraded_suggestion.force_settle_for_test();
+    // A fullscreen §12 overlay owns the surface: the banner must not paint behind it,
+    // and it must not burn its showing (it stays un-dismissed).
+    app.session_timeline_open = true;
+    let out = render_to_string(&app, 44, 11);
+    assert!(
+        !out.contains(DEGRADED_BANNER_MARKER),
+        "no banner paints while an overlay owns the surface:\n{out}",
+    );
+    assert!(
+        !app.degraded_suggestion.is_dismissed(),
+        "suppression never retires the suggestion",
+    );
+    // Closing the overlay lets the same un-dismissed suggestion reappear.
+    app.session_timeline_open = false;
+    let out = render_to_string(&app, 44, 11);
+    assert!(
+        out.contains(DEGRADED_BANNER_MARKER),
+        "the suppressed banner reappears once the overlay closes:\n{out}",
+    );
+}
+
+#[test]
+fn degraded_banner_survives_resize_between_tiny_sizes() {
+    let app = app_for_degraded_suggestion();
+    app.degraded_suggestion.force_settle_for_test();
+    // The banner reserves no layout rows; it paints across a resize as long as the
+    // surface stays tiny (degraded) and wide enough to hold the body.
+    for (w, h) in [(44u16, 11u16), (48, 12), (40, 10)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains(DEGRADED_BANNER_MARKER),
+            "the banner paints across resize at {w}x{h}:\n{out}",
+        );
+    }
+}
+
+#[test]
+fn degraded_banner_does_not_paint_on_a_too_narrow_surface() {
+    let app = app_for_degraded_suggestion();
+    app.degraded_suggestion.force_settle_for_test();
+    // Below the 12-column floor the banner refuses to paint (the edge guard), so a
+    // sliver terminal never shows a clipped suggestion.
+    let out = render_to_string(&app, 10, 10);
+    assert!(
+        !out.contains(DEGRADED_BANNER_MARKER),
+        "the banner refuses to paint on a too-narrow surface:\n{out}",
+    );
+}
+
+// ===========================================================================
 // Scratchpad Pane (§12.3.3) — integration tests driving the real `render()` /
 // `handle_key` / `handle_mouse` / `handle_paste` paths through the TestBackend.
 // ===========================================================================

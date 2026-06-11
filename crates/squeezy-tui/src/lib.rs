@@ -96,6 +96,7 @@ mod commands_style;
 mod config_screen;
 mod copy;
 mod copy_code;
+mod degraded_mode;
 mod density;
 mod diff_detail_pane;
 mod dock;
@@ -9666,6 +9667,28 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
             app.toggle_layout_fallback_diagnostics();
             true
         }
+        keymap::Action::AcceptDegradedSuggestion => {
+            // §12.9.4: accept the proactively-shown degraded-mode suggestion,
+            // applying the suggested modes to the live session. A no-op fall-through
+            // (returns `false`) when no suggestion is showing, so the chord never
+            // steals a key from the composer or the surface beneath. A global
+            // display-preference verb; the config/setup screens own their own
+            // routing, so only those gate it.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            accept_degraded_suggestion(app)
+        }
+        keymap::Action::DismissDegradedSuggestion => {
+            // §12.9.4: dismiss the proactively-shown degraded-mode suggestion,
+            // latching it for the session. A no-op fall-through when nothing is
+            // showing. A global display-preference verb; only the config/setup
+            // screens gate it.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            dismiss_degraded_suggestion(app)
+        }
     }
 }
 
@@ -13192,6 +13215,164 @@ fn first_run_hint_suppressed(app: &TuiApp) -> bool {
         // hint is exactly the secondary noise zen exists to hide, so suppress it
         // while zen is on.
         || app.zen.chrome_suppressed()
+}
+
+/// Detect the degraded-terminal suggestion to offer this frame (§12.9.4), or
+/// `None` when the terminal is not degraded (or already at every suggested mode).
+/// Reads the live §12.7.3 capability probe, the painted size, and the modes the
+/// renderer is currently drawing with, then defers to the pure
+/// [`degraded_mode::DegradedModeSuggestor::detect`] rule so the banner render and
+/// the unit tests evaluate identical logic. Best-effort and side-effect-free.
+fn detect_degraded_suggestion(app: &TuiApp) -> Option<degraded_mode::DegradedSuggestion> {
+    let caps = terminal_profile::TerminalCapabilities::detect();
+    let (cols, rows) = app.off_frame_terminal_size();
+    // The mouse policy the renderer would resolve for this terminal (the §12.7.3
+    // override pin if the user set one this session, else the built-in default), so
+    // a "mouse off" suggestion is suppressed when mouse is already off.
+    let current_mouse = app
+        .terminal_profile_override
+        .map(|p| p.mouse)
+        .unwrap_or_else(|| terminal_profile::TerminalProfile::resolve(caps).mouse);
+    degraded_mode::DegradedModeSuggestor::detect(
+        caps,
+        cols,
+        rows,
+        app.glyph_mode,
+        app.density_override,
+        current_mouse,
+    )
+}
+
+/// Whether the §12.9.4 degraded-mode suggestion banner must stay hidden this frame.
+/// Shares the §12.1.8 first-run-hint suppression set (a modal / fullscreen overlay
+/// / command palette / search / paste flow owns the surface), so the proactive
+/// banner never paints behind a modal. Pure read over `app`.
+fn degraded_suggestion_suppressed(app: &TuiApp) -> bool {
+    first_run_hint_suppressed(app)
+}
+
+/// `Ctrl+Alt+;` (and a click on the banner's `[accept]` affordance): accept the
+/// proactively-shown degraded-mode suggestion (§12.9.4), applying the suggested
+/// minimal-glyph chrome / compact density / mouse-off modes to the live session and
+/// persisting them, then latching the suggestion so it never nags again. Returns
+/// `true` only when a suggestion was actually showing (so the keymap dispatch
+/// reports the key consumed); `false` — a fall-through — when nothing is showing, so
+/// the chord never steals a key from the composer or the surface beneath.
+fn accept_degraded_suggestion(app: &mut TuiApp) -> bool {
+    // Only act when a banner is actually on screen (the same gate the dismiss path
+    // uses), so the accept chord is a no-op fall-through otherwise.
+    if !app.degraded_suggestion.is_showing() {
+        return false;
+    }
+    let Some(suggestion) = detect_degraded_suggestion(app) else {
+        // Showing flag set but the condition cleared this frame: latch it closed
+        // without applying anything stale.
+        app.degraded_suggestion.accept();
+        app.needs_redraw = true;
+        return true;
+    };
+    let target = suggestion.target();
+    let mut applied: Vec<&'static str> = Vec::new();
+
+    // Glyph mode → ASCII chrome: apply in-session immediately (the renderer reads
+    // `app.glyph_mode` every frame) and persist via the same `[tui].glyph_mode`
+    // path the §12.7.6 editor commits through.
+    if let Some(mode) = target.glyph_mode {
+        app.glyph_mode = mode;
+        persist_glyph_mode(app, mode);
+        applied.push("ASCII chrome");
+    }
+    // Density → pinned compact: apply in-session and persist via the same
+    // `[tui].density` path the §12.4.1 cycle persists through.
+    if let Some(mode) = target.density {
+        app.density_override = mode;
+        persist_density(app, mode);
+        applied.push("compact density");
+    }
+    // Mouse → off: record the §12.7.3 per-terminal policy override (mouse disabled)
+    // so the preference is honored and persisted; the live capture state is owned by
+    // the terminal guard and reconciled on the next enter-setup.
+    if let Some(mouse) = target.mouse {
+        apply_degraded_mouse_override(app, mouse);
+        applied.push("mouse off");
+    }
+
+    app.degraded_suggestion.accept();
+    app.status = if applied.is_empty() {
+        "degraded-mode suggestion accepted".to_string()
+    } else {
+        format!("\u{2713} degraded mode: {}", applied.join(" + "))
+    };
+    app.needs_redraw = true;
+    true
+}
+
+/// `Ctrl+Alt+'` (and a click on the banner's `[dismiss]` affordance): dismiss the
+/// proactively-shown degraded-mode suggestion (§12.9.4), latching it for the session
+/// so the same suggestion never returns. Returns `true` when a suggestion was
+/// actually showing; `false` — a fall-through — when nothing is showing.
+fn dismiss_degraded_suggestion(app: &mut TuiApp) -> bool {
+    if !app.degraded_suggestion.is_showing() {
+        return false;
+    }
+    app.degraded_suggestion.dismiss();
+    app.status = "degraded-mode suggestion dismissed".to_string();
+    app.needs_redraw = true;
+    true
+}
+
+/// Persist a Minimal Glyph Mode pick to the user-scope config (§12.7.6) at
+/// `[tui].glyph_mode`, mirroring the §12.7.6 editor's commit path. Best-effort: a
+/// write failure leaves the in-session value in place and notes it in the status
+/// line. Factored out so the §12.9.4 accept path persists exactly like the editor.
+fn persist_glyph_mode(app: &mut TuiApp, mode: glyph_mode::GlyphMode) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    let target_path = app.user_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    let edit = SettingsEdit {
+        path: &["tui", "glyph_mode"],
+        op: EditOp::SetString(mode.as_str().to_string()),
+    };
+    if let Err(err) = apply_edits(&scope_target, &[edit]) {
+        app.status = format!("glyph mode set, but save failed: {err}");
+    }
+}
+
+/// Record a §12.7.3 per-terminal mouse policy override (here: mouse disabled) for
+/// the detected terminal and persist it under `[tui.terminal_profiles.<kind>]`, so
+/// the §12.9.4 "mouse off" suggestion is honored and survives a restart. Caches the
+/// override on the app so the §12.7.3 editor (and the next `detect`) sees it.
+/// Best-effort: a write failure leaves the in-session override in place.
+fn apply_degraded_mouse_override(app: &mut TuiApp, mouse: terminal_profile::MouseMode) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    let caps = terminal_profile::TerminalCapabilities::detect();
+    let base = app
+        .terminal_profile_override
+        .unwrap_or_else(|| terminal_profile::TerminalProfile::resolve(caps));
+    let working = terminal_profile::TerminalProfile { mouse, ..base };
+    app.terminal_profile_override = Some(working);
+
+    let kind = caps.kind.as_str();
+    let [(glyph_k, glyph_v), (mouse_k, mouse_v), (color_k, color_v)] = working.as_config_pairs();
+    let target_path = app.user_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    let edit = SettingsEdit {
+        path: &[],
+        op: EditOp::SetTableEntry {
+            table_path: &["tui", "terminal_profiles"],
+            key: kind.to_string(),
+            fields: vec![
+                (glyph_k, EditOp::SetString(glyph_v.to_string())),
+                (mouse_k, EditOp::SetString(mouse_v.to_string())),
+                (color_k, EditOp::SetString(color_v.to_string())),
+            ],
+        },
+    };
+    if let Err(err) = apply_edits(&scope_target, &[edit]) {
+        app.status = format!("mouse policy set, but save failed: {err}");
+    }
 }
 
 /// Handle a key while the Universal Command Palette (§12.1.1) is open. Returns
@@ -17101,6 +17282,18 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // seen so it never returns.
         interaction::Action::DismissFirstRunHint => {
             dismiss_first_run_hint(app);
+        }
+        // A click on the Automatic Degraded-Mode Suggestions banner's `[accept]`
+        // affordance (§12.9.4) applies the suggested modes — the mouse twin of the
+        // `AcceptDegradedSuggestion` verb.
+        interaction::Action::AcceptDegradedSuggestion => {
+            accept_degraded_suggestion(app);
+        }
+        // A click on the banner's `[dismiss]` affordance (§12.9.4) latches the
+        // suggestion dismissed — the mouse twin of the `DismissDegradedSuggestion`
+        // verb.
+        interaction::Action::DismissDegradedSuggestion => {
+            dismiss_degraded_suggestion(app);
         }
         // A click on an Actionable Tool Outputs item row (§12.3.1): move the cursor
         // onto it and run its primary action (copy the matched element) — the mouse
@@ -23827,6 +24020,16 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     // nothing and registers no click target. Drawn after the toast stack so a toast
     // wins the same corner, and before the hover popover so a peek covers it.
     render_first_run_hint(frame, area, app);
+    // The Automatic Degraded-Mode Suggestions banner (§12.9.4) is a NON-modal dim
+    // line painted on the main surface only — every fullscreen overlay returns
+    // earlier and never reaches here, so it never leaks over a modal. It reserves no
+    // layout rows and clips what it overlaps (like the toast stack); it paints (and
+    // registers its accept/dismiss click targets) ONLY when a degraded terminal is
+    // detected and the user has not yet accepted/dismissed the suggestion, so an
+    // idle / non-degraded session pays nothing. Drawn after the first-run hint so
+    // the two share the bottom-left without overlapping (the banner takes the row
+    // above the hint).
+    render_degraded_suggestion(frame, area, app);
     // The Replayable Interaction Macros (§12.3.7) record/replay status strip is a
     // NON-modal dim line painted at the top-left of the main surface only — every
     // fullscreen overlay returns earlier and never reaches here, so the strip never
@@ -30097,6 +30300,160 @@ fn render_first_run_hint(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     );
 }
 
+/// Render the Automatic Degraded-Mode Suggestions banner (§12.9.4): a single dim
+/// warning-toned line painted near the bottom-left of the main surface ONLY when
+/// the §12.7.3 capability probe / painted size / active modes detect a degraded
+/// terminal AND the user has not yet accepted or dismissed the suggestion, after a
+/// short settle delay. It names the lead reason + its impact, a confidence badge
+/// (the spec's "include confidence"), the concrete modes accepting would apply, and
+/// `[accept]` / `[dismiss]` affordances — each registering its own click target
+/// (the mouse twins of the `Accept`/`DismissDegradedSuggestion` verbs). It reserves
+/// no layout rows and clips what it overlaps (like the toast stack); when no
+/// suggestion is active (not degraded, already accepted/dismissed, feature off, or
+/// a transient suppression) it paints nothing and registers no targets, so an idle /
+/// non-degraded session pays nothing.
+fn render_degraded_suggestion(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    use ratatui::{
+        style::{Modifier, Style},
+        text::{Line, Span},
+        widgets::{Clear, Paragraph},
+    };
+    if area.width < 12 || area.height == 0 {
+        return;
+    }
+    let suppressed = degraded_suggestion_suppressed(app);
+    let suggestion = detect_degraded_suggestion(app);
+    if !app
+        .degraded_suggestion
+        .active(suggestion.as_ref(), std::time::Instant::now(), suppressed)
+    {
+        return;
+    }
+    // `active` returned true, so a suggestion is present and settled.
+    let Some(suggestion) = suggestion else {
+        return;
+    };
+    let accept = key_hint(app, keymap::Action::AcceptDegradedSuggestion);
+    let dismiss = key_hint(app, keymap::Action::DismissDegradedSuggestion);
+    // The two affordances are distinct, separately-clickable spans, and they are
+    // the *actionable* part — so they are budgeted FIRST and never dropped while the
+    // body (informational) is truncated to fit the remaining width. This keeps the
+    // banner usable even at the tiny widths that trigger it. The labels are terse
+    // (`[accept]` / `[dismiss]`, no inline chord) so they fit on a cramped line; the
+    // rebindable key chords are named in the body prefix when there is room, and are
+    // always discoverable via `/keymap`.
+    let accept_label = "[accept]".to_string();
+    let dismiss_label = " [dismiss]".to_string();
+    let accept_w = accept_label.chars().count();
+    let dismiss_w = dismiss_label.chars().count();
+
+    // The full body: lead reason + impact + confidence badge + what accepting
+    // applies + the keyboard chords. Truncated to whatever width is left after the
+    // affordances, longest-detail-last so the most useful prefix survives a tight
+    // width.
+    let lead = suggestion.lead_signal();
+    // When several reasons corroborate, name the lead in full and summarize the
+    // rest by count so the line stays terse.
+    let more = match suggestion.signal_count().saturating_sub(1) {
+        0 => String::new(),
+        n => format!(" +{n} more"),
+    };
+    let body = format!(
+        "degraded \u{2192} {} [{}] \u{00b7} {}{more} ({accept} accept / {dismiss} dismiss) \u{00b7} ",
+        suggestion.target().summary(),
+        suggestion.confidence_label(),
+        lead.impact(),
+    );
+
+    // Clamp the whole line to the area, leaving a one-cell margin so it never
+    // collides with a right-corner toast. Reserve the affordances, then give the
+    // body the remainder.
+    let max_width = area.width.saturating_sub(1) as usize;
+    let affordances_w = accept_w + dismiss_w;
+    let body_budget = max_width.saturating_sub(affordances_w);
+    let body_visual: String = body.chars().take(body_budget).collect();
+    let body_w = body_visual.chars().count();
+    // The affordances are terse (`[accept] [dismiss]`, 18 cells), so they fit on any
+    // terminal wide enough to clear the 12-col floor — but defend with a final clamp
+    // so a pathological width never overflows the line.
+    let accept_visual: String = accept_label
+        .chars()
+        .take(max_width.saturating_sub(body_w))
+        .collect();
+    let accept_w = accept_visual.chars().count();
+    let dismiss_visual: String = dismiss_label
+        .chars()
+        .take(max_width.saturating_sub(body_w + accept_w))
+        .collect();
+    let dismiss_w = dismiss_visual.chars().count();
+
+    let total_w = (body_w + accept_w + dismiss_w) as u16;
+    if total_w == 0 {
+        return;
+    }
+    // Paint on the row ABOVE the very bottom row when there is height for it (the
+    // §12.1.8 first-run hint owns the last row), else fall back to the last row.
+    let y = if area.height >= 2 {
+        area.bottom().saturating_sub(2)
+    } else {
+        area.bottom().saturating_sub(1)
+    };
+    let row_rect = Rect {
+        x: area.left(),
+        y,
+        width: total_w.min(area.width),
+        height: 1,
+    };
+    // Warning-toned dim italic so it reads as a restrained suggestion, never as a
+    // transcript entry or a hard error.
+    let base_style = Style::default()
+        .fg(crate::render::theme::warn())
+        .add_modifier(Modifier::ITALIC);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(body_visual, base_style));
+    if !accept_visual.is_empty() {
+        spans.push(Span::styled(
+            accept_visual,
+            base_style.add_modifier(Modifier::BOLD),
+        ));
+    }
+    if !dismiss_visual.is_empty() {
+        spans.push(Span::styled(dismiss_visual, base_style));
+    }
+    frame.render_widget(Clear, row_rect);
+    frame.render_widget(Paragraph::new(Line::from(spans)), row_rect);
+
+    // Register a click target for each affordance so a click on `[accept]` accepts
+    // and a click on `[dismiss]` dismisses — the mouse twins of the keyboard verbs.
+    // Registered last so they win over whatever the status row registered beneath.
+    let accept_x = row_rect.x.saturating_add(body_w as u16);
+    if accept_w > 0 {
+        app.register_click(
+            Rect {
+                x: accept_x,
+                y,
+                width: accept_w as u16,
+                height: 1,
+            },
+            interaction::TargetKey::Chrome(interaction::ChromeKey::DegradedSuggestionAccept),
+            interaction::Action::AcceptDegradedSuggestion,
+        );
+    }
+    let dismiss_x = accept_x.saturating_add(accept_w as u16);
+    if dismiss_w > 0 {
+        app.register_click(
+            Rect {
+                x: dismiss_x,
+                y,
+                width: dismiss_w as u16,
+                height: 1,
+            },
+            interaction::TargetKey::Chrome(interaction::ChromeKey::DegradedSuggestionDismiss),
+            interaction::Action::DismissDegradedSuggestion,
+        );
+    }
+}
+
 /// Render the Replayable Interaction Macros (§12.3.7) record/replay status strip:
 /// a single dim line at the top-left of `area` while the recorder is active. It
 /// shows the live "● REC macro — N step(s)" or "▶ replay macro — done/total"
@@ -30409,6 +30766,17 @@ fn should_advance_animation_tick(app: &TuiApp) -> bool {
         || app
             .first_run_hints
             .reveal_pending(std::time::Instant::now(), first_run_hint_suppressed(app))
+        // Automatic Degraded-Mode Suggestions (§12.9.4): keep one tick alive only
+        // while a degraded-terminal suggestion is still settling (un-dismissed,
+        // inside its settle window), so the dim banner paints once after its short
+        // delay and then the engine goes quiet — never a redraw loop. On a
+        // non-degraded terminal, once accepted/dismissed, or while suppressed,
+        // `reveal_pending` returns `false`, preserving the zero-idle-cost invariant.
+        || app.degraded_suggestion.reveal_pending(
+            detect_degraded_suggestion(app).as_ref(),
+            std::time::Instant::now(),
+            degraded_suggestion_suppressed(app),
+        )
 }
 
 fn working_line(app: &TuiApp) -> Line<'static> {
@@ -43325,6 +43693,19 @@ pub(crate) struct TuiApp {
     /// render path paints nothing and the redraw gate schedules no tick: zero idle
     /// cost after dismissal.
     pub(crate) first_run_hints: first_run_hints::HintEngine,
+    /// Automatic Degraded-Mode Suggestions (§12.9.4): the dismissed latch + settle
+    /// clock that, together with the live §12.7.3 capability probe / painted size /
+    /// active §12.7.6 glyph + §12.4.1 density modes, decides whether to paint the
+    /// dim "degraded terminal — suggest a plainer mode?" banner this frame. The user
+    /// accepts it (applies the suggested ASCII chrome / compact density / mouse-off
+    /// modes via the `AcceptDegradedSuggestion` verb / a `[accept]` click) or
+    /// dismisses it (the `DismissDegradedSuggestion` verb / a `[dismiss]` click),
+    /// latched for the session so it never nags again. On a non-degraded (or
+    /// already-accepted/dismissed) terminal
+    /// [`degraded_mode::DegradedModeSuggestor::is_quiet`] / a `None` detection make
+    /// the render path paint nothing and the redraw gate schedule no tick: zero idle
+    /// cost.
+    pub(crate) degraded_suggestion: degraded_mode::DegradedModeSuggestor,
     /// User-authored slash macros loaded from `~/.squeezy/prompts/` and
     /// `<workspace>/.squeezy/prompts/`. Consulted by
     /// [`handle_slash_command`] when the typed head isn't a built-in
@@ -43899,6 +44280,7 @@ impl TuiApp {
             gestures: interaction::Recognizer::new(),
             hover_intent: hover_intent::HoverIntentState::default(),
             first_run_hints: first_run_hints::HintEngine::default(),
+            degraded_suggestion: degraded_mode::DegradedModeSuggestor::default(),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
             preserve_input_after_slash_command: false,
             settings_path_override: None,
