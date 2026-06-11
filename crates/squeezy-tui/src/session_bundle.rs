@@ -24,13 +24,19 @@
 //! ## Redaction is on by default
 //!
 //! Bundles are meant to be *shared*, so the privacy-safe default is to redact:
-//! [`redact_secrets`] masks the obvious secret shapes (bearer/authorization
-//! tokens, `KEY=secret` assignments for sensitive-looking keys, long
-//! high-entropy `sk-`/`ghp_`-style API keys) before the transcript is embedded,
-//! and the manifest records both that redaction ran and how many spans were
-//! masked. A caller can opt out (`redact = false`) for a fully local bundle, and
-//! the manifest says so plainly so a reader is never misled about whether a
-//! bundle was sanitized.
+//! [`redact_secrets`] masks the common secret shapes (bearer/authorization
+//! tokens, `KEY=secret` assignments for sensitive-looking keys, high-entropy
+//! `sk-`/`ghp_`/`AKIA`/`AIza`-style API keys, `eyJ…` JWTs, PEM private-key
+//! blocks, and `scheme://user:pass@host` URL passwords) before the transcript
+//! is embedded, and the manifest records both that redaction ran and how many
+//! spans were masked. A caller can opt out (`redact = false`) for a fully local
+//! bundle, and the manifest says so plainly so a reader is never misled about
+//! whether a bundle was sanitized.
+//!
+//! Redaction is a best-effort HEURISTIC, not an exhaustive guarantee: it
+//! recognises known secret shapes and cannot catch every credential a free-form
+//! transcript might contain. Treat a redacted bundle as "common secrets masked",
+//! and still review one before sharing it widely.
 //!
 //! ## Portable paths
 //!
@@ -264,18 +270,52 @@ pub(crate) fn parse_bundle_request(rest: &str) -> Result<BundleRequest, String> 
 pub(crate) fn redact_secrets(text: &str) -> (String, usize) {
     let mut out = String::with_capacity(text.len());
     let mut count = 0usize;
+    // PEM private-key blocks span multiple lines: once a `-----BEGIN ... PRIVATE
+    // KEY-----` header is seen, every base64 body line through the matching
+    // `-----END ...-----` is masked. The whole block counts as a single mask.
+    let mut in_pem = false;
     for line in text.split_inclusive('\n') {
         // Preserve the trailing newline (if any) verbatim; redact only content.
         let (content, newline) = match line.strip_suffix('\n') {
             Some(rest) => (rest, "\n"),
             None => (line, ""),
         };
+        if in_pem {
+            // Inside a PEM block: mask the body, and watch for the END marker.
+            if is_pem_end(content) {
+                in_pem = false;
+                out.push_str(content); // the END marker itself is not a secret
+            } else {
+                out.push_str("***REDACTED***");
+            }
+            out.push_str(newline);
+            continue;
+        }
+        if is_pem_private_key_begin(content) {
+            in_pem = true;
+            count += 1; // count the whole block once, at its header
+            out.push_str(content); // the BEGIN marker itself is not a secret
+            out.push_str(newline);
+            continue;
+        }
         let (redacted, n) = redact_line(content);
         out.push_str(&redacted);
         out.push_str(newline);
         count += n;
     }
     (out, count)
+}
+
+/// True for a `-----BEGIN ... PRIVATE KEY-----` header (RSA/EC/OPENSSH/PGP/…).
+fn is_pem_private_key_begin(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("-----BEGIN ") && t.ends_with("PRIVATE KEY-----")
+}
+
+/// True for any `-----END ...-----` footer (closes a PEM block).
+fn is_pem_end(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("-----END ") && t.ends_with("-----")
 }
 
 /// Redact a single line, returning the masked line and the number of spans
@@ -293,10 +333,15 @@ fn redact_line(line: &str) -> (String, usize) {
         return (masked, 1);
     }
 
-    // 3) Inline high-entropy API keys with a known prefix.
+    // 3) URL userinfo password: mask the `pass` in `scheme://user:pass@host`.
+    if let Some(masked) = redact_url_userinfo(line) {
+        return (masked, 1);
+    }
+
+    // 4) Inline high-entropy API keys with a known prefix, plus JWTs.
     let mut result = String::with_capacity(line.len());
     for token in split_keep_delims(line) {
-        if is_api_key_token(token) {
+        if is_api_key_token(token) || is_jwt_token(token) {
             result.push_str("***REDACTED***");
             count += 1;
         } else {
@@ -308,6 +353,49 @@ fn redact_line(line: &str) -> (String, usize) {
     } else {
         (line.to_string(), 0)
     }
+}
+
+/// Mask the password in a `scheme://user:pass@host` URL (CWE: leaked DB/HTTP
+/// credentials), keeping the scheme, user, and host so the line still reads.
+/// Returns `None` when the line has no `://user:pass@` shape.
+fn redact_url_userinfo(line: &str) -> Option<String> {
+    let scheme_at = line.find("://")?;
+    let after_scheme = scheme_at + "://".len();
+    // The authority ends at the first `/`, `?`, `#`, or whitespace.
+    let rest = &line[after_scheme..];
+    let authority_len = rest.find(['/', '?', '#', ' ', '\t']).unwrap_or(rest.len());
+    let authority = &rest[..authority_len];
+    // userinfo (`user:pass`) precedes the LAST `@` in the authority.
+    let at = authority.rfind('@')?;
+    let userinfo = &authority[..at];
+    let colon = userinfo.find(':')?;
+    let pass = &userinfo[colon + 1..];
+    if pass.is_empty() {
+        return None;
+    }
+    let pass_start = after_scheme + colon + 1;
+    let pass_end = pass_start + pass.len();
+    Some(format!(
+        "{}***REDACTED***{}",
+        &line[..pass_start],
+        &line[pass_end..]
+    ))
+}
+
+/// True when `token` has the three-segment base64url JWT shape
+/// `eyJ<header>.<payload>.<signature>` (the `eyJ` prefix is the base64 of
+/// `{"`, the universal JWT header start).
+fn is_jwt_token(token: &str) -> bool {
+    if !token.starts_with("eyJ") {
+        return false;
+    }
+    let parts: Vec<&str> = token.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
 }
 
 /// Mask `Bearer <token>` / `Authorization: <token>` suffixes.
@@ -354,9 +442,11 @@ fn redact_assignment(line: &str) -> Option<String> {
                 continue;
             }
             let upper = bare.to_ascii_uppercase();
-            let sensitive = ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "API"]
-                .iter()
-                .any(|needle| upper.contains(needle));
+            // Match on whole `_`-delimited segments (or the whole key), NOT a
+            // bare substring, so a benign plural like `Tokens` (segment
+            // `TOKENS`) does not false-positive while `API_KEY`/`DB_PASSWORD`
+            // still do.
+            let sensitive = is_sensitive_key(&upper);
             let value = &line[idx + 1..];
             if sensitive && !value.trim().is_empty() {
                 let lead_ws: String = value.chars().take_while(|c| c.is_whitespace()).collect();
@@ -365,6 +455,21 @@ fn redact_assignment(line: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// True when an upper-cased bare key (already stripped to `[A-Z0-9_]`) names a
+/// secret. Matches on whole `_`-delimited segments, plus a short list of common
+/// separator-less names, so `API_KEY`/`DB_PASSWORD`/`SECRET` redact while a
+/// benign plural like `TOKENS` (which only *contains* `TOKEN`) does not.
+fn is_sensitive_key(upper: &str) -> bool {
+    const SEGMENTS: [&str; 7] = [
+        "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "API", "APIKEY",
+    ];
+    const WHOLE: [&str; 4] = ["APIKEY", "ACCESSTOKEN", "AUTHTOKEN", "PRIVATEKEY"];
+    if WHOLE.contains(&upper) {
+        return true;
+    }
+    upper.split('_').any(|seg| SEGMENTS.contains(&seg))
 }
 
 /// True when `token` looks like a high-entropy API key with a known prefix.
@@ -382,6 +487,15 @@ fn is_api_key_token(token: &str) -> bool {
     {
         return true;
     }
+    // Google API keys: AIza + 35 base64url chars.
+    if let Some(rest) = token.strip_prefix("AIza")
+        && rest.len() >= 35
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return true;
+    }
     false
 }
 
@@ -393,8 +507,9 @@ fn split_keep_delims(line: &str) -> Vec<&str> {
     let mut start = 0;
     let mut in_word = false;
     for (i, ch) in line.char_indices() {
-        // A "word" char is anything that can appear in an API key token.
-        let is_word = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_';
+        // A "word" char is anything that can appear in an API key or JWT token
+        // (`.` keeps a three-segment `eyJ….….…` JWT as a single token).
+        let is_word = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.';
         if is_word != in_word {
             if i > start {
                 out.push(&line[start..i]);

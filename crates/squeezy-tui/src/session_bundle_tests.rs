@@ -127,6 +127,58 @@ fn redact_preserves_trailing_newline_and_blank_lines() {
     assert_eq!(out, "plain text\n\n", "structure preserved exactly");
 }
 
+/// deep-review #63: the matcher must cover the advertised "share-safe" classes —
+/// PEM private-key blocks, JWTs, Google `AIza` keys, and `scheme://user:pass@`
+/// URL passwords — and must NOT mangle a benign `Tokens: 1,234` line (whose key
+/// only *contains* the substring `TOKEN`).
+#[test]
+fn redact_covers_pem_jwt_google_and_url_secrets_without_false_positives() {
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQabcDEF_-12";
+    let aiza = "AIzaSyA1234567890abcdefghijklmnopqrstuv";
+    let transcript = format!(
+        "intro line\n\
+         -----BEGIN RSA PRIVATE KEY-----\n\
+         MIIEowIBAAKCAQEAabcdefghijklmnop\n\
+         qrstuvwxyz0123456789ABCDEFGHIJKL\n\
+         -----END RSA PRIVATE KEY-----\n\
+         my jwt is {jwt} ok\n\
+         google key {aiza} here\n\
+         db url postgres://user:hunter2@db.example.com:5432/app\n\
+         Tokens: 1,234\n"
+    );
+
+    let (out, n) = redact_secrets(&transcript);
+
+    // Exactly four secret classes masked: PEM block (counted once), JWT, AIza,
+    // URL password.
+    assert_eq!(n, 4, "four secret classes masked:\n{out}");
+
+    // Each secret is gone.
+    assert!(!out.contains("MIIEowIBAAKCAQEA"), "PEM body masked:\n{out}");
+    assert!(
+        !out.contains("qrstuvwxyz0123456789"),
+        "PEM body masked:\n{out}"
+    );
+    assert!(!out.contains(jwt), "JWT masked:\n{out}");
+    assert!(!out.contains(aiza), "AIza key masked:\n{out}");
+    assert!(!out.contains("hunter2"), "URL password masked:\n{out}");
+
+    // The PEM markers survive so the block still reads as a key block.
+    assert!(out.contains("-----BEGIN RSA PRIVATE KEY-----"), "{out}");
+    assert!(out.contains("-----END RSA PRIVATE KEY-----"), "{out}");
+    // The URL scheme/user/host survive; only the password is masked.
+    assert!(
+        out.contains("postgres://user:***REDACTED***@db.example.com"),
+        "{out}"
+    );
+
+    // The benign Tokens line is untouched (no false positive on `TOKEN`).
+    assert!(
+        out.contains("Tokens: 1,234"),
+        "benign Tokens line must be left verbatim:\n{out}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Build / manifest / checksum
 // ---------------------------------------------------------------------------
