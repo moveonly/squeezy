@@ -9247,6 +9247,16 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
                 return false;
             }
+            // The default Alt+d chord collides with the composer's
+            // delete-word-forward. While the composer holds text, defer to that
+            // editor motion — mirroring the TranscriptHome/End empty-composer
+            // convention — so an Alt+d with a lingering main-view selection never
+            // hijacks delete-word while the user is editing a prompt
+            // (deep-review #92). With an empty composer the selection-set verb
+            // still fires.
+            if !app.input.is_empty() {
+                return false;
+            }
             add_live_selection_to_set(app)
         }
         keymap::Action::CopyMultiSelection => {

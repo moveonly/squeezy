@@ -28314,6 +28314,42 @@ async fn add_selection_chord_without_a_live_range_is_a_noop() {
     assert!(app.selection_set.is_empty(), "no range to commit");
 }
 
+/// deep-review #92: AddSelectionToSet defaults to Alt+d, which is also the
+/// composer's delete-word-forward. While the composer holds text, an Alt+d with a
+/// lingering main-view selection must keep deleting the next word and must NOT
+/// commit the selection into the set (the editor wins while editing).
+#[tokio::test]
+async fn alt_d_with_nonempty_composer_deletes_word_not_commits_selection() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("alpha row text"));
+
+    // Arm a lingering main-surface selection (the state that triggers the bug).
+    triple_click_row(&mut app, "alpha row text");
+    assert!(app.selection.is_some(), "triple-click armed a row selection");
+    assert!(app.selection_set.is_empty(), "set starts empty");
+
+    // Now edit a prompt with the cursor before a word to delete.
+    set_input(&mut app, "alpha beta gamma".to_string());
+    app.input_cursor = "alpha ".len();
+
+    handle_key(&mut app, &mut agent, add_selection_key())
+        .await
+        .expect("alt+d while editing");
+
+    // The composer's delete-word-forward ran: "beta" is gone.
+    assert_eq!(
+        app.input, "alpha  gamma",
+        "Alt+d deleted the next word while editing",
+    );
+    assert_eq!(app.input_cursor, "alpha ".len(), "cursor stayed put");
+    // The selection set was NOT committed.
+    assert!(
+        app.selection_set.is_empty(),
+        "Alt+d must NOT commit the selection while the composer is non-empty",
+    );
+}
+
 #[tokio::test]
 async fn combined_copy_yields_every_disjoint_range_in_one_payload() {
     let mut agent = test_agent(SessionMode::Build);
