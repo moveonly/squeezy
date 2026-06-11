@@ -24,18 +24,22 @@ use squeezy_core::{Result, SqueezyError, TuiSynchronizedOutput};
 use crate::terminal_writer::TerminalWriter;
 use crate::{
     BEGIN_SYNCHRONIZED_UPDATE, END_SYNCHRONIZED_UPDATE, MIRROR_FALLBACK_WIDTH, TuiApp,
-    apply_editor_handoff_outcome, close_subagent_compare, compensate_main_scroll_for_append,
-    dogfood, editor_handoff, emit_finish_fullscreen_mirror_streamed,
-    emit_finish_fullscreen_restore, emit_terminal_emergency_teardown, emit_terminal_enter_setup,
-    main_render_cache, mark_full_redraw_after_resume, metrics, precheck_terminal_environment,
-    prompt_elapsed_ms, refresh_attention_route, refresh_change_summary, refresh_duplicate_folds,
-    refresh_error_lenses, refresh_health_markers, refresh_lane_fold, refresh_related_links,
-    refresh_review_board, refresh_session_timeline, refresh_subagent_timeline,
-    refresh_transcript_index, refresh_turn_outline, render, report_editor_handoff_error,
-    resolve_mouse_capture, resolve_synchronized_output, review_board_reconcile_cursor,
-    signal_teardown, subagent_compare_records_present, terminal_restore, terminal_title_for, toast,
-    transcript_lines_for_render,
+    close_subagent_compare, compensate_main_scroll_for_append, dogfood,
+    emit_finish_fullscreen_mirror_streamed, emit_finish_fullscreen_restore,
+    emit_terminal_emergency_teardown, emit_terminal_enter_setup, main_render_cache,
+    mark_full_redraw_after_resume, metrics, precheck_terminal_environment, prompt_elapsed_ms,
+    refresh_attention_route, refresh_change_summary, refresh_duplicate_folds, refresh_error_lenses,
+    refresh_health_markers, refresh_lane_fold, refresh_related_links, refresh_review_board,
+    refresh_session_timeline, refresh_subagent_timeline, refresh_transcript_index,
+    refresh_turn_outline, render, resolve_mouse_capture, resolve_synchronized_output,
+    review_board_reconcile_cursor, signal_teardown, subagent_compare_records_present,
+    terminal_restore, terminal_title_for, toast, transcript_lines_for_render,
 };
+// Editor handoff (suspend → external $EDITOR) is Unix-only; these are used solely by the
+// #[cfg(unix)] suspend_and_resume / run_pending_editor_handoff methods below, so the import
+// must be cfg-gated too or Windows clippy trips `-D unused-imports` (deep-review #52 CI follow-up).
+#[cfg(unix)]
+use crate::{apply_editor_handoff_outcome, editor_handoff, report_editor_handoff_error};
 
 pub(crate) struct TerminalGuard {
     /// `Option` so we can drop and rebuild the ratatui `Terminal`, and
