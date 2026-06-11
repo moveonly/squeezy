@@ -188,18 +188,50 @@ impl ClipboardSink for RealSink {
     }
 
     fn write_temp_file(&mut self, payload: &[u8], suggested_name: &str) -> io::Result<PathBuf> {
-        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "squeezy-copy-{}-{}-{}",
-            std::process::id(),
-            counter,
-            suggested_name,
-        ));
-        let mut file = std::fs::File::create(&path)?;
-        file.write_all(payload)?;
-        file.flush()?;
-        Ok(path)
+        let dir = std::env::temp_dir();
+        // Create the file atomically and privately. `create_new(true)` maps to
+        // O_CREAT|O_EXCL, so a pre-planted file or symlink at the predictable
+        // leaf name causes EEXIST instead of being followed/truncated (no
+        // symlink / CWE-59 attack, no clobber of another user's file). On Unix
+        // we also force mode 0o600 so the copied payload is not world-readable
+        // (CWE-377). We retry on AlreadyExists with a fresh counter so a single
+        // pre-planted name does not wedge the chain.
+        let mut last_err: Option<io::Error> = None;
+        for _ in 0..16 {
+            let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut path = dir.clone();
+            path.push(format!(
+                "squeezy-copy-{}-{}-{}",
+                std::process::id(),
+                counter,
+                suggested_name,
+            ));
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&path) {
+                Ok(mut file) => {
+                    file.write_all(payload)?;
+                    file.flush()?;
+                    return Ok(path);
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not allocate a fresh clipboard temp file",
+            )
+        }))
     }
 }
 

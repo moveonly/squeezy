@@ -690,3 +690,92 @@ fn real_sink_run_command_does_not_deadlock_on_large_payload() {
         outcome.stderr
     );
 }
+
+// ---------------------------------------------------------------------------
+// RealSink: temp-file is created privately and atomically (security)
+// ---------------------------------------------------------------------------
+
+/// `write_temp_file` must not follow/clobber a pre-planted path at its
+/// predictable leaf name: `create_new(true)` (O_CREAT|O_EXCL) means a file or
+/// symlink already sitting at the target name causes the write to surface an
+/// error rather than overwriting it. We pre-create the exact predictable leaf
+/// `squeezy-copy-<pid>-<counter>-<label>` and assert the next attempt either
+/// errors or routes around the collision — never truncating the pre-planted
+/// content.
+#[cfg(unix)]
+#[test]
+fn real_sink_write_temp_file_refuses_to_clobber_preplanted_path() {
+    use std::io::Write as _;
+
+    // The shared TEMP_FILE_COUNTER may be advanced by other tests in this same
+    // binary between our load and the call, so we cannot pin a single counter.
+    // Instead we pre-plant sentinels across the next several predictable leaf
+    // names; whichever one the first attempt lands on must be left intact —
+    // `create_new` EEXISTs and routes past it, where `File::create` would
+    // truncate it to "NEW PAYLOAD".
+    let label = "clobber-victim.txt";
+    let base = TEMP_FILE_COUNTER.load(Ordering::Relaxed);
+    let mut planted: Vec<std::path::PathBuf> = Vec::new();
+    for off in 0..8u64 {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "squeezy-copy-{}-{}-{}",
+            std::process::id(),
+            base + off,
+            label,
+        ));
+        let mut f = std::fs::File::create(&p).expect("plant sentinel");
+        f.write_all(b"SENTINEL").expect("write sentinel");
+        planted.push(p);
+    }
+
+    let mut sink = RealSink;
+    let result = sink.write_temp_file(b"NEW PAYLOAD", label);
+
+    // The returned path must NOT be one of the pre-planted sentinels.
+    if let Ok(written) = &result {
+        assert!(
+            !planted.contains(written),
+            "must not reuse a pre-planted path; create_new should EEXIST and retry"
+        );
+    }
+    // Every sentinel must still hold its original bytes (none truncated).
+    let mut intact = true;
+    for p in &planted {
+        if std::fs::read(p).ok().as_deref() != Some(b"SENTINEL".as_slice()) {
+            intact = false;
+        }
+        let _ = std::fs::remove_file(p);
+    }
+    if let Ok(written) = &result {
+        let _ = std::fs::remove_file(written);
+    }
+    assert!(
+        intact,
+        "pre-planted files must not be truncated/overwritten"
+    );
+}
+
+/// On Unix the created temp file must be private (0o600), not the umask-derived
+/// 0o644 that `File::create` yields, so a clipboard payload is not readable by
+/// other local users (CWE-377).
+#[cfg(unix)]
+#[test]
+fn real_sink_write_temp_file_is_mode_0600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut sink = RealSink;
+    let path = sink
+        .write_temp_file(b"secret payload", "mode-check.txt")
+        .expect("temp file created");
+    let mode = std::fs::metadata(&path)
+        .expect("stat temp file")
+        .permissions()
+        .mode()
+        & 0o777;
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        mode, 0o600,
+        "clipboard temp file must be 0o600, got {mode:o}"
+    );
+}
