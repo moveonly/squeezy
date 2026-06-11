@@ -142,6 +142,48 @@ fn anchor_excludes_itself_and_earlier_entries() {
 }
 
 #[test]
+fn delta_survives_removal_of_an_entry_before_the_anchor() {
+    // The delta must cut on the stable `anchor.entry_id`, not the frozen
+    // positional `anchor.sequence`. Removing an entry *before* the anchor (an
+    // apply_patch retain, tool coalescing) shifts every later entry down one
+    // index; a positional cut would silently drop the entry that lands on the
+    // stale sequence.
+    let mut summary = ChangeSummary::new();
+    let sources = vec![
+        source(1, TimelineKind::Prompt, false, "a: before the anchor"),
+        source(2, TimelineKind::Plan, false, "the anchor target"),
+        source(3, TimelineKind::Edit, false, "c: edit after anchor"),
+        source(4, TimelineKind::Tool, false, "d: command after anchor"),
+    ];
+    // Anchor on entry id=2 at its current index (sequence 1): the delta is {c,d}.
+    summary.set_anchor(Anchor {
+        entry_id: 2,
+        sequence: 1,
+    });
+    assert!(rebuild(&mut summary, &sources));
+    let ids: Vec<u64> = summary.items().iter().map(|i| i.entry_id).collect();
+    assert_eq!(ids, vec![3, 4], "delta before removal is c and d");
+
+    // Remove entry a (id=1): every later entry shifts down one index, so the
+    // anchor target now sits at index 0, c at index 1, d at index 2.
+    let after_removal = vec![
+        source(2, TimelineKind::Plan, false, "the anchor target"),
+        source(3, TimelineKind::Edit, false, "c: edit after anchor"),
+        source(4, TimelineKind::Tool, false, "d: command after anchor"),
+    ];
+    assert!(
+        rebuild(&mut summary, &after_removal),
+        "the removal moves the fingerprint, forcing a rebuild"
+    );
+    let ids: Vec<u64> = summary.items().iter().map(|i| i.entry_id).collect();
+    assert_eq!(
+        ids,
+        vec![3, 4],
+        "c (now at the stale sequence index) must not drop out of the delta"
+    );
+}
+
+#[test]
 fn anchor_at_session_end_is_an_honest_empty_delta() {
     let mut summary = ChangeSummary::new();
     let sources = sample_sources();

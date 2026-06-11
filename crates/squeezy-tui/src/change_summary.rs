@@ -277,13 +277,25 @@ impl ChangeSummary {
         }
         self.items.clear();
         if let Some(anchor) = self.anchor {
+            // Re-resolve the cut from the stable `anchor.entry_id` against the
+            // CURRENT sources every rebuild rather than trusting the frozen
+            // positional `anchor.sequence`. Removals before the anchor (an
+            // apply_patch failure->success retain, tool coalescing) shift every
+            // later entry down one index, so a genuinely-after entry whose new
+            // index <= the stale sequence would silently drop out. Falling back
+            // to `anchor.sequence` only when the anchored entry itself was
+            // removed keeps a sensible cut in that edge case.
+            let cut = sources
+                .iter()
+                .position(|s| s.id == anchor.entry_id)
+                .unwrap_or(anchor.sequence as usize);
             // Classify every later source once, preserving chronological order
             // within each group by walking the slice in order per group.
             for &group in ChangeGroupKind::ALL {
                 for source in sources
                     .iter()
                     .enumerate()
-                    .filter(|(seq, _)| *seq as u32 > anchor.sequence)
+                    .filter(|(seq, _)| *seq > cut)
                     .map(|(_, source)| source)
                 {
                     if ChangeGroupKind::classify(source.kind, source.is_error) != group {
