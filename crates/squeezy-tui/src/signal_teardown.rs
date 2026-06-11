@@ -328,6 +328,84 @@ pub(crate) fn reraise_sigtstp_default() {
     }
 }
 
+/// Run `f` with the `SIGTSTP` (Ctrl+Z) disposition temporarily reset to
+/// `SIG_DFL`, restoring the previous disposition afterward (even on panic).
+///
+/// Used around the blocking external-editor spawn (`run_pending_editor_handoff`
+/// → `editor_handoff::run_handoff`). Without this, a Ctrl+Z pressed INSIDE the
+/// editor hangs the session: the editor child stops, but squeezy's
+/// `Command::status()` is a `waitpid` WITHOUT `WUNTRACED`, so it never returns
+/// for a stopped child — and the tokio notify-only `SIGTSTP` listener installed
+/// by [`install_signal_handlers`] only flips the cooperative-suspend flag, which
+/// the main loop (blocked in `status()`) cannot act on. Deadlock.
+///
+/// With `SIG_DFL` installed for the duration of the spawn, a Ctrl+Z is delivered
+/// to the foreground process group with the kernel's default "stop" disposition,
+/// so the editor job is stopped/continued by the shell's job control normally
+/// (and squeezy stops alongside it, resuming together on `fg`) instead of
+/// squeezy's listener swallowing the stop and wedging `status()`. The saved
+/// disposition (tokio's listener) is restored when `f` returns so the NEXT Ctrl+Z
+/// at the squeezy prompt is again routed to cooperative suspend. (deep-review #5)
+///
+/// Best-effort: if the `sigaction` swap fails, `f` runs with the existing
+/// disposition (no behavior change) — never a hard error.
+#[cfg(unix)]
+pub(crate) fn with_default_sigtstp<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    /// Restores the saved `SIGTSTP` `sigaction` on drop, so the disposition is
+    /// put back even if `f` panics or returns early.
+    struct SigtstpRestore {
+        saved: libc::sigaction,
+        active: bool,
+    }
+    impl Drop for SigtstpRestore {
+        fn drop(&mut self) {
+            if self.active {
+                // Safety: restoring a previously-captured, valid `sigaction`.
+                unsafe {
+                    libc::sigaction(libc::SIGTSTP, &self.saved, std::ptr::null_mut());
+                }
+            }
+        }
+    }
+
+    // Safety: `sigaction` is async-signal-safe. Capture the current SIGTSTP
+    // disposition (tokio's notify-only handler) and install SIG_DFL for the
+    // duration of `f`.
+    let restore = unsafe {
+        let mut saved: libc::sigaction = std::mem::zeroed();
+        let mut dfl: libc::sigaction = std::mem::zeroed();
+        dfl.sa_sigaction = libc::SIG_DFL;
+        if libc::sigaction(libc::SIGTSTP, &dfl, &mut saved) == 0 {
+            SigtstpRestore {
+                saved,
+                active: true,
+            }
+        } else {
+            // Swap failed; run `f` with the existing disposition (best-effort).
+            SigtstpRestore {
+                saved,
+                active: false,
+            }
+        }
+    };
+    let result = f();
+    drop(restore);
+    result
+}
+
+/// Non-Unix passthrough: there is no `SIGTSTP` / job-control suspend off Unix, so
+/// the editor spawn runs `f` directly with no disposition change. (deep-review #5)
+#[cfg(not(unix))]
+pub(crate) fn with_default_sigtstp<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    f()
+}
+
 /// Non-Unix stub: no reachable `SIGTERM`/`SIGHUP` equivalent to hook. The panic
 /// hook (cross-platform) and `Drop` remain the recovery paths. Kept as a named
 /// no-op so the call site in the event loop is unconditional and `cfg`-free.

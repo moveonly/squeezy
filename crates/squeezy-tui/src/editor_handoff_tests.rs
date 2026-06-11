@@ -29,6 +29,21 @@ fn env_from<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsSt
     }
 }
 
+/// Serializes every test that drives `run_handoff`: on Unix the handoff resets
+/// the process-global `SIGTSTP` disposition to `SIG_DFL` for the editor spawn and
+/// restores it afterward (deep-review #5), so two `run_handoff` calls racing in
+/// the parallel test pool would clobber each other's saved disposition. Holding
+/// this lock for the whole of each such test keeps the save/restore exclusive.
+static SIGTSTP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`SIGTSTP_TEST_LOCK`], recovering a poisoned lock so one failing test
+/// does not cascade into every other `run_handoff` test.
+fn sigtstp_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    SIGTSTP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 // ── resolve_editor ────────────────────────────────────────────────────────
 
 #[test]
@@ -126,6 +141,7 @@ fn classify_result_interior_newlines_preserved() {
 
 #[test]
 fn run_handoff_modify_reads_back_the_edit_and_cleans_up() {
+    let _lock = sigtstp_test_guard();
     let dir = unique_dir("modify");
     let command = EditorCommand {
         program: "fake".to_string(),
@@ -159,6 +175,7 @@ fn run_handoff_modify_reads_back_the_edit_and_cleans_up() {
 
 #[test]
 fn run_handoff_unchanged_when_editor_saves_nothing_new() {
+    let _lock = sigtstp_test_guard();
     let dir = unique_dir("unchanged");
     let command = EditorCommand {
         program: "fake".to_string(),
@@ -181,6 +198,7 @@ fn run_handoff_unchanged_when_editor_saves_nothing_new() {
 
 #[test]
 fn run_handoff_propagates_editor_failure_and_still_cleans_up() {
+    let _lock = sigtstp_test_guard();
     let dir = unique_dir("fail");
     let command = EditorCommand {
         program: "fake".to_string(),
@@ -207,6 +225,7 @@ fn run_handoff_propagates_editor_failure_and_still_cleans_up() {
 
 #[test]
 fn run_handoff_slow_editor_completes_after_the_closure_returns() {
+    let _lock = sigtstp_test_guard();
     // "Sleep" coverage: the runner blocks (here, a short sleep) before saving;
     // run_handoff only reads back once the closure returns, so the edit lands.
     let dir = unique_dir("slow");
@@ -237,6 +256,7 @@ fn run_handoff_slow_editor_completes_after_the_closure_returns() {
 /// file before the `?` on the read result propagated.
 #[test]
 fn run_handoff_preserves_the_temp_file_when_read_back_fails() {
+    let _lock = sigtstp_test_guard();
     let dir = unique_dir("nonutf8");
     let pid = 1234u32;
     let seq = 11u64;
@@ -287,6 +307,7 @@ fn run_handoff_preserves_the_temp_file_when_read_back_fails() {
 #[cfg(unix)]
 #[test]
 fn run_handoff_refuses_to_follow_a_preplanted_symlink() {
+    let _lock = sigtstp_test_guard();
     let dir = unique_dir("symlink");
     let pid = 1234u32;
     let seq = 99u64;
@@ -346,6 +367,7 @@ fn run_handoff_creates_a_0600_temp_file() {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
 
+    let _lock = sigtstp_test_guard();
     let dir = unique_dir("mode");
     let command = EditorCommand {
         program: "fake".to_string(),
@@ -432,4 +454,89 @@ fn review_action_all_is_the_rendered_order() {
     assert_eq!(ReviewAction::Accept.label(), "Accept");
     assert_eq!(ReviewAction::Reopen.label(), "Reopen");
     assert_eq!(ReviewAction::Discard.label(), "Discard");
+}
+
+// ── SIGTSTP handling around the editor spawn (deep-review #5) ──────────────
+
+/// A no-op `SIGTSTP` handler used to stand in for tokio's notify-only listener:
+/// a NON-default disposition, so the test can prove `run_handoff` reset it to
+/// `SIG_DFL` for the editor spawn.
+#[cfg(unix)]
+extern "C" fn noop_sigtstp_handler(_signo: libc::c_int) {}
+
+/// (deep-review #5) A Ctrl+Z INSIDE the external editor must NOT hang the
+/// session. The fix runs the editor spawn with the `SIGTSTP` disposition reset to
+/// `SIG_DFL`, so the editor job is parked/continued by the shell's job control
+/// instead of squeezy's notify-only tokio listener swallowing the stop while
+/// `Command::status()` (a `waitpid` without `WUNTRACED`) blocks forever.
+///
+/// We install a non-default `SIGTSTP` handler (standing in for tokio's listener),
+/// then drive `run_handoff` with a fake editor that records the live `SIGTSTP`
+/// disposition during the spawn. It must observe `SIG_DFL` (the wrap reset it),
+/// and the non-default handler must be RESTORED after the handoff returns. With
+/// the pre-fix code (no disposition change) the observed handler is the installed
+/// non-default one and the `SIG_DFL` assertion fails.
+#[cfg(unix)]
+#[test]
+fn run_handoff_resets_sigtstp_to_default_during_the_editor_spawn() {
+    let _lock = sigtstp_test_guard();
+
+    // Install a non-default SIGTSTP handler, saving whatever was there so we can
+    // put it back at the end (do not perturb the rest of the test process).
+    let mut original: libc::sigaction = unsafe { std::mem::zeroed() };
+    let mut installed: libc::sigaction = unsafe { std::mem::zeroed() };
+    // Cast the fn item through a thin pointer before `usize` (a direct
+    // `fn as usize` trips the fn-to-numeric-cast lint).
+    let installed_disposition = noop_sigtstp_handler as *const () as usize;
+    installed.sa_sigaction = installed_disposition;
+    let install_rc = unsafe { libc::sigaction(libc::SIGTSTP, &installed, &mut original) };
+    assert_eq!(install_rc, 0, "test setup: installing the stand-in handler");
+
+    let dir = unique_dir("sigtstp");
+    let command = EditorCommand {
+        program: "fake".to_string(),
+        args: Vec::new(),
+    };
+
+    // The fake editor records the live SIGTSTP disposition the moment it runs.
+    let observed_during_spawn = std::cell::Cell::new(usize::MAX);
+    let outcome = run_handoff(
+        &command,
+        EditorTarget::Composer,
+        "before",
+        &dir,
+        4242,
+        1,
+        |_command, _path| {
+            let mut observed: libc::sigaction = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::sigaction(libc::SIGTSTP, std::ptr::null(), &mut observed) };
+            assert_eq!(rc, 0, "observing the SIGTSTP disposition inside the spawn");
+            observed_during_spawn.set(observed.sa_sigaction);
+            Ok(())
+        },
+    )
+    .expect("handoff runs");
+    assert_eq!(outcome, HandoffOutcome::Unchanged);
+
+    // Capture the disposition AFTER the handoff returned (to prove the restore),
+    // then put the process's original SIGTSTP disposition back regardless.
+    let mut after: libc::sigaction = unsafe { std::mem::zeroed() };
+    let after_rc = unsafe { libc::sigaction(libc::SIGTSTP, &original, &mut after) };
+    assert_eq!(after_rc, 0, "test teardown: restoring the original handler");
+
+    // During the spawn the disposition must have been SIG_DFL (the wrap reset it).
+    assert_eq!(
+        observed_during_spawn.get(),
+        libc::SIG_DFL,
+        "the editor spawn must run with SIGTSTP reset to SIG_DFL so a Ctrl+Z in \
+         the editor is handled by job control, not squeezy's notify-only listener",
+    );
+    // After the handoff, the non-default (tokio-stand-in) handler must be back, so
+    // the next Ctrl+Z at the squeezy prompt is routed to cooperative suspend.
+    assert_eq!(
+        after.sa_sigaction, installed_disposition,
+        "the handoff must restore the prior SIGTSTP handler after the editor exits",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

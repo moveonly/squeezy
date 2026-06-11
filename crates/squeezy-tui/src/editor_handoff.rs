@@ -255,9 +255,18 @@ where
     let path: PathBuf = dir.join(temp_file_name(target, pid, seq));
     write_new_private(&path, initial_text.as_bytes())?;
 
-    // Run the editor; on failure still clean up the temp file before bubbling
-    // the error so a failed spawn never leaves a stray file behind.
-    let run_result = run_editor(command, &path);
+    // Run the editor with the SIGTSTP (Ctrl+Z) disposition reset to SIG_DFL for
+    // the duration of the (blocking) spawn. Without this, a Ctrl+Z INSIDE the
+    // editor wedges the session: the editor child stops, but the spawn's
+    // `waitpid` (no `WUNTRACED`) never returns for a stopped child, and squeezy's
+    // tokio notify-only SIGTSTP listener only flips a flag the blocked main loop
+    // cannot act on. With SIG_DFL the editor job is stopped/continued by the
+    // shell's job control normally. The previous disposition is restored when the
+    // editor returns. (deep-review #5)
+    //
+    // On failure still clean up the temp file before bubbling the error so a
+    // failed spawn never leaves a stray file behind.
+    let run_result = crate::signal_teardown::with_default_sigtstp(|| run_editor(command, &path));
     if let Err(error) = run_result {
         let _ = std::fs::remove_file(&path);
         return Err(error);
