@@ -19056,6 +19056,37 @@ fn osc52_clipboard_rejects_payloads_above_cap() {
     assert!(err.contains(&OSC52_MAX_PAYLOAD_BYTES.to_string()), "{err}");
 }
 
+#[test]
+fn build_osc52_sequence_caps_the_encoded_not_the_raw_length() {
+    // OSC 52 carries base64, which inflates the raw payload by ~4/3. The cap
+    // must gate the *encoded* length: a 7000-byte raw payload encodes to
+    // 4 * ceil(7000/3) = 9336 base64 bytes, well past the 8 KiB cap, yet it
+    // slips under the raw 8192 cap. Capping the raw length therefore emitted a
+    // sequence the terminal silently truncates/drops (deep-review #41).
+    let raw_over = "x".repeat(7000);
+    let encoded_len = 4 * raw_over.len().div_ceil(3);
+    assert!(
+        encoded_len > OSC52_MAX_PAYLOAD_BYTES && raw_over.len() <= OSC52_MAX_PAYLOAD_BYTES,
+        "precondition: 7000 raw bytes are under the raw cap but over it once encoded"
+    );
+    let err = super::build_osc52_sequence(&raw_over)
+        .expect_err("a payload whose base64 overflows the cap must be refused");
+    assert!(err.contains("exceeds"), "{err}");
+    // The error reports the *encoded* size, not the raw one.
+    assert!(err.contains(&encoded_len.to_string()), "{err}");
+
+    // Conversely a payload whose *encoded* length still fits the cap is accepted:
+    // 6000 raw -> 4 * 2000 = 8000 base64 bytes <= 8192.
+    let raw_ok = "x".repeat(6000);
+    assert!(4 * raw_ok.len().div_ceil(3) <= OSC52_MAX_PAYLOAD_BYTES);
+    let seq =
+        super::build_osc52_sequence(&raw_ok).expect("an in-cap encoded payload must be accepted");
+    assert!(
+        seq.starts_with("\x1b]52;c;") && seq.ends_with('\x07'),
+        "{seq:?}"
+    );
+}
+
 /// Finding 1 (Phase 5a review): the app-layer copy path must be able to inject
 /// a recording sink so a copy that falls through to the richer
 /// `ClipboardChain` lands the exact bytes on a TEST seam — never real OSC 52 /

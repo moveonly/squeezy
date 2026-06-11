@@ -21422,8 +21422,14 @@ fn deliver_copy(app: &mut TuiApp, text: &str, label: &str) {
         Err(primary_err) => {
             // Only an oversized payload (past the OSC 52 cap) benefits from the
             // richer chain — that is where the platform command / temp file add
-            // value. For any other primary failure, report it directly.
-            if text.len() <= OSC52_MAX_PAYLOAD_BYTES {
+            // value. For any other primary failure, report it directly. Gauge
+            // the size by the *base64-encoded* length (what the escape actually
+            // carries), matching `build_osc52_sequence`'s cap: otherwise a raw
+            // payload in (6144, 8192] whose encoding overflows 8 KiB would be
+            // reported as a hard failure instead of falling through to the
+            // platform-command chain (deep-review #41).
+            let encoded_len = 4 * text.len().div_ceil(3);
+            if encoded_len <= OSC52_MAX_PAYLOAD_BYTES {
                 app.status = format!("copy failed: {primary_err}");
                 app.toasts
                     .push(app.status.clone(), toast::ToastVariant::Error);
@@ -43341,14 +43347,20 @@ impl Clipboard for Osc52Clipboard {
 /// a tmux-aware DCS wrap is a separate change and would need to update the
 /// regression test that locks the current bare shape.
 pub(crate) fn build_osc52_sequence(text: &str) -> std::result::Result<String, String> {
-    if text.len() > OSC52_MAX_PAYLOAD_BYTES {
+    // Cap the *encoded* length, not the raw payload: OSC 52 carries base64,
+    // which inflates the payload by ~4/3. Gating on `text.len()` let a 7000-byte
+    // raw payload (≈9336 base64 bytes) slip past an 8 KiB cap and emit a
+    // sequence the terminal silently truncates/drops (deep-review #41). Mirrors
+    // `clipboard.rs::try_osc52`, which gates on `encoded.len()`.
+    let encoded = base64_encode(text.as_bytes());
+    if encoded.len() > OSC52_MAX_PAYLOAD_BYTES {
         return Err(format!(
             "payload {} bytes exceeds terminal clipboard cap of {} bytes",
-            text.len(),
+            encoded.len(),
             OSC52_MAX_PAYLOAD_BYTES,
         ));
     }
-    Ok(format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes())))
+    Ok(format!("\x1b]52;c;{encoded}\x07"))
 }
 
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
