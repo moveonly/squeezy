@@ -9530,6 +9530,15 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
                 return false;
             }
+            // The default Alt+b chord collides with the readline word-left motion
+            // (`move_input_cursor_word_left`). While the composer holds text, defer
+            // to that motion — mirroring the TranscriptHome/End empty-composer
+            // convention — so an accidental Alt+b mid-edit never silently writes a
+            // bundle file to disk (deep-review #4 / #12). The verb stays reachable
+            // with an empty composer (or by rebinding it off Alt+b).
+            if !app.input.is_empty() {
+                return false;
+            }
             handle_bundle_command(app, agent, "");
             true
         }
@@ -9549,6 +9558,14 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
             // their own routing, and the Ctrl+T overlay guard above already blocks
             // this while the overlay (which has its own local `f` filter) is open.
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            // The default Alt+f chord collides with the readline word-right motion
+            // (`move_input_cursor_word_right`). While the composer holds text, defer
+            // to that motion — mirroring TranscriptHome/End — so editing a prompt is
+            // not hijacked by a filter cycle (deep-review #4 / #12). The verb stays
+            // reachable with an empty composer (or by rebinding it off Alt+f).
+            if !app.input.is_empty() {
                 return false;
             }
             cycle_main_semantic_filter(app, false);

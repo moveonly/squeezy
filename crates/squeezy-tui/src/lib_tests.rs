@@ -15008,6 +15008,84 @@ async fn alt_b_builds_bundle_and_preview_renders_across_sizes() {
     }
 }
 
+/// deep-review #4: a NON-empty composer must keep readline word-motion. Alt+b is
+/// the bundle chord by default but also the readline word-left key; while the user
+/// is editing a prompt, Alt+b must move the cursor one word left and must NOT
+/// silently write a bundle file to disk.
+#[tokio::test]
+async fn alt_b_with_nonempty_composer_moves_word_left_not_bundle() {
+    let root = temp_workspace("bundle_wordnav");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    app.input = "foo bar".to_string();
+    app.input_cursor = app.input.len();
+    let before_transcript = app.transcript.len();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+    )
+    .await
+    .unwrap();
+
+    // The composer word-left motion ran: the cursor sits at the start of "bar".
+    assert_eq!(
+        app.input_cursor,
+        "foo ".len(),
+        "Alt+b moved the input cursor one word left while editing",
+    );
+    // The draft text is untouched and no bundle side effects fired.
+    assert_eq!(app.input, "foo bar", "Alt+b did not mutate the draft");
+    assert!(
+        !app.status.starts_with("wrote bundle "),
+        "Alt+b must NOT build a bundle while the composer is non-empty: {}",
+        app.status,
+    );
+    assert_eq!(
+        app.transcript.len(),
+        before_transcript,
+        "Alt+b must NOT echo a bundle preview row while editing",
+    );
+    assert!(
+        walk_files(&root.join(".squeezy").join("bundles")).is_empty(),
+        "Alt+b must NOT write a bundle file while editing",
+    );
+}
+
+/// deep-review #4: the Alt+f twin. A NON-empty composer must keep readline
+/// word-right motion; Alt+f must move the cursor one word right rather than
+/// cycling the semantic filter.
+#[tokio::test]
+async fn alt_f_with_nonempty_composer_moves_word_right_not_filter() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    app.input = "foo bar".to_string();
+    app.input_cursor = 0;
+    let filter_before = app.main_semantic_filter;
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        app.input_cursor,
+        "foo".len(),
+        "Alt+f moved the input cursor one word right while editing",
+    );
+    assert_eq!(
+        app.main_semantic_filter, filter_before,
+        "Alt+f must NOT cycle the semantic filter while the composer is non-empty",
+    );
+}
+
 /// Recursively collect every regular file under `dir` (empty when missing).
 fn walk_files(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
