@@ -16925,6 +16925,13 @@ fn re_triggering_a_jump_mid_ease_samples_start_from_the_displayed_position() {
 
     // Advance the ease to its midpoint by back-dating its start clock (clock-safe
     // on Windows). The displayed offset is now strictly between start and target.
+    //
+    // Pin a SINGLE logical `now` for both the displayed-mid read below and the
+    // re-trigger's `start` sample (via the `*_at` clock-injectable helpers). The
+    // production path samples `Instant::now()` independently at each call, so on a
+    // slow/loaded CI runner real time elapses between the two reads and the ease
+    // advances — making `second.start != displayed_mid` and failing the
+    // exact-equality assert. Threading one `now` removes that wall-clock TOCTOU.
     let now = std::time::Instant::now();
     let half = std::time::Duration::from_millis(MAIN_SCROLL_ANIM_MS / 2);
     if let Some(anim) = app.main_scroll_anim.as_mut() {
@@ -16932,7 +16939,7 @@ fn re_triggering_a_jump_mid_ease_samples_start_from_the_displayed_position() {
     }
     let (line_count, viewport_h) = active_transcript_geometry(&app);
     let displayed_mid =
-        displayed_main_from_bottom(&app, app.transcript_scroll, line_count, viewport_h);
+        displayed_main_from_bottom_at(&app, app.transcript_scroll, line_count, viewport_h, now);
     assert!(
         displayed_mid > first.start && displayed_mid < first.target,
         "the ease is genuinely partway (displayed {displayed_mid} between \
@@ -16941,9 +16948,10 @@ fn re_triggering_a_jump_mid_ease_samples_start_from_the_displayed_position() {
         first.target,
     );
 
-    // Re-trigger: commit a new (different) target while the ease is in flight.
+    // Re-trigger: commit a new (different) target while the ease is in flight,
+    // sampling the start at the SAME pinned `now` as the displayed-mid read.
     let new_target = 0; // re-pin to the tail
-    commit_main_from_bottom_animated(&mut app, new_target);
+    commit_main_from_bottom_animated_at(&mut app, new_target, now);
     let second = app
         .main_scroll_anim
         .expect("the re-trigger arms a fresh ease");

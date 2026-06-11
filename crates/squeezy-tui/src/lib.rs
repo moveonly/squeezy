@@ -19242,14 +19242,32 @@ fn cancel_main_scroll_anim(app: &mut TuiApp) {
 /// only governs the painted position on the way there. Honours the
 /// reduced-motion / instant-scroll switch (`smooth_scroll_enabled`).
 fn commit_main_from_bottom_animated(app: &mut TuiApp, target_from_bottom: usize) {
+    commit_main_from_bottom_animated_at(app, target_from_bottom, std::time::Instant::now());
+}
+
+/// Clock-injectable core of [`commit_main_from_bottom_animated`]: samples the
+/// in-flight ease's displayed `start` against an explicit `now`. Production reads
+/// the wall clock (via the wrapper above); the in-crate test suite pins one `now`
+/// so the re-trigger's `start` and an earlier displayed-position read agree
+/// exactly, with no wall-clock drift between the two samples.
+fn commit_main_from_bottom_animated_at(
+    app: &mut TuiApp,
+    target_from_bottom: usize,
+    now: std::time::Instant,
+) {
     let (line_count, viewport_h) = active_transcript_geometry(app);
     // Sample the start from the DISPLAYED position, not the logical/committed
     // offset: while a prior ease is in flight the logical offset already equals
     // that ease's destination, so easing from it would snap the paint back to the
-    // old target before easing forward. `displayed_main_from_bottom` returns the
-    // live mid-ease position when an anim is active (deep-review #125).
-    let start =
-        displayed_main_from_bottom(app, active_transcript_scroll(app), line_count, viewport_h);
+    // old target before easing forward. `displayed_main_from_bottom_at` returns
+    // the live mid-ease position when an anim is active (deep-review #125).
+    let start = displayed_main_from_bottom_at(
+        app,
+        active_transcript_scroll(app),
+        line_count,
+        viewport_h,
+        now,
+    );
     active_transcript_scroll_mut(app).set_from_bottom(target_from_bottom, line_count, viewport_h);
     arm_main_scroll_anim_from(app, start);
 }
@@ -33677,11 +33695,35 @@ fn displayed_main_from_bottom(
     total_rows: usize,
     viewport_h: usize,
 ) -> usize {
+    displayed_main_from_bottom_at(
+        app,
+        state,
+        total_rows,
+        viewport_h,
+        std::time::Instant::now(),
+    )
+}
+
+/// Clock-injectable core of [`displayed_main_from_bottom`]: samples the in-flight
+/// ease against an explicit `now` rather than `Instant::now()`. Production reads
+/// the wall clock (via the wrapper above); the in-crate test suite pins a single
+/// `now` so a displayed-position read and a re-trigger's start sample share one
+/// logical instant, eliminating wall-clock TOCTOU drift on slow/loaded CI.
+fn displayed_main_from_bottom_at(
+    app: &TuiApp,
+    state: scroll::ScrollState,
+    total_rows: usize,
+    viewport_h: usize,
+    now: std::time::Instant,
+) -> usize {
     let logical = state.offset_from_bottom(total_rows, viewport_h);
     let Some(anim) = app.main_scroll_anim else {
         return logical;
     };
-    let elapsed = anim.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let elapsed = now
+        .saturating_duration_since(anim.started_at)
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
     let displayed = anim.displayed_from_bottom(elapsed);
     let max_from_bottom = total_rows.saturating_sub(viewport_h);
     displayed.min(max_from_bottom)
