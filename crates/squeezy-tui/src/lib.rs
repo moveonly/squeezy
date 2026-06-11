@@ -163,6 +163,7 @@ mod status_line_setup;
 mod streaming;
 mod streaming_patch;
 mod subagent_preview;
+mod subagent_promote;
 mod subagent_timeline;
 mod terminal_profile;
 mod terminal_writer;
@@ -2981,7 +2982,13 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     if app.subagent_timeline_open {
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
-                interaction::TargetKey::Chrome(interaction::ChromeKey::SubagentTimelineRow(_)),
+                interaction::TargetKey::Chrome(
+                    interaction::ChromeKey::SubagentTimelineRow(_)
+                    // §12.8.4: the `[promote]` affordance on the selected row is its
+                    // own click target (topmost on its cells) routed to the promote
+                    // handler; the rest of the row still jumps.
+                    | interaction::ChromeKey::SubagentTimelinePromoteButton(_),
+                ),
                 action,
             )) = app.click_target_at(mouse.column, mouse.row)
         {
@@ -8701,6 +8708,20 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
                 None => false,
             }
         }
+        keymap::Action::PromoteSubagentResult => {
+            // §12.8.4: promote the selected subagent's result into a follow-up
+            // prompt. Main-surface verb; the config/setup screens own their own
+            // routing. When the timeline panel is open it promotes the panel's
+            // cursor row (handled by the panel's own key handler before the global
+            // keymap runs); from the main surface it promotes the subagent pane's
+            // selected row. A no-op (status hint) when no subagent row is selected,
+            // so the chord never steals a key from the composer.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            promote_selected_subagent_result(app);
+            true
+        }
         keymap::Action::ToggleToolActions => {
             // Main-surface overlay; the config/setup screens own their own
             // routing, and the Ctrl+T overlay guard above already blocks this
@@ -10338,6 +10359,14 @@ fn handle_subagent_timeline_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
             subagent_timeline_jump_to_selected(app, true);
         }
+        // `y` promotes the selected subagent's result into a follow-up prompt
+        // (§12.8.4) — the always-available equivalent of the `Ctrl+Alt+Q` verb for
+        // terminals that swallow the Meta chord, and the keyboard twin of the row's
+        // promote-click affordance. Fills the composer (idle) or queues (active
+        // turn); never auto-submitted.
+        KeyCode::Char('y') => {
+            promote_subagent_timeline_row(app, app.subagent_timeline_selected);
+        }
         // Swallow every other key so the panel is modal: a stray keystroke cannot
         // leak into the composer underneath while the panel owns focus.
         _ => {}
@@ -10952,6 +10981,133 @@ fn restore_subagent_return_anchor(app: &mut TuiApp) -> bool {
     app.status = "returned from subagent".to_string();
     app.needs_redraw = true;
     true
+}
+
+// ===========================================================================
+// Promote Subagent Result To Prompt (§12.8.4)
+// ===========================================================================
+
+/// Distill a record's [`SubagentLifecycle`] into the promote-model
+/// [`subagent_promote::PromoteStatus`]. A pure 1:1 map so the promote module
+/// needn't reach back into `lib.rs`.
+fn promote_status_of(lifecycle: SubagentLifecycle) -> subagent_promote::PromoteStatus {
+    match lifecycle {
+        SubagentLifecycle::Running => subagent_promote::PromoteStatus::Running,
+        SubagentLifecycle::Completed => subagent_promote::PromoteStatus::Done,
+        SubagentLifecycle::Failed => subagent_promote::PromoteStatus::Failed,
+        SubagentLifecycle::Rejected => subagent_promote::PromoteStatus::Capped,
+    }
+}
+
+/// Build a [`subagent_promote::PromoteSource`] for the subagent at 0-based pane
+/// `index`, or `None` when no live record holds that index (a prune resolved it
+/// away). The result text is the record's `latest` line — the completion summary
+/// for a finished subagent, the failure diagnostic for a failed one, the latest
+/// activity for a running one, or the cap reason for a rejected one (the
+/// `note_subagent_*` events already fold each of those into `latest`). A blank
+/// `latest` falls back to the original prompt so a running subagent that has
+/// reported nothing yet still promotes the task it was given.
+fn build_promote_source(app: &TuiApp, index: usize) -> Option<subagent_promote::PromoteSource> {
+    let record = app.subagent_pane.records.get(index)?;
+    let name = format!("{} #{}", record.agent, index + 1);
+    let status = promote_status_of(record.lifecycle);
+    let result = if record.latest.trim().is_empty() {
+        record.prompt.clone()
+    } else {
+        record.latest.clone()
+    };
+    Some(subagent_promote::PromoteSource::new(name, status, result))
+}
+
+/// Promote the subagent at 0-based pane `index` into a follow-up prompt (§12.8.4):
+/// distill its result into a clean plain-text projection and fill the composer
+/// (when idle) or queue it behind the running turn (when one is in flight) —
+/// **never auto-submitted**. The shared handler the panel's `y` key, the
+/// `PromoteSubagentResult` verb, and the row's promote-click all reach, so the
+/// paths are identical by construction. Bounds the index against the live record
+/// list so a prune mid-gesture resolves to a no-op (status hint). Returns `true`
+/// when it promoted a result.
+fn promote_subagent_at_index(app: &mut TuiApp, index: usize) -> bool {
+    let Some(source) = build_promote_source(app, index) else {
+        app.status = "promote: that subagent is no longer tracked".to_string();
+        app.needs_redraw = true;
+        return false;
+    };
+    let prompt = source.project();
+    // Idle fills the composer (editable draft the user reviews); an active turn
+    // queues the prompt behind it. Either way the user still submits/drains it —
+    // the spec is explicit that a promote never auto-submits.
+    let destination = subagent_promote::PromoteDestination::for_turn(app.turn_rx.is_some());
+    match destination {
+        subagent_promote::PromoteDestination::Composer => {
+            input::insert_input_text(app, &prompt);
+        }
+        subagent_promote::PromoteDestination::Queue => {
+            app.prompt_queue.push_back(prompt);
+            enqueue_queue_id(app);
+        }
+    }
+    app.status = match destination {
+        subagent_promote::PromoteDestination::Composer => format!(
+            "promoted {} \u{2014} {}, review and submit",
+            source.name,
+            destination.verb(),
+        ),
+        subagent_promote::PromoteDestination::Queue => format!(
+            "promoted {} \u{2014} {} ({} in queue)",
+            source.name,
+            destination.verb(),
+            app.prompt_queue.len(),
+        ),
+    };
+    app.needs_redraw = true;
+    true
+}
+
+/// Promote the subagent selected on the main surface (the subagent pane's cursor)
+/// into a follow-up prompt (§12.8.4) — the `PromoteSubagentResult` keyboard verb's
+/// main-surface path. A no-op (status hint) when the cursor is on `main` (pane row
+/// 0) or no subagent is selected, so the chord never steals a key from the
+/// composer without a target.
+fn promote_selected_subagent_result(app: &mut TuiApp) {
+    match app.subagent_pane.selected.checked_sub(1) {
+        Some(index) => {
+            promote_subagent_at_index(app, index);
+        }
+        None => {
+            app.status = "no subagent selected \u{2014} nothing to promote".to_string();
+            app.needs_redraw = true;
+        }
+    }
+}
+
+/// Promote the subagent on the Subagent Timeline Panel's *visible* row `index`
+/// into a follow-up prompt (§12.8.4) — the panel's `y` key + promote-click path.
+/// Resolves the visible (filtered) row to its live pane index before promoting, so
+/// a filtered list never promotes the wrong subagent. A no-op (status hint) when
+/// the row resolves to nothing (an empty / over-filtered panel, or a vanished
+/// record).
+fn promote_subagent_timeline_row(app: &mut TuiApp, index: usize) {
+    let Some(id) = app
+        .subagent_timeline
+        .visible_get(index)
+        .map(|entry| entry.id)
+    else {
+        app.status = "promote: nothing to promote".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    let Some(pane_index) = app
+        .subagent_pane
+        .records
+        .iter()
+        .position(|record| record.id == id)
+    else {
+        app.status = "promote: that subagent is no longer tracked".to_string();
+        app.needs_redraw = true;
+        return;
+    };
+    promote_subagent_at_index(app, pane_index);
 }
 
 /// `Alt+6`: toggle the Subagent Hover Preview popover (§12.8.2) for the currently
@@ -15450,6 +15606,14 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // anchor) — the same handler the `JumpToSubagent` keyboard verb reaches.
         interaction::Action::SubagentJump(index) => {
             jump_to_subagent_index(app, index);
+        }
+        // §12.8.4: the promote affordance on a Subagent Timeline Panel row distills
+        // that subagent's result into a follow-up prompt and fills the composer
+        // (idle) or queues it (active turn) — the same handler the panel's `y` key
+        // and the `PromoteSubagentResult` verb reach. The index is into the visible
+        // (filtered) subagent list, matching the row's select target.
+        interaction::Action::SubagentTimelinePromote(index) => {
+            promote_subagent_timeline_row(app, index);
         }
     }
 }
@@ -25524,7 +25688,7 @@ fn render_subagent_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &Tui
     } else {
         Line::from(Span::styled(
             format!(
-                "{} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter open \u{00b7} f filter \u{00b7} Esc close",
+                "{} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter open \u{00b7} y promote \u{00b7} f filter \u{00b7} Esc close",
                 app.subagent_timeline.summary(),
             ),
             Style::default()
@@ -25608,6 +25772,42 @@ fn render_subagent_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &Tui
             interaction::TargetKey::Chrome(interaction::ChromeKey::SubagentTimelineRow(index)),
             interaction::Action::SubagentTimelineSelectJump(index),
         );
+
+        // §12.8.4: paint a small `[promote]` affordance at the right edge of the
+        // selected row and register it as its own click target. Registered AFTER
+        // the whole-row jump target so it wins on its own cells (the registry is
+        // topmost-last), while the rest of the row still jumps. Only the selected
+        // row carries it so the panel stays uncluttered; the `y` key / `Ctrl+Alt+Q`
+        // verb promote any row regardless. The hint reads in text so a monochrome
+        // terminal still sees it.
+        if is_selected {
+            let label = " [promote] ";
+            let label_cells = label.chars().count() as u16;
+            if row_rect.width > label_cells {
+                let button_rect = Rect {
+                    x: row_rect.x + row_rect.width - label_cells,
+                    y: row_rect.y,
+                    width: label_cells,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        label,
+                        Style::default()
+                            .fg(crate::render::theme::accent())
+                            .add_modifier(Modifier::BOLD),
+                    ))),
+                    button_rect,
+                );
+                app.register_click(
+                    button_rect,
+                    interaction::TargetKey::Chrome(
+                        interaction::ChromeKey::SubagentTimelinePromoteButton(index),
+                    ),
+                    interaction::Action::SubagentTimelinePromote(index),
+                );
+            }
+        }
     }
 }
 

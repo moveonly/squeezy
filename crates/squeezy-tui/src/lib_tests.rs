@@ -35129,6 +35129,270 @@ async fn subagent_timeline_renders_across_resizes() {
     assert_eq!(app.subagent_timeline.len(), 4, "rows stable across resize");
 }
 
+// ---- Promote Subagent Result To Prompt (§12.8.4) ----
+
+/// Open the Subagent Timeline Panel and park the cursor on the first (completed)
+/// row, so the promote tests act on a known subagent with a real result.
+async fn open_timeline_on_first_row(app: &mut TuiApp, agent: &mut Agent) {
+    handle_key(
+        app,
+        agent,
+        KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("Alt+5 opens the subagent-timeline panel");
+    let _ = render_to_string(app, 96, 24);
+    // Walk the cursor up to the first row (the panel parks on the freshest row).
+    for _ in 0..app.subagent_timeline.visible_len() {
+        handle_key(app, agent, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .expect("up");
+    }
+    assert_eq!(app.subagent_timeline_selected, 0, "cursor at the first row");
+}
+
+#[tokio::test]
+async fn promote_y_in_panel_idle_fills_composer_with_projection() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    open_timeline_on_first_row(&mut app, &mut agent).await;
+
+    // Idle (no turn running): `y` promotes the selected subagent's result into the
+    // composer as editable draft text — never auto-submitted.
+    assert!(app.turn_rx.is_none(), "the session is idle");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("y promotes the selected subagent");
+
+    // The composer now holds the clean projection: an attribution header naming the
+    // completed subagent + its result, never an auto-submit.
+    assert!(
+        app.input.contains("From explore #1 (done result):"),
+        "composer carries the attribution header: {:?}",
+        app.input,
+    );
+    assert!(
+        app.input.contains("found the bug"),
+        "composer carries the result body: {:?}",
+        app.input,
+    );
+    assert!(app.prompt_queue.is_empty(), "idle promote does not queue");
+    assert!(
+        app.turn_rx.is_none(),
+        "promote never starts a turn (no auto-submit)"
+    );
+}
+
+#[tokio::test]
+async fn promote_ctrl_alt_q_from_main_surface_fills_composer() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    // Select the completed subagent on the main surface (pane row 1 = record 0).
+    app.subagent_pane.selected = 1;
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+    )
+    .await
+    .expect("Ctrl+Alt+Q promotes the selected subagent");
+
+    assert!(
+        app.input.contains("From explore #1 (done result):"),
+        "the main-surface verb fills the composer too: {:?}",
+        app.input,
+    );
+    assert!(app.prompt_queue.is_empty(), "idle promote does not queue");
+}
+
+#[tokio::test]
+async fn promote_during_running_turn_queues_instead_of_composer() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Pretend a turn is in flight: an active turn must QUEUE the promoted prompt,
+    // not fill the composer (the spec's idle-vs-running rule).
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    let input_before = app.input.clone();
+
+    open_timeline_on_first_row(&mut app, &mut agent).await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("y promotes during a running turn");
+
+    assert_eq!(
+        app.input, input_before,
+        "the composer is left untouched mid-turn"
+    );
+    assert_eq!(app.prompt_queue.len(), 1, "the promoted prompt is queued");
+    assert!(
+        app.prompt_queue[0].contains("From explore #1 (done result):"),
+        "the queued item is the clean projection: {:?}",
+        app.prompt_queue[0],
+    );
+    // The id sidecar tracks the new queue item (enqueue_queue_id ran after push_back).
+    assert_eq!(
+        app.prompt_queue_ids.len(),
+        app.prompt_queue.len(),
+        "the queue id sidecar stays aligned",
+    );
+}
+
+#[tokio::test]
+async fn promote_button_mouse_click_promotes_selected_row() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    open_timeline_on_first_row(&mut app, &mut agent).await;
+    // Render so the selected row's `[promote]` affordance registers a click target.
+    let out = render_to_string(&app, 96, 24);
+    assert!(
+        out.contains("[promote]"),
+        "the promote affordance paints:\n{out}"
+    );
+
+    // Scan for the registered promote-button target on the first row.
+    let mut hit_cell = None;
+    'scan: for row in 0..24u16 {
+        for col in 0..96u16 {
+            if let Some((
+                interaction::TargetKey::Chrome(
+                    interaction::ChromeKey::SubagentTimelinePromoteButton(idx),
+                ),
+                _,
+            )) = app.click_target_at(col, row)
+                && idx == 0
+            {
+                hit_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hit_cell.expect("a promote-button target is registered on the selected row");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    // The click promotes (idle → composer), and never opens a transcript overlay
+    // the way a plain row-click would.
+    assert!(
+        app.input.contains("From explore #1 (done result):"),
+        "the promote click fills the composer: {:?}",
+        app.input,
+    );
+    assert!(
+        app.transcript_overlay.is_none(),
+        "a promote click does not jump to a transcript",
+    );
+}
+
+#[tokio::test]
+async fn promote_y_on_empty_panel_is_a_harmless_no_op() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(96, 24);
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("open an empty panel");
+    assert!(app.subagent_timeline.is_empty());
+
+    // `y` on an empty panel must not panic, must not fill the composer or queue.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("y on empty panel");
+    assert!(app.input.is_empty(), "nothing promoted from an empty panel");
+    assert!(
+        app.prompt_queue.is_empty(),
+        "nothing queued from an empty panel"
+    );
+    assert!(
+        app.subagent_timeline_open,
+        "the panel stays open (y is modal)"
+    );
+}
+
+#[tokio::test]
+async fn promote_capped_subagent_frames_honest_note() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    open_timeline_on_first_row(&mut app, &mut agent).await;
+    // Walk to the last row — the cap-rejected subagent (no transcript, no metrics).
+    for _ in 0..app.subagent_timeline.visible_len() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .await
+        .expect("down");
+    }
+    let last = app.subagent_timeline.visible_len() - 1;
+    assert_eq!(
+        app.subagent_timeline_selected, last,
+        "cursor on the last (capped) row"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("promote the capped subagent");
+    // A capped subagent still promotes — its cap note framed honestly as a `note`,
+    // never a fake result (the spec's capped-record edge).
+    assert!(
+        app.input.contains("(capped note):"),
+        "the capped row promotes an honest note: {:?}",
+        app.input,
+    );
+}
+
+#[tokio::test]
+async fn promote_affordance_paints_across_resizes() {
+    let mut app = app_with_subagents();
+    let mut agent = test_agent(SessionMode::Build);
+    open_timeline_on_first_row(&mut app, &mut agent).await;
+
+    // The `[promote]` affordance on the selected row paints (and the panel never
+    // panics) at narrow, default, and wide frames — the mouse affordance survives
+    // resize even when the header hint line gets truncated on a narrow frame.
+    for (w, h) in [(96u16, 24u16), (140, 40), (80, 20)] {
+        let out = render_to_string(&app, w, h);
+        assert!(
+            out.contains("[promote]"),
+            "promote affordance paints at {w}x{h}:\n{out}",
+        );
+    }
+}
+
 // ---- Universal Command Palette (§12.1.1) ----
 
 /// Open the Universal Command Palette via its `Ctrl+Alt+P` default chord. Returns a

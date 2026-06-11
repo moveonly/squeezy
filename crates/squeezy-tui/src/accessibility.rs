@@ -826,6 +826,10 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // default) reaches the same `jump_to_subagent_index` handler the
         // double-click drives.
         A::SubagentJump(_) => KeyboardPath::Keymap(Action::JumpToSubagent),
+        // Subagent result promote (§12.8.4) — `PromoteSubagentResult` (Ctrl+Alt+Q
+        // default) and the timeline panel's own `y` key both reach the same
+        // `promote_subagent_timeline_row` handler the click drives.
+        A::SubagentTimelinePromote(_) => KeyboardPath::Keymap(Action::PromoteSubagentResult),
     })
 }
 

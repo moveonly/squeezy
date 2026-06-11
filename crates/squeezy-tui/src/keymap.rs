@@ -420,6 +420,14 @@ pub(crate) enum Action {
     /// resolves to a select-only no-op. When no subagent row is selected it falls
     /// through, so the chord never steals a key from the composer.
     JumpToSubagent,
+    /// Promote the selected subagent's result into a follow-up prompt (`Ctrl+Alt+Q`
+    /// default; §12.8.4). Distills the subagent's completion summary / failure
+    /// diagnostic / latest activity into a clean, plain-text prompt and drops it in
+    /// the composer (when idle) or queues it behind the running turn — never
+    /// auto-submitted. The keyboard twin of the timeline panel's `y` promote key. A
+    /// no-op (status hint) when no subagent row is selected, so the chord never
+    /// steals a key from the composer.
+    PromoteSubagentResult,
     /// Open / close the Actionable Tool Outputs overlay (`Ctrl+Alt+A` default;
     /// §12.3.1) for the focused (or top-visible) tool result. It scans that result's
     /// output for actionable elements — file paths, URLs, error lines, diff hunks,
@@ -591,6 +599,7 @@ impl Action {
             Self::DismissFirstRunHint => "dismiss_first_run_hint",
             Self::PreviewSubagent => "preview_subagent",
             Self::JumpToSubagent => "jump_to_subagent",
+            Self::PromoteSubagentResult => "promote_subagent_result",
             Self::ToggleToolActions => "toggle_tool_actions",
             Self::ToggleScratchpad => "toggle_scratchpad",
             Self::ToggleTemplates => "toggle_templates",
@@ -678,6 +687,7 @@ impl Action {
         Action::DismissFirstRunHint,
         Action::PreviewSubagent,
         Action::JumpToSubagent,
+        Action::PromoteSubagentResult,
         Action::ToggleToolActions,
         Action::ToggleScratchpad,
         Action::ToggleTemplates,
@@ -876,6 +886,12 @@ impl Action {
             // own ↑↓ select + Enter open keys.
             | Self::PreviewSubagent
             | Self::JumpToSubagent
+            // Promote Subagent Result To Prompt (§12.8.4): the promote verb is
+            // `Ctrl+Alt+Q` (a Ctrl+Alt / Meta chord) — the same Meta encoding that
+            // is unreliable across Linux terminals, tmux, and SSH as the rest of the
+            // Ctrl+Alt overlay/picker family. The always-available equivalent is the
+            // subagent timeline panel's own `y` promote key.
+            | Self::PromoteSubagentResult
             // Actionable Tool Outputs overlay toggle is `Ctrl+Alt+A` — a Ctrl+Alt
             // (Meta) chord, the same classically-unreliable encoding across Linux
             // terminals, tmux, and SSH as the `Ctrl+Alt+H`/`Ctrl+Alt+P`/
@@ -1239,6 +1255,17 @@ impl Action {
             // modifier keeps the jump distinct and clear of every composer chord.
             Self::JumpToSubagent => KeyBinding::new(
                 KeyCode::Char('d'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Promote Subagent Result To Prompt (§12.8.4). `Ctrl+Alt+Q` — `Q`
+            // recalls "Queue" (the active-turn destination) and follows the existing
+            // `Ctrl+Alt+letter` style (`Ctrl+Alt+D` jump / `Ctrl+Alt+A` tool actions
+            // / `Ctrl+Alt+H`/`P`/`R`/`N`). It is free: bare `Alt+q` is the bookmarks
+            // overlay, so the Ctrl+Alt modifier keeps the promote verb distinct and
+            // clear of every composer chord. The in-panel `y` promote key reaches the
+            // same handler for terminals that swallow the Meta chord.
+            Self::PromoteSubagentResult => KeyBinding::new(
+                KeyCode::Char('q'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
             // Actionable Tool Outputs (§12.3.1). `Ctrl+Alt+A` — `A` recalls

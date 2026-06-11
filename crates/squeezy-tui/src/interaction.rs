@@ -174,6 +174,12 @@ pub(crate) enum ChromeKey {
     /// 0-based index in the *visible* (filtered) subagent list so a click selects +
     /// jumps the main view to that subagent's conversation.
     SubagentTimelineRow(usize),
+    /// The small `[promote]` affordance painted at the right of a Subagent Timeline
+    /// Panel row (§12.8.4), keyed by the row's 0-based index in the *visible*
+    /// (filtered) subagent list. A click promotes that subagent's result into a
+    /// follow-up prompt (composer when idle / queue when a turn runs) rather than
+    /// jumping — the mouse twin of the panel's `y` key.
+    SubagentTimelinePromoteButton(usize),
     /// An annotation row in the Entry Annotations overlay (§12.2.5), keyed by its
     /// 0-based index in the annotation list so a click selects + jumps the main
     /// view to the entry that exact annotation anchors.
@@ -435,6 +441,14 @@ pub(crate) enum Action {
     /// click both selects and jumps in one go. The index is into the *visible*
     /// (filtered) subagent list.
     SubagentTimelineSelectJump(usize),
+    /// Promote the given subagent row's result into a follow-up prompt (§12.8.4):
+    /// distill its completion summary / failure diagnostic / latest activity into a
+    /// clean plain-text prompt and fill the composer (idle) or queue it (active
+    /// turn) — never auto-submitted. Mouse twin of the panel's `y` promote key + the
+    /// `PromoteSubagentResult` keyboard verb; both reach the same
+    /// `promote_subagent_timeline_row` handler. The index is into the *visible*
+    /// (filtered) subagent list, matching the row's select target.
+    SubagentTimelinePromote(usize),
     /// Select the given annotation row in the Entry Annotations overlay (§12.2.5):
     /// move the cursor onto it and jump the main view to the entry that annotation
     /// anchors. Mouse twin of moving the cursor with ↑↓ and pressing Enter; a click
@@ -670,6 +684,7 @@ impl Action {
         Action::GlyphModeSelect(0),
         Action::SubagentSelect(0),
         Action::SubagentJump(0),
+        Action::SubagentTimelinePromote(0),
     ];
 }
 
