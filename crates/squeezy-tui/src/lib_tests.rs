@@ -10601,7 +10601,10 @@ fn dogfood_overlay_off_by_default_and_toggle_forces_hud_visible() {
 #[tokio::test]
 async fn dogfood_overlay_keymap_chord_toggles_through_dispatch() {
     // Keyboard path: the Ctrl+Alt+M keymap action drives the toggle through the
-    // real dispatch, the same routing a rebound key would take.
+    // real handle_key entry point, the same routing a production keypress takes.
+    // (Was previously calling dispatch_keymap_action directly, which bypassed the
+    // hardcoded front-of-loop intercept and masked the dead binding — deep-review
+    // #111.)
     let mut app = test_app(SessionMode::Build);
     let mut agent = test_agent(SessionMode::Build);
     assert!(!app.show_dogfood_metrics);
@@ -10609,8 +10612,9 @@ async fn dogfood_overlay_keymap_chord_toggles_through_dispatch() {
         KeyCode::Char('m'),
         KeyModifiers::CONTROL | KeyModifiers::ALT,
     );
-    let consumed = dispatch_keymap_action(&mut app, &mut agent, chord);
-    assert!(consumed, "the chord is consumed by the keymap dispatch");
+    handle_key(&mut app, &mut agent, chord)
+        .await
+        .expect("handle_key");
     assert!(
         app.show_dogfood_metrics,
         "Ctrl+Alt+M toggles the dogfood overlay on"
