@@ -9171,6 +9171,23 @@ fn dispatch_keymap_action_inner(
     {
         return false;
     }
+    // The prompt-queue reorder overlay (§11G) is documented as a modal that
+    // consumes keys before the global keymap. `dispatch_keymap_action` actually
+    // runs first, so without this guard a global chord (FocusPrev/NextEntry,
+    // PageUp, etc.) would fire over the open queue overlay and move the main view
+    // out from under it. Mirror the Ctrl+T guard above: while the queue overlay is
+    // open, block every keymap action except `QueueUndo` (its own undo verb, which
+    // self-guards on the overlay being open) and the hidden debug overlays (which
+    // are reachable from every surface). The overlay's own keys are routed by
+    // `handle_prompt_queue_overlay_key` after this returns `false`.
+    if app.prompt_queue_overlay.is_some()
+        && action != keymap::Action::QueueUndo
+        && action != keymap::Action::ToggleLatencyOverlay
+        && action != keymap::Action::ToggleDogfoodMetrics
+        && action != keymap::Action::ToggleLayoutFallbackDiag
+    {
+        return false;
+    }
     match action {
         keymap::Action::ToggleConfigScreen => {
             toggle_config_screen(app, agent, None);

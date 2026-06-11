@@ -141,9 +141,11 @@ pub(crate) enum Action {
     /// falls through so `u` keeps its normal composer meaning. The other
     /// queue verbs (focus move, item reorder, delete) are consumed inside the
     /// overlay's own modal key handler via `PromptQueueState::dispatch`
-    /// (Up/Down, Shift+Up/Down, Delete), keeping the overlay's
-    /// before-the-global-keymap consumption pattern; undo is the one genuinely
-    /// new verb, so it earns a rebindable action.
+    /// (Up/Down, Shift+Up/Down, Delete). While that overlay is open
+    /// `dispatch_keymap_action_inner` early-returns for every action except this
+    /// `QueueUndo` and the hidden debug overlays, so the global keymap can no
+    /// longer fire over the open overlay — `QueueUndo` is the one genuinely new
+    /// verb allowed through, so it earns a rebindable action.
     QueueUndo,
     /// Toggle the hidden per-interaction UX latency-budget overlay
     /// (`Ctrl+Alt+L` default; §12.10.1). A deliberately obscure debug chord —

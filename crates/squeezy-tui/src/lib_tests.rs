@@ -31717,6 +31717,104 @@ async fn condition_skip_drop_is_recoverable_via_queue_undo() {
 }
 
 #[tokio::test]
+async fn queue_overlay_is_modal_and_swallows_global_keymap_actions() {
+    // The prompt-queue overlay is documented as a modal that consumes keys before
+    // the global keymap, but `dispatch_keymap_action` runs first. Without the modal
+    // guard a global chord fires over the open overlay and moves the main view out
+    // from under it. Assert FocusPrevEntry (Ctrl+Up) leaves the transcript focus
+    // cursor UNCHANGED while the queue overlay is open.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..5 {
+        app.push_transcript_item(TranscriptItem::user(format!("entry {index}")));
+    }
+    app.selected_entry = Some(2);
+    app.input.clear(); // empty composer so FocusPrevEntry is not deferred to it
+    app.prompt_queue.push_back("queued".to_string());
+    enqueue_queue_id(&mut app);
+    app.prompt_queue_overlay = Some(prompt_queue::PromptQueueState::new());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl+up while the queue overlay is open");
+
+    assert_eq!(
+        app.selected_entry,
+        Some(2),
+        "the open queue overlay must swallow FocusPrevEntry (no main-view focus move)",
+    );
+    assert!(app.prompt_queue_overlay.is_some(), "the overlay stays open",);
+}
+
+#[tokio::test]
+async fn queue_overlay_modal_gate_blocks_page_up_scroll_of_the_main_transcript() {
+    // Second modal case: PageUp (ScrollTranscriptPageUp) must not scroll the
+    // underlying transcript while the queue overlay is open.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..80 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(12);
+    app.input.clear();
+    app.prompt_queue.push_back("queued".to_string());
+    enqueue_queue_id(&mut app);
+    app.prompt_queue_overlay = Some(prompt_queue::PromptQueueState::new());
+    let before = active_transcript_scroll(&app).from_bottom();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+    )
+    .await
+    .expect("page up while the queue overlay is open");
+
+    assert_eq!(
+        active_transcript_scroll(&app).from_bottom(),
+        before,
+        "PageUp must not scroll the main transcript while the queue overlay is open",
+    );
+    assert!(app.prompt_queue_overlay.is_some(), "the overlay stays open");
+}
+
+#[tokio::test]
+async fn queue_overlay_modal_gate_still_lets_queue_undo_through() {
+    // The modal guard must NOT block QueueUndo (bare `u`): it is the overlay's own
+    // undo verb and self-guards on the overlay being open. Delete an item, then
+    // undo it through the top-level key path while the overlay is open.
+    let mut app = queue_app(&["alpha", "beta"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+    )
+    .await
+    .expect("delete the focused queued prompt");
+    assert_eq!(queue_texts(&app), vec!["beta".to_string()]);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("queue undo while the overlay is open");
+    assert_eq!(
+        queue_texts(&app),
+        vec!["alpha".to_string(), "beta".to_string()],
+        "QueueUndo still routes through the modal gate to restore the deleted prompt",
+    );
+}
+
+#[tokio::test]
 async fn drain_under_open_overlay_clamps_the_focus_cursor() {
     // The drain pump runs while the reorder overlay is open (it omits the overlay
     // from `prompt_queue_drain_blocked`), shrinking the queue under the cursor.
