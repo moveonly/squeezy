@@ -204,6 +204,36 @@ async fn install_signal_handlers_registers_without_blocking() {
     super::install_signal_handlers();
 }
 
+/// Unix-only (deep-review #115): the emergency-teardown signal set must include
+/// SIGINT, so an external `kill -INT <pid>` runs the terminal restore and exits
+/// 130 (`128 + SIGINT`) — matching the SIGTERM (143) / SIGHUP (129) handling
+/// rather than leaving SIGINT on its default disposition (which would terminate
+/// the process with the alternate screen still up). Pins the set + exit codes
+/// without raising real signals.
+#[cfg(unix)]
+#[test]
+fn emergency_teardown_set_covers_sigint_with_exit_130() {
+    let signals = super::emergency_teardown_signals();
+    let signos: Vec<libc::c_int> = signals.iter().map(|(_, signo)| *signo).collect();
+
+    assert!(
+        signos.contains(&libc::SIGINT),
+        "SIGINT must trigger emergency teardown so `kill -INT` restores the \
+         terminal; set = {signos:?}"
+    );
+    // The other polite-kill signals stay covered (no regression).
+    assert!(signos.contains(&libc::SIGTERM), "SIGTERM stays covered");
+    assert!(signos.contains(&libc::SIGHUP), "SIGHUP stays covered");
+
+    // The handler exits with `128 + signo`; SIGINT maps to the conventional 130.
+    const {
+        assert!(
+            128 + libc::SIGINT == 130,
+            "an external SIGINT teardown must exit 130"
+        );
+    }
+}
+
 /// Unix-only: the SIGTSTP suspend request is a read-and-clear flag. The handler
 /// arms it (here via the test setter, since raising a real SIGTSTP would stop the
 /// test process), the loop drains it exactly once, and a second drain sees

@@ -173,16 +173,41 @@ pub(crate) fn restore_previous_panic_hook() {
     }
 }
 
+/// The signals whose external delivery runs the emergency terminal teardown and
+/// exits the process with the conventional `128 + signo` status. Pure (no I/O,
+/// no spawn) so a test can pin the set and the resulting exit codes without
+/// raising real signals.
+///
+/// `SIGINT` is included (deep-review #115): an external `kill -INT <pid>` must
+/// restore the terminal and exit 130, matching the `SIGTERM` (143) / `SIGHUP`
+/// (129) handling. The interactive Ctrl+C is unaffected — in raw mode it is an
+/// `ETX` key event, not a delivered `SIGINT`.
+#[cfg(unix)]
+fn emergency_teardown_signals() -> [(tokio::signal::unix::SignalKind, libc::c_int); 3] {
+    use tokio::signal::unix::SignalKind;
+    [
+        (SignalKind::terminate(), libc::SIGTERM),
+        (SignalKind::hangup(), libc::SIGHUP),
+        (SignalKind::interrupt(), libc::SIGINT),
+    ]
+}
+
 /// Install the OS-signal handlers that run the emergency teardown when the
 /// process is asked to terminate without unwinding (so `TerminalGuard::Drop`
 /// would otherwise never run).
 ///
 /// On Unix this spawns a task per signal:
 ///
-///   * `SIGTERM` / `SIGHUP`: on first delivery, run [`run_emergency_teardown`]
-///     and exit the process — a killed squeezy must not leave the terminal in
-///     raw mode / the alternate screen. `SIGKILL` is unhandleable by design and
-///     is intentionally not covered.
+///   * `SIGTERM` / `SIGHUP` / `SIGINT`: on first delivery, run
+///     [`run_emergency_teardown`] and exit the process with the conventional
+///     `128 + signo` status — a killed squeezy must not leave the terminal in
+///     raw mode / the alternate screen. An external `kill -INT <pid>` (a polite
+///     kill from a supervisor or another shell) is covered too: it leaves the
+///     alt screen and shows the cursor before exiting 130 (deep-review #115).
+///     In raw mode the interactive Ctrl+C is delivered as an `ETX` key event,
+///     not as `SIGINT`, so this handler only governs an *external* SIGINT and
+///     does not change in-app Ctrl+C handling. `SIGKILL` is unhandleable by
+///     design and is intentionally not covered.
 ///   * `SIGTSTP` (Ctrl+Z): set [`SUSPEND_REQUESTED`] so the main loop suspends
 ///     cooperatively at its next turn (clean terminal restore → re-raise the
 ///     stop with the default disposition → re-enter + full redraw on resume).
@@ -218,10 +243,7 @@ pub(crate) fn install_signal_handlers() {
     // Best-effort: if the runtime cannot register a listener (e.g. another
     // library already took an incompatible handler), we simply fall back to the
     // panic hook + Drop. A failed registration must never abort startup.
-    for (kind, signo) in [
-        (SignalKind::terminate(), libc::SIGTERM),
-        (SignalKind::hangup(), libc::SIGHUP),
-    ] {
+    for (kind, signo) in emergency_teardown_signals() {
         let Ok(mut stream) = signal(kind) else {
             continue;
         };
