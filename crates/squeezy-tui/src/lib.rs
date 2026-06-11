@@ -35645,32 +35645,49 @@ fn main_semantic_filter_hash(app: &TuiApp) -> u64 {
     hasher.finish()
 }
 
-/// The animation phase folded into [`main_render_cache::MainRenderKey`] for the
-/// pending-assistant tail's moon span.
+/// The pending-assistant tail moon's color/phase, folded into
+/// [`main_render_cache::MainRenderKey`].
 ///
-/// The tail's crescent is painted by `turn_coin_span`, tinted with
-/// `TurnVisualState::Running.color(tick)` — which alternates between two tints
-/// every 4 ticks (the `tick % 8 < 4` branch). When a Running turn is showing
-/// that tail the color genuinely changes, so the key must move with it or a
-/// cache hit on momentarily-stable pending text would freeze the pulse. Gated
-/// behind the has-animating-tail predicate: a tail is only animating while
-/// `turn_visual == Running` AND a pending-assistant tail is actually shown
-/// (no active subagent view, non-empty display content). On every other frame
-/// — idle, settled, or a non-Running outcome whose moon color is static — the
-/// value is held at a constant `0` so the cache still hits regardless of the
-/// live `animation_tick`. Only the two-state color *bucket* is folded (not the
-/// raw tick), so a Running tail churns through at most two keys — flipping
-/// exactly when the tint flips — rather than minting a fresh key every tick.
+/// The tail's crescent is painted by `turn_coin_span`, tinted by
+/// `app.turn_visual.color(tick)` — green/red/cyan/accent for the resolved
+/// outcomes and a two-tint pulse (the `tick % 8 < 4` branch) while Running. The
+/// key must move with that color or a cache hit on momentarily-stable pending
+/// text would serve a stale-tinted moon. Two distinct cases would otherwise
+/// alias and break:
+///
+/// * the Running pulse (must re-key when the tint flips), and
+/// * a `Running -> Failed/Cancelled/Succeeded` interrupt/resolve that *retains*
+///   the pending tail (deep-review #38): the pending text is byte-identical, so
+///   without folding the outcome the key is unchanged and the cached Running
+///   (accent-tinted) rows are served instead of repainting the moon
+///   red/cyan/green.
+///
+/// Gated on the tail actually being shown — same predicate `render` paints the
+/// moon under (no active subagent view, non-empty display content). When no
+/// tail is shown the moon is not painted, so its color cannot matter and the
+/// value is held at a constant `0` so idle/settled transcripts still hit
+/// regardless of the live `animation_tick`. When a tail IS shown a non-zero
+/// discriminant per painted color is folded: Running churns through at most two
+/// keys (flipping exactly when the tint flips), every other outcome is a single
+/// stable key, and none of them collide with the no-tail `0`.
 fn main_render_tail_anim_phase(app: &TuiApp) -> u64 {
-    let has_animating_tail = app.turn_visual == TurnVisualState::Running
-        && active_subagent_record(app).is_none()
-        && pending_assistant_display_content(app).is_some();
-    if has_animating_tail {
+    let tail_shown =
+        active_subagent_record(app).is_none() && pending_assistant_display_content(app).is_some();
+    if !tail_shown {
+        return 0;
+    }
+    match app.turn_visual {
         // Mirror the exact branch `TurnVisualState::Running.color` keys on, so
-        // the folded value flips iff the painted tint flips.
-        u64::from(app.animation_tick % 8 < 4)
-    } else {
-        0
+        // the folded value flips iff the painted pulse tint flips. Offset by 1
+        // so neither pulse bucket collides with the no-tail `0`.
+        TurnVisualState::Running => 1 + u64::from(app.animation_tick % 8 < 4),
+        // Each resolved outcome paints a distinct static moon color, so each
+        // needs its own stable, non-zero discriminant — otherwise a retained
+        // tail that resolves (Running -> Failed, etc.) keeps the prior key.
+        TurnVisualState::Idle => 3,
+        TurnVisualState::Succeeded => 4,
+        TurnVisualState::Cancelled => 5,
+        TurnVisualState::Failed => 6,
     }
 }
 

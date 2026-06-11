@@ -33899,6 +33899,58 @@ fn main_render_cache_pending_tail_moon_pulses_across_tick() {
 }
 
 #[test]
+fn main_render_cache_repaints_tail_moon_when_running_turn_resolves() {
+    // Regression for deep-review #38: after an Esc-interrupt the turn flips
+    // `turn_visual` Running -> Failed but LEAVES the pending-assistant tail
+    // intact. The tail's moon is tinted by `app.turn_visual.color(tick)` — an
+    // accent/secondary pulse while Running, solid red once Failed — but the
+    // pending text is byte-identical across the flip. If `MainRenderKey` folds
+    // only the Running pulse bucket (collapsing every non-Running outcome to the
+    // same `0` the `% 8 >= 4` Running bucket also collapsed to), the post-flip
+    // key is identical and the cached Running-tinted moon is served instead of
+    // a freshly repainted red one.
+    let _theme = lock_main_render_theme();
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("go"));
+    app.pending_assistant
+        .push_delta("streaming a stable answer tail");
+    let width = 60u16;
+
+    // Warm the cache while Running at tick 4: `4 % 8 >= 4`, the bucket the old
+    // key collapsed to `0` — the exact value Failed also collapsed to, so this
+    // is where the stale-tint aliasing bites.
+    app.animation_tick = 4;
+    app.turn_visual = TurnVisualState::Running;
+    let running_tint = app.turn_visual.color(4);
+    let rows_running = transcript_lines_and_entry_offsets(&app, Some(width), false).0;
+    assert_eq!(
+        first_moon_color(&rows_running),
+        Some(running_tint),
+        "precondition: the Running tail moon paints the Running tint"
+    );
+
+    // Interrupt resolves the turn to Failed but retains the pending tail and the
+    // tick. The moon must now repaint red, not serve the cached Running tint.
+    app.turn_visual = TurnVisualState::Failed;
+    let failed_tint = app.turn_visual.color(4);
+    assert_ne!(
+        running_tint, failed_tint,
+        "precondition: the Failed moon tint differs from the Running tint"
+    );
+    let new_key = main_render_key(&app, width, false);
+    assert!(
+        !main_render_cache::contains_main_key(&new_key),
+        "the resolved-outcome tail must mint a fresh key, not reuse the Running slot"
+    );
+    let rows_failed = transcript_lines_and_entry_offsets(&app, Some(width), false).0;
+    assert_eq!(
+        first_moon_color(&rows_failed),
+        Some(failed_tint),
+        "the retained tail moon must repaint the Failed tint, not the stale Running tint"
+    );
+}
+
+#[test]
 fn main_render_key_idle_tail_phase_is_stable_across_ticks() {
     // The has-animating-tail gate: when NO pending tail is showing (or the turn
     // is not Running), the folded phase is held at a constant 0 so a bare tick
