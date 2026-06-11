@@ -31961,6 +31961,100 @@ async fn drain_under_open_overlay_clamps_the_focus_cursor() {
 }
 
 #[tokio::test]
+async fn keyboard_swap_of_identical_adjacent_prompts_mirrors_the_id_sidecar() {
+    // A keyboard Shift+Down swap of two textually identical adjacent prompts must
+    // still swap the id sidecar and record a Reordered undo. The old content-diff
+    // detector found NO difference for equal texts, so the ids stayed put and the
+    // swap was silently invisible to identity (drag/delete/condition would then
+    // act on the wrong row).
+    let mut app = queue_app(&["dup", "dup"]);
+    let id0 = queue_id_at(&app, 0);
+    let id1 = queue_id_at(&app, 1);
+    assert_ne!(id0, id1, "the two slots carry distinct ids");
+    // Focus the front row, then Shift+Down swaps it with its (identical) neighbour.
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    let undo_before = app.prompt_queue_undo.len();
+    assert!(
+        handle_prompt_queue_overlay_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+        ),
+        "Shift+Down is consumed by the overlay",
+    );
+    // The visible text is unchanged (both rows say "dup")...
+    assert_eq!(
+        queue_texts(&app),
+        vec!["dup".to_string(), "dup".to_string()]
+    );
+    // ...but the id sidecar swapped, so identity tracked the moved prompt.
+    assert_eq!(
+        app.prompt_queue_ids.iter().copied().collect::<Vec<_>>(),
+        vec![id1, id0],
+        "the swap is mirrored onto the id sidecar",
+    );
+    // The cursor followed the moved item down to index 1.
+    assert_eq!(
+        app.prompt_queue_overlay.as_ref().expect("overlay").selected,
+        1,
+    );
+    // A Reordered undo record was pushed (keyed by the moved item's id).
+    assert_eq!(
+        app.prompt_queue_undo.len(),
+        undo_before + 1,
+        "a Reordered undo is recorded for the duplicate swap",
+    );
+    assert!(
+        matches!(
+            app.prompt_queue_undo.last(),
+            Some(QueueMutation::Reordered { id, .. }) if *id == id0
+        ),
+        "the undo is keyed by the moved item's stable id",
+    );
+    // And QueueUndo reverses it exactly, restoring the original id order.
+    assert!(queue_undo(&mut app));
+    assert_eq!(
+        app.prompt_queue_ids.iter().copied().collect::<Vec<_>>(),
+        vec![id0, id1],
+        "undo restores the original id order",
+    );
+}
+
+#[tokio::test]
+async fn keyboard_cursor_move_over_identical_prompts_does_not_touch_the_id_sidecar() {
+    // A bare Down (cursor move, no swap) over identical adjacent prompts must NOT
+    // swap the ids or push an undo — the swap classifier keys off the Shift key,
+    // not a content diff.
+    let mut app = queue_app(&["dup", "dup"]);
+    let id0 = queue_id_at(&app, 0);
+    let id1 = queue_id_at(&app, 1);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    let undo_before = app.prompt_queue_undo.len();
+    assert!(handle_prompt_queue_overlay_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    ));
+    assert_eq!(
+        app.prompt_queue_ids.iter().copied().collect::<Vec<_>>(),
+        vec![id0, id1],
+        "a pure cursor move leaves the id sidecar untouched",
+    );
+    assert_eq!(
+        app.prompt_queue_undo.len(),
+        undo_before,
+        "a pure cursor move records no undo",
+    );
+    assert_eq!(
+        app.prompt_queue_overlay.as_ref().expect("overlay").selected,
+        1,
+        "the cursor still moved",
+    );
+}
+
+#[tokio::test]
 async fn record_turn_outcome_captures_success_and_edits() {
     // The turn-finish capture stores the success flag + the edits flag for the
     // condition gate.

@@ -22410,7 +22410,7 @@ fn handle_prompt_queue_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             app.status = "prompt queue closed".to_string();
         }
         prompt_queue::QueueDispatch::Handled => {
-            reconcile_queue_after_dispatch(app, &before, cursor);
+            reconcile_queue_after_dispatch(app, &before, cursor, key);
         }
         // Stay modal: swallow the key so stray input can't leak into the
         // composer while the overlay owns the surface.
@@ -22436,12 +22436,19 @@ struct PreDispatchCursor {
 /// After `PromptQueueState::dispatch` mutated `prompt_queue`, mirror the one
 /// op it performed onto the id sidecar + undo stack. `before` is the queue's
 /// contents prior to the dispatch; `cursor` is the focused slot's identity
-/// captured before dispatch. Recognises exactly the two mutating ops the
-/// dispatcher can do — a single delete (length shrank by one) or an adjacent
-/// swap (same length) — and leaves the ids untouched for a pure cursor move.
-/// Both ops key off `cursor` (the exact acted-on slot), so they stay id-exact
-/// even when adjacent queue items are textually identical.
-fn reconcile_queue_after_dispatch(app: &mut TuiApp, before: &[String], cursor: PreDispatchCursor) {
+/// captured before dispatch; `key` is the dispatched key so a swap (Shift+↑/↓)
+/// is told apart from a pure cursor move (↑/↓) WITHOUT diffing the content —
+/// the content diff is ambiguous when adjacent items are textually identical.
+/// Recognises exactly the two mutating ops the dispatcher can do — a single
+/// delete (length shrank by one) or an adjacent swap (same length) — and leaves
+/// the ids untouched for a pure cursor move. Both ops key off `cursor` (the exact
+/// acted-on slot), so they stay id-exact even for adjacent duplicate prompts.
+fn reconcile_queue_after_dispatch(
+    app: &mut TuiApp,
+    before: &[String],
+    cursor: PreDispatchCursor,
+    key: KeyEvent,
+) {
     let after_len = app.prompt_queue.len();
     if after_len + 1 == before.len() {
         // A delete: `PromptQueueState::delete` removed `cursor.selected`, so
@@ -22466,30 +22473,43 @@ fn reconcile_queue_after_dispatch(app: &mut TuiApp, before: &[String], cursor: P
         app.status = format!("deleted queued prompt ({after_len} left)");
         app.needs_redraw = true;
     } else if after_len == before.len() {
-        // Either a pure cursor move (queue unchanged) or an adjacent swap.
-        let first_diff = (0..after_len).find(|&i| app.prompt_queue[i] != before[i]);
-        if let Some(i) = first_diff
-            && i + 1 < after_len
-            && app.prompt_queue[i] == before[i + 1]
-            && app.prompt_queue[i + 1] == before[i]
-        {
-            // Adjacent swap of i and i+1: mirror on the ids, record undo by the
-            // moved item's stable id (the one originally at `cursor.selected`)
-            // and its original left-neighbour, so undo survives a front-drain.
-            app.prompt_queue_ids.swap(i, i + 1);
-            if let Some(id) = cursor.id {
-                push_queue_undo(
-                    app,
-                    QueueMutation::Reordered {
-                        id,
-                        prev: cursor.prev_id,
-                    },
-                );
+        // Either a pure cursor move (queue unchanged) or an adjacent swap. Only
+        // Shift+↑/↓ swaps — a bare ↑/↓ just moves the cursor. Classify off the key
+        // (not a content diff) so two identical adjacent prompts that swap are
+        // still mirrored onto the id sidecar. The dispatcher updates `selected` to
+        // follow the moved item, so a real swap shifts it by ±1; an edge swap
+        // (Shift+↑ at the front / Shift+↓ at the back) is a no-op and leaves it
+        // put — detected by `new_selected == cursor.selected`.
+        let is_swap_key = matches!(key.code, KeyCode::Up | KeyCode::Down)
+            && key.modifiers.contains(KeyModifiers::SHIFT);
+        let new_selected = app
+            .prompt_queue_overlay
+            .as_ref()
+            .map(|state| state.selected)
+            .unwrap_or(cursor.selected);
+        if is_swap_key && new_selected != cursor.selected {
+            // The two swapped slots are the cursor's old and new positions; their
+            // lower index is the left member of the swapped pair.
+            let lo = cursor.selected.min(new_selected);
+            if lo + 1 < app.prompt_queue_ids.len() {
+                // Mirror the swap on the ids and record undo by the moved item's
+                // stable id (the one at `cursor.selected`) + its original
+                // left-neighbour, so undo survives a front-drain.
+                app.prompt_queue_ids.swap(lo, lo + 1);
+                if let Some(id) = cursor.id {
+                    push_queue_undo(
+                        app,
+                        QueueMutation::Reordered {
+                            id,
+                            prev: cursor.prev_id,
+                        },
+                    );
+                }
+                app.status = "moved queued prompt".to_string();
+                app.needs_redraw = true;
             }
-            app.status = "moved queued prompt".to_string();
-            app.needs_redraw = true;
         }
-        // else: cursor-only move — nothing to mirror.
+        // else: cursor-only move (or an edge no-op swap) — nothing to mirror.
     }
     clamp_queue_focus(app);
 }
