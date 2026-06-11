@@ -651,6 +651,10 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // default). The status-line indicator click and the keyboard verb both
         // drive the same `cycle_density` handler.
         A::CycleDensity => KeyboardPath::Keymap(Action::CycleDensity),
+        // Presentation Mode indicator (§12.4.6) — `TogglePresentation`
+        // (`Ctrl+Alt+C` default). The status-line `[present]` indicator click and
+        // the keyboard verb both drive the same `toggle_presentation` handler.
+        A::TogglePresentation => KeyboardPath::Keymap(Action::TogglePresentation),
         // Dockable Panels header (§12.4.4) — `CycleDockPanel` (`Ctrl+Alt+F`
         // default). The docked panel's header click and the keyboard verb both
         // drive the same `cycle_dock_panel` handler.

@@ -277,6 +277,28 @@ fn all_array_lists_each_mode_once() {
 }
 
 #[test]
+fn at_least_expanded_lifts_lower_tiers_and_keeps_the_mode() {
+    // Presentation Mode (§12.4.6) reuses this to force the spacious layout. A
+    // compact / default density is lifted to expanded; an already-expanded one is
+    // unchanged. The originating mode is always preserved so a status readout
+    // still names what the user picked.
+    let compact = DensityMode::Compact.resolve(80, 24);
+    assert_eq!(compact.tier(), DensityTier::Compact);
+    let lifted = compact.at_least_expanded();
+    assert_eq!(lifted.tier(), DensityTier::Expanded);
+    assert_eq!(lifted.mode(), DensityMode::Compact, "mode is preserved");
+
+    let default = DensityMode::Default.resolve(80, 24);
+    assert_eq!(default.at_least_expanded().tier(), DensityTier::Expanded);
+
+    // Already expanded → unchanged (idempotent).
+    let expanded = DensityMode::Expanded.resolve(80, 24);
+    let twice = expanded.at_least_expanded();
+    assert_eq!(twice.tier(), DensityTier::Expanded);
+    assert_eq!(twice.mode(), DensityMode::Expanded);
+}
+
+#[test]
 fn tiers_order_compact_to_expanded() {
     // The derived ordering reads "more roomy = greater", which the renderer's
     // `>=` comparisons rely on.

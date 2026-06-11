@@ -582,6 +582,18 @@ pub(crate) enum Action {
     /// ←→/Space adjust the focused row, `r`/Delete reset, Esc/the toggle close. The
     /// overlay does not exist until opened, so an idle session pays nothing.
     ToggleSmartSplit,
+    /// Toggle Presentation Mode (`Ctrl+Alt+C` default; §12.4.6). The screen-share
+    /// / demo display mode: it elevates the resolved Adaptive Density to the
+    /// spacious expanded layout (reusing the §12.4.1 density table) and suppresses
+    /// the metadata detail line (cost / account / provider / tokens / full paths)
+    /// so a live screen-share does not expose it. Display-only — the transcript,
+    /// the cost snapshot, and every persisted value are untouched (hiding, not
+    /// redaction), so leaving the mode (or the `/reveal` one-shot command) brings
+    /// every value straight back. The enabled-state is persisted to
+    /// `[tui].presentation` so it survives a restart (always re-hidden — the
+    /// reveal is never persisted). The mouse twin is a click on the status-line
+    /// `[present]` indicator.
+    TogglePresentation,
 }
 
 impl Action {
@@ -677,6 +689,7 @@ impl Action {
             Self::OpenGestureSettings => "open_gesture_settings",
             Self::OpenGlyphMode => "open_glyph_mode",
             Self::ToggleSmartSplit => "toggle_smart_split",
+            Self::TogglePresentation => "toggle_presentation",
         }
     }
 
@@ -771,6 +784,7 @@ impl Action {
         Action::OpenGestureSettings,
         Action::OpenGlyphMode,
         Action::ToggleSmartSplit,
+        Action::TogglePresentation,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -1053,6 +1067,12 @@ impl Action {
             // family above. The always-available equivalent is the overlay's own
             // ↑↓/←→ keys once opened.
             | Self::ToggleSmartSplit
+            // Presentation Mode toggle (§12.4.6) is `Ctrl+Alt+C` — a Ctrl+Alt
+            // (Meta) chord, the same classically-unreliable encoding across Linux
+            // terminals, tmux, and SSH as the rest of the Ctrl+Alt overlay/picker
+            // family above. The always-available equivalent is a click on the
+            // status-line `[present]` indicator.
+            | Self::TogglePresentation
             | Self::OpenFocusedInDetail => Some("terminal-dependent"),
             // Plain keys and broadly-portable Ctrl chords. `>` is a bare
             // (shifted) printable key — no Alt/Ctrl chord — so it is broadly
@@ -1542,6 +1562,16 @@ impl Action {
             // composer chord.
             Self::ToggleSmartSplit => KeyBinding::new(
                 KeyCode::Char('v'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            // Presentation Mode (§12.4.6). `Ctrl+Alt+C` (mnemonic: screen-share
+            // Cards) is the last free `Ctrl+Alt` letter — `Ctrl+Alt+A`/`B`/`D`..`Z`
+            // are taken by the macro/debug/overlay/picker/editor/profile/density/
+            // dock/subagent chords above, and bare `Alt+c` is the copy-focused-entry
+            // verb, so the Ctrl+Alt modifier keeps the presentation toggle distinct
+            // from it while staying clear of every composer chord.
+            Self::TogglePresentation => KeyBinding::new(
+                KeyCode::Char('c'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
         }

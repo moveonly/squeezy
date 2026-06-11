@@ -137,6 +137,7 @@ mod paste_preview;
 mod paste_staging;
 mod paste_transform;
 mod pinned_compare;
+mod presentation;
 mod prompt_history;
 mod prompt_queue;
 mod prompt_queue_multiselect;
@@ -957,6 +958,12 @@ async fn run_inner_with_terminal(
     // session opens with the panel already docked. A session that never docked
     // keeps the undocked default; a malformed value is ignored.
     restore_dock(&mut app);
+    // Presentation Mode (§12.4.6): restore the enabled-state the user left on in a
+    // prior session from the user-scope config before the first paint, so a
+    // screen-share session opens already in the mode. A session that never enabled
+    // it keeps the off-default; the one-shot reveal is never persisted, so a
+    // restored mode always starts with metadata hidden.
+    restore_presentation(&mut app);
     if let Some(banner) = update_banner.filter(|s| !s.trim().is_empty()) {
         app.push_log(banner);
     }
@@ -6051,6 +6058,94 @@ fn restore_density(app: &mut TuiApp) {
     }
 }
 
+/// Toggle Presentation Mode (§12.4.6) on/off, persist the new enabled-state to
+/// the user-scope config, and surface it in the status line. The mouse twin (a
+/// click on the status-line `[present]` indicator) routes here too. Presentation
+/// Mode only changes display policy — it elevates the resolved density to the
+/// spacious layout and suppresses the metadata detail line — so it never touches
+/// the transcript's scroll, selection, focus, the queue, the composer, or the
+/// cost snapshot (display hiding, not redaction). Turning the mode off also
+/// clears any pending one-shot reveal.
+fn toggle_presentation(app: &mut TuiApp) {
+    let enabled = app.presentation.toggle();
+    // Persist first; a write failure overwrites the status with its own note, so
+    // set the success status *after* the persist attempt only when it did not
+    // already report an error.
+    persist_presentation(app, app.presentation);
+    if !app.status.contains("save failed") {
+        let verb = if enabled {
+            "\u{2713} presentation"
+        } else {
+            "\u{2717} presentation"
+        };
+        app.status = format!("{verb}: {}", app.presentation.describe());
+    }
+    app.needs_redraw = true;
+}
+
+/// Apply the Presentation Mode (§12.4.6) one-shot reveal: lift the metadata
+/// suppression while staying in the mode so a value can be shown to a viewer
+/// without leaving the screen-share layout. A no-op (with an explanatory status)
+/// when the mode is off or already revealed. The reveal is session-local — it is
+/// never persisted, so the next launch re-hides metadata. Display-only: nothing
+/// in the model is mutated.
+fn reveal_presentation(app: &mut TuiApp) {
+    if app.presentation.reveal() {
+        app.status = "\u{2713} presentation: metadata revealed".to_string();
+    } else if app.presentation.is_enabled() {
+        app.status = "presentation: metadata already revealed".to_string();
+    } else {
+        app.status = "presentation: not active".to_string();
+    }
+    app.needs_redraw = true;
+}
+
+/// Persist the Presentation Mode (§12.4.6) enabled-state to the user-scope config
+/// at `[tui].presentation`. The on-state writes its slug; the off-state clears
+/// the key so a restored session starts with the mode off. The one-shot reveal
+/// is never persisted. Best-effort: a write failure leaves the in-session value
+/// in place and notes it in the status line, mirroring the density commit path.
+fn persist_presentation(app: &mut TuiApp, state: presentation::PresentationState) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    let target_path = app.user_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    let op = if state.is_enabled() {
+        EditOp::SetString(presentation::PresentationState::ENABLED_SLUG.to_string())
+    } else {
+        EditOp::Unset
+    };
+    let edit = SettingsEdit {
+        path: &["tui", "presentation"],
+        op,
+    };
+    if let Err(err) = apply_edits(&scope_target, &[edit]) {
+        app.status = format!("presentation set, but save failed: {err}");
+    }
+}
+
+/// Read the persisted Presentation Mode (§12.4.6) enabled-state from the
+/// user-scope settings TOML. The value lives at `[tui].presentation` as the
+/// bounded `on` slug; an absent file / table / field, or any other value,
+/// collapses to the off-default so the session starts without the mode.
+/// Best-effort, pure read — safe to call at startup.
+fn read_persisted_presentation(app: &TuiApp) -> Option<presentation::PresentationState> {
+    let text = std::fs::read_to_string(app.user_settings_path()).ok()?;
+    let doc = text.parse::<toml::Table>().ok()?;
+    let slug = doc.get("tui")?.as_table()?.get("presentation")?.as_str()?;
+    Some(presentation::PresentationState::from_persisted(slug))
+}
+
+/// Restore the persisted Presentation Mode (§12.4.6) enabled-state onto a
+/// freshly-built app at startup, so a mode the user left on in a prior session
+/// survives a restart (always re-hidden — the reveal is never persisted). A
+/// no-op when nothing is persisted (the app keeps the off-default).
+fn restore_presentation(app: &mut TuiApp) {
+    if let Some(state) = read_persisted_presentation(app) {
+        app.presentation = state;
+    }
+}
+
 /// Cycle the active Dockable Panel's dock position (§12.4.4) one step
 /// (`undocked → left → right → bottom → undocked`), apply it in-session, persist
 /// the new state to the user-scope config, and surface the dock in the status
@@ -8909,6 +9004,18 @@ fn dispatch_keymap_action_inner(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
                 return false;
             }
             cycle_dock_panel(app);
+            true
+        }
+        keymap::Action::TogglePresentation => {
+            // Main-surface display setting (§12.4.6); the config/setup screens own
+            // their own routing, and the Ctrl+T overlay guard above already blocks
+            // this while the overlay (which has its own native layout) is open.
+            // Presentation Mode only changes spacing/chrome + metadata visibility on
+            // the main surface.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_presentation(app);
             true
         }
         keymap::Action::ToggleHyperlinks => {
@@ -16629,6 +16736,14 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         interaction::Action::CycleDensity => {
             cycle_density(app);
         }
+        // A click on the status-line Presentation Mode indicator (§12.4.6): toggle
+        // the screen-share mode on/off — the mouse twin of the
+        // `TogglePresentation` (`Ctrl+Alt+C`) keyboard verb, driving the same
+        // `toggle_presentation` handler so mouse/keyboard parity holds by
+        // construction.
+        interaction::Action::TogglePresentation => {
+            toggle_presentation(app);
+        }
         // A click on the docked panel's header (§12.4.4): cycle the panel's dock
         // position forward — the mouse twin of the `CycleDockPanel` (`Ctrl+Alt+F`)
         // keyboard verb, driving the same `cycle_dock_panel` handler so
@@ -17967,6 +18082,24 @@ async fn handle_slash_command_on_surface(
             slash_arg_shape_from_rest(input),
         );
         handle_bundle_command(app, agent, rest);
+        return true;
+    }
+
+    // `/reveal` (§12.4.6) is the Presentation Mode one-shot reveal command: it
+    // lifts the screen-share metadata suppression for the rest of the session
+    // without leaving the mode (so a value can be shown to a viewer on demand). A
+    // TUI-local display toggle that mutates nothing in the model, so it is handled
+    // here before the agent-owned dispatch parser, which does not know it.
+    if raw_head == "/reveal" {
+        record_slash_command_telemetry(
+            agent,
+            "/reveal",
+            surface,
+            SlashOutcome::Accepted,
+            SlashAliasKind::Canonical,
+            slash_arg_shape_from_rest(input),
+        );
+        reveal_presentation(app);
         return true;
     }
 
@@ -22877,7 +23010,12 @@ struct MainTranscriptLayout {
 /// [`TuiApp::effective_density`], so the layout the renderer paints and the tier
 /// a dispatch/status read reports never disagree.
 fn resolved_density_for(app: &TuiApp, area: Rect) -> density::ResolvedDensity {
-    app.density_override.resolve(area.width, area.height)
+    // Presentation Mode (§12.4.6) elevates the resolved tier to the spacious
+    // expanded layout through the *same* density table, so a screen-share gets
+    // the roomy cards without a second spacing engine. A no-op when the mode is
+    // off, so a normal session keeps exactly the density it resolved.
+    app.presentation
+        .present_density(app.density_override.resolve(area.width, area.height))
 }
 
 /// Whether the welcome / startup card is included for a render `area`, under the
@@ -39889,12 +40027,37 @@ fn status_left_text(app: &TuiApp) -> String {
     } else {
         "no repo"
     };
-    let mut base = format!("dir {} · git {}", app.directory, branch);
+    // Presentation Mode (§12.4.6): on a screen-share the full working-directory
+    // path is hidden — only the final component (the workspace name) is shown so
+    // the rest of an absolute path is not exposed to viewers. Display-only: the
+    // underlying `app.directory` is untouched, so leaving the mode (or revealing)
+    // restores the full path. A revealed mode shows the full path.
+    let dir = if app.presentation.suppresses_metadata() {
+        presentation_dir_label(&app.directory)
+    } else {
+        app.directory.clone()
+    };
+    let mut base = format!("dir {dir} · git {branch}");
     if let Some(segment) = turn_progress_segment(app) {
         base.push_str(" · ");
         base.push_str(&segment);
     }
     base
+}
+
+/// Presentation Mode (§12.4.6) path label for the status overview: the final
+/// path component (the workspace name) instead of the full directory, so a
+/// screen-share does not expose the rest of an absolute path. Trailing
+/// separators are trimmed first so `…/repo/` still yields `repo`; an empty or
+/// separator-only directory falls back to `…` rather than a blank cell. Splits
+/// on BOTH separators so a Windows path (`C:\Users\me\repo`) is trimmed the same
+/// way as a Unix one.
+fn presentation_dir_label(directory: &str) -> String {
+    let trimmed = directory.trim_end_matches(['/', '\\']);
+    match trimmed.rsplit(['/', '\\']).next() {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => "…".to_string(),
+    }
 }
 
 /// Compact mid-turn progress segment for the status bar — replaces the
@@ -40040,6 +40203,14 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         // detail line is not occupying the overview row), so a calm session
         // registers nothing.
         register_attention_indicator_target(app, status_area);
+        // Presentation Mode (§12.4.6): register a click target over the
+        // `[present]` badge on the bottom (hints) row so a click toggles the mode
+        // — the mouse twin of the `TogglePresentation` (`Ctrl+Alt+C`) keyboard
+        // verb. Only registered when the badge is actually painted (the mode is on
+        // and no attention indicator owns the slot), so a normal session registers
+        // nothing. Registered before the density target because the presentation
+        // badge wins the slot whenever both could paint.
+        register_presentation_indicator_target(app, status_area);
         // Adaptive Density (§12.4.1): register a click target over the density
         // badge on the bottom (hints) row so a click cycles the override — the
         // mouse twin of the `CycleDensity` (`Ctrl+Alt+X`) keyboard verb. Only
@@ -40048,6 +40219,47 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         // registers nothing.
         register_density_indicator_target(app, status_area);
     }
+}
+
+/// Register the Presentation Mode indicator's click rect on the status block's
+/// bottom (hints) row (§12.4.6). [`format_status_lines`] prepends the
+/// `[present]` badge to that row's left edge exactly when
+/// [`presentation::PresentationState::indicator`] is `Some` *and* no attention
+/// indicator owns the slot, so the click span mirrors that: `[x, x + badge
+/// width)` on the last status row, clamped to the row width. A click there
+/// reaches the same `toggle_presentation` handler as the `TogglePresentation`
+/// keyboard verb. A no-op when the badge is not painted (the mode is off, an
+/// attention indicator present, or a one-row footer).
+fn register_presentation_indicator_target(app: &TuiApp, status_area: Rect) {
+    // Suppressed whenever the attention indicator owns the left edge — it is
+    // registered there first and the badge is not painted, so the two click
+    // targets never overlap.
+    if !app.attention_route.indicator().is_empty() {
+        return;
+    }
+    let Some(badge) = app.presentation.indicator() else {
+        return;
+    };
+    if status_area.width == 0 || status_area.height < 2 {
+        return;
+    }
+    let row_right = (status_area.x + status_area.width) as usize;
+    let abs_start = status_area.x as usize;
+    let abs_end = (abs_start + badge.chars().count()).min(row_right);
+    if abs_end <= abs_start {
+        return;
+    }
+    let rect = Rect {
+        x: status_area.x,
+        y: status_area.y + status_area.height - 1,
+        width: (abs_end - abs_start) as u16,
+        height: 1,
+    };
+    app.register_click(
+        rect,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::PresentationIndicator),
+        interaction::Action::TogglePresentation,
+    );
 }
 
 /// Register the Adaptive Density indicator's click rect on the status block's
@@ -40059,10 +40271,11 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 /// keyboard verb. A no-op when the badge is not painted (an `Auto` override, an
 /// attention indicator present, or a one-row footer).
 fn register_density_indicator_target(app: &TuiApp, status_area: Rect) {
-    // Suppressed whenever the attention indicator owns the left edge — it is
-    // registered there first and the badge is not painted, so the two click
-    // targets never overlap.
-    if !app.attention_route.indicator().is_empty() {
+    // Suppressed whenever the attention indicator OR the Presentation Mode badge
+    // (§12.4.6) owns the left edge — both are registered/painted there first and
+    // the density badge is not painted in that case, so the click targets never
+    // overlap.
+    if !app.attention_route.indicator().is_empty() || app.presentation.indicator().is_some() {
         return;
     }
     let Some(badge) = density_indicator(app) else {
@@ -40562,7 +40775,15 @@ fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     // line. `shows_status_detail` is the single ceiling — it never *forces* a
     // detail line the session has nothing to put in (the `and_then` below still
     // collapses an empty item list to the overview).
-    let detail = if app.effective_density().shows_status_detail() {
+    // Presentation Mode (§12.4.6): on a screen-share the metadata detail line
+    // (cost / account / provider / tokens / paths) is suppressed by default so it
+    // is not exposed to viewers, collapsing the top row to the terse
+    // `dir … · git …` overview (itself path-trimmed below). Display-only — the
+    // underlying snapshot is untouched, so the one-shot reveal (or leaving the
+    // mode) brings the line straight back. A revealed mode keeps the line.
+    let detail = if app.presentation.suppresses_metadata() {
+        None
+    } else if app.effective_density().shows_status_detail() {
         configured_status_line_items(app).and_then(|items| {
             status::render_status_detail_line(app, &items, app.status_line_use_colors)
         })
@@ -40579,7 +40800,13 @@ fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     };
     let mut bottom = if detail_was_present(app) {
         Line::from(hints_span)
-    } else if app.status_verbosity == StatusVerbosity::Verbose {
+    } else if app.status_verbosity == StatusVerbosity::Verbose
+        && !app.presentation.suppresses_metadata()
+    {
+        // Presentation Mode (§12.4.6) also suppresses the verbose inline-details
+        // fallback (taken only when the configured item list is empty), so a
+        // screen-share never leaks the cost/account/token metadata through the
+        // hints row either. The one-shot reveal restores it.
         Line::from(Span::styled(
             format!(
                 "{} · {}",
@@ -40606,6 +40833,28 @@ fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
             indicator,
             Style::default()
                 .fg(crate::render::theme::warn())
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            " · ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+        spans.append(&mut bottom.spans);
+        bottom = Line::from(spans);
+    } else if let Some(badge) = app.presentation.indicator() {
+        // Presentation Mode (§12.4.6): while the mode is on, prepend the
+        // active-mode badge (`[present]`, or `[present: revealed]` when the
+        // one-shot reveal is lifting suppression) to the hints row's left edge so
+        // the user always knows the screen-share policy is in effect and whether
+        // metadata is currently hidden. A click on it toggles the mode — the mouse
+        // twin of `Ctrl+Alt+C`. Suppressed while an attention indicator owns the
+        // slot (attention wins; the keyboard verb still toggles). Off by default,
+        // so a normal session's status line is byte-identical.
+        let mut spans = Vec::with_capacity(bottom.spans.len() + 2);
+        spans.push(Span::styled(
+            badge,
+            Style::default()
+                .fg(crate::render::theme::accent())
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
@@ -42142,6 +42391,17 @@ pub(crate) struct TuiApp {
     /// render `area` via [`dock::DockState::placement`] only while a frame is laid
     /// out (and when cycled), so an idle session pays nothing.
     pub(crate) dock: dock::DockState,
+    /// Presentation Mode (§12.4.6): the screen-share / demo display state — off
+    /// by default (so a fresh session is byte-identical to one without the
+    /// feature). When on, the renderer elevates the resolved density to the
+    /// spacious expanded layout and suppresses the metadata detail line
+    /// (cost / account / provider / paths) for the screen-share, leaving the
+    /// underlying transcript and cost snapshot untouched (display hiding, not
+    /// redaction). `Ctrl+Alt+C` toggles it and a one-shot reveal lifts the
+    /// suppression without leaving the mode; the enabled-state is restored from
+    /// `[tui].presentation` at startup. Read only while a frame is laid out (and
+    /// on the toggle/reveal keypress/click), so an idle session pays nothing.
+    pub(crate) presentation: presentation::PresentationState,
     /// Local Transcript Index (§12.5.1): an in-memory index over the transcript,
     /// keyed by stable entry id and grouped by category (user turns, tool calls,
     /// errors, …). Rebuilt incrementally — only when the transcript's
@@ -42808,7 +43068,11 @@ impl TuiApp {
     /// allocation-free — an idle session that never resolves pays nothing.
     pub(crate) fn effective_density(&self) -> density::ResolvedDensity {
         let (width, height) = self.off_frame_terminal_size();
-        self.density_override.resolve(width, height)
+        // Mirror the render path's Presentation Mode (§12.4.6) elevation so the
+        // off-frame readout/scroll-geometry tier matches the one the renderer
+        // paints with.
+        self.presentation
+            .present_density(self.density_override.resolve(width, height))
     }
 
     /// The OSC 8 hyperlink capability actually in effect (§11G.5): the runtime
@@ -43150,6 +43414,7 @@ impl TuiApp {
             smart_split_rect_cache: std::cell::Cell::new(None),
             density_override: density::DensityMode::default(),
             dock: dock::DockState::default(),
+            presentation: presentation::PresentationState::default(),
             transcript_index: transcript_index::TranscriptIndex::new(),
             transcript_index_open: false,
             transcript_index_selected: 0,

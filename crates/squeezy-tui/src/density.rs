@@ -194,6 +194,19 @@ impl ResolvedDensity {
         self.tier
     }
 
+    /// This density with its tier raised to *at least* [`DensityTier::Expanded`],
+    /// keeping the originating mode. Used by Presentation Mode (§12.4.6) to force
+    /// the spacious layout through the *same* per-tier spacing table rather than a
+    /// second spacing engine — an already-expanded density is returned unchanged,
+    /// and a compact/default one is lifted to expanded. The mode is preserved so a
+    /// status readout still shows what the user originally picked.
+    pub(crate) fn at_least_expanded(self) -> ResolvedDensity {
+        ResolvedDensity {
+            mode: self.mode,
+            tier: self.tier.max(DensityTier::Expanded),
+        }
+    }
+
     /// Blank rows inserted between the transcript and the prompt block. Compact
     /// spends none (every row goes to content); default keeps the single-row
     /// breather the renderer always had; expanded doubles it for a roomier feel.

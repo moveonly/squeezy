@@ -198,6 +198,10 @@ pub(crate) enum ChromeKey {
     /// override `auto → compact → default → expanded → auto` — the mouse twin of
     /// the `CycleDensity` (`Ctrl+Alt+X`) verb.
     DensityIndicator,
+    /// The Presentation Mode indicator painted on the status line (§12.4.6). A
+    /// single affordance with no identity of its own; a click toggles the mode
+    /// on/off — the mouse twin of the `TogglePresentation` (`Ctrl+Alt+C`) verb.
+    PresentationIndicator,
     /// The header of a docked auxiliary panel (§12.4.4). A single affordance with
     /// no identity of its own; a click cycles the panel's dock position
     /// `left → right → bottom → undocked` — the mouse twin of the `CycleDockPanel`
@@ -428,6 +432,11 @@ pub(crate) enum Action {
     /// density indicator; both step the override `auto → compact → default →
     /// expanded → auto`, persist it, and request a redraw.
     CycleDensity,
+    /// Toggle Presentation Mode (§12.4.6) on/off. Mouse twin of the
+    /// `TogglePresentation` (`Ctrl+Alt+C`) keyboard verb / a click on the
+    /// status-line `[present]` indicator; both flip the screen-share display mode,
+    /// persist it, and request a redraw.
+    TogglePresentation,
     /// Cycle the active Dockable Panel's dock position (§12.4.4). Mouse twin of
     /// the `CycleDockPanel` (`Ctrl+Alt+F`) keyboard verb / a click on the docked
     /// panel's header; both step the panel `left → right → bottom → undocked`,
@@ -750,6 +759,7 @@ impl Action {
         Action::JumpToAttention,
         Action::SmartSplitAdjustField(0),
         Action::CycleDensity,
+        Action::TogglePresentation,
         Action::CycleDockPanel,
     ];
 }

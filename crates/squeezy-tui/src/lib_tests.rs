@@ -41222,6 +41222,300 @@ fn density_survives_tiny_and_resized_frames() {
 }
 
 // ===========================================================================
+// Presentation Mode (§12.4.6)
+// ===========================================================================
+
+/// `Ctrl+Alt+C` — the default Presentation Mode toggle verb.
+fn presentation_toggle_key() -> KeyEvent {
+    KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    )
+}
+
+/// Point the app's persisted-settings path at a scratch file and return the
+/// guard + path, mirroring `density_scratch`.
+fn presentation_scratch(app: &mut TuiApp, name: &str) -> (ScopedSettingsPath, PathBuf) {
+    let dir = temp_workspace(name);
+    let settings_path = dir.join("settings.toml");
+    let guard = ScopedSettingsPath::new(settings_path.clone());
+    app.set_settings_path_override(Some(settings_path.clone()));
+    (guard, settings_path)
+}
+
+/// Flatten the painted status lines into plain text for substring assertions.
+fn status_text_at(app: &TuiApp, width: u16) -> String {
+    lines_to_plain_text(&format_status_lines(app, width))
+}
+
+#[test]
+fn presentation_default_is_off_and_paints_no_badge() {
+    // A fresh app is off; the painted status line carries no `[present]` badge, so
+    // an existing session is byte-identical to before this landed.
+    let app = test_app(SessionMode::Build);
+    assert!(!app.presentation.is_enabled());
+
+    let out = render_to_string(&app, 100, 30);
+    assert!(
+        !out.contains("[present"),
+        "an off session paints no presentation badge:\n{out}"
+    );
+}
+
+#[tokio::test]
+async fn presentation_toggle_key_paints_badge_persists_and_survives_restart() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, settings_path) = presentation_scratch(&mut app, "presentation_toggle");
+    app.set_test_frame_size(100, 30);
+
+    // Off -> on. The status reports the new state and it is persisted under
+    // `[tui].presentation`.
+    handle_key(&mut app, &mut agent, presentation_toggle_key())
+        .await
+        .unwrap();
+    assert!(
+        app.presentation.is_enabled(),
+        "Ctrl+Alt+C turns the mode on"
+    );
+    assert!(
+        app.status.contains("presentation"),
+        "status reports the new state: {}",
+        app.status
+    );
+    let written = std::fs::read_to_string(&settings_path).expect("settings written");
+    assert!(
+        written.contains("presentation = \"on\""),
+        "the on-state persists under [tui]: {written}"
+    );
+
+    // The status line now carries the active-mode badge.
+    assert!(
+        status_text_at(&app, 100).contains("[present]"),
+        "the presentation badge paints while the mode is on",
+    );
+
+    // A fresh session restores the on-state at startup (always re-hidden).
+    let mut fresh = test_app(SessionMode::Build);
+    fresh.set_settings_path_override(Some(settings_path.clone()));
+    assert!(
+        !fresh.presentation.is_enabled(),
+        "a fresh app starts off before restore runs",
+    );
+    restore_presentation(&mut fresh);
+    assert!(
+        fresh.presentation.is_enabled(),
+        "the persisted on-state is restored at startup",
+    );
+    assert!(
+        !fresh.presentation.is_revealed(),
+        "a restored mode always starts with metadata hidden",
+    );
+
+    // Off again clears the persisted key so the next session starts off.
+    handle_key(&mut app, &mut agent, presentation_toggle_key())
+        .await
+        .unwrap();
+    assert!(!app.presentation.is_enabled());
+    let cleared = std::fs::read_to_string(&settings_path).expect("settings written");
+    assert!(
+        !cleared.contains("presentation = \"on\""),
+        "turning the mode off clears the persisted key: {cleared}"
+    );
+}
+
+#[tokio::test]
+async fn presentation_suppresses_metadata_and_reveal_restores_it() {
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = presentation_scratch(&mut app, "presentation_meta");
+    // A configured detail line carrying cost so the metadata is on-screen by
+    // default.
+    app.status_line_items = Some(vec![status::StatusLineItem::Cost]);
+    app.cost.estimated_usd_micros = Some(2_500_000);
+    app.set_test_frame_size(200, 30);
+
+    // Before the mode: the cost metadata detail line is visible.
+    let before = status_text_at(&app, 200);
+    assert!(
+        before.contains("cost"),
+        "cost metadata is visible off:\n{before}"
+    );
+
+    // Turn the mode on: the metadata detail line is suppressed. The cost snapshot
+    // itself is untouched (display hiding, not redaction).
+    app.presentation.toggle();
+    let hidden = status_text_at(&app, 200);
+    assert!(
+        !hidden.contains("cost"),
+        "presentation suppresses the cost metadata line:\n{hidden}"
+    );
+    assert!(
+        app.cost.estimated_usd_micros == Some(2_500_000),
+        "display hiding never mutates the cost snapshot",
+    );
+
+    // The one-shot reveal restores the metadata without leaving the mode (the
+    // badge now reads `revealed`).
+    reveal_presentation(&mut app);
+    let revealed = status_text_at(&app, 200);
+    assert!(
+        revealed.contains("cost"),
+        "reveal restores the cost metadata:\n{revealed}"
+    );
+    assert!(
+        revealed.contains("[present: revealed]"),
+        "the badge names the revealed policy:\n{revealed}"
+    );
+    assert!(app.presentation.is_enabled(), "reveal stays in the mode");
+}
+
+#[test]
+fn presentation_hides_the_full_path_in_the_overview() {
+    // With no configured detail line, the top status row is the `dir … · git …`
+    // overview. Presentation Mode trims the full working-directory path to just
+    // the workspace name; the one-shot reveal restores it.
+    let mut app = test_app(SessionMode::Build);
+    // An explicit empty list disables the detail row, so the overview (carrying
+    // the directory) is what paints on the top row.
+    app.status_line_items = Some(Vec::new());
+    app.directory = "/Users/example/workspaces/secret-project".to_string();
+    app.set_test_frame_size(200, 30);
+
+    // Off: the full absolute path is visible.
+    let before = status_text_at(&app, 200);
+    assert!(
+        before.contains("/Users/example/workspaces/secret-project"),
+        "the full path is visible off:\n{before}"
+    );
+
+    // On: only the final component (the workspace name) is shown; the rest of the
+    // path is hidden. The underlying `app.directory` is untouched.
+    app.presentation.toggle();
+    let hidden = status_text_at(&app, 200);
+    assert!(
+        !hidden.contains("/Users/example/workspaces"),
+        "presentation hides the full path:\n{hidden}"
+    );
+    assert!(
+        hidden.contains("dir secret-project"),
+        "the workspace name is still shown:\n{hidden}"
+    );
+    assert_eq!(
+        app.directory, "/Users/example/workspaces/secret-project",
+        "display hiding never mutates the directory",
+    );
+
+    // Reveal restores the full path.
+    reveal_presentation(&mut app);
+    let revealed = status_text_at(&app, 200);
+    assert!(
+        revealed.contains("/Users/example/workspaces/secret-project"),
+        "reveal restores the full path:\n{revealed}"
+    );
+}
+
+#[test]
+fn presentation_forces_the_spacious_layout() {
+    // At a fixed mid-size, turning the mode on lifts the resolved density to the
+    // spacious expanded tier, so the transcript-to-prompt gap grows. Off, the same
+    // size resolves to the default tier.
+    let mut app = app_with_transcript_for_density();
+    let area = Rect::new(0, 0, 100, 30);
+
+    // Off (Auto -> Default at 100x30): the single-row historical gap.
+    let off = main_transcript_layout(&app, area, true);
+    assert_eq!(off.transcript_prompt_gap_height, 1, "default gap off");
+
+    // On: the expanded tier doubles the gap, the spacious screen-share layout.
+    app.presentation.toggle();
+    let on = main_transcript_layout(&app, area, true);
+    assert_eq!(
+        on.transcript_prompt_gap_height, 2,
+        "presentation forces the spacious expanded gap",
+    );
+}
+
+#[tokio::test]
+async fn presentation_badge_paints_and_click_toggles() {
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, _path) = presentation_scratch(&mut app, "presentation_badge");
+    app.presentation.toggle();
+    app.set_test_frame_size(100, 30);
+
+    // Render so the badge + its click target register on the status row.
+    let out = render_to_string(&app, 100, 30);
+    assert!(
+        out.contains("[present]"),
+        "the presentation badge paints on the status line:\n{out}"
+    );
+
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::PresentationIndicator,
+        ))
+        .expect("the badge registers a click target while painted");
+
+    // A click on the badge toggles the mode off — the mouse twin of the keyboard
+    // verb.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        !app.presentation.is_enabled(),
+        "clicking the badge toggles the mode off",
+    );
+}
+
+#[test]
+fn presentation_survives_tiny_and_resized_frames() {
+    // The mode resolves + paints without panic across a range of sizes, including
+    // an empty transcript and a frame too small to host the status badge.
+    for enabled in [false, true] {
+        let mut app = test_app(SessionMode::Build);
+        if enabled {
+            app.presentation.toggle();
+        }
+        for (w, h) in [(3u16, 2u16), (20, 6), (80, 24), (120, 40), (200, 60)] {
+            let _ = render_to_string(&app, w, h);
+        }
+    }
+}
+
+#[test]
+fn presentation_restore_ignores_a_malformed_config() {
+    // Any non-`on` value collapses to the off-default so a stale / garbage value
+    // keeps the built-in behaviour.
+    let mut app = test_app(SessionMode::Build);
+    let (_guard, settings_path) = presentation_scratch(&mut app, "presentation_malformed");
+    std::fs::write(&settings_path, "[tui]\npresentation = \"yes\"\n")
+        .expect("write malformed settings");
+    let restored = read_persisted_presentation(&app).expect("table present");
+    assert!(!restored.is_enabled(), "an unrecognised value reads as off",);
+
+    // A missing field reads as None (no table entry to restore from).
+    std::fs::write(&settings_path, "[tui]\nglyph_mode = \"ascii\"\n")
+        .expect("write settings without presentation");
+    assert!(read_persisted_presentation(&app).is_none());
+}
+
+#[test]
+fn presentation_dir_label_trims_paths_on_both_separators() {
+    assert_eq!(presentation_dir_label("/Users/me/repo"), "repo");
+    assert_eq!(presentation_dir_label("/Users/me/repo/"), "repo");
+    assert_eq!(presentation_dir_label("C:\\Users\\me\\repo"), "repo");
+    assert_eq!(presentation_dir_label("repo"), "repo");
+    // A separator-only / empty path falls back to an ellipsis, never a blank cell.
+    assert_eq!(presentation_dir_label("/"), "…");
+    assert_eq!(presentation_dir_label(""), "…");
+}
+
+// ===========================================================================
 // Dockable Panels (§12.4.4)
 // ===========================================================================
 
