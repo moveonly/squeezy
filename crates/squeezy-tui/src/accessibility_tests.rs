@@ -390,6 +390,43 @@ fn keyboard_paths_point_at_real_keymap_actions() {
     }
 }
 
+#[test]
+fn keyboard_paths_resolve_in_the_default_keymap() {
+    // Non-vacuity: every `Keymap(action)` keyboard path must genuinely resolve
+    // in the default keymap (its default binding round-trips back to it under the
+    // reverse lookup). A mouse-only action that names a keymap action which is
+    // shadowed by a colliding default would be unreachable from the keyboard.
+    let default_keymap =
+        crate::keymap::KeymapResolver::from_overrides(&std::collections::BTreeMap::new());
+    let mut violations = Vec::new();
+    keyboard_reachability_gate_with(&default_keymap, &mut violations);
+    assert!(
+        violations.is_empty(),
+        "every keymap-backed mouse affordance must resolve in the default keymap: {violations:#?}"
+    );
+}
+
+#[test]
+fn keyboard_reachability_gate_flags_a_shadowed_keymap_path() {
+    // The gate is a *checked* one, not a string claim: if a `Keymap(action)`
+    // path's target is shadowed in the keymap (some other action wins its key in
+    // the reverse lookup), the gate must report a violation naming it. Here we
+    // rebind `open_search` onto QueueUndo's default `u`, so `u` no longer
+    // resolves to QueueUndo (the JumpToLatest/QueueUndo path target) and the gate
+    // catches it. Without the resolution check this scenario is silently passed.
+    let mut overrides = std::collections::BTreeMap::new();
+    overrides.insert("open_search".to_string(), "u".to_string());
+    let shadowed = crate::keymap::KeymapResolver::from_overrides(&overrides);
+    let mut violations = Vec::new();
+    keyboard_reachability_gate_with(&shadowed, &mut violations);
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.detail.contains("QueueUndo") && v.detail.contains("does not resolve")),
+        "gate must flag the shadowed QueueUndo keymap path: {violations:#?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // audit_app — the bespoke-app entry point
 // ---------------------------------------------------------------------------

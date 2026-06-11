@@ -551,13 +551,47 @@ fn minimal_glyph_gate(captured: &AuditSurface, out: &mut Vec<Violation>) {
 /// Keyboard-reachability gate: every mouse affordance in the hit-test
 /// vocabulary must have a keyboard equivalent. The spec's "no mouse-only"
 /// guarantee. Reported per-affordance so a regression names the orphaned one.
+///
+/// For a [`KeyboardPath::Keymap`] equivalent the gate is *checked*, not a bare
+/// string claim: the cited action must genuinely resolve in the default keymap
+/// (its default binding must round-trip back to it under the reverse lookup, so
+/// a colliding default that shadows the action is caught). A
+/// [`KeyboardPath::Always`] equivalent names an overlay/modal handler the global
+/// keymap does not own, so it is accepted as documented prose.
 fn keyboard_reachability_gate(out: &mut Vec<Violation>) {
+    let default_keymap =
+        crate::keymap::KeymapResolver::from_overrides(&std::collections::BTreeMap::new());
+    keyboard_reachability_gate_with(&default_keymap, out);
+}
+
+/// Inner reachability gate, parameterised by the keymap whose bindings the
+/// [`KeyboardPath::Keymap`] arms are checked against. Split out so the gate's
+/// resolution check can be exercised against a deliberately-shadowed keymap in a
+/// unit test; production always passes the default keymap.
+fn keyboard_reachability_gate_with(
+    keymap: &crate::keymap::KeymapResolver,
+    out: &mut Vec<Violation>,
+) {
     for &mouse_action in interaction::Action::AUDIT_ALL {
-        if keyboard_equivalent(mouse_action).is_none() {
-            out.push(Violation {
+        match keyboard_equivalent(mouse_action) {
+            None => out.push(Violation {
                 gate: GateKind::KeyboardReachability,
                 detail: format!("mouse affordance {mouse_action:?} has no keyboard equivalent"),
-            });
+            }),
+            Some(KeyboardPath::Keymap(action)) => {
+                let binding = keymap.binding(action);
+                if keymap.lookup(binding.code, binding.modifiers) != Some(action) {
+                    out.push(Violation {
+                        gate: GateKind::KeyboardReachability,
+                        detail: format!(
+                            "mouse affordance {mouse_action:?} maps to keymap action {action:?}, \
+                             which does not resolve to {} in the default keymap",
+                            binding.display()
+                        ),
+                    });
+                }
+            }
+            Some(KeyboardPath::Always(_)) => {}
         }
     }
 }
