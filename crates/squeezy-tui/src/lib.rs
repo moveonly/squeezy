@@ -298,14 +298,20 @@ fn shell_output_is_unified_diff(tool: &ToolTranscript) -> bool {
 }
 
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
-/// Enable basic button-press/release reporting (1000) with SGR
-/// coordinate encoding (1006). Required for the clickable queue
-/// indicator strip to receive `MouseEventKind::Down(Left)` events.
+/// Enable button-press/release reporting (1000) PLUS button-event (drag)
+/// tracking (1002), with SGR coordinate encoding (1006). 1000 is required for
+/// the clickable queue indicator strip to receive `MouseEventKind::Down(Left)`
+/// events; 1002 makes the terminal also report `MouseEventKind::Drag(Left)`
+/// while a button is held, which the always-on drag features depend on — the
+/// transcript text-selection drag, the prompt-queue reorder drag, and the
+/// transcript-overlay scrollbar-thumb drag. Without 1002 those `Drag` handlers
+/// are unreachable: most emulators never forward a `Drag` event under bare 1000
+/// (deep-review #2, #8).
 /// Note: while this is enabled, native text selection in the terminal
 /// requires holding `Shift` on most emulators — the standard tradeoff
 /// when a TUI takes over mouse input.
-const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1006h";
-// The matching disable sequence (1000l, 1006l) is already part of
+const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+// The matching disable sequence (1000l, 1002l, 1006l) is already part of
 // `DISABLE_MOUSE_MODES`, so the Drop tear-down covers undoing this
 // without needing a dedicated constant.
 /// Belt-and-braces keyboard-enhancement reset, emitted alongside the single

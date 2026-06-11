@@ -10176,6 +10176,31 @@ fn fullscreen_enter_respects_mouse_capture_disabled() {
     );
 }
 
+#[test]
+fn fullscreen_enter_enables_drag_reporting_for_drag_dependent_features() {
+    // Enable-sequence-to-feature contract (deep-review #2): `handle_mouse` has
+    // live `MouseEventKind::Drag(Left)` handlers (transcript text-selection drag,
+    // prompt-queue reorder drag, transcript-overlay scrollbar-thumb drag). Most
+    // emulators only forward `Drag` events when button-event tracking (DEC private
+    // mode 1002) is on, so the enter sequence MUST request 1002 alongside the
+    // basic 1000 button reporting. Pinning it here means a future `?1002h` removal
+    // cannot land green while the drag handlers remain compiled in.
+    let mut bytes = Vec::new();
+    emit_terminal_enter_setup(&mut bytes, /* mouse_capture = */ true)
+        .expect("emit fullscreen enter setup");
+    let ansi = String::from_utf8(bytes).expect("ansi");
+    assert!(
+        ansi.contains("\x1b[?1002h"),
+        "fullscreen enter must enable button-event (drag) tracking so the live \
+         Drag(Left) features are reachable, got {ansi:?}"
+    );
+    // The constant the enter sequence prints carries the same contract.
+    assert!(
+        ENABLE_MOUSE_CLICK_CAPTURE.contains("\x1b[?1002h"),
+        "the mouse-capture enable constant must request drag tracking (1002)"
+    );
+}
+
 /// (deep-review #25) The SIGTERM/SIGHUP/SIGTSTP handlers must be armed BEFORE the
 /// blocking resume picker runs, so a kill signal during the picker's `event::read`
 /// runs the emergency teardown instead of stranding the terminal in raw mode +
