@@ -17403,6 +17403,103 @@ fn main_scrollbar_click_routes_through_handle_mouse() {
     assert!(!app.transcript_scroll.is_following());
 }
 
+#[test]
+fn main_scrollbar_drag_stays_captured_off_gutter_column() {
+    // deep-review #124: a thumb drag latched by a gutter press keeps tracking the
+    // pointer even after it drifts off the exact 1-cell gutter column — a fast
+    // drag that strays a column or two must not drop the grab into text
+    // selection. An off-gutter PRESS still falls through (no latch).
+    let mut app = app_with_user_turns(200);
+    let _ = render_transcript_to_string(&app, 40, 12);
+    let cache = app
+        .main_scrollbar_cache
+        .get()
+        .expect("overflow caches the gutter");
+    let gutter_x = cache.scrollbar_area.x;
+    let gutter_top_y = cache.scrollbar_area.y;
+    let gutter_bottom_y = cache.scrollbar_area.y + cache.scrollbar_area.height - 1;
+    assert!(gutter_x >= 2, "need room left of the gutter to drift onto");
+
+    // 1) PRESS at the TOP of the gutter: scrolls up off the tail and arms the
+    //    drag-latch for the hold.
+    let pressed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: gutter_x,
+            row: gutter_top_y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(pressed, "the gutter press changes the scroll state");
+    assert_eq!(
+        app.scrollbar_drag,
+        Some(ScrollbarDragSurface::Main),
+        "the gutter press arms the drag-latch"
+    );
+    let after_press = app.transcript_scroll.from_bottom();
+    assert!(after_press > 0, "pressing the top scrolls up off the tail");
+
+    // 2) DRAG to the BOTTOM row but OFF the gutter column (drifted left). Without
+    //    the latch this would miss the gutter hit-test and fall through; with it,
+    //    the drag is row-resolved and the thumb tracks to the tail.
+    let dragged = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: gutter_x - 2,
+            row: gutter_bottom_y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        dragged,
+        "an off-gutter drag stays captured and tracks the pointer"
+    );
+    assert_eq!(
+        app.transcript_scroll.from_bottom(),
+        0,
+        "dragging to the bottom of the track pins back to the tail, even off-column"
+    );
+
+    // 3) Button-up releases the latch.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: gutter_x - 2,
+            row: gutter_bottom_y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(
+        app.scrollbar_drag, None,
+        "button-up releases the scrollbar drag-latch"
+    );
+
+    // 4) After release, an off-gutter PRESS does NOT arm the latch (it falls
+    //    through to the surface beneath), so the scroll state is unchanged by it.
+    let before_off_press = app.transcript_scroll.from_bottom();
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: gutter_x - 2,
+            row: gutter_top_y,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(
+        app.scrollbar_drag, None,
+        "an off-gutter press never arms the scrollbar drag-latch"
+    );
+    assert_eq!(
+        app.transcript_scroll.from_bottom(),
+        before_off_press,
+        "an off-gutter press does not move the scrollbar (it falls through)"
+    );
+}
+
 // ---- resize anchoring (render-level) ------------------------------------
 
 #[test]

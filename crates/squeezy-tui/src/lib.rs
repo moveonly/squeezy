@@ -2631,6 +2631,18 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         app.hover_intent.set_suppression(None);
     }
 
+    // Release the scrollbar drag-latch on button-up (deep-review #124): the grab
+    // held the thumb captured off-gutter for the duration of the press; once the
+    // button is up a subsequent press/drag is hit-tested against the real gutter
+    // column again. Cleared before the per-overlay routing so no later arm sees a
+    // stale latch.
+    if matches!(
+        mouse.kind,
+        MouseEventKind::Up(crossterm::event::MouseButton::Left)
+    ) {
+        app.scrollbar_drag = None;
+    }
+
     // The Clickable Breadcrumbs strip (§12.1.5) is NON-modal: while shown it
     // registers a `BreadcrumbCrumb` target per crumb on the status row. A left
     // click on one focuses + activates that crumb (the mouse twin of ←→ + Enter),
@@ -3446,17 +3458,47 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // the pointer continuously. When capture is off no `Drag` events arrive, so
     // the drag arm is simply inert — no guard plumbing needed. Hit-tested before
     // the wheel arms so a click on the gutter never doubles as a scroll.
-    if let MouseEventKind::Down(crossterm::event::MouseButton::Left)
-    | MouseEventKind::Drag(crossterm::event::MouseButton::Left) = mouse.kind
-        && let Some(from_bottom) =
-            main_scrollbar_from_bottom_from_mouse(app, mouse.column, mouse.row)
+    //
+    // Drag-latch (deep-review #124): a PRESS in the gutter arms `scrollbar_drag`;
+    // while armed, a `Drag` is resolved by ROW only (against the cached gutter
+    // column) so the grab survives the pointer drifting off the 1-cell gutter.
+    // An off-gutter press never arms the latch, so it still falls through to text
+    // selection. The latch is released on button-up at the top of `handle_mouse`.
     {
-        // Direct manipulation: snap (no ease) so the thumb tracks the pointer.
-        cancel_main_scroll_anim(app);
-        let (line_count, viewport_h) = active_transcript_geometry(app);
-        let before = active_transcript_scroll(app);
-        active_transcript_scroll_mut(app).set_from_bottom(from_bottom, line_count, viewport_h);
-        return active_transcript_scroll(app) != before;
+        let is_press = matches!(
+            mouse.kind,
+            MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        );
+        let is_drag = matches!(
+            mouse.kind,
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+        );
+        // While a main-scrollbar drag is latched, hit-test the cached gutter
+        // column instead of the (possibly drifted) pointer column.
+        let effective_column = if is_drag && app.scrollbar_drag == Some(ScrollbarDragSurface::Main)
+        {
+            app.main_scrollbar_cache
+                .get()
+                .map(|c| c.scrollbar_area.x)
+                .unwrap_or(mouse.column)
+        } else {
+            mouse.column
+        };
+        if (is_press || is_drag)
+            && let Some(from_bottom) =
+                main_scrollbar_from_bottom_from_mouse(app, effective_column, mouse.row)
+        {
+            // A press that lands in the gutter arms the drag-latch for the hold.
+            if is_press {
+                app.scrollbar_drag = Some(ScrollbarDragSurface::Main);
+            }
+            // Direct manipulation: snap (no ease) so the thumb tracks the pointer.
+            cancel_main_scroll_anim(app);
+            let (line_count, viewport_h) = active_transcript_geometry(app);
+            let before = active_transcript_scroll(app);
+            active_transcript_scroll_mut(app).set_from_bottom(from_bottom, line_count, viewport_h);
+            return active_transcript_scroll(app) != before;
+        }
     }
 
     // Minimap turn-rail cell: a left-click jumps the transcript so the entry
@@ -3953,6 +3995,19 @@ fn hover_suppress_scroll(app: &mut TuiApp) {
 }
 
 /// Map an absolute `(column, row)` mouse position onto a `from_bottom` for the
+/// Which scrollbar gutter a thumb drag is latched to (deep-review #124). Set on
+/// a left press that lands in a gutter column; while set, the drag stays
+/// captured even if the pointer drifts off that 1-cell column, so a fast drag
+/// that strays a column doesn't drop the grab into text selection. Cleared on
+/// button-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScrollbarDragSurface {
+    /// The main transcript view's scrollbar gutter.
+    Main,
+    /// The Ctrl+T transcript-overlay scrollbar gutter.
+    Overlay,
+}
+
 /// MAIN transcript scrollbar, using the per-frame `main_scrollbar_cache`.
 /// Returns `None` when the position is outside the cached gutter rect (or no
 /// scrollbar was drawn this frame). The row→scroll math mirrors the overlay's
@@ -7089,13 +7144,37 @@ fn handle_transcript_overlay_mouse(
         }
         MouseEventKind::Down(crossterm::event::MouseButton::Left)
         | MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+            // Drag-latch (deep-review #124): while an overlay-scrollbar drag is
+            // armed, resolve a `Drag` by ROW only (against the cached gutter
+            // column) so the grab survives the pointer drifting off the 1-cell
+            // gutter; a PRESS in the gutter arms it. Released on button-up.
+            let is_press = matches!(
+                mouse.kind,
+                MouseEventKind::Down(crossterm::event::MouseButton::Left)
+            );
+            let is_drag = matches!(
+                mouse.kind,
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+            );
+            let effective_column =
+                if is_drag && app.scrollbar_drag == Some(ScrollbarDragSurface::Overlay) {
+                    app.transcript_overlay_scrollbar_cache
+                        .get()
+                        .map(|c| c.scrollbar_area.x)
+                        .unwrap_or(mouse.column)
+                } else {
+                    mouse.column
+                };
             if app
                 .transcript_overlay
                 .as_ref()
                 .is_some_and(|state| state.mode.mouse_capture())
                 && let Some((scroll, max_scroll)) =
-                    transcript_overlay_scroll_from_mouse(app, mouse.column, mouse.row)
+                    transcript_overlay_scroll_from_mouse(app, effective_column, mouse.row)
             {
+                if is_press {
+                    app.scrollbar_drag = Some(ScrollbarDragSurface::Overlay);
+                }
                 set_transcript_overlay_scroll_from_cached_geometry(app, scroll, max_scroll)
             } else {
                 false
@@ -45033,6 +45112,12 @@ pub(crate) struct TuiApp {
     /// plus its position when the drag started (for the undo record). `None`
     /// when no reorder drag is in flight.
     pub(crate) prompt_queue_drag: Option<QueueDrag>,
+    /// Which scrollbar gutter a thumb drag is currently latched to, or `None`
+    /// when no scrollbar drag is in flight (deep-review #124). Armed on a left
+    /// press inside a gutter column and held until button-up, so a drag that
+    /// drifts off the 1-cell gutter stays captured instead of falling through to
+    /// text selection. An off-gutter PRESS never arms it.
+    pub(crate) scrollbar_drag: Option<ScrollbarDragSurface>,
     /// Open reorder overlay state. `None` when the overlay is closed;
     /// the queue itself lives on `prompt_queue` regardless.
     pub(crate) prompt_queue_overlay: Option<prompt_queue::PromptQueueState>,
@@ -45781,6 +45866,7 @@ impl TuiApp {
             next_temp_file_nonce: 0,
             prompt_queue_undo: Vec::new(),
             prompt_queue_drag: None,
+            scrollbar_drag: None,
             prompt_queue_overlay: None,
             editing_queue_id: None,
             prompt_queue_multiselect: prompt_queue_multiselect::MultiSelect::new(),
