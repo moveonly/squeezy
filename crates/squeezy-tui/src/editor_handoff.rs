@@ -16,8 +16,8 @@
 //!   - [`EditorTarget`] names what is being edited and supplies the temp-file
 //!     extension (`.md` for the composer prose) so the editor lights up syntax.
 //!   - [`temp_file_name`] builds a collision-resistant temp filename from the
-//!     target, the process id, and a per-app nonce — no hardcoded path, just the
-//!     leaf the caller joins onto [`std::env::temp_dir`].
+//!     target, the process id, and a per-app sequence number — no hardcoded
+//!     path, just the leaf the caller joins onto [`std::env::temp_dir`].
 //!   - [`run_handoff`] is the testable core: it writes the initial text to a
 //!     file in the supplied directory, invokes an injected `run_editor` closure
 //!     (the real spawn in `lib.rs`, a fake editor in the tests), reads the saved
@@ -166,16 +166,16 @@ fn parse_editor_value(value: &str) -> Option<EditorCommand> {
 }
 
 /// Build the leaf temp-file name for a handoff. Collision-resistant without
-/// needing a real mkstemp: the process id plus a caller-supplied monotonic nonce
-/// make concurrent or repeated handoffs land on distinct files, and the target
-/// label + extension keep a stray file self-describing. The caller joins this
-/// onto [`std::env::temp_dir`] (never a hardcoded `/tmp`).
-pub(crate) fn temp_file_name(target: EditorTarget, pid: u32, nonce: u64) -> String {
+/// needing a real mkstemp: the process id plus a caller-supplied monotonic
+/// sequence number make concurrent or repeated handoffs land on distinct files,
+/// and the target label + extension keep a stray file self-describing. The
+/// caller joins this onto [`std::env::temp_dir`] (never a hardcoded `/tmp`).
+pub(crate) fn temp_file_name(target: EditorTarget, pid: u32, seq: u64) -> String {
     format!(
         "squeezy_edit_{}_{}_{}.{}",
         target.label(),
         pid,
-        nonce,
+        seq,
         target.extension(),
     )
 }
@@ -246,13 +246,13 @@ pub(crate) fn run_handoff<R>(
     initial_text: &str,
     dir: &Path,
     pid: u32,
-    nonce: u64,
+    seq: u64,
     run_editor: R,
 ) -> io::Result<HandoffOutcome>
 where
     R: FnOnce(&EditorCommand, &Path) -> io::Result<()>,
 {
-    let path: PathBuf = dir.join(temp_file_name(target, pid, nonce));
+    let path: PathBuf = dir.join(temp_file_name(target, pid, seq));
     write_new_private(&path, initial_text.as_bytes())?;
 
     // Run the editor; on failure still clean up the temp file before bubbling

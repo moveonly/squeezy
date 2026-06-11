@@ -83,10 +83,10 @@ fn temp_file_name_is_self_describing_and_extensioned() {
 }
 
 #[test]
-fn temp_file_name_distinct_per_nonce() {
+fn temp_file_name_distinct_per_seq() {
     let a = temp_file_name(EditorTarget::Composer, 1, 1);
     let b = temp_file_name(EditorTarget::Composer, 1, 2);
-    assert!(a != b, "a different nonce yields a different leaf");
+    assert!(a != b, "a different seq yields a different leaf");
 }
 
 // ── classify_result ───────────────────────────────────────────────────────
