@@ -75,13 +75,22 @@ pub(crate) enum CaptureOutcome {
     /// The chord is a reserved recovery binding (`Ctrl+C` / `Esc` / `Ctrl+D`)
     /// and may not be bound; the capture is refused with this label.
     Reserved { label: &'static str },
+    /// The chord is a bare structural key the composer needs unconditionally —
+    /// `Enter`, `Backspace`, `Tab`, an arrow, or a plain (unmodified) character.
+    /// Letting the user rebind one of these would brick prompt typing/submission
+    /// (e.g. three Enters in a row rebinding Enter), so the editor refuses it with
+    /// this label, exactly like a reserved recovery key.
+    Unsafe { label: &'static str },
 }
 
 impl CaptureOutcome {
     /// True when the chord may be committed (free or a warnable conflict, but
-    /// never a reserved recovery key).
+    /// never a reserved recovery key or a bare structural composer key).
     pub(crate) fn is_committable(&self) -> bool {
-        !matches!(self, CaptureOutcome::Reserved { .. })
+        !matches!(
+            self,
+            CaptureOutcome::Reserved { .. } | CaptureOutcome::Unsafe { .. }
+        )
     }
 }
 
@@ -125,14 +134,38 @@ pub(crate) fn reserved_label(binding: &KeyBinding) -> Option<&'static str> {
     None
 }
 
+/// Return the structural-key label `binding` matches, or `None`. These are the
+/// bare keys the main composer needs unconditionally for typing and submission:
+/// `Enter`, `Backspace`, `Tab`, the four arrows, and any plain (unmodified)
+/// character. Binding an action onto one of them would strand the user mid-prompt
+/// (e.g. rebinding `Enter` away from submit), so the editor refuses them exactly
+/// like the reserved recovery keys. A structural key only counts when it carries
+/// no Ctrl/Alt/Shift modifier — `Alt+Enter`, `Ctrl+Left`, etc. stay bindable.
+pub(crate) fn unsafe_label(binding: &KeyBinding) -> Option<&'static str> {
+    if !binding.modifiers.is_empty() {
+        return None;
+    }
+    match binding.code {
+        KeyCode::Enter => Some("Enter"),
+        KeyCode::Backspace => Some("Backspace"),
+        KeyCode::Tab => Some("Tab"),
+        KeyCode::Up => Some("Up"),
+        KeyCode::Down => Some("Down"),
+        KeyCode::Left => Some("Left"),
+        KeyCode::Right => Some("Right"),
+        KeyCode::Char(_) => Some("a bare key"),
+        _ => None,
+    }
+}
+
 /// Classify a captured `binding` for the row currently being edited (`editing`).
 /// A chord that lands on a reserved recovery key is [`CaptureOutcome::Reserved`];
-/// one that another *different* action already binds is
-/// [`CaptureOutcome::Conflict`] (naming that action's slug); a chord equal to the
-/// editing row's own current binding, or bound by nothing else, is
-/// [`CaptureOutcome::Free`]. The conflict scan walks the supplied `rows`, so it
-/// reflects the live map the editor was opened with (including earlier edits the
-/// caller folded back in).
+/// a bare structural composer key is [`CaptureOutcome::Unsafe`]; one that another
+/// *different* action already binds is [`CaptureOutcome::Conflict`] (naming that
+/// action's slug); a chord equal to the editing row's own current binding, or
+/// bound by nothing else, is [`CaptureOutcome::Free`]. The conflict scan walks the
+/// supplied `rows`, so it reflects the live map the editor was opened with
+/// (including earlier edits the caller folded back in).
 pub(crate) fn capture_outcome(
     rows: &[EditorRow],
     editing: Action,
@@ -140,6 +173,9 @@ pub(crate) fn capture_outcome(
 ) -> CaptureOutcome {
     if let Some(label) = reserved_label(&binding) {
         return CaptureOutcome::Reserved { label };
+    }
+    if let Some(label) = unsafe_label(&binding) {
+        return CaptureOutcome::Unsafe { label };
     }
     for row in rows {
         if row.action == editing {

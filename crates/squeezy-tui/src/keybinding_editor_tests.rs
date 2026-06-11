@@ -292,6 +292,65 @@ fn reset_selected_reverts_to_default_and_reports_the_change() {
 }
 
 #[test]
+fn bare_structural_composer_keys_cannot_be_captured() {
+    // Enter / Backspace / arrows / a bare letter are needed unconditionally by the
+    // composer (typing + submission). The editor must refuse to bind them, exactly
+    // like a reserved recovery key — otherwise three Enters in a row could rebind
+    // Enter and brick prompt submission (deep-review #3).
+    let rows = default_rows();
+    for (binding, label) in [
+        (KeyBinding::new(KeyCode::Enter, KeyModifiers::NONE), "Enter"),
+        (
+            KeyBinding::new(KeyCode::Backspace, KeyModifiers::NONE),
+            "Backspace",
+        ),
+        (KeyBinding::new(KeyCode::Tab, KeyModifiers::NONE), "Tab"),
+        (KeyBinding::new(KeyCode::Up, KeyModifiers::NONE), "Up"),
+        (KeyBinding::new(KeyCode::Down, KeyModifiers::NONE), "Down"),
+        (KeyBinding::new(KeyCode::Left, KeyModifiers::NONE), "Left"),
+        (KeyBinding::new(KeyCode::Right, KeyModifiers::NONE), "Right"),
+        (
+            KeyBinding::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            "a bare key",
+        ),
+    ] {
+        let outcome = capture_outcome(&rows, Action::ToggleMinimap, binding);
+        assert_eq!(
+            outcome,
+            CaptureOutcome::Unsafe { label },
+            "{binding:?} must classify as Unsafe",
+        );
+        assert!(
+            !outcome.is_committable(),
+            "{binding:?} must not be committable",
+        );
+    }
+}
+
+#[test]
+fn modified_structural_keys_stay_bindable() {
+    // Only BARE structural keys are refused — Alt+Enter, Ctrl+Left, Shift+Tab and a
+    // modified letter remain capturable so power chords still work.
+    let rows = default_rows();
+    for binding in [
+        KeyBinding::new(KeyCode::Enter, KeyModifiers::ALT),
+        KeyBinding::new(KeyCode::Left, KeyModifiers::CONTROL),
+        KeyBinding::new(KeyCode::Tab, KeyModifiers::SHIFT),
+        KeyBinding::new(KeyCode::Char('a'), KeyModifiers::ALT),
+    ] {
+        let outcome = capture_outcome(&rows, Action::ToggleMinimap, binding);
+        assert!(
+            outcome.is_committable(),
+            "{binding:?} must stay committable",
+        );
+        assert!(
+            !matches!(outcome, CaptureOutcome::Unsafe { .. }),
+            "{binding:?} must not be classified Unsafe",
+        );
+    }
+}
+
+#[test]
 fn begin_capture_is_a_noop_when_already_capturing() {
     let mut state = editor();
     assert!(state.begin_capture());

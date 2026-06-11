@@ -10258,6 +10258,10 @@ fn keybinding_editor_capture_status(app: &TuiApp) -> String {
                 "{} is reserved (recovery key) — press a different chord · Esc cancels",
                 label,
             ),
+            keybinding_editor::CaptureOutcome::Unsafe { label } => format!(
+                "{} is needed for typing — press a different chord · Esc cancels",
+                label,
+            ),
         },
     }
 }
@@ -25327,6 +25331,7 @@ fn render_keybinding_editor_surface(frame: &mut Frame<'_>, area: Rect, app: &Tui
     let header = if editor.is_capturing() {
         let style = match editor.pending().map(|p| &p.outcome) {
             Some(keybinding_editor::CaptureOutcome::Reserved { .. })
+            | Some(keybinding_editor::CaptureOutcome::Unsafe { .. })
             | Some(keybinding_editor::CaptureOutcome::Conflict { .. }) => Style::default()
                 .fg(crate::render::theme::warn())
                 .add_modifier(Modifier::BOLD),
