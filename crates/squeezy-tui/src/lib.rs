@@ -2597,8 +2597,15 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         mouse.kind,
         MouseEventKind::Drag(crossterm::event::MouseButton::Left)
     ) {
-        app.hover_intent
-            .set_suppression(Some(hover_intent::SuppressReason::Drag));
+        // Hiding the painted affordance requires a redraw to erase it (the clearing
+        // `set_suppression(None)` never re-reveals, so its result stays dropped).
+        // Mirrors the Move suppression path below (deep-review #101).
+        if app
+            .hover_intent
+            .set_suppression(Some(hover_intent::SuppressReason::Drag))
+        {
+            app.needs_redraw = true;
+        }
         app.hover_intent.set_suppression(None);
     }
 
@@ -3919,8 +3926,15 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
 /// reveal again. Resets the recognizer's hover arm so the next move re-starts the
 /// intent clock rather than instantly re-revealing the scrolled-past target.
 fn hover_suppress_scroll(app: &mut TuiApp) {
-    app.hover_intent
-        .set_suppression(Some(hover_intent::SuppressReason::Scroll));
+    // Hiding the painted affordance requires a redraw to erase it — otherwise a
+    // wheel at a scroll boundary (no scroll change to drive the redraw) leaves the
+    // cleared affordance painted until some other event repaints (deep-review #101).
+    if app
+        .hover_intent
+        .set_suppression(Some(hover_intent::SuppressReason::Scroll))
+    {
+        app.needs_redraw = true;
+    }
     app.hover_intent.set_suppression(None);
     app.gestures.reset();
 }

@@ -43569,6 +43569,94 @@ fn hover_intent_scroll_suppresses_an_in_flight_reveal() {
 }
 
 #[test]
+fn hover_suppression_at_scroll_boundary_requests_a_redraw_to_erase_affordance() {
+    // §12.1.3 hover-reveal suppression must request a redraw whenever it actually
+    // hides a painted affordance — even when the gesture itself yields no other
+    // state change. A fresh view follows the tail (`from_bottom == 0`), so a wheel
+    // ScrollDown cannot move it further; `handle_mouse` reports no scroll change.
+    // Without the fix the cleared affordance stays painted until some unrelated
+    // event repaints (deep-review #101).
+    let mut app = app_with_hoverable_transcript();
+    let top_id = active_transcript_entries(&app).first().expect("entry").id;
+    app.selected_entry = None;
+    // The default view follows the tail (the scroll-down boundary).
+    assert_eq!(
+        active_transcript_scroll(&app).from_bottom(),
+        0,
+        "a fresh view is pinned to the tail"
+    );
+
+    // Stage an in-flight revealed hover, then clear the redraw flag so the only way
+    // it can be set again is the suppression honoring its erase contract.
+    app.hover_intent
+        .on_hover_enter(top_id, 1, 1, std::time::Instant::now());
+    assert_eq!(app.hover_intent.hovered_target(), Some(top_id));
+    let scroll_before = active_transcript_scroll(&app);
+    app.needs_redraw = false;
+
+    // ScrollDown at the tail boundary: no scroll change, so handle_mouse returns false.
+    let consumed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        !consumed,
+        "a wheel at the tail boundary moves nothing, so handle_mouse reports no change"
+    );
+    assert_eq!(
+        active_transcript_scroll(&app),
+        scroll_before,
+        "the view is already at the tail, so the scroll is a no-op"
+    );
+    // The affordance was hidden, so a redraw must be requested to erase it.
+    assert!(app.hover_intent.hovered_target().is_none());
+    assert!(
+        app.needs_redraw,
+        "hiding the painted affordance must request a redraw to erase it"
+    );
+}
+
+#[test]
+fn drag_hover_suppression_requests_a_redraw_to_erase_affordance() {
+    // The button-held drag arm of §12.1.3 must also honor the erase-redraw
+    // contract: a left-button drag that suppresses a painted hover affordance
+    // requests a redraw even when nothing else about the drag mutates state
+    // (deep-review #101).
+    let mut app = app_with_hoverable_transcript();
+    let top_id = active_transcript_entries(&app).first().expect("entry").id;
+    pin_view_to_entry(&mut app, top_id);
+    app.selected_entry = None;
+
+    app.hover_intent
+        .on_hover_enter(top_id, 1, 1, std::time::Instant::now());
+    assert_eq!(app.hover_intent.hovered_target(), Some(top_id));
+    app.needs_redraw = false;
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        app.hover_intent.hovered_target().is_none(),
+        "a left-button drag hides the in-flight hover reveal"
+    );
+    assert!(
+        app.needs_redraw,
+        "hiding the painted affordance must request a redraw to erase it"
+    );
+}
+
+#[test]
 fn hover_intent_resize_keeps_reveal_on_the_same_entry() {
     // The reveal is anchored by stable id, so a resize that reflows the transcript
     // still paints the hint on the same focused entry's header. Focus the LAST
