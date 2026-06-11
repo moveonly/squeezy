@@ -47931,7 +47931,14 @@ impl TerminalGuard {
 fn render_lines_to_owned_buffer(lines: &[Line<'static>], width: u16) -> Buffer {
     let width = width.max(1);
     let paragraph = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
-    let height = (paragraph.line_count(width).min(u16::MAX as usize) as u16).max(1);
+    let total_rows = paragraph.line_count(width);
+    let height = (total_rows.min(u16::MAX as usize) as u16).max(1);
+    // A transcript that wraps past `u16::MAX` rows can't fit a single buffer. The
+    // exit mirror must keep the NEWEST content (the final answer the user is
+    // reading), so scroll to the tail instead of drawing head-first — otherwise
+    // the most recent rows are silently dropped (deep-review #75 / #95).
+    let scroll_y = scroll::to_u16_clamped(total_rows.saturating_sub(u16::MAX as usize));
+    let paragraph = paragraph.scroll((scroll_y, 0));
     let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
     (&paragraph).render(buffer.area, &mut buffer);
     let used = buffer_used_height(&buffer).max(1);

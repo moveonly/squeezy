@@ -12091,6 +12091,39 @@ fn render_lines_to_owned_buffer_clamps_empty_input_to_one_row() {
     );
 }
 
+/// The exit mirror keeps the NEWEST rows when a transcript wraps past the
+/// `u16::MAX` buffer-height ceiling: it scrolls to the tail rather than drawing
+/// head-first and silently dropping the most recent content (deep-review
+/// #75 / #95).
+#[test]
+fn render_lines_to_owned_buffer_keeps_the_tail_past_the_u16_ceiling() {
+    // A short sentinel that fits the width on one row, so wrapping never splits it
+    // across rows and breaks the substring match.
+    const SENTINEL: &str = "TAILZZ";
+    let total = u16::MAX as usize + 100;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(total);
+    for _ in 0..(total - 1) {
+        lines.push(Line::from("x".to_string()));
+    }
+    lines.push(Line::from(SENTINEL.to_string()));
+
+    let width = 16u16;
+    let buf = render_lines_to_owned_buffer(&lines, width);
+
+    // Read every buffer row into a string; the tail sentinel must be present.
+    let mut painted = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            painted.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+        }
+        painted.push('\n');
+    }
+    assert!(
+        painted.contains(SENTINEL),
+        "the mirror keeps the newest (tail) rows, not the head, past 65535 rows",
+    );
+}
+
 /// Finding-1 height fix: `visual_line_count`'s `chars().count().div_ceil(width)`
 /// estimate UNDER-counts a logical line that (a) word-wraps a too-long word and
 /// (b) contains wide CJK glyphs measured as one column but rendered as two. The
@@ -44831,3 +44864,4 @@ fn dock_restore_ignores_a_malformed_config() {
         .expect("write bare-panel settings");
     assert_eq!(read_persisted_dock(&app), None);
 }
+
