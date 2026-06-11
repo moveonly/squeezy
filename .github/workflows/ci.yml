@@ -399,6 +399,33 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  xtermcheck-oracle:
+    name: xterm.js resize-reflow oracle
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.inputs.checkout_ref || github.ref }}
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20"
+
+      # The xterm.js (VS Code engine) oracle catches resize-reflow / divider
+      # stacking that the byte/cell-level Rust tests cannot see. It is a Node
+      # tool, so it is gated here rather than in the cargo nextest run; this job
+      # makes it run unconditionally on every PR instead of being manual-only.
+      - name: Install xtermcheck deps
+        working-directory: crates/squeezy-tui/tools/termsim/xtermcheck
+        run: npm ci
+
+      - name: Run xtermcheck regression tests
+        working-directory: crates/squeezy-tui/tools/termsim/xtermcheck
+        run: npm test
+
   coverage-summary:
     name: Coverage summary (${{ matrix.platform }})
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
