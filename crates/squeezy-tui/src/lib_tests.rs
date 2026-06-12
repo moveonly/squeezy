@@ -10348,27 +10348,37 @@ fn fullscreen_enter_respects_mouse_capture_disabled() {
 }
 
 #[test]
-fn fullscreen_enter_enables_drag_reporting_for_drag_dependent_features() {
-    // Enable-sequence-to-feature contract (deep-review #2): `handle_mouse` has
-    // live `MouseEventKind::Drag(Left)` handlers (transcript text-selection drag,
-    // prompt-queue reorder drag, transcript-overlay scrollbar-thumb drag). Most
-    // emulators only forward `Drag` events when button-event tracking (DEC private
-    // mode 1002) is on, so the enter sequence MUST request 1002 alongside the
-    // basic 1000 button reporting. Pinning it here means a future `?1002h` removal
-    // cannot land green while the drag handlers remain compiled in.
+fn fullscreen_enter_omits_drag_reporting_to_preserve_native_selection() {
+    // Enable-sequence contract: the enter sequence enables click reporting
+    // (DEC private mode 1000) so click affordances work, but DELIBERATELY does
+    // NOT enable button-event/drag tracking (1002). Under bare 1000 a click-DRAG
+    // is not reported to the app, so the terminal performs its own native text
+    // selection on the drag — the user can select anywhere on screen and ⌘C just
+    // copies, with no iTerm2 "mouse reporting prevented a selection" nag (that
+    // nag only fires when 1002 swallows the drag). This mirrors vim's
+    // `ttymouse=xterm` and Claude Code. Pinning it here means a future `?1002h`
+    // re-enable cannot land green: it would re-break native selection and the
+    // copy nag. (Intentionally reverses deep-review #2/#8.)
     let mut bytes = Vec::new();
     emit_terminal_enter_setup(&mut bytes, /* mouse_capture = */ true)
         .expect("emit fullscreen enter setup");
     let ansi = String::from_utf8(bytes).expect("ansi");
     assert!(
-        ansi.contains("\x1b[?1002h"),
-        "fullscreen enter must enable button-event (drag) tracking so the live \
-         Drag(Left) features are reachable, got {ansi:?}"
+        ansi.contains("\x1b[?1000h"),
+        "fullscreen enter must enable click reporting (1000) so click affordances \
+         work, got {ansi:?}"
+    );
+    assert!(
+        !ansi.contains("\x1b[?1002h"),
+        "fullscreen enter must NOT enable drag tracking (1002): it would swallow \
+         the drag and block native text selection + trigger the ⌘C nag, got {ansi:?}"
     );
     // The constant the enter sequence prints carries the same contract.
     assert!(
-        ENABLE_MOUSE_CLICK_CAPTURE.contains("\x1b[?1002h"),
-        "the mouse-capture enable constant must request drag tracking (1002)"
+        ENABLE_MOUSE_CLICK_CAPTURE.contains("\x1b[?1000h")
+            && !ENABLE_MOUSE_CLICK_CAPTURE.contains("\x1b[?1002h"),
+        "the mouse-capture enable constant must request click reporting (1000) but \
+         not drag tracking (1002), to preserve native selection"
     );
 }
 
@@ -23689,14 +23699,17 @@ fn transcript_overlay_drag_uses_cached_scrollbar_geometry() {
 }
 
 #[test]
-fn scrollbar_drag_feature_is_reachable_because_motion_reporting_is_enabled() {
-    // deep-review #8: the transcript-overlay scrollbar-drag feature is only
-    // reachable if the terminal forwards `MouseEventKind::Drag(Left)` events,
-    // which requires button-event (motion) reporting — DEC private mode 1002. Pin
-    // the end-to-end contract: the production enter-setup must enable 1002, and a
-    // `Drag(Left)` in `ScrollbarDrag` mode must actually move the scroll. Before
-    // the fix the enter-setup only emitted 1000h/1006h, so a real terminal never
-    // produced the `Drag` events this handler consumes — the feature was dead.
+fn scrollbar_drag_handler_maps_correctly_but_enter_omits_drag_reporting() {
+    // The transcript-overlay scrollbar-drag handler is retained and its mapping
+    // math still works when a `MouseEventKind::Drag(Left)` is injected. BUT the
+    // production enter-setup intentionally no longer enables button-event (drag)
+    // reporting (DEC private mode 1002): we prioritize native terminal text
+    // selection, which only works when 1002 is OFF (a real terminal then selects
+    // on drag instead of forwarding `Drag` to the app). So this handler is no
+    // longer reached by a real mouse drag — native selection takes its place.
+    // Pin both halves: enter-setup keeps 1000 (clicks) and omits 1002 (drag), and
+    // the handler still maps correctly when driven directly. (Reverses
+    // deep-review #2/#8 by design; see `fullscreen_enter_omits_drag_reporting…`.)
     let mut enter = Vec::new();
     emit_terminal_enter_setup(&mut enter, /* mouse_capture = */ true)
         .expect("emit fullscreen enter setup");
@@ -23706,9 +23719,9 @@ fn scrollbar_drag_feature_is_reachable_because_motion_reporting_is_enabled() {
         "enter-setup must enable button-press reporting"
     );
     assert!(
-        enter.contains("\x1b[?1002h"),
-        "enter-setup must enable button-event (drag) tracking so a real terminal \
-         forwards the Drag(Left) events the scrollbar-drag handler consumes, got {enter:?}"
+        !enter.contains("\x1b[?1002h"),
+        "enter-setup must NOT enable drag tracking (1002): it would block native \
+         text selection and trigger the ⌘C nag, got {enter:?}"
     );
 
     // The handler the enabled drag events drive: a drag in ScrollbarDrag mode
@@ -23745,7 +23758,7 @@ fn scrollbar_drag_feature_is_reachable_because_motion_reporting_is_enabled() {
     );
     assert!(
         moved,
-        "a Drag(Left) in ScrollbarDrag mode must drive the now-reachable drag handler"
+        "a Drag(Left) injected in ScrollbarDrag mode must still drive the retained drag handler"
     );
     assert_eq!(
         app.transcript_overlay.expect("overlay").scroll,

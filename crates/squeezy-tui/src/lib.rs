@@ -301,19 +301,21 @@ fn shell_output_is_unified_diff(tool: &ToolTranscript) -> bool {
 }
 
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
-/// Enable button-press/release reporting (1000) PLUS button-event (drag)
-/// tracking (1002), with SGR coordinate encoding (1006). 1000 is required for
-/// the clickable queue indicator strip to receive `MouseEventKind::Down(Left)`
-/// events; 1002 makes the terminal also report `MouseEventKind::Drag(Left)`
-/// while a button is held, which the always-on drag features depend on — the
-/// transcript text-selection drag, the prompt-queue reorder drag, and the
-/// transcript-overlay scrollbar-thumb drag. Without 1002 those `Drag` handlers
-/// are unreachable: most emulators never forward a `Drag` event under bare 1000
-/// (deep-review #2, #8).
-/// Note: while this is enabled, native text selection in the terminal
-/// requires holding `Shift` on most emulators — the standard tradeoff
-/// when a TUI takes over mouse input.
-const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+/// Enable button-press/release reporting (1000) with SGR coordinate encoding
+/// (1006) — but deliberately NOT button-event/drag tracking (1002). 1000 lets
+/// the app receive `MouseEventKind::Down(Left)`/`Up`, so click affordances keep
+/// working (the queue strip, clickable breadcrumbs, expand, the subagent pane,
+/// OSC 8 hyperlinks). Omitting 1002 is the whole point: under bare 1000 a
+/// click-DRAG is NOT reported to the app, so the terminal performs its OWN
+/// native text selection on the drag — exactly like vim's `ttymouse=xterm` and
+/// Claude Code. The user can then drag-select anywhere on screen (transcript,
+/// prompt box, anything) and copy with the terminal's own ⌘C / copy-on-select,
+/// and iTerm2 never shows its "mouse reporting prevented a selection" nag — that
+/// nag only fires when 1002 swallows the drag. The tradeoff: app-driven DRAG
+/// gestures (transcript drag-select, prompt-queue reorder, scrollbar-thumb drag)
+/// are unreachable — native selection plus keyboard reorder/scroll replace them.
+/// (Intentionally reverses the 1002 enablement from deep-review #2/#8.)
+const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1006h";
 // The matching disable sequence (1000l, 1002l, 1006l) is already part of
 // `DISABLE_MOUSE_MODES`, so the Drop tear-down covers undoing this
 // without needing a dedicated constant.
@@ -22270,7 +22272,7 @@ fn build_terminal_diagnostic(app: &TuiApp, sync_policy: TuiSynchronizedOutput) -
     lines.push("Remedies:".to_string());
     lines.push("  - tmux OSC52: `set-option -g allow-passthrough on`".to_string());
     lines.push(
-        "  - native text selection: mouse capture is on by default; SQUEEZY_MOUSE_CAPTURE=0 to free it (or Shift+drag)"
+        "  - native text selection: just drag to select and copy — clicks still work; only app drag-gestures are off. SQUEEZY_MOUSE_CAPTURE=0 disables click capture entirely"
             .to_string(),
     );
     lines.push("  - shell: set SQUEEZY_SHELL (e.g. SQUEEZY_SHELL=/bin/bash)".to_string());
