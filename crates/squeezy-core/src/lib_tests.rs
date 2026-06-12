@@ -2621,6 +2621,17 @@ fn shell_request(target: &str) -> PermissionRequest {
 }
 
 #[test]
+fn copy_on_select_defaults_on() {
+    // Claude Code fullscreen parity: drag-select auto-copies on release unless
+    // the user opts out with `[tui] copy_on_select = false`.
+    let config = TuiConfig::default();
+    assert!(
+        config.copy_on_select,
+        "copy_on_select must default to true so drag-then-paste works out of the box"
+    );
+}
+
+#[test]
 fn section_settings_cover_budgets_permissions_graph_cache_tui_and_mcp() {
     let settings = SettingsFile::from_toml_str(
         r#"
@@ -2707,6 +2718,7 @@ response_verbosity = "concise"
 tool_output_verbosity = "normal"
 transcript_default = "expanded"
 show_reasoning_usage = false
+copy_on_select = false
 
 [mcp.servers.docs]
 enabled = true
@@ -2781,6 +2793,10 @@ reason = "docs lookups are safe"
     );
     assert_eq!(config.tui.transcript_default, TranscriptDefault::Expanded);
     assert!(!config.tui.show_reasoning_usage);
+    assert!(
+        !config.tui.copy_on_select,
+        "[tui] copy_on_select = false parses through"
+    );
     assert_eq!(config.mcp_servers["docs"].transport, McpTransport::Http);
     assert_eq!(config.mcp_servers["docs"].timeout_ms, Some(5_000));
     assert_eq!(

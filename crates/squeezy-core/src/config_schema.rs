@@ -1118,6 +1118,19 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
+                label: "copy_on_select",
+                toml_path: &["tui", "copy_on_select"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::Immediate,
+                get: get_copy_on_select,
+                set: set_copy_on_select,
+                default_display: "true",
+                default: || FieldValue::Bool(true),
+                help: "Copy app-level mouse selections to the clipboard automatically on release — drag, then paste.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
                 label: "synchronized_output",
                 toml_path: &["tui", "synchronized_output"],
                 kind: FieldKind::Enum {
@@ -3107,6 +3120,19 @@ fn set_persist_prompt_history(cfg: &mut AppConfig, value: FieldValue) -> Result<
     match value {
         FieldValue::Bool(v) => {
             cfg.tui.persist_prompt_history = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_copy_on_select(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.tui.copy_on_select)
+}
+fn set_copy_on_select(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.tui.copy_on_select = v;
             Ok(())
         }
         _ => Err("expects bool"),

@@ -10024,6 +10024,11 @@ pub struct TuiConfig {
     /// opts in, matching shell-history conventions and avoiding any
     /// surprise persisted plaintext for users who'd rather not have it.
     pub persist_prompt_history: bool,
+    /// Copy app-level mouse selections to the clipboard automatically on
+    /// mouse release (Claude Code fullscreen parity). On by default —
+    /// drag, then paste; no copy chord needed. Off keeps selections
+    /// manual: `Ctrl+C` / `⌘C` / `Ctrl+Shift+C` / `Alt+y` still copy.
+    pub copy_on_select: bool,
     /// User-supplied key rebindings for the TUI composer / chat surface.
     /// Keyed by an action slug (e.g. `transcript_overlay`, `page_up`);
     /// the value is a key spec like `"Ctrl+t"` or `"PageUp"`. Unknown
@@ -10069,6 +10074,7 @@ impl TuiConfig {
                 .desktop_notifications
                 .unwrap_or(NotificationMethod::Off),
             persist_prompt_history: settings.persist_prompt_history.unwrap_or(false),
+            copy_on_select: settings.copy_on_select.unwrap_or(true),
             keymap: settings.keymap.unwrap_or_default(),
             shell_diff_inline: settings.shell_diff_inline.unwrap_or(ShellDiffInline::Full),
         }
@@ -10098,6 +10104,7 @@ pub struct TuiSettings {
     pub themes: Option<BTreeMap<String, TuiThemeSettings>>,
     pub desktop_notifications: Option<NotificationMethod>,
     pub persist_prompt_history: Option<bool>,
+    pub copy_on_select: Option<bool>,
     pub keymap: Option<BTreeMap<String, String>>,
     pub shell_diff_inline: Option<ShellDiffInline>,
 }
@@ -10122,6 +10129,7 @@ impl TuiSettings {
                 "themes",
                 "desktop_notifications",
                 "persist_prompt_history",
+                "copy_on_select",
                 "keymap",
                 "shell_diff_inline",
             ],
@@ -10199,6 +10207,12 @@ impl TuiSettings {
                 source,
                 &field(path, "persist_prompt_history"),
             )?,
+            copy_on_select: bool_value(
+                table,
+                "copy_on_select",
+                source,
+                &field(path, "copy_on_select"),
+            )?,
             keymap: string_map_value(table, "keymap", source, &field(path, "keymap"))?,
             shell_diff_inline: shell_diff_inline_value(
                 table,
@@ -10229,6 +10243,7 @@ impl TuiSettings {
             &mut self.persist_prompt_history,
             next.persist_prompt_history,
         );
+        replace_if_some(&mut self.copy_on_select, next.copy_on_select);
         replace_if_some(&mut self.keymap, next.keymap);
         replace_if_some(&mut self.shell_diff_inline, next.shell_diff_inline);
     }

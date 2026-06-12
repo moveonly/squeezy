@@ -10464,10 +10464,25 @@ fn fullscreen_enter_enables_drag_reporting_for_drag_dependent_features() {
         "fullscreen enter must enable button-event (drag) tracking so the live \
          Drag(Left) features are reachable, got {ansi:?}"
     );
+    // Any-motion (1003) carries the same contract for the hover-intent
+    // previews: `MouseEventKind::Moved` only arrives from a live terminal
+    // under 1003, so removing it would silently kill hover previews.
+    assert!(
+        ansi.contains("\x1b[?1003h"),
+        "fullscreen enter must enable any-event (motion) tracking so the live \
+         Moved hover features are reachable, got {ansi:?}"
+    );
     // The constant the enter sequence prints carries the same contract.
     assert!(
-        ENABLE_MOUSE_CLICK_CAPTURE.contains("\x1b[?1002h"),
-        "the mouse-capture enable constant must request drag tracking (1002)"
+        ENABLE_MOUSE_CLICK_CAPTURE.contains("\x1b[?1002h")
+            && ENABLE_MOUSE_CLICK_CAPTURE.contains("\x1b[?1003h"),
+        "the mouse-capture enable constant must request drag (1002) and \
+         any-motion (1003) tracking"
+    );
+    // And the teardown must undo it.
+    assert!(
+        DISABLE_MOUSE_MODES.contains("\x1b[?1003l"),
+        "the teardown constant must disable any-motion tracking"
     );
 }
 
@@ -23472,8 +23487,8 @@ async fn transcript_overlay_m_toggles_scrollbar_drag_mode() {
         "drag mode should describe the active scrollbar behavior: {drag_hint}"
     );
     assert!(
-        drag_hint.contains("Shift-drag select"),
-        "drag mode should preserve the terminal selection escape hatch: {drag_hint}"
+        drag_hint.contains(&format!("{}-drag select", app.native_select_label)),
+        "drag mode should name THIS terminal's native-selection bypass key: {drag_hint}"
     );
 
     handle_key(
@@ -23808,6 +23823,11 @@ fn scrollbar_drag_feature_is_reachable_because_motion_reporting_is_enabled() {
         enter.contains("\x1b[?1002h"),
         "enter-setup must enable button-event (drag) tracking so a real terminal \
          forwards the Drag(Left) events the scrollbar-drag handler consumes, got {enter:?}"
+    );
+    assert!(
+        enter.contains("\x1b[?1003h"),
+        "enter-setup must enable any-event (motion) tracking so a real terminal \
+         forwards the Moved events the hover-intent previews consume, got {enter:?}"
     );
 
     // The handler the enabled drag events drive: a drag in ScrollbarDrag mode
@@ -25965,6 +25985,37 @@ fn synchronized_output_auto_stays_off_for_unknown_terminals() {
         !super::detect_synchronized_output_support_from_env(tmux_only),
         "tmux alone (without capability signals from the outer terminal) must not auto-enable BSU"
     );
+}
+
+#[test]
+fn native_selection_modifier_label_names_the_right_key_per_terminal() {
+    // iTerm2 bypasses mouse capture with Option, Apple Terminal with Fn, and
+    // most other emulators with Shift. The wrong label sends users chasing a
+    // dead chord ("hold Shift" does nothing in iTerm2).
+    let fixtures: &[(&[(&str, &str)], &str)] = &[
+        (&[("TERM_PROGRAM", "iTerm.app")], "Option"),
+        (&[("TERM_PROGRAM", "iterm2")], "Option"),
+        (&[("ITERM_SESSION_ID", "w0t0p0")], "Option"),
+        // iTerm2 over SSH: TERM_PROGRAM absent, LC_TERMINAL forwarded.
+        (&[("LC_TERMINAL", "iTerm2")], "Option"),
+        (&[("TERM_PROGRAM", "Apple_Terminal")], "Fn"),
+        (&[("TERM_PROGRAM", "WezTerm")], "Shift"),
+        (&[("TERM", "xterm-kitty")], "Shift"),
+        (&[], "Shift"),
+    ];
+    for (fixture, expected) in fixtures {
+        let lookup = |key: &str| -> Option<std::ffi::OsString> {
+            fixture
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| std::ffi::OsString::from(*v))
+        };
+        assert_eq!(
+            super::native_selection_modifier_label(lookup),
+            *expected,
+            "label for {fixture:?}"
+        );
+    }
 }
 
 #[test]
@@ -31450,6 +31501,9 @@ async fn copy_of_a_drag_selection_sends_clean_text_through_the_recording_sink() 
             error: None,
         }),
     );
+    // This test pins the EXPLICIT copy-chord funnel, so opt out of the
+    // default copy-on-release to keep selecting and copying distinct here.
+    app.copy_on_select = false;
     app.push_transcript_item(TranscriptItem::user("the prompt"));
     app.push_transcript_item(TranscriptItem::assistant("copy this exact phrase"));
 
@@ -31461,10 +31515,11 @@ async fn copy_of_a_drag_selection_sends_clean_text_through_the_recording_sink() 
     handle_mouse(&mut app, left_drag_with(x + 30, y, KeyModifiers::NONE));
     handle_mouse(&mut app, left_up(x + 30, y));
 
-    // Nothing has been sent to the clipboard yet — selecting is not copying.
+    // Nothing has been sent to the clipboard yet — with copy_on_select off,
+    // selecting is not copying.
     assert!(
         writes.lock().unwrap().is_empty(),
-        "drag-selecting must not touch the clipboard"
+        "drag-selecting must not touch the clipboard when copy_on_select is off"
     );
 
     // The copy chord routes the selection's clean text through the sink exactly
@@ -31491,6 +31546,98 @@ async fn copy_of_a_drag_selection_sends_clean_text_through_the_recording_sink() 
 }
 
 #[tokio::test]
+async fn release_after_drag_copies_the_selection_and_keeps_the_highlight() {
+    // Copy-on-select (default on, Claude Code fullscreen parity): finishing a
+    // drag copies the selection on mouse release — drag, then paste — and the
+    // highlight is KEPT so quote / add-to-set verbs still have a live range.
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    assert!(app.copy_on_select, "copy_on_select defaults on");
+    app.push_transcript_item(TranscriptItem::assistant("copy this exact phrase"));
+
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "copy this exact phrase").expect("painted");
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_drag_with(x + 30, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_up(x + 30, y));
+
+    assert_eq!(
+        writes.lock().unwrap().clone().as_slice(),
+        ["copy this exact phrase"],
+        "the release auto-copied the dragged selection exactly once"
+    );
+    assert!(
+        app.selection.as_ref().is_some_and(|s| !s.is_empty()),
+        "the highlight survives the auto-copy for follow-up verbs"
+    );
+}
+
+#[tokio::test]
+async fn release_does_not_copy_when_copy_on_select_is_off() {
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.copy_on_select = false;
+    app.push_transcript_item(TranscriptItem::assistant("copy this exact phrase"));
+
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "copy this exact phrase").expect("painted");
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_drag_with(x + 30, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_up(x + 30, y));
+
+    assert!(
+        writes.lock().unwrap().is_empty(),
+        "with copy_on_select off, release leaves the clipboard untouched"
+    );
+    assert!(
+        app.selection.as_ref().is_some_and(|s| !s.is_empty()),
+        "the selection itself still arms normally"
+    );
+}
+
+#[tokio::test]
+async fn bare_click_release_still_copies_nothing_under_copy_on_select() {
+    // A click without a drag collapses to an empty selection and is cleared on
+    // release — copy-on-select must not turn every stray click into a copy.
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    assert!(app.copy_on_select, "copy_on_select defaults on");
+    app.push_transcript_item(TranscriptItem::assistant("copy this exact phrase"));
+
+    let buffer = render_transcript_to_buffer(&app, 40, 12);
+    let (x, y) = find_text_cell(&buffer, "copy this exact phrase").expect("painted");
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_up(x, y));
+
+    assert!(
+        writes.lock().unwrap().is_empty(),
+        "a bare click copies nothing"
+    );
+    assert!(
+        app.selection.is_none(),
+        "a bare click leaves no lingering selection"
+    );
+}
+
+#[tokio::test]
 async fn ctrl_c_copies_the_active_selection_then_clears_it() {
     // Ctrl+C is the universal Copy when a selection is active (Claude Code's
     // fullscreen model): mouse capture stays on, the app owns the drag-select,
@@ -31504,6 +31651,8 @@ async fn ctrl_c_copies_the_active_selection_then_clears_it() {
             error: None,
         }),
     );
+    // Pin the explicit chord, not the release auto-copy.
+    app.copy_on_select = false;
     app.push_transcript_item(TranscriptItem::user("the prompt"));
     app.push_transcript_item(TranscriptItem::assistant("copy this exact phrase"));
 
@@ -31579,6 +31728,8 @@ async fn cmd_c_copies_the_active_selection_then_clears_it() {
             error: None,
         }),
     );
+    // Pin the explicit chord, not the release auto-copy.
+    app.copy_on_select = false;
     app.push_transcript_item(TranscriptItem::user("the prompt"));
     app.push_transcript_item(TranscriptItem::assistant("copy this exact phrase"));
 
@@ -31667,6 +31818,8 @@ async fn ctrl_shift_c_copies_the_active_selection_in_both_letter_cases() {
                 error: None,
             }),
         );
+        // Pin the explicit chord, not the release auto-copy.
+        app.copy_on_select = false;
         app.push_transcript_item(TranscriptItem::assistant("copy this exact phrase"));
 
         let buffer = render_transcript_to_buffer(&app, 40, 12);
@@ -31714,6 +31867,8 @@ async fn cmd_c_copies_the_selection_even_while_the_config_screen_is_open() {
             error: None,
         }),
     );
+    // Pin the explicit chord, not the release auto-copy.
+    app.copy_on_select = false;
     app.push_transcript_item(TranscriptItem::assistant("copy this exact phrase"));
 
     let buffer = render_transcript_to_buffer(&app, 40, 12);

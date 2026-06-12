@@ -301,21 +301,31 @@ fn shell_output_is_unified_diff(tool: &ToolTranscript) -> bool {
 }
 
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
-/// Enable button-press/release reporting (1000) PLUS button-event (drag)
-/// tracking (1002), with SGR coordinate encoding (1006). 1000 is required for
-/// the clickable queue indicator strip to receive `MouseEventKind::Down(Left)`
-/// events; 1002 makes the terminal also report `MouseEventKind::Drag(Left)`
-/// while a button is held, which the always-on drag features depend on — the
-/// transcript text-selection drag, the prompt-queue reorder drag, and the
-/// transcript-overlay scrollbar-thumb drag. Without 1002 those `Drag` handlers
-/// are unreachable: most emulators never forward a `Drag` event under bare 1000
-/// (deep-review #2, #8).
+/// Enable button-press/release reporting (1000), button-event (drag) tracking
+/// (1002), AND any-event (motion) tracking (1003), with SGR coordinate
+/// encoding (1006). 1000 is required for the clickable queue indicator strip
+/// to receive `MouseEventKind::Down(Left)` events; 1002 makes the terminal
+/// also report `MouseEventKind::Drag(Left)` while a button is held, which the
+/// always-on drag features depend on — the transcript text-selection drag, the
+/// prompt-queue reorder drag, and the transcript-overlay scrollbar-thumb drag
+/// (deep-review #2, #8). 1003 adds motion WITHOUT a held button
+/// (`MouseEventKind::Moved`), which the hover-intent previews (§12.1.3/.4,
+/// §12.8.2) consume — without it those features are unreachable in a live
+/// terminal (only tests could inject `Moved`). Terminals apply the
+/// most-recently-enabled mode and ignore ones they don't support, so listing
+/// 1000→1002→1003 degrades gracefully to the richest supported tier. This
+/// exact tier (any-motion + SGR) is what Claude Code's fullscreen mode
+/// requests. Event-flood pressure is bounded by `MAX_INPUT_EVENTS_PER_POLL`
+/// and the input-batch coalescers.
 /// Note: while this is enabled, native text selection in the terminal
-/// requires holding `Shift` on most emulators — the standard tradeoff
-/// when a TUI takes over mouse input.
-const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-// The matching disable sequence (1000l, 1002l, 1006l) is already part of
-// `DISABLE_MOUSE_MODES`, so the Drop tear-down covers undoing this
+/// requires holding a bypass key (`Option` on iTerm2, `Fn` on Apple
+/// Terminal, `Shift` on most others — see
+/// [`native_selection_modifier_label`]) — the standard tradeoff when a TUI
+/// takes over mouse input. The in-app `⌘C`/`Ctrl+Shift+C`/`Ctrl+C` copy
+/// chords and copy-on-select cover the no-bypass path.
+const ENABLE_MOUSE_CLICK_CAPTURE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+// The matching disable sequence (1000l, 1002l, 1003l, 1006l) is already part
+// of `DISABLE_MOUSE_MODES`, so the Drop tear-down covers undoing this
 // without needing a dedicated constant.
 /// Belt-and-braces keyboard-enhancement reset, emitted alongside the single
 /// `PopKeyboardEnhancementFlags` stack pop on the teardown paths. This is the
@@ -488,6 +498,36 @@ where
         }
     }
     false
+}
+
+/// The modifier key this terminal uses to bypass app mouse capture for a
+/// one-off NATIVE text selection: iTerm2 uses `Option`, Apple Terminal `Fn`,
+/// and most others (kitty, WezTerm, Ghostty, GNOME/VTE, VS Code) `Shift`.
+/// `LC_TERMINAL` covers iTerm2 over SSH, where `TERM_PROGRAM` is absent.
+/// Injected-env shape for testability, mirroring
+/// [`detect_synchronized_output_support_from_env`].
+fn native_selection_modifier_label<F>(env_get: F) -> &'static str
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    if let Some(prog) = env_get("TERM_PROGRAM") {
+        let prog = prog.to_string_lossy().to_ascii_lowercase();
+        if matches!(prog.as_str(), "iterm.app" | "iterm2") {
+            return "Option";
+        }
+        if prog == "apple_terminal" {
+            return "Fn";
+        }
+    }
+    if env_get("ITERM_SESSION_ID").is_some() {
+        return "Option";
+    }
+    if let Some(lc) = env_get("LC_TERMINAL")
+        && lc.to_string_lossy().eq_ignore_ascii_case("iterm2")
+    {
+        return "Option";
+    }
+    "Shift"
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3908,12 +3948,19 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
                 // Release ends a drag; a bare click (collapsed cell selection)
                 // leaves no selection so a single click doesn't paint a 1-cell
-                // highlight.
+                // highlight. A non-empty selection copies on release when
+                // `copy_on_select` is on (Claude Code fullscreen parity:
+                // drag, then paste) — the highlight is KEPT so the quote /
+                // add-to-set / save-snippet verbs still have a live range;
+                // the explicit copy chords (Ctrl+C, ⌘C, Ctrl+Shift+C) remain
+                // the clear-on-copy paths.
                 if let Some(sel) = app.selection.as_ref()
                     && sel.surface == selection::SelectionSurface::Main
                 {
                     if sel.is_empty() {
                         app.selection = None;
+                    } else if app.copy_on_select {
+                        let _ = copy_any_active_selection(app);
                     }
                     return true;
                 }
@@ -22331,10 +22378,10 @@ fn build_terminal_diagnostic(app: &TuiApp, sync_policy: TuiSynchronizedOutput) -
     lines.push(String::new());
     lines.push("Remedies:".to_string());
     lines.push("  - tmux OSC52: `set-option -g allow-passthrough on`".to_string());
-    lines.push(
-        "  - native text selection: mouse capture is on by default; SQUEEZY_MOUSE_CAPTURE=0 to free it (or Shift+drag)"
-            .to_string(),
-    );
+    lines.push(format!(
+        "  - native text selection: hold {}+drag to bypass mouse capture; SQUEEZY_MOUSE_CAPTURE=0 frees the mouse entirely",
+        app.native_select_label
+    ));
     lines.push("  - shell: set SQUEEZY_SHELL (e.g. SQUEEZY_SHELL=/bin/bash)".to_string());
     lines.join("\n")
 }
@@ -22832,11 +22879,13 @@ fn toggle_transcript_overlay_mouse_capture(app: &mut TuiApp) {
         };
         let capture = state.mode.mouse_capture();
         app.status = if capture {
-            "transcript scrollbar drag on (Shift-drag selects text)"
+            format!(
+                "transcript scrollbar drag on ({}-drag selects text)",
+                app.native_select_label
+            )
         } else {
-            "transcript native selection mode"
-        }
-        .to_string();
+            "transcript native selection mode".to_string()
+        };
         // Mouse Hover Intent (§12.1.3): turning capture off (native-selection
         // mode) means the terminal stops forwarding reliable motion, so suppress
         // (and hide) any hover reveal and reset the recognizer's hover arm. The
@@ -43561,8 +43610,10 @@ fn key_hint(app: &TuiApp, action: keymap::Action) -> String {
 fn format_status_hint_base(app: &TuiApp) -> String {
     if let Some(overlay) = app.transcript_overlay.as_ref() {
         return if overlay.mode.mouse_capture() {
-            "PgUp/PgDn/Wheel scroll · M native selection · drag right gutter scroll · Shift-drag select · Esc close"
-                .to_string()
+            format!(
+                "PgUp/PgDn/Wheel scroll · M native selection · drag right gutter scroll · {}-drag select · Esc close",
+                app.native_select_label
+            )
         } else {
             "PgUp/PgDn/Wheel scroll · M scrollbar drag · native select/copy · Esc close".to_string()
         };
@@ -44331,6 +44382,17 @@ pub(crate) struct TuiApp {
     /// `true`. Independent of the push-time retry coalescer
     /// ([`coalesce_tool_transcript_entry`]).
     pub(crate) coalesce_tool_runs: bool,
+    /// Copy app-level mouse selections to the clipboard automatically on
+    /// mouse release (Claude Code fullscreen parity). Mirrors
+    /// `config.tui.copy_on_select`; flipped at runtime via `/config
+    /// copy_on_select = …`. Default `true`.
+    pub(crate) copy_on_select: bool,
+    /// The modifier key THIS terminal uses to bypass mouse capture for a
+    /// native selection ("Option" on iTerm2, "Fn" on Apple Terminal, "Shift"
+    /// elsewhere). Resolved once at startup from the environment so hints
+    /// can name the right key instead of wrongly telling iTerm2 users to
+    /// hold Shift.
+    pub(crate) native_select_label: &'static str,
     /// Mirrors `config.tui.shell_diff_inline`. The active value also lives
     /// in the process-wide [`SHELL_DIFF_INLINE_OVERRIDE`] so the deep
     /// render path can consult it without a parameter cascade — this
@@ -45923,6 +45985,8 @@ impl TuiApp {
             transcript_default: config.tui.transcript_default,
             show_reasoning_usage: config.tui.show_reasoning_usage,
             coalesce_tool_runs: config.tui.coalesce_tool_runs,
+            copy_on_select: config.tui.copy_on_select,
+            native_select_label: native_selection_modifier_label(|key| std::env::var_os(key)),
             shell_diff_inline: {
                 set_shell_diff_inline(config.tui.shell_diff_inline);
                 config.tui.shell_diff_inline
@@ -46263,6 +46327,7 @@ impl TuiApp {
         self.transcript_default = config.tui.transcript_default;
         self.show_reasoning_usage = config.tui.show_reasoning_usage;
         self.coalesce_tool_runs = config.tui.coalesce_tool_runs;
+        self.copy_on_select = config.tui.copy_on_select;
         self.permissions = PermissionStatus::from_policy(&config.permissions);
         self.telemetry = TelemetryStatus::from_config(&config.telemetry);
         self.context_window_tokens = config.context_compaction.effective_window();
