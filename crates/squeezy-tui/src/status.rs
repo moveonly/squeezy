@@ -37,6 +37,8 @@ pub(crate) const DEFAULT_STATUS_LINE_ITEMS: &[StatusLineItem] = &[
     StatusLineItem::CacheHit,
 ];
 
+const LANGUAGE_STATUS_MAX_BYTES: usize = 48;
+
 /// Narrow status-line preset for SSH / tmux / narrow Linux terminals.
 /// Keeps spend, budget, and context visible while eliding directory,
 /// language, and branch metadata — items that are only useful in a wide
@@ -415,7 +417,7 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
             if summary.is_empty() || summary == "none" {
                 None
             } else {
-                Some(compact_text(summary, 48))
+                Some(compact_language_summary(summary, LANGUAGE_STATUS_MAX_BYTES))
             }
         }
         StatusLineItem::GitBranch => app
@@ -517,6 +519,45 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
             .latest_plan_progress
             .as_ref()
             .map(|progress| compact_text(progress, 60)),
+    }
+}
+
+fn compact_language_summary(summary: &str, max_bytes: usize) -> String {
+    let summary = summary.trim();
+    if summary.len() <= max_bytes {
+        return summary.to_string();
+    }
+    let entries: Vec<&str> = summary
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    if entries.len() <= 1 {
+        return compact_text(summary, max_bytes);
+    }
+    for keep in (1..entries.len()).rev() {
+        let omitted = entries.len() - keep;
+        let candidate = format!("{}, {}", entries[..keep].join(", "), other_label(omitted));
+        if candidate.len() <= max_bytes {
+            return candidate;
+        }
+    }
+    let omitted = entries.len().saturating_sub(1);
+    let suffix = other_label(omitted);
+    let reserved = suffix.len() + 2;
+    let head = if max_bytes > reserved {
+        compact_text(entries[0], max_bytes - reserved)
+    } else {
+        compact_text(entries[0], max_bytes)
+    };
+    format!("{head}, {suffix}")
+}
+
+fn other_label(count: usize) -> String {
+    if count == 1 {
+        "1 other".to_string()
+    } else {
+        format!("{count} others")
     }
 }
 

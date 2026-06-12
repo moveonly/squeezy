@@ -3997,11 +3997,21 @@ fn startup_language_summary(loaded: &RepoProfileLoad) -> String {
         let entry = families.entry(family).or_insert((display, 0));
         entry.1 += language.files;
     }
-    if families.is_empty() {
+    render_language_summary(families.into_values().collect())
+}
+
+fn render_language_summary(mut entries: Vec<(String, usize)>) -> String {
+    entries.retain(|(_, files)| *files > 0);
+    entries.sort_by(|(left_name, left_files), (right_name, right_files)| {
+        right_files
+            .cmp(left_files)
+            .then_with(|| left_name.cmp(right_name))
+    });
+    if entries.is_empty() {
         return "none".to_string();
     }
     let mut summary = String::new();
-    for (name, files) in families.into_values() {
+    for (name, files) in entries {
         if !summary.is_empty() {
             summary.push_str(", ");
         }
@@ -4019,6 +4029,12 @@ fn language_family_display<'a>(family: &str, fallback: &'a str) -> &'a str {
         "go" => "Go",
         "c-family" => "C/C++",
         "js-ts" => "JS/TS",
+        "ruby" => "Ruby",
+        "php" => "PHP",
+        "kotlin" => "Kotlin",
+        "swift" => "Swift",
+        "scala" => "Scala",
+        "dart" => "Dart",
         _ => fallback,
     }
 }

@@ -44049,24 +44049,35 @@ fn configured_language_summary(config: &AppConfig) -> String {
 /// into the same shape `startup_language_summary` in `squeezy-cli` uses
 /// at first paint, so the status-line value stays visually identical
 /// across the initial render and subsequent watcher-driven refreshes.
-/// Families are merged (jsx/tsx → JS/TS, c/cpp → C/C++) and sorted by
-/// display name; zero-count families are omitted.
+/// Families are merged (jsx/tsx -> JS/TS, c/cpp -> C/C++) and sorted by
+/// descending file share; zero-count families are omitted.
 fn format_language_report(report: &squeezy_tools::LanguageReport) -> String {
-    let entries: [(&str, usize); 7] = [
+    let mut entries: Vec<(&str, usize)> = vec![
         ("C/C++", report.c_files + report.cpp_files),
         ("C#", report.csharp_files),
+        ("Dart", report.dart_files),
         ("Go", report.go_files),
         ("Java", report.java_files),
         (
             "JS/TS",
             report.javascript_files + report.jsx_files + report.typescript_files + report.tsx_files,
         ),
+        ("Kotlin", report.kotlin_files),
+        ("PHP", report.php_files),
         ("Python", report.python_files),
+        ("Ruby", report.ruby_files),
         ("Rust", report.rust_files),
+        ("Scala", report.scala_files),
+        ("Swift", report.swift_files),
     ];
+    entries.retain(|(_, count)| *count > 0);
+    entries.sort_by(|(left_name, left_count), (right_name, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_name.cmp(right_name))
+    });
     let pieces: Vec<String> = entries
-        .iter()
-        .filter(|(_, count)| *count > 0)
+        .into_iter()
         .map(|(name, count)| format!("{name} {count}"))
         .collect();
     if pieces.is_empty() {

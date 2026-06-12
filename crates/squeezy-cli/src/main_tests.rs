@@ -12,6 +12,23 @@ fn model_choice_label_round_trips_to_model_id() {
 }
 
 #[test]
+fn language_summary_orders_by_file_share_and_labels_supported_families() {
+    assert_eq!(
+        render_language_summary(vec![
+            (language_family_display("ruby", "ruby").to_string(), 5),
+            (language_family_display("rust", "rust").to_string(), 20),
+            (
+                language_family_display("js-ts", "typescript").to_string(),
+                12
+            ),
+            (language_family_display("swift", "swift").to_string(), 4),
+            (language_family_display("dart", "dart").to_string(), 1),
+        ]),
+        "Rust 20, JS/TS 12, Ruby 5, Swift 4, Dart 1"
+    );
+}
+
+#[test]
 fn model_selection_state_detects_saved_startup_choice() {
     let settings = SettingsFile::from_toml_str(
         r#"

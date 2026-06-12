@@ -3347,6 +3347,105 @@ async fn status_line_cost_ticks_live_and_survives_cancel() {
 }
 
 #[tokio::test]
+async fn completed_turn_with_cost_does_not_append_cost_footer() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            estimated_usd_micros: Some(123),
+            ..CostSnapshot::default()
+        },
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+        session_cost: Some(CostSnapshot {
+            estimated_usd_micros: Some(123),
+            ..CostSnapshot::default()
+        }),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        app.cost.estimated_usd_micros,
+        Some(123),
+        "status-line cost should still update"
+    );
+    let log_text = app
+        .transcript
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Log(log) => Some(log.message.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !log_text.contains("turn:") && !log_text.contains("$0."),
+        "completed turn must not append a cost footer: {log_text}"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_turn_with_cost_does_not_append_cost_footer() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+        cost: CostSnapshot {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            estimated_usd_micros: Some(123),
+            ..CostSnapshot::default()
+        },
+        metrics: TurnMetrics::default(),
+        session_cost: Some(CostSnapshot {
+            estimated_usd_micros: Some(123),
+            ..CostSnapshot::default()
+        }),
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        app.cost.estimated_usd_micros,
+        Some(123),
+        "status-line cost should still update"
+    );
+    let log_text = app
+        .transcript
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Log(log) => Some(log.message.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        log_text.contains("turn cancelled"),
+        "cancelled turn warning should remain: {log_text}"
+    );
+    assert!(
+        !log_text.contains("cancelled · turn:") && !log_text.contains("$0."),
+        "cancelled turn must not append a cost footer: {log_text}"
+    );
+}
+
+#[tokio::test]
 async fn status_line_context_ticks_live_mid_turn() {
     let mut app = test_app(SessionMode::Build);
     app.context_window_tokens = 1_000;
@@ -25297,6 +25396,50 @@ fn status_line_languages_use_squeezy_amber() {
         dir_span.style.fg,
         Some(expected_language_color),
         "other path-family status items should not use the language brand accent"
+    );
+}
+
+#[test]
+fn format_language_report_sorts_by_file_share_and_includes_all_families() {
+    let report = squeezy_tools::LanguageReport {
+        c_files: 3,
+        cpp_files: 4,
+        csharp_files: 6,
+        dart_files: 1,
+        go_files: 2,
+        java_files: 5,
+        javascript_files: 7,
+        jsx_files: 1,
+        kotlin_files: 4,
+        php_files: 3,
+        python_files: 8,
+        ruby_files: 5,
+        rust_files: 20,
+        scala_files: 2,
+        swift_files: 4,
+        typescript_files: 5,
+        tsx_files: 2,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        format_language_report(&report),
+        "Rust 20, JS/TS 15, Python 8, C/C++ 7, C# 6, Java 5, Ruby 5, Kotlin 4, Swift 4, PHP 3, Go 2, Scala 2, Dart 1"
+    );
+}
+
+#[test]
+fn status_line_languages_truncates_with_omitted_family_count() {
+    use crate::status::StatusLineItem;
+    let mut app = test_app(SessionMode::Build);
+    app.language_summary = "Rust 247, JS/TS 31, Python 10, Kotlin 7, Swift 4, Dart 3".to_string();
+
+    let summary = status::resolve_status_item(&app, StatusLineItem::Languages).expect("languages");
+
+    assert_eq!(summary, "Rust 247, JS/TS 31, Python 10, 3 others");
+    assert!(
+        !summary.contains("..."),
+        "language truncation should preserve whole entries: {summary}"
     );
 }
 
