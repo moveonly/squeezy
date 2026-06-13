@@ -2098,10 +2098,12 @@ fn format_keycode(code: KeyCode, modifiers: KeyModifiers) -> String {
 /// `action: KeySpec` rows plus a hint about how to override and a
 /// validation block for any bad entries.
 pub(crate) fn format_keymap_command(resolver: &KeymapResolver) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    lines.push("Key bindings".to_string());
-    lines.push("(override in settings.toml under [tui.keymap])".to_string());
-    lines.push(String::new());
+    let mut lines: Vec<String> = vec![
+        "Key bindings".to_string(),
+        "Rebind interactively with Ctrl+Alt+B (writes ~/.squeezy/keybindings.toml),".to_string(),
+        "or override in settings.toml under [tui.keymap].".to_string(),
+        String::new(),
+    ];
     let mut rows: Vec<(String, String, bool, Option<&'static str>)> = Vec::new();
     for action in Action::ALL.iter().copied() {
         let binding = resolver.binding(action);
