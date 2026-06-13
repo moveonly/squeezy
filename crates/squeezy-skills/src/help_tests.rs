@@ -643,3 +643,20 @@ fn extract_doc_intro_returns_short_paragraph_unchanged() {
     let content = "# Heading\n\nshort intro\n\nmore text";
     assert_eq!(extract_doc_intro(content, 400), "short intro");
 }
+
+#[test]
+fn prompt_templates_topic_describes_real_slash_activation() {
+    let help = SqueezyHelp::new("");
+    let body = help.answer_topic("prompt-templates").body;
+    // Templates are invoked as `/<template-name>`, not via a non-existent
+    // `/prompt-template` command. The help text must teach the form the
+    // dispatch/catalog actually parses.
+    assert!(
+        !body.contains("/prompt-template"),
+        "prompt-templates summary must not advertise the non-command `/prompt-template`: {body}"
+    );
+    assert!(
+        body.contains("/review"),
+        "prompt-templates summary must show the real `/<name>` slash form: {body}"
+    );
+}

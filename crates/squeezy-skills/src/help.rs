@@ -722,7 +722,7 @@ const TOPICS: &[TopicDefinition] = &[
             "custom prompt",
             "reusable prompt",
         ],
-        summary: "Prompt templates are reusable `.md` files stored in `~/.squeezy/prompts/` (user scope) or `<workspace>/.squeezy/prompts/` (project scope). Each file's name (without `.md`) becomes the template name. Activate with `/prompt-template <name>` in the composer. Project templates shadow user templates with the same name.",
+        summary: "Prompt templates are reusable `.md` files stored in `~/.squeezy/prompts/` (user scope) or `<workspace>/.squeezy/prompts/` (project scope). Each file's name (without `.md`) becomes a slash command: a `review.md` template runs as `/review [args]` in the composer. Project templates shadow user templates with the same name.",
         docs: &[
             "docs/external/PROMPT_TEMPLATES.md",
             "docs/external/SKILLS.md",
