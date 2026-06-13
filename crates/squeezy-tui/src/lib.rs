@@ -15526,12 +15526,17 @@ fn toggle_annotations(app: &mut TuiApp) {
 }
 
 /// The list index of the annotation nearest the current top-of-view reading
-/// position, so the overlay opens with its cursor where the user is. Prefers the
-/// first annotation at or after the position; when the view sits past every
-/// annotation it parks on the last one via the reverse walk instead of wrapping
-/// to the top. `0` on an empty store.
+/// position, so the overlay opens with its cursor where the user is. Prefers a
+/// note anchored to the current entry, then the first annotation after the
+/// position; when the view sits past every annotation it parks on the last one
+/// via the reverse walk instead of wrapping to the top. `0` on an empty store.
 fn annotation_cursor_near_current(app: &TuiApp) -> usize {
     let current = current_top_entry_id(app);
+    if let Some(id) = current
+        && let Some(idx) = app.annotations.first_index_for_entry(id)
+    {
+        return idx;
+    }
     let after_is_real = current
         .map(|id| app.annotations.list().iter().any(|a| a.entry_id > id))
         .unwrap_or(true);
