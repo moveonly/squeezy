@@ -20815,10 +20815,12 @@ impl Clipboard for RecordingClipboard {
     }
 }
 
-/// Clipboard double whose `read_text` returns a canned value, for exercising the
-/// in-app paste chord without touching the real system clipboard.
+/// Clipboard double whose `read_text` / `read_image` return canned values, for
+/// exercising the in-app paste chord without touching the real system clipboard.
+#[derive(Default)]
 struct ReadableClipboard {
     read: Option<String>,
+    image: Option<(Vec<u8>, String)>,
 }
 
 impl Clipboard for ReadableClipboard {
@@ -20828,6 +20830,10 @@ impl Clipboard for ReadableClipboard {
 
     fn read_text(&mut self) -> Option<String> {
         self.read.clone()
+    }
+
+    fn read_image(&mut self) -> Option<(Vec<u8>, String)> {
+        self.image.clone()
     }
 }
 
@@ -48938,6 +48944,7 @@ async fn cmd_v_pastes_clipboard_text_into_the_composer_at_the_cursor() {
     let mut app = test_app(SessionMode::Build);
     app.clipboard = Box::new(ReadableClipboard {
         read: Some("WORLD".to_string()),
+        ..Default::default()
     });
     set_input(&mut app, "hello ".to_string());
     app.input_cursor = app.input.len();
@@ -48962,6 +48969,7 @@ async fn ctrl_shift_v_also_pastes_the_clipboard() {
     let mut app = test_app(SessionMode::Build);
     app.clipboard = Box::new(ReadableClipboard {
         read: Some("pasted".to_string()),
+        ..Default::default()
     });
 
     press(
@@ -48983,6 +48991,7 @@ async fn paste_chord_with_empty_clipboard_is_a_consumed_no_op() {
     // helpers and must never type a stray 'v'.
     app.clipboard = Box::new(ReadableClipboard {
         read: Some(String::new()),
+        ..Default::default()
     });
     set_input(&mut app, "keep".to_string());
     app.input_cursor = app.input.len();
@@ -49021,6 +49030,67 @@ fn paste_chord_matches_super_and_ctrl_shift_v_only() {
         KeyCode::Char('v'),
         KeyModifiers::SUPER | KeyModifiers::ALT
     )));
+}
+
+#[tokio::test]
+async fn cmd_v_attaches_a_clipboard_image() {
+    // ⌘V of a screenshot attaches it as an image token (Claude Code parity).
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
+    app.clipboard = Box::new(ReadableClipboard {
+        image: Some((png.clone(), "image/png".to_string())),
+        ..Default::default()
+    });
+
+    press(
+        &mut app,
+        &mut agent,
+        KeyCode::Char('v'),
+        KeyModifiers::SUPER,
+    )
+    .await;
+
+    assert!(
+        app.input.contains("[Image clipboard]"),
+        "⌘V of a clipboard image inserts an image placeholder: {:?}",
+        app.input,
+    );
+    assert_eq!(app.prompt_attachments.len(), 1, "one image attachment");
+    match &app.prompt_attachments[0].payload {
+        PromptAttachmentPayload::Image { media_type, bytes } => {
+            assert_eq!(media_type, "image/png");
+            assert_eq!(bytes.as_ref(), png.as_slice());
+        }
+        other => panic!("expected an image attachment, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cmd_v_prefers_a_clipboard_image_over_text() {
+    // A copied image leaves the text clipboard set too on some platforms; the
+    // image wins so ⌘V attaches the screenshot rather than typing stray text.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    app.clipboard = Box::new(ReadableClipboard {
+        read: Some("stale text".to_string()),
+        image: Some((png, "image/png".to_string())),
+    });
+
+    press(
+        &mut app,
+        &mut agent,
+        KeyCode::Char('v'),
+        KeyModifiers::SUPER,
+    )
+    .await;
+
+    assert!(
+        app.input.contains("[Image clipboard]") && !app.input.contains("stale text"),
+        "the image is attached, not the text: {:?}",
+        app.input,
+    );
 }
 
 // ===========================================================================

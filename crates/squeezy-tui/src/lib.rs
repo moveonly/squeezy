@@ -8094,6 +8094,33 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         if app.terminal_title_state == TerminalTitleState::Notification {
             app.terminal_title_state = TerminalTitleState::Cleared;
         }
+        // An IMAGE on the clipboard (a screenshot) is attached as an image token,
+        // matching Claude Code — checked before text because a copied image leaves
+        // the text clipboard empty. Only when the composer owns the surface (no
+        // modal/overlay that runs its own paste routing): `handle_paste` already
+        // gates those for text, but the image path bypasses it, so guard here.
+        if app.config_screen.is_none()
+            && app.theme_editor.is_none()
+            && !app.scratchpad_open
+            && app.pending_approval.is_none()
+            && app.pending_mcp_elicitation.is_none()
+            && app.paste_preview.is_none()
+            && app.paste_transform.is_none()
+            && app.editor_handoff.is_none()
+            && let Some((bytes, media_type)) = app
+                .clipboard
+                .read_image()
+                .or_else(clipboard::read_system_clipboard_image)
+        {
+            let media_type = detect_image_mime(&bytes)
+                .map(str::to_string)
+                .unwrap_or(media_type);
+            let placeholder =
+                insert_prompt_image_token(app, "[Image clipboard]".to_string(), media_type, bytes);
+            app.status = format!("inserted {placeholder}");
+            app.needs_redraw = true;
+            return Ok(false);
+        }
         let pasted = app
             .clipboard
             .read_text()
@@ -44629,6 +44656,13 @@ pub(crate) trait Clipboard: Send {
     /// [`clipboard::read_system_clipboard`] (the platform `pbpaste`/`wl-paste`/…
     /// helpers); only the test double overrides it to inject canned text.
     fn read_text(&mut self) -> Option<String> {
+        None
+    }
+
+    /// Read a raster IMAGE `(bytes, media_type)` from the clipboard for the paste
+    /// chord (⌘V of a screenshot). Defaults to `None` so production falls back to
+    /// [`clipboard::read_system_clipboard_image`]; the test double overrides it.
+    fn read_image(&mut self) -> Option<(Vec<u8>, String)> {
         None
     }
 }

@@ -499,6 +499,143 @@ pub(crate) fn read_system_clipboard() -> Option<String> {
     None
 }
 
+/// True when `bytes` begin with the PNG 8-byte signature.
+fn is_png(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+}
+
+/// Run a command that writes PNG bytes to stdout; accept the bytes only when it
+/// exits cleanly AND they carry the PNG signature. Used by the stdout-piping
+/// image readers (`pngpaste`, `wl-paste`, `xclip`); not compiled on Windows,
+/// whose reader round-trips through a temp file instead.
+#[cfg(not(target_os = "windows"))]
+fn clipboard_image_from_stdout(program: &str, args: &[&str]) -> Option<Vec<u8>> {
+    use std::process::{Command, Stdio};
+    let out = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if out.status.success() && is_png(&out.stdout) {
+        Some(out.stdout)
+    } else {
+        None
+    }
+}
+
+/// A private, collision-resistant temp-file path with the given extension, used
+/// by the clipboard-image readers that must round-trip through a file (macOS
+/// AppleScript fallback and Windows PowerShell).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn unique_temp_path(ext: &str) -> PathBuf {
+    let n = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("squeezy-clip-{pid}-{n}.{ext}"))
+}
+
+/// Read a raster IMAGE from the host clipboard for the paste chord (⌘V of a
+/// screenshot), returning `(png_bytes, "image/png")`. `None` when the clipboard
+/// holds no image, or no image-capable helper is available. Tools that pipe the
+/// bytes to stdout (`pngpaste`, `wl-paste`, `xclip`) are read directly; macOS
+/// without `pngpaste` and Windows fall back to dumping the clipboard image to a
+/// private temp file and reading it back. Only PNG is accepted (what every path
+/// below produces), validated against the PNG signature.
+#[cfg(target_os = "macos")]
+pub(crate) fn read_system_clipboard_image() -> Option<(Vec<u8>, String)> {
+    use std::process::{Command, Stdio};
+    // Prefer `pngpaste` (Homebrew) when present; otherwise have AppleScript dump
+    // the clipboard PNG to a private temp file and read it back.
+    if let Some(bytes) = clipboard_image_from_stdout("pngpaste", &["-"]) {
+        return Some((bytes, "image/png".to_string()));
+    }
+    let path = unique_temp_path("png");
+    let script = format!(
+        "try\n\
+         set pngData to (the clipboard as «class PNGf»)\n\
+         on error\n\
+         return\n\
+         end try\n\
+         set fh to open for access (POSIX file \"{}\") with write permission\n\
+         set eof fh to 0\n\
+         write pngData to fh\n\
+         close access fh",
+        path.display()
+    );
+    let ran = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let result = if ran {
+        match std::fs::read(&path) {
+            Ok(bytes) if is_png(&bytes) => Some((bytes, "image/png".to_string())),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+/// See the macOS doc above. Windows: PowerShell dumps the clipboard image to a
+/// private temp file as PNG, which we read back.
+#[cfg(target_os = "windows")]
+pub(crate) fn read_system_clipboard_image() -> Option<(Vec<u8>, String)> {
+    use std::process::{Command, Stdio};
+    let path = unique_temp_path("png");
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; \
+         $img = [System.Windows.Forms.Clipboard]::GetImage(); \
+         if ($img -ne $null) {{ $img.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png) }}",
+        path.display()
+    );
+    let ran = Command::new("powershell")
+        .args(["-NoProfile", "-STA", "-Command", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let result = if ran {
+        match std::fs::read(&path) {
+            Ok(bytes) if is_png(&bytes) => Some((bytes, "image/png".to_string())),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+/// See the macOS doc above. Linux / other unix: Wayland first when advertised,
+/// then X11 — both pipe PNG to stdout.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub(crate) fn read_system_clipboard_image() -> Option<(Vec<u8>, String)> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && let Some(bytes) = clipboard_image_from_stdout("wl-paste", &["-t", "image/png"])
+    {
+        return Some((bytes, "image/png".to_string()));
+    }
+    if let Some(bytes) = clipboard_image_from_stdout(
+        "xclip",
+        &["-selection", "clipboard", "-t", "image/png", "-o"],
+    ) {
+        return Some((bytes, "image/png".to_string()));
+    }
+    if let Some(bytes) = clipboard_image_from_stdout("wl-paste", &["-t", "image/png"]) {
+        return Some((bytes, "image/png".to_string()));
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Providers + chain
 // ---------------------------------------------------------------------------
