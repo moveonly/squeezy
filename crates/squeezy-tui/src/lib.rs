@@ -1338,18 +1338,29 @@ async fn run_inner_with_terminal(
         }
     }
 
+    // Leave the alternate screen FIRST so the UI exits the instant the user
+    // quits: they get their normal terminal + mirrored scrollback back while
+    // the (fast) session-state persist, telemetry flush, and background-task
+    // drain finish behind it, instead of staring at a frozen alt-screen
+    // through teardown. Best-effort — a teardown IO error must not mask a
+    // completed session, and `Drop` still runs the idempotent emergency
+    // teardown (which sees `alt_screen_active == false` here and won't leave
+    // the alternate screen a second time). `Drop` stays emergency-only and
+    // never mirrors. App state is final once the event loop has broken, so
+    // nothing below mutates what `finish_fullscreen` renders.
+    let _ = terminal.finish_fullscreen(&app);
+
     agent
         .finish_session(squeezy_store::SessionStatus::Completed)
         .await;
     agent.flush_telemetry().await;
-
-    // Clean, successful exit: leave the alternate screen, mirror the collapsed
-    // transcript into native scrollback, write the resume hint, and restore
-    // terminal modes. Best-effort — a teardown IO error must not mask a
-    // completed session, and `Drop` still runs the idempotent emergency teardown
-    // (which sees `alt_screen_active == false` here and won't leave the alternate
-    // screen a second time). `Drop` stays emergency-only and never mirrors.
-    let _ = terminal.finish_fullscreen(&app);
+    // Proactively cancel the agent-lifetime background tasks (MCP
+    // tool-palette refresh/reload, etc.) and join them before we return.
+    // Without this they outlive `run` and get reaped by the unbounded
+    // runtime drop, which is part of what makes quitting feel "locked".
+    // The runtime `shutdown_timeout` in the CLI bounds the worst case;
+    // this drains the common case cleanly so the timeout is just a net.
+    agent.shutdown().await;
 
     Ok((StartupRunOutcome::Finished, None))
 }

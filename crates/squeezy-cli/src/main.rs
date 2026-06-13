@@ -762,12 +762,25 @@ fn main() -> squeezy_core::Result<()> {
 }
 
 fn run_blocking() -> squeezy_core::Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(WORKER_THREAD_STACK_SIZE)
         .build()
-        .map_err(|err| SqueezyError::Config(format!("failed to build async runtime: {err}")))?
-        .block_on(run())
+        .map_err(|err| SqueezyError::Config(format!("failed to build async runtime: {err}")))?;
+    let result = runtime.block_on(run());
+    // Exit immediately. `run` has already torn down what must be torn down:
+    // session state is persisted, MCP children are killed (the agent dropped,
+    // firing each StdioProcessHandle's process-group SIGTERM plus tokio's
+    // kill_on_drop), and the agent's background tasks are drained. The only
+    // thing that can still be in flight is the workspace graph build on a
+    // `spawn_blocking` thread, which can't be cancelled mid-parse. It is a
+    // best-effort cache — abandoning an unfinished build just means the next
+    // launch rebuilds, and redb is crash-safe so an aborted mid-write recovers
+    // to the last committed state. So return the runtime in the background
+    // rather than blocking on that build: quitting is instant regardless of
+    // repo size.
+    runtime.shutdown_background();
+    result
 }
 
 async fn run() -> squeezy_core::Result<()> {
