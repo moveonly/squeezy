@@ -1105,7 +1105,7 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
             "/compact history  — show compaction timeline for this session",
         ],
         available_during_turn: false,
-        capability_note: None,
+        capability_note: Some("Requires: [net]"),
         related: &["cost", "sessions"],
     },
     SlashCommandHelp {
@@ -1120,7 +1120,7 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
             "/effort auto   — clear manual effort; model/provider decides",
         ],
         available_during_turn: false,
-        capability_note: None,
+        capability_note: Some("Requires: [edit]"),
         related: &["providers", "config"],
     },
     SlashCommandHelp {
@@ -1168,8 +1168,8 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
             "/tool-verbosity normal   — standard preview (default)",
             "/tool-verbosity verbose  — full tool output in transcript",
         ],
-        available_during_turn: true,
-        capability_note: None,
+        available_during_turn: false,
+        capability_note: Some("Requires: [edit]"),
         related: &["tui"],
     },
     SlashCommandHelp {

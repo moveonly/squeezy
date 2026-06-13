@@ -457,6 +457,46 @@ fn slash_command_help_table_has_no_duplicate_names() {
 }
 
 #[test]
+fn slash_command_help_reports_turn_blocking_and_capabilities() {
+    // The help metadata duplicates the slash registry's availability/capability
+    // facts across a crate boundary, so it can silently drift. Pin the corrected
+    // facts: /tool-verbosity cannot run mid-turn and needs edit; /compact needs
+    // net; /effort needs edit — each surfaced through the rendered body.
+    let help = SqueezyHelp::new("");
+
+    let tool_verbosity = help
+        .answer_for_input("/help /tool-verbosity")
+        .expect("answer for /tool-verbosity")
+        .render_markdown();
+    assert!(
+        tool_verbosity.contains("Cannot run while a turn is in progress"),
+        "/tool-verbosity must report it cannot run mid-turn: {tool_verbosity}"
+    );
+    assert!(
+        tool_verbosity.contains("**Capability:**") && tool_verbosity.contains("[edit]"),
+        "/tool-verbosity must report the edit capability: {tool_verbosity}"
+    );
+
+    let compact = help
+        .answer_for_input("/help /compact")
+        .expect("answer for /compact")
+        .render_markdown();
+    assert!(
+        compact.contains("**Capability:**") && compact.contains("[net]"),
+        "/compact must report the net capability: {compact}"
+    );
+
+    let effort = help
+        .answer_for_input("/help /effort")
+        .expect("answer for /effort")
+        .render_markdown();
+    assert!(
+        effort.contains("**Capability:**") && effort.contains("[edit]"),
+        "/effort must report the edit capability: {effort}"
+    );
+}
+
+#[test]
 fn tui_topic_summary_does_not_advertise_unregistered_commands() {
     // The `tui` topic summary hand-lists the slash vocabulary and cannot import
     // the live registry across crates, so it drifts. Guard the two failure modes:
