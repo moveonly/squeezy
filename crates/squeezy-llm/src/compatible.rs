@@ -1402,20 +1402,19 @@ impl StreamState {
             // branch still applies to genuinely non-empty malformed JSON
             // so the existing `INVALID_TOOL_ARGUMENTS_*` markers continue
             // to flow through.
-            let arguments = if partial.arguments.is_empty() {
-                // M-29 (Phase 4FH-AB): an empty arguments string from
-                // a zero-arg tool call surfaces as `Value::Null` so the
-                // dispatcher can distinguish "model sent no arguments"
-                // from "model sent `{}`". H-25 cap does not apply here
-                // because the cap only latches when *deltas* arrive.
-                Value::Null
-            } else if partial.arguments_overflow {
-                // H-25: if the accumulator hit the byte cap mid-stream
-                // the args we have are necessarily truncated. Surface
-                // the synthetic invalid-arguments envelope so the
-                // agent loop can decide what to do (retry / abort)
-                // instead of feeding the model a half-JSON blob that
-                // would parse-fail later in the tool dispatcher.
+            let arguments = if partial.arguments_overflow {
+                // H-25: if the accumulator hit the byte cap the args we
+                // have are necessarily truncated. Surface the synthetic
+                // invalid-arguments envelope so the agent loop can decide
+                // what to do (retry / abort) instead of feeding the model
+                // a half-JSON blob that would parse-fail later in the
+                // tool dispatcher. This branch is checked BEFORE the
+                // empty check because the cap also latches when the very
+                // first arguments delta alone exceeds the ceiling — in
+                // that case the accumulator stays empty while the overflow
+                // flag is set, and treating it as a zero-arg `Value::Null`
+                // call would silently dispatch the tool with no arguments
+                // instead of flagging the truncation.
                 let arguments_text = partial.arguments;
                 json!({
                     INVALID_TOOL_ARGUMENTS_KEY: true,
@@ -1424,6 +1423,12 @@ impl StreamState {
                     ),
                     INVALID_TOOL_ARGUMENTS_RAW_KEY: arguments_text,
                 })
+            } else if partial.arguments.is_empty() {
+                // M-29 (Phase 4FH-AB): an empty arguments string from
+                // a zero-arg tool call surfaces as `Value::Null` so the
+                // dispatcher can distinguish "model sent no arguments"
+                // from "model sent `{}`".
+                Value::Null
             } else {
                 let arguments_text = partial.arguments;
                 serde_json::from_str::<Value>(&arguments_text).unwrap_or_else(|err| {

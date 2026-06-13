@@ -30,7 +30,7 @@ use std::{fs, path::Path};
 use redb::TableDefinition;
 use squeezy_core::Result;
 
-use crate::{current_schema_version, initialize_schema, open_database, state_path};
+use crate::{current_schema_version, open_database, state_path};
 
 /// Tables added by [`V2AddResolverTables`]. Duplicated here so the
 /// migration is self-contained even if the table constants in
@@ -237,10 +237,14 @@ impl Migration for InitializeStoreSchemaV1 {
                 .map_err(store_error)?;
         }
         write.commit().map_err(store_error)?;
-        // Defensive: ensure the store-level initialiser still runs so any
-        // future tables added directly to `initialize_schema` (rather
-        // than through their own migration) come online on first boot.
-        initialize_schema(&database)
+        // Each V1 table above mirrors the tables opened by
+        // `initialize_schema`, so this migration leaves the store at
+        // exactly its declared `version()` (1). We deliberately do NOT call
+        // `initialize_schema` here: it re-stamps `schema_version =
+        // SCHEMA_VERSION`, which would jump the on-disk stamp past 1 and
+        // break the per-version idempotency / resume contract. Tables added
+        // in later schema versions belong in their own migration.
+        Ok(())
     }
 }
 

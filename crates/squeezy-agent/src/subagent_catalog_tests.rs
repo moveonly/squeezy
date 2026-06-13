@@ -227,6 +227,48 @@ fn discover_project_overrides_user_when_names_collide() {
 }
 
 #[test]
+fn discover_keeps_first_file_when_same_precedence_names_collide() {
+    // Two files in the SAME directory (same precedence) can declare the
+    // same `name:` because the frontmatter name is independent of the
+    // filename. `load_dir` sorts entries by path and `dedupe` keeps the
+    // first-seen one, so the alphabetically-earliest file wins
+    // deterministically regardless of `fs::read_dir` iteration order.
+    let workspace = temp_root("same_precedence_collision");
+    let user_dir = temp_root("same_precedence_collision_user");
+    let project_agents = workspace.join(".squeezy").join("agents");
+    fs::create_dir_all(&project_agents).expect("mkdir project agents");
+
+    fs::write(
+        project_agents.join("recon.md"),
+        "---\nname: scout\ndescription: recon-file scout\n---\nRecon body",
+    )
+    .expect("write recon");
+    fs::write(
+        project_agents.join("scout.md"),
+        "---\nname: scout\ndescription: scout-file scout\n---\nScout body",
+    )
+    .expect("write scout");
+
+    let catalog = SubagentCatalog::discover(&workspace, Some(&user_dir));
+    let scout = catalog.find("scout").expect("scout present");
+    assert_eq!(scout.source, SubagentSource::Project);
+    // recon.md sorts before scout.md, so it is the first-seen survivor.
+    assert_eq!(scout.description, "recon-file scout");
+    assert_eq!(
+        scout.file_path.as_deref(),
+        Some(project_agents.join("recon.md").as_path())
+    );
+
+    // Exactly one entry survives the collision.
+    let scout_count = catalog
+        .entries()
+        .iter()
+        .filter(|entry| entry.name == "scout")
+        .count();
+    assert_eq!(scout_count, 1, "duplicate name must collapse to one entry");
+}
+
+#[test]
 fn discover_does_not_let_disk_definitions_shadow_builtins() {
     let workspace = temp_root("discover_no_builtin_shadow");
     let user_dir = temp_root("discover_no_builtin_shadow_user");

@@ -136,44 +136,101 @@ struct TarjanState {
     sccs: Vec<Scc>,
 }
 
-fn tarjan_visit(node: &FileId, graph: &ImportGraph, state: &mut TarjanState) {
-    state.indices.insert(node.clone(), state.index_counter);
-    state.lowlinks.insert(node.clone(), state.index_counter);
+/// One frame of the explicit Tarjan work stack, simulating a single
+/// recursive `tarjan_visit` call. `successors` is the (already sorted)
+/// successor list captured on entry; `cursor` is the index of the next
+/// successor to examine, so the frame can resume after a child frame
+/// returns.
+struct TarjanFrame {
+    node: FileId,
+    successors: Vec<FileId>,
+    cursor: usize,
+}
+
+/// Iterative Tarjan SCC visit. Equivalent to the textbook recursive
+/// `tarjan_visit`, but pushes per-call frames onto a heap-allocated
+/// work stack instead of recursing, so traversal depth is bounded by
+/// available heap rather than the native thread stack. Deep import
+/// chains (file N imports file N+1 for large N) therefore cannot
+/// overflow the stack. Output ordering is identical because
+/// `sorted_successors` already normalises traversal order.
+fn tarjan_visit(start: &FileId, graph: &ImportGraph, state: &mut TarjanState) {
+    let mut frames: Vec<TarjanFrame> = Vec::new();
+
+    // Push the initial frame (equivalent to entering `tarjan_visit(start)`).
+    state.indices.insert(start.clone(), state.index_counter);
+    state.lowlinks.insert(start.clone(), state.index_counter);
     state.index_counter += 1;
-    state.stack.push(node.clone());
-    state.on_stack.insert(node.clone());
+    state.stack.push(start.clone());
+    state.on_stack.insert(start.clone());
+    frames.push(TarjanFrame {
+        node: start.clone(),
+        successors: graph.sorted_successors(start),
+        cursor: 0,
+    });
 
-    for succ in graph.sorted_successors(node) {
-        if !state.indices.contains_key(&succ) {
-            tarjan_visit(&succ, graph, state);
-            let succ_low = state.lowlinks[&succ];
-            let node_low = state.lowlinks[node];
-            state.lowlinks.insert(node.clone(), node_low.min(succ_low));
-        } else if state.on_stack.contains(&succ) {
-            let succ_idx = state.indices[&succ];
-            let node_low = state.lowlinks[node];
-            state.lowlinks.insert(node.clone(), node_low.min(succ_idx));
-        }
-    }
-
-    if state.lowlinks[node] == state.indices[node] {
-        let mut files = Vec::new();
-        while let Some(top) = state.stack.pop() {
-            state.on_stack.remove(&top);
-            let done = &top == node;
-            files.push(top);
-            if done {
-                break;
+    // Indexed (rather than `last_mut`) access into `frames` so the work
+    // stack can be pushed/popped without holding a borrow across the
+    // mutation.
+    while let Some(top) = frames.len().checked_sub(1) {
+        let frame = &mut frames[top];
+        if frame.cursor < frame.successors.len() {
+            let succ = frame.successors[frame.cursor].clone();
+            frame.cursor += 1;
+            let node = frame.node.clone();
+            if !state.indices.contains_key(&succ) {
+                // Descend into `succ` (equivalent to the recursive call).
+                // The lowlink fold of the child into this parent happens
+                // when the child frame returns (see the pop branch below).
+                state.indices.insert(succ.clone(), state.index_counter);
+                state.lowlinks.insert(succ.clone(), state.index_counter);
+                state.index_counter += 1;
+                state.stack.push(succ.clone());
+                state.on_stack.insert(succ.clone());
+                frames.push(TarjanFrame {
+                    node: succ.clone(),
+                    successors: graph.sorted_successors(&succ),
+                    cursor: 0,
+                });
+            } else if state.on_stack.contains(&succ) {
+                let succ_idx = state.indices[&succ];
+                let node_low = state.lowlinks[&node];
+                state.lowlinks.insert(node, node_low.min(succ_idx));
             }
+            continue;
         }
-        files.sort_by(|left, right| left.0.cmp(&right.0));
-        let id = u32::try_from(state.sccs.len()).unwrap_or(u32::MAX);
-        let is_cyclic = files.len() > 1;
-        state.sccs.push(Scc {
-            id,
-            files,
-            is_cyclic,
-        });
+
+        // All successors of this frame's node have been processed; this
+        // is the point where the recursive call would return. Emit an SCC
+        // if the node is a root, then fold its lowlink into its parent.
+        let node = frame.node.clone();
+        if state.lowlinks[&node] == state.indices[&node] {
+            let mut files = Vec::new();
+            while let Some(top) = state.stack.pop() {
+                state.on_stack.remove(&top);
+                let done = top == node;
+                files.push(top);
+                if done {
+                    break;
+                }
+            }
+            files.sort_by(|left, right| left.0.cmp(&right.0));
+            let id = u32::try_from(state.sccs.len()).unwrap_or(u32::MAX);
+            let is_cyclic = files.len() > 1;
+            state.sccs.push(Scc {
+                id,
+                files,
+                is_cyclic,
+            });
+        }
+        frames.pop();
+        if let Some(parent) = frames.last() {
+            let node_low = state.lowlinks[&node];
+            let parent_low = state.lowlinks[&parent.node];
+            state
+                .lowlinks
+                .insert(parent.node.clone(), parent_low.min(node_low));
+        }
     }
 }
 

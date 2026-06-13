@@ -77,8 +77,14 @@ pub(crate) fn spawn(
             }
 
             // If state_dir falls inside this writable root, deny write to it.
+            // Use a path-boundary comparison rather than a raw string prefix:
+            // canonical keys carry no trailing separator, so `starts_with`
+            // alone would match across path components (e.g. root
+            // "c:/proj/app" vs state "c:/proj/app-state/..."), causing a
+            // spurious deny on a sibling directory. Mirrors the
+            // `is_under_writable_root` semantics in world_writable.rs.
             let root_key = path_norm::canonical_key(root);
-            if state_key.starts_with(&root_key) {
+            if state_key == root_key || state_key.starts_with(&format!("{root_key}/")) {
                 tracing::debug!(
                     "restricted spawn: add_deny_write_ace on state_dir '{}' (inside writable root)",
                     state_dir.display()

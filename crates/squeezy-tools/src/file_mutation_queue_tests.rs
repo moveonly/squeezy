@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{lock_paths_for_mutation, mutation_key};
+use super::{MUTATION_LOCKS, lock_paths_for_mutation, mutation_key};
 
 static TEST_WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -279,6 +279,57 @@ async fn overlapping_multi_path_callers_do_not_deadlock() {
     })
     .await
     .expect("overlapping multi-path callers must not deadlock");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn released_locks_are_pruned_from_the_global_map() {
+    // Mutating one path then releasing its guard must leave the global
+    // `MUTATION_LOCKS` map free to reclaim that entry: a subsequent
+    // acquisition (of any path) prunes idle entries, so the released path's
+    // realpath key must no longer be present. This guards against the map
+    // growing without bound over a long-lived session that touches many
+    // distinct paths. We only assert on our own unique keys, so the shared
+    // process-global map being touched by other tests does not interfere.
+    let root = temp_dir("prune");
+    let path_a = root.join("a.txt");
+    let path_b = root.join("b.txt");
+    fs::write(&path_a, b"a").expect("write a");
+    fs::write(&path_b, b"b").expect("write b");
+
+    let key_a = mutation_key(&path_a);
+    let key_b = mutation_key(&path_b);
+
+    // Acquire and release the lock for `a`: its entry is now idle
+    // (strong-count == 1, referenced only by the map).
+    {
+        let guard = lock_paths_for_mutation([&path_a]).await;
+        assert!(
+            MUTATION_LOCKS
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .contains_key(&key_a),
+            "held lock for `a` must be present in the global map"
+        );
+        drop(guard);
+    }
+
+    // Acquiring any lock now runs the opportunistic prune; `a` is idle so it
+    // must be evicted, while `b` (held below) survives.
+    let guard_b = lock_paths_for_mutation([&path_b]).await;
+    {
+        let map = MUTATION_LOCKS.lock().unwrap_or_else(|err| err.into_inner());
+        assert!(
+            !map.contains_key(&key_a),
+            "idle lock for `a` should have been pruned from the global map"
+        );
+        assert!(
+            map.contains_key(&key_b),
+            "currently-held lock for `b` must survive pruning"
+        );
+    }
+    drop(guard_b);
 
     let _ = fs::remove_dir_all(&root);
 }

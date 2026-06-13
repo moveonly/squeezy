@@ -1667,7 +1667,7 @@ fn handle_mcp_add_form_key(
         (KeyCode::Char(' '), KeyModifiers::NONE) if form.field_index == 1 => {
             form.transport = form.transport.next();
         }
-        (KeyCode::Backspace, _) => {
+        (KeyCode::Backspace, _) if form.field_index != 1 => {
             let target = active_add_field(form);
             target.pop();
         }

@@ -478,15 +478,9 @@ pub(crate) fn extract_java_annotation_reference(
     if text.is_empty() || is_java_keyword(&text) {
         return;
     }
-    let span = name_node.map(span_from_node).unwrap_or_else(|| {
-        let raw_span = span_from_node(node);
-        SourceSpan::new(
-            raw_span.start_byte.saturating_add(1).min(raw_span.end_byte),
-            raw_span.end_byte,
-            raw_span.start,
-            raw_span.end,
-        )
-    });
+    let span = name_node
+        .map(span_from_node)
+        .unwrap_or_else(|| span_from_node(node));
     ctx.references.push(ParsedReference {
         file_id: ctx.file.id.clone(),
         owner_id: owner_id.clone(),

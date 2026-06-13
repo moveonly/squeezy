@@ -132,37 +132,46 @@ impl SemanticGraph {
         if caller_file.language != LanguageKind::Scala {
             return None;
         }
+        let caller_package = self.scala_package_for_file(&caller.file_id);
         let class_candidates = self.symbols_by_name.get(receiver)?;
-        for class_id in class_candidates {
-            let Some(class_symbol) = self.symbols.get(class_id) else {
-                continue;
-            };
-            if !matches!(
-                class_symbol.kind,
-                SymbolKind::Class | SymbolKind::Trait | SymbolKind::Enum | SymbolKind::Struct
-            ) {
-                continue;
-            }
-            let Some(object_id) = self.scala_companion_object_for(class_symbol) else {
-                continue;
-            };
-            if let Some(method) = self
-                .children_by_parent
-                .get(&object_id)
-                .into_iter()
-                .flatten()
-                .filter_map(|child_id| self.symbols.get(child_id))
-                .find(|symbol| {
-                    matches!(
-                        symbol.kind,
-                        SymbolKind::Method | SymbolKind::Function | SymbolKind::Const
-                    ) && symbol.name == call.name
-                })
-            {
-                return Some(method.id.clone());
-            }
-        }
-        None
+        let matches = class_candidates
+            .iter()
+            .filter_map(|class_id| self.symbols.get(class_id))
+            .filter(|class_symbol| {
+                matches!(
+                    class_symbol.kind,
+                    SymbolKind::Class | SymbolKind::Trait | SymbolKind::Enum | SymbolKind::Struct
+                )
+            })
+            // Only consider receiver classes that are actually in scope at the
+            // call site: declared in the caller's file, in the caller's
+            // package, or brought in by a matching import. This mirrors
+            // `scala_top_level_def` / `kotlin_companion_member_call` and stops
+            // an unrelated same-named class in another package from binding.
+            .filter(|class_symbol| {
+                class_symbol.file_id == caller.file_id
+                    || self.scala_package_for_file(&class_symbol.file_id) == caller_package
+                    || self
+                        .imports_for_file(&caller.file_id)
+                        .any(|import| self.scala_import_matches_symbol(import, class_symbol))
+            })
+            .filter_map(|class_symbol| self.scala_companion_object_for(class_symbol))
+            .flat_map(|object_id| {
+                self.children_by_parent
+                    .get(&object_id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|child_id| self.symbols.get(child_id))
+                    .filter(|symbol| {
+                        matches!(
+                            symbol.kind,
+                            SymbolKind::Method | SymbolKind::Function | SymbolKind::Const
+                        ) && symbol.name == call.name
+                    })
+                    .map(|symbol| symbol.id.clone())
+                    .collect::<Vec<_>>()
+            });
+        single_symbol(matches)
     }
 
     /// Resolve an extension-method invocation by matching the receiver's

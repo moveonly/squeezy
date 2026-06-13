@@ -343,12 +343,36 @@ pub(crate) fn python_from_imports(
 }
 
 pub(crate) fn extract_js_ts_commonjs_facts(ctx: &mut ExtractContext<'_>) {
-    for line in ctx.source.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("//") {
+    // Track whether we are inside a `/* ... */` block comment as it can span
+    // multiple lines. String-literal and `//` line-comment content is skipped
+    // per line by `js_ts_code_token_offset`.
+    let mut in_block_comment = false;
+    for raw_line in ctx.source.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
             continue;
         }
-        if let Some((left, right)) = line.split_once("require(") {
+        // Block comments may span lines, so each needle scan must start from the
+        // same line-entry state. Scan once to locate `require(`, then re-derive
+        // the entry state for the `module.exports` scan, and finally advance the
+        // persistent state to the end-of-line value exactly once.
+        let entry_block_comment = in_block_comment;
+        let mut require_state = entry_block_comment;
+        let require_offset = js_ts_code_token_offset(line, "require(", &mut require_state);
+        let mut exports_state = entry_block_comment;
+        let exports_offset = js_ts_code_token_offset(line, "module.exports", &mut exports_state);
+        // Both scans start from the same line-entry state, so they agree on the
+        // end-of-line block-comment state; advance the persistent state once.
+        in_block_comment = require_state;
+        debug_assert_eq!(require_state, exports_state);
+        // Only treat the `require(` / `module.exports` text as a real CommonJS
+        // fact when it occurs in code context (not inside a string or comment)
+        // and as a standalone token rather than the tail/head of a longer name.
+        if let Some(idx) = require_offset
+            && js_ts_token_boundary_before(line, idx)
+        {
+            let left = &line[..idx];
+            let right = &line[idx + "require(".len()..];
             let alias = js_ts_commonjs_alias(left);
             if let Some(module) = first_js_ts_string_literal(right)
                 && let Some(alias) = alias
@@ -369,28 +393,112 @@ pub(crate) fn extract_js_ts_commonjs_facts(ctx: &mut ExtractContext<'_>) {
                 });
             }
         }
-        if let Some((_, right)) = line.split_once("module.exports")
-            && let Some((_, exported)) = right.split_once('=')
+        if let Some(idx) = exports_offset
+            && js_ts_token_boundary_before(line, idx)
         {
-            let exported = exported.trim().trim_end_matches(';').trim();
-            if is_js_ts_identifier(exported) {
-                let imported_name = Some(exported.to_string());
-                ctx.imports.push(ParsedImport {
-                    file_id: ctx.file.id.clone(),
-                    owner_id: None,
-                    path: exported.to_string(),
-                    alias: None,
-                    is_glob: false,
-                    is_reexport: true,
-                    is_static: false,
-                    span: SourceSpan::new(0, 0, SourcePoint::new(0, 0), SourcePoint::new(0, 0)),
-                    provenance: Provenance::new("tree-sitter-js-ts", "commonjs export"),
-                    kind: ImportKind::Named,
-                    imported_name,
-                    is_global: false,
-                });
+            let after = &line["module.exports".len() + idx..];
+            // Require a token boundary after `module.exports` so a longer name
+            // such as `module.exportsFoo` is not mistaken for an export.
+            let is_boundary_after = after
+                .chars()
+                .next()
+                .is_none_or(|ch| ch.is_whitespace() || matches!(ch, '=' | '.' | '['));
+            if is_boundary_after && let Some((_, exported)) = after.split_once('=') {
+                let exported = exported.trim().trim_end_matches(';').trim();
+                if is_js_ts_identifier(exported) {
+                    let imported_name = Some(exported.to_string());
+                    ctx.imports.push(ParsedImport {
+                        file_id: ctx.file.id.clone(),
+                        owner_id: None,
+                        path: exported.to_string(),
+                        alias: None,
+                        is_glob: false,
+                        is_reexport: true,
+                        is_static: false,
+                        span: SourceSpan::new(0, 0, SourcePoint::new(0, 0), SourcePoint::new(0, 0)),
+                        provenance: Provenance::new("tree-sitter-js-ts", "commonjs export"),
+                        kind: ImportKind::Named,
+                        imported_name,
+                        is_global: false,
+                    });
+                }
             }
         }
+    }
+}
+
+/// Returns the byte offset of the first occurrence of `needle` in `line` that
+/// lies in code context — i.e. not inside a string literal, a `//` line
+/// comment, or a `/* ... */` block comment. `in_block_comment` carries the
+/// block-comment state into the call (block comments may span lines) and is
+/// updated to reflect the state at the end of `line`.
+pub(crate) fn js_ts_code_token_offset(
+    line: &str,
+    needle: &str,
+    in_block_comment: &mut bool,
+) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut found: Option<usize> = None;
+    let mut idx = 0usize;
+    let mut string_quote: Option<u8> = None;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if *in_block_comment {
+            if byte == b'*' && bytes.get(idx + 1) == Some(&b'/') {
+                *in_block_comment = false;
+                idx += 2;
+                continue;
+            }
+            idx += 1;
+            continue;
+        }
+        if let Some(quote) = string_quote {
+            if byte == b'\\' {
+                // Skip the escaped byte; `\` is ASCII so `idx + 2` stays on a
+                // char boundary even if the escaped byte is multi-byte's lead.
+                idx += 2;
+                continue;
+            }
+            if byte == quote {
+                string_quote = None;
+            }
+            idx += 1;
+            continue;
+        }
+        match byte {
+            b'/' if bytes.get(idx + 1) == Some(&b'/') => {
+                // Rest of the line is a comment; nothing more to match here.
+                break;
+            }
+            b'/' if bytes.get(idx + 1) == Some(&b'*') => {
+                *in_block_comment = true;
+                idx += 2;
+                continue;
+            }
+            b'\'' | b'"' | b'`' => {
+                string_quote = Some(byte);
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if found.is_none() && line[idx..].starts_with(needle) {
+            found = Some(idx);
+            // Keep scanning so `in_block_comment` is correct at end of line, but
+            // do not advance into the needle's interior (it is plain code).
+        }
+        idx += 1;
+    }
+    found
+}
+
+/// True when the character immediately before `idx` in `line` is not part of a
+/// JS/TS identifier, so the token starting at `idx` is not the tail of a longer
+/// name (e.g. rejects `myrequire(` and `obj.module.exports`).
+pub(crate) fn js_ts_token_boundary_before(line: &str, idx: usize) -> bool {
+    match line[..idx].chars().next_back() {
+        Some(ch) => !(ch == '_' || ch == '$' || ch == '.' || ch.is_ascii_alphanumeric()),
+        None => true,
     }
 }
 
