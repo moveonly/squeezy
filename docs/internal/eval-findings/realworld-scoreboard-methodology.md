@@ -46,15 +46,6 @@ The checked-in CSVs are the current source of truth for this directory:
 - `mini-vs-codex-realworld.csv`: 15/15 WIN.
 - `haiku-vs-cc-realworld.csv`: 15/15 WIN.
 
-The Haiku numbers were recomputed against CC baselines re-derived from raw CC
-stream logs with the current grader. `$0.000` timeout reps are excluded as
-invalid, not counted as wins. Older prose in this directory that says Haiku is
-8/15, 9/15, or 13/15, or that `c`/`go`/python/java are pending or losses, is
-historical and predates the committed CSV refresh.
-
-The last two Haiku non-wins (`c` and `go`) were closed in #326: a Go
-struct-embedding graph-intent fix, a corrected Go grader for the Terraform
-`Meta`/`StateMeta` scenario, a replaced C task (request-flow caller-graph audit
-with edge-based grading), and a harness fix so reruns resolve paths from the
-checked-out repo. Before/after evidence for that flip is in
-`haiku-c-go-nonwins-handoff.md`.
+The Haiku numbers are computed against CC baselines derived from raw CC stream
+logs with the current grader. `$0.000` timeout reps are excluded as invalid,
+not counted as wins.
