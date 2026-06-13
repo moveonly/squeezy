@@ -15090,6 +15090,47 @@ async fn ctrl_up_with_multiline_composer_moves_cursor_not_entry_focus() {
     );
 }
 
+/// Vertical cursor motion keys the column by CHARACTER, not byte: arrowing up or
+/// down through multi-byte text (here each Greek letter is two bytes) must land
+/// on the same visual column and on a char boundary, never mid-glyph.
+#[tokio::test]
+async fn vertical_cursor_motion_tracks_character_column_across_multibyte_lines() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    // Down from char column 3 of an ASCII line into a Greek line: a byte column
+    // would land at byte 3 (inside the second glyph) and snap left; the char
+    // column lands at the boundary after the third letter.
+    set_input(&mut app, "abc\nαβγδ".to_string());
+    app.input_cursor = "abc".len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down across multibyte line");
+    assert_eq!(
+        app.input_cursor,
+        "abc\nαβγ".len(),
+        "Down keeps the third-character column on the multi-byte line",
+    );
+
+    // Up back onto the ASCII line returns to the same character column.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("up across multibyte line");
+    assert_eq!(
+        app.input_cursor,
+        "abc".len(),
+        "Up restores the third-character column on the ASCII line",
+    );
+}
+
 #[tokio::test]
 async fn ctrl_y_copies_last_assistant_message() {
     let mut agent = test_agent(SessionMode::Build);
