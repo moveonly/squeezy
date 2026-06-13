@@ -30456,7 +30456,7 @@ fn subagent_timeline_status_style(status: subagent_timeline::SubagentTimelineSta
 fn render_subagent_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let filter_note = match app.subagent_timeline.filter() {
         Some(status) => format!("\u{2014} filter [{}] ", status.label()),
-        None => "\u{2014} running + completed subagents ".to_string(),
+        None => "\u{2014} all subagents ".to_string(),
     };
     let title = Line::from(vec![
         Span::styled(
