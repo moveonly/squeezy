@@ -4,6 +4,11 @@ High-level outcome of the PR `perf/graph-jsts-inheritance` (#298): a set of gene
 semantic-graph correctness/efficiency fixes that also moved the haiku comprehension board
 from 9 → 13 wins, each flip tied to a concrete fix (no benchmark-specific hacks).
 
+> Superseded: this summarizes PR #298, which took the haiku board to 13/15. The
+> remaining `c` and `go` losses were later closed in #326, so the checked-in
+> `haiku-vs-cc-realworld.csv` now shows **15/15 WIN**. See
+> `realworld-scoreboard-methodology.md` for the current tally.
+
 ## Board (n=3 medians)
 
 - **mini tier** (squeezy on gpt-5.4-mini vs `codex exec -m gpt-5.4-mini`): **15/15 WIN**
