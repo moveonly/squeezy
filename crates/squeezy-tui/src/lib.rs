@@ -8256,6 +8256,9 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         // the text clipboard empty. Only when the composer owns the surface (no
         // modal/overlay that runs its own paste routing): `handle_paste` already
         // gates those for text, but the image path bypasses it, so guard here.
+        // The platform-helper fallbacks run on the blocking pool with a bounded
+        // wait so a wedged clipboard helper never freezes the event loop; a
+        // timeout falls through to the same unavailable handling as no helper.
         if app.config_screen.is_none()
             && app.theme_editor.is_none()
             && !app.scratchpad_open
@@ -8264,24 +8267,44 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             && app.paste_preview.is_none()
             && app.paste_transform.is_none()
             && app.editor_handoff.is_none()
-            && let Some((bytes, media_type)) = app
-                .clipboard
-                .read_image()
-                .or_else(clipboard::read_system_clipboard_image)
         {
-            let media_type = detect_image_mime(&bytes)
-                .map(str::to_string)
-                .unwrap_or(media_type);
-            let placeholder =
-                insert_prompt_image_token(app, "[Image clipboard]".to_string(), media_type, bytes);
-            app.status = format!("inserted {placeholder}");
-            app.needs_redraw = true;
-            return Ok(false);
+            let image = match app.clipboard.read_image() {
+                Some(image) => Some(image),
+                None => match clipboard::read_system_clipboard_image_bounded().await {
+                    Ok(image) => image,
+                    Err(()) => {
+                        app.status = "clipboard read timed out".to_string();
+                        app.needs_redraw = true;
+                        return Ok(false);
+                    }
+                },
+            };
+            if let Some((bytes, media_type)) = image {
+                let media_type = detect_image_mime(&bytes)
+                    .map(str::to_string)
+                    .unwrap_or(media_type);
+                let placeholder = insert_prompt_image_token(
+                    app,
+                    "[Image clipboard]".to_string(),
+                    media_type,
+                    bytes,
+                );
+                app.status = format!("inserted {placeholder}");
+                app.needs_redraw = true;
+                return Ok(false);
+            }
         }
-        let pasted = app
-            .clipboard
-            .read_text()
-            .or_else(clipboard::read_system_clipboard);
+        let pasted = match app.clipboard.read_text() {
+            Some(text) => Some(text),
+            None => match clipboard::read_system_clipboard_bounded().await {
+                Ok(text) => text,
+                Err(()) => {
+                    app.status = "clipboard read timed out".to_string();
+                    app.needs_redraw = true;
+                    return Ok(false);
+                }
+            },
+        };
         match pasted {
             Some(text) if !text.is_empty() => {
                 handle_paste(app, agent, text).await?;
