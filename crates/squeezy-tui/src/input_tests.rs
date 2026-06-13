@@ -289,22 +289,25 @@ fn slash_suggestions_returns_no_matches_for_unrelated_input() {
 }
 
 #[test]
-fn browse_menu_hides_advanced_commands_and_groups_by_category() {
+fn browse_lists_every_registered_command_grouped_by_category() {
+    // Browse mode (bare `/` at the prompt start) is a complete, categorized index
+    // of the command vocabulary: every registered command appears, so a user
+    // discovers `/pins`, `/unpin`, `/diff`, etc. by browsing rather than by
+    // stumbling onto them. Feature gating is layered on top by
+    // `slash_suggestions_visible`; this pre-gate list is the full set.
     let suggestions = slash_suggestions("/");
-    // Progressive disclosure: advanced commands are withheld from the bare-`/`
-    // browse list (they still surface when a needle is typed — see
-    // `advanced_commands_surface_when_filtered`).
-    assert!(
-        suggestions.iter().all(|cmd| !cmd.is_advanced()),
-        "browse list must contain only primary commands"
-    );
-    assert!(
-        suggestions.iter().any(|cmd| cmd.name == "/pin"),
-        "a primary command like /pin should be in the browse list"
-    );
-    assert!(
-        !suggestions.iter().any(|cmd| cmd.name == "/revert-turn"),
-        "an advanced command like /revert-turn should be withheld from browse"
+    let names: Vec<&str> = suggestions.iter().map(|cmd| cmd.name).collect();
+    for command in SLASH_COMMANDS {
+        assert!(
+            names.contains(&command.name),
+            "{} must be discoverable in the bare-`/` browse list",
+            command.name
+        );
+    }
+    assert_eq!(
+        names.len(),
+        SLASH_COMMANDS.len(),
+        "browse lists each command exactly once"
     );
     // Grouped by category order, so categories never interleave.
     let order: Vec<usize> = suggestions
@@ -320,13 +323,109 @@ fn browse_menu_hides_advanced_commands_and_groups_by_category() {
 }
 
 #[test]
-fn advanced_commands_surface_when_filtered() {
-    // `/revert-turn` is advanced (hidden from browse) but must stay fuzzy-findable.
-    let names = slash_suggestions("/revert")
-        .into_iter()
+fn browse_sorts_commands_alphabetically_within_each_category() {
+    // Within a group the commands are ordered by name so the group is easy to
+    // scan; this guards the `.then(left.name.cmp(right.name))` tiebreak in the
+    // browse sort, which the category-order check above would not catch on its own.
+    let suggestions = slash_suggestions("/");
+    let mut per_category: std::collections::BTreeMap<usize, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for cmd in &suggestions {
+        per_category
+            .entry(cmd.category().order_index())
+            .or_default()
+            .push(cmd.name);
+    }
+    for (order_index, names) in &per_category {
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            names, &sorted,
+            "commands in category #{order_index} must be alphabetical: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn default_browse_shows_every_command_except_features_that_are_off() {
+    // The contract: every command shows up by default under its category — unless
+    // its feature is disabled (checkpointing and the AI reviewer both default
+    // off), in which case it stays hidden until enabled rather than dangling as a
+    // command that cannot do anything yet.
+    let default_vis = SlashMenuVisibility {
+        checkpoints_enabled: false,
+        reviewer_enabled: false,
+    };
+    let visible: Vec<&str> = slash_suggestions_visible("/", "/".len(), default_vis)
+        .iter()
         .map(|cmd| cmd.name)
-        .collect::<Vec<_>>();
-    assert!(names.contains(&"/revert-turn"), "{names:?}");
+        .collect();
+    for command in SLASH_COMMANDS {
+        assert_eq!(
+            visible.contains(&command.name),
+            command.visible(default_vis),
+            "{}: shown_by_default={} but visible()={}",
+            command.name,
+            visible.contains(&command.name),
+            command.visible(default_vis),
+        );
+    }
+    // Gating is not a no-op: the default list is a *strict* subset of the registry
+    // (the checkpoint + reviewer commands are withheld), so a regression that
+    // stopped applying the gates — or one that dropped a non-gated command from
+    // browse — breaks the equivalence above rather than silently passing.
+    assert!(
+        visible.len() < SLASH_COMMANDS.len(),
+        "default visibility must hide the feature-gated commands, got all {}",
+        visible.len()
+    );
+    // Concretely: the feature-gated commands are absent by default…
+    for hidden in [
+        "/checkpoints",
+        "/checkpoint",
+        "/undo",
+        "/revert-turn",
+        "/reviewer",
+    ] {
+        assert!(
+            !visible.contains(&hidden),
+            "{hidden} should be hidden by default"
+        );
+    }
+    // …while every previously-"advanced" command is now discoverable by default.
+    for shown in ["/pins", "/unpin", "/diff", "/tasks", "/bundle", "/keymap"] {
+        assert!(
+            visible.contains(&shown),
+            "{shown} should be shown by default"
+        );
+    }
+}
+
+#[test]
+fn enabling_a_feature_adds_its_commands_to_browse() {
+    // With every gate on, the browse list is exactly the complete registry — the
+    // checkpoint and reviewer commands join their categories.
+    let all_on = SlashMenuVisibility {
+        checkpoints_enabled: true,
+        reviewer_enabled: true,
+    };
+    let visible: Vec<&str> = slash_suggestions_visible("/", "/".len(), all_on)
+        .iter()
+        .map(|cmd| cmd.name)
+        .collect();
+    assert_eq!(visible.len(), SLASH_COMMANDS.len());
+    for shown in [
+        "/checkpoints",
+        "/checkpoint",
+        "/undo",
+        "/revert-turn",
+        "/reviewer",
+    ] {
+        assert!(
+            visible.contains(&shown),
+            "{shown} should appear once its feature is on"
+        );
+    }
 }
 
 #[test]
@@ -340,16 +439,18 @@ fn every_slash_command_has_a_category() {
 }
 
 #[test]
-fn advanced_partition_only_covers_registered_commands() {
-    // Every command is either primary or advanced; this just sanity-checks that
-    // both halves are non-empty so a future refactor can't collapse the
-    // progressive-disclosure split by accident.
-    let advanced = SLASH_COMMANDS.iter().filter(|c| c.is_advanced()).count();
-    let primary = SLASH_COMMANDS.len() - advanced;
-    assert!(
-        advanced > 0 && primary > 0,
-        "primary={primary} advanced={advanced}"
-    );
+fn every_category_in_order_has_at_least_one_command() {
+    // No header should ever render with nothing under it: each category in the
+    // browse order must own at least one command. Paired with
+    // `every_slash_command_has_a_category`, this keeps the category↔command
+    // mapping a total partition into non-empty groups.
+    for category in SlashCategory::ORDER {
+        let count = SLASH_COMMANDS
+            .iter()
+            .filter(|cmd| cmd.category() == category)
+            .count();
+        assert!(count > 0, "category {} has no commands", category.title());
+    }
 }
 
 #[test]

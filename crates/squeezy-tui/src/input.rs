@@ -373,19 +373,23 @@ pub(crate) enum SlashCategory {
     ChatModes,
     Context,
     Cost,
+    Workspace,
     Checkpoints,
     Sessions,
+    Export,
     Settings,
 }
 
 impl SlashCategory {
     /// Display order in the browse menu — most-used-by-newcomers first.
-    pub(crate) const ORDER: [SlashCategory; 6] = [
+    pub(crate) const ORDER: [SlashCategory; 8] = [
         SlashCategory::ChatModes,
         SlashCategory::Context,
         SlashCategory::Cost,
+        SlashCategory::Workspace,
         SlashCategory::Checkpoints,
         SlashCategory::Sessions,
+        SlashCategory::Export,
         SlashCategory::Settings,
     ];
 
@@ -402,8 +406,10 @@ impl SlashCategory {
             SlashCategory::ChatModes => "Chat & modes",
             SlashCategory::Context => "Context & memory",
             SlashCategory::Cost => "Cost & effort",
+            SlashCategory::Workspace => "Workspace & tasks",
             SlashCategory::Checkpoints => "Checkpoints & undo",
             SlashCategory::Sessions => "Sessions",
+            SlashCategory::Export => "Share & export",
             SlashCategory::Settings => "Settings & display",
         }
     }
@@ -411,12 +417,16 @@ impl SlashCategory {
     /// One-liner shown next to the header to explain the group to a newcomer.
     pub(crate) fn blurb(self) -> &'static str {
         match self {
-            SlashCategory::ChatModes => "steer the agent: plan vs build, and get help",
+            SlashCategory::ChatModes => "plan vs build, get help, and send feedback",
             SlashCategory::Context => "what the model keeps: attach, pin, compact, or clear",
-            SlashCategory::Cost => "track spend and tune reasoning effort",
+            SlashCategory::Cost => "track spend, route models, and tune reasoning effort",
+            SlashCategory::Workspace => "uncommitted changes and background tasks",
             SlashCategory::Checkpoints => "undo on-disk file edits from earlier turns",
             SlashCategory::Sessions => "save, resume, and fork conversations",
-            SlashCategory::Settings => "configure models, permissions, theme, and tools",
+            SlashCategory::Export => "export or bundle a transcript to share",
+            SlashCategory::Settings => {
+                "configure models, permissions, and theme — or view keys, reviews, and diagnostics"
+            }
         }
     }
 }
@@ -463,62 +473,23 @@ impl SlashCommand {
                 SlashCategory::Context
             }
             "/cost" | "/effort" | "/cheap" | "/parent" | "/router" => SlashCategory::Cost,
+            // `/diff` (uncommitted working-tree changes) and the `/task*`
+            // background-task commands are all "what is happening in my workspace
+            // right now": neither is gated, so this group always has an anchor and
+            // never collapses to an empty header.
+            "/diff" | "/tasks" | "/task" | "/task-cancel" => SlashCategory::Workspace,
             "/checkpoints" | "/undo" | "/checkpoint" | "/revert-turn" => SlashCategory::Checkpoints,
-            // `/diff` (git working changes) and the `/task*` background-task
-            // commands are not strictly "sessions", but they are all advanced
-            // (never shown in the browse list, where category headers render), so
-            // their home here is invisible to users. If any is ever promoted out
-            // of `is_advanced()`, give it a more fitting category first.
-            "/sessions"
-            | "/resume"
-            | "/fork"
-            | "/session"
-            | "/session-export"
-            | "/session-export-html"
-            | "/export"
-            | "/bundle"
-            | "/diff"
-            | "/tasks"
-            | "/task"
-            | "/task-cancel" => SlashCategory::Sessions,
+            "/sessions" | "/resume" | "/fork" | "/session" => SlashCategory::Sessions,
+            // Getting a transcript or saved session out to a file, the clipboard,
+            // or a shareable bundle. Distinct from `Sessions` (which manages the
+            // saved conversations themselves) so neither group is a grab-bag.
+            "/export" | "/bundle" | "/session-export" | "/session-export-html" => {
+                SlashCategory::Export
+            }
             "/config" | "/model" | "/permissions" | "/theme" | "/mcp" | "/tool-verbosity"
             | "/statusline" | "/keymap" | "/terminal" | "/reviewer" => SlashCategory::Settings,
             other => unreachable!("slash command {other} is not assigned to a SlashCategory"),
         }
-    }
-
-    /// Advanced/rarely-needed commands are hidden from the bare-`/` browse list
-    /// (progressive disclosure) but still surface the moment the user types a
-    /// matching needle. The curated browse set stays short and newcomer-legible.
-    pub(crate) fn is_advanced(&self) -> bool {
-        matches!(
-            self.name,
-            "/plans"
-                | "/feedback"
-                | "/report"
-                | "/pins"
-                | "/unpin"
-                | "/cheap"
-                | "/parent"
-                | "/router"
-                | "/checkpoint"
-                | "/revert-turn"
-                | "/session"
-                | "/session-export"
-                | "/session-export-html"
-                | "/export"
-                | "/bundle"
-                | "/diff"
-                | "/tasks"
-                | "/task"
-                | "/task-cancel"
-                | "/mcp"
-                | "/tool-verbosity"
-                | "/statusline"
-                | "/keymap"
-                | "/terminal"
-                | "/reviewer"
-        )
     }
 
     /// Runtime feature that must be enabled for this command to appear at all.
@@ -1229,20 +1200,21 @@ pub(crate) fn slash_suggestions_at(input: &str, cursor: usize) -> Vec<SlashComma
         return Vec::new();
     };
     let needle = &input[context.start..context.end];
-    // Bare `/` at the prompt start is browse mode: show the curated (non-advanced)
-    // commands grouped by category order, alphabetical within each group. The
-    // renderer turns the category boundaries into header rows. Advanced commands
-    // are withheld here and only surface once a needle narrows the list
-    // (progressive disclosure). This guard mirrors `slash_menu_browsing` so the
-    // grouped ordering and the header rows are emitted under exactly the same
-    // condition — a mid-prompt `/` falls through to the flat path below (it only
-    // offers the few inline commands, where grouping with no headers would just
-    // look like an arbitrary reordering).
+    // Bare `/` at the prompt start is browse mode: show *every* command grouped by
+    // category order, alphabetical within each group, so the whole vocabulary is
+    // discoverable at a glance rather than only after a user happens to type a
+    // command's name. The renderer turns the category boundaries into header rows.
+    // The only commands withheld are those whose feature is off (applied later, in
+    // `slash_suggestions_visible`), so a newcomer never sees a command that cannot
+    // do anything yet. This guard mirrors `slash_menu_browsing` so the grouped
+    // ordering and the header rows are emitted under exactly the same condition — a
+    // mid-prompt `/` falls through to the flat path below (it only offers the few
+    // inline commands, where grouping with no headers would just look like an
+    // arbitrary reordering).
     if needle == "/" && context.at_prompt_start {
         let mut suggestions = SLASH_COMMANDS
             .iter()
             .filter(|command| slash_command_matches_context(command, context))
-            .filter(|command| !command.is_advanced())
             .copied()
             .collect::<Vec<_>>();
         suggestions.sort_by(|left, right| {
@@ -1268,15 +1240,28 @@ pub(crate) fn slash_suggestions_at(input: &str, cursor: usize) -> Vec<SlashComma
     scored.into_iter().map(|(cmd, _)| cmd).collect()
 }
 
+/// Browse/fuzzy suggestions for `input`/`cursor` with the feature gates applied:
+/// the same list `slash_suggestions_at` produces, minus commands whose feature is
+/// off (checkpoints, reviewer). Pure over `(input, cursor, visibility)` so the
+/// full "show everything except what is disabled" behaviour is unit-testable
+/// without a `TuiApp`; `slash_suggestions_for_app` is the thin live wrapper.
+pub(crate) fn slash_suggestions_visible(
+    input: &str,
+    cursor: usize,
+    visibility: SlashMenuVisibility,
+) -> Vec<SlashCommand> {
+    slash_suggestions_at(input, cursor)
+        .into_iter()
+        .filter(|command| command.visible(visibility))
+        .collect()
+}
+
 pub(crate) fn slash_suggestions_for_app(app: &TuiApp) -> Vec<SlashCommand> {
     let visibility = SlashMenuVisibility {
         checkpoints_enabled: app.checkpoints_enabled,
         reviewer_enabled: app.reviewer_enabled,
     };
-    slash_suggestions_at(&app.input, app.input_cursor)
-        .into_iter()
-        .filter(|command| command.visible(visibility))
-        .collect()
+    slash_suggestions_visible(&app.input, app.input_cursor, visibility)
 }
 
 /// Whether the slash menu is in bare-`/` browse mode (category headers shown)

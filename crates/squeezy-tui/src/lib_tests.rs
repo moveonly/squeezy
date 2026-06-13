@@ -5909,8 +5909,8 @@ fn checkpoint_commands_appear_only_when_checkpointing_enabled() {
         }
     }
 
-    // Enabled: the primary checkpoint commands join the browse list, and the
-    // advanced ones become fuzzy-findable.
+    // Enabled: every checkpoint command joins the browse list under its category,
+    // and stays fuzzy-findable too.
     let mut config = test_config(SessionMode::Build);
     config.checkpoints_enabled = true;
     let mut enabled_app = test_app_with_config(&config, SessionMode::Build);
@@ -5920,10 +5920,10 @@ fn checkpoint_commands_appear_only_when_checkpointing_enabled() {
         .into_iter()
         .map(|command| command.name)
         .collect::<Vec<_>>();
-    for primary in ["/checkpoints", "/undo"] {
+    for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
         assert!(
-            browse.contains(&primary),
-            "{primary} should be in the browse list when checkpointing is enabled"
+            browse.contains(&checkpoint_command),
+            "{checkpoint_command} should be in the browse list when checkpointing is enabled"
         );
     }
 
@@ -5934,7 +5934,7 @@ fn checkpoint_commands_appear_only_when_checkpointing_enabled() {
         .collect::<Vec<_>>();
     assert!(
         filtered.contains(&"/revert-turn"),
-        "advanced /revert-turn should be fuzzy-findable when enabled: {filtered:?}"
+        "/revert-turn should stay fuzzy-findable when enabled: {filtered:?}"
     );
 }
 
@@ -6086,6 +6086,35 @@ fn slash_browse_renders_category_headers_that_vanish_when_filtering() {
         !header.contains('/'),
         "a header row is not a command row: {header}"
     );
+
+    // Windowing only paints ~10 command rows at a time, so a later category's
+    // header renders once its commands scroll into view. Park the cursor on a
+    // command in each newly-added group and confirm its header paints — guarding
+    // the Workspace & tasks and Share & export categories specifically.
+    let suggestions = input::slash_suggestions_for_app(&app);
+    for (needle, want_header) in [
+        ("/diff", "Workspace & tasks"),
+        ("/export", "Share & export"),
+    ] {
+        let idx = suggestions
+            .iter()
+            .position(|command| command.name == needle)
+            .unwrap_or_else(|| panic!("{needle} should be in the browse list"));
+        app.slash_menu_index = idx;
+        let rendered = slash_suggestion_lines(&app, 120)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rendered.iter().any(|line| line.contains(want_header)),
+            "{want_header} header should render with {needle} selected: {rendered:?}"
+        );
+    }
 
     // Filtering (typed needle): the list collapses to a flat, header-less set so
     // the best fuzzy match is never buried under a group title.
