@@ -223,13 +223,14 @@ pub(crate) use input::set_input;
 pub(crate) use input::{HistoryDirection, SLASH_COMMANDS, SelectionDirection, SlashCommand};
 use input::{
     clear_input, complete_selected_slash_command, delete_at_cursor, delete_before_cursor,
-    delete_next_word, delete_previous_word, delete_to_line_end, delete_to_line_start,
-    handle_mention_popup_key, handle_overlay_key, handle_request_user_input_key, input_cursor,
-    insert_input_char, insert_input_text, move_input_cursor_down, move_input_cursor_left,
-    move_input_cursor_line_end, move_input_cursor_line_start, move_input_cursor_right,
-    move_input_cursor_up, move_input_cursor_word_left, move_input_cursor_word_right,
-    move_slash_menu_selection, push_input_history, recall_prompt_history,
-    reject_unknown_slash_command,
+    delete_buffer_at_cursor, delete_buffer_before_cursor, delete_next_word, delete_previous_word,
+    delete_to_line_end, delete_to_line_start, handle_mention_popup_key, handle_overlay_key,
+    handle_request_user_input_key, input_cursor, insert_buffer_char, insert_input_char,
+    insert_input_text, move_buffer_cursor_left, move_buffer_cursor_right, move_input_cursor_down,
+    move_input_cursor_left, move_input_cursor_line_end, move_input_cursor_line_start,
+    move_input_cursor_right, move_input_cursor_up, move_input_cursor_word_left,
+    move_input_cursor_word_right, move_slash_menu_selection, push_input_history,
+    recall_prompt_history, reject_unknown_slash_command,
 };
 
 use notification::DesktopNotifier;
@@ -20275,7 +20276,6 @@ fn request_turn_interrupt(app: &mut TuiApp) -> bool {
     }
     if let Some(pending) = app.pending_mcp_elicitation.take() {
         let _ = pending.response_tx.send(McpElicitationResponse::cancel());
-        clear_mcp_elicitation_seeded_input(app);
         interrupted = true;
     }
     if interrupted {
@@ -24900,7 +24900,7 @@ fn switch_mode(
 }
 
 fn handle_mcp_elicitation_key(app: &mut TuiApp, key: KeyEvent) -> bool {
-    let Some(pending) = app.pending_mcp_elicitation.take() else {
+    let Some(mut pending) = app.pending_mcp_elicitation.take() else {
         return false;
     };
     let is_form = pending.request.kind == McpElicitationKind::Form;
@@ -24909,7 +24909,7 @@ fn handle_mcp_elicitation_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && (key.code == KeyCode::Char('j') || key.code == KeyCode::Enter)
     {
-        insert_input_char(app, '\n');
+        insert_buffer_char(&mut pending.answer, &mut pending.answer_cursor, '\n');
         keep_mcp_elicitation_pending(app, pending);
         return true;
     }
@@ -24942,39 +24942,39 @@ fn handle_mcp_elicitation_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             send_mcp_elicitation_response(app, pending, McpElicitationChoice::Decline)
         }
         KeyCode::Backspace if is_form => {
-            delete_before_cursor(app);
+            delete_buffer_before_cursor(&mut pending.answer, &mut pending.answer_cursor);
             keep_mcp_elicitation_pending(app, pending);
             true
         }
         KeyCode::Delete if is_form => {
-            delete_at_cursor(app);
+            delete_buffer_at_cursor(&mut pending.answer, &mut pending.answer_cursor);
             keep_mcp_elicitation_pending(app, pending);
             true
         }
         KeyCode::Left if is_form => {
-            move_input_cursor_left(app);
+            move_buffer_cursor_left(&pending.answer, &mut pending.answer_cursor);
             keep_mcp_elicitation_pending(app, pending);
             true
         }
         KeyCode::Right if is_form => {
-            move_input_cursor_right(app);
+            move_buffer_cursor_right(&pending.answer, &mut pending.answer_cursor);
             keep_mcp_elicitation_pending(app, pending);
             true
         }
         KeyCode::Home if is_form => {
-            app.input_cursor = 0;
+            pending.answer_cursor = 0;
             keep_mcp_elicitation_pending(app, pending);
             true
         }
         KeyCode::End if is_form => {
-            app.input_cursor = app.input.len();
+            pending.answer_cursor = pending.answer.len();
             keep_mcp_elicitation_pending(app, pending);
             true
         }
         KeyCode::Char(ch)
             if is_form && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
         {
-            insert_input_char(app, ch);
+            insert_buffer_char(&mut pending.answer, &mut pending.answer_cursor, ch);
             keep_mcp_elicitation_pending(app, pending);
             true
         }
@@ -24998,7 +24998,7 @@ fn send_mcp_elicitation_response(
     match choice {
         McpElicitationChoice::Accept => {
             let content = if pending.request.kind == McpElicitationKind::Form {
-                match parse_mcp_elicitation_form_content(&app.input) {
+                match parse_mcp_elicitation_form_content(&pending.answer) {
                     Ok(content) => Some(content),
                     Err(error) => {
                         app.status = error;
@@ -25013,15 +25013,12 @@ fn send_mcp_elicitation_response(
             let _ = pending
                 .response_tx
                 .send(McpElicitationResponse::accept(content));
-            clear_input(app);
-            app.mcp_elicitation_seeded_input = None;
             app.status = format!("accepted mcp request from {server}");
             true
         }
         McpElicitationChoice::Decline => {
             let server = pending.request.server.clone();
             let _ = pending.response_tx.send(McpElicitationResponse::decline());
-            clear_mcp_elicitation_seeded_input(app);
             app.status = format!("declined mcp request from {server}");
             true
         }
@@ -25031,7 +25028,6 @@ fn send_mcp_elicitation_response(
 fn send_mcp_elicitation_cancel(app: &mut TuiApp, pending: PendingMcpElicitation) -> bool {
     let server = pending.request.server.clone();
     let _ = pending.response_tx.send(McpElicitationResponse::cancel());
-    clear_mcp_elicitation_seeded_input(app);
     app.status = format!("cancelled mcp request from {server}");
     true
 }
@@ -25080,23 +25076,11 @@ fn mcp_elicitation_options() -> &'static [McpElicitationOption] {
     &[MCP_ELICITATION_ACCEPT, MCP_ELICITATION_DECLINE]
 }
 
-pub(crate) fn seed_mcp_elicitation_form_input(app: &mut TuiApp, request: &McpElicitationRequest) {
-    app.mcp_elicitation_seeded_input = None;
-    if request.kind != McpElicitationKind::Form || !app.input.trim().is_empty() {
-        return;
+pub(crate) fn seed_mcp_elicitation_form_answer(request: &McpElicitationRequest) -> String {
+    if request.kind != McpElicitationKind::Form {
+        return String::new();
     }
-    let template = mcp_elicitation_form_template(request.schema.as_ref());
-    app.input = template.clone();
-    app.input_cursor = app.input.len();
-    app.mcp_elicitation_seeded_input = Some(template);
-}
-
-pub(crate) fn clear_mcp_elicitation_seeded_input(app: &mut TuiApp) {
-    if let Some(seeded) = app.mcp_elicitation_seeded_input.take()
-        && app.input == seeded
-    {
-        clear_input(app);
-    }
+    mcp_elicitation_form_template(request.schema.as_ref())
 }
 
 fn mcp_elicitation_form_template(schema: Option<&serde_json::Value>) -> String {
@@ -33901,7 +33885,7 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
             &format_mcp_elicitation_menu_lines(
                 &pending.request,
                 app.mcp_elicitation_selection_index,
-                &app.input,
+                &pending.answer,
             ),
             width,
         )
@@ -33961,7 +33945,7 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
         format_mcp_elicitation_menu_lines(
             &pending.request,
             app.mcp_elicitation_selection_index,
-            &app.input,
+            &pending.answer,
         )
     } else if let Some(pending) = app.pending_request_user_input.as_ref() {
         format_request_user_input_menu_lines(
@@ -46565,7 +46549,6 @@ pub(crate) struct TuiApp {
     pub(crate) pending_approval: Option<PendingApproval>,
     pub(crate) approval_selection_index: usize,
     pub(crate) pending_mcp_elicitation: Option<PendingMcpElicitation>,
-    pub(crate) mcp_elicitation_seeded_input: Option<String>,
     pub(crate) pending_request_user_input: Option<PendingRequestUserInput>,
     /// Prompt that was in flight when the most recent turn was cancelled
     /// or failed. Surfaced via Ctrl+R so the user can recover from a
@@ -47912,7 +47895,6 @@ impl TuiApp {
             pending_approval: None,
             approval_selection_index: 0,
             pending_mcp_elicitation: None,
-            mcp_elicitation_seeded_input: None,
             pending_request_user_input: None,
             cancelled_prompt: None,
             last_turn_had_edits: false,
@@ -49446,6 +49428,13 @@ pub(crate) struct PendingApproval {
 pub(crate) struct PendingMcpElicitation {
     pub(crate) request: McpElicitationRequest,
     pub(crate) response_tx: oneshot::Sender<McpElicitationResponse>,
+    /// Form answer typed inside the modal. Kept separate from
+    /// `TuiApp::input` so the user's pending next-prompt draft is not
+    /// hijacked by the elicitation form, mirroring
+    /// `PendingRequestUserInput`.
+    pub(crate) answer: String,
+    /// Byte cursor into `answer`.
+    pub(crate) answer_cursor: usize,
 }
 
 pub(crate) struct PendingRequestUserInput {

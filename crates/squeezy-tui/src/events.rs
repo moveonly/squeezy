@@ -340,14 +340,16 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 } => {
                     if let Some(previous) = app.pending_mcp_elicitation.take() {
                         let _ = previous.response_tx.send(McpElicitationResponse::cancel());
-                        crate::clear_mcp_elicitation_seeded_input(app);
                     }
                     app.status = format_mcp_elicitation_status_line(&request);
                     app.mcp_elicitation_selection_index = 0;
-                    crate::seed_mcp_elicitation_form_input(app, &request);
+                    let answer = crate::seed_mcp_elicitation_form_answer(&request);
+                    let answer_cursor = answer.len();
                     app.pending_mcp_elicitation = Some(PendingMcpElicitation {
                         request,
                         response_tx,
+                        answer,
+                        answer_cursor,
                     });
                     break;
                 }
@@ -427,7 +429,6 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     app.turn_visual = TurnVisualState::Succeeded;
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
-                    crate::clear_mcp_elicitation_seeded_input(app);
                     cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     // Preserve the user's scroll position; if they paged up
@@ -577,7 +578,6 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     finalize_proposed_plan(app);
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
-                    crate::clear_mcp_elicitation_seeded_input(app);
                     cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     app.cancel = None;
@@ -632,7 +632,6 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     finalize_proposed_plan(app);
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
-                    crate::clear_mcp_elicitation_seeded_input(app);
                     cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     app.cancel = None;

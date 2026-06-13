@@ -22426,7 +22426,28 @@ fn mcp_form_menu_renders_full_pretty_schema() {
 }
 
 #[test]
-fn mcp_form_input_is_seeded_without_overwriting_user_text() {
+fn mcp_form_answer_is_seeded_into_its_own_buffer_not_the_composer() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "required": ["name"],
+        "properties": { "name": { "type": "string" } }
+    });
+    let request = McpElicitationRequest {
+        server: "docs".to_string(),
+        request_id: "r1".to_string(),
+        kind: McpElicitationKind::Form,
+        message: "fill this".to_string(),
+        schema: Some(schema),
+        url: None,
+        elicitation_id: None,
+    };
+
+    let answer = seed_mcp_elicitation_form_answer(&request);
+    assert!(answer.contains("\"name\""), "{answer}");
+}
+
+#[test]
+fn mcp_form_elicitation_preserves_pending_composer_draft() {
     let schema = serde_json::json!({
         "type": "object",
         "required": ["name"],
@@ -22442,19 +22463,49 @@ fn mcp_form_input_is_seeded_without_overwriting_user_text() {
         elicitation_id: None,
     };
     let mut app = test_app(SessionMode::Build);
-
-    seed_mcp_elicitation_form_input(&mut app, &request);
-    assert!(app.input.contains("\"name\""), "{}", app.input);
-    assert_eq!(app.input_cursor, app.input.len());
-
-    app.input = "{\"custom\": true}".to_string();
+    app.input = "draft prompt".to_string();
     app.input_cursor = app.input.len();
-    seed_mcp_elicitation_form_input(&mut app, &request);
-    assert_eq!(app.input, "{\"custom\": true}");
+
+    let answer = seed_mcp_elicitation_form_answer(&request);
+    let answer_cursor = answer.len();
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+    app.pending_mcp_elicitation = Some(PendingMcpElicitation {
+        request,
+        response_tx,
+        answer,
+        answer_cursor,
+    });
+
+    // Seeding the form must not touch the composer draft, and the
+    // template must land in the modal's own answer buffer.
+    assert_eq!(app.input, "draft prompt");
+    assert!(
+        app.pending_mcp_elicitation
+            .as_ref()
+            .is_some_and(|p| p.answer.contains("\"name\"")),
+        "template must seed the modal answer buffer"
+    );
+
+    // Typing into the modal edits the answer, not the composer.
+    assert!(handle_mcp_elicitation_key(
+        &mut app,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE)
+    ));
+    assert!(handle_mcp_elicitation_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+    ));
+    assert_eq!(app.input, "draft prompt");
+    assert!(
+        app.pending_mcp_elicitation
+            .as_ref()
+            .is_some_and(|p| p.answer.ends_with('x')),
+        "typed char must land in the modal answer buffer"
+    );
 }
 
 #[test]
-fn mcp_form_decline_clears_untouched_seeded_input() {
+fn mcp_form_decline_preserves_composer_draft() {
     let request = McpElicitationRequest {
         server: "docs".to_string(),
         request_id: "r1".to_string(),
@@ -22469,12 +22520,15 @@ fn mcp_form_decline_clears_untouched_seeded_input() {
         elicitation_id: None,
     };
     let mut app = test_app(SessionMode::Build);
-    seed_mcp_elicitation_form_input(&mut app, &request);
-    assert!(app.input.contains("\"name\""), "{}", app.input);
+    app.input = "draft prompt".to_string();
+    let answer = seed_mcp_elicitation_form_answer(&request);
+    let answer_cursor = answer.len();
     let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
     let pending = PendingMcpElicitation {
         request,
         response_tx,
+        answer,
+        answer_cursor,
     };
 
     assert!(send_mcp_elicitation_response(
@@ -22483,8 +22537,7 @@ fn mcp_form_decline_clears_untouched_seeded_input() {
         McpElicitationChoice::Decline
     ));
 
-    assert_eq!(app.input, "");
-    assert!(app.mcp_elicitation_seeded_input.is_none());
+    assert_eq!(app.input, "draft prompt");
     let response = response_rx.try_recv().expect("decline response");
     assert_eq!(
         response.action,
@@ -22493,7 +22546,7 @@ fn mcp_form_decline_clears_untouched_seeded_input() {
 }
 
 #[test]
-fn mcp_form_cancel_preserves_user_modified_seeded_input() {
+fn mcp_form_cancel_preserves_composer_draft() {
     let request = McpElicitationRequest {
         server: "docs".to_string(),
         request_id: "r1".to_string(),
@@ -22508,19 +22561,20 @@ fn mcp_form_cancel_preserves_user_modified_seeded_input() {
         elicitation_id: None,
     };
     let mut app = test_app(SessionMode::Build);
-    seed_mcp_elicitation_form_input(&mut app, &request);
-    app.input = "{\"name\":\"edited\"}".to_string();
-    app.input_cursor = app.input.len();
+    app.input = "draft prompt".to_string();
+    let answer = "{\"name\":\"edited\"}".to_string();
+    let answer_cursor = answer.len();
     let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
     let pending = PendingMcpElicitation {
         request,
         response_tx,
+        answer,
+        answer_cursor,
     };
 
     assert!(send_mcp_elicitation_cancel(&mut app, pending));
 
-    assert_eq!(app.input, "{\"name\":\"edited\"}");
-    assert!(app.mcp_elicitation_seeded_input.is_none());
+    assert_eq!(app.input, "draft prompt");
     let response = response_rx.try_recv().expect("cancel response");
     assert_eq!(response.action, squeezy_tools::McpElicitationAction::Cancel);
 }

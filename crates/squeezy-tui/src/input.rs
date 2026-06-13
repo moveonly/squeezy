@@ -1561,59 +1561,85 @@ pub(crate) fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> 
 }
 
 fn insert_answer_char(pending: &mut PendingRequestUserInput, ch: char) {
-    let cursor = clamp_byte_cursor(&pending.answer, pending.answer_cursor);
-    pending.answer.insert(cursor, ch);
-    pending.answer_cursor = cursor + ch.len_utf8();
+    insert_buffer_char(&mut pending.answer, &mut pending.answer_cursor, ch);
 }
 
 fn delete_answer_before_cursor(pending: &mut PendingRequestUserInput) {
-    let cursor = clamp_byte_cursor(&pending.answer, pending.answer_cursor);
-    if cursor == 0 {
-        return;
-    }
-    let mut prev = cursor - 1;
-    while prev > 0 && !pending.answer.is_char_boundary(prev) {
-        prev -= 1;
-    }
-    pending.answer.replace_range(prev..cursor, "");
-    pending.answer_cursor = prev;
+    delete_buffer_before_cursor(&mut pending.answer, &mut pending.answer_cursor);
 }
 
 fn delete_answer_at_cursor(pending: &mut PendingRequestUserInput) {
-    let cursor = clamp_byte_cursor(&pending.answer, pending.answer_cursor);
-    if cursor >= pending.answer.len() {
-        return;
-    }
-    let mut next = cursor + 1;
-    while next < pending.answer.len() && !pending.answer.is_char_boundary(next) {
-        next += 1;
-    }
-    pending.answer.replace_range(cursor..next, "");
-    pending.answer_cursor = cursor;
+    delete_buffer_at_cursor(&mut pending.answer, &mut pending.answer_cursor);
 }
 
 fn move_answer_cursor_left(pending: &mut PendingRequestUserInput) {
-    let cursor = clamp_byte_cursor(&pending.answer, pending.answer_cursor);
-    if cursor == 0 {
-        return;
-    }
-    let mut prev = cursor - 1;
-    while prev > 0 && !pending.answer.is_char_boundary(prev) {
-        prev -= 1;
-    }
-    pending.answer_cursor = prev;
+    move_buffer_cursor_left(&pending.answer, &mut pending.answer_cursor);
 }
 
 fn move_answer_cursor_right(pending: &mut PendingRequestUserInput) {
-    let cursor = clamp_byte_cursor(&pending.answer, pending.answer_cursor);
-    if cursor >= pending.answer.len() {
+    move_buffer_cursor_right(&pending.answer, &mut pending.answer_cursor);
+}
+
+/// Edit a free-form answer buffer that is kept separate from the
+/// composer (`TuiApp::input`). Shared by the plan-mode question modal
+/// and the MCP elicitation form so a pending next-prompt draft is never
+/// hijacked by an active modal.
+pub(crate) fn insert_buffer_char(buffer: &mut String, cursor: &mut usize, ch: char) {
+    let at = clamp_byte_cursor(buffer, *cursor);
+    buffer.insert(at, ch);
+    *cursor = at + ch.len_utf8();
+}
+
+pub(crate) fn delete_buffer_before_cursor(buffer: &mut String, cursor: &mut usize) {
+    let at = clamp_byte_cursor(buffer, *cursor);
+    if at == 0 {
         return;
     }
-    let mut next = cursor + 1;
-    while next < pending.answer.len() && !pending.answer.is_char_boundary(next) {
+    let mut prev = at - 1;
+    while prev > 0 && !buffer.is_char_boundary(prev) {
+        prev -= 1;
+    }
+    buffer.replace_range(prev..at, "");
+    *cursor = prev;
+}
+
+pub(crate) fn delete_buffer_at_cursor(buffer: &mut String, cursor: &mut usize) {
+    let at = clamp_byte_cursor(buffer, *cursor);
+    if at >= buffer.len() {
+        return;
+    }
+    let mut next = at + 1;
+    while next < buffer.len() && !buffer.is_char_boundary(next) {
         next += 1;
     }
-    pending.answer_cursor = next;
+    buffer.replace_range(at..next, "");
+    *cursor = at;
+}
+
+pub(crate) fn move_buffer_cursor_left(buffer: &str, cursor: &mut usize) {
+    let at = clamp_byte_cursor(buffer, *cursor);
+    if at == 0 {
+        *cursor = 0;
+        return;
+    }
+    let mut prev = at - 1;
+    while prev > 0 && !buffer.is_char_boundary(prev) {
+        prev -= 1;
+    }
+    *cursor = prev;
+}
+
+pub(crate) fn move_buffer_cursor_right(buffer: &str, cursor: &mut usize) {
+    let at = clamp_byte_cursor(buffer, *cursor);
+    if at >= buffer.len() {
+        *cursor = buffer.len();
+        return;
+    }
+    let mut next = at + 1;
+    while next < buffer.len() && !buffer.is_char_boundary(next) {
+        next += 1;
+    }
+    *cursor = next;
 }
 
 fn clamp_byte_cursor(text: &str, cursor: usize) -> usize {
