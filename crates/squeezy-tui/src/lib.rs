@@ -2701,18 +2701,17 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // drags outside the prompt fall through so transcript selection remains
     // available. Hit-tested in ABSOLUTE screen coordinates against the chrome
     // targets `render_paste_preview_inline` registered this frame.
-    if app.paste_preview.is_some() {
-        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
-            && let Some((interaction::TargetKey::Chrome(key), action)) =
-                app.click_target_at(mouse.column, mouse.row)
-            && matches!(
-                key,
-                interaction::ChromeKey::PasteConfirm | interaction::ChromeKey::PasteCancel
-            )
-        {
-            dispatch_click_action(app, action);
-            return true;
-        }
+    if app.paste_preview.is_some()
+        && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((interaction::TargetKey::Chrome(key), action)) =
+            app.click_target_at(mouse.column, mouse.row)
+        && matches!(
+            key,
+            interaction::ChromeKey::PasteConfirm | interaction::ChromeKey::PasteCancel
+        )
+    {
+        dispatch_click_action(app, action);
+        return true;
     }
 
     // The inline paste-transform question (§12.6.2) follows the same rule: a
@@ -2720,16 +2719,15 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // and drags outside the prompt fall through to normal transcript handling.
     // Hit-tested in ABSOLUTE screen coordinates against the row targets
     // `render_paste_transform_inline` registered this frame.
-    if app.paste_transform.is_some() {
-        if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
-            && let Some((
-                interaction::TargetKey::Chrome(interaction::ChromeKey::PasteTransformItem(_)),
-                action,
-            )) = app.click_target_at(mouse.column, mouse.row)
-        {
-            dispatch_click_action(app, action);
-            return true;
-        }
+    if app.paste_transform.is_some()
+        && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::PasteTransformItem(_)),
+            action,
+        )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
     }
 
     // The clipboard-history picker (§12.6.1) owns the pointer while open: a
