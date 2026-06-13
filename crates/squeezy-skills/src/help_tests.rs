@@ -645,6 +645,19 @@ fn extract_doc_intro_returns_short_paragraph_unchanged() {
 }
 
 #[test]
+fn providers_topic_names_gateway_presets_not_just_first_party() {
+    // The supported surface is far wider than the curated first-party vendors;
+    // the summary must surface at least one OpenAI-compatible gateway so a
+    // reader of `/help providers` learns presets like OpenRouter are supported.
+    let help = SqueezyHelp::new("");
+    let body = help.answer_topic("providers").body;
+    assert!(
+        body.contains("OpenRouter"),
+        "providers summary must mention a gateway preset such as OpenRouter: {body}"
+    );
+}
+
+#[test]
 fn bundled_skill_docs_do_not_advertise_nonexistent_slash_skill() {
     // There is no `/skill` user command in the dispatch parser; skills activate
     // via triggers, the model's `load_skill` tool, or implicit shell use. The

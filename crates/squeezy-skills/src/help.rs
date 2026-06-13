@@ -424,7 +424,7 @@ const TOPICS: &[TopicDefinition] = &[
             "api key",
             "api-key",
         ],
-        summary: "Provider selection is configuration-driven. Squeezy supports built-in OpenAI, Anthropic, Google Gemini, Azure OpenAI, Ollama, and Bedrock provider metadata. API key settings name environment variables; `config inspect` redacts secret-looking values and provider key names where appropriate.",
+        summary: "Provider selection is configuration-driven. Squeezy ships first-party metadata for OpenAI, OpenAI Codex, GitHub Copilot, Anthropic, Google Gemini, Azure OpenAI, Bedrock, and Vertex AI, plus OpenAI-compatible presets and gateways — OpenRouter, Vercel AI Gateway, PortKey, Groq, xAI, DeepSeek, Mistral, Together, Fireworks, Cerebras, DeepInfra, Baseten, Cloudflare, local Ollama/LM Studio/vLLM/llama.cpp, and a generic `openai_compatible` preset (see PROVIDERS.md for the full list). API key settings name environment variables; `config inspect` redacts secret-looking values and provider key names where appropriate.",
         docs: &[
             "docs/external/PROVIDERS.md",
             "docs/external/CONFIGURATION.md",
