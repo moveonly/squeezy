@@ -581,12 +581,29 @@ pub fn write_settings_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()>
     }
     let tmp = sibling_tempfile(target);
     {
+        // Settings files are per-user config and may hold inline secrets
+        // (provider API keys, MCP env / HTTP headers). On unix the tempfile is
+        // created owner-only (0o600) *before* the secret bytes are written, so
+        // it is never world-readable — even briefly — even when the parent
+        // directory is group/world-traversable. `create_new` also refuses to
+        // reuse an attacker-planted tempfile of the same name.
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
         let mut file = fs::File::create(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
-    // Settings files are per-user config and may hold inline secrets (provider
-    // API keys), so every scope is tightened to owner-only before the rename.
+    // Belt-and-suspenders: tighten to owner-only before the rename. On unix this
+    // is a no-op (the file was created 0o600 above); on other platforms it is
+    // the only place permissions are constrained.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -2458,6 +2458,20 @@ impl CheckpointStore {
             // exact CRLF/normalization surprise the worktree-hash store is
             // designed to prevent. Surface the missing blob so the caller
             // converts it into a `CheckpointObjectMissing` conflict instead.
+            //
+            // A hand-edited / partially-written / corrupted journal line can
+            // carry a digest that is not a 64-char hex string. `raw_blob_path`
+            // slices `sha256[..2]` to derive the shard prefix, which would
+            // panic on a length-0/1 digest in release builds (the only guard
+            // there is a debug-only assert). Validate the digest here and
+            // surface malformed input as an error so the caller turns it into
+            // a recoverable `CheckpointObjectMissing` conflict rather than a
+            // hard process panic.
+            if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "raw worktree byte blob hash {sha256:?} for {path} is malformed"
+                ));
+            }
             return fs::read(self.raw_blob_path(sha256)).map_err(|err| {
                 format!("raw worktree byte blob {sha256} for {path} unreadable: {err}")
             });

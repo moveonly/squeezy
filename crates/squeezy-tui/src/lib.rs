@@ -28000,7 +28000,13 @@ fn theme_editor_channel_value_at(bar: Rect, column: u16) -> u8 {
     // The first 2 cells of the bar are the "R "/"G "/"B " label; the rest is the
     // 256-step track.
     let track_x = bar.x.saturating_add(THEME_EDITOR_BAR_LABEL_WIDTH);
-    let track_w = bar.width.saturating_sub(THEME_EDITOR_BAR_LABEL_WIDTH);
+    // Match the painted track width: the tail cells reserved for the " 255"
+    // numeric label are not part of the clickable track (see
+    // `render_theme_editor_bar`), so they must be subtracted here too.
+    let track_w = bar
+        .width
+        .saturating_sub(THEME_EDITOR_BAR_LABEL_WIDTH)
+        .saturating_sub(THEME_EDITOR_BAR_VALUE_WIDTH);
     if track_w == 0 {
         return 0;
     }
@@ -28017,6 +28023,47 @@ fn theme_editor_channel_value_at(bar: Rect, column: u16) -> u8 {
 /// Width of the single-letter channel label ("R ", "G ", "B ") at the head of a
 /// Theme Editor channel bar, in cells. The remaining bar width is the value track.
 const THEME_EDITOR_BAR_LABEL_WIDTH: u16 = 2;
+
+/// Cells reserved at the tail of a Theme Editor channel bar for the trailing
+/// " 255" numeric value label. The paint (`render_theme_editor_bar`) and the
+/// click hit-test (`theme_editor_channel_value_at`) MUST subtract the same amount
+/// so the visible track and the clickable track stay the same width.
+const THEME_EDITOR_BAR_VALUE_WIDTH: u16 = 4;
+
+#[cfg(test)]
+mod theme_editor_bar_hittest_tests {
+    use super::*;
+
+    /// The clickable track and the painted track must agree in width: the
+    /// rightmost VISIBLE track cell maps to 255, and clicking the reserved
+    /// numeric-value region (the " 255" label cells) clamps to 255 rather than
+    /// being treated as track that reads below max. Regression guard for the
+    /// paint-vs-hit-test width drift.
+    #[test]
+    fn rightmost_visible_track_cell_maps_to_max() {
+        let bar = Rect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 1,
+        };
+        // Painted track: width - label(2) - value(4) = 44 cells, starting at
+        // column track_x = 2, so the last visible cell is column 2 + 44 - 1 = 45.
+        let track_x = THEME_EDITOR_BAR_LABEL_WIDTH;
+        let track_w = bar.width - THEME_EDITOR_BAR_LABEL_WIDTH - THEME_EDITOR_BAR_VALUE_WIDTH;
+        let last_visible = track_x + track_w - 1;
+        assert_eq!(theme_editor_channel_value_at(bar, last_visible), 255);
+        // Clicking the reserved " 255" label region (just past the visible track)
+        // clamps to 255 rather than reading as a lower track value.
+        assert_eq!(
+            theme_editor_channel_value_at(bar, bar.width - 1),
+            255,
+            "value-label region must clamp to 255"
+        );
+        // A click at/left of the track origin reads as 0.
+        assert_eq!(theme_editor_channel_value_at(bar, track_x), 0);
+    }
+}
 
 /// Paint the Theme Editor overlay (§12.7.2) as a centered modal: a left rail of
 /// the curated palette ROLES (the focused one marked) and a right panel showing
@@ -28580,11 +28627,13 @@ fn render_theme_editor_bar(
     } else {
         Style::default().fg(crate::render::theme::quiet())
     };
-    // Reserve 4 trailing cells for " 255" so the value never overflows the row.
+    // Reserve trailing cells for " 255" so the value never overflows the row.
+    // The hit-test (`theme_editor_channel_value_at`) subtracts the same amount so
+    // the clickable track matches the painted track exactly.
     let track_w = area
         .width
         .saturating_sub(THEME_EDITOR_BAR_LABEL_WIDTH)
-        .saturating_sub(4);
+        .saturating_sub(THEME_EDITOR_BAR_VALUE_WIDTH);
     let filled = if track_w == 0 {
         0
     } else {

@@ -1716,12 +1716,17 @@ fn extract_doc_intro(content: &str, max_chars: usize) -> &str {
     } else {
         trimmed
     };
-    // Find end of first paragraph (first blank line = two consecutive newlines)
-    let end = after_heading
-        .find("\n\n")
-        .unwrap_or(after_heading.len())
-        .min(max_chars);
-    &after_heading[..end]
+    // Find end of first paragraph (first blank line = two consecutive newlines).
+    // `find`/`len` yield byte offsets and both land on char boundaries.
+    let para_end = after_heading.find("\n\n").unwrap_or(after_heading.len());
+    let para = &after_heading[..para_end];
+    // Cap at `max_chars` *characters*; `char_indices().nth()` yields a
+    // char-boundary byte index, so the final slice never splits a multi-byte char.
+    let end = para
+        .char_indices()
+        .nth(max_chars)
+        .map_or(para.len(), |(i, _)| i);
+    &para[..end]
 }
 
 /// How many top-scoring bundled docs to include when the lexical scorer is

@@ -75,6 +75,12 @@ const CONSECUTIVE_DENIAL_TRIP: usize = 2;
 const RECENT_WINDOW: usize = 20;
 const RECENT_DENIAL_TRIP: usize = 5;
 const AUDIT_RING_CAPACITY: usize = 50;
+/// How many recent turn ids worth of per-turn circuits to keep. Circuits are
+/// strictly per-turn and never re-consulted once a newer turn begins, so older
+/// entries are dead weight. A small sliding window bounds `turn_circuits`
+/// (otherwise it grows one entry per reviewed turn for the session lifetime)
+/// while tolerating any out-of-order access among near-current turns.
+const CIRCUIT_TURN_WINDOW: u64 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AiReviewerTranscriptSnapshot {
@@ -778,7 +784,19 @@ fn parse_reviewer_response(text: &str) -> Option<ReviewerDecision> {
 }
 
 impl AiReviewerState {
+    /// Evict circuits for turns older than the sliding window ending at
+    /// `turn_id`. Per-turn circuits are never consulted once a newer turn
+    /// begins, so this bounds `turn_circuits` to `CIRCUIT_TURN_WINDOW` entries
+    /// without dropping the current turn's circuit. Called before every
+    /// `or_default()` insert so the map can never grow unbounded.
+    fn prune_turn_circuits(&mut self, turn_id: TurnId) {
+        let current = turn_id.get();
+        self.turn_circuits
+            .retain(|id, _| id.saturating_add(CIRCUIT_TURN_WINDOW) >= current);
+    }
+
     fn bypass_reason(&mut self, turn_id: TurnId) -> Option<String> {
+        self.prune_turn_circuits(turn_id);
         let circuit = self.turn_circuits.entry(turn_id.get()).or_default();
         circuit
             .tripped
@@ -786,6 +804,7 @@ impl AiReviewerState {
     }
 
     fn record_non_denial(&mut self, turn_id: TurnId) {
+        self.prune_turn_circuits(turn_id);
         let circuit = self.turn_circuits.entry(turn_id.get()).or_default();
         circuit.consecutive_denials = 0;
         circuit.recent.push_back(false);
@@ -793,6 +812,7 @@ impl AiReviewerState {
     }
 
     fn record_denial(&mut self, turn_id: TurnId) -> Option<String> {
+        self.prune_turn_circuits(turn_id);
         let circuit = self.turn_circuits.entry(turn_id.get()).or_default();
         circuit.consecutive_denials = circuit.consecutive_denials.saturating_add(1);
         circuit.recent.push_back(true);

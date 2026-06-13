@@ -170,6 +170,15 @@ pub(crate) fn maybe_micro_compact(
                 "{prefix} — call_id={call_id}, name={tool_name}, original_bytes={original_bytes}]",
                 prefix = MICRO_COMPACT_CLEARED_PREFIX,
             );
+            // Only rewrite when the placeholder strictly shrinks the body —
+            // micro-compaction is a *cost* win, and a placeholder longer than
+            // the original output (tiny reads, empty greps) would grow the
+            // payload instead of reclaiming it. Mirrors the same guard in
+            // `splice_changed_spans`. Skipping also keeps the untouched body
+            // out of `cleared_call_ids`.
+            if replacement.len() >= output.len() {
+                continue;
+            }
             bytes_saved =
                 bytes_saved.saturating_add(original_bytes.saturating_sub(replacement.len()));
             cleared_call_ids.push(call_id.clone());

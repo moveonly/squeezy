@@ -261,7 +261,11 @@ impl DispatchCommand {
         // like `/help quantum billing` see the full topic verbatim,
         // mirroring `input.strip_prefix(command).map(str::trim)` in
         // the old handler.
-        let rest = input.strip_prefix(head).map(str::trim).unwrap_or_default();
+        let rest = input
+            .trim_start()
+            .strip_prefix(head)
+            .map(str::trim)
+            .unwrap_or_default();
         let cmd = match head {
             "/help" => Self::Help {
                 topic: none_if_empty(rest),

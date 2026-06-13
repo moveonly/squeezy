@@ -230,13 +230,14 @@ fn parse_entry(value: &Value) -> Option<DiscoveredModel> {
         });
     let max_output_tokens = value
         .get("max_completion_tokens")
-        .or_else(|| value.get("max_tokens"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| value.get("max_tokens").and_then(|v| v.as_u64()))
         .or_else(|| {
             value
                 .get("top_provider")
                 .and_then(|tp| tp.get("max_completion_tokens"))
-        })
-        .and_then(|v| v.as_u64());
+                .and_then(|v| v.as_u64())
+        });
     let supports_tools = value
         .get("supported_parameters")
         .and_then(|v| v.as_array())

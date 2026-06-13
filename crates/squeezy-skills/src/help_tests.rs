@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, fs, path::Path};
 
 use super::{
-    HelpCitation, HelpStatus, SqueezyHelp, bundled_doc_paths, bundled_docs,
+    HelpCitation, HelpStatus, SqueezyHelp, bundled_doc_paths, bundled_docs, extract_doc_intro,
     matches_squeezy_help_input, relevant_docs_for_input,
 };
 
@@ -538,4 +538,32 @@ fn relevant_docs_for_input_scopes_corpus() {
         partial_docs.len(),
         bundled_docs().len()
     );
+}
+
+#[test]
+fn extract_doc_intro_does_not_panic_on_multibyte_boundary() {
+    // First paragraph longer than the char cap, with a 3-byte em-dash placed so
+    // that it straddles the byte offset a naive `&s[..max_chars]` slice would
+    // land on. Regression for the byte-vs-char slice panic.
+    let mut para = "a".repeat(399);
+    para.push('—'); // U+2014, 3 bytes: occupies char index 399 (the cap boundary)
+    para.push_str(&"b".repeat(50));
+    let content = format!("# Heading\n\n{para}\n\nsecond paragraph");
+
+    // Must not panic and must stay on char boundaries (i.e. be valid &str).
+    let intro = extract_doc_intro(&content, 400);
+
+    // Capped at exactly `max_chars` characters from the first paragraph.
+    assert_eq!(intro.chars().count(), 400);
+    assert!(intro.starts_with('a'));
+    // The em-dash is the 400th char, so it must be fully included (not split).
+    assert!(intro.ends_with('—'));
+    // First-paragraph semantics: never bleeds into the second paragraph.
+    assert!(!intro.contains("second paragraph"));
+}
+
+#[test]
+fn extract_doc_intro_returns_short_paragraph_unchanged() {
+    let content = "# Heading\n\nshort intro\n\nmore text";
+    assert_eq!(extract_doc_intro(content, 400), "short intro");
 }

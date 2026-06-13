@@ -331,10 +331,16 @@ fn anthropic_tool_choice(hint: Option<&str>) -> Option<Value> {
         "required" | "any" => Some(json!({ "type": "any" })),
         "none" => None,
         _ => {
-            // `tool:NAME` form — force a specific tool.
-            if let Some(name) = lower
-                .strip_prefix("tool:")
-                .map(str::trim)
+            // `tool:NAME` form — force a specific tool. Match the
+            // `tool:` prefix case-insensitively but preserve the
+            // original case of NAME: Anthropic tool names (MCP/custom)
+            // are case-sensitive, so lowercasing would break forcing a
+            // tool like `tool:searchCode`. Mirrors `bedrock_tool_choice`,
+            // which strips the prefix from the original-case string.
+            if let Some(name) = raw
+                .get(..5)
+                .filter(|prefix| prefix.eq_ignore_ascii_case("tool:"))
+                .map(|_| raw[5..].trim())
                 .filter(|s| !s.is_empty())
             {
                 return Some(json!({ "type": "tool", "name": name }));

@@ -1034,14 +1034,20 @@ pub(crate) fn move_input_cursor_up(app: &mut TuiApp) -> bool {
     if curr_start == 0 {
         return false;
     }
-    let col = cursor - curr_start;
+    let col_chars = app.input[curr_start..cursor].chars().count();
     let prev_end = curr_start - 1;
     let prev_start = app.input[..prev_end]
         .rfind('\n')
         .map(|i| i + 1)
         .unwrap_or(0);
     let prev_len = prev_end - prev_start;
-    app.input_cursor = prev_start + col.min(prev_len);
+    let prev_line = &app.input[prev_start..prev_end];
+    app.input_cursor = prev_start
+        + prev_line
+            .char_indices()
+            .nth(col_chars)
+            .map(|(b, _)| b)
+            .unwrap_or(prev_len);
     true
 }
 
@@ -1050,7 +1056,7 @@ pub(crate) fn move_input_cursor_up(app: &mut TuiApp) -> bool {
 pub(crate) fn move_input_cursor_down(app: &mut TuiApp) -> bool {
     let cursor = input_cursor(app);
     let curr_start = line_start_before_cursor(&app.input, cursor);
-    let col = cursor - curr_start;
+    let col_chars = app.input[curr_start..cursor].chars().count();
     let Some(next_start) = app.input[curr_start..]
         .find('\n')
         .map(|offset| curr_start + offset + 1)
@@ -1062,7 +1068,13 @@ pub(crate) fn move_input_cursor_down(app: &mut TuiApp) -> bool {
         .map(|offset| next_start + offset)
         .unwrap_or(app.input.len());
     let next_len = next_end - next_start;
-    app.input_cursor = next_start + col.min(next_len);
+    let next_line = &app.input[next_start..next_end];
+    app.input_cursor = next_start
+        + next_line
+            .char_indices()
+            .nth(col_chars)
+            .map(|(b, _)| b)
+            .unwrap_or(next_len);
     true
 }
 

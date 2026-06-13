@@ -128,12 +128,51 @@ impl Default for RuleKey {
     }
 }
 
+/// Inverse of [`escape_toml_basic_string`]: strip at most one enclosing quote on
+/// each side, then unescape in a single left-to-right scan. Unlike a greedy
+/// `trim_matches('"')` plus ordered `replace` calls, this round-trips targets
+/// whose value itself contains quotes or backslashes, so `contains_rule` can
+/// recognize an already-persisted identical rule.
 fn parse_basic_string(value: &str) -> String {
-    value
-        .trim()
-        .trim_matches('"')
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\")
+    let value = value.trim();
+    let value = value.strip_prefix('"').unwrap_or(value);
+    let value = value.strip_suffix('"').unwrap_or(value);
+
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(decoded) => out.push(decoded),
+                    None => {
+                        // Not a valid \uXXXX escape; preserve the raw input.
+                        out.push('\\');
+                        out.push('u');
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            // Unknown escape: keep the backslash and the following char verbatim.
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            // Trailing lone backslash: keep it verbatim.
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 fn lock_path(path: &Path) -> PathBuf {
