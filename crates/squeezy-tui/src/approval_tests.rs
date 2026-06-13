@@ -336,6 +336,47 @@ fn network_preview_shows_method_and_url() {
 }
 
 #[test]
+fn network_shell_command_renders_host_aware() {
+    // A `curl`/`git clone` shell command is classified Network with its host
+    // encoded in the colon target. The renderer must surface the host line,
+    // a host-scoped Rule, and a host-scoped project-allow option rather than
+    // treating the colon-encoded target as a URL or opaque command prefix.
+    let mut req = request_with(
+        "shell",
+        PermissionCapability::Network,
+        "shell:curl:example.com",
+        &[
+            ("command", "curl https://example.com"),
+            ("shell_prefix", "shell:curl:example.com"),
+            ("host", "example.com"),
+        ],
+    );
+    req.permission.suggested_rules.push(PermissionRule::new(
+        "network",
+        "shell:curl:example.com",
+        PermissionMode::Allow,
+        PermissionRuleSource::Session,
+        None,
+    ));
+    let out = flatten(&render_preview(&req));
+    assert!(out.contains("host example.com"), "host line missing: {out}");
+    assert!(
+        out.contains("Rule: network host example.com"),
+        "rule line should be host-aware, not a command prefix: {out}"
+    );
+    assert!(
+        !out.contains("command prefix shell:curl:example.com"),
+        "colon-encoded command-prefix label leaked: {out}"
+    );
+
+    let menu = format_approval_prompt(&req);
+    assert!(
+        menu.contains("Always allow host example.com"),
+        "project-allow option should name the host: {menu}"
+    );
+}
+
+#[test]
 fn mcp_preview_shows_server_and_tool() {
     let req = request_with(
         "mcp",

@@ -379,21 +379,31 @@ fn append_read(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
 }
 
 fn append_network(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
-    let url = permission
-        .metadata
-        .get("url")
-        .cloned()
-        .unwrap_or_else(|| permission.target.clone());
-    let method = permission
-        .metadata
-        .get("method")
-        .cloned()
-        .unwrap_or_else(|| "GET".to_string());
-    lines.push(plain_white(format!(
-        "🌐 {} {}",
-        method,
-        compact_text(&url, 160)
-    )));
+    // A network *shell* command (e.g. `curl https://…`) carries the literal
+    // command rather than a structured URL/method; show that instead of
+    // rendering the colon-encoded rule target as if it were a URL.
+    if let Some(command) = permission.metadata.get("command") {
+        lines.push(plain_white(format!(
+            "🌐 $ {}",
+            middle_truncate(&command.replace('\n', " "), 160)
+        )));
+    } else {
+        let url = permission
+            .metadata
+            .get("url")
+            .cloned()
+            .unwrap_or_else(|| permission.target.clone());
+        let method = permission
+            .metadata
+            .get("method")
+            .cloned()
+            .unwrap_or_else(|| "GET".to_string());
+        lines.push(plain_white(format!(
+            "🌐 {} {}",
+            method,
+            compact_text(&url, 160)
+        )));
+    }
     if let Some(host) = permission.metadata.get("host") {
         lines.push(dim(format!("host {host}")));
     }
@@ -480,6 +490,12 @@ fn append_rule_preview(lines: &mut Vec<Line<'static>>, permission: &PermissionRe
 }
 
 fn format_rule(permission: &PermissionRequest, rule: &PermissionRule) -> String {
+    // A network shell command (e.g. `curl https://…`) persists a host-scoped
+    // rule; name the host rather than the colon-encoded `shell:cmd:host` target
+    // so the rule reads the same way as a web-fetch rule.
+    if let Some(label) = network_host_rule_label(permission) {
+        return label;
+    }
     if permission.tool_name == "shell" || permission.metadata.contains_key("shell_prefix") {
         format!("command prefix {}", rule.target)
     } else {
@@ -488,11 +504,28 @@ fn format_rule(permission: &PermissionRequest, rule: &PermissionRule) -> String 
 }
 
 fn format_rule_target(permission: &PermissionRequest) -> String {
+    if let Some(label) = network_host_rule_label(permission) {
+        return label;
+    }
     if permission.tool_name == "shell" || permission.metadata.contains_key("shell_prefix") {
         format!("command prefix {}", permission.target)
     } else {
         format!("{} {}", permission.capability.as_str(), permission.target)
     }
+}
+
+/// `network host <host>` for a network-capability request that carries a
+/// concrete host, otherwise `None`. Covers both web-fetch and the
+/// `shell:cmd:host` shell-network shape so the rule line names the host scope
+/// rather than the opaque colon-encoded command target.
+fn network_host_rule_label(permission: &PermissionRequest) -> Option<String> {
+    if permission.capability != PermissionCapability::Network {
+        return None;
+    }
+    permission
+        .metadata
+        .get("host")
+        .map(|host| format!("network host {host}"))
 }
 
 fn plain_white(text: String) -> Line<'static> {

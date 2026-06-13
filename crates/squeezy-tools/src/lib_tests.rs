@@ -446,6 +446,9 @@ fn shell_permission_metadata_detects_network_commands() {
     assert_eq!(request.metadata["timeout_ms"], "1000");
     assert_eq!(request.metadata["output_byte_cap"], "2048");
     assert!(request.metadata["env"].contains("allowlist"));
+    // The concrete host is lifted out of the colon-encoded rule target so the
+    // approval renderer can show it host-aware.
+    assert_eq!(request.metadata["host"], "example.com");
 
     let git_clone = registry.permission_request(&ToolCall {
         call_id: "git".to_string(),
@@ -457,6 +460,7 @@ fn shell_permission_metadata_detects_network_commands() {
     });
     assert_eq!(git_clone.capability, PermissionCapability::Network);
     assert_eq!(git_clone.target, "shell:git clone:example.com");
+    assert_eq!(git_clone.metadata["host"], "example.com");
 
     let _ = fs::remove_dir_all(root);
 }

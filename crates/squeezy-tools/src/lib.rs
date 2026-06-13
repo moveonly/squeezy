@@ -2491,6 +2491,23 @@ impl ToolRegistry {
                 metadata.insert("command".to_string(), command.to_string());
                 metadata.insert("cwd".to_string(), workdir.to_string());
                 metadata.insert("shell_prefix".to_string(), analysis.rule_target.clone());
+                // A network shell command encodes its host in the rule target
+                // (`shell:{cmd}:{host}`). Lift the concrete host into its own
+                // metadata key so the approval renderer's host-aware paths (the
+                // `host …` line and the "Always allow host …" project label)
+                // light up instead of treating the colon-encoded target as an
+                // opaque command prefix.
+                if analysis.network
+                    && analysis.capability == PermissionCapability::Network
+                    && let Some(host) = analysis
+                        .rule_target
+                        .strip_prefix("shell:")
+                        .and_then(|rest| rest.rsplit_once(':'))
+                        .map(|(_, host)| host)
+                        .filter(|host| !host.is_empty() && *host != "*")
+                {
+                    metadata.insert("host".to_string(), host.to_string());
+                }
                 metadata.insert("env".to_string(), "allowlist (values redacted)".to_string());
                 metadata.insert(
                     "network".to_string(),
