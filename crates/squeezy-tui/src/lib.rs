@@ -21888,10 +21888,14 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             }
             Err(error) => set_status_notice(app, format!("session export failed: {error}")),
         },
-        DispatchCommand::SessionExportHtml { id, path } => {
-            let target = path
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(format!("squeezy-session-{id}.html")));
+        DispatchCommand::SessionExportHtml { id, path, force } => {
+            let target = match path {
+                Some(path) => resolve_workspace_path(&app.workspace_root, &path),
+                None => resolve_workspace_path(
+                    &app.workspace_root,
+                    &format!("squeezy-session-{id}.html"),
+                ),
+            };
             match agent.show_session(&id).and_then(|record| {
                 squeezy_agent::export_session_to_html(
                     &record,
@@ -21900,19 +21904,29 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 .map_err(|err| {
                     squeezy_core::SqueezyError::Tool(format!("failed to render html: {err}"))
                 })
-                .and_then(|html| {
-                    std::fs::write(&target, &html).map_err(squeezy_core::SqueezyError::from)?;
-                    Ok(html.len())
-                })
             }) {
-                Ok(len) => {
-                    app.status = format!("wrote {} ({} bytes)", target.display(), len);
-                    app.push_transcript_item(TranscriptItem::system(format!(
-                        "Wrote session export HTML to {} ({} bytes).",
-                        target.display(),
-                        len
-                    )));
-                }
+                Ok(html) => match write_export_atomically(&target, &html, force) {
+                    Ok(()) => {
+                        let len = html.len();
+                        app.status = format!("wrote {} ({} bytes)", target.display(), len);
+                        app.push_transcript_item(TranscriptItem::system(format!(
+                            "Wrote session export HTML to {} ({} bytes).",
+                            target.display(),
+                            len
+                        )));
+                    }
+                    Err(error) => {
+                        let message = if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            format!(
+                                "session export html failed: {} already exists (append `!` to overwrite)",
+                                target.display(),
+                            )
+                        } else {
+                            format!("session export html failed: {error}")
+                        };
+                        set_status_notice(app, message);
+                    }
+                },
                 Err(error) => {
                     set_status_notice(app, format!("session export html failed: {error}"))
                 }

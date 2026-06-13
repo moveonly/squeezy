@@ -11111,6 +11111,7 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
             DispatchCommand::SessionExportHtml {
                 id: "s".to_string(),
                 path: None,
+                force: false,
             },
             "session-export-html",
         ),

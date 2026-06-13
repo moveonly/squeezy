@@ -144,6 +144,7 @@ pub enum DispatchCommand {
     SessionExportHtml {
         id: String,
         path: Option<String>,
+        force: bool,
     },
     Checkpoints,
     CheckpointsDoctor,
@@ -372,18 +373,39 @@ impl DispatchCommand {
                 id: require_id(head, rest, "<session_id>")?,
             },
             "/session-export-html" => {
-                let mut tokens = rest.split_whitespace();
-                let id = match tokens.next() {
-                    Some(value) => value.to_string(),
-                    None => {
-                        return Err(DispatchCommandParseError::Usage {
-                            command: head.to_string(),
-                            hint: "usage: /session-export-html <session_id> [path]".to_string(),
-                        });
-                    }
+                let trimmed = rest.trim_start();
+                let (id, remainder) = trimmed
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((trimmed, ""));
+                if id.is_empty() {
+                    return Err(DispatchCommandParseError::Usage {
+                        command: head.to_string(),
+                        hint: "usage: /session-export-html <session_id> [path] [!]".to_string(),
+                    });
+                }
+                // Keep the verbatim tail (interior whitespace intact) as the
+                // path so destinations with spaces are not truncated. A leading
+                // `force `/`-f ` or a trailing ` !`/` -f` opts into overwriting an
+                // existing file, mirroring the `/export` file form.
+                let tail = remainder.trim();
+                let (tail, force) = if let Some(rest) = tail
+                    .strip_prefix("force ")
+                    .or_else(|| tail.strip_prefix("-f "))
+                {
+                    (rest.trim_start(), true)
+                } else if let Some(rest) =
+                    tail.strip_suffix(" !").or_else(|| tail.strip_suffix(" -f"))
+                {
+                    (rest.trim_end(), true)
+                } else {
+                    (tail, false)
                 };
-                let path = tokens.next().map(str::to_string);
-                Self::SessionExportHtml { id, path }
+                let path = (!tail.is_empty()).then(|| tail.to_string());
+                Self::SessionExportHtml {
+                    id: id.to_string(),
+                    path,
+                    force,
+                }
             }
             "/checkpoints" => {
                 if rest.eq_ignore_ascii_case("doctor") {
