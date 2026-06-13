@@ -2687,6 +2687,71 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         app.scrollbar_drag = None;
     }
 
+    // Screen-buffer text selection (select & copy any painted CHROME — the status
+    // line, footer, banners, /config, pickers, palettes, the question/approval
+    // views, …). Two concerns are split so the gesture never steals a press a
+    // specialized handler needs:
+    //   • An ACTIVE selection owns the pointer on every surface — extend on Drag,
+    //     copy/clear on release — so a drag begun anywhere completes anywhere.
+    //   • A fresh left press anywhere ENDS a finished selection (click-to-deselect,
+    //     like a native text box); it is re-armed below only if it lands on free
+    //     chrome.
+    // ARMING a new selection is gated per-surface: a pre-pass right below for the
+    // swallow-all overlays that interact only through registered click-targets,
+    // and a main-view/config bottom fallback at the end of `handle_mouse` that
+    // runs AFTER every scrollbar / smart-split / subagent-compare / transcript /
+    // composer handler has had first crack.
+    match mouse.kind {
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+            if app.screen_selection.is_some() =>
+        {
+            let sel = app
+                .screen_selection
+                .as_mut()
+                .expect("screen_selection checked is_some");
+            sel.cursor_col = mouse.column;
+            sel.cursor_row = mouse.row;
+            app.needs_redraw = true;
+            return true;
+        }
+        MouseEventKind::Up(crossterm::event::MouseButton::Left)
+            if app.screen_selection.is_some() =>
+        {
+            // A real drag auto-copies on release (keeping the highlight so the
+            // copy chords stay the clear-on-copy path); a bare click leaves a
+            // collapsed selection — clear it.
+            if app.screen_selection.is_some_and(|s| s.is_empty()) {
+                clear_screen_selection(app);
+            } else if app.copy_on_select {
+                let _ = copy_screen_selection(app);
+            }
+            return true;
+        }
+        MouseEventKind::Down(crossterm::event::MouseButton::Left)
+            if app.screen_selection.is_some() =>
+        {
+            // A press anywhere drops a finished selection; re-armed below if it
+            // lands on free chrome.
+            clear_screen_selection(app);
+        }
+        _ => {}
+    }
+
+    // ARM a screen selection on a left press over the dead space of a swallow-all
+    // overlay (pickers, palettes, the subagent timeline, …) — surfaces that only
+    // interact through registered click-targets, so any non-target cell is free
+    // to select. Runs BEFORE those overlays swallow the event. The rect-driven
+    // overlays (smart-split, subagent compare) own their whole pointer surface
+    // and are excluded by `overlay_allows_screen_selection`.
+    if overlay_allows_screen_selection(app)
+        && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && cell_is_chrome(app, mouse.column, mouse.row)
+        && app.click_target_at(mouse.column, mouse.row).is_none()
+    {
+        arm_screen_selection(app, mouse.column, mouse.row);
+        return true;
+    }
+
     // The Clickable Breadcrumbs strip (§12.1.5) is NON-modal: while shown it
     // registers a `BreadcrumbCrumb` target per crumb on the status row. A left
     // click on one focuses + activates that crumb (the mouse twin of ←→ + Enter),
@@ -4034,50 +4099,24 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         }
     }
 
-    // Screen-buffer selection (the "select anything" fallback): a drag that
-    // starts on CHROME — outside the transcript text area and the composer —
-    // selects the painted cells (status line, footer, breadcrumbs, banners) and
-    // copies them. This runs only AFTER every click-target, transcript, and
-    // composer arm declined the event, so it never steals a click (those return
-    // true first). Copy is via copy-on-select on release (drag → ⌘V), the
-    // zero-config path. Held in absolute screen coords, so scroll/resize drop it.
-    if app.transcript_overlay.is_none() && app.config_screen.is_none() {
-        match mouse.kind {
-            MouseEventKind::Down(crossterm::event::MouseButton::Left)
-                if cell_is_chrome(app, mouse.column, mouse.row) =>
-            {
-                // Mutual exclusion with the transcript/composer selections.
-                app.selection = None;
-                input::clear_input_selection(app);
-                app.screen_selection = Some(screen_selection::ScreenSelection::at(
-                    mouse.column,
-                    mouse.row,
-                ));
-                app.needs_redraw = true;
-                return true;
-            }
-            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                if let Some(sel) = app.screen_selection.as_mut() {
-                    sel.cursor_col = mouse.column;
-                    sel.cursor_row = mouse.row;
-                    app.needs_redraw = true;
-                    return true;
-                }
-            }
-            MouseEventKind::Up(crossterm::event::MouseButton::Left)
-                if app.screen_selection.is_some() =>
-            {
-                // A real drag auto-copies on release (keeping the highlight); a
-                // bare click on chrome leaves a collapsed selection — clear it.
-                if app.screen_selection.is_some_and(|s| s.is_empty()) {
-                    clear_screen_selection(app);
-                } else if app.copy_on_select {
-                    let _ = copy_screen_selection(app);
-                }
-                return true;
-            }
-            _ => {}
-        }
+    // Screen-buffer selection — main-view / config / inline-question bottom
+    // fallback. Any left press that reached here UNCLAIMED, on selectable chrome
+    // (outside the transcript & composer text, which keep their own per-surface
+    // selections, and not on a registered click-target), arms a screen-buffer
+    // selection of the painted glyphs. Lowest priority on purpose: every
+    // specialized handler above (scrollbar gutter, minimap, badges,
+    // transcript/composer selection, …) already had first crack, so this only
+    // catches genuine chrome — the status line, footer, banners, the /config
+    // page, and the inline question/approval views. The active drag + release
+    // are handled by the early block at the top of `handle_mouse`.
+    if app.transcript_overlay.is_none()
+        && app.status_line_setup.is_none()
+        && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && cell_is_chrome(app, mouse.column, mouse.row)
+        && app.click_target_at(mouse.column, mouse.row).is_none()
+    {
+        arm_screen_selection(app, mouse.column, mouse.row);
+        return true;
     }
 
     // Shift+wheel pans the no-wrap main view horizontally (§11G.4): the mouse
@@ -4746,6 +4785,55 @@ fn clear_screen_selection(app: &mut TuiApp) {
     app.screen_selection_snapshot.replace(None);
 }
 
+/// Arm a fresh (collapsed) screen-buffer selection at `(col, row)`, dropping any
+/// live transcript/composer selection so only one selection is ever active.
+fn arm_screen_selection(app: &mut TuiApp, col: u16, row: u16) {
+    app.selection = None;
+    input::clear_input_selection(app);
+    app.screen_selection = Some(screen_selection::ScreenSelection::at(col, row));
+    app.needs_redraw = true;
+}
+
+/// True when a SWALLOW-ALL overlay that interacts only through registered
+/// click-targets is open, so a press on its dead space should arm a screen
+/// selection (instead of being swallowed) before the overlay's own arm runs.
+///
+/// Deliberately excludes the two rect-driven surfaces — the Smart Split inspector
+/// and the Compare Subagent Outputs view — which route presses by cached
+/// geometry rather than click-targets and therefore own their entire pointer
+/// surface. The transcript overlay and status-line setup own their own
+/// text-selection / inputs and are likewise not here. Keep this list in sync with
+/// the `if app.<overlay> { …; return true }` arms in [`handle_mouse`].
+fn overlay_allows_screen_selection(app: &TuiApp) -> bool {
+    app.clipboard_history_open
+        || app.snippets_open
+        || app.templates_open
+        || app.keybinding_editor.is_some()
+        || app.workspace_profile.is_some()
+        || app.session_checkpoint_overlay.is_some()
+        || app.theme_editor.is_some()
+        || app.terminal_profile_editor.is_some()
+        || app.gesture_settings_editor.is_some()
+        || app.glyph_mode_editor.is_some()
+        || app.transcript_index_open
+        || app.related_links_open
+        || app.duplicate_folds_open
+        || app.error_lens_open
+        || app.health_markers_open
+        || app.turn_outline_open
+        || app.lane_fold_open
+        || app.bookmarks_open
+        || app.session_timeline_open
+        || app.subagent_timeline_open
+        || app.review_board_open
+        || app.changes_since_open
+        || app.action_palette.is_some()
+        || app.tool_actions.is_some()
+        || app.annotations_open
+        || app.command_palette.is_some()
+        || app.editor_handoff.is_some()
+}
+
 /// True when `(col, row)` is on CHROME — outside both the transcript text area
 /// and the composer text area — so a drag there should arm the screen-buffer
 /// selection rather than a per-surface one. Used as the gate on the screen
@@ -4798,6 +4886,23 @@ fn is_copy_chord(key: &KeyEvent) -> bool {
 /// + letter-case rules as [`is_copy_chord`].
 fn is_cut_chord(key: &KeyEvent) -> bool {
     if !matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X')) {
+        return false;
+    }
+    key.modifiers == KeyModifiers::SUPER
+        || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+}
+
+/// The system-convention PASTE chords: `⌘V` and `Ctrl+Shift+V`. Same exact
+/// modifier-match and letter-case rules as [`is_copy_chord`]. Needed because the
+/// same iTerm2 "remap Left Command → Super" that makes in-app `⌘C`/`⌘V` reach
+/// the app stops
+/// iTerm2 from running its own Paste (which would otherwise arrive as bracketed
+/// paste); without this chord the forwarded `⌘V` would do nothing. `Ctrl+V`
+/// alone is deliberately NOT a paste chord — it is the readline "quoted insert"
+/// / literal-next convention and belongs to the keymap. Bare bracketed paste
+/// (terminals that DON'T forward the chord) still flows through `Event::Paste`.
+fn is_paste_chord(key: &KeyEvent) -> bool {
+    if !matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) {
         return false;
     }
     key.modifiers == KeyModifiers::SUPER
@@ -7961,6 +8066,34 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             clear_all_text_selections(app);
         } else {
             app.status = "nothing selected — drag with the mouse to select text".to_string();
+        }
+        app.needs_redraw = true;
+        return Ok(false);
+    }
+
+    // `⌘V` / `Ctrl+Shift+V` — paste. Reads the system clipboard and routes the
+    // text through the very same `handle_paste` path as a bracketed paste, so the
+    // config/overlay routing, image-token detection, and paste-safety/transform
+    // gates all apply identically. Matched before normalisation for the same
+    // reason as copy/cut (`Ctrl+Shift+V` would otherwise fold to `Ctrl+V`). The
+    // read prefers the injected `app.clipboard` (the test seam) and falls back to
+    // the platform helpers. An empty/unavailable clipboard is a consumed no-op
+    // so the chord never types a stray 'v'.
+    if is_paste_chord(&key) {
+        if app.terminal_title_state == TerminalTitleState::Notification {
+            app.terminal_title_state = TerminalTitleState::Cleared;
+        }
+        let pasted = app
+            .clipboard
+            .read_text()
+            .or_else(clipboard::read_system_clipboard);
+        match pasted {
+            Some(text) if !text.is_empty() => {
+                handle_paste(app, agent, text).await?;
+            }
+            _ => {
+                app.status = "clipboard is empty (or no paste helper available)".to_string();
+            }
         }
         app.needs_redraw = true;
         return Ok(false);
@@ -25372,6 +25505,13 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     // a phantom composer offset. `render_input` repopulates it when the main view
     // actually paints the composer this frame.
     app.input_area_cache.set(None);
+    // Same for the main transcript text-area cache: cleared up front so that when
+    // a fullscreen overlay/config paints (and `render_transcript` does not run),
+    // `cell_is_chrome` treats the whole overlay as selectable chrome instead of
+    // testing a stale main-view rect. `render_transcript` repopulates it on a
+    // main-view frame. Only the main-view mouse paths read it, and an overlay's
+    // own mouse handling preempts those, so clearing it is side-effect-free.
+    app.main_text_area_cache.set(None);
     let area = frame.area();
     // Record the size we're painting at so off-frame transcript geometry
     // (`active_transcript_geometry`, `jump_*_geometry`,
@@ -44234,6 +44374,14 @@ fn role_label(role: &Role) -> &'static str {
 
 pub(crate) trait Clipboard: Send {
     fn copy_text(&mut self, text: &str) -> std::result::Result<(), String>;
+
+    /// Read the clipboard for the in-app paste chord (⌘V / Ctrl+Shift+V).
+    /// Defaults to `None` so production falls back to
+    /// [`clipboard::read_system_clipboard`] (the platform `pbpaste`/`wl-paste`/…
+    /// helpers); only the test double overrides it to inject canned text.
+    fn read_text(&mut self) -> Option<String> {
+        None
+    }
 }
 
 struct Osc52Clipboard;
