@@ -5104,7 +5104,10 @@ fn toggle_snippets(app: &mut TuiApp) {
     app.snippets_open = !app.snippets_open;
     app.status = if app.snippets_open {
         if app.snippets.is_empty() {
-            "snippets (empty) — save one with Alt+3 over a selection · Esc to close".to_string()
+            format!(
+                "snippets (empty) — save one with {} over a selection · Esc to close",
+                key_hint(app, keymap::Action::SaveSnippetFromSelection)
+            )
         } else {
             format!(
                 "snippets: {} — ↑↓ select · Enter insert · q queue · d delete · c clear · Esc close",
