@@ -4043,14 +4043,33 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                     );
                 }
             }
-            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                let rows = main_surface_rows(app);
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left)
                 if app
                     .selection
                     .as_ref()
-                    .is_some_and(|s| s.surface == selection::SelectionSurface::Main)
-                    && let Some(pos) =
-                        main_point_from_mouse_clamped(app, &rows, mouse.column, mouse.row)
+                    .is_some_and(|s| s.surface == selection::SelectionSurface::Main) =>
+            {
+                // Edge auto-scroll: a selection drag that reaches the top or
+                // bottom row of the text area scrolls a step FIRST, so the
+                // selection can extend past the visible window. One step per
+                // drag event — terminals only emit `Drag` on movement, so the
+                // pointer is clamped to the window edge and the user keeps
+                // nudging at the edge to keep scrolling (the native gesture).
+                // Mapping the cell happens after the scroll so it lands on the
+                // newly revealed content.
+                if let Some(cache) = app.main_text_area_cache.get() {
+                    let area = cache.text_area;
+                    if area.height > 0 {
+                        if mouse.row <= area.y {
+                            scroll_transcript_up(app, 1);
+                        } else if mouse.row >= area.y + area.height - 1 {
+                            scroll_transcript_down(app, 1);
+                        }
+                    }
+                }
+                let rows = main_surface_rows(app);
+                if let Some(pos) =
+                    main_point_from_mouse_clamped(app, &rows, mouse.column, mouse.row)
                 {
                     let cursor_row = pos.row;
                     set_selection_cursor(app, pos);

@@ -48908,6 +48908,40 @@ fn retroactive_drag_arm_does_not_hijack_a_transcript_selection() {
     );
 }
 
+#[test]
+fn drag_selection_auto_scrolls_at_the_top_edge() {
+    // Dragging a transcript selection up to the top row of the text area scrolls
+    // the view a step so the selection can extend beyond the visible window.
+    let mut app = test_app(SessionMode::Build);
+    for i in 0..60 {
+        app.push_transcript_item(TranscriptItem::assistant(format!("scroll line {i}")));
+    }
+    let _ = render_full_to_buffer(&app, 60, 24);
+    let area = app
+        .main_text_area_cache
+        .get()
+        .expect("main text area painted")
+        .text_area;
+    assert!(area.height >= 4, "need a few visible rows for the gesture");
+
+    // Press on a visible middle row to arm a main selection.
+    let mid_row = area.y + area.height / 2;
+    handle_mouse(&mut app, left_down(area.x + 1, mid_row, KeyModifiers::NONE));
+    assert!(
+        app.selection.is_some(),
+        "a press on transcript text arms a selection",
+    );
+
+    let before = active_transcript_scroll(&app).from_bottom();
+    // Drag to the very top row: the edge auto-scroll reveals earlier content.
+    handle_mouse(&mut app, left_drag(area.x + 1, area.y));
+    let after = active_transcript_scroll(&app).from_bottom();
+    assert!(
+        after > before,
+        "dragging to the top edge auto-scrolls the transcript up (before={before}, after={after})",
+    );
+}
+
 // =====================================================================
 // Composer native-grade cursor motion: ⌘ line, ⌘↑↓ / Ctrl+Home/End doc,
 // with Shift-extend.
