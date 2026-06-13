@@ -14083,8 +14083,9 @@ fn promote_subagent_at_index(app: &mut TuiApp, index: usize) -> bool {
     };
     let prompt = source.project();
     // Idle fills the composer (editable draft the user reviews); an active turn
-    // queues the prompt behind it. Either way the user still submits/drains it —
-    // the spec is explicit that a promote never auto-submits.
+    // queues the prompt behind it. A promote never auto-submits, so a queued
+    // promote is stamped Manual: it stays in place until the user runs it by
+    // hand rather than auto-draining when the running turn completes.
     let destination = subagent_promote::PromoteDestination::for_turn(app.turn_rx.is_some());
     match destination {
         subagent_promote::PromoteDestination::Composer => {
@@ -14093,6 +14094,10 @@ fn promote_subagent_at_index(app: &mut TuiApp, index: usize) -> bool {
         subagent_promote::PromoteDestination::Queue => {
             app.prompt_queue.push_back(prompt);
             enqueue_queue_id(app);
+            if let Some(id) = app.prompt_queue_ids.back().copied() {
+                app.prompt_queue_conditions
+                    .set(id, queue_conditions::QueueCondition::Manual);
+            }
         }
     }
     app.status = match destination {
@@ -14102,10 +14107,9 @@ fn promote_subagent_at_index(app: &mut TuiApp, index: usize) -> bool {
             destination.verb(),
         ),
         subagent_promote::PromoteDestination::Queue => format!(
-            "promoted {} \u{2014} {} ({} in queue)",
+            "promoted {} \u{2014} {} (manual, run when ready)",
             source.name,
             destination.verb(),
-            app.prompt_queue.len(),
         ),
     };
     app.needs_redraw = true;

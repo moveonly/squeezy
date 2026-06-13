@@ -50039,3 +50039,68 @@ fn entry_preview_meta_shows_turn_size_and_cost() {
         "the answer shows its size: {answer_meta}",
     );
 }
+
+#[test]
+fn promote_during_active_turn_queues_manual_never_auto_drains() {
+    let mut app = test_app(SessionMode::Build);
+    // A subagent that finished while a turn is in flight.
+    app.note_subagent_started(1, "delegate".to_string(), "do the thing".to_string());
+    app.note_subagent_completed(
+        1,
+        "delegate".to_string(),
+        "found the bug in foo.rs".to_string(),
+        TurnMetrics::default(),
+    );
+    // Model an active turn so promote takes the Queue destination.
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    assert!(
+        promote_subagent_at_index(&mut app, 0),
+        "a completed record promotes",
+    );
+
+    assert_eq!(app.prompt_queue.len(), 1, "the promote lands on the queue");
+    let id = *app
+        .prompt_queue_ids
+        .back()
+        .expect("the queued promote has a stable id");
+    assert_eq!(
+        app.prompt_queue_conditions.get(id),
+        queue_conditions::QueueCondition::Manual,
+        "an active-turn promote is held Manual, never auto-submitted",
+    );
+
+    // Even after a clean turn outcome the manual item is held in place, not drained.
+    app.record_turn_outcome(true);
+    sync_queue_ids(&mut app);
+    assert_eq!(
+        queue_drain_action(&app),
+        queue_conditions::DrainAction::Stop,
+        "a Manual promote does not auto-drain when the turn completes",
+    );
+}
+
+#[test]
+fn promote_while_idle_fills_composer_unchanged() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "do the thing".to_string());
+    app.note_subagent_completed(
+        1,
+        "delegate".to_string(),
+        "found the bug in foo.rs".to_string(),
+        TurnMetrics::default(),
+    );
+    // Idle (no turn_rx): promote fills the composer, not the queue.
+    assert!(app.turn_rx.is_none());
+
+    assert!(promote_subagent_at_index(&mut app, 0));
+    assert!(
+        app.prompt_queue.is_empty(),
+        "an idle promote never touches the queue",
+    );
+    assert!(
+        !app.input.is_empty(),
+        "an idle promote fills the composer with editable draft text",
+    );
+}
