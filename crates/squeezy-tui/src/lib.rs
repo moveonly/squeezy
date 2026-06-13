@@ -11058,7 +11058,7 @@ fn keybinding_editor_browse_status(app: &TuiApp) -> String {
     };
     match editor.selected_row() {
         Some(row) => format!(
-            "{} = {} — ↑↓ select · Enter rebind · r reset · Esc close",
+            "{} = {} — ↑↓/kj select · PgUp/PgDn/Home/End · Enter rebind · r/Del reset · Esc close",
             row.action.slug(),
             row.binding.display(),
         ),
