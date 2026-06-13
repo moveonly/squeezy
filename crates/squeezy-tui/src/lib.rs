@@ -8799,25 +8799,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
-    // While the config screen is open, route all other keys to it.
-    if app.config_screen.is_some() {
-        let mut feedback = config_screen::ConfigFeedback::new();
-        let outcome = {
-            let state = app.config_screen.as_mut().expect("checked above");
-            config_screen::handle_key(state, agent, &mut feedback, key)
-        };
-        // Drain any MCP actions staged by `/mcp` key bindings before
-        // the next draw so the user sees status updates immediately
-        // rather than waiting for the next animation tick.
-        drain_mcp_actions(app, agent, &mut feedback);
-        if matches!(outcome, config_screen::KeyOutcome::Close) {
-            close_config_screen(app, agent, "config closed");
-        }
-        forward_config_feedback(app, feedback);
-        return Ok(false);
-    }
-
-    // `/statusline` overlay swallows all keys until closed.
+    // `/statusline` overlay swallows all keys until closed. Checked BEFORE the
+    // config screen so that when it was opened FROM config's `status_line` field
+    // (config stays open underneath), the overlay — not config — handles keys;
+    // closing it then returns to config.
     if app.status_line_setup.is_some() {
         let outcome = app
             .status_line_setup
@@ -8837,8 +8822,42 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             } => {
                 app.status_line_setup = None;
                 save_status_line(app, agent, items, use_colors, scope);
+                // If opened from the config screen (still open beneath), refresh
+                // its snapshot so the `status_line` row shows the saved value.
+                sync_config_status_line(app, agent);
             }
         }
+        return Ok(false);
+    }
+
+    // While the config screen is open, route all other keys to it.
+    if app.config_screen.is_some() {
+        let mut feedback = config_screen::ConfigFeedback::new();
+        let outcome = {
+            let state = app.config_screen.as_mut().expect("checked above");
+            config_screen::handle_key(state, agent, &mut feedback, key)
+        };
+        // Drain any MCP actions staged by `/mcp` key bindings before
+        // the next draw so the user sees status updates immediately
+        // rather than waiting for the next animation tick.
+        drain_mcp_actions(app, agent, &mut feedback);
+        match outcome {
+            config_screen::KeyOutcome::Close => {
+                close_config_screen(app, agent, "config closed");
+            }
+            // Editing the `status_line` field opens the rich `/statusline`
+            // builder over the (still-open) config screen — the same picker the
+            // `/statusline` command uses — instead of a raw text editor.
+            config_screen::KeyOutcome::OpenStatusLineSetup => {
+                app.status_line_setup = Some(status_line_setup::StatusLineSetupState::new(
+                    app.status_line_items.as_deref(),
+                    app.status_line_use_colors,
+                ));
+                app.status = "/statusline".to_string();
+            }
+            config_screen::KeyOutcome::KeepOpen => {}
+        }
+        forward_config_feedback(app, feedback);
         return Ok(false);
     }
 
@@ -20222,6 +20241,18 @@ fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: String) {
 /// Persist the picker's selection to `[tui].status_line` /
 /// `[tui].status_line_use_colors` in the chosen scope (user or project
 /// settings file) and apply it in-memory immediately.
+/// After the `/statusline` builder saves while the config screen is open beneath
+/// it (the field was edited from config), refresh the config screen's in-memory
+/// `effective` snapshot so its `status_line` row shows the just-saved value
+/// rather than the pre-edit list. No-op when config isn't open.
+fn sync_config_status_line(app: &mut TuiApp, agent: &Agent) {
+    if let Some(state) = app.config_screen.as_mut() {
+        let cfg = agent.config_snapshot();
+        state.effective.tui.status_line = cfg.tui.status_line.clone();
+        state.effective.tui.status_line_use_colors = cfg.tui.status_line_use_colors;
+    }
+}
+
 fn save_status_line(
     app: &mut TuiApp,
     agent: &mut Agent,

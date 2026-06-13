@@ -1407,11 +1407,14 @@ pub(crate) fn inheritance_label(_active: ConfigScope, source: FieldSource) -> St
 }
 
 /// Outcome of a single key press on the screen. `Close` tells the host to
-/// hide the screen; `KeepOpen` keeps it; `OpenedExternal` is reserved for
-/// future "open shell" actions.
+/// hide the screen; `KeepOpen` keeps it; `OpenStatusLineSetup` asks the host to
+/// open the rich `/statusline` builder over the (still-open) config screen, so
+/// editing the `status_line` field uses the same discoverable picker as the
+/// `/statusline` command instead of a raw comma-separated text editor.
 pub(crate) enum KeyOutcome {
     KeepOpen,
     Close,
+    OpenStatusLineSetup,
 }
 
 /// Action staged by the synchronous `/mcp` page key handler that the

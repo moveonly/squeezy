@@ -344,6 +344,12 @@ pub(crate) fn handle_key(
                 );
                 return KeyOutcome::KeepOpen;
             }
+            // The status-line field opens the rich `/statusline` builder (the same
+            // discoverable picker the command uses) instead of the raw
+            // comma-separated list editor — both entry points share one UI.
+            if field.toml_path == ["tui", "status_line"] {
+                return KeyOutcome::OpenStatusLineSetup;
+            }
             // The model field opens a registry-driven picker; the per-provider
             // routing model fields stay free-text (a short id/alias like
             // "haiku" — and the picker's cross-provider switch would be wrong
