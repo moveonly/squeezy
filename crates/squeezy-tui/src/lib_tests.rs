@@ -34308,6 +34308,92 @@ async fn condition_skip_drop_is_recoverable_via_queue_undo() {
 }
 
 #[tokio::test]
+async fn undo_of_a_condition_skip_restores_the_run_condition() {
+    // Undoing a condition-skip drop must bring the prompt back WITH its
+    // condition. Without the condition the restored prompt would default to
+    // `Always` and auto-run on the next drain — exactly what its `IfPrevFailed`
+    // gate was meant to prevent.
+    let mut app = queue_app(&["recover-on-failure", "park-me"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    for _ in 0..2 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("cycle front to if-failed");
+    }
+    let id_front = queue_id_at(&app, 0);
+    // Make the second prompt Manual so the pump parks after the drop.
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 1;
+    }
+    for _ in 0..5 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("cycle second to manual");
+    }
+    app.prompt_queue_overlay = None;
+    app.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+        succeeded: true,
+        had_edits: false,
+    });
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+    // The skip-drop pruned the condition entry.
+    assert!(app.prompt_queue_conditions.get(id_front).is_always());
+    // Undo restores the prompt AND its condition.
+    assert!(queue_undo(&mut app), "the dropped prompt is undoable");
+    let id_restored = queue_id_at(&app, 0);
+    assert_eq!(id_restored, id_front, "restored with its original id");
+    assert_eq!(
+        app.prompt_queue_conditions.get(id_restored),
+        queue_conditions::QueueCondition::IfPrevFailed,
+        "the restored prompt keeps its run-condition rather than defaulting to Always"
+    );
+    // A re-drain with the same success outcome skips it again instead of running.
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+    assert!(
+        app.turn_rx.is_none(),
+        "the restored conditional prompt is skipped again, not auto-run"
+    );
+}
+
+#[test]
+fn undo_of_a_manual_delete_restores_the_run_condition() {
+    // The manual-delete path is condition-lossy on undo the same way: once the
+    // deleted id's orphaned condition entry is pruned (the drain pump does this),
+    // undoing must still bring the condition back rather than defaulting it to
+    // `Always`.
+    let mut app = queue_app(&["conditional", "other"]);
+    let id0 = queue_id_at(&app, 0);
+    app.prompt_queue_conditions
+        .set(id0, queue_conditions::QueueCondition::IfPrevFailed);
+    assert!(queue_delete_by_id(&mut app, id0), "the prompt is deleted");
+    // Prune orphaned condition entries the way a drain tick would, so the map no
+    // longer holds the deleted id.
+    let live = queue_live_ids(&app);
+    app.prompt_queue_conditions.retain_live(&live);
+    assert!(
+        app.prompt_queue_conditions.get(id0).is_always(),
+        "the deleted id's condition entry was pruned"
+    );
+    assert!(queue_undo(&mut app), "the delete is undoable");
+    assert_eq!(
+        app.prompt_queue_conditions.get(id0),
+        queue_conditions::QueueCondition::IfPrevFailed,
+        "undo reattaches the deleted prompt's condition"
+    );
+}
+
+#[tokio::test]
 async fn queue_overlay_is_modal_and_swallows_global_keymap_actions() {
     // The prompt-queue overlay is documented as a modal that consumes keys before
     // the global keymap, but `dispatch_keymap_action` runs first. Without the modal

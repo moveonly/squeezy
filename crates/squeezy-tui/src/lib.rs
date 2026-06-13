@@ -17723,8 +17723,16 @@ const QUEUE_UNDO_CAP: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum QueueMutation {
     /// An item was deleted. Undo re-inserts `text` at `index` (clamped) with
-    /// its original `id` so its hit-target identity is restored too.
-    Deleted { index: usize, id: u64, text: String },
+    /// its original `id` so its hit-target identity is restored too, and
+    /// reattaches `condition` so a restored conditional prompt (e.g. an
+    /// `IfPrevFailed` recovery prompt) does not silently come back unconditional
+    /// and auto-run on the next drain.
+    Deleted {
+        index: usize,
+        id: u64,
+        text: String,
+        condition: queue_conditions::QueueCondition,
+    },
     /// An item was moved. Recorded by *stable id*, not absolute index, so a
     /// front-drain between the move and its undo cannot stale the record:
     /// `id` is the moved item; `prev` is the id that sat immediately before
@@ -17855,6 +17863,7 @@ fn queue_delete_by_id(app: &mut TuiApp, id: u64) -> bool {
     let Some(index) = queue_index_for_id(app, id) else {
         return false;
     };
+    let condition = app.prompt_queue_conditions.get(id);
     let text = app
         .prompt_queue
         .remove(index)
@@ -17868,6 +17877,7 @@ fn queue_delete_by_id(app: &mut TuiApp, id: u64) -> bool {
             index,
             id,
             text: text.clone(),
+            condition,
         },
     );
     clamp_queue_focus(app);
@@ -17914,11 +17924,19 @@ fn queue_undo(app: &mut TuiApp) -> bool {
         return false;
     };
     match &mutation {
-        QueueMutation::Deleted { index, id, text } => {
+        QueueMutation::Deleted {
+            index,
+            id,
+            text,
+            condition,
+        } => {
             let at = (*index).min(app.prompt_queue.len());
             app.prompt_queue.insert(at, text.clone());
             app.prompt_queue_ids.insert(at, *id);
             app.next_queue_id = app.next_queue_id.max(id + 1);
+            // Reattach the run-condition the delete pruned, so the restored item
+            // keeps its gate instead of defaulting to `Always`.
+            app.prompt_queue_conditions.set(*id, *condition);
             app.status = "undid delete".to_string();
         }
         QueueMutation::Reordered { id, prev } => {
@@ -24115,12 +24133,14 @@ fn reconcile_queue_after_dispatch(
             .remove(index)
             .or(cursor.id)
             .unwrap_or(next_id);
+        let condition = app.prompt_queue_conditions.get(id);
         push_queue_undo(
             app,
             QueueMutation::Deleted {
                 index,
                 id,
                 text: before[index].clone(),
+                condition,
             },
         );
         app.auto_drain_queue = false;
@@ -24489,7 +24509,16 @@ pub(crate) async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Age
                     // delete) — QueueUndo can then recover an `IfPrevFailed`
                     // recovery prompt that was dropped after a success, etc.
                     if let Some(id) = skipped_id {
-                        push_queue_undo(app, QueueMutation::Deleted { index, id, text });
+                        let condition = app.prompt_queue_conditions.get(id);
+                        push_queue_undo(
+                            app,
+                            QueueMutation::Deleted {
+                                index,
+                                id,
+                                text,
+                                condition,
+                            },
+                        );
                     }
                 }
                 // Same as the Run arm: the queue shrank under an open overlay, so
