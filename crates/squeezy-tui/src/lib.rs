@@ -25573,7 +25573,7 @@ fn main_transcript_layout(
         .saturating_add(input_height)
         .saturating_add(plan_indicator_height)
         .saturating_add(subagent_height)
-        .saturating_add(2);
+        .saturating_add(layout_fallback::STATUS_BLOCK_HEIGHT);
     let optional_height = area.height.saturating_sub(required_height);
     let attachment_height = attachment_panel_height(app, optional_height);
     // Adaptive Density (§12.4.1): the base call decides *whether* a
@@ -26082,7 +26082,7 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     if approval_height > 0 {
         constraints.push(Constraint::Length(approval_height));
     }
-    constraints.push(Constraint::Length(2));
+    constraints.push(Constraint::Length(layout_fallback::STATUS_BLOCK_HEIGHT));
     if subagent_height > 0 {
         constraints.push(Constraint::Length(subagent_height));
     }

@@ -96,6 +96,15 @@ pub(crate) const MIN_USABLE_HEIGHT: u16 = 4;
 /// layout. Mirrors [`MIN_USABLE_HEIGHT`] for the horizontal axis.
 pub(crate) const MIN_USABLE_WIDTH: u16 = 8;
 
+/// Rows the render path always reserves for the fixed status block, on top of
+/// the tracked main-column blocks. The renderer pushes a `Constraint::Length`
+/// of this height and `main_transcript_layout` accounts for it in its required
+/// reserve; [`reserved_height`] folds it in so the overflow check matches what
+/// the renderer actually places.
+///
+/// [`reserved_height`]: LayoutGeometry::reserved_height
+pub(crate) const STATUS_BLOCK_HEIGHT: u16 = 2;
+
 impl LayoutGeometry {
     /// Whether the area is large enough that a usable main-view layout is
     /// expected. On a tinier area the validity check is disabled — see
@@ -117,6 +126,9 @@ impl LayoutGeometry {
             .saturating_add(self.transcript_prompt_gap_height)
             .saturating_add(self.transcript_height)
             .saturating_add(self.input_height)
+            // Fixed status block the render path always pushes on top of the
+            // tracked blocks; counted so the overflow check matches the frame.
+            .saturating_add(STATUS_BLOCK_HEIGHT)
     }
 
     /// Whether this geometry would paint a degenerate (unusable) frame for its
@@ -128,7 +140,9 @@ impl LayoutGeometry {
     /// - **no composer** — `input_height == 0`. The composer is the one block
     ///   the main view always reserves; losing it leaves no way to type.
     /// - **overflow** — the reserved rows exceed the area height, so ratatui
-    ///   would clip the bottom block off the screen.
+    ///   would clip the bottom block off the screen. The reserved total
+    ///   includes the fixed status block the render path always places (see
+    ///   [`STATUS_BLOCK_HEIGHT`]), so the check matches the painted frame.
     ///
     /// On a sub-usable area nothing is degenerate: a 2-row terminal genuinely
     /// cannot host the split, and there is no better frame to restore, so the
