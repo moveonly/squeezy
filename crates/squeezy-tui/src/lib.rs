@@ -19572,6 +19572,23 @@ fn diff_detail_pane_entry_present(app: &TuiApp) -> bool {
         .any(|entry| entry.id == pane.entry_id)
 }
 
+/// Whether the overlay is currently wide enough to actually paint the detail
+/// pane (`split_overlay_content` succeeds at the live terminal size). A pinned
+/// pane is invisible below [`diff_detail_pane::MIN_SPLIT_WIDTH`], so the scroll
+/// controls must be no-ops there rather than scrolling a pane nobody can see.
+fn diff_detail_pane_splittable(app: &TuiApp) -> bool {
+    let (width, height) = app.off_frame_terminal_size();
+    let full_area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let (content_area, _) = transcript_overlay_content_and_status_areas(full_area);
+    let inner = transcript_overlay_inner(content_area);
+    diff_detail_pane::split_overlay_content(inner).is_some()
+}
+
 /// `(total_rows, viewport_h)` for the detail pane. Prefers the LAST PAINTED text
 /// rect (cached each frame in `diff_detail_pane_rect_cache`) so the scroll clamp
 /// uses the exact geometry the user is looking at; falls back to rebuilding the
@@ -23795,7 +23812,13 @@ fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     // keys move the PANE while the plain keys keep moving the transcript — so
     // the transcript context the spec wants preserved stays reachable. Matched
     // before the plain scroll arms (which ignore Shift) so the modifier wins.
-    if app.diff_detail_pane.is_some() && key.modifiers.contains(KeyModifiers::SHIFT) {
+    // Gated on the pane actually being splittable: below the min width the pane
+    // is invisible, so Shift+scroll falls through to the transcript instead of
+    // scrolling a pane nobody can see.
+    if app.diff_detail_pane.is_some()
+        && diff_detail_pane_splittable(app)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+    {
         match key.code {
             KeyCode::Up => {
                 scroll_diff_detail_pane(app, VerticalScrollDir::Up, 1);
@@ -35527,18 +35550,30 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             format!("· filter: {} (f) ", other.label(&tool_names))
         }
     };
+    let full_inner = transcript_overlay_inner(area);
     // The detail-pane hint only appears when an entry is focused (so `d` is
-    // actionable) or the pane is already open. A stale pinned id that has fallen
-    // out of the transcript is healed to a closed pane right here, so the render
-    // never paints an empty pane or a dangling hint.
-    let pane_open = app.diff_detail_pane.is_some() && diff_detail_pane_entry_present(app);
+    // actionable) or the pane is already open AND the overlay is wide enough to
+    // actually split. A stale pinned id that has fallen out of the transcript is
+    // healed to a closed pane right here, so the render never paints an empty
+    // pane or a dangling hint.
+    let pane_pinned = app.diff_detail_pane.is_some() && diff_detail_pane_entry_present(app);
+    let can_split = diff_detail_pane::split_overlay_content(full_inner).is_some();
+    let pane_open = pane_pinned && can_split;
     // The Pinned Compare View (§12.2.3) takes over the whole inner area when open,
     // so its hint takes precedence over the detail-pane hint.
     let compare_open = app.pinned_compare.is_some() && pinned_compare_entries_present(app);
+    let pane_hidden_notice = format!(
+        "· detail pane hidden — widen to {}+ columns ",
+        diff_detail_pane::MIN_SPLIT_WIDTH
+    );
     let detail_suffix = if compare_open {
         "· compare: Tab focus · x diff · Alt+t/Esc close "
     } else if pane_open {
         "· detail pane: d/Esc close · Shift+↑/↓ scroll "
+    } else if pane_pinned {
+        // The pane is pinned but the terminal is too narrow to split: say so
+        // instead of advertising scroll/close controls for an invisible pane.
+        pane_hidden_notice.as_str()
     } else if active_selected_entry(app).is_some() {
         "· d: detail pane · Alt+t: compare "
     } else {
@@ -35561,7 +35596,6 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 .add_modifier(Modifier::BOLD),
         ));
     frame.render_widget(block, area);
-    let full_inner = transcript_overlay_inner(area);
     // The Pinned Compare View (§12.2.3) owns the whole inner area when open: it
     // shows two equal panes (pinned vs. live, or two pinned entries) instead of
     // the single scrolling transcript. Render it and return — the detail pane and

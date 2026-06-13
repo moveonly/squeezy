@@ -2667,6 +2667,62 @@ async fn detail_pane_scrolls_with_shift_down_and_clamps_at_the_end() {
     );
 }
 
+#[test]
+fn detail_pane_hint_hidden_when_too_narrow_to_split() {
+    let mut app = app_with_focused_tool_entry();
+    // Pin the focused entry directly to simulate the pane being open when the
+    // terminal is then shrunk below the split width.
+    let focused_id = app.transcript[app.selected_entry.unwrap()].id;
+    app.diff_detail_pane = Some(diff_detail_pane::DiffDetailPaneState::new(focused_id));
+
+    // Too narrow to split: the scroll/close hint must NOT advertise an invisible
+    // pane, and no detail-pane hit-test rect is registered.
+    let narrow = render_to_string(&app, 50, 24);
+    assert!(
+        !narrow.contains("Shift"),
+        "the scroll hint is suppressed below the split width:\n{narrow}"
+    );
+    assert!(
+        app.diff_detail_pane_rect_cache.get().is_none(),
+        "no detail-pane rect is registered while hidden"
+    );
+
+    // Wide enough to split: the pane paints and the scroll/close hint returns.
+    let wide = render_to_string(&app, 160, 40);
+    assert!(
+        wide.contains("Shift"),
+        "the scroll hint returns once the pane can split:\n{wide}"
+    );
+    assert!(
+        wide.contains("Tool: shell"),
+        "the pane paints at a wide width:\n{wide}"
+    );
+}
+
+#[tokio::test]
+async fn detail_pane_shift_scroll_is_noop_when_too_narrow() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    let focused_id = app.transcript[app.selected_entry.unwrap()].id;
+    app.diff_detail_pane = Some(diff_detail_pane::DiffDetailPaneState::new(focused_id));
+    // Drive the off-frame geometry against a too-narrow viewport.
+    app.set_test_frame_size(50, 24);
+
+    let before = app.diff_detail_pane.expect("pane").scroll;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift+down at narrow width");
+    assert_eq!(
+        app.diff_detail_pane.expect("pane").scroll,
+        before,
+        "Shift+Down must not scroll an invisible pane"
+    );
+}
+
 #[tokio::test]
 async fn detail_pane_wheel_over_pane_scrolls_the_pane_not_the_transcript() {
     let mut app = app_with_focused_tool_entry();
