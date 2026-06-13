@@ -43521,7 +43521,7 @@ async fn hover_preview_double_click_caret_opens_detail() {
 async fn hover_preview_mouse_hover_reveals_after_intent_delay() {
     // The mouse path: a stable hover over an entry header (two Moves separated by
     // the hover-intent delay) reveals the preview. A real sleep crosses the
-    // 150ms HOVER_INTENT_MS threshold the recognizer keys on Instant::now().
+    // HOVER_INTENT_MS threshold the recognizer keys on Instant::now().
     let mut app = app_with_hover_preview(1);
     let entry_id = active_transcript_entries(&app)[1].id;
 
@@ -45133,9 +45133,10 @@ async fn annotation_survives_appends_and_resize() {
 // and handle_mouse() / handle_key() paths.
 // ===========================================================================
 
-/// The hover-affordance hint glyph (`›`) the §12.1.3 renderer paints on the
-/// revealed/focused card header. Mirrors `HOVER_HINT_GLYPH` in `lib.rs`.
-const HOVER_HINT_GLYPH_TEST: &str = "\u{203a}";
+/// The hover-affordance hint glyph (`⋯`) the §12.1.3 renderer paints on the
+/// revealed/focused card header — distinct from the `›` selection caret. Mirrors
+/// `HOVER_HINT_GLYPH` in `lib.rs`.
+const HOVER_HINT_GLYPH_TEST: &str = "\u{22ef}";
 
 /// A small main-transcript app whose first entry is visible at the top of the
 /// viewport, so a focus/hover reveal lands inside the painted window. Built like
@@ -48668,5 +48669,105 @@ async fn cmd_x_with_no_selection_is_inert_and_types_nothing() {
     assert_eq!(
         app.input, "hello",
         "⌘X with no selection must not type an 'x' or delete"
+    );
+}
+
+// ===========================================================================
+// Selection caret unification + per-turn cost ledger (hover-preview meta).
+// ===========================================================================
+
+/// The selected user prompt opens on the shared `›` caret (the bug fix); an
+/// unselected prompt keeps the plain indent so the `◑`/`◐` bullet never shifts.
+#[test]
+fn selected_user_prompt_opens_on_the_caret() {
+    let item = TranscriptItem::user("hello");
+    let unselected = format_user_prompt_entry(&item, false, Some(80));
+    let selected = format_user_prompt_entry(&item, true, Some(80));
+    assert_eq!(
+        unselected[0].spans[0].content.as_ref(),
+        "  ",
+        "an unselected prompt keeps the plain indent",
+    );
+    assert_eq!(
+        selected[0].spans[0].content.as_ref(),
+        "\u{203a} ",
+        "a selected prompt opens on the `›` caret",
+    );
+}
+
+/// `turn_for_entry_index` (the ledger key) is numerically identical to the turn the
+/// session timeline assigns each entry — the shared-rule guard that keeps a turn's
+/// cost keyed to the same ordinal it is displayed under.
+#[test]
+fn turn_for_entry_index_matches_timeline_turn_numbering() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::system("preamble")); // turn 0
+    app.push_transcript_item(TranscriptItem::user("q1")); // turn 1
+    app.push_transcript_item(TranscriptItem::assistant("a1"));
+    app.push_transcript_item(TranscriptItem::user("q2")); // turn 2
+    app.push_transcript_item(TranscriptItem::assistant("a2"));
+    let entries = active_transcript_entries(&app);
+    let sources = build_timeline_sources(entries);
+    for (i, source) in sources.iter().enumerate() {
+        assert_eq!(
+            turn_for_entry_index(entries, i),
+            source.turn,
+            "entry {i} keys to the same turn the timeline shows",
+        );
+    }
+    assert_eq!(
+        current_turn_of(entries),
+        sources.last().unwrap().turn,
+        "current_turn_of equals the last entry's turn",
+    );
+}
+
+/// Only a priced turn (some provider token/usd usage) is worth recording.
+#[test]
+fn turn_metrics_priced_requires_provider_usage() {
+    assert!(
+        !turn_metrics_priced(&squeezy_core::TurnMetrics::default()),
+        "an empty turn is not priced",
+    );
+    let mut metrics = squeezy_core::TurnMetrics::default();
+    metrics.provider.output_tokens = Some(5);
+    assert!(turn_metrics_priced(&metrics), "provider usage is priced");
+}
+
+/// The hover-preview meta line carries the entry's turn and a message's size, and —
+/// for a prompt or answer on the main conversation — that turn's cost from the
+/// ledger. Both the prompt and the answer of a turn read the same cost.
+#[test]
+fn entry_preview_meta_shows_turn_size_and_cost() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("hi")); // turn 1
+    app.push_transcript_item(TranscriptItem::assistant("there\nworld")); // 2 lines
+
+    let mut metrics = squeezy_core::TurnMetrics::default();
+    metrics.provider.estimated_usd_micros = Some(12_340); // $0.0123
+    metrics.provider.input_tokens = Some(1234); // 1.2k
+    metrics.provider.output_tokens = Some(340);
+    app.turn_costs.insert(1, metrics);
+
+    let entries = active_transcript_entries(&app);
+    let prompt_meta =
+        build_entry_preview_meta(&app, &entries[0], turn_for_entry_index(entries, 0)).unwrap();
+    let answer_meta =
+        build_entry_preview_meta(&app, &entries[1], turn_for_entry_index(entries, 1)).unwrap();
+
+    assert!(prompt_meta.contains("turn 1"), "{prompt_meta}");
+    assert!(
+        prompt_meta.contains("$0.0123"),
+        "the prompt shows its turn's cost: {prompt_meta}",
+    );
+    assert!(
+        answer_meta.contains("$0.0123")
+            && answer_meta.contains("1.2k in")
+            && answer_meta.contains("340 out"),
+        "the answer shows the same turn's cost, tokens compacted: {answer_meta}",
+    );
+    assert!(
+        answer_meta.contains("2 lines"),
+        "the answer shows its size: {answer_meta}",
     );
 }

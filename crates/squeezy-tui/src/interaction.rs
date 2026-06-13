@@ -888,7 +888,7 @@ pub(crate) const MULTI_CLICK_MS: u128 = 400;
 /// hover affordances reveal — debounces flicker as the pointer sweeps across
 /// targets. Only relevant when terminal mouse capture is on; otherwise no
 /// Move/Drag events arrive and the recognizer stays inert.
-pub(crate) const HOVER_INTENT_MS: u128 = 150;
+pub(crate) const HOVER_INTENT_MS: u128 = 90;
 
 /// Raw mouse-button phase fed to the recognizer, distilled from crossterm's
 /// `MouseEventKind` so this module needn't depend on crossterm directly. The

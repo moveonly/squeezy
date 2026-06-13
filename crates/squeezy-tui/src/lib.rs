@@ -12170,6 +12170,9 @@ fn session_timeline_jump_to_selected(app: &mut TuiApp, advance: bool) {
         app.needs_redraw = true;
     } else {
         app.status = "session timeline: could not jump".to_string();
+        // Repaint even on a failed jump: the click already moved the cursor, so
+        // the caret must follow it (keyboard nav always redraws).
+        app.needs_redraw = true;
     }
 }
 
@@ -13325,12 +13328,15 @@ fn build_entry_preview(
     entry_id: u64,
     source: hover_preview::PreviewSource,
 ) -> Option<hover_preview::HoverPreview> {
-    let entry = active_transcript_entries(app)
-        .iter()
-        .find(|entry| entry.id == entry_id)?;
+    let entries = active_transcript_entries(app);
+    let idx = entries.iter().position(|entry| entry.id == entry_id)?;
+    let entry = &entries[idx];
     let kind = hover_preview_kind(entry);
     let title = action_palette_title(entry, action_palette_unit_kind(entry));
     let body = hover_preview_body(entry);
+    // Meta line: the entry's turn, a message's size, and — for a prompt or answer
+    // on the main conversation — that turn's cost from the per-turn ledger.
+    let meta = build_entry_preview_meta(app, entry, turn_for_entry_index(entries, idx));
     // The primary (double-click / Enter) verb mirrors the keyboard `Ctrl+Enter`
     // detail path, but only when the entry has detail-worthy content; otherwise
     // the preview is read-only. `policy_for` keeps every destructive verb out of
@@ -13343,9 +13349,46 @@ fn build_entry_preview(
     } else {
         None
     };
-    Some(hover_preview::HoverPreview::new(
-        entry_id, kind, title, body, primary, source,
-    ))
+    let preview = hover_preview::HoverPreview::new(entry_id, kind, title, body, primary, source);
+    Some(match meta {
+        Some(meta) => preview.with_meta(meta),
+        None => preview,
+    })
+}
+
+/// The hover-preview meta line for `entry`: its turn, a message's line count, and
+/// — for a prompt or answer on the main conversation — that turn's cost from the
+/// per-turn ledger (`app.turn_costs`). The ledger is main-conversation scoped, so a
+/// subagent view shows turn/size only.
+fn build_entry_preview_meta(app: &TuiApp, entry: &TranscriptEntry, turn: u32) -> Option<String> {
+    let mut parts = vec![format!("turn {turn}")];
+    if let TranscriptEntryKind::Message(item) = &entry.kind {
+        let lines = item.content.lines().count().max(1);
+        parts.push(format!(
+            "{lines} {}",
+            if lines == 1 { "line" } else { "lines" }
+        ));
+    }
+    let is_message_turn = matches!(
+        &entry.kind,
+        TranscriptEntryKind::Message(item) if matches!(item.role, Role::User | Role::Assistant)
+    );
+    if is_message_turn
+        && active_subagent_record(app).is_none()
+        && let Some(metrics) = app.turn_costs.get(&turn)
+    {
+        let provider = &metrics.provider;
+        if let Some(usd) = provider.estimated_usd_micros {
+            parts.push(format_cost_usd(usd));
+        }
+        if let Some(input) = provider.input_tokens {
+            parts.push(format!("{} in", compact_token_count(input)));
+        }
+        if let Some(output) = provider.output_tokens {
+            parts.push(format!("{} out", compact_token_count(output)));
+        }
+    }
+    Some(parts.join(" \u{00b7} "))
 }
 
 /// `Alt+1`: toggle the Hover Preview popover (§12.1.4) for the currently focused
@@ -16727,17 +16770,50 @@ fn timeline_kind_of(entries: &[TranscriptEntry], index: usize) -> session_timeli
 /// (`None` today — transcript entries carry no per-event clock, the spec's
 /// "missing timestamps" case), and its deterministic label source. Pure over the
 /// entry slice.
+/// Whether a transcript entry opens a new turn — a `Role::User` prompt. The one
+/// rule shared by the session-timeline turn numbering and the per-turn cost
+/// ledger, so a turn is keyed identically wherever it is counted.
+fn entry_opens_turn(entry: &TranscriptEntry) -> bool {
+    matches!(&entry.kind, TranscriptEntryKind::Message(item) if item.role == Role::User)
+}
+
+/// The turn ordinal of the entry at `idx`, by the [`entry_opens_turn`] rule: each
+/// prompt opens a turn (first prompt = turn 1); entries before any prompt are
+/// turn 0. O(idx) — for single-entry lookups such as a hover preview.
+fn turn_for_entry_index(entries: &[TranscriptEntry], idx: usize) -> u32 {
+    entries
+        .iter()
+        .take(idx.saturating_add(1))
+        .filter(|entry| entry_opens_turn(entry))
+        .count() as u32
+}
+
+/// The current (latest) turn number for `entries` — the count of prompts so far,
+/// i.e. [`turn_for_entry_index`] of the last entry. Keys a just-finished turn's
+/// cost into the ledger.
+fn current_turn_of(entries: &[TranscriptEntry]) -> u32 {
+    entries
+        .iter()
+        .filter(|entry| entry_opens_turn(entry))
+        .count() as u32
+}
+
+/// Whether a turn's metrics carry priced provider usage worth recording — guards
+/// the ledger against empty help/local-tool turns that produce no cost.
+fn turn_metrics_priced(metrics: &squeezy_core::TurnMetrics) -> bool {
+    let p = &metrics.provider;
+    p.estimated_usd_micros.is_some() || p.input_tokens.is_some() || p.output_tokens.is_some()
+}
+
 fn build_timeline_sources(entries: &[TranscriptEntry]) -> Vec<session_timeline::TimelineSource> {
     let mut turn: u32 = 0;
     entries
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            // A user prompt starts a new turn; the first prompt makes turn 1.
-            // Entries before any prompt belong to turn 0 (a pre-prompt preamble),
-            // which is grouped honestly rather than forced into turn 1.
-            if matches!(&entry.kind, TranscriptEntryKind::Message(item) if item.role == Role::User)
-            {
+            // A user prompt opens a new turn (first prompt = turn 1); entries
+            // before any prompt are turn 0. The same rule the cost ledger keys on.
+            if entry_opens_turn(entry) {
                 turn = turn.saturating_add(1);
             }
             session_timeline::TimelineSource {
@@ -20969,6 +21045,7 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 app.toasts.clear();
                 app.cost = squeezy_core::CostSnapshot::default();
                 app.metrics = squeezy_core::TurnMetrics::default();
+                app.turn_costs.clear();
                 let note = match new_session {
                     Some(new_id) => format!(
                         "Conversation cleared. The previous conversation is saved and remains \
@@ -30822,7 +30899,10 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
         )))
         .map(|rect| rect.y)
         .unwrap_or(area.y);
-    let Some(rect) = hover_preview::popover_rect(area, anchor_row, preview.body.len()) else {
+    // The meta line (turn · size · cost), when present, occupies one content row
+    // beyond the body excerpt.
+    let body_rows = preview.body.len() + usize::from(preview.meta.is_some());
+    let Some(rect) = hover_preview::popover_rect(area, anchor_row, body_rows) else {
         return;
     };
 
@@ -30855,13 +30935,21 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
 
     // Title line: stronger (bold) foreground — the spec's "stronger foreground"
     // emphasis — naming WHICH unit is under the pointer.
-    let mut lines: Vec<Line> = Vec::with_capacity(preview.body.len() + 2);
+    let mut lines: Vec<Line> = Vec::with_capacity(preview.body.len() + 3);
     lines.push(Line::from(Span::styled(
         preview.title.clone(),
         Style::default()
             .fg(crate::render::theme::foreground())
             .add_modifier(Modifier::BOLD),
     )));
+    // Meta line (turn · size · cost): silver/secondary so it reads as structured
+    // context, distinct from the bold title above and the quiet excerpt below.
+    if let Some(meta) = preview.meta.as_ref() {
+        lines.push(Line::from(Span::styled(
+            meta.clone(),
+            Style::default().fg(crate::render::theme::secondary()),
+        )));
+    }
     // Body excerpt: quiet, so the peek reads as ambient context, not chrome.
     for body_line in &preview.body {
         lines.push(Line::from(Span::styled(
@@ -33294,11 +33382,12 @@ fn render_entry_rename_labels(
 
 /// A single fixed-width hint glyph painted at the right edge of the
 /// hover-revealed (or, when no motion is reported, keyboard-focused) transcript
-/// card's header row (§12.1.3). Restrained on purpose: one accent-bold cell that
-/// says "this card is interactive" without changing the row's height or width —
-/// the spec's "controls appear only when they add obvious value … without
+/// card's header row (§12.1.3). Restrained on purpose: one accent-bold "more" mark
+/// (`⋯`), deliberately distinct from the `›` selection caret so hover reads as
+/// "previewable" rather than "selected", without changing the row's height or
+/// width — the spec's "controls appear only when they add obvious value … without
 /// changing row heights".
-const HOVER_HINT_GLYPH: &str = "\u{203a}";
+const HOVER_HINT_GLYPH: &str = "\u{22ef}";
 
 /// Mouse Hover Intent (§12.1.3): paint the restrained hover affordance on the
 /// header row of the *revealed* entry — the one the pointer is dwelling on (after
@@ -33354,6 +33443,27 @@ fn render_hover_affordance(
             // The revealed entry has scrolled out of the window: paint nothing.
             return;
         }
+        // Always-present hover cue (§12.1.3): faintly tint the revealed entry's
+        // on-screen row span so a previewable row is unmistakable even when a badge
+        // occupies the corner glyph below. `set_style` recolors the background of
+        // the already-drawn cells without disturbing any glyph. The span runs to the
+        // next entry's header (or the transcript end), clamped to the painted window.
+        let span_end = entry_offsets.get(i + 1).copied().unwrap_or(total_rows);
+        let tint_top = header_row.max(top_row);
+        let tint_bottom = span_end.min(bottom_row);
+        if tint_bottom > tint_top {
+            let tint_rect = Rect {
+                x: text_area.x,
+                y: text_area.y + (tint_top - top_row) as u16,
+                width: text_area.width,
+                height: (tint_bottom - tint_top) as u16,
+            }
+            .intersection(text_area);
+            frame.buffer_mut().set_style(
+                tint_rect,
+                Style::default().bg(crate::render::theme::surface()),
+            );
+        }
         // The annotation marker (§12.2.5) already occupies the right edge of an
         // annotated entry's header and is the dominant affordance there, so skip
         // the hover hint to avoid stacking two glyphs in one cell.
@@ -33387,6 +33497,7 @@ fn render_hover_affordance(
                 HOVER_HINT_GLYPH,
                 Style::default()
                     .fg(crate::render::theme::accent())
+                    .bg(crate::render::theme::surface())
                     .add_modifier(Modifier::BOLD),
             ))),
             hint_rect,
@@ -36929,8 +37040,18 @@ fn format_transcript_entry_with_width(
     }
 }
 
+/// The selected-row caret (`›`) drawn in a transcript entry's left gutter, with a
+/// blank of equal width so toggling selection never shifts the row. The same `›`
+/// the timeline overlay and every picker use; routed through one constant so the
+/// scrollback glyph stays a single value. `rail::is_margin_span` matches this glyph
+/// so a selected row still threads the gutter.
+const SELECT_CARET: &str = "\u{203a} ";
+/// The three-cell variant for the assistant answer rows, whose status glyph lands
+/// in the rail's gutter column (see `assistant_line`).
+const SELECT_CARET_WIDE: &str = "\u{203a}  ";
+
 fn format_slash_echo_line(data: &SlashEchoData, selected: bool) -> Line<'static> {
-    let marker = if selected { "> " } else { "  " };
+    let marker = if selected { SELECT_CARET } else { "  " };
     let mut spans = vec![
         Span::raw(marker),
         Span::styled(
@@ -37608,7 +37729,7 @@ fn format_ansi_system_entry(
 
 fn format_user_prompt_entry(
     item: &TranscriptItem,
-    _selected: bool,
+    selected: bool,
     _width: Option<u16>,
 ) -> Vec<Line<'static>> {
     let bang_range = bang_command_marker_range(&item.content);
@@ -37665,7 +37786,15 @@ fn format_user_prompt_entry(
         } else {
             Span::raw("  ".to_string())
         };
-        let mut spans = vec![Span::raw(INDENT.to_string()), prefix_span];
+        // Selection shows the shared `›` caret in the left gutter on the first
+        // line only (matching every other entry); unselected keeps the indent, so
+        // the `◑`/`◐` bullet never shifts column.
+        let gutter = if selected && index == 0 {
+            SELECT_CARET
+        } else {
+            INDENT
+        };
+        let mut spans = vec![Span::raw(gutter.to_string()), prefix_span];
         push_styled_segments(&mut spans, line_text, line_start, style_text_at);
         lines.push(Line::from(spans));
         line_start = line_start.saturating_add(line_text.len()).saturating_add(1);
@@ -37768,7 +37897,7 @@ fn reasoning_block_lines_with_extras(
     transcript_shortcut: &str,
 ) -> Vec<Line<'static>> {
     let style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
-    let marker = if selected { "> " } else { "" };
+    let marker = if selected { SELECT_CARET } else { "" };
     let mut lines = Vec::new();
     let body_lines: Vec<&str> = text.lines().collect();
     if collapsed {
@@ -38309,7 +38438,7 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
         // Operational chrome: dim italic line with no bullet so it visually
         // sinks below content. Always one line; selection inherits the
         // standard marker so keyboard nav still highlights the entry.
-        let marker = if selected { "> " } else { "  " };
+        let marker = if selected { SELECT_CARET } else { "  " };
         let style = Style::default()
             .fg(palette::footer_fg())
             .add_modifier(Modifier::ITALIC);
@@ -38323,7 +38452,7 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
         // Subagent breadcrumb: a single magenta `◆` node (pairs with the
         // plan's hollow `◇`). The gutter pass turns the leading margin into
         // `├─`/`╰─` in magenta, so the whole node reads as delegated work.
-        let marker = if selected { "> " } else { "  " };
+        let marker = if selected { SELECT_CARET } else { "  " };
         let preview = compact_text(message, 200);
         return vec![Line::from(vec![
             Span::raw(marker),
@@ -38341,7 +38470,7 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
         // the same glyph as a settled step, because a note is just a quiet
         // settled node. The gutter pass turns the leading margin into `├─`/`╰─`
         // so it threads the rail without competing with the agent's own work.
-        let marker = if selected { "> " } else { "  " };
+        let marker = if selected { SELECT_CARET } else { "  " };
         let preview = compact_text(message, 200);
         return vec![Line::from(vec![
             Span::raw(marker),
@@ -38356,7 +38485,7 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
         // are flattened to spaces so the whole warning reads as one node, and the
         // gutter pass turns the leading margin into `├─`/`╰─` so it threads the
         // rail. Long provider warnings stay fully visible (wrap, not truncate).
-        let marker = if selected { "> " } else { "  " };
+        let marker = if selected { SELECT_CARET } else { "  " };
         let preview = message.replace('\n', " ");
         return vec![Line::from(vec![
             Span::raw(marker),
@@ -38373,7 +38502,7 @@ fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Li
         // Hard failure: a red `✖` node, distinct from a cyan `⚠` warning. The
         // full reason rides on the line (newlines flattened) and the gutter pass
         // threads it on the rail so a turn failure always shows what broke.
-        let marker = if selected { "> " } else { "  " };
+        let marker = if selected { SELECT_CARET } else { "  " };
         let preview = message.replace('\n', " ");
         return vec![Line::from(vec![
             Span::raw(marker),
@@ -38426,7 +38555,7 @@ fn action_line_styled(
     content: impl Into<String>,
     content_style: Style,
 ) -> Line<'static> {
-    let marker = if selected { "> " } else { "  " };
+    let marker = if selected { SELECT_CARET } else { "  " };
     let content = content.into();
     let spacer = if content.is_empty() { "" } else { " " };
     Line::from(vec![
@@ -38456,7 +38585,7 @@ fn action_line_spans(
     action_color: Color,
     content: Vec<Span<'static>>,
 ) -> Line<'static> {
-    let marker = if selected { "> " } else { "  " };
+    let marker = if selected { SELECT_CARET } else { "  " };
     let mut spans = vec![
         Span::raw(marker),
         Span::styled(
@@ -38480,7 +38609,7 @@ fn action_line_spans(
 }
 
 fn detail_line(selected: bool, color: Color, content: impl Into<String>) -> Line<'static> {
-    let marker = if selected { "> " } else { "  " };
+    let marker = if selected { SELECT_CARET } else { "  " };
     Line::from(vec![
         Span::raw(marker),
         Span::styled(
@@ -38576,7 +38705,7 @@ pub(crate) mod rail {
     /// it. Used by the live work cell, whose marker is its own spinner star, so
     /// `elbow + star` lands content in the same column as `elbow + marker`.
     fn is_margin_span(span: &Span<'_>) -> bool {
-        matches!(span.content.as_ref(), "  " | "> ")
+        matches!(span.content.as_ref(), "  " | "\u{203a} ")
     }
 
     pub(crate) fn set_elbow(line: &mut Line<'static>, is_last: bool, chrome: Color) {
@@ -38707,9 +38836,9 @@ fn assistant_line(
     content_style: Style,
 ) -> Line<'static> {
     // Three-cell margin lands the answer marker in the rail's gutter column so
-    // the `│` connector threads straight down into it; selection shows `>` at
+    // the `│` connector threads straight down into it; selection shows `›` at
     // the far left without disturbing that column.
-    let marker = if selected { ">  " } else { "   " };
+    let marker = if selected { SELECT_CARET_WIDE } else { "   " };
     let content = content.into();
     let spacer = if content.is_empty() { "" } else { " " };
     Line::from(vec![
@@ -38731,7 +38860,7 @@ fn assistant_text_lines(
     // to column 5; every wrapped/continuation row hangs to that same column so a
     // long answer reads as one indented block under the marker rather than
     // spilling back to column 0 when the terminal soft-wraps it.
-    let marker = if selected { ">  " } else { "   " };
+    let marker = if selected { SELECT_CARET_WIDE } else { "   " };
     let hang = "     ";
     let marker_head = |seg: Vec<Span<'static>>| {
         let mut spans = vec![Span::raw(marker), status.clone(), Span::raw(" ")];
@@ -42804,6 +42933,12 @@ fn turn_progress_segment(app: &TuiApp) -> Option<String> {
     }
 }
 
+/// Format a micro-USD amount as a compact dollar string (`$0.0123`), matching the
+/// live turn-cost segment's four-decimal precision.
+fn format_cost_usd(micros: u64) -> String {
+    format!("${:.4}", micros as f64 / 1_000_000.0)
+}
+
 fn compact_token_count(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.2}M", tokens as f64 / 1_000_000.0)
@@ -45025,6 +45160,11 @@ pub(crate) struct TuiApp {
     /// update proves the cap is enforceable again.
     pub(crate) cap_unenforceable: bool,
     pub(crate) metrics: squeezy_core::TurnMetrics,
+    /// Per-turn cost ledger for the main conversation, keyed by turn ordinal
+    /// (`current_turn_of`). Written when a turn completes or cancels with priced
+    /// usage; read by the hover preview to show a prompt/answer turn's cost.
+    /// Bounded by the session's turn count; cleared on `/clear`.
+    pub(crate) turn_costs: std::collections::BTreeMap<u32, squeezy_core::TurnMetrics>,
     pub(crate) turn_rx: Option<mpsc::Receiver<AgentEvent>>,
     pub(crate) job_rx: Option<broadcast::Receiver<JobEvent>>,
     pub(crate) jobs: BTreeMap<JobId, JobSnapshot>,
@@ -46360,6 +46500,7 @@ impl TuiApp {
             cost_cap_usd_micros: config.max_session_cost_usd_micros.filter(|cap| *cap > 0),
             cap_unenforceable: false,
             metrics: squeezy_core::TurnMetrics::default(),
+            turn_costs: std::collections::BTreeMap::new(),
             turn_rx: None,
             job_rx: None,
             jobs: BTreeMap::new(),

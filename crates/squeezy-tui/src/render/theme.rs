@@ -241,6 +241,12 @@ pub(crate) fn quiet() -> Color {
     color(token::UI_QUIET)
 }
 
+/// A faint elevated-surface background, one step lighter than the base. Used as the
+/// subtle row tint marking a hovered/previewable transcript row.
+pub(crate) fn surface() -> Color {
+    color(token::UI_SURFACE)
+}
+
 pub(crate) fn footer() -> Color {
     color(token::UI_FOOTER)
 }

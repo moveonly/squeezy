@@ -39,24 +39,22 @@ fn plain_text_rejoins_spans_losslessly() {
 
 #[test]
 fn strip_focus_caret_only_eats_a_true_column_zero_caret() {
-    // A focused header opens on the selection caret `"> "`; that chrome IS
+    // A focused header opens on the selection caret `"› "`; that chrome IS
     // stripped so copied text is focus-invariant.
-    assert_eq!(strip_focus_caret("> answer text"), "answer text");
-    assert_eq!(strip_focus_caret(">  answer text"), "answer text");
+    assert_eq!(strip_focus_caret("\u{203a} answer text"), "answer text");
+    assert_eq!(strip_focus_caret("\u{203a}  answer text"), "answer text");
 
-    // Load-bearing invariant guard (finding #18): content rows in this surface
-    // never begin with `"> "` at column 0 — body text and Markdown blockquotes
-    // hang under a whitespace indent. Pin that a blockquote rendered on an
-    // indented continuation row is NOT mutated, so a future renderer change that
-    // emitted `"> "` at column 0 would fail this loudly instead of silently
-    // eating the blockquote marker from copied text.
+    // The caret `›` is a distinct glyph from a Markdown blockquote's ASCII `>`, so a
+    // blockquote is never mistaken for the caret and survives the strip untouched —
+    // even at column 0, and under an indent.
     assert_eq!(
         strip_focus_caret("    > quoted body"),
         "    > quoted body",
         "an indented blockquote must survive the caret strip untouched"
     );
-    // A bare `>` with no following space (real content) is never eaten.
-    assert_eq!(strip_focus_caret(">no space"), ">no space");
+    assert_eq!(strip_focus_caret("> blockquote"), "> blockquote");
+    // A bare caret with no following space (real content) is never eaten.
+    assert_eq!(strip_focus_caret("\u{203a}no space"), "\u{203a}no space");
 }
 
 #[test]

@@ -12,10 +12,10 @@ use tokio::sync::broadcast;
 use crate::{
     PendingApproval, PendingMcpElicitation, PendingPlanChoice, PendingRequestUserInput,
     TranscriptItem, TuiApp, TurnVisualState, compaction_status_line, context_window_pct,
-    dedupe_assistant_repeated_tool_output, format_approval_status_line, format_error_status,
-    format_mcp_elicitation_status_line, format_mcp_status_snapshot, input, is_control_tool_name,
-    proposed_plan, refresh_search, render, strip_plan_handoff_prefix, tool_call_label,
-    tool_result_status_text,
+    current_turn_of, dedupe_assistant_repeated_tool_output, format_approval_status_line,
+    format_error_status, format_mcp_elicitation_status_line, format_mcp_status_snapshot, input,
+    is_control_tool_name, proposed_plan, refresh_search, render, strip_plan_handoff_prefix,
+    tool_call_label, tool_result_status_text, turn_metrics_priced,
 };
 
 pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
@@ -406,6 +406,14 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.cost = session_cost;
                     }
                     app.metrics = metrics;
+                    // Record this turn's priced cost into the per-turn ledger so a
+                    // settled prompt/answer can show its turn's spend on hover,
+                    // keyed by the same turn ordinal the session timeline uses. Only
+                    // priced turns are kept (help / local-tool turns produce none).
+                    if turn_metrics_priced(&app.metrics) {
+                        app.turn_costs
+                            .insert(current_turn_of(&app.transcript), app.metrics.clone());
+                    }
                     app.status = "ready".to_string();
                     app.turn_visual = TurnVisualState::Succeeded;
                     app.clear_active_tools();
