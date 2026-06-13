@@ -17389,20 +17389,28 @@ fn subagent_timeline_status(
 /// (§12.8.1) consumes. Pure data extraction: each row carries the subagent's id,
 /// role label, lifecycle status, latest activity line, elapsed seconds (computed
 /// from the record's monotonic `started` instant via a *saturating* duration — no
-/// back-dated subtraction that could underflow a fresh clock), tool count, and
-/// the child-reported cost in USD micros (the subagent provider's spend, falling
-/// back to the main provider's). A cap-rejected record has no start time and so
-/// reports `None` elapsed/cost — the spec's "accurate cost depends on child
-/// metrics" / cap-rejection cases, rendered honestly downstream.
+/// back-dated subtraction that could underflow a fresh clock — and frozen at the
+/// record's `ended` instant once it finishes, so a completed/failed subagent's
+/// run time stops climbing instead of drifting up forever), tool count, and the
+/// child-reported cost in USD micros (the subagent provider's spend, falling back
+/// to the main provider's). A cap-rejected record has no start time and so reports
+/// `None` elapsed/cost — the spec's "accurate cost depends on child metrics" /
+/// cap-rejection cases, rendered honestly downstream.
 fn build_subagent_timeline_sources(app: &TuiApp) -> Vec<subagent_timeline::SubagentTimelineSource> {
     let now = std::time::Instant::now();
     app.subagent_pane
         .records
         .iter()
         .map(|record| {
-            let elapsed_secs = record
-                .started
-                .map(|started| now.saturating_duration_since(started).as_secs());
+            // A finished record freezes at `ended - started`; a running one
+            // still counts up from `started` against `now`.
+            let elapsed_secs = record.started.map(|started| {
+                record
+                    .ended
+                    .unwrap_or(now)
+                    .saturating_duration_since(started)
+                    .as_secs()
+            });
             let (tool_count, cost_micros) = match record.metrics.as_ref() {
                 Some(metrics) => {
                     let tools = metrics.subagent_tool_calls.max(metrics.tool_calls);
@@ -45906,6 +45914,12 @@ struct SubagentRecord {
     /// that could underflow a fresh monotonic clock). A cap-rejected record sets
     /// `None`: it never ran, so it has no honest elapsed time.
     started: Option<std::time::Instant>,
+    /// When this subagent reached a terminal lifecycle (completed or failed),
+    /// stamped once at that transition. While `None` the timeline reads elapsed
+    /// as `now - started` (a live counter); once set, elapsed freezes at
+    /// `ended - started` so a finished subagent's run time stops drifting and an
+    /// all-finished session's timeline fingerprint stabilises.
+    ended: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -48419,8 +48433,10 @@ impl TuiApp {
             record.metrics = None;
             record.transcript = transcript;
             // Re-arm the clock for a restarted subagent so the timeline's
-            // elapsed column counts from this fresh run, not the prior one.
+            // elapsed column counts from this fresh run, not the prior one, and
+            // clear any frozen end so the live counter resumes.
             record.started = Some(std::time::Instant::now());
+            record.ended = None;
         } else {
             self.subagent_pane.records.push(SubagentRecord {
                 id,
@@ -48431,6 +48447,7 @@ impl TuiApp {
                 scroll: scroll::ScrollState::pinned(),
                 metrics: None,
                 started: Some(std::time::Instant::now()),
+                ended: None,
                 transcript,
             });
         }
@@ -48524,6 +48541,7 @@ impl TuiApp {
             record.lifecycle = SubagentLifecycle::Completed;
             record.latest = compact_text(&summary, 140);
             record.metrics = Some(metrics);
+            record.ended = Some(std::time::Instant::now());
             record.transcript.push(entry);
         }
     }
@@ -48547,6 +48565,7 @@ impl TuiApp {
             record.lifecycle = SubagentLifecycle::Failed;
             record.latest = compact_text(&error, 140);
             record.metrics = Some(metrics);
+            record.ended = Some(std::time::Instant::now());
             record.transcript.push(entry);
         }
     }
@@ -48585,6 +48604,7 @@ impl TuiApp {
             // A cap-rejected subagent never ran, so it has no honest start time:
             // the timeline renders its elapsed column as "-".
             started: None,
+            ended: None,
         });
         self.prune_subagent_records();
         self.clamp_subagent_selection();

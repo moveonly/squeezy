@@ -50104,3 +50104,66 @@ fn promote_while_idle_fills_composer_unchanged() {
         "an idle promote fills the composer with editable draft text",
     );
 }
+
+#[test]
+fn finished_subagent_elapsed_freezes_at_ended() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "work".to_string());
+    app.note_subagent_completed(
+        1,
+        "delegate".to_string(),
+        "done".to_string(),
+        TurnMetrics::default(),
+    );
+    // Pin a deterministic run window of exactly 5 s on the finished record.
+    let started = Instant::now() - Duration::from_secs(60);
+    let record = app
+        .subagent_pane
+        .records
+        .iter_mut()
+        .find(|r| r.id == 1)
+        .expect("record exists");
+    record.started = Some(started);
+    record.ended = Some(started + Duration::from_secs(5));
+
+    let first = build_subagent_timeline_sources(&app)[0].elapsed_secs;
+    assert_eq!(first, Some(5), "a finished subagent reads ended - started");
+    // A second build at a later wall-clock instant must not move it.
+    let second = build_subagent_timeline_sources(&app)[0].elapsed_secs;
+    assert_eq!(
+        second, first,
+        "a frozen elapsed does not drift across builds"
+    );
+}
+
+#[test]
+fn running_subagent_elapsed_still_advances() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "work".to_string());
+    // Still Running (no completion): no `ended`, so elapsed counts up from start.
+    let record = app
+        .subagent_pane
+        .records
+        .iter_mut()
+        .find(|r| r.id == 1)
+        .expect("record exists");
+    assert!(record.ended.is_none(), "a running record has no end stamp");
+    record.started = Some(Instant::now() - Duration::from_secs(3));
+
+    let elapsed = build_subagent_timeline_sources(&app)[0].elapsed_secs;
+    assert!(
+        elapsed.is_some_and(|secs| secs >= 3),
+        "a running subagent's elapsed counts up from started: {elapsed:?}",
+    );
+}
+
+#[test]
+fn rejected_subagent_reports_no_elapsed() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_rejected("delegate".to_string(), "concurrency cap".to_string(), 3, 3);
+    let elapsed = build_subagent_timeline_sources(&app)[0].elapsed_secs;
+    assert_eq!(
+        elapsed, None,
+        "a cap-rejected subagent has no honest elapsed"
+    );
+}
