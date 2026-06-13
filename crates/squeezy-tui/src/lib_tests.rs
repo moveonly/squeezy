@@ -48783,3 +48783,142 @@ async fn cmd_a_on_empty_composer_is_a_noop() {
         "⌘A on an empty composer selects nothing",
     );
 }
+
+// =====================================================================
+// Screen-buffer selection (status line / chrome): a drag outside the
+// transcript + composer text areas selects painted cells and copies them.
+// =====================================================================
+
+#[test]
+fn cell_is_chrome_true_without_caches_false_inside_transcript() {
+    // No frame painted yet → no caches → treat any cell as chrome (a drag can
+    // still select).
+    let mut app = test_app(SessionMode::Build);
+    assert!(
+        cell_is_chrome(&app, 5, 5),
+        "with no painted caches, a cell defaults to chrome",
+    );
+
+    // After a frame paints the transcript, a cell INSIDE the transcript text
+    // area is NOT chrome (a drag there drives the transcript selection).
+    app.push_transcript_item(TranscriptItem::assistant("inside the transcript body"));
+    let buffer = render_full_to_buffer(&app, 60, 24);
+    let (tx, ty) = find_text_cell(&buffer, "inside the transcript").expect("transcript painted");
+    assert!(
+        !cell_is_chrome(&app, tx, ty),
+        "a cell inside the transcript text area is not chrome",
+    );
+}
+
+#[test]
+fn screen_selection_extracts_painted_text_from_the_snapshot_and_copies() {
+    // The extraction path is surface-agnostic: it reads whatever glyphs are
+    // painted in the snapshot under the selection. Drive it over known painted
+    // text and confirm the copied string + clipboard delivery.
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::assistant("EXTRACTME marker tail"));
+    let buffer = render_full_to_buffer(&app, 60, 24);
+    let (x, y) = find_text_cell(&buffer, "EXTRACTME").expect("painted");
+
+    // Span exactly "EXTRACTME" (9 cells → cursor inclusive at x+8).
+    let mut sel = screen_selection::ScreenSelection::at(x, y);
+    sel.cursor_col = x + 8;
+    app.screen_selection = Some(sel);
+    // A render with the selection live takes the snapshot the copy reads.
+    let _ = render_full_to_buffer(&app, 60, 24);
+
+    assert!(
+        copy_screen_selection(&mut app),
+        "non-empty screen selection copies"
+    );
+    let sent = writes.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1, "exactly one clipboard write");
+    assert!(
+        sent[0].contains("EXTRACTME"),
+        "the copied screen text contains the painted glyphs, got {:?}",
+        sent[0],
+    );
+}
+
+#[test]
+fn screen_selection_highlight_reverses_the_selected_cells() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("highlight these cells"));
+    let buffer = render_full_to_buffer(&app, 60, 24);
+    let (x, y) = find_text_cell(&buffer, "highlight").expect("painted");
+
+    let mut sel = screen_selection::ScreenSelection::at(x, y);
+    sel.cursor_col = x + 4;
+    app.screen_selection = Some(sel);
+    let painted = render_full_to_buffer(&app, 60, 24);
+
+    for col in x..=x + 4 {
+        assert!(
+            painted[(col, y)].modifier.contains(Modifier::REVERSED),
+            "selected cell ({col},{y}) is REVERSED-highlighted",
+        );
+    }
+}
+
+#[tokio::test]
+async fn esc_clears_a_screen_selection() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.screen_selection = Some(screen_selection::ScreenSelection::at(3, 1));
+    app.screen_selection.as_mut().unwrap().cursor_col = 9;
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+
+    assert!(
+        app.screen_selection.is_none(),
+        "Esc clears the screen selection"
+    );
+    assert!(app.status.contains("selection cleared"), "{}", app.status);
+}
+
+#[test]
+fn scrolling_clears_a_screen_selection() {
+    let mut app = test_app(SessionMode::Build);
+    for i in 0..40 {
+        app.push_transcript_item(TranscriptItem::user(format!("line {i}")));
+    }
+    app.screen_selection = Some(screen_selection::ScreenSelection::at(2, 2));
+    scroll_transcript_up(&mut app, 3);
+    assert!(
+        app.screen_selection.is_none(),
+        "scrolling invalidates the absolute-coord screen selection",
+    );
+}
+
+#[test]
+fn transcript_press_clears_a_stale_screen_selection() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("press inside this body"));
+    let buffer = render_full_to_buffer(&app, 60, 24);
+    let (tx, ty) = find_text_cell(&buffer, "press inside").expect("painted");
+
+    app.screen_selection = Some(screen_selection::ScreenSelection::at(0, 0));
+    handle_mouse(&mut app, left_down(tx, ty, KeyModifiers::NONE));
+
+    assert!(
+        app.screen_selection.is_none(),
+        "a transcript press drops the live screen selection (mutual exclusion)",
+    );
+    assert!(
+        app.selection.is_some(),
+        "the transcript selection armed instead"
+    );
+}

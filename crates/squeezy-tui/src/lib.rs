@@ -158,6 +158,7 @@ mod render_health;
 mod resume_picker;
 mod review_board;
 mod scratchpad;
+mod screen_selection;
 mod scroll;
 mod search;
 mod selection;
@@ -2598,6 +2599,9 @@ async fn handle_input_event(
             app.dogfood_metrics.record_resize_input(dogfood_now_ms());
             app.pending_resize = true;
             app.needs_redraw = true;
+            // A screen-buffer selection's absolute cell coords are stale after a
+            // reflow; drop it on resize.
+            clear_screen_selection(app);
             // A live (following) view re-pins to the tail; a scrolled-up view
             // keeps its logical anchor (Focus-Preserving Resize, §12.4.3): the
             // entry at the top before the reflow is re-pinned to the top after
@@ -3982,10 +3986,10 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 if let Some(pos) = composer_char_from_mouse(app, mouse.column, mouse.row) {
                     // Mutual exclusion: starting a composer selection drops any
-                    // live transcript selection so the two never both arm (the
-                    // transcript Up arm above only fires on a Main selection,
-                    // this one only on an input selection).
+                    // live transcript OR screen-buffer selection so only one is
+                    // ever armed (the Up arms each fire on their own surface).
                     app.selection = None;
+                    clear_screen_selection(app);
                     // Multi-click (mirrors the transcript's
                     // `handle_main_selection_press`): single = caret + drag
                     // anchor, double = word under the cursor, triple = the whole
@@ -4048,6 +4052,52 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                     input::clear_input_selection(app);
                 } else if app.copy_on_select {
                     let _ = copy_input_selection(app);
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
+
+    // Screen-buffer selection (the "select anything" fallback): a drag that
+    // starts on CHROME — outside the transcript text area and the composer —
+    // selects the painted cells (status line, footer, breadcrumbs, banners) and
+    // copies them. This runs only AFTER every click-target, transcript, and
+    // composer arm declined the event, so it never steals a click (those return
+    // true first). Copy is via copy-on-select on release (drag → ⌘V), the
+    // zero-config path. Held in absolute screen coords, so scroll/resize drop it.
+    if app.transcript_overlay.is_none() && app.config_screen.is_none() {
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                if cell_is_chrome(app, mouse.column, mouse.row) =>
+            {
+                // Mutual exclusion with the transcript/composer selections.
+                app.selection = None;
+                input::clear_input_selection(app);
+                app.screen_selection = Some(screen_selection::ScreenSelection::at(
+                    mouse.column,
+                    mouse.row,
+                ));
+                app.needs_redraw = true;
+                return true;
+            }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                if let Some(sel) = app.screen_selection.as_mut() {
+                    sel.cursor_col = mouse.column;
+                    sel.cursor_row = mouse.row;
+                    app.needs_redraw = true;
+                    return true;
+                }
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                if app.screen_selection.is_some() =>
+            {
+                // A real drag auto-copies on release (keeping the highlight); a
+                // bare click on chrome leaves a collapsed selection — clear it.
+                if app.screen_selection.is_some_and(|s| s.is_empty()) {
+                    clear_screen_selection(app);
+                } else if app.copy_on_select {
+                    let _ = copy_screen_selection(app);
                 }
                 return true;
             }
@@ -4481,9 +4531,10 @@ fn handle_main_selection_press(
     app.last_click = Some((now, column, row, multiplicity));
 
     // Mutual exclusion: starting a transcript selection drops any live composer
-    // selection so the two surfaces never both arm (mirror of the composer
-    // Down arm clearing `app.selection`).
+    // OR screen-buffer selection so only one is ever armed (mirror of the
+    // composer/screen Down arms clearing `app.selection`).
     input::clear_input_selection(app);
+    clear_screen_selection(app);
 
     // Shift+click extends the current selection's cursor (when one exists on
     // this surface).
@@ -4633,15 +4684,117 @@ fn copy_active_selection(app: &mut TuiApp) -> bool {
 /// clear via [`clear_all_text_selections`], copy-on-release keeps the highlight
 /// for quote/add-to-set follow-ups).
 fn copy_any_active_selection(app: &mut TuiApp) -> bool {
-    copy_input_selection(app) || copy_active_selection(app)
+    // Precedence matches the mutually-exclusive arming order: a live screen
+    // (chrome) selection, else the composer, else the transcript.
+    copy_screen_selection(app) || copy_input_selection(app) || copy_active_selection(app)
 }
 
-/// Clear BOTH the transcript and composer selections. The explicit copy chords
-/// (`⌘C`/`Ctrl+Shift+C`/`Ctrl+C`) clear-on-copy, and since either surface may
-/// have held the copied range, both are dropped to leave a clean slate.
+/// Copy the live screen-buffer (chrome) selection by reading the painted glyphs
+/// out of the snapshot taken in the render highlight pass. Returns `true` when
+/// there was non-empty text to copy. Does NOT clear the selection.
+fn copy_screen_selection(app: &mut TuiApp) -> bool {
+    let Some(sel) = app.screen_selection else {
+        return false;
+    };
+    if sel.is_empty() {
+        return false;
+    }
+    // Borrow the snapshot only long enough to extract; deliver_copy needs &mut.
+    let text = {
+        let snap = app.screen_selection_snapshot.borrow();
+        let Some(buffer) = snap.as_ref() else {
+            return false; // no frame snapshotted yet (render hasn't run since arm)
+        };
+        extract_screen_buffer_text(buffer, &sel)
+    };
+    if text.is_empty() {
+        return false;
+    }
+    deliver_copy(app, &text, "selection");
+    true
+}
+
+/// Extract clean text from a rendered-buffer snapshot within a screen selection:
+/// linear (text-style) span, walking each row by display width so wide-glyph
+/// continuation cells are skipped, trimming trailing whitespace per row and
+/// joining rows with newlines.
+fn extract_screen_buffer_text(
+    buffer: &ratatui::buffer::Buffer,
+    sel: &screen_selection::ScreenSelection,
+) -> String {
+    let width = buffer.area.width;
+    let height = buffer.area.height;
+    let mut rows: Vec<String> = Vec::new();
+    for row in sel.row_span() {
+        if row >= height {
+            break;
+        }
+        let Some(span) = sel.col_span_for_row(row, width) else {
+            continue;
+        };
+        let mut line = String::new();
+        let mut col = span.start;
+        while col < span.end {
+            let sym = buffer[(col, row)].symbol();
+            if sym.is_empty() {
+                // ratatui wide-glyph continuation cell — already consumed.
+                col += 1;
+                continue;
+            }
+            line.push_str(sym);
+            col += UnicodeWidthStr::width(sym).max(1) as u16;
+        }
+        rows.push(line.trim_end().to_string());
+    }
+    while rows.last().is_some_and(|l| l.is_empty()) {
+        rows.pop();
+    }
+    rows.join("\n")
+}
+
+/// Clear BOTH the transcript and composer selections AND the screen-buffer
+/// selection (dropping its snapshot). The explicit copy chords
+/// (`⌘C`/`Ctrl+Shift+C`/`Ctrl+C`) clear-on-copy, and since any of the three
+/// surfaces may have held the copied range, all are dropped to leave a clean
+/// slate.
 fn clear_all_text_selections(app: &mut TuiApp) {
     app.selection = None;
     input::clear_input_selection(app);
+    clear_screen_selection(app);
+}
+
+/// Drop the screen-buffer selection and its buffer snapshot. Cheap no-op when
+/// there is none, so callers on hot paths (scroll, press) can call it
+/// unconditionally.
+fn clear_screen_selection(app: &mut TuiApp) {
+    app.screen_selection = None;
+    app.screen_selection_snapshot.replace(None);
+}
+
+/// True when `(col, row)` is on CHROME — outside both the transcript text area
+/// and the composer text area — so a drag there should arm the screen-buffer
+/// selection rather than a per-surface one. Used as the gate on the screen
+/// selection fallback. If neither cache is populated yet (nothing painted), the
+/// cell is treated as chrome.
+fn cell_is_chrome(app: &TuiApp, col: u16, row: u16) -> bool {
+    let in_rect = |r: Rect| {
+        col >= r.x
+            && col < r.x.saturating_add(r.width)
+            && row >= r.y
+            && row < r.y.saturating_add(r.height)
+    };
+    if app
+        .main_text_area_cache
+        .get()
+        .is_some_and(|c| in_rect(c.text_area))
+    {
+        return false;
+    }
+    // `input_area_cache` holds a non-Copy `InputAreaCache`; take + restore.
+    let composer = app.input_area_cache.take();
+    let in_composer = composer.as_ref().is_some_and(|c| in_rect(c.area));
+    app.input_area_cache.set(composer);
+    !in_composer
 }
 
 /// True for the system-convention copy chords: `⌘C` (kitty-protocol
@@ -8213,7 +8366,8 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     if key.code == KeyCode::Esc
         && (app.selection.is_some()
             || !app.selection_set.is_empty()
-            || app.input_selection.is_some())
+            || app.input_selection.is_some()
+            || app.screen_selection.is_some())
         && app.config_screen.is_none()
         && app.transcript_overlay.is_none()
         && app.status_line_setup.is_none()
@@ -8223,10 +8377,11 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     {
         app.selection = None;
         app.selection_set.clear();
-        // The composer selection is part of "an active selection" too, so Esc
-        // dismisses it in the same keystroke (mirrors the mutual-exclusion
-        // clears on press).
+        // The composer + screen-buffer selections are part of "an active
+        // selection" too, so Esc dismisses them in the same keystroke (mirrors
+        // the mutual-exclusion clears on press).
         input::clear_input_selection(app);
+        clear_screen_selection(app);
         app.status = "selection cleared".to_string();
         return Ok(false);
     }
@@ -19521,12 +19676,16 @@ fn scroll_transcript_up(app: &mut TuiApp, lines: usize) {
     // the user's wheel/page input. `cancel_main_scroll_anim` makes the painted
     // position jump straight to the (about-to-change) logical state.
     cancel_main_scroll_anim(app);
+    // A screen-buffer selection is in absolute screen coords; scrolling reflows
+    // what's under those cells, so drop it.
+    clear_screen_selection(app);
     let (line_count, viewport_h) = active_transcript_geometry(app);
     active_transcript_scroll_mut(app).scroll_by(lines as isize, line_count, viewport_h);
 }
 
 fn scroll_transcript_down(app: &mut TuiApp, lines: usize) {
     cancel_main_scroll_anim(app);
+    clear_screen_selection(app);
     let (line_count, viewport_h) = active_transcript_geometry(app);
     active_transcript_scroll_mut(app).scroll_by(-(lines as isize), line_count, viewport_h);
 }
@@ -25233,6 +25392,41 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     // overlaps in the top-right, like the toast stack.
     if app.show_render_metrics {
         render_metrics_hud(frame, frame.area(), app);
+    }
+    // Screen-buffer selection highlight draws LAST, after every surface + the
+    // HUD, so it can invert chrome cells anywhere on screen. It also snapshots
+    // the painted (pre-highlight) buffer so a copy reads the real glyphs.
+    if let Some(sel) = app.screen_selection {
+        paint_screen_selection_highlight(frame, app, sel);
+    }
+}
+
+/// Snapshot the painted buffer for text extraction, then invert the selected
+/// cells (`Modifier::REVERSED`). Runs after all surfaces have painted, only
+/// while a `screen_selection` is live. The snapshot is taken BEFORE the invert
+/// so the stored glyphs are the clean painted text.
+fn paint_screen_selection_highlight(
+    frame: &mut Frame<'_>,
+    app: &TuiApp,
+    sel: screen_selection::ScreenSelection,
+) {
+    let area = frame.area();
+    // Refresh the snapshot each frame the selection survives (cheap; only while
+    // a selection is held) so extraction always matches what is on screen.
+    app.screen_selection_snapshot
+        .replace(Some(frame.buffer_mut().clone()));
+    let buf = frame.buffer_mut();
+    for row in sel.row_span() {
+        if row >= area.height {
+            break;
+        }
+        if let Some(span) = sel.col_span_for_row(row, area.width) {
+            for col in span {
+                buf[(col, row)]
+                    .modifier
+                    .insert(ratatui::style::Modifier::REVERSED);
+            }
+        }
     }
 }
 
@@ -44953,6 +45147,16 @@ pub(crate) struct TuiApp {
     /// active surface's wrapped `Vec<Line>`. Drives copy when present and the
     /// highlight in both renders.
     pub(crate) selection: Option<selection::Selection>,
+    /// Screen-buffer-level selection over painted cells, for CHROME text the
+    /// per-surface transcript/composer selections don't cover (status line,
+    /// footer, breadcrumbs, banners). Armed by a drag that begins outside both
+    /// text areas. Mutually exclusive with `selection`/`input_selection`. Held
+    /// in absolute screen coords, so scroll/resize invalidate it.
+    pub(crate) screen_selection: Option<screen_selection::ScreenSelection>,
+    /// Snapshot of the rendered buffer taken in the highlight pass while a
+    /// `screen_selection` is live, so copy can read the painted glyphs. Refreshed
+    /// each frame the selection survives; dropped when it clears.
+    pub(crate) screen_selection_snapshot: std::cell::RefCell<Option<ratatui::buffer::Buffer>>,
     /// Multi-Cursor-Like Transcript Selection (§12.1.6): the committed
     /// *disjoint* extra ranges, in addition to the live one in
     /// [`TuiApp::selection`]. `Alt+d` commits the live range here (and a
@@ -46468,6 +46672,8 @@ impl TuiApp {
             main_text_area_cache: std::cell::Cell::new(None),
             last_frame_size: std::cell::Cell::new(None),
             selection: None,
+            screen_selection: None,
+            screen_selection_snapshot: std::cell::RefCell::new(None),
             selection_set: multi_selection::SelectionSet::new(),
             search: None,
             jump_marks: jump_marks::JumpMarkStack::new(),
