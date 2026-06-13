@@ -10038,8 +10038,8 @@ pub struct TuiConfig {
     /// slugs and unparseable specs are surfaced by the TUI when
     /// `/keymap` is invoked.
     pub keymap: BTreeMap<String, String>,
-    /// Whether `git diff`-style output from shell tools renders in full
-    /// (default) or stays under the collapsed-card head/tail preview cap.
+    /// Whether `git diff`-style output from shell tools stays under the
+    /// collapsed-card head/tail preview cap (default) or renders in full.
     pub shell_diff_inline: ShellDiffInline,
 }
 

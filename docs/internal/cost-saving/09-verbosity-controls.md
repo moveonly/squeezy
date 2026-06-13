@@ -166,8 +166,8 @@ and on every settings hot-reload.
 ```rust
 // crates/squeezy-tui/src/lib.rs:146-167
 /// Process-wide override for `tui.shell_diff_inline`, pinned by the TuiApp
-/// at startup and re-applied on settings hot-reload. Encoded as `0 = Full
-/// (default)`, `1 = Folded`. A static lets the deeply-nested render path
+/// at startup and re-applied on settings hot-reload. Encoded as `0 = Folded
+/// (default)`, `1 = Full`. A static lets the deeply-nested render path
 /// consult the setting without threading it through every formatter, the
 /// same pattern the palette uses for tone/accent overrides.
 static SHELL_DIFF_INLINE_OVERRIDE: std::sync::atomic::AtomicU8 =
@@ -175,8 +175,8 @@ static SHELL_DIFF_INLINE_OVERRIDE: std::sync::atomic::AtomicU8 =
 
 fn shell_diff_inline_setting() -> ShellDiffInline {
     match SHELL_DIFF_INLINE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => ShellDiffInline::Folded,
-        _ => ShellDiffInline::Full,
+        1 => ShellDiffInline::Full,
+        _ => ShellDiffInline::Folded,
     }
 }
 ```
@@ -344,11 +344,14 @@ a `…` ellipsis sandwiched between three head and three tail lines.
 The full output stays on disk in the session log; if the model needs
 it later, `read_tool_output` returns it without re-streaming.
 
-If the user runs `git diff` during this session, the unified-diff
-detection in `shell_output_is_unified_diff` plus the default
-`ShellDiffInline::Full` causes the diff to render in full, bypassing
-the preview cap entirely — Compact for arbitrary noisy stdout, Full
-for the one stream where compaction defeats the purpose.
+If the agent runs `git diff` during this session, the unified-diff
+detection in `shell_output_is_unified_diff` fires, but under the default
+`ShellDiffInline::Folded` the diff stays on the same Compact head/tail
+preview cap as any other shell output — a diff the agent ran to inspect
+the tree is incidental noise, not a file edit the user must review (the
+user can still expand the card). Setting `ShellDiffInline::Full` opts
+into rendering such diffs in full, bypassing the preview cap. Edits the
+agent makes (`apply_patch`/`write_file`) bypass the cap regardless.
 
 ## Edge cases & limits
 
