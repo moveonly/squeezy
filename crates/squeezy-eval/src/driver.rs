@@ -121,8 +121,18 @@ pub async fn run_scenario(
     }
 
     // 1. Provision the workspace.
+    //
+    // Startup-phase timing (squeezy-perf): every step between here and
+    // the first `start_turn` is "cold start" — work the user waits
+    // through before they can prompt. We stamp each phase with an
+    // `Instant` and emit `PerfSample` events into the trace so a
+    // post-hoc analysis can split a run's wall-clock into a startup
+    // segment vs a prompting segment without guessing from the first
+    // event timestamp.
     let scratch_root = options.out_root.join("_workspaces");
+    let t_workspace = Instant::now();
     let workspace = workspace::provision(&scenario.workspace, &scratch_root)?;
+    let workspace_provision_ms = t_workspace.elapsed().as_millis() as u64;
 
     // 1b. Materialize any fixture skills under the snapshot's
     // `.squeezy/skills/<dir>/SKILL.md`. Runs before AppConfig builds
@@ -142,22 +152,57 @@ pub async fn run_scenario(
         .provider
         .as_deref()
         .filter(|name| !name.eq_ignore_ascii_case("mock"));
+    let t_config = Instant::now();
     let mut config = match provider_override {
         Some(provider) => AppConfig::from_env_and_settings_with_provider(provider)
             .map_err(|err| EvalError::Config(format!("load AppConfig: {err}")))?,
         None => AppConfig::from_env_and_settings()
             .map_err(|err| EvalError::Config(format!("load AppConfig: {err}")))?,
     };
+    let config_load_ms = t_config.elapsed().as_millis() as u64;
     disable_product_telemetry(&mut config);
     apply_overlay(&mut config, &scenario.squeezy, &workspace.path)?;
     apply_mcp_overlay(&mut config, &scenario.mcp)?;
+    let t_provider = Instant::now();
     let provider = if scenario.squeezy.provider.as_deref() == Some("mock") {
         crate::mock_provider::MockProvider::shared(scenario.mock.clone())
     } else {
         provider_from_config(&config.provider)
             .map_err(|err| EvalError::Provider(provider_hint(err)))?
     };
+    let provider_init_ms = t_provider.elapsed().as_millis() as u64;
+    let t_agent = Instant::now();
     let agent = Agent::new(config.clone(), provider.clone());
+    let agent_new_ms = t_agent.elapsed().as_millis() as u64;
+    // Emit the startup-phase breakdown into the trace. These four
+    // `PerfSample`s sum to the cold-start cost the user waits through
+    // before the first prompt can be dispatched (workspace snapshot +
+    // settings/env config load + provider/HTTP client construction +
+    // `Agent::new`, which opens the session/graph stores and spawns the
+    // deferred graph-cache task). Recorded before any turn so the
+    // analysis can subtract them from the run's wall-clock.
+    for (label, ms) in [
+        ("startup_workspace_provision", workspace_provision_ms),
+        ("startup_config_load", config_load_ms),
+        ("startup_provider_init", provider_init_ms),
+        ("startup_agent_new", agent_new_ms),
+    ] {
+        capture.record(
+            None,
+            EvalEventKind::PerfSample {
+                label: label.to_string(),
+                ms,
+            },
+        )?;
+    }
+    if options.live {
+        println!(
+            "⏱ startup: workspace={workspace_provision_ms}ms config={config_load_ms}ms \
+             provider={provider_init_ms}ms agent_new={agent_new_ms}ms (total \
+             {}ms before first prompt)",
+            workspace_provision_ms + config_load_ms + provider_init_ms + agent_new_ms
+        );
+    }
     let provider_name = agent.provider_name();
     let model = config.model.clone();
     let session_id = agent.session_id().unwrap_or_default();
