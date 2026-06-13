@@ -48501,25 +48501,42 @@ fn transcript_press_clears_a_stale_screen_selection() {
 }
 
 #[test]
-fn global_pre_pass_arms_a_screen_selection_on_chrome_via_handle_mouse() {
-    // The GLOBAL pre-pass at the top of `handle_mouse` arms a screen selection on
-    // any non-interactive cell that isn't the transcript/composer text. With no
-    // render yet there are no area caches and no registered click-targets, so the
-    // whole surface reads as selectable chrome — a press arms, a drag extends.
+fn screen_selection_arms_on_main_view_chrome_via_handle_mouse() {
+    // The main-view bottom fallback in `handle_mouse` arms a screen selection on a
+    // press over chrome (status line / footer) that no specialized handler claimed,
+    // and the early active-drag block then extends it on Drag from any surface.
     let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hello there"));
+    let _ = render_full_to_buffer(&app, 60, 24);
 
-    assert!(handle_mouse(&mut app, left_down(5, 1, KeyModifiers::NONE)));
+    // Find a chrome, non-target cell (scanning the footer rows up) that the
+    // transcript/composer/scrollbar handlers leave alone.
+    let mut spot = None;
+    'outer: for row in (0..24u16).rev() {
+        for col in 0..60u16 {
+            if cell_is_chrome(&app, col, row) && app.click_target_at(col, row).is_none() {
+                spot = Some((col, row));
+                break 'outer;
+            }
+        }
+    }
+    let (col, row) = spot.expect("the main view has selectable chrome");
+
+    assert!(handle_mouse(
+        &mut app,
+        left_down(col, row, KeyModifiers::NONE)
+    ));
     assert!(
         app.screen_selection.is_some(),
-        "a press on chrome arms a screen-buffer selection",
+        "a press on main-view chrome arms a screen-buffer selection",
     );
 
-    handle_mouse(&mut app, left_drag(20, 1));
+    handle_mouse(&mut app, left_drag(col + 3, row));
     let sel = app.screen_selection.expect("still armed");
     assert_eq!(
         (sel.cursor_col, sel.cursor_row),
-        (20, 1),
-        "the drag extends the screen selection's moving end",
+        (col + 3, row),
+        "the active-drag block extends the selection's moving end on any surface",
     );
 }
 
