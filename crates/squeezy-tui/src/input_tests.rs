@@ -148,33 +148,58 @@ fn copy_is_hidden_from_slash_menu() {
 }
 
 #[test]
-fn slash_menu_surfaces_checkpoint_commands_when_disabled_for_discovery() {
-    let names = slash_suggestions("/")
-        .into_iter()
-        .filter(|cmd| cmd.visible_with_checkpoints(false))
-        .map(|cmd| cmd.name)
-        .collect::<Vec<_>>();
-
+fn checkpoint_commands_hidden_until_checkpointing_enabled() {
+    // Checkpointing is off by default, so its commands must not be offered
+    // (browse or fuzzy) until the user enables it — a newcomer should never see
+    // a command that cannot do anything yet.
+    let off = SlashMenuVisibility {
+        checkpoints_enabled: false,
+        reviewer_enabled: true,
+    };
+    let on = SlashMenuVisibility {
+        checkpoints_enabled: true,
+        reviewer_enabled: true,
+    };
     for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
+        let cmd = find_command(checkpoint_command);
         assert!(
-            names.contains(&checkpoint_command),
-            "{checkpoint_command} should remain discoverable when checkpointing is disabled"
+            !cmd.visible(off),
+            "{checkpoint_command} should be hidden while checkpointing is disabled"
+        );
+        assert!(
+            cmd.visible(on),
+            "{checkpoint_command} should be visible once checkpointing is enabled"
         );
     }
 }
 
 #[test]
-fn checkpoint_commands_show_when_checkpointing_is_enabled() {
-    let names = slash_suggestions("/")
-        .into_iter()
-        .filter(|cmd| cmd.visible_with_checkpoints(true))
-        .map(|cmd| cmd.name)
-        .collect::<Vec<_>>();
+fn reviewer_command_hidden_until_auto_review_enabled() {
+    let off = SlashMenuVisibility {
+        checkpoints_enabled: true,
+        reviewer_enabled: false,
+    };
+    let on = SlashMenuVisibility {
+        checkpoints_enabled: true,
+        reviewer_enabled: true,
+    };
+    assert!(
+        !find_command("/reviewer").visible(off),
+        "/reviewer should be hidden until the AI reviewer is enabled"
+    );
+    assert!(find_command("/reviewer").visible(on));
+}
 
-    for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
+#[test]
+fn ungated_commands_stay_visible_regardless_of_flags() {
+    let all_off = SlashMenuVisibility {
+        checkpoints_enabled: false,
+        reviewer_enabled: false,
+    };
+    for name in ["/help", "/cost", "/config", "/pin", "/clear"] {
         assert!(
-            names.contains(&checkpoint_command),
-            "{checkpoint_command} should be visible when checkpointing is enabled"
+            find_command(name).visible(all_off),
+            "{name} should never be gated"
         );
     }
 }
@@ -264,21 +289,67 @@ fn slash_suggestions_returns_no_matches_for_unrelated_input() {
 }
 
 #[test]
-fn slash_suggestion_count_matches_full_suggestions() {
-    for input in ["/", "/co", "please /", "please /att", "/zzz"] {
-        assert_eq!(
-            slash_suggestion_count_at(input, input.len(), true),
-            slash_suggestions(input).len(),
-            "{input:?}"
-        );
-    }
+fn browse_menu_hides_advanced_commands_and_groups_by_category() {
+    let suggestions = slash_suggestions("/");
+    // Progressive disclosure: advanced commands are withheld from the bare-`/`
+    // browse list (they still surface when a needle is typed — see
+    // `advanced_commands_surface_when_filtered`).
+    assert!(
+        suggestions.iter().all(|cmd| !cmd.is_advanced()),
+        "browse list must contain only primary commands"
+    );
+    assert!(
+        suggestions.iter().any(|cmd| cmd.name == "/pin"),
+        "a primary command like /pin should be in the browse list"
+    );
+    assert!(
+        !suggestions.iter().any(|cmd| cmd.name == "/revert-turn"),
+        "an advanced command like /revert-turn should be withheld from browse"
+    );
+    // Grouped by category order, so categories never interleave.
+    let order: Vec<usize> = suggestions
+        .iter()
+        .map(|cmd| cmd.category().order_index())
+        .collect();
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        order, sorted,
+        "browse list must be grouped by category order"
+    );
+}
 
-    let checkpoint_disabled_count = slash_suggestion_count_at("/", 1, false);
-    let filtered_count = slash_suggestions("/")
+#[test]
+fn advanced_commands_surface_when_filtered() {
+    // `/revert-turn` is advanced (hidden from browse) but must stay fuzzy-findable.
+    let names = slash_suggestions("/revert")
         .into_iter()
-        .filter(|cmd| cmd.visible_with_checkpoints(false))
-        .count();
-    assert_eq!(checkpoint_disabled_count, filtered_count);
+        .map(|cmd| cmd.name)
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"/revert-turn"), "{names:?}");
+}
+
+#[test]
+fn every_slash_command_has_a_category() {
+    // `category()` hits `unreachable!` for an unassigned command; exercising it
+    // over the whole registry turns that into a test failure rather than a
+    // runtime panic when the menu renders.
+    for command in SLASH_COMMANDS {
+        let _ = command.category();
+    }
+}
+
+#[test]
+fn advanced_partition_only_covers_registered_commands() {
+    // Every command is either primary or advanced; this just sanity-checks that
+    // both halves are non-empty so a future refactor can't collapse the
+    // progressive-disclosure split by accident.
+    let advanced = SLASH_COMMANDS.iter().filter(|c| c.is_advanced()).count();
+    let primary = SLASH_COMMANDS.len() - advanced;
+    assert!(
+        advanced > 0 && primary > 0,
+        "primary={primary} advanced={advanced}"
+    );
 }
 
 #[test]
@@ -300,6 +371,12 @@ fn slash_suggestions_mid_prompt_only_show_inline_commands() {
             "prefix-only command {prefix_only} should not appear mid-prompt: {names:?}"
         );
     }
+    // Mid-prompt is not browse mode (no category headers render), so the list
+    // must stay alphabetical rather than slipping into category-grouped order —
+    // which would look like an arbitrary reshuffle without the headers.
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "mid-prompt suggestions stay alphabetical");
 }
 
 #[test]

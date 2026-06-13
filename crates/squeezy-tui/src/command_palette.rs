@@ -22,7 +22,7 @@
 //! filter runs only while it is open.
 
 use crate::fuzzy;
-use crate::input::SLASH_COMMANDS;
+use crate::input::{SLASH_COMMANDS, SlashMenuVisibility};
 use crate::keymap::{Action, KeymapResolver};
 
 /// What running a palette entry does. Resolved at run time in `lib.rs`:
@@ -90,7 +90,14 @@ impl CommandPalette {
     /// [`SLASH_COMMANDS`] order), so an empty query always lists the same set in
     /// the same order. `during_task` gates a slash command's availability the same
     /// way the composer menu does, surfacing a disabled reason rather than hiding it.
-    pub(crate) fn build(keymap: &KeymapResolver, during_task: bool) -> Self {
+    /// `visibility` applies the same feature gates as the slash menu (e.g. checkpoint
+    /// commands when checkpointing is off, `/reviewer` when Auto-review is off), so a
+    /// gated command stays out of this parallel discovery surface too.
+    pub(crate) fn build(
+        keymap: &KeymapResolver,
+        during_task: bool,
+        visibility: SlashMenuVisibility,
+    ) -> Self {
         let mut entries: Vec<CommandEntry> = Vec::new();
         for action in Action::ALL.iter().copied() {
             // Never list the palette's own toggle inside the palette — running it
@@ -107,6 +114,12 @@ impl CommandPalette {
             });
         }
         for command in SLASH_COMMANDS.iter().copied() {
+            // Commands gated behind a disabled feature (checkpoints off, reviewer
+            // off) are hidden here exactly as they are in the slash menu, so the
+            // palette never offers a command that cannot do anything yet.
+            if !command.visible(visibility) {
+                continue;
+            }
             // A command that is not available during a task is disabled while a turn
             // is running (`during_task`); the row stays listed with an honest reason
             // rather than vanishing, matching the spec's "disabled reasons".

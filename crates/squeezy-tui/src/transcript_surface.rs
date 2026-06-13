@@ -211,26 +211,26 @@ pub(crate) fn strip_gutter(line: &str) -> &str {
     strip_message_marker(after_gutter)
 }
 
-/// Drop a leading focus/selection caret (`>` plus its trailing space run) when a
-/// line opens on one. The renderer paints `">  "` (message header) or `"> "`
+/// Drop a leading focus/selection caret (`›` plus its trailing space run) when a
+/// line opens on one. The renderer paints `"›  "` (message header) or `"› "`
 /// (reasoning / slash echo) at column 0 of the *focused* entry's header; this
 /// removes exactly that so the cleaned text is focus-invariant. A no-op when the
-/// line does not open on `">"` immediately followed by a space.
+/// line does not open on `›` immediately followed by a space — and, because the
+/// caret is a distinct glyph from a Markdown blockquote's ASCII `>`, a blockquote
+/// is never mistaken for it.
 fn strip_focus_caret(line: &str) -> &str {
     let mut chars = line.char_indices();
-    let Some((_, '>')) = chars.next() else {
+    let Some((_, '\u{203a}')) = chars.next() else {
         return line;
     };
-    // Require at least one space after the caret so a stray `>` that begins real
-    // content (no following space) is never eaten.
+    // Require at least one space after the caret so a stray `›` that begins real
+    // content (no following space) is never eaten. `space_idx` is the byte offset
+    // of that space — a char boundary, so the slice stays UTF-8-safe past the
+    // multi-byte caret.
     match chars.next() {
-        Some((_, ' ')) => {}
-        _ => return line,
+        Some((space_idx, ' ')) => line[space_idx..].trim_start_matches(' '),
+        _ => line,
     }
-    // Skip the caret and every space that follows it (the marker pads to a fixed
-    // 3-cell gutter column).
-    let rest = &line[1..];
-    rest.trim_start_matches(' ')
 }
 
 /// Drop a leading message-prompt marker glyph and its single following space

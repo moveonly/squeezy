@@ -128,60 +128,60 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     // look riskier or costlier than it is in practice.
     slash_args(
         "/help",
-        "local help; unknown topics can use the model",
+        "get help on a topic or command",
         true,
         "[topic|/slash-command]",
     ),
     slash_args_caps(
         "/config",
-        "open config (or pass a section name)",
+        "open settings (optionally jump to a section)",
         true,
         "[section]",
         &[PermissionCapability::Edit],
     ),
     slash_caps(
         "/model",
-        "open config focused on provider and model",
+        "choose the provider and model",
         true,
         &[PermissionCapability::Edit],
     ),
     slash_caps(
         "/permissions",
-        "open config focused on permissions",
+        "review what the agent is allowed to do",
         true,
         &[PermissionCapability::Edit],
     ),
     slash_caps(
         "/mcp",
-        "open config focused on MCP servers (status, enable, restart)",
+        "manage MCP servers (status, enable, restart)",
         true,
         &[PermissionCapability::Edit],
     ),
     slash_args(
         "/plan",
-        "switch to Plan mode (optionally with a prompt to run)",
+        "switch to Plan mode — read-only, no edits",
         false,
         "[prompt]",
     ),
     slash_args(
         "/build",
-        "switch to Build mode (optionally with a prompt to run)",
+        "switch to Build mode — full tool access",
         false,
         "[prompt]",
     ),
     slash_args_caps(
         "/plans",
-        "manage persisted plan-mode artifacts (list/show/delete/set-active/open)",
+        "manage saved plans (list/show/delete/set-active/open)",
         true,
         "[list|show|delete|set-active|open] [<id>]",
         &[PermissionCapability::Read],
     ),
-    slash("/cost", "show token and cost accounting"),
-    slash("/context", "show context budget and compaction state"),
-    slash("/reviewer", "show recent AI reviewer auto-decisions"),
+    slash("/cost", "show token usage and dollar spend"),
+    slash("/context", "show context-window usage and headroom"),
+    slash("/reviewer", "show recent auto-review decisions"),
     slash_args_caps(
         "/attach",
-        "insert a file token in the prompt",
+        "attach a file or directory as context",
         false,
         "<path>",
         &[PermissionCapability::Read],
@@ -189,7 +189,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     // `/compact` triggers a summarisation turn against the model.
     SlashCommand {
         name: "/compact",
-        description: "compact context now (undo to restore; history to view timeline)",
+        description: "summarize old context to free the window (undo/history)",
         available_during_task: false,
         parameter_hint: None,
         capabilities: &[PermissionCapability::Network],
@@ -199,7 +199,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     // capability badges, but it must not fire mid-turn.
     SlashCommand {
         name: "/clear",
-        description: "clear the conversation and start fresh (prior session stays resumable)",
+        description: "start a fresh chat (prior session stays resumable)",
         available_during_task: false,
         parameter_hint: None,
         capabilities: &[],
@@ -215,16 +215,16 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     slash_args("/task-cancel", "cancel a background task", true, "<id>"),
     SlashCommand {
         name: "/pin",
-        description: "pin a transcript item (opens a picker)",
+        description: "keep a transcript item across compaction (picker)",
         available_during_task: false,
         parameter_hint: None,
         capabilities: &[],
     },
-    slash("/pins", "list pinned context"),
-    slash_args("/unpin", "remove pinned context", false, "<id>"),
+    slash("/pins", "list kept (pinned) items"),
+    slash_args("/unpin", "stop keeping a pinned item", false, "<id>"),
     slash_caps(
         "/feedback",
-        "preview feedback and ask to send",
+        "preview and send maintainer feedback",
         true,
         &[PermissionCapability::Network],
     ),
@@ -242,54 +242,54 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     ),
     slash_args_caps(
         "/session",
-        "show a saved session, or rename/label the active one",
+        "show a session, or rename/label the current one",
         true,
         "<id> | rename <name> | label <name>",
         &[PermissionCapability::Read],
     ),
     slash_args_caps(
         "/resume",
-        "resume a saved session",
+        "reopen a saved session",
         false,
         "<id>",
         &[PermissionCapability::Read],
     ),
     slash_args(
         "/fork",
-        "branch the current session into a sibling (optionally under another workspace)",
+        "branch this chat into a new session",
         false,
         "[<workspace_path>]",
     ),
     slash_args_caps(
         "/session-export",
-        "export a saved session",
+        "export a saved session (json/md)",
         false,
         "<id>",
         &[PermissionCapability::Read, PermissionCapability::Edit],
     ),
     slash_args_caps(
         "/session-export-html",
-        "export a saved session as self-contained HTML",
+        "export a saved session as standalone HTML",
         false,
         "<id> [path]",
         &[PermissionCapability::Read, PermissionCapability::Edit],
     ),
     slash_caps(
         "/checkpoints",
-        "list local checkpoints",
+        "list file checkpoints (snapshots before edits)",
         true,
         &[PermissionCapability::Read],
     ),
     slash_args_caps(
         "/checkpoint",
-        "show a local checkpoint",
+        "show one file checkpoint",
         true,
         "<id>",
         &[PermissionCapability::Read],
     ),
     SlashCommand {
         name: "/undo",
-        description: "undo the latest checkpoint",
+        description: "roll back the last file edit",
         available_during_task: false,
         parameter_hint: None,
         capabilities: &[
@@ -299,7 +299,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/revert-turn",
-        description: "revert a turn checkpoint",
+        description: "undo all file edits from one turn",
         available_during_task: false,
         parameter_hint: None,
         capabilities: &[
@@ -309,35 +309,35 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     slash_args_caps(
         "/effort",
-        "set reasoning effort for this session (or `auto` to clear)",
+        "set reasoning effort (auto to clear)",
         false,
         "[low|medium|high|xhigh|auto]",
         &[PermissionCapability::Edit],
     ),
-    slash("/cheap", "force next turn onto the provider's cheap model"),
-    slash("/parent", "force next turn onto the parent model"),
+    slash("/cheap", "force the next turn onto the cheap model"),
+    slash("/parent", "force the next turn onto the main model"),
     slash_args(
         "/router",
-        "open routing config (or on|off to toggle session-wide auto-routing)",
+        "toggle auto cheap-model routing (or open config)",
         true,
         "[on|off]",
     ),
     slash_args_caps(
         "/tool-verbosity",
-        "open config focused on tool output verbosity (or set inline)",
+        "set tool-output detail (compact/normal/verbose)",
         false,
         "[compact|normal|verbose]",
         &[PermissionCapability::Edit],
     ),
     slash_caps(
         "/statusline",
-        "configure which items appear in the status bar",
+        "choose what shows in the status bar",
         true,
         &[PermissionCapability::Edit],
     ),
     slash_args_caps(
         "/theme",
-        "open theme config or switch theme",
+        "switch color theme (or open theme config)",
         true,
         "[default|bright|fun|catppuccin|high-contrast|<custom>]",
         &[PermissionCapability::Edit],
@@ -345,23 +345,102 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     slash("/keymap", "list current key bindings"),
     slash_args_caps(
         "/export",
-        "export the transcript (md/txt/json) to a file, clipboard, stdout, or dir",
+        "export the transcript to a file, clipboard, or stdout",
         true,
         "<md|txt|json> [clipboard|stdout|dir:<name>|<path>]",
         &[PermissionCapability::Edit],
     ),
     slash_args_caps(
         "/bundle",
-        "build a shareable session bundle (transcript + manifest + checksum, redacted)",
+        "build a shareable session bundle (redacted)",
         true,
         "[md|json] [no-redact]",
         &[PermissionCapability::Edit],
     ),
     slash(
         "/terminal",
-        "show terminal diagnostic info (TTY, TERM, clipboard, notifications, shell)",
+        "show terminal diagnostics (TTY, clipboard, shell)",
     ),
 ];
+
+/// Grouping used by the bare-`/` browse menu. Each command belongs to exactly
+/// one category; the categories render as non-selectable header rows (title +
+/// blurb) ordered by how often a newcomer reaches for them. Grouping is a
+/// *browse* affordance only — once the user types a needle the menu collapses
+/// back to a flat, fuzzy-ranked list with no headers (see `slash_suggestions_at`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlashCategory {
+    ChatModes,
+    Context,
+    Cost,
+    Checkpoints,
+    Sessions,
+    Settings,
+}
+
+impl SlashCategory {
+    /// Display order in the browse menu — most-used-by-newcomers first.
+    pub(crate) const ORDER: [SlashCategory; 6] = [
+        SlashCategory::ChatModes,
+        SlashCategory::Context,
+        SlashCategory::Cost,
+        SlashCategory::Checkpoints,
+        SlashCategory::Sessions,
+        SlashCategory::Settings,
+    ];
+
+    pub(crate) fn order_index(self) -> usize {
+        Self::ORDER
+            .iter()
+            .position(|category| *category == self)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Short header label shown above the group.
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            SlashCategory::ChatModes => "Chat & modes",
+            SlashCategory::Context => "Context & memory",
+            SlashCategory::Cost => "Cost & effort",
+            SlashCategory::Checkpoints => "Checkpoints & undo",
+            SlashCategory::Sessions => "Sessions",
+            SlashCategory::Settings => "Settings & display",
+        }
+    }
+
+    /// One-liner shown next to the header to explain the group to a newcomer.
+    pub(crate) fn blurb(self) -> &'static str {
+        match self {
+            SlashCategory::ChatModes => "steer the agent: plan vs build, and get help",
+            SlashCategory::Context => "what the model keeps: attach, pin, compact, or clear",
+            SlashCategory::Cost => "track spend and tune reasoning effort",
+            SlashCategory::Checkpoints => "undo on-disk file edits from earlier turns",
+            SlashCategory::Sessions => "save, resume, and fork conversations",
+            SlashCategory::Settings => "configure models, permissions, theme, and tools",
+        }
+    }
+}
+
+/// Runtime condition under which a command is offered at all. Commands whose
+/// feature is off by default are hidden from BOTH the browse list and the
+/// fuzzy results until that feature is enabled, so a newcomer never sees a
+/// command that cannot do anything yet (e.g. `/undo` with checkpointing off).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlashGate {
+    Always,
+    /// Visible only when `[tools].checkpoints_enabled` is on.
+    Checkpoints,
+    /// Visible only under the Auto-review permission preset (AI reviewer on).
+    Reviewer,
+}
+
+/// Snapshot of the runtime flags that gate command visibility, taken from the
+/// live `TuiApp` so the suggestion, count, and render paths all agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlashMenuVisibility {
+    pub(crate) checkpoints_enabled: bool,
+    pub(crate) reviewer_enabled: bool,
+}
 
 impl SlashCommand {
     pub(crate) fn is_dimmed(&self, task_in_progress: bool) -> bool {
@@ -372,8 +451,92 @@ impl SlashCommand {
         matches!(self.name, "/attach" | "/help" | "/plan" | "/build")
     }
 
-    pub(crate) fn visible_with_checkpoints(&self, _checkpoints_enabled: bool) -> bool {
-        true
+    /// Category this command lives under in the browse menu. The match is
+    /// exhaustive over the registry; `every_slash_command_has_a_category`
+    /// guards against a new command slipping through the `unreachable!` arm.
+    pub(crate) fn category(&self) -> SlashCategory {
+        match self.name {
+            "/help" | "/plan" | "/build" | "/plans" | "/feedback" | "/report" => {
+                SlashCategory::ChatModes
+            }
+            "/context" | "/attach" | "/pin" | "/compact" | "/clear" | "/pins" | "/unpin" => {
+                SlashCategory::Context
+            }
+            "/cost" | "/effort" | "/cheap" | "/parent" | "/router" => SlashCategory::Cost,
+            "/checkpoints" | "/undo" | "/checkpoint" | "/revert-turn" => SlashCategory::Checkpoints,
+            // `/diff` (git working changes) and the `/task*` background-task
+            // commands are not strictly "sessions", but they are all advanced
+            // (never shown in the browse list, where category headers render), so
+            // their home here is invisible to users. If any is ever promoted out
+            // of `is_advanced()`, give it a more fitting category first.
+            "/sessions"
+            | "/resume"
+            | "/fork"
+            | "/session"
+            | "/session-export"
+            | "/session-export-html"
+            | "/export"
+            | "/bundle"
+            | "/diff"
+            | "/tasks"
+            | "/task"
+            | "/task-cancel" => SlashCategory::Sessions,
+            "/config" | "/model" | "/permissions" | "/theme" | "/mcp" | "/tool-verbosity"
+            | "/statusline" | "/keymap" | "/terminal" | "/reviewer" => SlashCategory::Settings,
+            other => unreachable!("slash command {other} is not assigned to a SlashCategory"),
+        }
+    }
+
+    /// Advanced/rarely-needed commands are hidden from the bare-`/` browse list
+    /// (progressive disclosure) but still surface the moment the user types a
+    /// matching needle. The curated browse set stays short and newcomer-legible.
+    pub(crate) fn is_advanced(&self) -> bool {
+        matches!(
+            self.name,
+            "/plans"
+                | "/feedback"
+                | "/report"
+                | "/pins"
+                | "/unpin"
+                | "/cheap"
+                | "/parent"
+                | "/router"
+                | "/checkpoint"
+                | "/revert-turn"
+                | "/session"
+                | "/session-export"
+                | "/session-export-html"
+                | "/export"
+                | "/bundle"
+                | "/diff"
+                | "/tasks"
+                | "/task"
+                | "/task-cancel"
+                | "/mcp"
+                | "/tool-verbosity"
+                | "/statusline"
+                | "/keymap"
+                | "/terminal"
+                | "/reviewer"
+        )
+    }
+
+    /// Runtime feature that must be enabled for this command to appear at all.
+    pub(crate) fn gate(&self) -> SlashGate {
+        match self.name {
+            "/checkpoints" | "/checkpoint" | "/undo" | "/revert-turn" => SlashGate::Checkpoints,
+            "/reviewer" => SlashGate::Reviewer,
+            _ => SlashGate::Always,
+        }
+    }
+
+    /// Whether this command should be offered given the current runtime flags.
+    pub(crate) fn visible(&self, vis: SlashMenuVisibility) -> bool {
+        match self.gate() {
+            SlashGate::Always => true,
+            SlashGate::Checkpoints => vis.checkpoints_enabled,
+            SlashGate::Reviewer => vis.reviewer_enabled,
+        }
     }
 
     /// Short label used in the slash menu badge, e.g. `net`, `read`, `edit`.
@@ -1066,14 +1229,28 @@ pub(crate) fn slash_suggestions_at(input: &str, cursor: usize) -> Vec<SlashComma
         return Vec::new();
     };
     let needle = &input[context.start..context.end];
-    // Bare `/` lists every command, ordered alphabetically by name.
-    if needle == "/" {
+    // Bare `/` at the prompt start is browse mode: show the curated (non-advanced)
+    // commands grouped by category order, alphabetical within each group. The
+    // renderer turns the category boundaries into header rows. Advanced commands
+    // are withheld here and only surface once a needle narrows the list
+    // (progressive disclosure). This guard mirrors `slash_menu_browsing` so the
+    // grouped ordering and the header rows are emitted under exactly the same
+    // condition — a mid-prompt `/` falls through to the flat path below (it only
+    // offers the few inline commands, where grouping with no headers would just
+    // look like an arbitrary reordering).
+    if needle == "/" && context.at_prompt_start {
         let mut suggestions = SLASH_COMMANDS
             .iter()
             .filter(|command| slash_command_matches_context(command, context))
+            .filter(|command| !command.is_advanced())
             .copied()
             .collect::<Vec<_>>();
-        suggestions.sort_by(|left, right| left.name.cmp(right.name));
+        suggestions.sort_by(|left, right| {
+            left.category()
+                .order_index()
+                .cmp(&right.category().order_index())
+                .then(left.name.cmp(right.name))
+        });
         return suggestions;
     }
     let query = crate::fuzzy::PreparedQuery::new(needle);
@@ -1092,34 +1269,30 @@ pub(crate) fn slash_suggestions_at(input: &str, cursor: usize) -> Vec<SlashComma
 }
 
 pub(crate) fn slash_suggestions_for_app(app: &TuiApp) -> Vec<SlashCommand> {
+    let visibility = SlashMenuVisibility {
+        checkpoints_enabled: app.checkpoints_enabled,
+        reviewer_enabled: app.reviewer_enabled,
+    };
     slash_suggestions_at(&app.input, app.input_cursor)
         .into_iter()
-        .filter(|command| command.visible_with_checkpoints(app.checkpoints_enabled))
+        .filter(|command| command.visible(visibility))
         .collect()
 }
 
-fn slash_suggestion_count_for_app(app: &TuiApp) -> usize {
-    slash_suggestion_count_at(&app.input, app.input_cursor, app.checkpoints_enabled)
+/// Whether the slash menu is in bare-`/` browse mode (category headers shown)
+/// rather than filtering against a typed needle (flat, header-less results).
+/// Restricted to the prompt start: a mid-prompt `/` offers only the few inline
+/// commands, where a category header above them would be noise.
+pub(crate) fn slash_menu_browsing(app: &TuiApp) -> bool {
+    slash_completion_context(&app.input, app.input_cursor).is_some_and(|context| {
+        context.at_prompt_start && &app.input[context.start..context.end] == "/"
+    })
 }
 
-fn slash_suggestion_count_at(input: &str, cursor: usize, checkpoints_enabled: bool) -> usize {
-    let Some(context) = slash_completion_context(input, cursor) else {
-        return 0;
-    };
-    let needle = &input[context.start..context.end];
-    let include = |command: &&SlashCommand| {
-        slash_command_matches_context(command, context)
-            && command.visible_with_checkpoints(checkpoints_enabled)
-    };
-    if needle == "/" {
-        return SLASH_COMMANDS.iter().filter(include).count();
-    }
-    let query = crate::fuzzy::PreparedQuery::new(needle);
-    SLASH_COMMANDS
-        .iter()
-        .filter(include)
-        .filter(|command| crate::fuzzy::score_prepared(command.name, &query).is_some())
-        .count()
+// The visible count is derived straight from the suggestion list so the
+// selection-clamping and movement math can never drift from what renders.
+fn slash_suggestion_count_for_app(app: &TuiApp) -> usize {
+    slash_suggestions_for_app(app).len()
 }
 
 fn slash_command_matches_context(command: &SlashCommand, context: SlashCompletionContext) -> bool {

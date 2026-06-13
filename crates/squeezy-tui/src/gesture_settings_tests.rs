@@ -303,7 +303,7 @@ fn configured_dwell_drives_the_recognizer_hover_intent() {
     // the dwell does.
     let dwell = Duration::from_millis(u64::from(GestureSettings::DEFAULT.hover_dwell_ms));
     // The default dwell must be strictly positive for the "before" instant to land
-    // between the first Move and the dwell deadline; HOVER_INTENT_MS is 150ms.
+    // between the first Move and the dwell deadline.
     assert!(dwell > Duration::ZERO, "the default dwell is positive");
     let mut rec = Recognizer::new();
     let target = TargetKey::Entry(EntryId(1));

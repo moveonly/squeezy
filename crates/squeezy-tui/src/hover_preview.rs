@@ -207,6 +207,9 @@ pub(crate) struct HoverPreview {
     /// A bounded body excerpt (already line-split, trimmed, and capped by the
     /// caller). May be empty — the popover then shows the title alone.
     pub(crate) body: Vec<String>,
+    /// An optional one-line meta string (turn · size · cost) shown beneath the
+    /// title. `None` for previews that carry no structured metadata.
+    pub(crate) meta: Option<String>,
     /// The primary activation verb (double-click / Enter), if the target has one.
     pub(crate) primary: Option<Action>,
     /// How this preview was requested.
@@ -238,9 +241,19 @@ impl HoverPreview {
             kind,
             title,
             body,
+            meta: None,
             primary,
             source,
         }
+    }
+
+    /// Attach a one-line meta string (turn · size · cost) shown beneath the title.
+    /// Clamps it and trims the body by one row so the popover keeps its fixed size:
+    /// the meta line takes one of the bounded content rows.
+    pub(crate) fn with_meta(mut self, meta: String) -> Self {
+        self.body.truncate(PREVIEW_BODY_LINES.saturating_sub(1));
+        self.meta = Some(clamp_line(&meta));
+        self
     }
 
     /// Whether this preview can be activated (has a non-destructive primary verb).

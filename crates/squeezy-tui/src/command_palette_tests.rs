@@ -14,9 +14,18 @@ fn resolver() -> KeymapResolver {
     KeymapResolver::from_overrides(&BTreeMap::new())
 }
 
+/// All feature gates on, so every slash command is offered — the baseline most
+/// tests want when they are not exercising gating itself.
+fn all_visible() -> crate::input::SlashMenuVisibility {
+    crate::input::SlashMenuVisibility {
+        checkpoints_enabled: true,
+        reviewer_enabled: true,
+    }
+}
+
 /// Build the palette with no running turn (the common idle case).
 fn idle_palette() -> CommandPalette {
-    CommandPalette::build(&resolver(), false)
+    CommandPalette::build(&resolver(), false, all_visible())
 }
 
 #[test]
@@ -53,6 +62,53 @@ fn build_sources_both_registries_and_omits_its_own_toggle() {
 }
 
 #[test]
+fn palette_hides_gated_commands_until_their_feature_is_enabled() {
+    // The palette is a second discovery surface (Ctrl-shortcut), so it must apply
+    // the same feature gates as the slash menu — otherwise a newcomer reaches a
+    // command that cannot do anything yet.
+    let slash_names = |palette: &CommandPalette| -> Vec<String> {
+        palette
+            .visible()
+            .iter()
+            .filter_map(|entry| match entry.run {
+                PaletteRun::Slash { name, .. } => Some(name.to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let all_off = crate::input::SlashMenuVisibility {
+        checkpoints_enabled: false,
+        reviewer_enabled: false,
+    };
+    let gated_off = CommandPalette::build(&resolver(), false, all_off);
+    let off_names = slash_names(&gated_off);
+    for hidden in [
+        "/reviewer",
+        "/checkpoints",
+        "/checkpoint",
+        "/undo",
+        "/revert-turn",
+    ] {
+        assert!(
+            !off_names.contains(&hidden.to_string()),
+            "{hidden} must not be listed in the palette while its feature is off: {off_names:?}"
+        );
+    }
+    // Ungated commands are unaffected.
+    assert!(off_names.contains(&"/cost".to_string()));
+
+    let gated_on = CommandPalette::build(&resolver(), false, all_visible());
+    let on_names = slash_names(&gated_on);
+    for shown in ["/reviewer", "/checkpoints", "/undo", "/revert-turn"] {
+        assert!(
+            on_names.contains(&shown.to_string()),
+            "{shown} should be listed once its feature is on"
+        );
+    }
+}
+
+#[test]
 fn action_entries_carry_humanized_label_and_current_binding() {
     let palette = idle_palette();
     let entry = palette
@@ -73,7 +129,11 @@ fn action_entries_carry_humanized_label_and_current_binding() {
 fn binding_column_reflects_user_override() {
     let mut overrides = BTreeMap::new();
     overrides.insert("toggle_session_timeline".to_string(), "Ctrl+G".to_string());
-    let palette = CommandPalette::build(&KeymapResolver::from_overrides(&overrides), false);
+    let palette = CommandPalette::build(
+        &KeymapResolver::from_overrides(&overrides),
+        false,
+        all_visible(),
+    );
     let entry = palette
         .visible()
         .iter()
@@ -225,7 +285,7 @@ fn slash_commands_are_disabled_during_a_task_with_an_honest_reason() {
         .find(|c| !c.available_during_task)
         .expect("at least one command is task-blocked");
 
-    let during_task = CommandPalette::build(&resolver(), true);
+    let during_task = CommandPalette::build(&resolver(), true, all_visible());
     let entry = during_task
         .visible()
         .iter()

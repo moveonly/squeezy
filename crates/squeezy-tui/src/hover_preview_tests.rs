@@ -291,3 +291,29 @@ fn popover_width_clamps_to_a_narrow_area() {
     );
     assert!(rect.x + rect.width <= area.x + area.width);
 }
+
+// ---- meta line ----
+
+/// `with_meta` attaches the line and trims one body row so the popover keeps its
+/// fixed size (the meta line occupies one of the bounded content rows).
+#[test]
+fn with_meta_attaches_a_line_and_keeps_the_body_bounded() {
+    let body: Vec<String> = (0..PREVIEW_BODY_LINES)
+        .map(|i| format!("body {i}"))
+        .collect();
+    let preview = HoverPreview::new(
+        1,
+        PreviewKind::Entry,
+        "title".to_string(),
+        body,
+        None,
+        PreviewSource::Hover,
+    )
+    .with_meta("turn 3 \u{00b7} $0.0123".to_string());
+    assert_eq!(preview.meta.as_deref(), Some("turn 3 \u{00b7} $0.0123"));
+    assert!(
+        preview.body.len() < PREVIEW_BODY_LINES,
+        "the meta line trims one body row to keep the popover fixed-size: {}",
+        preview.body.len(),
+    );
+}

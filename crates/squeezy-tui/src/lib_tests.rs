@@ -5790,7 +5790,7 @@ async fn slash_menu_completes_inline_command_token() {
 }
 
 #[tokio::test]
-async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
+async fn slash_menu_browse_groups_and_scrolls_with_windowing() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "/".to_string());
@@ -5801,14 +5801,18 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
         .map(|command| command.name)
         .collect::<Vec<_>>();
     assert!(names.len() > SLASH_MENU_MAX_ITEMS);
-    // Top window matches the sorted prefix — comparing against the
-    // sorted list itself keeps the test honest if `SLASH_COMMANDS`
-    // grows or `SLASH_MENU_MAX_ITEMS` is retuned.
-    assert_eq!(
-        &names[..SLASH_MENU_MAX_ITEMS],
-        &names[..SLASH_MENU_MAX_ITEMS]
-    );
-    assert!(names[0] < names[1] && names[1] < names[2], "alphabetical");
+    // Browse mode groups by category order (not a global alphabetical sort),
+    // so the category index is non-decreasing across the list rather than the
+    // names being sorted.
+    let order: Vec<usize> = suggestions
+        .iter()
+        .map(|command| command.category().order_index())
+        .collect();
+    let mut sorted_order = order.clone();
+    sorted_order.sort_unstable();
+    assert_eq!(order, sorted_order, "browse list is grouped by category");
+    // Command rows (lines beginning with `/`) stay windowed to the cap; the
+    // category header rows are extra, non-`/` lines and are not counted here.
     let command_rows = slash_suggestion_lines(&app, 120)
         .iter()
         .filter(|line| {
@@ -5886,34 +5890,52 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
 }
 
 #[test]
-fn slash_menu_surfaces_checkpoint_commands_when_disabled_for_discovery() {
+fn checkpoint_commands_appear_only_when_checkpointing_enabled() {
+    // Disabled (the default): no checkpoint command is offered — neither in the
+    // browse list nor when fuzzy-filtered — so a newcomer never sees a command
+    // that cannot do anything yet.
     let mut app = test_app(SessionMode::Build);
-    set_input(&mut app, "/".to_string());
-    let names = input::slash_suggestions_for_app(&app)
-        .into_iter()
-        .map(|command| command.name)
-        .collect::<Vec<_>>();
-    for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
-        assert!(
-            names.contains(&checkpoint_command),
-            "{checkpoint_command} should remain discoverable while checkpointing is disabled"
-        );
+    for probe in ["/", "/checkpoint", "/undo", "/revert"] {
+        set_input(&mut app, probe.to_string());
+        let names = input::slash_suggestions_for_app(&app)
+            .into_iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
+            assert!(
+                !names.contains(&checkpoint_command),
+                "{checkpoint_command} should be hidden while checkpointing is disabled (input {probe:?})"
+            );
+        }
     }
 
+    // Enabled: the primary checkpoint commands join the browse list, and the
+    // advanced ones become fuzzy-findable.
     let mut config = test_config(SessionMode::Build);
     config.checkpoints_enabled = true;
     let mut enabled_app = test_app_with_config(&config, SessionMode::Build);
+
     set_input(&mut enabled_app, "/".to_string());
-    let names = input::slash_suggestions_for_app(&enabled_app)
+    let browse = input::slash_suggestions_for_app(&enabled_app)
         .into_iter()
         .map(|command| command.name)
         .collect::<Vec<_>>();
-    for checkpoint_command in ["/checkpoints", "/checkpoint", "/undo", "/revert-turn"] {
+    for primary in ["/checkpoints", "/undo"] {
         assert!(
-            names.contains(&checkpoint_command),
-            "{checkpoint_command} should be suggested while checkpointing is enabled"
+            browse.contains(&primary),
+            "{primary} should be in the browse list when checkpointing is enabled"
         );
     }
+
+    set_input(&mut enabled_app, "/revert".to_string());
+    let filtered = input::slash_suggestions_for_app(&enabled_app)
+        .into_iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>();
+    assert!(
+        filtered.contains(&"/revert-turn"),
+        "advanced /revert-turn should be fuzzy-findable when enabled: {filtered:?}"
+    );
 }
 
 #[test]
@@ -6027,12 +6049,65 @@ fn slash_suggestion_lines_keep_short_hints_inline_when_width_allows() {
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
         })
-        .find(|line| line.contains("/attach ") && line.contains("insert a file token"))
+        .find(|line| line.contains("/attach ") && line.contains("file or directory"))
         .expect("attach suggestion line");
 
     assert!(
         attach_line.contains("<path>"),
         "short parameter hint should stay on the command row when it fits: {attach_line}"
+    );
+}
+
+#[test]
+fn slash_browse_renders_category_headers_that_vanish_when_filtering() {
+    let mut app = test_app(SessionMode::Build);
+
+    // Browse mode (bare `/`): category headers with their blurbs render as
+    // non-command rows above the commands.
+    set_input(&mut app, "/".to_string());
+    let browse = slash_suggestion_lines(&app, 120)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let header = browse
+        .iter()
+        .find(|line| line.contains("Context & memory"))
+        .expect("browse should render the Context & memory header");
+    assert!(
+        header.contains("what the model keeps"),
+        "header should carry the category blurb: {header}"
+    );
+    assert!(
+        !header.contains('/'),
+        "a header row is not a command row: {header}"
+    );
+
+    // Filtering (typed needle): the list collapses to a flat, header-less set so
+    // the best fuzzy match is never buried under a group title.
+    set_input(&mut app, "/co".to_string());
+    let filtered = slash_suggestion_lines(&app, 120)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        filtered
+            .iter()
+            .all(|line| !line.contains("Context & memory")),
+        "no category headers once a needle is typed: {filtered:?}"
+    );
+    assert!(
+        filtered.iter().any(|line| line.contains("/compact")),
+        "filtered results still render commands: {filtered:?}"
     );
 }
 
@@ -22922,7 +22997,7 @@ fn slash_parameter_hint_uses_status_model_color() {
     let description_span = attach_line
         .spans
         .iter()
-        .find(|span| span.content.contains("insert a file token in the prompt"))
+        .find(|span| span.content.contains("file or directory"))
         .expect("attach description span");
     let hint_span = lines
         .iter()
@@ -42227,12 +42302,22 @@ async fn command_palette_opens_and_lists_commands() {
     assert!(out.contains("Command palette"), "header present:\n{out}");
     assert!(out.contains("Enter run"), "navigation hint present:\n{out}");
     // The full registry is listed: every keymap action (minus the palette's own
-    // toggle) plus every slash command.
-    let expected = keymap::Action::ALL.len() - 1 + SLASH_COMMANDS.len();
+    // toggle) plus every slash command that is visible under the current feature
+    // gates (checkpoint/reviewer commands are hidden until their feature is on,
+    // exactly as in the slash menu).
+    let visibility = input::SlashMenuVisibility {
+        checkpoints_enabled: app.checkpoints_enabled,
+        reviewer_enabled: app.reviewer_enabled,
+    };
+    let visible_slash = SLASH_COMMANDS
+        .iter()
+        .filter(|command| command.visible(visibility))
+        .count();
+    let expected = keymap::Action::ALL.len() - 1 + visible_slash;
     assert_eq!(
         app.command_palette.as_ref().unwrap().len(),
         expected,
-        "the palette sources both the keymap registry and the slash table",
+        "the palette sources both the keymap registry and the gate-visible slash table",
     );
     // The first page shows humanized keymap-action labels with their current
     // binding — proving the keymap registry is the source.
@@ -43537,7 +43622,7 @@ async fn hover_preview_double_click_caret_opens_detail() {
 async fn hover_preview_mouse_hover_reveals_after_intent_delay() {
     // The mouse path: a stable hover over an entry header (two Moves separated by
     // the hover-intent delay) reveals the preview. A real sleep crosses the
-    // 150ms HOVER_INTENT_MS threshold the recognizer keys on Instant::now().
+    // HOVER_INTENT_MS threshold the recognizer keys on Instant::now().
     let mut app = app_with_hover_preview(1);
     let entry_id = active_transcript_entries(&app)[1].id;
 
@@ -45149,9 +45234,10 @@ async fn annotation_survives_appends_and_resize() {
 // and handle_mouse() / handle_key() paths.
 // ===========================================================================
 
-/// The hover-affordance hint glyph (`›`) the §12.1.3 renderer paints on the
-/// revealed/focused card header. Mirrors `HOVER_HINT_GLYPH` in `lib.rs`.
-const HOVER_HINT_GLYPH_TEST: &str = "\u{203a}";
+/// The hover-affordance hint glyph (`⋯`) the §12.1.3 renderer paints on the
+/// revealed/focused card header — distinct from the `›` selection caret. Mirrors
+/// `HOVER_HINT_GLYPH` in `lib.rs`.
+const HOVER_HINT_GLYPH_TEST: &str = "\u{22ef}";
 
 /// A small main-transcript app whose first entry is visible at the top of the
 /// viewport, so a focus/hover reveal lands inside the painted window. Built like
@@ -48871,4 +48957,104 @@ fn paste_chord_matches_super_and_ctrl_shift_v_only() {
         KeyCode::Char('v'),
         KeyModifiers::SUPER | KeyModifiers::ALT
     )));
+}
+
+// ===========================================================================
+// Selection caret unification + per-turn cost ledger (hover-preview meta).
+// ===========================================================================
+
+/// The selected user prompt opens on the shared `›` caret (the bug fix); an
+/// unselected prompt keeps the plain indent so the `◑`/`◐` bullet never shifts.
+#[test]
+fn selected_user_prompt_opens_on_the_caret() {
+    let item = TranscriptItem::user("hello");
+    let unselected = format_user_prompt_entry(&item, false, Some(80));
+    let selected = format_user_prompt_entry(&item, true, Some(80));
+    assert_eq!(
+        unselected[0].spans[0].content.as_ref(),
+        "  ",
+        "an unselected prompt keeps the plain indent",
+    );
+    assert_eq!(
+        selected[0].spans[0].content.as_ref(),
+        "\u{203a} ",
+        "a selected prompt opens on the `›` caret",
+    );
+}
+
+/// `turn_for_entry_index` (the ledger key) is numerically identical to the turn the
+/// session timeline assigns each entry — the shared-rule guard that keeps a turn's
+/// cost keyed to the same ordinal it is displayed under.
+#[test]
+fn turn_for_entry_index_matches_timeline_turn_numbering() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::system("preamble")); // turn 0
+    app.push_transcript_item(TranscriptItem::user("q1")); // turn 1
+    app.push_transcript_item(TranscriptItem::assistant("a1"));
+    app.push_transcript_item(TranscriptItem::user("q2")); // turn 2
+    app.push_transcript_item(TranscriptItem::assistant("a2"));
+    let entries = active_transcript_entries(&app);
+    let sources = build_timeline_sources(entries);
+    for (i, source) in sources.iter().enumerate() {
+        assert_eq!(
+            turn_for_entry_index(entries, i),
+            source.turn,
+            "entry {i} keys to the same turn the timeline shows",
+        );
+    }
+    assert_eq!(
+        current_turn_of(entries),
+        sources.last().unwrap().turn,
+        "current_turn_of equals the last entry's turn",
+    );
+}
+
+/// Only a priced turn (some provider token/usd usage) is worth recording.
+#[test]
+fn turn_metrics_priced_requires_provider_usage() {
+    assert!(
+        !turn_metrics_priced(&squeezy_core::TurnMetrics::default()),
+        "an empty turn is not priced",
+    );
+    let mut metrics = squeezy_core::TurnMetrics::default();
+    metrics.provider.output_tokens = Some(5);
+    assert!(turn_metrics_priced(&metrics), "provider usage is priced");
+}
+
+/// The hover-preview meta line carries the entry's turn and a message's size, and —
+/// for a prompt or answer on the main conversation — that turn's cost from the
+/// ledger. Both the prompt and the answer of a turn read the same cost.
+#[test]
+fn entry_preview_meta_shows_turn_size_and_cost() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("hi")); // turn 1
+    app.push_transcript_item(TranscriptItem::assistant("there\nworld")); // 2 lines
+
+    let mut metrics = squeezy_core::TurnMetrics::default();
+    metrics.provider.estimated_usd_micros = Some(12_340); // $0.0123
+    metrics.provider.input_tokens = Some(1234); // 1.2k
+    metrics.provider.output_tokens = Some(340);
+    app.turn_costs.insert(1, metrics);
+
+    let entries = active_transcript_entries(&app);
+    let prompt_meta =
+        build_entry_preview_meta(&app, &entries[0], turn_for_entry_index(entries, 0)).unwrap();
+    let answer_meta =
+        build_entry_preview_meta(&app, &entries[1], turn_for_entry_index(entries, 1)).unwrap();
+
+    assert!(prompt_meta.contains("turn 1"), "{prompt_meta}");
+    assert!(
+        prompt_meta.contains("$0.0123"),
+        "the prompt shows its turn's cost: {prompt_meta}",
+    );
+    assert!(
+        answer_meta.contains("$0.0123")
+            && answer_meta.contains("1.2k in")
+            && answer_meta.contains("340 out"),
+        "the answer shows the same turn's cost, tokens compacted: {answer_meta}",
+    );
+    assert!(
+        answer_meta.contains("2 lines"),
+        "the answer shows its size: {answer_meta}",
+    );
 }
