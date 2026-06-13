@@ -381,9 +381,53 @@ pub(crate) fn render_status_detail_line(
 }
 
 /// Resolve a single item to its display string. `None` hides the item.
+/// A short tier-ish label for a routed model id, used in the status line so the
+/// live rerouting target reads at a glance (`⤳haiku`) instead of a long id.
+/// Recognises the common small/mid tier families across providers; otherwise
+/// falls back to the trailing segment of the id, truncated.
+pub(crate) fn short_model_label(model: &str) -> String {
+    let lower = model.to_ascii_lowercase();
+    // `(needle, label)` pairs. `nano`/`mini` are matched only with a leading `-`
+    // so the substring `mini` does not match "ge[mini]ni"; `flash-lite`/`flash`
+    // are checked before them so the lite variant wins over a bare flash.
+    for (needle, label) in [
+        ("haiku", "haiku"),
+        ("sonnet", "sonnet"),
+        ("opus", "opus"),
+        ("flash-lite", "flash-lite"),
+        ("flash", "flash"),
+        ("-nano", "nano"),
+        ("-mini", "mini"),
+        ("pro", "pro"),
+    ] {
+        if lower.contains(needle) {
+            return label.to_string();
+        }
+    }
+    let tail = model.rsplit(['/', ':']).next().unwrap_or(model);
+    compact_text(tail, 16)
+}
+
+/// The `⤳<tier>` suffix shown after the model in the status line while the
+/// router has an active reroute/escalation target that differs from the
+/// configured model. Empty otherwise.
+fn active_route_suffix(app: &TuiApp) -> String {
+    match app
+        .active_routed_model
+        .as_deref()
+        .filter(|routed| *routed != app.model)
+    {
+        Some(routed) => format!(" ⤳{}", short_model_label(routed)),
+        None => String::new(),
+    }
+}
+
 pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<String> {
     match item {
-        StatusLineItem::Model => Some(compact_text(&app.model, 40)),
+        StatusLineItem::Model => Some(compact_text(
+            &format!("{}{}", app.model, active_route_suffix(app)),
+            40,
+        )),
         StatusLineItem::ModelWithReasoning => {
             let frag = crate::reasoning_status_fragment(app);
             if frag.is_empty() {
@@ -396,10 +440,13 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
             }
         }
         StatusLineItem::ProviderAndModel => {
-            let mut text = String::with_capacity(app.provider_name.len() + 1 + app.model.len());
+            let suffix = active_route_suffix(app);
+            let mut text =
+                String::with_capacity(app.provider_name.len() + 1 + app.model.len() + suffix.len());
             text.push_str(app.provider_name);
             text.push(':');
             text.push_str(&app.model);
+            text.push_str(&suffix);
             Some(compact_text(&text, 54))
         }
         StatusLineItem::ReasoningEffort => app

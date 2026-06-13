@@ -627,8 +627,21 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // A model-routing notice is TUI chrome, not turn content: push
                     // it as a dim `◦` note on the rail (one note pipeline) rather
                     // than a System transcript item, which rendered the off-rail
-                    // `• Noted ↪ routed …` line that severed the gutter.
-                    app.push_note(format!("routed `{from}` → `{to}` ({reason})"));
+                    // `• Noted ↪ routed …` line that severed the gutter. The lead
+                    // glyph makes the direction obvious at a glance: `↓` rerouted
+                    // DOWN to a cheaper rung at turn start, `↑` escalated UP a rung
+                    // mid-turn, `↳` kept on the parent because nothing cheaper fit.
+                    let note = if let Some(signal) = reason.strip_prefix("escalated_") {
+                        format!("↑ escalated `{from}` → `{to}` ({signal})")
+                    } else if reason == "reroute_skipped_context" {
+                        format!("↳ kept on `{to}` (context too large to reroute)")
+                    } else {
+                        format!("↓ rerouted `{from}` → `{to}` ({reason})")
+                    };
+                    // Surface the active model live in the status bar too; cleared
+                    // when the turn finishes (`note_turn_finished`).
+                    app.active_routed_model = Some(to.clone());
+                    app.push_note(note);
                     // Do not clear cap_unenforceable here: the new model may also
                     // be unpriced, and the broker's latch won't re-fire within this
                     // same turn. The flag is cleared only when we observe an actual

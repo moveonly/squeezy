@@ -26,14 +26,12 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::Deserialize;
-use squeezy_core::{AppConfig, CostSnapshot, RoutingConfig, SessionMode};
+use squeezy_core::{AppConfig, CostSnapshot, ModelTier, RoutingConfig, SessionMode, TierLadder};
 use squeezy_llm::{
     CacheRetention, CacheSpec, LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest,
     provider_honors_output_schema,
 };
 use tokio_util::sync::CancellationToken;
-
-use crate::cheap_model_for;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CheapReason {
@@ -74,6 +72,9 @@ pub(crate) enum TurnRoutingDecision {
     Parent,
     Cheap {
         reason: CheapReason,
+        /// Which rung of the ladder this turn starts on — `Weak` or `Medium`
+        /// (a `Strong` start is represented as `Parent`).
+        tier: ModelTier,
         model: Arc<str>,
     },
 }
@@ -81,6 +82,14 @@ pub(crate) enum TurnRoutingDecision {
 impl TurnRoutingDecision {
     pub(crate) fn is_cheap(&self) -> bool {
         matches!(self, Self::Cheap { .. })
+    }
+
+    /// The starting tier for this turn. `Parent` is the strong (flagship) rung.
+    pub(crate) fn tier(&self) -> ModelTier {
+        match self {
+            Self::Cheap { tier, .. } => *tier,
+            Self::Parent => ModelTier::Strong,
+        }
     }
 
     pub(crate) fn reason_label(&self) -> Option<String> {
@@ -468,20 +477,20 @@ struct JudgeReply {
     _reason: String,
 }
 
-/// Strict JSON-schema contract mirroring [`JudgeReply`]: a required
-/// `route` constrained to the two values [`parse_judge_reply`] accepts
-/// plus the `reason` the prompt asks for. Attached to the judge request
-/// only on providers that forward `output_schema`
-/// ([`provider_honors_output_schema`]) so the cheap-tier judge returns a
-/// schema-valid object instead of fenced/prose-wrapped JSON that costs a
-/// retry round — providers that drop the schema keep the loose-parse path.
+/// Strict JSON-schema contract mirroring [`JudgeReply`]: a required `route`
+/// constrained to the three tiers [`parse_judge_reply`] canonically emits plus
+/// the `reason` the prompt asks for. Attached to the judge request only on
+/// providers that forward `output_schema` ([`provider_honors_output_schema`])
+/// so the judge returns a schema-valid object instead of fenced/prose-wrapped
+/// JSON that costs a retry round — providers that drop the schema keep the
+/// loose-parse path (which also still accepts the legacy `cheap`/`parent`).
 fn judge_output_schema() -> LlmOutputSchema {
     LlmOutputSchema {
         name: "turn_route".to_string(),
         schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "route": { "type": "string", "enum": ["cheap", "parent"] },
+                "route": { "type": "string", "enum": ["weak", "medium", "strong"] },
                 "reason": { "type": "string" },
             },
             "required": ["route", "reason"],
@@ -496,6 +505,9 @@ pub(crate) struct ClassifyTurnInputs<'a> {
     pub provider: &'a Arc<dyn LlmProvider>,
     pub provider_name: &'a str,
     pub parent_model: &'a str,
+    /// The resolved cost/capability ladder for the active provider. Carries the
+    /// concrete weak/medium/strong model ids the decision selects among.
+    pub ladder: &'a TierLadder,
     pub config: &'a AppConfig,
     pub has_image_input: bool,
     pub has_large_attachment: bool,
@@ -534,9 +546,13 @@ impl ClassifyResult {
         }
     }
 
-    fn cheap(reason: CheapReason, model: Arc<str>) -> Self {
+    fn cheap(reason: CheapReason, tier: ModelTier, model: Arc<str>) -> Self {
         Self {
-            decision: TurnRoutingDecision::Cheap { reason, model },
+            decision: TurnRoutingDecision::Cheap {
+                reason,
+                tier,
+                model,
+            },
             judge_cost: CostSnapshot::default(),
             judge_model: None,
         }
@@ -548,6 +564,7 @@ pub(crate) async fn classify_turn(
     cancel: CancellationToken,
 ) -> ClassifyResult {
     let cfg = &inputs.config.routing;
+    let ladder = inputs.ladder;
 
     if inputs.overrides.force_parent {
         return ClassifyResult::parent();
@@ -559,12 +576,10 @@ pub(crate) async fn classify_turn(
         return ClassifyResult::parent();
     }
 
-    let Some(cheap) = cheap_model_for(inputs.provider_name, inputs.config) else {
-        return ClassifyResult::parent();
-    };
-    if cheap == inputs.parent_model {
-        // Routing to the same model would be a no-op — skip the
-        // classifier and the judge call entirely.
+    // Need a rung below the parent to reroute to at all. `can_reroute` is false
+    // when the ladder collapsed to a single rung (no cheap tier, or the cheap
+    // tier resolved to the parent itself) — routing would be a no-op.
+    if !ladder.can_reroute() {
         return ClassifyResult::parent();
     }
     // The reroute filter decides whether this parent is worth rerouting. The
@@ -578,7 +593,9 @@ pub(crate) async fn classify_turn(
             return ClassifyResult::parent();
         }
     }
-    let cheap: Arc<str> = Arc::from(cheap);
+    // The cheapest rung available — what the heuristic and `/cheap` target.
+    let (weak_tier, weak_model) = ladder.weakest();
+    let weak_model: Arc<str> = Arc::from(weak_model);
 
     if inputs.session_mode == SessionMode::Plan {
         return ClassifyResult::parent();
@@ -591,7 +608,7 @@ pub(crate) async fn classify_turn(
     }
 
     if inputs.overrides.force_cheap {
-        return ClassifyResult::cheap(CheapReason::UserExplicit, cheap);
+        return ClassifyResult::cheap(CheapReason::UserExplicit, weak_tier, weak_model);
     }
 
     // Linux sandbox/container/kernel prompts go to the parent by default so the
@@ -621,7 +638,7 @@ pub(crate) async fn classify_turn(
     if cfg.heuristic
         && let Some(reason) = heuristic_slam_dunk(inputs.user_input, cfg)
     {
-        return ClassifyResult::cheap(reason, cheap);
+        return ClassifyResult::cheap(reason, weak_tier, weak_model);
     }
 
     if !cfg.llm_judge {
@@ -631,7 +648,7 @@ pub(crate) async fn classify_turn(
     if prompt_chars == 0 || prompt_chars > cfg.judge_max_chars {
         return ClassifyResult::parent();
     }
-    let judge_model = judge_model_for(inputs.provider_name, inputs.config, &cheap);
+    let judge_model = judge_model_for(inputs.provider_name, inputs.config, &weak_model);
     // Custom judge prompt (per-provider override → global) falls back to the
     // built-in per-provider instructions.
     let instructions = inputs
@@ -651,15 +668,30 @@ pub(crate) async fn classify_turn(
     )
     .await;
     match verdict {
-        Some(true) => ClassifyResult {
-            decision: TurnRoutingDecision::Cheap {
-                reason: CheapReason::LlmJudge,
-                model: cheap,
-            },
-            judge_cost,
-            judge_model: Some(judge_model),
-        },
-        _ => ClassifyResult {
+        // The judge names a tier; clamp it up to the cheapest rung the ladder
+        // actually populates at or above that difficulty. A `strong` verdict (or
+        // a clamp that lands on the strong rung) keeps the turn on the parent.
+        Some(tier) => {
+            let (actual_tier, model) = ladder.at_least(tier);
+            if actual_tier == ModelTier::Strong {
+                ClassifyResult {
+                    decision: TurnRoutingDecision::Parent,
+                    judge_cost,
+                    judge_model: Some(judge_model),
+                }
+            } else {
+                ClassifyResult {
+                    decision: TurnRoutingDecision::Cheap {
+                        reason: CheapReason::LlmJudge,
+                        tier: actual_tier,
+                        model: Arc::from(model),
+                    },
+                    judge_cost,
+                    judge_model: Some(judge_model),
+                }
+            }
+        }
+        None => ClassifyResult {
             decision: TurnRoutingDecision::Parent,
             judge_cost,
             judge_model: Some(judge_model),
@@ -744,7 +776,7 @@ async fn run_judge(
     instructions: &str,
     user_input: &str,
     cancel: CancellationToken,
-) -> (Option<bool>, CostSnapshot) {
+) -> (Option<ModelTier>, CostSnapshot) {
     // The judge prompt is intentionally short. It sits below hosted
     // providers' useful prompt-cache minimums, so leave caching off
     // instead of surfacing misleading cache telemetry.
@@ -830,7 +862,7 @@ fn is_deictic_followup(user_input: &str) -> bool {
         .any(|marker| lower == *marker || lower.starts_with(&format!("{marker} ")))
 }
 
-fn parse_judge_reply(raw: &str) -> Option<bool> {
+fn parse_judge_reply(raw: &str) -> Option<ModelTier> {
     let trimmed = raw.trim();
     let body = trimmed
         .strip_prefix("```json")
@@ -838,14 +870,10 @@ fn parse_judge_reply(raw: &str) -> Option<bool> {
         .map(|stripped| stripped.trim().trim_end_matches("```").trim())
         .unwrap_or(trimmed);
     let reply: JudgeReply = serde_json::from_str(body).ok()?;
-    let route = reply.route.trim();
-    if route.eq_ignore_ascii_case("cheap") {
-        Some(true)
-    } else if route.eq_ignore_ascii_case("parent") {
-        Some(false)
-    } else {
-        None
-    }
+    // `ModelTier::parse` accepts the canonical weak/medium/strong as well as the
+    // legacy binary cheap/parent vocabulary, so an older judge prompt — or the
+    // scripted test provider — keeps routing correctly.
+    ModelTier::parse(reply.route.trim())
 }
 
 /// Per-turn escalation state. The streaming loop calls
@@ -856,9 +884,27 @@ fn parse_judge_reply(raw: &str) -> Option<bool> {
 pub(crate) struct EscalationState {
     pub triggered: Option<EscalationReason>,
     refusal_tail: String,
+    /// Cumulative-counter snapshots taken when the turn entered the current
+    /// rung. The detector compares against these deltas so each rung of a
+    /// stepwise escalation (weak → medium → strong) gets its OWN tool-call and
+    /// error budget rather than inheriting the cheaper rung's spend. Default
+    /// `0` keeps the single-escalation path (and every existing unit test)
+    /// identical: deltas equal the absolute cumulative counts.
+    tool_calls_baseline: u64,
+    errors_baseline: u64,
 }
 
 impl EscalationState {
+    /// Re-arm the detector for the next rung after a stepwise escalation:
+    /// clears the one-shot `triggered` latch and the refusal tail, and rebases
+    /// the counters so the new (stronger) rung starts with a fresh budget.
+    pub fn rearm_for_next_rung(&mut self, tool_calls: u64, tool_errors: u64, budget_denials: u64) {
+        self.triggered = None;
+        self.refusal_tail.clear();
+        self.tool_calls_baseline = tool_calls;
+        self.errors_baseline = tool_errors.saturating_add(budget_denials);
+    }
+
     /// The detector intentionally takes seven orthogonal signals
     /// (three counters, the latest assistant text, the on-cheap-turn
     /// gate, the routing config, and the parent's tool budget) so the
@@ -882,12 +928,15 @@ impl EscalationState {
             return None;
         }
         let ceiling = cfg.resolved_cheap_escalation_tool_calls(max_tool_calls_per_turn);
-        if tool_calls > ceiling {
+        if tool_calls.saturating_sub(self.tool_calls_baseline) > ceiling {
             self.triggered = Some(EscalationReason::ToolCallCeiling);
             return self.triggered;
         }
         let error_threshold = cfg.cheap_escalation_error_threshold as u64;
-        if tool_errors.saturating_add(budget_denials) >= error_threshold && error_threshold > 0 {
+        let errors = tool_errors
+            .saturating_add(budget_denials)
+            .saturating_sub(self.errors_baseline);
+        if errors >= error_threshold && error_threshold > 0 {
             self.triggered = Some(EscalationReason::ErrorThreshold);
             return self.triggered;
         }

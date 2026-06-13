@@ -6759,3 +6759,174 @@ fn provider_options_covers_all_accepted_providers() {
         );
     }
 }
+
+// -- Tier ladder (Auto rerouting) ------------------------------------------
+
+fn ladder_config(provider: &str, settings: ProviderSettings) -> AppConfig {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(provider.to_string(), settings);
+    AppConfig {
+        providers,
+        ..AppConfig::default()
+    }
+}
+
+#[test]
+fn model_tier_parse_accepts_legacy_and_new_vocab() {
+    assert_eq!(ModelTier::parse("cheap"), Some(ModelTier::Weak));
+    assert_eq!(ModelTier::parse("weak"), Some(ModelTier::Weak));
+    assert_eq!(ModelTier::parse("MID"), Some(ModelTier::Medium));
+    assert_eq!(ModelTier::parse("medium"), Some(ModelTier::Medium));
+    assert_eq!(ModelTier::parse("parent"), Some(ModelTier::Strong));
+    assert_eq!(ModelTier::parse("strong"), Some(ModelTier::Strong));
+    assert_eq!(ModelTier::parse("nonsense"), None);
+}
+
+#[test]
+fn model_tier_orders_weak_below_strong() {
+    assert!(ModelTier::Weak < ModelTier::Medium);
+    assert!(ModelTier::Medium < ModelTier::Strong);
+    assert_eq!(ModelTier::Weak.next_up(), Some(ModelTier::Medium));
+    assert_eq!(ModelTier::Medium.next_up(), Some(ModelTier::Strong));
+    assert_eq!(ModelTier::Strong.next_up(), None);
+}
+
+#[test]
+fn medium_model_for_anthropic_is_sonnet() {
+    assert_eq!(
+        medium_model_for_provider("anthropic"),
+        Some("claude-sonnet-4-6")
+    );
+}
+
+#[test]
+fn anthropic_ladder_is_haiku_sonnet_opus() {
+    let cfg = AppConfig::default();
+    let ladder = TierLadder::resolve(
+        &cfg,
+        "anthropic",
+        Some("claude-haiku-4-5-20251001"),
+        "claude-opus-4-8",
+    );
+    assert_eq!(
+        ladder.len(),
+        3,
+        "Haiku/Sonnet/Opus is a full three-rung ladder"
+    );
+    assert_eq!(
+        ladder.model_for(ModelTier::Weak),
+        Some("claude-haiku-4-5-20251001")
+    );
+    assert_eq!(
+        ladder.model_for(ModelTier::Medium),
+        Some("claude-sonnet-4-6")
+    );
+    assert_eq!(ladder.model_for(ModelTier::Strong), Some("claude-opus-4-8"));
+    assert_eq!(ladder.strong_model(), "claude-opus-4-8");
+    assert_eq!(ladder.weakest().0, ModelTier::Weak);
+    // Stepwise escalation climbs one rung at a time.
+    assert_eq!(
+        ladder.next_up(ModelTier::Weak),
+        Some((ModelTier::Medium, "claude-sonnet-4-6"))
+    );
+    assert_eq!(
+        ladder.next_up(ModelTier::Medium),
+        Some((ModelTier::Strong, "claude-opus-4-8"))
+    );
+    assert_eq!(ladder.next_up(ModelTier::Strong), None);
+}
+
+#[test]
+fn ladder_drops_medium_when_it_equals_parent() {
+    // Parent is Sonnet, so the mid rung is redundant: collapse to Haiku→Sonnet.
+    let cfg = AppConfig::default();
+    let ladder = TierLadder::resolve(
+        &cfg,
+        "anthropic",
+        Some("claude-haiku-4-5-20251001"),
+        "claude-sonnet-4-6",
+    );
+    assert_eq!(ladder.len(), 2);
+    assert_eq!(ladder.model_for(ModelTier::Medium), None);
+    // next_up steps straight over the missing rung to the parent.
+    assert_eq!(
+        ladder.next_up(ModelTier::Weak),
+        Some((ModelTier::Strong, "claude-sonnet-4-6"))
+    );
+}
+
+#[test]
+fn ladder_collapses_when_weak_equals_parent() {
+    let cfg = AppConfig::default();
+    let ladder = TierLadder::resolve(
+        &cfg,
+        "anthropic",
+        Some("claude-opus-4-8"),
+        "claude-opus-4-8",
+    );
+    // Weak == parent and medium (sonnet) != parent, so we keep Sonnet+Opus.
+    assert_eq!(ladder.model_for(ModelTier::Weak), None);
+    assert_eq!(ladder.strong_model(), "claude-opus-4-8");
+}
+
+#[test]
+fn openai_ladder_collapses_to_two_rungs() {
+    // OpenAI's `sonnet` alias is gpt-5.4-mini, which is also the typical weak
+    // tier — so the mid rung dedupes away and the ladder is mini→flagship.
+    let cfg = AppConfig::default();
+    let ladder = TierLadder::resolve(&cfg, "openai", Some("gpt-5.4-mini"), "gpt-5.5");
+    assert_eq!(ladder.len(), 2);
+    assert_eq!(ladder.model_for(ModelTier::Weak), Some("gpt-5.4-mini"));
+    assert_eq!(ladder.model_for(ModelTier::Medium), None);
+    assert_eq!(ladder.model_for(ModelTier::Strong), Some("gpt-5.5"));
+}
+
+#[test]
+fn per_provider_medium_override_wins_and_resolves_alias() {
+    let settings = ProviderSettings {
+        medium_model: Some("sonnet".to_string()),
+        ..Default::default()
+    };
+    let cfg = ladder_config("anthropic", settings);
+    let ladder = TierLadder::resolve(
+        &cfg,
+        "anthropic",
+        Some("claude-haiku-4-5-20251001"),
+        "claude-opus-4-8",
+    );
+    // "sonnet" alias resolves to the full Sonnet id.
+    assert_eq!(
+        ladder.model_for(ModelTier::Medium),
+        Some("claude-sonnet-4-6")
+    );
+}
+
+#[test]
+fn at_least_clamps_up_to_the_cheapest_available_rung() {
+    let cfg = AppConfig::default();
+    // Two-rung ladder (no medium): asking for Medium clamps up to Strong.
+    let ladder = TierLadder::resolve(&cfg, "openai", Some("gpt-5.4-mini"), "gpt-5.5");
+    assert_eq!(
+        ladder.at_least(ModelTier::Weak),
+        (ModelTier::Weak, "gpt-5.4-mini")
+    );
+    assert_eq!(
+        ladder.at_least(ModelTier::Medium),
+        (ModelTier::Strong, "gpt-5.5")
+    );
+    assert_eq!(
+        ladder.at_least(ModelTier::Strong),
+        (ModelTier::Strong, "gpt-5.5")
+    );
+}
+
+#[test]
+fn single_model_provider_yields_one_rung_ladder() {
+    let cfg = AppConfig::default();
+    // No weak model and no sonnet alias for an unknown provider → strong only.
+    let ladder = TierLadder::resolve(&cfg, "unknown-provider", None, "some-model");
+    assert_eq!(ladder.len(), 1);
+    assert!(!ladder.can_reroute());
+    assert_eq!(ladder.weakest(), (ModelTier::Strong, "some-model"));
+    assert_eq!(ladder.next_up(ModelTier::Strong), None);
+}

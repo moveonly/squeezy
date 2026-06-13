@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 const PARENT_MODEL: &str = "claude-opus-4-7";
 const CHEAP_MODEL: &str = "claude-haiku-4-5-20251001";
+const MEDIUM_MODEL: &str = "claude-sonnet-4-6";
 
 fn cheap_judge_completed_event() -> LlmEvent {
     LlmEvent::Completed {
@@ -259,6 +260,43 @@ async fn llm_judge_cheap_verdict_routes_borderline_prompt() {
         })
         .expect("must emit TurnRouted with judge reason");
     assert_eq!(reason, "llm_judge");
+}
+
+#[tokio::test]
+async fn llm_judge_medium_verdict_routes_to_mid_tier() {
+    // The Anthropic ladder for an Opus parent is Haiku → Sonnet → Opus. A
+    // "medium" verdict routes the turn to the Sonnet mid rung — the rung that
+    // simply did not exist in the old binary cheap↔parent router.
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        judge_reply("medium"),
+        end_turn_reply("handled on sonnet"),
+    ]));
+    let agent = Agent::new(config_with_routing(), provider.clone());
+    let events = drain_until_terminal(agent.start_turn(
+        "add a focused null-check to the parser in src/parse.rs".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "judge + turn must produce two requests");
+    assert_eq!(
+        &*requests[0].model, CHEAP_MODEL,
+        "judge dispatches on the cheap tier"
+    );
+    assert_eq!(
+        &*requests[1].model, MEDIUM_MODEL,
+        "medium verdict routes the turn to the Sonnet mid rung"
+    );
+
+    let routed = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::TurnRouted { to, reason, .. } if reason == "llm_judge" => Some(to.clone()),
+            _ => None,
+        })
+        .expect("medium route must emit TurnRouted with the judge reason");
+    assert_eq!(routed, MEDIUM_MODEL);
 }
 
 #[tokio::test]

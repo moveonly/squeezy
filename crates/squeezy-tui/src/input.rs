@@ -314,11 +314,14 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "[low|medium|high|xhigh|auto]",
         &[PermissionCapability::Edit],
     ),
-    slash("/cheap", "force the next turn onto the cheap model"),
-    slash("/parent", "force the next turn onto the main model"),
+    slash("/cheap", "force the next turn onto the cheap (weak) tier"),
+    slash(
+        "/parent",
+        "force the next turn onto the main (strong) model",
+    ),
     slash_args(
         "/router",
-        "toggle auto cheap-model routing (or open config)",
+        "toggle auto tiered routing weak→mid→strong (or open config)",
         true,
         "[on|off]",
     ),

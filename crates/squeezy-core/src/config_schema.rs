@@ -734,7 +734,20 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_provider_cheap_model,
                 default_display: "auto",
                 default: || FieldValue::String(String::new()),
-                help: "Route TO: the cheap model easy turns are sent to, for the active provider. Shows the model in effect; clear it to inherit the per-provider default mini tier (e.g. openai gpt-5.4-mini, google gemini-3.5-flash).",
+                help: "Route TO (weak rung): the cheap model easy turns are sent to, for the active provider. Shows the model in effect; clear it to inherit the per-provider default mini tier (e.g. openai gpt-5.4-mini, google gemini-3.5-flash).",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "medium_model",
+                toml_path: &["providers", "*", "medium_model"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_provider_medium_model,
+                set: set_provider_medium_model,
+                default_display: "auto",
+                default: || FieldValue::String(String::new()),
+                help: "Mid rung of the Auto ladder: moderate turns route here, and a weak turn escalates here before the parent. Empty = the per-provider Sonnet-class default (e.g. anthropic claude-sonnet-4-6); deduped away when it equals the cheap or parent model. Accepts aliases like 'sonnet'.",
                 env_override: None,
                 secret: false,
             },
@@ -3755,6 +3768,21 @@ fn default_cheap_model(cfg: &AppConfig, slug: &str) -> String {
         .or_else(|| (slug == "ollama").then(|| crate::DEFAULT_OLLAMA_MODEL.to_string()))
         .unwrap_or_default()
 }
+fn resolved_medium_model(cfg: &AppConfig, slug: &str) -> String {
+    cfg.providers
+        .get(slug)
+        .and_then(|p| p.medium_model.clone())
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| default_medium_model(slug))
+}
+fn default_medium_model(slug: &str) -> String {
+    // The ladder's mid rung defaults to the provider's Sonnet-class model
+    // (`medium_model_for_provider`); empty for providers with no distinct middle
+    // tier, where the ladder then collapses to cheap↔parent.
+    crate::medium_model_for_provider(slug)
+        .map(str::to_string)
+        .unwrap_or_default()
+}
 fn resolved_judge_model(cfg: &AppConfig, slug: &str) -> String {
     cfg.providers
         .get(slug)
@@ -3795,6 +3823,21 @@ fn set_provider_cheap_model(cfg: &mut AppConfig, value: FieldValue) -> Result<()
     let keep = s.trim().is_empty() || s == default_cheap_model(cfg, slug);
     let slug = slug.to_string();
     cfg.providers.entry(slug).or_default().cheap_model = (!keep).then_some(s);
+    Ok(())
+}
+
+fn get_provider_medium_model(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(resolved_medium_model(cfg, active_routing_provider(cfg)))
+}
+fn set_provider_medium_model(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::String(s) => s,
+        _ => return Err("expects string"),
+    };
+    let slug = active_routing_provider(cfg);
+    let keep = s.trim().is_empty() || s == default_medium_model(slug);
+    let slug = slug.to_string();
+    cfg.providers.entry(slug).or_default().medium_model = (!keep).then_some(s);
     Ok(())
 }
 

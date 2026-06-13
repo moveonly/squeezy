@@ -45576,6 +45576,12 @@ pub(crate) struct TuiApp {
     pub(crate) provider_name: &'static str,
     pub(crate) version: &'static str,
     pub(crate) model: String,
+    /// The model the live turn is actually running on when the router has
+    /// rerouted (down) or escalated (up) away from the configured `model`.
+    /// `None` between turns and on un-routed turns. Set from `TurnRouted`
+    /// events, surfaced as a `⤳tier` suffix in the status line, and cleared by
+    /// `note_turn_finished`.
+    pub(crate) active_routed_model: Option<String>,
     /// Mirror of `AppConfig::reasoning_effort`. `None` means "let the
     /// model choose"; the status-line `reasoning-effort` item hides
     /// itself in that case and shows the level (`low`, `medium`, …)
@@ -47223,6 +47229,7 @@ impl TuiApp {
             provider_name,
             version: env!("CARGO_PKG_VERSION"),
             model: config.model.clone(),
+            active_routed_model: None,
             reasoning_effort: config.reasoning_effort,
             directory: compact_path(&config.workspace_root),
             language_summary,
@@ -47763,6 +47770,9 @@ impl TuiApp {
         // end-of-turn footer prints final totals separately.
         self.turn_progress = None;
         self.active_tool_elapsed_ms = None;
+        // The routed-model badge describes the live turn only; the next turn
+        // re-derives it from its own routing decision.
+        self.active_routed_model = None;
         // Best-effort off-tab attention surface; the in-terminal toast and
         // title glyph already cover the on-screen case. We ignore any IO
         // error here because failing to notify is strictly less important

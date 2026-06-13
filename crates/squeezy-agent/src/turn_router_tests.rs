@@ -1,5 +1,5 @@
 use squeezy_core::{
-    CostSnapshot, DEFAULT_ROUTING_HEURISTIC_MAX_CHARS, DEFAULT_ROUTING_JUDGE_MAX_CHARS,
+    CostSnapshot, DEFAULT_ROUTING_HEURISTIC_MAX_CHARS, DEFAULT_ROUTING_JUDGE_MAX_CHARS, ModelTier,
     RoutingConfig,
 };
 
@@ -339,6 +339,54 @@ fn escalation_latches_once() {
 }
 
 #[test]
+fn rearm_gives_each_rung_its_own_tool_call_budget() {
+    // Default config derives the ceiling as max_tool_calls / 4; with max=40 the
+    // per-rung ceiling is 10, so escalation fires at the 11th call past the
+    // rung's baseline.
+    let cfg = default_routing_config();
+    let mut state = EscalationState::default();
+    assert_eq!(
+        state.maybe_trigger(11, 0, 0, "", true, &cfg, 40),
+        Some(EscalationReason::ToolCallCeiling)
+    );
+    // Latched until re-armed, even far past the ceiling.
+    assert_eq!(state.maybe_trigger(50, 0, 0, "", true, &cfg, 40), None);
+    // Re-arm for the next rung at the current cumulative count: the new rung
+    // starts with a fresh budget measured as a delta from 11.
+    state.rearm_for_next_rung(11, 0, 0);
+    assert_eq!(
+        state.maybe_trigger(21, 0, 0, "", true, &cfg, 40),
+        None,
+        "delta of 10 is at the ceiling, not over it"
+    );
+    assert_eq!(
+        state.maybe_trigger(22, 0, 0, "", true, &cfg, 40),
+        Some(EscalationReason::ToolCallCeiling),
+        "delta of 11 trips the next rung"
+    );
+}
+
+#[test]
+fn rearm_gives_each_rung_its_own_error_budget() {
+    let cfg = default_routing_config(); // error threshold = 2
+    let mut state = EscalationState::default();
+    assert_eq!(
+        state.maybe_trigger(0, 2, 0, "", true, &cfg, 40),
+        Some(EscalationReason::ErrorThreshold)
+    );
+    state.rearm_for_next_rung(0, 2, 0);
+    assert_eq!(
+        state.maybe_trigger(0, 3, 0, "", true, &cfg, 40),
+        None,
+        "one new error after re-arm is below the threshold"
+    );
+    assert_eq!(
+        state.maybe_trigger(0, 4, 0, "", true, &cfg, 40),
+        Some(EscalationReason::ErrorThreshold)
+    );
+}
+
+#[test]
 fn sticky_window_expires_after_n_turns() {
     let mut sticky = super::StickyEscalation::default();
     sticky.engage(3);
@@ -352,14 +400,27 @@ fn sticky_window_expires_after_n_turns() {
 
 #[test]
 fn parse_judge_reply_handles_bare_json() {
-    let parsed = super::parse_judge_reply(r#"{"route":"cheap","reason":"single command"}"#);
-    assert_eq!(parsed, Some(true));
+    // Legacy "cheap" maps to the weak tier; the new vocabulary parses directly.
+    assert_eq!(
+        super::parse_judge_reply(r#"{"route":"cheap","reason":"single command"}"#),
+        Some(ModelTier::Weak)
+    );
+    assert_eq!(
+        super::parse_judge_reply(r#"{"route":"weak","reason":"single command"}"#),
+        Some(ModelTier::Weak)
+    );
+    assert_eq!(
+        super::parse_judge_reply(r#"{"route":"medium","reason":"localized edit"}"#),
+        Some(ModelTier::Medium)
+    );
 }
 
 #[test]
 fn parse_judge_reply_handles_code_fence() {
     let raw = "```json\n{\"route\":\"parent\",\"reason\":\"needs reasoning\"}\n```";
-    assert_eq!(super::parse_judge_reply(raw), Some(false));
+    assert_eq!(super::parse_judge_reply(raw), Some(ModelTier::Strong));
+    let strong = "```json\n{\"route\":\"strong\",\"reason\":\"needs reasoning\"}\n```";
+    assert_eq!(super::parse_judge_reply(strong), Some(ModelTier::Strong));
 }
 
 #[test]
@@ -391,8 +452,8 @@ fn judge_output_schema_mirrors_judge_reply() {
     let values: Vec<&str> = route_enum.iter().filter_map(|v| v.as_str()).collect();
     assert_eq!(
         values,
-        vec!["cheap", "parent"],
-        "route enum is the parse set"
+        vec!["weak", "medium", "strong"],
+        "route enum is the canonical tier set"
     );
     assert_eq!(props["reason"]["type"], "string");
     assert_eq!(
@@ -405,14 +466,28 @@ fn judge_output_schema_mirrors_judge_reply() {
     );
 
     // A schema-valid document deserializes into the real parse target and
-    // routes to the expected decision — the schema cannot drift from the
-    // struct without this failing.
-    for (route, expect) in [("cheap", Some(true)), ("parent", Some(false))] {
+    // routes to the expected tier — the schema cannot drift from the struct
+    // without this failing.
+    for (route, expect) in [
+        ("weak", Some(ModelTier::Weak)),
+        ("medium", Some(ModelTier::Medium)),
+        ("strong", Some(ModelTier::Strong)),
+    ] {
         let doc = serde_json::json!({ "route": route, "reason": "x" });
         let reply: super::JudgeReply = serde_json::from_value(doc.clone()).expect("deserializes");
         assert_eq!(reply.route, route);
         assert_eq!(super::parse_judge_reply(&doc.to_string()), expect);
     }
+    // The loose parser still accepts the legacy binary vocabulary so older judge
+    // prompts (and the scripted integration provider) keep routing correctly.
+    assert_eq!(
+        super::parse_judge_reply(r#"{"route":"cheap","reason":"x"}"#),
+        Some(ModelTier::Weak)
+    );
+    assert_eq!(
+        super::parse_judge_reply(r#"{"route":"parent","reason":"x"}"#),
+        Some(ModelTier::Strong)
+    );
 }
 
 /// Records every request it is handed so a test can inspect the
@@ -487,7 +562,7 @@ async fn run_judge_attaches_schema_only_on_supporting_provider() {
         tokio_util::sync::CancellationToken::new(),
     )
     .await;
-    assert_eq!(verdict, Some(true));
+    assert_eq!(verdict, Some(ModelTier::Weak));
     let req = recorder.last_request();
     assert_eq!(
         req.output_schema,
@@ -679,8 +754,8 @@ fn judge_instructions_all_variants_keep_routing_guidance() {
     for provider in ["anthropic", "openai", "google"] {
         let prompt = super::judge_instructions_for(provider);
         assert!(
-            prompt.contains("'cheap'") && prompt.contains("'parent'"),
-            "{provider} variant must carry the cheap/parent guidance: {prompt}"
+            prompt.contains("'weak'") && prompt.contains("'medium'") && prompt.contains("'strong'"),
+            "{provider} variant must carry the weak/medium/strong guidance: {prompt}"
         );
         assert!(
             prompt.contains("JSON"),

@@ -21,7 +21,7 @@ use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
     ContextAttachmentStatus, ContextCompactionRecord, ContextCompactionState,
     ContextCompactionTrigger, ContextEstimate, ContextPin, CostOrigin, CostSnapshot,
-    DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_OLLAMA_MODEL, PROJECT_SETTINGS_FILE,
+    DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_OLLAMA_MODEL, ModelTier, PROJECT_SETTINGS_FILE,
     PermissionAction, PermissionCapability, PermissionPolicyMode, PermissionRequest,
     PermissionRisk, PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict,
     ProviderConfig, Redactor, ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError,
@@ -6354,7 +6354,65 @@ fn instructions_with_batch_hint(instructions: &str, enabled: bool) -> String {
     format!("{instructions}\n\n{BATCH_TOOL_CALLS_HINT}")
 }
 
+/// A short system-prompt suffix telling the model which rung of the cost ladder
+/// it is running on. On the weak/medium rungs it primes the model to flag when a
+/// task out-strips it (the refusal-phrase detector turns that into an automatic
+/// escalation); once the strong model takes over after an escalation it is told
+/// not to trust the weaker model's earlier work without re-verifying it (the
+/// "Opus shouldn't blindly trust Haiku" requirement). Returns `None` for a plain
+/// strong-tier turn that never routed cheap, so unrouted turns keep the exact
+/// prompt — and prompt-cache prefix — they always had.
+fn tier_trust_note(tier: ModelTier, started_cheap: bool) -> Option<String> {
+    match tier {
+        ModelTier::Weak | ModelTier::Medium => Some(format!(
+            "[Routing] This turn is running on the {} model tier, chosen automatically to keep \
+             routine work cheap. Do it well within your ability. If it turns out to need deeper \
+             architectural reasoning, broad multi-file synthesis, or you are genuinely uncertain \
+             how to proceed, say so plainly (e.g. \"I'm not sure\") rather than guessing — a \
+             stronger model will automatically take over.",
+            tier.label()
+        )),
+        ModelTier::Strong if started_cheap => Some(
+            "[Routing] You are the strong model and have just taken over this turn from a cheaper, \
+             weaker model that handled the earlier steps. Do not assume its edits, tool-result \
+             interpretations, or conclusions are correct — re-verify the key work before relying \
+             on it."
+                .to_string(),
+        ),
+        ModelTier::Strong => None,
+    }
+}
+
 impl TurnRuntime {
+    /// Shared tail for a mid-turn escalation: engages the sticky window, mirrors
+    /// it into `ConversationState` for resume, spawns telemetry, and emits the
+    /// `TurnRouted` event. The caller updates `current_model` / `current_tier` /
+    /// `on_cheap_turn` / re-arms the detector locally before calling this.
+    async fn emit_escalation(&self, from_model: String, to_model: String, reason_token: &str) {
+        let sticky_remaining = {
+            let mut state = self.routing_state.lock().expect("routing state lock");
+            state
+                .sticky
+                .engage(self.config.routing.escalation_sticky_turns);
+            state.sticky.remaining_turns
+        };
+        self.conversation_state
+            .lock()
+            .await
+            .set_routing_sticky_remaining_turns(sticky_remaining);
+        self.telemetry
+            .spawn(TelemetryEvent::routing_escalated(reason_token));
+        let _ = self
+            .tx
+            .send(AgentEvent::TurnRouted {
+                turn_id: self.turn_id,
+                from: from_model,
+                to: to_model,
+                reason: format!("escalated_{reason_token}"),
+            })
+            .await;
+    }
+
     fn session_prompt_cache_key(&self) -> Option<String> {
         self.session_log
             .as_ref()
@@ -7330,12 +7388,24 @@ impl TurnRuntime {
             .lock()
             .await
             .set_routing_sticky_remaining_turns(sticky_remaining_after_tick);
+        // The cost/capability ladder for the active provider — weak (small-fast)
+        // → medium (Sonnet-class) → strong (the parent/headline model). The
+        // classifier picks a starting rung; mid-turn escalation steps up it one
+        // rung at a time. Owned (no borrow of `self.config`), so it stays valid
+        // across the `&mut self` calls in the turn loop below.
+        let routing_ladder = squeezy_core::TierLadder::resolve(
+            &self.config,
+            self.provider.name(),
+            cheap_model_for(self.provider.name(), &self.config).as_deref(),
+            &parent_model_str,
+        );
         let classify_result = turn_router::classify_turn(
             turn_router::ClassifyTurnInputs {
                 user_input: &task_title,
                 provider: &self.provider,
                 provider_name: self.provider.name(),
                 parent_model: &parent_model_str,
+                ladder: &routing_ladder,
                 config: &self.config,
                 has_image_input: !image_items.is_empty(),
                 has_large_attachment: has_large_non_image_attachment(
@@ -7396,44 +7466,67 @@ impl TurnRuntime {
             // the per-model ledger's main-origin total.
             merge_cost(&mut total_cost, &judge_cost);
         }
+        // The rung this turn starts on (`Strong` == the parent/headline model).
+        // Mutated as mid-turn escalation steps it up the ladder.
+        let mut current_tier = decision.tier();
         let mut current_model: Arc<str> = match &decision {
             turn_router::TurnRoutingDecision::Cheap { model, .. } => model.clone(),
             turn_router::TurnRoutingDecision::Parent => parent_model.clone(),
         };
         let mut on_cheap_turn = decision.is_cheap();
-        // Reroute fit-check (NO compaction). A cheap turn must fit the cheaper
-        // model's effective window exactly as the conversation already stands.
-        // If it wouldn't fit, stay on the parent rather than compact-to-fit —
-        // routing must never shrink the context the parent resumes on next turn
-        // (the Opus→Haiku→broken-context hazard). Compaction stays owned by the
-        // parent model's own pressure logic.
+        // Context-aware tier selection (NO compaction). A routed turn must fit
+        // the chosen rung's effective window exactly as the conversation already
+        // stands; if it does not, climb the ladder to the cheapest rung that
+        // does. Routing must never shrink the context the parent resumes on next
+        // turn (the Opus→Haiku→broken-context hazard), so we step UP, never
+        // compact down. If nothing below the parent fits, the turn runs on the
+        // parent with no savings. Compaction stays owned by the parent model's
+        // own pressure logic.
         if on_cheap_turn {
-            let observed_ceiling = {
-                let state = self.conversation_state.lock().await;
-                state
-                    .observed_context_ceilings
-                    .get(&(self.provider.name().to_string(), current_model.to_string()))
-                    .copied()
-            };
-            if !model_fits_conversation(
-                &self.config,
-                self.provider.name(),
-                self.configured_model_context_window,
-                &current_model,
-                &conversation,
-                observed_ceiling,
-            ) {
+            let mut context_bumped_to: Option<Arc<str>> = None;
+            while current_tier != ModelTier::Strong {
+                let observed_ceiling = {
+                    let state = self.conversation_state.lock().await;
+                    state
+                        .observed_context_ceilings
+                        .get(&(self.provider.name().to_string(), current_model.to_string()))
+                        .copied()
+                };
+                if model_fits_conversation(
+                    &self.config,
+                    self.provider.name(),
+                    self.configured_model_context_window,
+                    &current_model,
+                    &conversation,
+                    observed_ceiling,
+                ) {
+                    break;
+                }
+                // The current rung cannot hold the context as-is — step up one.
+                match routing_ladder.next_up(current_tier) {
+                    Some((next_tier, next_model)) => {
+                        current_tier = next_tier;
+                        current_model = Arc::from(next_model);
+                        context_bumped_to = Some(current_model.clone());
+                    }
+                    None => {
+                        current_tier = ModelTier::Strong;
+                        current_model = parent_model.clone();
+                    }
+                }
+            }
+            if current_tier == ModelTier::Strong {
+                // No rung below the parent could hold the context: the turn stays
+                // on the parent (no savings), same outcome as the old binary
+                // fit-check, surfaced under the same stable reason token.
                 self.log_event(
                     "routing_skipped_context",
                     Some(self.turn_id),
                     Some(format!(
-                        "cheap model {current_model} cannot fit the current context; staying on \
-                         parent {parent_model_str} (no compaction)"
+                        "no rung below the parent {parent_model_str} can fit the current context; \
+                         staying on parent (no compaction)"
                     )),
-                    json!({
-                        "cheap_model": current_model.to_string(),
-                        "parent_model": parent_model_str,
-                    }),
+                    json!({ "parent_model": parent_model_str }),
                 );
                 let _ = self
                     .tx
@@ -7444,8 +7537,16 @@ impl TurnRuntime {
                         reason: "reroute_skipped_context".to_string(),
                     })
                     .await;
-                current_model = parent_model.clone();
                 on_cheap_turn = false;
+            } else if let Some(bumped) = context_bumped_to {
+                self.log_event(
+                    "routing_context_bumped",
+                    Some(self.turn_id),
+                    Some(format!(
+                        "context did not fit the judged rung; bumped up to {bumped}"
+                    )),
+                    json!({ "model": bumped.to_string() }),
+                );
             }
         }
         if on_cheap_turn {
@@ -7724,12 +7825,12 @@ impl TurnRuntime {
                 .as_ref()
                 .expect("instructions cache populated above")
                 .clone();
-            // Mid-turn escalation: if the cheap-routed turn has tripped
-            // any signal we tracked over the previous round, swap to
-            // the parent model from this round onward and let the
-            // sticky window suppress routing on the next user prompt.
-            // The decision is one-way — once the turn escalates it
-            // never falls back to the cheap tier within this turn.
+            // Mid-turn escalation: if the routed turn has tripped any signal we
+            // tracked over the previous round, step UP one rung of the ladder
+            // (weak → medium → strong) from this round onward and let the sticky
+            // window suppress routing on the next user prompt. The detector is
+            // re-armed with a fresh per-rung budget so a still-cheap rung can
+            // escalate again; escalation never steps back DOWN within a turn.
             if on_cheap_turn
                 && let Some(reason) = escalation_state.maybe_trigger(
                     broker.metrics.tool_calls,
@@ -7740,42 +7841,36 @@ impl TurnRuntime {
                     &self.config.routing,
                     self.config.max_tool_calls_per_turn,
                 )
+                && let Some((next_tier, next_model)) = routing_ladder.next_up(current_tier)
             {
                 let from_model = current_model.to_string();
-                current_model = parent_model.clone();
-                on_cheap_turn = false;
-                broker.metrics.escalated_to_parent = true;
-                let sticky_remaining = {
-                    let mut state = self.routing_state.lock().expect("routing state lock");
-                    state
-                        .sticky
-                        .engage(self.config.routing.escalation_sticky_turns);
-                    state.sticky.remaining_turns
-                };
-                // Mirror the engaged window into `ConversationState`
-                // so the next `to_resume_state()` call — which
-                // happens at every turn boundary via
-                // `persist_turn_accounting` — persists it without
-                // any extra plumbing.
-                self.conversation_state
-                    .lock()
-                    .await
-                    .set_routing_sticky_remaining_turns(sticky_remaining);
-                self.telemetry
-                    .spawn(TelemetryEvent::routing_escalated(reason.as_str()));
-                let _ = self
-                    .tx
-                    .send(AgentEvent::TurnRouted {
-                        turn_id: self.turn_id,
-                        from: from_model,
-                        to: parent_model_str.clone(),
-                        reason: format!("escalated_{}", reason.as_str()),
-                    })
+                let to_model: Arc<str> = Arc::from(next_model);
+                current_tier = next_tier;
+                current_model = to_model.clone();
+                on_cheap_turn = current_tier != ModelTier::Strong;
+                if current_tier == ModelTier::Strong {
+                    broker.metrics.escalated_to_parent = true;
+                }
+                escalation_state.rearm_for_next_rung(
+                    broker.metrics.tool_calls,
+                    broker.metrics.tool_errors,
+                    broker.metrics.budget_denials,
+                );
+                self.emit_escalation(from_model, to_model.to_string(), reason.as_str())
                     .await;
             }
+            // Tell the model which rung it is on — and, after an escalation, tell
+            // the strong model not to trust the weaker model's earlier work
+            // (see `tier_trust_note`). Appended per round so it tracks the live
+            // tier; constant within a rung, so it does not churn the prompt cache.
+            let effective_instructions =
+                match tier_trust_note(current_tier, broker.metrics.routed_to_cheap) {
+                    Some(note) => format!("{cached_instructions}\n\n{note}"),
+                    None => cached_instructions,
+                };
             let request = LlmRequest {
                 model: current_model.clone(),
-                instructions: Arc::from(cached_instructions),
+                instructions: Arc::from(effective_instructions),
                 input: Arc::from(next_input.as_slice()),
                 max_output_tokens: self.config.max_output_tokens,
                 temperature: self.config.temperature,
@@ -8033,33 +8128,23 @@ impl TurnRuntime {
                                 &self.config.routing,
                                 self.config.max_tool_calls_per_turn,
                             )
+                            && let Some((next_tier, next_model)) =
+                                routing_ladder.next_up(current_tier)
                         {
                             let from_model = current_model.to_string();
-                            current_model = parent_model.clone();
-                            on_cheap_turn = false;
-                            broker.metrics.escalated_to_parent = true;
-                            let sticky_remaining = {
-                                let mut state =
-                                    self.routing_state.lock().expect("routing state lock");
-                                state
-                                    .sticky
-                                    .engage(self.config.routing.escalation_sticky_turns);
-                                state.sticky.remaining_turns
-                            };
-                            self.conversation_state
-                                .lock()
-                                .await
-                                .set_routing_sticky_remaining_turns(sticky_remaining);
-                            self.telemetry
-                                .spawn(TelemetryEvent::routing_escalated(reason.as_str()));
-                            let _ = self
-                                .tx
-                                .send(AgentEvent::TurnRouted {
-                                    turn_id: self.turn_id,
-                                    from: from_model,
-                                    to: parent_model_str.clone(),
-                                    reason: format!("escalated_{}", reason.as_str()),
-                                })
+                            let to_model: Arc<str> = Arc::from(next_model);
+                            current_tier = next_tier;
+                            current_model = to_model.clone();
+                            on_cheap_turn = current_tier != ModelTier::Strong;
+                            if current_tier == ModelTier::Strong {
+                                broker.metrics.escalated_to_parent = true;
+                            }
+                            escalation_state.rearm_for_next_rung(
+                                broker.metrics.tool_calls,
+                                broker.metrics.tool_errors,
+                                broker.metrics.budget_denials,
+                            );
+                            self.emit_escalation(from_model, to_model.to_string(), reason.as_str())
                                 .await;
                         }
                     }
@@ -8324,30 +8409,16 @@ impl TurnRuntime {
                     cheap_provider_error_retry_used = true;
                     let reason = turn_router::EscalationReason::ProviderError;
                     let from_model = current_model.to_string();
+                    // A provider error on a routed model (rate limit, "model not
+                    // found", transient outage) is best recovered by jumping
+                    // straight to the reliable parent rather than stepping one
+                    // rung — a sibling rung may hit the same condition, and this
+                    // is a one-shot recovery, not a quality cascade.
                     current_model = parent_model.clone();
+                    current_tier = ModelTier::Strong;
                     on_cheap_turn = false;
                     broker.metrics.escalated_to_parent = true;
-                    let sticky_remaining = {
-                        let mut state = self.routing_state.lock().expect("routing state lock");
-                        state
-                            .sticky
-                            .engage(self.config.routing.escalation_sticky_turns);
-                        state.sticky.remaining_turns
-                    };
-                    self.conversation_state
-                        .lock()
-                        .await
-                        .set_routing_sticky_remaining_turns(sticky_remaining);
-                    self.telemetry
-                        .spawn(TelemetryEvent::routing_escalated(reason.as_str()));
-                    let _ = self
-                        .tx
-                        .send(AgentEvent::TurnRouted {
-                            turn_id: self.turn_id,
-                            from: from_model,
-                            to: parent_model_str.clone(),
-                            reason: format!("escalated_{}", reason.as_str()),
-                        })
+                    self.emit_escalation(from_model, parent_model_str.clone(), reason.as_str())
                         .await;
                     continue;
                 }
@@ -9116,33 +9187,24 @@ impl TurnRuntime {
                 );
                 routing_diversity_results_seen =
                     routing_diversity_results_seen.saturating_add(observed);
-                if routing_diversity_paths.len() >= ROUTING_DIVERSITY_DISTINCT_PATHS {
+                if routing_diversity_paths.len() >= ROUTING_DIVERSITY_DISTINCT_PATHS
+                    && let Some((next_tier, next_model)) = routing_ladder.next_up(current_tier)
+                {
                     let reason = turn_router::EscalationReason::ToolDiversity;
                     let from_model = current_model.to_string();
-                    current_model = parent_model.clone();
-                    on_cheap_turn = false;
-                    broker.metrics.escalated_to_parent = true;
-                    let sticky_remaining = {
-                        let mut state = self.routing_state.lock().expect("routing state lock");
-                        state
-                            .sticky
-                            .engage(self.config.routing.escalation_sticky_turns);
-                        state.sticky.remaining_turns
-                    };
-                    self.conversation_state
-                        .lock()
-                        .await
-                        .set_routing_sticky_remaining_turns(sticky_remaining);
-                    self.telemetry
-                        .spawn(TelemetryEvent::routing_escalated(reason.as_str()));
-                    let _ = self
-                        .tx
-                        .send(AgentEvent::TurnRouted {
-                            turn_id: self.turn_id,
-                            from: from_model,
-                            to: parent_model_str.clone(),
-                            reason: format!("escalated_{}", reason.as_str()),
-                        })
+                    let to_model: Arc<str> = Arc::from(next_model);
+                    current_tier = next_tier;
+                    current_model = to_model.clone();
+                    on_cheap_turn = current_tier != ModelTier::Strong;
+                    if current_tier == ModelTier::Strong {
+                        broker.metrics.escalated_to_parent = true;
+                    }
+                    escalation_state.rearm_for_next_rung(
+                        broker.metrics.tool_calls,
+                        broker.metrics.tool_errors,
+                        broker.metrics.budget_denials,
+                    );
+                    self.emit_escalation(from_model, to_model.to_string(), reason.as_str())
                         .await;
                 }
             }

@@ -110,6 +110,210 @@ pub fn judge_model_for_provider(provider: &str) -> Option<&'static str> {
     }
 }
 
+/// A rung on the cost/capability ladder the "Auto" router climbs, ordered
+/// cheapest → most capable. `Weak` is the small-fast tier (Anthropic Haiku,
+/// OpenAI nano/mini, Gemini Flash), `Strong` is the user's headline/parent
+/// model (Opus, GPT-5.x, Gemini Pro), and `Medium` is the mid rung in between
+/// (Anthropic Sonnet) — present only when the provider exposes a model
+/// strictly between the weak and strong rungs (see [`TierLadder`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTier {
+    Weak,
+    Medium,
+    Strong,
+}
+
+impl ModelTier {
+    /// Stable lowercase token used in telemetry, the judge contract, and the
+    /// `AgentEvent::TurnRouted` reason strings.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Weak => "weak",
+            Self::Medium => "medium",
+            Self::Strong => "strong",
+        }
+    }
+
+    /// Short human label for indicators ("cheap"/"mid"/"strong"). Mirrors the
+    /// cheap/mid/expensive vocabulary users reach for.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Weak => "cheap",
+            Self::Medium => "mid",
+            Self::Strong => "strong",
+        }
+    }
+
+    /// Parse a tier from a judge verdict or user input, accepting the historical
+    /// `cheap`/`parent` binary vocabulary alongside the new weak/medium/strong
+    /// and a few colloquial synonyms so the judge prompt and `/cheap`,`/parent`
+    /// slash commands keep working unchanged.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "weak" | "cheap" | "low" | "small" | "fast" => Some(Self::Weak),
+            "medium" | "mid" | "balanced" | "moderate" => Some(Self::Medium),
+            "strong" | "parent" | "expensive" | "high" | "flagship" | "best" => Some(Self::Strong),
+            _ => None,
+        }
+    }
+
+    /// The next rung up the abstract ladder (toward more capable), ignoring
+    /// whether a concrete model exists for it. Use [`TierLadder::next_up`] to
+    /// step over rungs the active provider does not populate.
+    pub const fn next_up(self) -> Option<Self> {
+        match self {
+            Self::Weak => Some(Self::Medium),
+            Self::Medium => Some(Self::Strong),
+            Self::Strong => None,
+        }
+    }
+}
+
+/// Built-in mid-rung model id for `provider` — the rung strictly between the
+/// small-fast tier and the flagship. Derived from the provider's `sonnet`-class
+/// alias (Anthropic Sonnet, and the Sonnet-backed default on Bedrock/gateways).
+/// Returns `None` for providers with no distinct middle tier; the
+/// [`TierLadder`] resolver additionally dedupes the result against the weak and
+/// strong rungs, so providers whose `sonnet` alias collapses onto their cheap
+/// tier (OpenAI mini, Gemini Flash) cleanly fall back to a two-rung ladder.
+/// Overridable per provider via `[providers.<p>].medium_model`.
+pub fn medium_model_for_provider(provider: &str) -> Option<&'static str> {
+    resolve_model_alias(provider, "sonnet")
+}
+
+/// The ordered cost/capability ladder for a single provider, resolved from the
+/// configured weak (small-fast) and strong (parent/headline) models plus the
+/// provider's mid rung. Rungs are deduped by model id so a provider with no
+/// distinct middle, or whose cheap tier equals the parent, collapses to fewer
+/// rungs without ever listing the same model twice. The strong rung is always
+/// present — it is the model the user chose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierLadder {
+    /// `(tier, model_id)` ordered cheapest → strongest.
+    rungs: Vec<(ModelTier, String)>,
+}
+
+impl TierLadder {
+    /// Resolve the ladder for `provider`. `weak` is the small-fast model the
+    /// caller already resolved (e.g. `cheap_model_for`), `strong` is the parent
+    /// model. The medium rung comes from `[providers.<p>].medium_model` →
+    /// [`medium_model_for_provider`]. Rungs equal to the strong rung (or, for
+    /// the weak rung, equal to a populated medium) are dropped.
+    pub fn resolve(config: &AppConfig, provider: &str, weak: Option<&str>, strong: &str) -> Self {
+        let weak = weak
+            .map(str::to_string)
+            // Routing to the parent model is a no-op; drop a weak rung that
+            // resolves to the same id as the strong rung.
+            .filter(|w| w != strong);
+
+        let medium = config
+            .providers
+            .get(provider)
+            .and_then(|p| p.medium_model.clone())
+            .filter(|m| !m.trim().is_empty())
+            .map(|m| {
+                resolve_model_alias(provider, &m)
+                    .map(str::to_string)
+                    .unwrap_or(m)
+            })
+            .or_else(|| medium_model_for_provider(provider).map(str::to_string))
+            // A medium rung that is just the parent again, or that collapses
+            // onto the weak rung (OpenAI mini, Gemini Flash), carries no value.
+            .filter(|m| m != strong)
+            .filter(|m| weak.as_deref() != Some(m.as_str()));
+
+        let mut rungs = Vec::with_capacity(3);
+        if let Some(w) = weak {
+            rungs.push((ModelTier::Weak, w));
+        }
+        if let Some(m) = medium {
+            rungs.push((ModelTier::Medium, m));
+        }
+        rungs.push((ModelTier::Strong, strong.to_string()));
+        Self { rungs }
+    }
+
+    /// All rungs, cheapest → strongest.
+    pub fn rungs(&self) -> &[(ModelTier, String)] {
+        &self.rungs
+    }
+
+    /// Number of distinct rungs (1 = single-model provider, 2 = classic
+    /// cheap↔parent, 3 = full weak/medium/strong ladder).
+    pub fn len(&self) -> usize {
+        self.rungs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rungs.is_empty()
+    }
+
+    /// True when the ladder has a rung cheaper than the strong (parent) tier,
+    /// i.e. there is somewhere to reroute a turn to.
+    pub fn can_reroute(&self) -> bool {
+        self.rungs.len() > 1
+    }
+
+    /// The model id for `tier`, if the ladder populated that rung.
+    pub fn model_for(&self, tier: ModelTier) -> Option<&str> {
+        self.rungs
+            .iter()
+            .find(|(t, _)| *t == tier)
+            .map(|(_, m)| m.as_str())
+    }
+
+    /// The strong (parent) model — always present.
+    pub fn strong_model(&self) -> &str {
+        self.rungs
+            .last()
+            .map(|(_, m)| m.as_str())
+            .expect("ladder always carries the strong rung")
+    }
+
+    /// The cheapest rung (tier + model). For a one-rung ladder this is the
+    /// strong rung.
+    pub fn weakest(&self) -> (ModelTier, &str) {
+        self.rungs
+            .first()
+            .map(|(t, m)| (*t, m.as_str()))
+            .expect("ladder always carries at least the strong rung")
+    }
+
+    /// Which tier `model` occupies in this ladder, if any.
+    pub fn tier_of(&self, model: &str) -> Option<ModelTier> {
+        self.rungs.iter().find(|(_, m)| m == model).map(|(t, _)| *t)
+    }
+
+    /// The next populated rung strictly above `tier` (tier + model), skipping
+    /// rungs the provider did not populate. `None` when `tier` is already the
+    /// top rung. This is how mid-turn escalation steps weak → medium → strong
+    /// one rung at a time, collapsing to weak → strong on providers without a
+    /// medium rung.
+    pub fn next_up(&self, tier: ModelTier) -> Option<(ModelTier, &str)> {
+        self.rungs
+            .iter()
+            .find(|(t, _)| *t > tier)
+            .map(|(t, m)| (*t, m.as_str()))
+    }
+
+    /// The lowest rung whose tier is `>= floor` (tier + model). Used to clamp a
+    /// chosen starting tier up to the cheapest rung that actually exists at or
+    /// above the judged difficulty. Falls back to the strong rung.
+    pub fn at_least(&self, floor: ModelTier) -> (ModelTier, &str) {
+        self.rungs
+            .iter()
+            .find(|(t, _)| *t >= floor)
+            .map(|(t, m)| (*t, m.as_str()))
+            .unwrap_or_else(|| {
+                self.rungs
+                    .last()
+                    .map(|(t, m)| (*t, m.as_str()))
+                    .expect("ladder always carries the strong rung")
+            })
+    }
+}
+
 /// Built-in default reroute filter for `provider` — a single standard regex
 /// matched against the parent model to decide whether an easy turn is worth
 /// rerouting (the parent is rerouted when the regex matches). The defaults use a
@@ -176,38 +380,54 @@ pub fn resolved_reroute_filter(config: &AppConfig, provider: &str) -> String {
 // debugging → parent) but differ in formatting cues per provider tier. Lives
 // in core so the config screen can show "the prompt we're using" and the agent
 // can dispatch it. A user `[providers.<p>].judge_prompt` overrides this.
+// The judge classifies a turn into one of three cost/capability tiers — weak
+// (cheap/fast), medium (mid), strong (flagship). The JSON field stays named
+// `route` (back-compat with the loose parser and the binary `cheap`/`parent`
+// values it still accepts). Guidance: pick the CHEAPEST tier that handles the
+// task well; when torn between two, pick the stronger one. Stepwise escalation
+// upgrades a turn that under-shoots, so the judge can lean cheap.
 pub const JUDGE_PROMPT_DEFAULT: &str = concat!(
-    "You are a routing classifier deciding which LLM should handle a coding-agent turn. ",
-    "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast and ",
-    "inexpensive but weaker at ambiguous instructions and architectural judgement. ",
+    "You are a routing classifier deciding which model tier should handle a coding-agent turn. ",
     "Reply with a SINGLE JSON object on one line, no markdown, no prose: ",
-    "{\"route\":\"cheap\"|\"parent\",\"reason\":\"<short explanation>\"}.\n\n",
-    "Choose 'cheap' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
+    "{\"route\":\"weak\"|\"medium\"|\"strong\",\"reason\":\"<short explanation>\"}.\n\n",
+    "There are three tiers, cheapest first: 'weak' is a small fast model (e.g. Haiku), ",
+    "'medium' is a mid model (e.g. Sonnet), 'strong' is the flagship (e.g. Opus) — expensive but ",
+    "best at multi-step reasoning.\n\n",
+    "Choose 'weak' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
     "operation plus its targets (e.g. \"checkout branch X and run cargo test\", \"rename foo() to bar() in src/lib.rs\"). ",
-    "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
-    "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
+    "Choose 'medium' for moderately complex but well-scoped work — a localized edit or feature in one or a few ",
+    "files, a focused bug fix, or straightforward multi-step work that needs no deep architectural judgement. ",
+    "Choose 'strong' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
+    "investigation, tricky debugging, or judgement about trade-offs. ",
+    "Pick the cheapest tier that can do the job well; when torn between two tiers, choose the stronger one.",
 );
 pub const JUDGE_PROMPT_OPENAI: &str = concat!(
     "You are a routing classifier. Output ONLY a single JSON object on one line. ",
     "Do NOT include any prose, preamble, explanation, or trailing text. ",
-    "Schema: {\"route\":\"cheap\"|\"parent\",\"reason\":\"<short explanation>\"}.\n\n",
-    "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast but ",
-    "weaker at ambiguous instructions and architectural judgement. ",
-    "Choose 'cheap' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
+    "Schema: {\"route\":\"weak\"|\"medium\"|\"strong\",\"reason\":\"<short explanation>\"}.\n\n",
+    "There are three tiers, cheapest first: 'weak' is a small fast model (e.g. nano), ",
+    "'medium' is a mid model (e.g. mini), 'strong' is the flagship — expensive but best at multi-step reasoning.\n\n",
+    "Choose 'weak' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
     "operation plus its targets (e.g. \"checkout branch X and run cargo test\", \"rename foo() to bar() in src/lib.rs\"). ",
-    "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
-    "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
+    "Choose 'medium' for moderately complex but well-scoped work — a localized edit or feature in one or a few ",
+    "files, a focused bug fix, or straightforward multi-step work that needs no deep architectural judgement. ",
+    "Choose 'strong' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
+    "investigation, tricky debugging, or judgement about trade-offs. ",
+    "Pick the cheapest tier that can do the job well; when torn between two tiers, choose the stronger one.",
 );
 pub const JUDGE_PROMPT_GOOGLE: &str = concat!(
     "You are a routing classifier. Reply with ONLY a single JSON object on one line — NO markdown fences, ",
     "NO code blocks, NO prose, NO commentary. ",
-    "Schema: {\"route\":\"cheap\"|\"parent\",\"reason\":\"<short explanation>\"}.\n\n",
-    "The parent model is expensive but excellent at multi-step reasoning. The cheap model is fast but ",
-    "weaker at ambiguous instructions and architectural judgement. ",
-    "Choose 'cheap' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
+    "Schema: {\"route\":\"weak\"|\"medium\"|\"strong\",\"reason\":\"<short explanation>\"}.\n\n",
+    "There are three tiers, cheapest first: 'weak' is a small fast model (e.g. Flash Lite), ",
+    "'medium' is a mid model (e.g. Flash), 'strong' is the flagship (e.g. Pro) — best at multi-step reasoning.\n\n",
+    "Choose 'weak' when the request is well-specified, narrowly scoped, and mechanical — a single named ",
     "operation plus its targets (e.g. \"checkout branch X and run cargo test\", \"rename foo() to bar() in src/lib.rs\"). ",
-    "Choose 'parent' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
-    "investigation, debugging, or judgement about trade-offs. When in doubt, choose 'parent'.",
+    "Choose 'medium' for moderately complex but well-scoped work — a localized edit or feature in one or a few ",
+    "files, a focused bug fix, or straightforward multi-step work that needs no deep architectural judgement. ",
+    "Choose 'strong' when the request needs architectural reasoning, cross-file synthesis, exploratory ",
+    "investigation, tricky debugging, or judgement about trade-offs. ",
+    "Pick the cheapest tier that can do the job well; when torn between two tiers, choose the stronger one.",
 );
 
 /// The built-in judge prompt for `provider`. A `[providers.<p>].judge_prompt`
@@ -4161,8 +4381,14 @@ pub struct ProviderSettings {
     /// `cheap_model_for` / `judge_model_for` in `squeezy-agent`.
     ///
     /// The model easy turns are rerouted to. `None` = the per-provider built-in
-    /// (`small_fast_model_for_provider`).
+    /// (`small_fast_model_for_provider`). This is the weak rung of the
+    /// [`TierLadder`].
     pub cheap_model: Option<String>,
+    /// The mid rung of the cost/capability ladder — the model moderate turns
+    /// route to and the rung a weak turn escalates to before the parent. `None`
+    /// = the per-provider built-in (`medium_model_for_provider`, Anthropic
+    /// Sonnet). Deduped against the weak and strong rungs by [`TierLadder`].
+    pub medium_model: Option<String>,
     /// The model that classifies turns cheap-vs-parent. `None` = the
     /// per-provider built-in mini tier (`judge_model_for_provider`). Should be a
     /// cheap/fast model.
@@ -4212,6 +4438,7 @@ impl ProviderSettings {
                 "cf_ai_gateway",
                 "use_oauth",
                 "cheap_model",
+                "medium_model",
                 "judge_model",
                 "judge_prompt",
                 "expensive_models",
@@ -4480,6 +4707,12 @@ impl ProviderSettings {
             cf_ai_gateway,
             use_oauth: bool_value(table, "use_oauth", source, &field(path, "use_oauth"))?,
             cheap_model: string_value(table, "cheap_model", source, &field(path, "cheap_model"))?,
+            medium_model: string_value(
+                table,
+                "medium_model",
+                source,
+                &field(path, "medium_model"),
+            )?,
             judge_model: string_value(table, "judge_model", source, &field(path, "judge_model"))?,
             judge_prompt: string_value(
                 table,
@@ -4532,6 +4765,7 @@ impl ProviderSettings {
         replace_if_some(&mut self.cf_ai_gateway, next.cf_ai_gateway);
         replace_if_some(&mut self.use_oauth, next.use_oauth);
         replace_if_some(&mut self.cheap_model, next.cheap_model);
+        replace_if_some(&mut self.medium_model, next.medium_model);
         replace_if_some(&mut self.judge_model, next.judge_model);
         replace_if_some(&mut self.judge_prompt, next.judge_prompt);
         replace_if_some(&mut self.expensive_models, next.expensive_models);

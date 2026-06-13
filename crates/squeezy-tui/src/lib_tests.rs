@@ -3482,6 +3482,46 @@ async fn status_line_context_ticks_live_mid_turn() {
     assert_eq!(app.status_context_input_tokens, Some(500));
 }
 
+#[test]
+fn short_model_label_recognizes_tier_families() {
+    assert_eq!(
+        status::short_model_label("claude-haiku-4-5-20251001"),
+        "haiku"
+    );
+    assert_eq!(status::short_model_label("claude-sonnet-4-6"), "sonnet");
+    assert_eq!(
+        status::short_model_label("anthropic/claude-opus-4.8"),
+        "opus"
+    );
+    assert_eq!(status::short_model_label("gpt-5.4-nano"), "nano");
+    assert_eq!(
+        status::short_model_label("gemini-2.5-flash-lite"),
+        "flash-lite"
+    );
+}
+
+#[test]
+fn status_line_shows_active_route_suffix() {
+    let mut app = test_app(SessionMode::Build);
+    // No active route → plain provider:model, exactly as before.
+    let plain = status::resolve_status_item(&app, status::StatusLineItem::ProviderAndModel)
+        .expect("provider+model");
+    assert!(!plain.contains('⤳'), "no suffix when not routed: {plain}");
+    // An active reroute to a cheaper rung surfaces a `⤳tier` badge.
+    app.active_routed_model = Some("claude-haiku-4-5-20251001".to_string());
+    let routed = status::resolve_status_item(&app, status::StatusLineItem::ProviderAndModel)
+        .expect("provider+model");
+    assert!(routed.contains("⤳haiku"), "routed suffix present: {routed}");
+    // A routed target equal to the configured model adds nothing (no-op route).
+    app.active_routed_model = Some(app.model.clone());
+    let same = status::resolve_status_item(&app, status::StatusLineItem::ProviderAndModel)
+        .expect("provider+model");
+    assert!(
+        !same.contains('⤳'),
+        "no suffix when routed == configured: {same}"
+    );
+}
+
 #[tokio::test]
 async fn cancelled_turn_clears_live_status_context() {
     let mut app = test_app(SessionMode::Build);
