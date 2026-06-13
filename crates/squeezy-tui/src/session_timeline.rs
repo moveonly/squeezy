@@ -180,15 +180,22 @@ pub(crate) struct TimelineEvent {
 
 impl TimelineEvent {
     /// The event's timestamp rendered as a compact `m:ss` clock relative to the
-    /// session start, or `"--:--"` when the source carried no timestamp (the
-    /// honest "missing timestamp" rendering). Pure so the time column is
-    /// unit-testable without a terminal.
+    /// session start (rolling up to `h:mm:ss` once an hour elapses so the
+    /// minutes field never runs away), or `"--:--"` when the source carried no
+    /// timestamp (the honest "missing timestamp" rendering). Pure so the time
+    /// column is unit-testable without a terminal.
     pub(crate) fn clock(&self) -> String {
         match self.timestamp {
             Some(secs) => {
-                let minutes = secs / 60;
                 let seconds = secs % 60;
-                format!("{minutes}:{seconds:02}")
+                if secs >= 3600 {
+                    let hours = secs / 3600;
+                    let minutes = (secs % 3600) / 60;
+                    format!("{hours}:{minutes:02}:{seconds:02}")
+                } else {
+                    let minutes = secs / 60;
+                    format!("{minutes}:{seconds:02}")
+                }
             }
             None => "--:--".to_string(),
         }

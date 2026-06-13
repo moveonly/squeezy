@@ -30655,7 +30655,7 @@ fn render_session_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
                 }),
             ),
             Span::styled(
-                format!("{:>6} ", event.clock()),
+                format!("{:>7} ", event.clock()),
                 Style::default().fg(crate::render::theme::quiet()),
             ),
             Span::styled(
