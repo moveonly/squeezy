@@ -69,7 +69,7 @@ use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // Accessibility Quality Gate (§12.10.5). `cfg(test)`-gated so the audit harness
 // never compiles into a shipped TUI binary; every item is exercised by its
@@ -3969,6 +3969,58 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         }
     }
 
+    // Text selection in the COMPOSER (the bottom prompt box). Mirrors the
+    // transcript press/drag/release contract above, but maps the screen cell onto
+    // a BYTE offset in `app.input` via `composer_char_from_mouse`. The cache the
+    // hit-test reads is only populated when `render_input` actually paints the
+    // composer (a fullscreen overlay/config/modal clears it up front in
+    // `render_surfaces`), so this branch silently no-ops — falling through to the
+    // footer/queue handling below — whenever one of those surfaces owns the
+    // pointer or the cell is outside the composer's painted text rectangle.
+    if app.transcript_overlay.is_none() && app.config_screen.is_none() {
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                if let Some(pos) = composer_char_from_mouse(app, mouse.column, mouse.row) {
+                    // Mutual exclusion: starting a composer selection drops any
+                    // live transcript selection so the two never both arm (the
+                    // transcript Up arm above only fires on a Main selection,
+                    // this one only on an input selection).
+                    app.selection = None;
+                    input::begin_input_selection(app, pos);
+                    app.input_cursor = pos;
+                    return true;
+                }
+            }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                if app.input_selection.is_some()
+                    && let Some(pos) = composer_char_from_mouse(app, mouse.column, mouse.row)
+                {
+                    input::extend_input_selection(app, pos);
+                    app.input_cursor = pos;
+                    return true;
+                }
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                if app.input_selection.is_some() =>
+            {
+                // Release ends a composer drag. A bare press+release with no drag
+                // leaves a collapsed (empty) selection; clear it so a single click
+                // just repositions the caret rather than arming a 0-width range.
+                // A real (non-empty) selection auto-copies when `copy_on_select`
+                // is on (drag, then paste), keeping the highlight so the explicit
+                // copy chords stay the clear-on-copy path — same contract as the
+                // transcript Up arm above.
+                if input::input_selection_range(app).is_none() {
+                    input::clear_input_selection(app);
+                } else if app.copy_on_select {
+                    let _ = copy_input_selection(app);
+                }
+                return true;
+            }
+            _ => {}
+        }
+    }
+
     // Shift+wheel pans the no-wrap main view horizontally (§11G.4): the mouse
     // affordance paired with the `Alt+h`/`Alt+l` keyboard pan (which stays the
     // primary, reliable path — with mouse capture on, many terminals reserve
@@ -4394,6 +4446,11 @@ fn handle_main_selection_press(
     };
     app.last_click = Some((now, column, row, multiplicity));
 
+    // Mutual exclusion: starting a transcript selection drops any live composer
+    // selection so the two surfaces never both arm (mirror of the composer
+    // Down arm clearing `app.selection`).
+    input::clear_input_selection(app);
+
     // Shift+click extends the current selection's cursor (when one exists on
     // this surface).
     if modifiers.contains(KeyModifiers::SHIFT)
@@ -4499,6 +4556,23 @@ fn select_row_at(
     app.selection = Some(sel);
 }
 
+/// Copy the active COMPOSER text selection (mouse drag / Shift-arrow) to the
+/// clipboard. Returns `true` when there was a non-empty input selection to
+/// copy; `false` (leaving the clipboard untouched) so the caller falls back to
+/// the transcript-selection / semantic-scope copy. The composer paints raw
+/// input, so the payload is the selected substring verbatim — no gutter/clean-
+/// text projection. Does NOT clear the selection (callers decide).
+fn copy_input_selection(app: &mut TuiApp) -> bool {
+    let Some(text) = input::input_selected_text(app) else {
+        return false;
+    };
+    if text.is_empty() {
+        return false;
+    }
+    deliver_copy(app, &text, "selection");
+    true
+}
+
 /// Copy the active selection's clean text to the clipboard with a status toast.
 /// Returns `true` when there was a non-empty selection to copy.
 fn copy_active_selection(app: &mut TuiApp) -> bool {
@@ -4517,14 +4591,23 @@ fn copy_active_selection(app: &mut TuiApp) -> bool {
     true
 }
 
-/// Copy whichever app-level selection is active. Today that is the
-/// transcript/overlay visual selection; the screen-level selection will hook
-/// in here so every copy chord (`⌘C`, `Ctrl+Shift+C`, `Ctrl+C`) shares one
-/// funnel. Returns `true` when something was copied. Does NOT clear the
-/// selection — callers decide (explicit copy chords clear, copy-on-release
-/// keeps the highlight for quote/add-to-set follow-ups).
+/// Copy whichever app-level selection is active so every copy chord (`⌘C`,
+/// `Ctrl+Shift+C`, `Ctrl+C`) shares one funnel. A live COMPOSER selection wins
+/// over the transcript selection — the user is selecting in the prompt box, so
+/// the chord copies that substring verbatim. Returns `true` when something was
+/// copied. Does NOT clear the selection — callers decide (explicit copy chords
+/// clear via [`clear_all_text_selections`], copy-on-release keeps the highlight
+/// for quote/add-to-set follow-ups).
 fn copy_any_active_selection(app: &mut TuiApp) -> bool {
-    copy_active_selection(app)
+    copy_input_selection(app) || copy_active_selection(app)
+}
+
+/// Clear BOTH the transcript and composer selections. The explicit copy chords
+/// (`⌘C`/`Ctrl+Shift+C`/`Ctrl+C`) clear-on-copy, and since either surface may
+/// have held the copied range, both are dropped to leave a clean slate.
+fn clear_all_text_selections(app: &mut TuiApp) {
+    app.selection = None;
+    input::clear_input_selection(app);
 }
 
 /// True for the system-convention copy chords: `⌘C` (kitty-protocol
@@ -7616,6 +7699,28 @@ fn handle_subagent_pane_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     }
 }
 
+/// Run a composer cursor move and reconcile the input selection (§ composer
+/// text selection). When `extend` is set (a Shift-modified motion) the moving
+/// end of the selection follows the cursor — beginning a fresh selection
+/// anchored at the PRE-move cursor when none was live — so Shift+arrow grows a
+/// range from where the caret sat. A bare (non-Shift) motion clears any live
+/// selection so the next gesture starts fresh. `mv` performs the actual caret
+/// move on `app.input_cursor`.
+fn move_composer_cursor(app: &mut TuiApp, extend: bool, mv: impl FnOnce(&mut TuiApp)) {
+    if extend {
+        let before = input::input_cursor(app);
+        if app.input_selection.is_none() {
+            input::begin_input_selection(app, before);
+        }
+        mv(app);
+        let after = input::input_cursor(app);
+        input::extend_input_selection(app, after);
+    } else {
+        input::clear_input_selection(app);
+        mv(app);
+    }
+}
+
 pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Result<bool> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Ok(false);
@@ -7644,7 +7749,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             app.terminal_title_state = TerminalTitleState::Cleared;
         }
         if copy_any_active_selection(app) {
-            app.selection = None;
+            clear_all_text_selections(app);
         } else {
             app.status = "nothing selected — drag with the mouse to select text".to_string();
         }
@@ -8157,8 +8262,13 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         let mv = match key.code {
             KeyCode::PageUp => Some(SelectionMove::PageUp),
             KeyCode::PageDown => Some(SelectionMove::PageDown),
-            KeyCode::Home => Some(SelectionMove::LineHome),
-            KeyCode::End => Some(SelectionMove::LineEnd),
+            // Shift+Home/End extend the TRANSCRIPT selection only when the
+            // composer is empty; with draft text they extend the COMPOSER
+            // selection instead (handled in the composer Home/End arms below),
+            // mirroring the TranscriptHome/TranscriptEnd convention so a
+            // Shift+Home while editing never hijacks line-select out of the box.
+            KeyCode::Home if app.input.is_empty() => Some(SelectionMove::LineHome),
+            KeyCode::End if app.input.is_empty() => Some(SelectionMove::LineEnd),
             _ => None,
         };
         if let Some(mv) = mv {
@@ -8222,7 +8332,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         // exit-confirm behavior below. Shares the copy funnel with the
         // `⌘C`/`Ctrl+Shift+C` intercept at the top of `handle_key`.
         if copy_any_active_selection(app) {
-            app.selection = None;
+            clear_all_text_selections(app);
             app.needs_redraw = true;
             return Ok(false);
         }
@@ -8335,7 +8445,8 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
-        move_input_cursor_line_start(app);
+        // Bare emacs-style caret motion: clears any live composer selection.
+        move_composer_cursor(app, false, move_input_cursor_line_start);
         return Ok(false);
     }
 
@@ -8367,22 +8478,22 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
-        move_input_cursor_left(app);
+        move_composer_cursor(app, false, move_input_cursor_left);
         return Ok(false);
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
-        move_input_cursor_right(app);
+        move_composer_cursor(app, false, move_input_cursor_right);
         return Ok(false);
     }
 
     if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('b') {
-        move_input_cursor_word_left(app);
+        move_composer_cursor(app, false, move_input_cursor_word_left);
         return Ok(false);
     }
 
     if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('f') {
-        move_input_cursor_word_right(app);
+        move_composer_cursor(app, false, move_input_cursor_word_right);
         return Ok(false);
     }
 
@@ -8439,32 +8550,40 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         // `[tui.keymap]`. When dispatch returned `false` for Home/End
         // (composer non-empty) the line-cursor cases below execute.
         KeyCode::Home => {
-            move_input_cursor_line_start(app);
+            // Shift+Home extends the composer selection to the line start; a
+            // bare Home clears it (see `move_composer_cursor`).
+            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+            move_composer_cursor(app, extend, move_input_cursor_line_start);
             Ok(false)
         }
         KeyCode::End => {
-            move_input_cursor_line_end(app);
+            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+            move_composer_cursor(app, extend, move_input_cursor_line_end);
             Ok(false)
         }
         KeyCode::Left => {
+            // Shift extends the composer selection; ALT/CONTROL pick the by-word
+            // motion (Shift+Ctrl/Alt+Left extends by a word).
+            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
             if key
                 .modifiers
                 .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
             {
-                move_input_cursor_word_left(app);
+                move_composer_cursor(app, extend, move_input_cursor_word_left);
             } else {
-                move_input_cursor_left(app);
+                move_composer_cursor(app, extend, move_input_cursor_left);
             }
             Ok(false)
         }
         KeyCode::Right => {
+            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
             if key
                 .modifiers
                 .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
             {
-                move_input_cursor_word_right(app);
+                move_composer_cursor(app, extend, move_input_cursor_word_right);
             } else {
-                move_input_cursor_right(app);
+                move_composer_cursor(app, extend, move_input_cursor_right);
             }
             Ok(false)
         }
@@ -21683,6 +21802,12 @@ fn copy_transcript_scope(
     scope: copy::CopyScope,
     format: copy::CopyFormat,
 ) -> bool {
+    // An active COMPOSER selection wins over everything: the user is selecting
+    // text in the prompt box, so a copy chord copies that substring verbatim.
+    if copy_input_selection(app) {
+        return true;
+    }
+
     // An active visual selection wins over the requested semantic unit: every
     // copy chord copies the selection when one is present, otherwise the focused
     // unit. The clean-text comes from the selection's own painted surface.
@@ -25049,6 +25174,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &TuiApp) {
 /// duplicating the HUD call at every early return.
 fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     app.begin_frame_clickables();
+    // Invalidate the composer hit-test cache up front: the fullscreen overlay /
+    // config / modal surfaces below `return` early without painting the composer,
+    // so leaving a stale cache would let a click on one of those surfaces map onto
+    // a phantom composer offset. `render_input` repopulates it when the main view
+    // actually paints the composer this frame.
+    app.input_area_cache.set(None);
     let area = frame.area();
     // Record the size we're painting at so off-frame transcript geometry
     // (`active_transcript_geometry`, `jump_*_geometry`,
@@ -35003,6 +35134,41 @@ pub(crate) struct MainTextAreaCache {
     h_offset: u16,
 }
 
+/// One painted logical line of the composer: the byte range of [`TuiApp::input`]
+/// it shows and the screen row the line's FIRST wrapped sub-row sits on. A
+/// logical line is a single `\n`-delimited chunk of the input; the Paragraph
+/// soft-wraps each into one-or-more screen rows by display width, so the mouse
+/// hit-test walks `display_width` from `first_screen_row` to find the sub-row
+/// and then the char within it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InputContentRow {
+    /// Screen row (absolute) of this logical line's first wrapped sub-row.
+    first_screen_row: u16,
+    /// Byte offset in [`TuiApp::input`] where this logical line begins.
+    byte_start: usize,
+    /// The logical line's text (without the trailing `\n`).
+    text: String,
+}
+
+/// Per-frame snapshot of the composer's painted text geometry, recorded at the
+/// end of `render_input` so a mouse press/drag maps a screen `(col, row)` onto a
+/// byte offset in [`TuiApp::input`]. The painter prepends a one-cell pad to each
+/// content row (see `composer_bubble_lines`), so [`Self::lead_cols`] is `1` and
+/// the hit-test subtracts it before mapping display column → char.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InputAreaCache {
+    /// The painted composer rect (origin + size).
+    area: Rect,
+    /// Display width (cells) available for wrapped content on the FIRST sub-row
+    /// of a logical line: `area.width - lead_cols`, min 1.
+    content_width: u16,
+    /// Cells of left pad the painter prepends to each content row.
+    lead_cols: u16,
+    /// The visible logical lines, top to bottom, each tagged with the screen row
+    /// of its first wrapped sub-row and its byte start in the input.
+    rows: Vec<InputContentRow>,
+}
+
 /// How a keyboard extend moves the selection cursor (Shift+nav). The per-move
 /// math lives in `extend_selection`, delegating row/page motion to
 /// `crate::selection`.
@@ -41932,6 +42098,10 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     let parts = app.input.split('\n').collect::<Vec<_>>();
     let slash_ranges = input::slash_command_ranges(&app.input);
     let bang_range = bang_command_marker_range(&app.input);
+    // The active composer text selection (byte range into `app.input`), if any:
+    // its cells are painted with the same REVERSED highlight the transcript
+    // selection uses so the two surfaces read consistently.
+    let selection_range = input::input_selection_range(app);
     let mut line_start = 0usize;
     parts
         .iter()
@@ -41939,7 +42109,7 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
             let mut spans = Vec::new();
             let line_end = line_start + line.len();
             let style_text_at = |abs_offset: usize| -> Style {
-                if bang_range
+                let base = if bang_range
                     .as_ref()
                     .is_some_and(|range| range.contains(&abs_offset))
                 {
@@ -41953,6 +42123,14 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
                     Style::default().fg(crate::render::theme::accent())
                 } else {
                     Style::default().fg(crate::render::theme::foreground())
+                };
+                if selection_range
+                    .as_ref()
+                    .is_some_and(|range| range.contains(&abs_offset))
+                {
+                    base.patch(selection_highlight_style())
+                } else {
+                    base
                 }
             };
             if cursor >= line_start && cursor <= line_end {
@@ -42119,6 +42297,173 @@ fn composer_bubble_lines(
         lines.push(Line::from(""));
     }
     lines
+}
+
+/// The composer layout geometry the painter (`composer_bubble_lines`) lays the
+/// content out with, expressed as `(window_start, content_top, lead_cols)`:
+///
+/// - `window_start` — first logical-line index shown (the windowing when the
+///   input is taller than the interior),
+/// - `content_top` — index in the produced `lines` `Vec` where the first content
+///   row sits (`1` horizon `+ top_pad`, or `0` in the no-chrome small-area case),
+/// - `lead_cols` — cells of left pad the painter prepends to each content row
+///   (`1` normally, `0` in the no-chrome case).
+///
+/// `content_len` is the number of logical (`\n`-split) lines. Mirrors
+/// `composer_bubble_lines` exactly so the mouse hit-test reconstructs the same
+/// row→line mapping the painter used.
+fn composer_content_geometry(
+    content_len: usize,
+    cursor_line: usize,
+    height: u16,
+    width: u16,
+) -> (usize, usize, u16) {
+    let width = width as usize;
+    let height = height as usize;
+    // No-chrome path: `composer_bubble_lines` returns the content unchrome'd
+    // (no horizon, no pad), so content begins at row 0 with no lead pad.
+    if width < 4 || height < 2 {
+        return (0, 0, 0);
+    }
+    let interior_rows = height.saturating_sub(1);
+    let (window_start, shown) = if content_len > interior_rows {
+        let cursor_line = cursor_line.min(content_len - 1);
+        let half = interior_rows / 2;
+        let max_start = content_len - interior_rows;
+        (
+            cursor_line.saturating_sub(half).min(max_start),
+            interior_rows,
+        )
+    } else {
+        (0, content_len)
+    };
+    let spare = interior_rows.saturating_sub(shown);
+    let top_pad = spare / 2;
+    // horizon line is `lines[0]`, then `top_pad` blanks, then content.
+    (window_start, 1 + top_pad, 1)
+}
+
+/// Snapshot the composer's painted text geometry into `app.input_area_cache` so
+/// a later mouse press/drag can map a screen `(col, row)` onto a byte offset in
+/// `app.input`. Mirrors the layout `composer_bubble_lines` paints (windowing +
+/// vertical pad + the one-cell left pad) and folds in the Paragraph's `scroll`
+/// so the recorded screen rows match exactly what the user sees.
+///
+/// `prompt_height` is the row budget the composer block itself was laid out at
+/// (`area.height` minus the indicator/overlay strips), and `scroll` is the
+/// vertical offset the footer Paragraph paints with.
+fn record_input_area_cache(app: &TuiApp, area: Rect, prompt_height: u16, scroll: u16) {
+    if area.width == 0 || area.height == 0 {
+        app.input_area_cache.set(None);
+        return;
+    }
+    let cursor_line = app.input[..input_cursor(app)].matches('\n').count();
+    // Logical (`\n`-split) lines, each with its byte start in the input.
+    let mut logical: Vec<(usize, &str)> = Vec::new();
+    let mut byte_start = 0usize;
+    for line in app.input.split('\n') {
+        logical.push((byte_start, line));
+        byte_start += line.len() + 1; // include the consumed '\n'
+    }
+    let (window_start, content_top, lead_cols) =
+        composer_content_geometry(logical.len(), cursor_line, prompt_height, area.width);
+    let content_width = area.width.saturating_sub(lead_cols).max(1);
+    let bottom = area.y.saturating_add(area.height);
+    let mut rows = Vec::new();
+    for (offset, (byte_start, text)) in logical.iter().enumerate().skip(window_start) {
+        // `lines` index of this content row's first sub-row, then offset by the
+        // Paragraph scroll into an absolute screen row. Rows scrolled off the
+        // top (`line_index < scroll`) are not painted, so skip them.
+        let line_index = content_top + (offset - window_start);
+        let Some(rel) = (line_index as u16).checked_sub(scroll) else {
+            continue;
+        };
+        let first_screen_row = area.y.saturating_add(rel);
+        if first_screen_row >= bottom {
+            continue;
+        }
+        rows.push(InputContentRow {
+            first_screen_row,
+            byte_start: *byte_start,
+            text: (*text).to_string(),
+        });
+    }
+    app.input_area_cache.set(Some(InputAreaCache {
+        area,
+        content_width,
+        lead_cols,
+        rows,
+    }));
+}
+
+/// Map a screen `(col, row)` onto a byte offset in `app.input`, using the
+/// composer geometry recorded by `record_input_area_cache`. Returns `None` when
+/// the cell is outside the composer's painted text rectangle or no composer has
+/// been painted yet.
+///
+/// The mapping accounts for the input rect origin, the one-cell left pad the
+/// painter prepends, and soft-wrapping: each logical line is wrapped to
+/// `content_width` display cells, so a click on a wrapped sub-row resolves
+/// against the right slice of the logical line. A click past a line's end clamps
+/// to that line's end (so a drag into the trailing whitespace still extends to
+/// the line end rather than dead-ending).
+fn composer_char_from_mouse(app: &TuiApp, col: u16, row: u16) -> Option<usize> {
+    let cache = app.input_area_cache.take();
+    app.input_area_cache.set(cache.clone());
+    let cache = cache?;
+    if col < cache.area.x || col >= cache.area.x.saturating_add(cache.area.width) {
+        return None;
+    }
+    // Find the logical line whose painted sub-rows cover `row`: it owns every
+    // row from its `first_screen_row` up to (but not including) the next line's
+    // first row (or the area bottom for the last line).
+    let area_bottom = cache.area.y.saturating_add(cache.area.height);
+    let mut entry: Option<&InputContentRow> = None;
+    for (idx, candidate) in cache.rows.iter().enumerate() {
+        let next_top = cache
+            .rows
+            .get(idx + 1)
+            .map(|next| next.first_screen_row)
+            .unwrap_or(area_bottom);
+        if row >= candidate.first_screen_row && row < next_top {
+            entry = Some(candidate);
+            break;
+        }
+    }
+    let entry = entry?;
+    // Which wrapped sub-row of this logical line did the click land on?
+    let sub_row = row.saturating_sub(entry.first_screen_row) as usize;
+    // The painter pads the FIRST sub-row by `lead_cols`; continuation sub-rows
+    // start at column 0. Subtract the pad on the first sub-row only.
+    let lead = if sub_row == 0 {
+        cache.lead_cols as usize
+    } else {
+        0
+    };
+    let local_col = (col.saturating_sub(cache.area.x) as usize).saturating_sub(lead);
+    // Walk the logical line by display width to find the char range that lands
+    // on `sub_row`, then resolve the column within that slice.
+    let display_col = sub_row * cache.content_width as usize + local_col;
+    Some(entry.byte_start + byte_offset_for_display_col(&entry.text, display_col))
+}
+
+/// Byte offset into `text` of the char at display column `display_col` (wide
+/// glyphs count two cells). Clamps to the byte length when the column is past
+/// the end of the content. Returns a byte (not char) offset so it composes with
+/// `byte_start`.
+fn byte_offset_for_display_col(text: &str, display_col: usize) -> usize {
+    let mut consumed = 0usize;
+    for (idx, ch) in text.char_indices() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w == 0 {
+            continue;
+        }
+        if display_col < consumed + w {
+            return idx;
+        }
+        consumed += w;
+    }
+    text.len()
 }
 
 fn slash_suggestion_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
@@ -42356,6 +42701,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     lines.extend(mention_lines);
     lines.extend(suggestion_lines);
     let scroll = lines.len().saturating_sub(area.height as usize) as u16;
+    record_input_area_cache(app, area, prompt_height, scroll);
     if indicator_present {
         // The footer Paragraph applies `.scroll((scroll, 0))`, so the strip is
         // PAINTED at `area.y + (indicator_row_offset - scroll)`. Register the click
@@ -44404,6 +44750,20 @@ pub(crate) struct TuiApp {
     pub(crate) telemetry: TelemetryStatus,
     pub(crate) input: String,
     pub(crate) input_cursor: usize,
+    /// Live text selection in the composer (mouse drag + Shift-arrow), as a
+    /// `(anchor, cursor)` pair of BYTE offsets into [`TuiApp::input`]; the
+    /// selected range is `min..max`. `anchor` is the fixed end the gesture
+    /// began at and `cursor` is the moving end. `None` = no selection (the
+    /// common case). Because these are byte offsets (not screen coordinates),
+    /// the selection is immune to soft-wrap/resize reflow. Cleared on any
+    /// non-extending cursor move, edit/typing, history recall, or submit. See
+    /// the `input::*_input_selection` helpers.
+    pub(crate) input_selection: Option<(usize, usize)>,
+    /// Per-frame snapshot of the composer's painted text geometry so a mouse
+    /// press/drag maps a screen `(col, row)` onto a byte offset in
+    /// [`TuiApp::input`]. Set at the end of `render_input`; `None` before the
+    /// composer's first paint or whenever a fullscreen surface owns the frame.
+    pub(crate) input_area_cache: std::cell::Cell<Option<InputAreaCache>>,
     pub(crate) prompt_attachments: Vec<PromptAttachment>,
     pub(crate) input_history: prompt_history::PromptHistory,
     pub(crate) input_history_index: Option<usize>,
@@ -46000,6 +46360,8 @@ impl TuiApp {
             telemetry: TelemetryStatus::from_config(&config.telemetry),
             input: String::new(),
             input_cursor: 0,
+            input_selection: None,
+            input_area_cache: std::cell::Cell::new(None),
             prompt_attachments: Vec::new(),
             input_history: if config.tui.persist_prompt_history {
                 prompt_history::PromptHistory::with_persistence(

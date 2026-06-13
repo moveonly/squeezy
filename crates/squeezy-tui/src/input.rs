@@ -417,6 +417,9 @@ pub(crate) fn note_input_edited(app: &mut TuiApp) {
     app.input_history_index = None;
     app.input_history_draft.clear();
     app.selected_entry = None;
+    // Any edit (typing/delete) invalidates a live composer selection: the
+    // byte offsets no longer line up with the mutated buffer.
+    clear_input_selection(app);
     app.prune_prompt_attachments();
     clamp_slash_menu_index(app);
     refresh_mention_popup(app);
@@ -580,6 +583,7 @@ pub(crate) fn apply_mention_popup(app: &mut TuiApp) -> bool {
         app.input = new_input;
         app.input_cursor = new_cursor;
         app.mention_popup = None;
+        clear_input_selection(app);
         clamp_slash_menu_index(app);
         return true;
     }
@@ -589,6 +593,7 @@ pub(crate) fn apply_mention_popup(app: &mut TuiApp) -> bool {
 pub(crate) fn clear_input(app: &mut TuiApp) {
     app.input.clear();
     app.input_cursor = 0;
+    clear_input_selection(app);
     app.clear_prompt_attachments();
     // Clearing the composer abandons any in-progress queued-prompt edit
     // (§11G.8): a fresh prompt typed afterwards must never be mistaken for a
@@ -600,6 +605,9 @@ pub(crate) fn clear_input(app: &mut TuiApp) {
 pub(crate) fn set_input(app: &mut TuiApp, input: String) {
     app.input = input;
     app.input_cursor = app.input.len();
+    // Replacing the whole buffer (history recall, mention/snippet apply)
+    // invalidates any live composer selection.
+    clear_input_selection(app);
     app.clear_prompt_attachments();
     clamp_input_cursor(app);
     clamp_slash_menu_index(app);
@@ -619,12 +627,68 @@ pub(crate) fn restore_prompt_after_cancel(app: &mut TuiApp) -> bool {
     };
     app.input = text;
     app.input_cursor = app.input.len();
+    clear_input_selection(app);
     app.clear_prompt_attachments();
     true
 }
 
 pub(crate) fn input_cursor(app: &TuiApp) -> usize {
     text_cursor(&app.input, app.input_cursor)
+}
+
+// ---------------------------------------------------------------------------
+// Composer selection (mouse drag + Shift-arrow). The selection is a byte-offset
+// `(anchor, cursor)` pair into `app.input`; the selected range is `min..max`.
+// `anchor` is the fixed end the gesture began at and `cursor` is the moving end
+// (it tracks `app.input_cursor` for keyboard extends). Both are kept on char
+// boundaries via `text_cursor`. `None` means nothing is selected. Because the
+// offsets are byte positions into the buffer (not screen coordinates), the
+// selection is immune to soft-wrap/resize reflow.
+// ---------------------------------------------------------------------------
+
+/// Begin a fresh, collapsed composer selection anchored at byte offset `pos`.
+/// Clamped onto a char boundary so a stray offset never splits a multi-byte
+/// glyph.
+pub(crate) fn begin_input_selection(app: &mut TuiApp, pos: usize) {
+    let pos = text_cursor(&app.input, pos);
+    app.input_selection = Some((pos, pos));
+}
+
+/// Move the moving end of the composer selection to byte offset `cursor`,
+/// keeping the anchor fixed. Starts a fresh selection anchored at the current
+/// cursor when none is live, so a Shift-extend with no prior selection grows
+/// from where the caret sits.
+pub(crate) fn extend_input_selection(app: &mut TuiApp, cursor: usize) {
+    let cursor = text_cursor(&app.input, cursor);
+    match app.input_selection.as_mut() {
+        Some((_, end)) => *end = cursor,
+        None => app.input_selection = Some((cursor, cursor)),
+    }
+}
+
+/// Drop any live composer selection. Cheap no-op when there is none, so callers
+/// on the hot edit/move path can call it unconditionally.
+pub(crate) fn clear_input_selection(app: &mut TuiApp) {
+    app.input_selection = None;
+}
+
+/// Normalized half-open byte range `[start, end)` of the live composer
+/// selection, clamped onto char boundaries and into `app.input`. `None` when
+/// there is no selection or it is collapsed (empty).
+pub(crate) fn input_selection_range(app: &TuiApp) -> Option<std::ops::Range<usize>> {
+    let (anchor, cursor) = app.input_selection?;
+    let anchor = text_cursor(&app.input, anchor);
+    let cursor = text_cursor(&app.input, cursor);
+    let (lo, hi) = (anchor.min(cursor), anchor.max(cursor));
+    if lo == hi { None } else { Some(lo..hi) }
+}
+
+/// The currently-selected composer substring, or `None` when nothing (or an
+/// empty range) is selected. This is the payload a copy of an input selection
+/// delivers to the clipboard.
+pub(crate) fn input_selected_text(app: &TuiApp) -> Option<String> {
+    let range = input_selection_range(app)?;
+    Some(app.input[range].to_string())
 }
 
 pub(crate) fn clamp_input_cursor(app: &mut TuiApp) {

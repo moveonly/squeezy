@@ -48281,3 +48281,318 @@ async fn streaming_mutation_reanchors_open_search_onto_the_shifted_rows() {
         "the re-anchored match count equals a fresh find against the live rows",
     );
 }
+
+// =====================================================================
+// Composer text selection (the lower prompt region): mouse drag, Shift-arrow
+// extend, the selection-highlight paint, copy integration, copy-on-release,
+// and mutual exclusion with the transcript selection.
+// =====================================================================
+
+/// Render only the composer footer (which stamps `input_area_cache`) into a
+/// known rect at the origin and return the painted buffer so a test can locate
+/// the screen cell a composer glyph landed on before driving a mouse gesture.
+fn render_composer_to_buffer(app: &TuiApp, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_input(frame, Rect::new(0, 0, width, height), app))
+        .expect("draw composer");
+    terminal.backend().buffer().clone()
+}
+
+#[test]
+fn composer_mouse_drag_selects_the_dragged_input_substring() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "hello world".to_string());
+
+    let buffer = render_composer_to_buffer(&app, 40, 6);
+    let (x, y) = find_text_cell(&buffer, "hello world").expect("composer text painted");
+
+    // Press at 'h', drag to just past the 'o' of "hello" (5 cells), release.
+    assert!(handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE)));
+    assert!(handle_mouse(&mut app, left_drag(x + 5, y)));
+    assert!(handle_mouse(&mut app, left_up(x + 5, y)));
+
+    assert_eq!(
+        input::input_selection_range(&app),
+        Some(0..5),
+        "the drag selects the dragged byte range",
+    );
+    assert_eq!(
+        input::input_selected_text(&app).as_deref(),
+        Some("hello"),
+        "the selected substring is the dragged text",
+    );
+}
+
+#[test]
+fn composer_bare_click_leaves_no_selection() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "hello world".to_string());
+
+    let buffer = render_composer_to_buffer(&app, 40, 6);
+    let (x, y) = find_text_cell(&buffer, "hello world").expect("composer text painted");
+
+    // Press + release at the same cell, no drag: a click, not a selection.
+    assert!(handle_mouse(
+        &mut app,
+        left_down(x + 2, y, KeyModifiers::NONE)
+    ));
+    assert!(handle_mouse(&mut app, left_up(x + 2, y)));
+    assert!(
+        app.input_selection.is_none(),
+        "a bare composer click must not leave a collapsed selection",
+    );
+    assert_eq!(
+        input::input_cursor(&app),
+        2,
+        "the bare click still repositions the caret",
+    );
+}
+
+#[tokio::test]
+async fn shift_right_extends_then_arrow_left_clears_the_composer_selection() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "hello".to_string());
+    app.input_cursor = 0;
+
+    for _ in 0..2 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+        )
+        .await
+        .expect("shift+right");
+    }
+
+    assert_eq!(
+        input::input_selection_range(&app),
+        Some(0..2),
+        "two Shift+Right extend the selection by two chars",
+    );
+    assert_eq!(input::input_selected_text(&app).as_deref(), Some("he"));
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+    )
+    .await
+    .expect("left");
+    assert!(
+        app.input_selection.is_none(),
+        "a bare cursor move clears the composer selection",
+    );
+}
+
+#[tokio::test]
+async fn shift_home_extends_the_composer_selection_to_line_start() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "hello".to_string());
+    app.input_cursor = "hello".len();
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift+home");
+
+    assert_eq!(
+        input::input_selection_range(&app),
+        Some(0..5),
+        "Shift+Home extends to the line start",
+    );
+    assert_eq!(input::input_selected_text(&app).as_deref(), Some("hello"));
+}
+
+#[tokio::test]
+async fn typing_clears_the_composer_selection() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "hello".to_string());
+    input::begin_input_selection(&mut app, 0);
+    input::extend_input_selection(&mut app, 5);
+    assert!(input::input_selection_range(&app).is_some());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("type a char");
+
+    assert!(
+        app.input_selection.is_none(),
+        "typing into the composer clears any live selection",
+    );
+}
+
+#[tokio::test]
+async fn copy_with_a_composer_selection_routes_the_selected_text_to_the_clipboard() {
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    set_input(&mut app, "hello world".to_string());
+    input::begin_input_selection(&mut app, "hello ".len());
+    input::extend_input_selection(&mut app, "hello world".len());
+
+    // The explicit copy-selection verb routes through `copy_transcript_scope`,
+    // which now copies the composer selection first.
+    assert!(dispatch_resolved_keymap_action(
+        &mut app,
+        &mut agent,
+        keymap::Action::CopySelection,
+    ));
+
+    assert_eq!(
+        writes.lock().unwrap().as_slice(),
+        ["world"],
+        "the composer selection's text is what reaches the clipboard",
+    );
+    assert!(app.status.contains("copied"), "{}", app.status);
+}
+
+#[tokio::test]
+async fn cmd_c_copies_the_composer_selection_and_clears_it() {
+    // The system copy chord must prefer the composer selection and clear it
+    // (Claude Code parity: ⌘C in the prompt box copies the highlighted text).
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    set_input(&mut app, "hello world".to_string());
+    input::begin_input_selection(&mut app, 0);
+    input::extend_input_selection(&mut app, "hello".len());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER),
+    )
+    .await
+    .expect("cmd+c");
+
+    assert_eq!(
+        writes.lock().unwrap().as_slice(),
+        ["hello"],
+        "⌘C copies the composer selection",
+    );
+    assert!(
+        app.input_selection.is_none(),
+        "⌘C clears the composer selection after copying",
+    );
+}
+
+#[test]
+fn composer_selection_highlight_paints_reversed_cells() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "hello world".to_string());
+    input::begin_input_selection(&mut app, 0);
+    input::extend_input_selection(&mut app, 5);
+
+    let buffer = render_composer_to_buffer(&app, 40, 6);
+    let (x, y) = find_text_cell(&buffer, "hello world").expect("composer text painted");
+
+    for dx in 0..5 {
+        assert!(
+            buffer[(x + dx, y)].modifier.contains(Modifier::REVERSED),
+            "selected cell {dx} of 'hello' must be REVERSED-highlighted",
+        );
+    }
+    assert!(
+        !buffer[(x + 6, y)].modifier.contains(Modifier::REVERSED),
+        "an unselected cell must not be highlighted",
+    );
+}
+
+#[test]
+fn composer_drag_release_copies_on_select_and_keeps_the_highlight() {
+    // copy-on-select parity for the composer: a real drag auto-copies on
+    // release (default on) and keeps the highlight.
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    assert!(app.copy_on_select, "copy_on_select defaults on");
+    set_input(&mut app, "hello world".to_string());
+
+    let buffer = render_composer_to_buffer(&app, 40, 6);
+    let (x, y) = find_text_cell(&buffer, "hello world").expect("composer text painted");
+    handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_drag(x + 5, y));
+    handle_mouse(&mut app, left_up(x + 5, y));
+
+    assert_eq!(
+        writes.lock().unwrap().as_slice(),
+        ["hello"],
+        "the composer drag auto-copied on release",
+    );
+    assert!(
+        input::input_selection_range(&app).is_some(),
+        "the composer highlight survives the auto-copy",
+    );
+}
+
+#[test]
+fn composer_press_clears_a_live_transcript_selection_and_vice_versa() {
+    // Mutual exclusion: only one of the two surfaces holds a selection at a
+    // time, so the transcript and composer Up arms never both fire on a release.
+    // Drive both gestures against ONE full-app render so the transcript sits at
+    // the top and the composer at the bottom — the real-app geometry where a
+    // composer click lands on a row the transcript hit-test rejects (rendering
+    // the two surfaces separately would leave a stale transcript cache that
+    // claims the composer's low rows).
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("transcript text here"));
+    set_input(&mut app, "composer text".to_string());
+
+    let buf = render_full_to_buffer(&app, 60, 24);
+    let (tx, ty) = find_text_cell(&buf, "transcript text here").expect("transcript painted");
+    let (cx, cy) = find_text_cell(&buf, "composer text").expect("composer painted");
+    assert!(cy > ty, "composer paints below the transcript");
+
+    // Arm a transcript selection.
+    handle_mouse(&mut app, left_down(tx, ty, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_drag_with(tx + 5, ty, KeyModifiers::NONE));
+    handle_mouse(&mut app, left_up(tx + 5, ty));
+    assert!(app.selection.is_some(), "transcript selection armed");
+
+    // A composer press drops the transcript selection and arms the composer's.
+    handle_mouse(&mut app, left_down(cx, cy, KeyModifiers::NONE));
+    assert!(
+        app.selection.is_none(),
+        "a composer press drops the live transcript selection",
+    );
+    assert!(
+        app.input_selection.is_some(),
+        "the composer selection armed"
+    );
+
+    // The reverse: a transcript press drops the composer selection.
+    handle_mouse(&mut app, left_down(tx, ty, KeyModifiers::NONE));
+    assert!(
+        app.input_selection.is_none(),
+        "a transcript press drops the live composer selection",
+    );
+}
