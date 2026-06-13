@@ -4261,6 +4261,16 @@ async fn plan_choice_discard_deletes_file_and_clears_handoff() {
     let plan_path = plans_dir.join(format!("{plan_id}.md"));
     fs::write(&plan_path, "step 1\n").expect("write plan");
 
+    // Point the on-disk `current` pointer at the plan so the discard path is
+    // exercised against a live pointer it must clean up.
+    proposed_plan::set_active_plan(&root, proposed_plan::FALLBACK_SESSION_ID, &plan_id)
+        .expect("set active plan");
+    assert_eq!(
+        proposed_plan::read_current_plan_id(&root, proposed_plan::FALLBACK_SESSION_ID).as_deref(),
+        Some(plan_id.as_str()),
+        "pointer is live before discard"
+    );
+
     let config = test_config_with_root(SessionMode::Plan, root.clone());
     let mut agent = test_agent_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Plan);
@@ -4284,6 +4294,10 @@ async fn plan_choice_discard_deletes_file_and_clears_handoff() {
     assert!(app.pending_plan_choice.is_none());
     assert!(app.current_plan_id.is_none());
     assert!(app.pending_plan_handoff.is_none());
+    assert!(
+        proposed_plan::read_current_plan_id(&root, proposed_plan::FALLBACK_SESSION_ID).is_none(),
+        "discard must clear the on-disk current pointer for the deleted plan"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

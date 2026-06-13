@@ -1661,28 +1661,34 @@ async fn apply_plan_choice(
         PlanChoiceAction::Refine => {
             app.status = "stay in Plan; describe the refinement".into();
         }
-        PlanChoiceAction::Discard => match std::fs::remove_file(&pending.plan_path) {
-            Ok(()) => {
-                app.push_log(format!(
-                    "plan {} discarded ({} deleted)",
-                    pending.plan_id,
-                    compact_path(&pending.plan_path)
-                ));
-                if app.current_plan_id.as_deref() == Some(pending.plan_id.as_str()) {
-                    app.current_plan_id = None;
+        PlanChoiceAction::Discard => {
+            let sid = app.plan_session_id().to_string();
+            // Route through `delete_plan` so the on-disk `current` pointer is
+            // cleared when it named this plan; a direct `remove_file` would leave
+            // the pointer aimed at a now-deleted plan id.
+            match proposed_plan::delete_plan(&app.workspace_root, &sid, &pending.plan_id) {
+                Ok(removed) => {
+                    app.push_log(format!(
+                        "plan {} discarded ({} deleted)",
+                        pending.plan_id,
+                        compact_path(&removed)
+                    ));
+                    if app.current_plan_id.as_deref() == Some(pending.plan_id.as_str()) {
+                        app.current_plan_id = None;
+                    }
+                    if app.pending_plan_handoff.as_deref() == Some(pending.plan_path.as_path()) {
+                        app.pending_plan_handoff = None;
+                        app.plan_handoff_turns_seen = 0;
+                    }
                 }
-                if app.pending_plan_handoff.as_deref() == Some(pending.plan_path.as_path()) {
-                    app.pending_plan_handoff = None;
-                    app.plan_handoff_turns_seen = 0;
+                Err(err) => {
+                    app.push_log(format!(
+                        "could not delete plan file {}: {err}",
+                        compact_path(&pending.plan_path)
+                    ));
                 }
             }
-            Err(err) => {
-                app.push_log(format!(
-                    "could not delete plan file {}: {err}",
-                    compact_path(&pending.plan_path)
-                ));
-            }
-        },
+        }
     }
 }
 
