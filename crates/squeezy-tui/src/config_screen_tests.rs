@@ -180,6 +180,51 @@ fn mcp_section_absorbs_keys_that_would_otherwise_panic_current_field() {
 }
 
 #[test]
+fn mcp_add_form_rejects_stdio_command_with_spaces() {
+    use crate::config_screen::{McpAction, McpAddForm, McpAddTransport};
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::McpServers));
+    state.mcp_add = Some(McpAddForm {
+        name: "docs".to_string(),
+        transport: McpAddTransport::Stdio,
+        command: "npx -y @scope/server".to_string(),
+        ..McpAddForm::default()
+    });
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    let pending_before = state.mcp_pending_actions.len();
+
+    let outcome = handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+
+    assert!(
+        matches!(outcome, KeyOutcome::KeepOpen),
+        "a multi-token stdio command must keep the form open"
+    );
+    let form = state.mcp_add.as_ref().expect("form stays open on error");
+    let err = form.error.as_deref().unwrap_or_default();
+    assert!(
+        err.contains("single executable"),
+        "error should explain the single-executable rule, got {err:?}"
+    );
+    assert_eq!(
+        state.mcp_pending_actions.len(),
+        pending_before,
+        "no Add action may be staged for an invalid stdio command"
+    );
+    assert!(
+        !state
+            .mcp_pending_actions
+            .iter()
+            .any(|a| matches!(a, McpAction::Add { .. })),
+        "no McpAction::Add must be queued"
+    );
+}
+
+#[test]
 fn themes_section_exposes_builtins_new_row_and_color_tokens() {
     let state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Themes));
 
