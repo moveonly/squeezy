@@ -113,6 +113,11 @@ impl JumpMarkStack {
     /// (e.g. `"jumps: #4 ← #2 ← #1"`), newest first, at most `max` entries.
     /// `label` maps an entry id to a compact human label; ids with no label are
     /// shown by id. Empty history yields an empty string.
+    ///
+    /// When the history holds more than `max` entries the readout is clipped, so a
+    /// trailing ` ← …` token is appended (e.g. `#8 ← #6 ← #4 ← #2 ← …`) to mark
+    /// that older jumps exist beyond the ones shown — without it a clipped trail
+    /// reads indistinguishably from an exhaustive one.
     pub(crate) fn history_summary(
         &self,
         max: usize,
@@ -124,6 +129,9 @@ impl JumpMarkStack {
         let mut parts: Vec<String> = Vec::new();
         for id in self.history.iter().take(max) {
             parts.push(label(*id).unwrap_or_else(|| format!("#{id}")));
+        }
+        if self.history.len() > max {
+            parts.push("\u{2026}".to_string());
         }
         parts.join(" \u{2190} ")
     }

@@ -1370,7 +1370,7 @@ fn print_status_table(rows: &[StatusRow]) {
     grid.push([
         "PROVIDER".to_string(),
         "SOURCE".to_string(),
-        "ENV".to_string(),
+        "ENV VAR".to_string(),
         "INLINE".to_string(),
     ]);
     for row in rows {
@@ -1385,7 +1385,7 @@ fn print_status_table(rows: &[StatusRow]) {
         };
         let inline_cell = match (&row.inline_tier, &row.inline_path) {
             (Some(tier), Some(path)) => format!("{} ({})", tier.as_str(), path.display()),
-            _ => "-".to_string(),
+            _ => "(unset)".to_string(),
         };
         // On Windows, annotate file-backed sources so users know the key
         // is not protected by Windows Credential Manager or DPAPI.
@@ -1397,6 +1397,7 @@ fn print_status_table(rows: &[StatusRow]) {
         grid.push([row.provider.to_string(), source_cell, env_cell, inline_cell]);
     }
     print_table_rows(&grid);
+    println!("(set) = env var is set · (fallback set) = fallback env var is set");
 }
 
 fn print_table_rows(rows: &[[String; 4]]) {

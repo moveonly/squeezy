@@ -227,13 +227,6 @@ impl SqueezyHelp {
     }
 
     fn unsupported(&self, topic: &str) -> HelpAnswer {
-        let mut topic_list = String::new();
-        for t in TOPICS {
-            if !topic_list.is_empty() {
-                topic_list.push_str(", ");
-            }
-            topic_list.push_str(t.id);
-        }
         let did_you_mean = {
             let candidates = top_topics_for_text(topic, 3);
             if candidates.is_empty() {
@@ -262,7 +255,7 @@ impl SqueezyHelp {
             topic: topic.trim().to_string(),
             status: HelpStatus::Unsupported,
             body: format!(
-                "No local help coverage for `{}`.{did_you_mean}{slash_did_you_mean}\n\nTry one of these topics: {topic_list}.\n\nFor current or broader documentation: {SQUEEZY_WEBSITE_URL} or {SQUEEZY_REPO_URL}.",
+                "No local help coverage for `{}`.{did_you_mean}{slash_did_you_mean}\n\nRun `/help` with no argument to see all topics grouped by category.\n\nFor current or broader documentation: {SQUEEZY_WEBSITE_URL} or {SQUEEZY_REPO_URL}.",
                 topic.trim()
             ),
             citations: Vec::new(),
@@ -1392,15 +1385,6 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         available_during_turn: false,
         capability_note: Some("Requires: [edit, destructive]"),
         related: &["checkpoints"],
-    },
-    SlashCommandHelp {
-        name: "/parent",
-        what: "Force the next turn to use the parent (non-cheap) model, overriding any active routing.",
-        syntax: "/parent",
-        examples: &["/parent  — run next turn with the full-tier model"],
-        available_during_turn: true,
-        capability_note: None,
-        related: &["providers", "config"],
     },
 ];
 

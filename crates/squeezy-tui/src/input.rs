@@ -624,6 +624,14 @@ pub(crate) fn refresh_mention_popup(app: &mut TuiApp) {
         .unwrap_or_default();
     if matches.is_empty() {
         app.mention_popup = None;
+        // Make an empty result explicit so a typo'd `@path` reads as "found
+        // nothing" rather than "the popup feature is off here". Only once the
+        // workspace walk has completed (cache present) and the user has typed a
+        // needle — while the cache is still building, or right after `@`, an
+        // empty list is expected and silence is correct.
+        if !query.query.is_empty() && app.workspace_file_cache.is_some() {
+            app.status = format!("no files match @{}", query.query);
+        }
         return;
     }
     app.mention_popup = Some(mention::MentionPopup::from_query(
@@ -1204,6 +1212,10 @@ pub(crate) fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirectio
             set_input(app, draft);
             app.input_history_index = None;
             app.slash_menu_index = 0;
+            // Stepping down past the newest entry drops back into the user's own
+            // stashed draft — name it so the boundary isn't read as just another
+            // (silent) history entry.
+            app.status = "draft".to_string();
             return true;
         }
         (Some(index), HistoryDirection::Next) => Some(index + 1),
@@ -1215,6 +1227,9 @@ pub(crate) fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirectio
         app.input_history_index = Some(index);
         app.selected_entry = None;
         app.slash_menu_index = 0;
+        // Show how deep into the ring this recall lands (1-based, newest = last)
+        // so the user can tell whether another Up will do anything.
+        app.status = format!("history {}/{}", index + 1, app.input_history.len());
     }
     true
 }

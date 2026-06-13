@@ -53,6 +53,33 @@ fn clean_title_caps_long_titles_with_ellipsis() {
 }
 
 #[test]
+fn node_retains_full_title_when_truncated() {
+    // A long source caps the displayed `title` but retains the uncapped
+    // `full_title` so the overlay can reveal the cut tail in place.
+    let long = "word ".repeat(40);
+    let node = node_for_entry(&entry(9, OutlineKind::Assistant, &long));
+    assert!(node.is_truncated(), "long title should report truncation");
+    assert_eq!(node.title.chars().count(), TITLE_CAP + 1);
+    assert!(node.title.ends_with('\u{2026}'));
+    assert!(
+        node.full_title.chars().count() > TITLE_CAP,
+        "full title must keep the uncapped text: {}",
+        node.full_title
+    );
+    assert!(node.full_title.starts_with("word word"));
+}
+
+#[test]
+fn node_full_title_matches_title_when_short() {
+    // A short title is not truncated: `full_title` equals `title` and the node
+    // reports no truncation, so the overlay paints no reveal row.
+    let node = node_for_entry(&entry(2, OutlineKind::UserTurn, "short label"));
+    assert_eq!(node.title, "short label");
+    assert_eq!(node.full_title, "short label");
+    assert!(!node.is_truncated());
+}
+
+#[test]
 fn clean_title_caps_on_char_boundary_for_multibyte() {
     // A run of multibyte chars must cap without panicking on a byte boundary.
     let long = "é".repeat(200);

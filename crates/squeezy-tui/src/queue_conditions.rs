@@ -103,6 +103,24 @@ impl QueueCondition {
         }
     }
 
+    /// A self-describing ASCII glyph for a no-color terminal, where every theme
+    /// colour collapses to one foreground and the tinted Unicode tags
+    /// ([`Self::marker_glyph`]) lose the runnable/skip/blocked distinction they
+    /// carried. Each kind reads on its letter alone — `[y]`/`[n]` for the
+    /// succeeded/failed gates, `[+]`/`[0]` for edited/no-edits, `[m]` for manual,
+    /// and a quiet `[ ]` for an always-run row — so a monochrome scan still tells
+    /// the gates apart. Exactly three cells wide so the column never shifts.
+    pub(crate) fn marker_glyph_ascii(self) -> &'static str {
+        match self {
+            QueueCondition::Always => "[ ]",
+            QueueCondition::IfPrevSucceeded => "[y]",
+            QueueCondition::IfPrevFailed => "[n]",
+            QueueCondition::IfPrevEdited => "[+]",
+            QueueCondition::IfPrevNoEdits => "[0]",
+            QueueCondition::Manual => "[m]",
+        }
+    }
+
     /// A short human label for the status line when the condition is set / cycled.
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -317,17 +335,36 @@ pub(crate) fn plan_drain(items: &[DrainItem], outcome: Option<TurnOutcome>) -> D
 }
 
 /// The marker glyph + colour painted at the head of a conditional overlay row.
-/// An unconditional row gets invisible blanks (columns stay aligned with the
-/// group / multi-select markers); a conditional row gets a tag tinted by its
-/// evaluation against the latest outcome so a blocked / skip-bound row reads at a
-/// glance: a row that *would* skip on the next drain is drawn in the warn colour,
-/// a blocked (manual / not-yet-evaluable) row in quiet, a runnable one in accent.
-/// Kept here next to the state so the render and the tests agree on the glyph.
+/// An unconditional row gets a quiet `[·]` placeholder (so every row shows a
+/// complete, consistent condition column that reads as "always-run", not a blank
+/// hole); a conditional row gets a tag tinted by its evaluation against the
+/// latest outcome so a blocked / skip-bound row reads at a glance: a row that
+/// *would* skip on the next drain is drawn in the warn colour, a blocked (manual
+/// / not-yet-evaluable) row in quiet, a runnable one in accent.
+///
+/// On a no-color terminal (`NO_COLOR` / a monochrome term) every theme colour
+/// collapses to one foreground, so the tint that distinguished runnable from
+/// skip-bound from blocked is gone. There we fall back to the self-describing
+/// ASCII glyphs ([`QueueCondition::marker_glyph_ascii`]) so the gate kinds stay
+/// legible on the letter alone. Kept here next to the state so the render and the
+/// tests agree on the glyph.
 pub(crate) fn condition_marker_span(
     condition: QueueCondition,
     outcome: Option<TurnOutcome>,
 ) -> Span<'static> {
-    let glyph = condition.marker_glyph();
+    let no_color = matches!(
+        crate::render::palette::color_level(),
+        crate::render::palette::ColorLevel::NoColor
+    );
+    let glyph = if no_color {
+        condition.marker_glyph_ascii()
+    } else if condition.is_always() {
+        // A quiet placeholder so an always-run row reads as "set to run", not a
+        // missing-data hole, while staying the same 3-cell width as the tags.
+        "[·]"
+    } else {
+        condition.marker_glyph()
+    };
     let color = if condition.is_always() {
         crate::render::theme::quiet()
     } else {

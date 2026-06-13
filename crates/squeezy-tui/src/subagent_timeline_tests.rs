@@ -238,7 +238,7 @@ fn counts_and_attention_are_reported() {
     assert_eq!(timeline.count_of(SubagentTimelineStatus::Failed), 1);
     assert_eq!(timeline.count_of(SubagentTimelineStatus::Rejected), 1);
     assert_eq!(timeline.running_count(), 1);
-    // Failed + capped both want attention.
+    // Failed + rejected both want attention.
     assert_eq!(timeline.attention_count(), 2);
 }
 
@@ -249,7 +249,7 @@ fn summary_lists_subagents_statuses_and_attention() {
     assert!(summary.contains("1 running"), "{summary}");
     assert!(summary.contains("1 done"), "{summary}");
     assert!(summary.contains("1 failed"), "{summary}");
-    assert!(summary.contains("1 capped"), "{summary}");
+    assert!(summary.contains("1 rejected"), "{summary}");
     assert!(summary.contains("2 attention"), "{summary}");
 }
 
@@ -302,7 +302,7 @@ fn filter_cycles_through_present_statuses_then_back_to_all() {
 
 #[test]
 fn filter_skips_absent_statuses() {
-    // Only running + failed are present; the cycle never offers done/capped.
+    // Only running + failed are present; the cycle never offers done/rejected.
     let sources = vec![
         source(1, SubagentTimelineStatus::Running),
         source(2, SubagentTimelineStatus::Failed),

@@ -412,6 +412,18 @@ impl ResumePickerState {
         0
     }
 
+    /// Number of recent sessions that live outside the current cwd — the rows
+    /// the Tab toggle would reveal. Counted off `all_sessions` (the unscoped
+    /// recency-filtered list) so the scoped view can advertise the toggle even
+    /// when it has no rows of its own to show.
+    fn other_project_count(&self) -> usize {
+        let cwd_str = self.cwd.display().to_string();
+        self.all_sessions
+            .iter()
+            .filter(|summary| !paths_same(&summary.cwd, &cwd_str))
+            .count()
+    }
+
     /// Flip the project scope and re-derive `candidates`. The cursor is
     /// reset to "Start fresh" so the user does not act on a row that
     /// silently moved under them.
@@ -570,7 +582,12 @@ pub(crate) fn run_picker<W: io::Write>(
     } else {
         ResumePickerState::new(all_sessions, cwd)
     };
-    if state.candidates.is_empty() {
+    // Only skip the picker entirely when there is genuinely nothing to resume.
+    // When the scoped view is empty but recent sessions exist in *other*
+    // projects, still draw a frame: the "Start fresh" row plus a Tab hint teach
+    // the toggle that would surface those sessions, instead of silently
+    // dropping the user into a fresh session unaware they exist.
+    if state.candidates.is_empty() && state.other_project_count() == 0 {
         return Ok(ResumeChoice::StartFresh);
     }
     let choice = loop {
@@ -628,7 +645,7 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
             Constraint::Length(1), // spacer
             Constraint::Min(3),    // list
             Constraint::Length(1), // spacer
-            Constraint::Length(2), // footer
+            Constraint::Length(3), // footer (legend line + two hint lines)
         ])
         .split(inner);
 
@@ -745,6 +762,27 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
             ),
         ]);
         frame.render_widget(Paragraph::new(hint), layout[4]);
+    } else if state.candidates.is_empty() {
+        // Scoped view has no rows of its own. If recent sessions exist in other
+        // projects, teach the Tab toggle that would reveal them — otherwise the
+        // user never learns the resume path is one keystroke away.
+        let other = state.other_project_count();
+        if other > 0 {
+            let hint = Line::from(vec![
+                Span::styled(
+                    " Tab ",
+                    Style::default().fg(crate::render::theme::secondary()),
+                ),
+                Span::styled(
+                    format!(
+                        "— {other} session{} in other projects",
+                        if other == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(crate::render::theme::quiet()),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(hint), layout[4]);
+        }
     }
 
     let tab_hint = if state.show_all_projects {
@@ -752,8 +790,24 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     } else {
         "all projects"
     };
-    let mut footer_lines = Vec::with_capacity(2);
-    footer_lines.push(Line::from(vec![
+    let mut footer_lines = Vec::with_capacity(3);
+    // A lone `!` on a row is cryptic, so when any candidate failed to load its
+    // branch data (e.g. a transient file-lock) explain what the marker means and
+    // that the session still resumes safely at its latest event.
+    if state
+        .candidates
+        .iter()
+        .any(|e| e.summary.branch_load_failed)
+    {
+        footer_lines.push(Line::from(vec![
+            Span::styled("! ", Style::default().fg(crate::render::theme::warn())),
+            Span::styled(
+                "— branch data unavailable; resumes at latest event",
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]));
+    }
+    let mut first_line = vec![
         Span::styled(
             "↑/↓ ",
             Style::default().fg(crate::render::theme::secondary()),
@@ -767,7 +821,17 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
             "confirm  ",
             Style::default().fg(crate::render::theme::quiet()),
         ),
-    ]));
+    ];
+    // In the cross-project view the always-visible "confirm" wording hides the
+    // real consequence: confirming a foreign row re-roots the workspace into
+    // that directory. Spell it out so it isn't discoverable only on hover.
+    if state.show_all_projects {
+        first_line.push(Span::styled(
+            "· cross-project rows change your working directory",
+            Style::default().fg(crate::render::theme::quiet()),
+        ));
+    }
+    footer_lines.push(Line::from(first_line));
     let mut second_line = Vec::with_capacity(if state.can_go_back() { 8 } else { 6 });
     if state.can_go_back() {
         second_line.push(Span::styled(

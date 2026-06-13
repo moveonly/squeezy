@@ -766,7 +766,7 @@ pub fn pick_startup_model_selection_in_terminal(
         .collect::<Vec<_>>();
     themes.push(StartupThemeChoice {
         name: String::new(),
-        label: "Custom theme in /config".to_string(),
+        label: "Pick a theme later in the config screen".to_string(),
         action: StartupThemeAction::ConfigureInConfig,
     });
     startup_model_picker::run_picker(
@@ -1274,11 +1274,19 @@ async fn run_inner_with_terminal(
                 // next decision.
                 app.render_health
                     .record_frame_committed(now, app.render_metrics.get().frame);
+                app.toasts.push(
+                    "Recovered a stalled screen — forced a full redraw.",
+                    toast::ToastVariant::Info,
+                );
+            } else {
+                // The forced redraw errored — exactly the wedged-terminal case the
+                // watchdog exists for. Don't claim a fix that didn't happen; say so
+                // honestly and let the throttle retry the redraw on a later stall.
+                app.toasts.push(
+                    "Screen still stalled — retrying redraw.",
+                    toast::ToastVariant::Warning,
+                );
             }
-            app.toasts.push(
-                "Recovered a stalled screen — forced a full redraw.",
-                toast::ToastVariant::Info,
-            );
             // The forced redraw committed the frame, so the normal gate below
             // should not immediately repaint on top of it.
             app.needs_redraw = false;
@@ -1288,6 +1296,17 @@ async fn run_inner_with_terminal(
             terminal.draw_app(&mut app)?;
             app.needs_redraw = false;
             frame_limiter.mark_emitted(now);
+            // The last-known-good layout store held the screen usable through a
+            // degenerate frame this session. Surface that once — a single quiet
+            // toast on the first substitution, then silence — so a user hitting a
+            // sub-usable size or a resize storm gets one glance-able signal that
+            // stability is being actively held, without nagging on every frame.
+            if app.layout_fallback.take_first_fallback_notice() {
+                app.toasts.push(
+                    "Recovered the layout — restored the last good frame.",
+                    toast::ToastVariant::Info,
+                );
+            }
             // Record the committed frame so the watchdog's drawn revision catches
             // up to the state revision and the stall clock resets. The frame
             // ordinal is the cheap per-frame signature — already stamped by
@@ -2689,8 +2708,8 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
 
     // The Clickable Breadcrumbs strip (§12.1.5) is NON-modal: while shown it
     // registers a `BreadcrumbCrumb` target per crumb on the status row. A left
-    // click on one focuses + activates that crumb (the mouse twin of ←→ + Enter),
-    // but — unlike the fullscreen overlays below — a click that misses every crumb
+    // click on one focuses + activates that crumb (the mouse twin of ←→ +
+    // Shift+Enter), but — unlike the fullscreen overlays below — a click that misses every crumb
     // is NOT swallowed: it falls through to the transcript/footer handling so the
     // strip never steals clicks meant for the surface beneath it. Hit-tested in
     // absolute screen coordinates against the targets the strip registered this
@@ -8115,16 +8134,16 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     }
 
     // The Clickable Breadcrumbs strip (§12.1.5) is non-modal but, while shown, owns
-    // its small set of navigation keys (←→/hl move the breadcrumb focus, Enter jump
-    // to the focused crumb, Esc/Alt+2 hide) BEFORE the selection-clear / chord /
+    // its small set of navigation keys (←→ move the breadcrumb focus, Shift+Enter
+    // jump to the focused crumb, Alt+2 hide) BEFORE the selection-clear / chord /
     // keymap dispatch, so a breadcrumb arrow never leaks into the main view. Every
     // OTHER key falls through (`handle_breadcrumbs_key` returns false), so normal
     // composer typing keeps working while the orienting strip is visible.
     //
     // Zen Mode suppresses the chrome (the strip is never painted and registers no
     // click targets under `chrome_suppressed`), so the interceptor must NOT eat
-    // breadcrumb keys there — otherwise ←/→/Enter would drive an invisible strip
-    // (Enter silently jumping the transcript) with no on-screen cue. Gate it the
+    // breadcrumb keys there — otherwise ←/→/Shift+Enter would drive an invisible
+    // strip (silently jumping the transcript) with no on-screen cue. Gate it the
     // same way the dock/minimap suppression does; the strip reappears unchanged on
     // zen exit.
     if app.breadcrumbs_open && !app.zen.chrome_suppressed() && handle_breadcrumbs_key(app, key) {
@@ -9768,12 +9787,27 @@ fn dispatch_keymap_action_inner(
             // surface the search status over the overlay-toggle status.
             if app.search.is_some() {
                 let surface = active_selection_surface(app);
+                let switched = app.search.as_ref().map(|s| s.surface) != Some(surface);
                 if let Some(state) = app.search.as_mut() {
                     state.surface = surface;
+                    // The two surfaces draw from DIFFERENT painted `Vec<Line>`
+                    // sources, so the previous match's `(row, col)` has no
+                    // meaningful correspondence on the new surface — the
+                    // nearest-by-row re-anchor would land on a positionally
+                    // arbitrary, unrelated hit. Drop `current` so `rebuild`
+                    // honestly re-anchors to the first match rather than silently
+                    // mis-landing (the per-id re-anchor is a larger change).
+                    if switched {
+                        state.current = None;
+                    }
                 }
                 refresh_search(app);
                 if let Some(state) = app.search.as_ref() {
-                    app.status = search_status_text(state);
+                    app.status = if switched && state.current.is_some() {
+                        format!("{} — re-run on new view", search_status_text(state))
+                    } else {
+                        search_status_text(state)
+                    };
                 }
             }
             true
@@ -11926,8 +11960,9 @@ fn toggle_breadcrumbs(app: &mut TuiApp) {
         // Park the focus on the deepest crumb (the current location), so the first
         // ← steps back up the trail toward the session root.
         app.breadcrumbs_focus = model.len().saturating_sub(1);
-        app.status = "breadcrumbs — \u{2190}\u{2192} focus \u{00b7} Enter jump \u{00b7} Alt+2 hide"
-            .to_string();
+        app.status =
+            "breadcrumbs — \u{2190}\u{2192} focus \u{00b7} Shift+Enter jump \u{00b7} Alt+2 hide"
+                .to_string();
     } else {
         app.status = "breadcrumbs hidden".to_string();
     }
@@ -11937,17 +11972,18 @@ fn toggle_breadcrumbs(app: &mut TuiApp) {
 /// Handle a key while the Clickable Breadcrumbs strip (§12.1.5) is shown. Returns
 /// `true` when the key was consumed so it never leaks to the composer or global
 /// keymap. The strip's own toggle chord (`Alt+2`) hides it; bare Left/Right move
-/// the breadcrumb focus along the trail (clamped, no wrap).
+/// the breadcrumb focus along the trail (clamped, no wrap); `Shift+Enter`
+/// activates the focused crumb (the keyboard twin of clicking it).
 ///
 /// Unlike the fullscreen overlays this is a *non-modal* strip: it claims ONLY the
-/// keys that can never collide with composer text entry — its toggle chord and
-/// bare Left/Right (which are not printable and have no composer-typing meaning).
-/// Crucially it does NOT eat bare `Enter` (prompt submission), bare letters like
-/// `h`/`l` (composer typing — eating them turned "hello" into "eo"), or bare `Esc`
-/// (global dismiss / turn interrupt): those fall through so typing and submission
-/// keep working while the orienting strip is visible (deep-review #6). The strip
-/// is still dismissable via its toggle chord, and a crumb is still activatable by
-/// mouse click.
+/// keys that can never collide with composer text entry — its toggle chord, bare
+/// Left/Right (not printable, no composer-typing meaning), and `Shift+Enter` (a
+/// chord no composer typing produces). Crucially it does NOT eat bare `Enter`
+/// (prompt submission), bare letters like `h`/`l` (composer typing — eating them
+/// turned "hello" into "eo"), or bare `Esc` (global dismiss / turn interrupt):
+/// those fall through so typing and submission keep working while the orienting
+/// strip is visible (deep-review #6). The strip is still dismissable via its
+/// toggle chord, and a crumb is still activatable by mouse click.
 fn handle_breadcrumbs_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if !app.breadcrumbs_open {
         return false;
@@ -11957,6 +11993,15 @@ fn handle_breadcrumbs_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         app.breadcrumbs_open = false;
         app.status = "breadcrumbs hidden".to_string();
         app.needs_redraw = true;
+        return true;
+    }
+    // `Shift+Enter` is the keyboard twin of clicking a crumb: it activates the
+    // focused crumb (the bare `Enter` it shadows still submits the composer, so
+    // the non-modal strip never steals prompt submission). It is the only
+    // modified key the strip claims; matched before the bare-arrow gate below so
+    // the lone-SHIFT modifier does not fall through.
+    if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::SHIFT {
+        breadcrumbs_activate_focused(app);
         return true;
     }
     // Only bare (unmodified) arrows steer the strip; a modified arrow (e.g.
@@ -12109,11 +12154,21 @@ fn handle_session_timeline_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             let visible = app.session_timeline.visible_len();
             app.session_timeline_selected = visible.saturating_sub(1);
             app.status = match app.session_timeline.filter() {
-                Some(kind) => format!(
-                    "session timeline: filter [{}] ({} shown) — f next \u{00b7} Esc close",
-                    kind.label(),
-                    visible,
-                ),
+                Some(kind) => {
+                    // The cycle only steps through kinds that actually have
+                    // events, so it can appear to skip positions. Show where the
+                    // active kind sits in that present-only set (`i/N present`)
+                    // so the skipping reads as intentional, not broken.
+                    let present = app.session_timeline.present_kinds();
+                    let position = present.iter().position(|&k| k == kind).map_or(0, |i| i + 1);
+                    format!(
+                        "session timeline: filter [{}] ({}/{} present, {} shown) — f next \u{00b7} Esc close",
+                        kind.label(),
+                        position,
+                        present.len(),
+                        visible,
+                    )
+                }
                 None => format!(
                     "session timeline: filter off ({} events) — f filter \u{00b7} Esc close",
                     app.session_timeline.len(),
@@ -15221,7 +15276,12 @@ fn handle_annotation_edit_key(app: &mut TuiApp, key: KeyEvent) {
         }
         KeyCode::Char(ch) => {
             if let Some(buf) = app.annotation_edit.as_mut() {
-                buf.push(ch);
+                // Stop at the cap so the on-screen buffer matches the note that
+                // `normalise_text` will store — past the limit the tail would be
+                // silently dropped at save time.
+                if buf.chars().count() < annotations::ANNOTATION_TEXT_LIMIT {
+                    buf.push(ch);
+                }
             }
             app.needs_redraw = true;
         }
@@ -15466,13 +15526,16 @@ fn recopy_selected_clipboard_entry(app: &mut TuiApp) {
 }
 
 /// Re-copy the clipboard-history entry with `id` (the shared keyboard/mouse
-/// path). Clones the payload out first so the immutable `&str` borrow ends before
-/// `deliver_copy` takes `&mut app`.
+/// path). Promotes the existing entry to the front (reusing its id and original
+/// scope label) before re-delivering, so re-copying a row captured as
+/// "selection" or "paste preview" collapses back onto that row in the funnel's
+/// `record` rather than inserting a payload-identical twin under a generic
+/// "clipboard history" label.
 fn recopy_clipboard_entry(app: &mut TuiApp, id: u64) {
-    let Some(text) = app.clipboard_history.text_of(id).map(str::to_string) else {
+    let Some((text, label)) = app.clipboard_history.promote_to_front(id) else {
         return;
     };
-    deliver_copy(app, &text, "clipboard history");
+    deliver_copy(app, &text, &label);
     app.needs_redraw = true;
 }
 
@@ -18101,10 +18164,10 @@ fn toggle_prompt_queue_overlay(app: &mut TuiApp) {
         app.prompt_queue_drag = None;
     }
     app.status = if app.prompt_queue_overlay.is_some() {
-        format!(
-            "prompt queue ({} queued) · ↑↓ focus · Space tag · g group · z fold · p pause · Enter/e edit · r run next · Del remove · Esc close",
-            app.prompt_queue.len()
-        )
+        // The overlay header paints the authoritative, state-aware key legend, so
+        // the open status just announces the count — one legend, one truth (a
+        // second cheatsheet here only drifted from the header's).
+        format!("prompt queue ({} queued)", app.prompt_queue.len())
     } else {
         "prompt queue closed".to_string()
     };
@@ -18592,8 +18655,8 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
             command_palette_select_run(app, index);
         }
         // A click on a breadcrumb crumb (§12.1.5): move the breadcrumb focus onto
-        // it and jump to the location it stands for — the mouse twin of ←→ + Enter,
-        // in one go.
+        // it and jump to the location it stands for — the mouse twin of ←→ +
+        // Shift+Enter, in one go.
         interaction::Action::BreadcrumbActivate(index) => {
             app.breadcrumbs_focus = index;
             breadcrumbs_activate_focused(app);
@@ -18915,6 +18978,25 @@ fn toggle_diff_detail_pane(app: &mut TuiApp) {
     };
     if !entry_has_detail_pane_content(entry) {
         app.status = "focused entry has no diff / detail to pane".to_string();
+        return;
+    }
+    // Gate the open on the same width the renderer needs to split. Opening an
+    // invisible pane and then offering scroll keys is worse than a no-op, so
+    // report the requirement honestly and keep the pane closed.
+    let (width, height) = app.off_frame_terminal_size();
+    let full_area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let (content_area, _) = transcript_overlay_content_and_status_areas(full_area);
+    let inner = transcript_overlay_inner(content_area);
+    if inner.width < diff_detail_pane::MIN_SPLIT_WIDTH {
+        app.status = format!(
+            "detail pane needs {}+ columns — widen the terminal",
+            diff_detail_pane::MIN_SPLIT_WIDTH
+        );
         return;
     }
     app.diff_detail_pane = Some(diff_detail_pane::DiffDetailPaneState::new(entry.id));
@@ -23715,7 +23797,40 @@ pub(crate) fn queue_drain_action(app: &TuiApp) -> queue_conditions::DrainAction 
     queue_conditions::plan_drain(&items, app.last_turn_outcome)
 }
 
+/// Build the status flash for a run of condition-skips during one drain pass.
+/// One item reads `skipped queued prompt (condition not met)`; a batch reads
+/// `skipped N conditional items (2 if previous succeeded, 1 if previous made no
+/// edits)`, tallied by condition kind in first-seen order, so the user sees what
+/// cleared the queue at a glance instead of only the last item's bare count.
+fn summarize_skipped_conditions(skipped: &[queue_conditions::QueueCondition]) -> String {
+    let n = skipped.len();
+    if n == 1 {
+        return "skipped queued prompt (condition not met)".to_string();
+    }
+    // Tally per kind in first-seen order (a stable, deterministic grouping that
+    // needs no extra ordering on the pure enum).
+    let mut tally: Vec<(queue_conditions::QueueCondition, usize)> = Vec::new();
+    for &cond in skipped {
+        if let Some(entry) = tally.iter_mut().find(|(c, _)| *c == cond) {
+            entry.1 += 1;
+        } else {
+            tally.push((cond, 1));
+        }
+    }
+    let breakdown = tally
+        .iter()
+        .map(|(cond, count)| format!("{count} {}", cond.label()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("skipped {n} conditional items ({breakdown})")
+}
+
 pub(crate) async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Agent) {
+    // Accumulate the conditions of every item this drain pass skips so a *run* of
+    // skips flashes one summary at the end ("skipped 3 conditional items (…)")
+    // instead of each iteration clobbering the status with a bare `(N left)` the
+    // user only ever sees the last of. Per-item previews still go to the log.
+    let mut skipped_conditions: Vec<queue_conditions::QueueCondition> = Vec::new();
     while app.turn_rx.is_none() && !prompt_queue_drain_blocked(app) {
         // Keep the id sidecar aligned before consulting the group/condition models
         // so a front-drain since the last tick can't stale the pause / condition
@@ -23753,6 +23868,11 @@ pub(crate) async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Age
                 // turn, so a run of skip-bound prompts clears in order.
                 let skipped = app.prompt_queue.remove(index);
                 let skipped_id = app.prompt_queue_ids.remove(index);
+                // Record which condition skipped this item so the end-of-pass
+                // summary can name them by kind, not just count.
+                if let Some(id) = skipped_id {
+                    skipped_conditions.push(app.prompt_queue_conditions.get(id));
+                }
                 if let Some(text) = skipped {
                     let preview = text.lines().next().unwrap_or("").trim();
                     app.push_log(format!(
@@ -23769,7 +23889,9 @@ pub(crate) async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Age
                 // Same as the Run arm: the queue shrank under an open overlay, so
                 // stabilise the positional cursor before re-planning.
                 clamp_queue_focus(app);
-                app.status = format!("skipped queued prompt ({} left)", app.prompt_queue.len());
+                // Flash a *cumulative* summary that survives the loop: re-planning
+                // would otherwise overwrite this with the next iteration's count.
+                app.status = summarize_skipped_conditions(&skipped_conditions);
                 app.needs_redraw = true;
                 // Loop: re-plan against the now-shorter queue.
             }
@@ -24988,7 +25110,7 @@ fn format_approval_menu_lines(
 /// they travel with the options they describe. The status line no longer
 /// carries them.
 fn approval_keybind_hint() -> &'static str {
-    "Up/Down choose · Enter/Y approve once · A/P always approve repo · N/D deny · Esc cancel"
+    "Up/Down choose · Enter approve once · A always allow · N deny · Esc cancel"
 }
 
 fn approval_footer_line() -> Line<'static> {
@@ -26065,6 +26187,18 @@ fn paste_preview_inline_lines(
                     .fg(crate::render::theme::warn())
                     .add_modifier(Modifier::BOLD),
             ),
+            // Faint band cue: this confirm/cancel question is the >10k-char tier,
+            // so the escalation from the inline/attachment paths is self-evident
+            // rather than reading as an arbitrary jump to a different UI.
+            Span::styled(
+                format!(
+                    " (>{}k chars)",
+                    paste_preview::VERY_LARGE_PASTE_CHAR_THRESHOLD / 1000
+                ),
+                Style::default()
+                    .fg(crate::render::theme::quiet())
+                    .add_modifier(Modifier::DIM),
+            ),
             Span::styled(
                 format!(" · {}", preview.summary()),
                 Style::default().fg(crate::render::theme::secondary()),
@@ -26168,6 +26302,15 @@ fn paste_transform_inline_lines(menu: &paste_transform::PasteTransformMenu) -> V
             Style::default().fg(crate::render::theme::quiet()),
         )),
     ];
+    // When the paste carries terminal escapes the menu opens on Strip ANSI; name
+    // the cause so the highlighted default reads as a consequence of the detected
+    // bytes rather than an unexplained guess.
+    if payload.has_ansi() {
+        lines.push(Line::from(Span::styled(
+            "terminal escapes detected — Strip ANSI selected",
+            Style::default().fg(crate::render::theme::warn()),
+        )));
+    }
     let accent = crate::render::theme::accent();
     let foreground = crate::render::theme::foreground();
     let quiet = crate::render::theme::quiet();
@@ -26207,7 +26350,12 @@ fn render_paste_transform_inline(
             .wrap(Wrap { trim: false }),
         area,
     );
-    let rows_top = area.y.saturating_add(2);
+    // Header height: the `Paste · summary` line and the key-hint line, plus the
+    // "terminal escapes detected" note that `paste_transform_inline_lines`
+    // inserts only for an escape-laden paste. The item rows (the click targets)
+    // start just below, so this offset must track that extra note exactly.
+    let header_rows = if menu.payload().has_ansi() { 3 } else { 2 };
+    let rows_top = area.y.saturating_add(header_rows);
     for (index, _) in menu.items().iter().enumerate() {
         let row_y = rows_top.saturating_add(index as u16);
         if row_y >= area.y.saturating_add(area.height) {
@@ -29634,7 +29782,20 @@ fn render_turn_outline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
     // refresh) can never leave the cursor past the end.
     let selected = app.turn_outline_selected.min(count - 1);
     let list_top = inner.y.saturating_add(2);
-    let list_bottom = inner.y.saturating_add(inner.height);
+    // When the selected node's title was truncated at TITLE_CAP, reserve the
+    // bottom row of the surface for a faint reveal of the full text, so the cut
+    // tail is recoverable without leaving the outline (§12.2.1 polish). Only the
+    // selected node can overflow the row, so one reserved row suffices.
+    let reveal_full_title = app
+        .turn_outline
+        .get(selected)
+        .filter(|node| node.is_truncated())
+        .map(|node| node.full_title.clone());
+    let reserved = if reveal_full_title.is_some() { 1 } else { 0 };
+    let list_bottom = inner
+        .y
+        .saturating_add(inner.height)
+        .saturating_sub(reserved);
     let rows = list_bottom.saturating_sub(list_top) as usize;
 
     // Scroll the node list so the selected node stays visible when the outline is
@@ -29700,6 +29861,25 @@ fn render_turn_outline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             interaction::TargetKey::Chrome(interaction::ChromeKey::TurnOutlineRow(index)),
             interaction::Action::TurnOutlineSelect(index),
         );
+    }
+
+    // Reveal the selected node's full title in the reserved bottom row when its
+    // list label was truncated, so the cut tail is readable in place.
+    if let Some(full) = reveal_full_title {
+        let reveal_rect = Rect {
+            x: inner.x,
+            y: list_bottom,
+            width: inner.width,
+            height: 1,
+        };
+        let reveal = Line::from(vec![
+            Span::styled(
+                "  \u{21b3} ",
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(full, Style::default().fg(crate::render::theme::secondary())),
+        ]);
+        frame.render_widget(Paragraph::new(reveal), reveal_rect);
     }
 }
 
@@ -29933,6 +30113,29 @@ fn render_review_board_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
 
     if app.review_board.is_empty() {
         return;
+    }
+
+    // Gloss the focused lane so a glance distinguishes Blocked (ran and failed)
+    // from Capped (refused before start) — same-looking "failure" labels with
+    // different remediations. One dim line under the header, lane-keyed off the
+    // cursor's card.
+    if let Some(card) = cursor_id.and_then(|id| {
+        app.review_board
+            .index_of(id)
+            .and_then(|index| app.review_board.card_at(index))
+    }) {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                card.lane.gloss(),
+                Style::default().fg(crate::render::theme::quiet()),
+            ))),
+            Rect {
+                x: inner.x,
+                y: inner.y.saturating_add(1),
+                width: inner.width,
+                height: 1,
+            },
+        );
     }
 
     // Lay the lanes out top-to-bottom: a bold lane header, then its worker rows,
@@ -30916,7 +31119,7 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
     // Overlay the popover region only (Clear is scoped to `rect`, never the whole
     // frame), so the transcript underneath keeps its geometry.
     frame.render_widget(ratatui::widgets::Clear, rect);
-    let title = Line::from(vec![
+    let mut title_spans = vec![
         Span::styled(
             " Preview ",
             Style::default()
@@ -30927,7 +31130,20 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
             format!("\u{2014} {} ", preview.kind.noun()),
             Style::default().fg(crate::render::theme::secondary()),
         ),
-    ]);
+    ];
+    // A keyboard-pinned peek is sticky (an incidental mouse drift won't dismiss
+    // it); a mouse hover vanishes on pointer-leave. Name that in the header so the
+    // self-describing artifact is honest about the one behavior that differs — a
+    // quiet dim suffix, never for a mouse hover.
+    if preview.is_keyboard() {
+        title_spans.push(Span::styled(
+            "\u{00b7} pinned ",
+            Style::default()
+                .fg(crate::render::theme::quiet())
+                .add_modifier(Modifier::DIM),
+        ));
+    }
+    let title = Line::from(title_spans);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -30964,13 +31180,28 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
             Style::default().fg(crate::render::theme::quiet()),
         )));
     }
-    // Footer hint: honest about whether double-click / Enter activates here.
-    lines.push(Line::from(Span::styled(
+    // Footer hint: honest about whether double-click / Enter activates here. For a
+    // keyboard-pinned peek the previewed entry IS the focused entry the action
+    // palette acts on, so name its chord in context — the one place a keyboard user
+    // learns the card has a contextual menu without hunting the command palette.
+    let mut footer_spans = vec![Span::styled(
         preview.activate_hint().to_string(),
         Style::default()
             .fg(crate::render::theme::secondary())
             .add_modifier(Modifier::DIM),
-    )));
+    )];
+    if preview.is_keyboard() {
+        footer_spans.push(Span::styled(
+            format!(
+                " \u{00b7} {} for actions",
+                key_hint(app, keymap::Action::OpenActionPalette)
+            ),
+            Style::default()
+                .fg(crate::render::theme::quiet())
+                .add_modifier(Modifier::DIM),
+        ));
+    }
+    lines.push(Line::from(footer_spans));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -31599,6 +31830,15 @@ fn render_annotations_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         } else {
             "edit: "
         };
+        // Surface the 280-char cap as the user types so the clamp at save time
+        // (`normalise_text`) is never a silent surprise on a long paste. The
+        // counter goes warn-coloured once the buffer is at or over the limit.
+        let used = buf.chars().count();
+        let counter_style = if used >= annotations::ANNOTATION_TEXT_LIMIT {
+            Style::default().fg(crate::render::theme::warn())
+        } else {
+            Style::default().fg(crate::render::theme::quiet())
+        };
         Line::from(vec![
             Span::styled(
                 verb,
@@ -31609,6 +31849,10 @@ fn render_annotations_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Span::styled(
                 format!("{buf}\u{2588}"),
                 Style::default().fg(crate::render::theme::foreground()),
+            ),
+            Span::styled(
+                format!("  ({used}/{})", annotations::ANNOTATION_TEXT_LIMIT),
+                counter_style,
             ),
             Span::styled(
                 "  \u{00b7} Enter save \u{00b7} Esc cancel",
@@ -32258,6 +32502,20 @@ fn render_metrics_hud(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     if app.show_layout_fallback {
         lines.push(String::new());
         lines.push(app.layout_fallback.diagnostics_line());
+        // Effective content width vs. the raw terminal. The transcript wraps to
+        // `main_text_width` — the painted text column, which excludes the
+        // scrollbar gutter and an active minimap rail — so on a wide terminal with
+        // a rail active the text reflows noticeably narrower than the frame, with
+        // no visible cause. Surface it only when the gap is material (>10%), and
+        // only here behind the geometry-diagnostics overlay, so a normal session
+        // never sees it.
+        let text_w = app.main_text_width.get();
+        if text_w > 0 && area.width > 0 && u32::from(text_w) * 10 < u32::from(area.width) * 9 {
+            lines.push(format!(
+                "content {text_w}x{} (term {})",
+                area.height, area.width
+            ));
+        }
     }
     if lines.is_empty() || area.height < 3 || area.width < 12 {
         return;
@@ -36779,6 +37037,17 @@ fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
             Style::default(),
             None,
         ));
+        // Stage the live tail: a quiet affordance below the in-flight reply so a
+        // truncated fence or mid-sentence cut at the bottom reads as "still
+        // being written" rather than "this is where the reply ends". The pending
+        // controller is cleared on settle, so this line only ever paints while a
+        // turn is in flight and drops the instant the assistant entry commits.
+        lines.push(Line::from(Span::styled(
+            "\u{21b3} streaming\u{2026}",
+            Style::default()
+                .fg(crate::render::theme::quiet())
+                .add_modifier(Modifier::DIM | Modifier::ITALIC),
+        )));
     }
     lines
 }
@@ -42083,7 +42352,14 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     // so the typed content floats beneath it with only the open-layout pad
     // added by `composer_bubble_lines`.
     if app.input.is_empty() {
-        return vec![Line::from(prompt_cursor_span())];
+        let palette = key_hint(app, keymap::Action::ToggleCommandPalette);
+        return vec![Line::from(vec![
+            prompt_cursor_span(),
+            Span::styled(
+                format!(" Type a prompt and press Enter · {palette} for commands"),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ])];
     }
     let cursor = input_cursor(app);
     let parts = app.input.split('\n').collect::<Vec<_>>();
@@ -42189,7 +42465,20 @@ fn push_styled_segments(
 }
 
 fn prompt_input_lines(app: &TuiApp, height: u16, width: u16) -> Vec<Line<'static>> {
-    let content = prompt_input_content_lines(app);
+    let mut content = prompt_input_content_lines(app);
+    // The empty-input placeholder is a single decorative row; clip it to the
+    // row width (the painter prepends one lead column) so it never soft-wraps
+    // and grows the bottom-anchored composer, which would push an open queue
+    // overlay off the top of the pane on narrow terminals.
+    if app.input.is_empty()
+        && let Some(line) = content.first_mut()
+    {
+        if width >= 8 {
+            truncate_line_to_width(line, (width as usize).saturating_sub(1));
+        } else {
+            *line = Line::from(prompt_cursor_span());
+        }
+    }
     let cursor_line = app.input[..input_cursor(app)].matches('\n').count();
     let horizon = composer_horizon_line(app, width as usize);
     composer_bubble_lines(horizon, content, cursor_line, height, width)
@@ -42605,6 +42894,17 @@ fn slash_suggestion_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
             lines.push(Line::from(spans));
         }
     }
+    // Trailing key-hint, matching the convention every modal overlay paints, so
+    // the Up/Down handoff away from history recall is self-evident (the menu
+    // owns those keys while it is open) and Tab/Enter completion is advertised.
+    if !lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "↑↓ choose · Tab/Enter complete · Esc close",
+            Style::default()
+                .fg(crate::render::theme::quiet())
+                .add_modifier(Modifier::DIM),
+        )));
+    }
     lines
 }
 
@@ -42882,6 +43182,15 @@ fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
     };
     lines.push(Line::from(Span::styled(
         footer,
+        Style::default()
+            .fg(crate::render::theme::quiet())
+            .add_modifier(Modifier::DIM),
+    )));
+    // Key-hint, matching the convention every modal overlay paints — the popup
+    // accepts both Tab and Enter to apply (see `handle_mention_popup_key`), so
+    // advertise them rather than leaving the keys to guesswork.
+    lines.push(Line::from(Span::styled(
+        "↑↓ choose · Tab/Enter apply · Esc cancel",
         Style::default()
             .fg(crate::render::theme::quiet())
             .add_modifier(Modifier::DIM),
@@ -43275,7 +43584,7 @@ fn register_attention_indicator_target(app: &TuiApp, status_area: Rect) {
 /// is wider than the row the MIDDLE crumbs are elided to a single `…` so the root
 /// (where am I rooted) and the deepest crumb (where I am) always stay visible — the
 /// spec's "middle truncation". Each rendered crumb's exact rect is registered so a
-/// click reaches the same `breadcrumbs_activate_focused` path as ←→ + Enter.
+/// click reaches the same `breadcrumbs_activate_focused` path as ←→ + Shift+Enter.
 fn render_breadcrumbs_strip(frame: &mut Frame<'_>, row: Rect, app: &TuiApp) {
     if row.width == 0 || row.height == 0 {
         return;
@@ -44049,6 +44358,14 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · {} full transcript · /help",
         key_hint(app, keymap::Action::ToggleTranscriptOverlay)
     );
+    // Point first-time users at the configurable status line, but only while
+    // they're still on the built-in default list (`status_line_items` is
+    // `None`). The instant they open the picker the configured list is stored
+    // and this hint self-retires, so it never competes for hint-row width once
+    // they've discovered it.
+    if app.status_line_items.is_none() {
+        base.push_str(" · /statusline customizes the status line");
+    }
     if app.context_warn_tokens > 0
         && app.context_estimate.estimated_tokens >= app.context_warn_tokens
     {
@@ -45557,7 +45874,7 @@ pub(crate) struct TuiApp {
     /// Whether the Clickable Breadcrumbs strip (§12.1.5) is shown. `false` =
     /// hidden (the resting state, paints nothing and schedules no redraw); `true` =
     /// the `session ▸ turn ▸ entry` strip paints on the status row and owns
-    /// ←→/Enter while focused. Toggled by the `ToggleBreadcrumbs` keymap action.
+    /// ←→/Shift+Enter while focused. Toggled by the `ToggleBreadcrumbs` keymap action.
     pub(crate) breadcrumbs_open: bool,
     /// Focused crumb index into the breadcrumb trail (§12.1.5). Clamped to the
     /// trail length each render. Only meaningful while `breadcrumbs_open`; the
@@ -46919,6 +47236,15 @@ impl TuiApp {
     pub(crate) fn notify_approval_pending(&self, tool_name: &str) {
         let message = format!("squeezy needs approval for {tool_name}");
         let _ = self.desktop_notifier.notify(&message);
+    }
+
+    /// Fire the desktop-notification surface for a cost-cap pressure event
+    /// (warning crossing, pressure-gate pause, or hard-cap stop). These end
+    /// or block a turn while the user may have tab-switched away, so they get
+    /// the same off-tab treatment as turn-complete / approval-pending. Gated
+    /// by the same `[tui].desktop_notifications` opt-in (a no-op when off).
+    pub(crate) fn notify_cost_pressure(&self, message: &str) {
+        let _ = self.desktop_notifier.notify(message);
     }
 
     /// Whether the next frame would visibly differ from the current one

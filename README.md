@@ -60,6 +60,10 @@ squeezy providers list            # provider registry and model counts
 squeezy sessions list             # recent local sessions
 squeezy --resume                  # open the resume picker
 
+# Add a key with `squeezy auth set openai`, check resolution with
+# `squeezy auth status`, or use a subscription via
+# `squeezy auth anthropic login` / `squeezy auth github-copilot login`.
+
 # Aggregator path: one key can route to many upstream models.
 export OPENROUTER_API_KEY=...     # https://openrouter.ai/keys
 squeezy

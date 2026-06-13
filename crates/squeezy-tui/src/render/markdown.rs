@@ -609,6 +609,28 @@ impl Writer {
             return;
         };
         let source = block.source.trim_end_matches('\n');
+        // Faint header row before the body: surfaces the declared language
+        // (so adjacent blocks in different languages read apart) and, when
+        // the body renders plain, distinguishes a deliberate plain block
+        // from a silent highlighter fallback (no language / unsupported /
+        // too large to highlight).
+        let header = match highlight::classify_fence(block.language.as_deref(), source) {
+            highlight::FenceLabel::Highlighted(name) => name.to_string(),
+            highlight::FenceLabel::NoLanguage => "code".to_string(),
+            highlight::FenceLabel::Unsupported => {
+                // `Unsupported` only fires when a hint was present.
+                let hint = block.language.as_deref().unwrap_or("code");
+                format!("unsupported: {hint}")
+            }
+            highlight::FenceLabel::TooLarge => match block.language.as_deref() {
+                Some(hint) => format!("{hint} · too large to highlight"),
+                None => "too large to highlight".to_string(),
+            },
+        };
+        self.lines.push(Line::from(Span::styled(
+            header,
+            Style::default().fg(crate::render::theme::quiet()),
+        )));
         let code_lines = highlight::highlight_code(block.language.as_deref(), source);
         self.lines.extend(code_lines);
     }

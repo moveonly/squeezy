@@ -21,6 +21,23 @@
 //! Every emit is best-effort (`let _ = …`): a failing escape on a dying or
 //! legacy-Windows terminal must never panic inside a panic hook or abort a
 //! signal handler mid-restore.
+//!
+//! ## Concurrency / memory ordering
+//!
+//! Every static in this module is read and written from crash paths that run on
+//! arbitrary threads: the panic hook fires on whatever thread panicked, the
+//! SIGTERM/SIGHUP/SIGTSTP listeners run on a separate async task, and
+//! `TerminalGuard::Drop` can unwind concurrently with the panic hook (a `panic!`
+//! fires the hook AND then unwinds into `Drop`). There is no lock ordering these
+//! accesses, so all four flags — [`ALT_SCREEN_ACTIVE`], [`SUSPEND_REQUESTED`],
+//! [`HOOKS_INSTALLED`], and [`SIGNAL_HANDLERS_INSTALLED`] — use
+//! [`Ordering::SeqCst`] deliberately. SeqCst gives a single total order across
+//! threads, which is what makes the alt-screen `swap(false)` leave the alternate
+//! screen *exactly once* under the Drop/panic-hook race and keeps the
+//! install/resume guards globally visible the instant they flip. Do NOT downgrade
+//! any of these to `Relaxed`/`Acquire`/`Release` without re-deriving that the
+//! exactly-once teardown and the cross-thread install visibility still hold —
+//! the cost here is paid only on crash/suspend, never on the hot render path.
 
 use std::io::{self, Write};
 use std::sync::Mutex;
@@ -37,6 +54,7 @@ use crossterm::terminal::disable_raw_mode;
 /// `true` once a fullscreen guard enters the alternate screen; cleared by the
 /// clean-exit / Drop paths so a second crash-path teardown is a no-op for the
 /// alt-screen leave (the mode restores are themselves idempotent).
+// SeqCst: crash-path atomicity — see the module-level "Concurrency" note.
 static ALT_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Set by the `SIGTSTP` (Ctrl+Z) handler to ask the main loop to suspend at the
@@ -49,6 +67,7 @@ static ALT_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// because that races the renderer's own writes and the model is mid-mutation.
 /// Cooperative suspend at the top of the loop keeps every byte ordered and lets
 /// us re-enter + force a full redraw deterministically on `SIGCONT`.
+// SeqCst: crash-path atomicity — see the module-level "Concurrency" note.
 #[cfg(unix)]
 static SUSPEND_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -58,6 +77,7 @@ static SUSPEND_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// the shared [`ALT_SCREEN_ACTIVE`] flag, so it stays correct for whichever guard
 /// is live). Also gates [`restore_previous_panic_hook`], so the restore is
 /// idempotent: only the swap-from-`true` caller actually puts the old hook back.
+// SeqCst: crash-path atomicity — see the module-level "Concurrency" note.
 static HOOKS_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Guards single installation of the OS-signal handlers across the process,
@@ -68,6 +88,7 @@ static HOOKS_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// exactly once keeps those listeners correct for every later in-process session
 /// (they read the shared [`ALT_SCREEN_ACTIVE`] / [`SUSPEND_REQUESTED`] statics);
 /// deliberately never reset on clean exit.
+// SeqCst: crash-path atomicity — see the module-level "Concurrency" note.
 #[cfg(unix)]
 static SIGNAL_HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
 

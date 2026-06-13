@@ -47,6 +47,44 @@ fn gate_kind_labels_are_unique() {
     assert_eq!(labels.len(), count, "gate labels must be unique");
 }
 
+#[test]
+fn every_gate_carries_a_distinct_prose_explanation() {
+    let kinds = [
+        GateKind::Contrast,
+        GateKind::ScreenReaderText,
+        GateKind::MinimalGlyph,
+        GateKind::KeyboardReachability,
+    ];
+    let mut explanations: Vec<&str> = kinds.iter().map(|k| k.explanation()).collect();
+    for &why in &explanations {
+        assert!(!why.is_empty(), "every gate explains why it matters");
+    }
+    let count = explanations.len();
+    explanations.sort_unstable();
+    explanations.dedup();
+    assert_eq!(
+        explanations.len(),
+        count,
+        "each gate's explanation is distinct"
+    );
+
+    // The enriched Debug form surfaces the label + the explainer alongside the
+    // detail, so a CI failure report carries the reasoning, not just the symptom.
+    let rendered = format!(
+        "{:?}",
+        Violation {
+            gate: GateKind::ScreenReaderText,
+            detail: "required content X not extractable".to_string(),
+        }
+    );
+    assert!(rendered.contains("screen_reader_text"), "{rendered}");
+    assert!(
+        rendered.contains("screen readers extract text only"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("required content X"), "{rendered}");
+}
+
 // ---------------------------------------------------------------------------
 // Capture — the integration path: drives the real render() over a TestBackend
 // ---------------------------------------------------------------------------

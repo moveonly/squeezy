@@ -289,13 +289,35 @@ impl ClipboardHistoryStore {
         }
     }
 
-    /// The full payload of the entry with `id`, for re-delivery to the clipboard.
-    /// `None` when no such entry exists (it was evicted/deleted meanwhile).
+    /// The full payload of the entry with `id`, or `None` when it was
+    /// evicted/deleted. Test-only read accessor used to assert re-copy and
+    /// eviction behavior against stable ids.
+    #[cfg(test)]
     pub(crate) fn text_of(&self, id: u64) -> Option<&str> {
         self.entries
             .iter()
             .find(|e| e.id == id)
             .map(|e| e.text.as_str())
+    }
+
+    /// Promote the entry with `id` to the front (newest) and point the cursor at
+    /// it, returning a clone of its `(text, label)`. Used by the picker's re-copy
+    /// verb so re-copying an existing row reuses its id and original scope label
+    /// rather than inserting a fresh, payload-identical row under a generic
+    /// "clipboard history" label. The caller re-delivers the returned text through
+    /// the copy funnel with the returned label; because the entry is now the
+    /// front with that exact text+label, the funnel's `record` collapses onto it
+    /// (same text *and* label) instead of duplicating it. `None` when no such
+    /// entry exists (it was evicted/deleted meanwhile).
+    pub(crate) fn promote_to_front(&mut self, id: u64) -> Option<(String, String)> {
+        let pos = self.entries.iter().position(|e| e.id == id)?;
+        if pos != 0 {
+            let entry = self.entries.remove(pos);
+            self.entries.insert(0, entry);
+        }
+        self.selected = 0;
+        let front = &self.entries[0];
+        Some((front.text.clone(), front.label.clone()))
     }
 
     /// Toggle the pinned flag of the entry with `id`. Returns the entry's new

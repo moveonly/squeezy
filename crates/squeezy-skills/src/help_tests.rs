@@ -443,6 +443,20 @@ fn slash_help_index_shows_grouped_topics() {
 }
 
 #[test]
+fn slash_command_help_table_has_no_duplicate_names() {
+    // The drift tests dedup names into a HashSet and so cannot catch a
+    // duplicate `name` shadowing a sibling entry. Assert uniqueness here so a
+    // second source-of-truth description for one command fails loudly.
+    let mut seen = BTreeSet::new();
+    for name in super::slash_command_help_names() {
+        assert!(
+            seen.insert(name),
+            "duplicate slash-command help entry for {name:?}"
+        );
+    }
+}
+
+#[test]
 fn squeezy_help_doc_citations_are_bundled_paths() {
     let bundled = bundled_doc_paths().into_iter().collect::<BTreeSet<_>>();
     let topics = [

@@ -79,6 +79,37 @@ pub(crate) fn highlight_code(language_hint: Option<&str>, source: &str) -> Vec<L
     cache::get_or_compute_highlight(source, name, || highlight_uncached(source, lang))
 }
 
+/// Why a fenced code block renders plain instead of syntax-highlighted.
+/// Drives the faint header label so a deliberately-plain block reads
+/// differently from one where highlighting silently gave up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FenceLabel {
+    /// A supported grammar resolved the hint and highlighted the body.
+    Highlighted(&'static str),
+    /// No info string on the fence — plain by design.
+    NoLanguage,
+    /// An info string was present but no grammar matched it.
+    Unsupported,
+    /// The body is past the highlight size limits, so color was skipped.
+    TooLarge,
+}
+
+/// Classify how a fenced block (info string + body) will render, so the
+/// caller can paint a faint one-line header distinguishing a deliberate
+/// plain block from a silent highlighter fallback.
+pub(crate) fn classify_fence(language_hint: Option<&str>, source: &str) -> FenceLabel {
+    if exceeds_highlight_limits(source) {
+        return FenceLabel::TooLarge;
+    }
+    match language_hint {
+        None => FenceLabel::NoLanguage,
+        Some(hint) => match HighlightLanguage::from_hint(hint) {
+            Some(lang) => FenceLabel::Highlighted(language_spec(lang).name),
+            None => FenceLabel::Unsupported,
+        },
+    }
+}
+
 fn highlight_uncached(source: &str, lang: HighlightLanguage) -> Vec<Line<'static>> {
     let Some(config) = highlight_config(lang) else {
         return plain_lines(source);

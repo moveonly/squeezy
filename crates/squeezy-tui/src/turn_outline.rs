@@ -147,13 +147,25 @@ pub(crate) struct OutlineEntry {
 /// One node of the outline (§12.2.1). `entry_id` is the stable
 /// `TranscriptEntry::id` of the entry it stands for (the quick-jump target);
 /// `kind` is the section; `status` is ok/failed; `title` is the short, bounded,
-/// deterministic, secret-free label.
+/// deterministic, secret-free label; `full_title` is the same label *before*
+/// the [`TITLE_CAP`] truncation, retained so the overlay can reveal the cut
+/// text on selection rather than forcing the user to leave the outline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OutlineNode {
     pub(crate) entry_id: u64,
     pub(crate) kind: OutlineKind,
     pub(crate) status: OutlineStatus,
     pub(crate) title: String,
+    pub(crate) full_title: String,
+}
+
+impl OutlineNode {
+    /// Whether [`title`](Self::title) was truncated from
+    /// [`full_title`](Self::full_title) — the cue for the overlay to offer a
+    /// reveal of the cut text.
+    pub(crate) fn is_truncated(&self) -> bool {
+        self.title != self.full_title
+    }
 }
 
 /// Largest number of characters retained in a node `title`. One short line: long
@@ -169,6 +181,19 @@ const TITLE_CAP: usize = 60;
 /// `"(kind)"` rather than inventing text — the spec's "prefer honest
 /// deterministic labels over fake summaries".
 pub(crate) fn clean_title(raw: &str, kind: OutlineKind) -> String {
+    let full = full_title(raw, kind);
+    if full.chars().count() <= TITLE_CAP {
+        return full;
+    }
+    let prefix: String = full.chars().take(TITLE_CAP).collect();
+    format!("{prefix}\u{2026}")
+}
+
+/// The collapsed one-line title *before* the [`TITLE_CAP`] truncation that
+/// [`clean_title`] applies. Same honest derivation (first non-blank line,
+/// interior whitespace collapsed, kind fallback) but uncapped, so the overlay
+/// can recover the full text the truncated label dropped.
+fn full_title(raw: &str, kind: OutlineKind) -> String {
     // First non-blank line only — a node label is one line.
     let first_line = raw.lines().map(str::trim).find(|line| !line.is_empty());
     let Some(line) = first_line else {
@@ -180,11 +205,7 @@ pub(crate) fn clean_title(raw: &str, kind: OutlineKind) -> String {
     if collapsed.is_empty() {
         return format!("({})", kind.label());
     }
-    if collapsed.chars().count() <= TITLE_CAP {
-        return collapsed;
-    }
-    let prefix: String = collapsed.chars().take(TITLE_CAP).collect();
-    format!("{prefix}\u{2026}")
+    collapsed
 }
 
 /// Build the outline node for one classified entry. Pure and standalone so it is
@@ -202,6 +223,7 @@ pub(crate) fn node_for_entry(entry: &OutlineEntry) -> OutlineNode {
         kind: entry.kind,
         status,
         title: clean_title(&entry.raw_title, entry.kind),
+        full_title: full_title(&entry.raw_title, entry.kind),
     }
 }
 

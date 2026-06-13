@@ -136,8 +136,21 @@ fn history_summary_respects_max() {
         stack.jump_back(None);
     }
     let summary = stack.history_summary(2, |_| None);
-    // Two newest only: 5 then 4.
-    assert_eq!(summary, "#5 \u{2190} #4");
+    // Two newest only: 5 then 4, with a trailing ellipsis marking that older
+    // jumps (3, 2, 1) exist beyond the clipped readout.
+    assert_eq!(summary, "#5 \u{2190} #4 \u{2190} \u{2026}");
+}
+
+#[test]
+fn history_summary_no_ellipsis_when_not_clipped() {
+    let mut stack = JumpMarkStack::new();
+    for id in 1..=3u64 {
+        stack.set(id);
+        stack.jump_back(None);
+    }
+    // Exactly `max` entries: an exhaustive readout carries no trailing ellipsis.
+    let summary = stack.history_summary(3, |_| None);
+    assert_eq!(summary, "#3 \u{2190} #2 \u{2190} #1");
 }
 
 #[test]

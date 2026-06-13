@@ -80,7 +80,10 @@ impl SubagentTimelineStatus {
             SubagentTimelineStatus::Running => "running",
             SubagentTimelineStatus::Completed => "done",
             SubagentTimelineStatus::Failed => "failed",
-            SubagentTimelineStatus::Rejected => "capped",
+            // "rejected" (matching the `Rejected` variant) is honest about what
+            // happened to the agent — it never ran — and reserves "cap" for the
+            // compare view's two-slot column bound, which is an unrelated concept.
+            SubagentTimelineStatus::Rejected => "rejected",
         }
     }
 

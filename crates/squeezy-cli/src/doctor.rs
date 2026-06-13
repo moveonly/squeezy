@@ -116,6 +116,16 @@ impl Status {
         }
     }
 
+    /// Severity rank for the human-readable ordering: failures first, then
+    /// warnings, then ok rows. The `--json` body keeps source order.
+    fn severity_rank(self) -> u8 {
+        match self {
+            Status::Fail => 0,
+            Status::Warn => 1,
+            Status::Ok => 2,
+        }
+    }
+
     fn matches_filter(self, filter: DoctorStatusFilter) -> bool {
         matches!(
             (self, filter),
@@ -185,7 +195,13 @@ impl DoctorReport {
             .max()
             .unwrap_or(0)
             .max(4);
-        for check in &self.checks {
+        // Surface failures first, then warnings, then ok rows, so a skim of a
+        // mostly-green run can't miss a failure buried mid-list. `sort_by_key`
+        // is stable, so category push-order is preserved within each group.
+        // The `--json` body intentionally keeps source order for stable parsing.
+        let mut ordered: Vec<&Check> = self.checks.iter().collect();
+        ordered.sort_by_key(|check| check.status.severity_rank());
+        for check in ordered {
             println!(
                 "  [{}] {:<name_width$}  {}",
                 check.status.as_str(),
@@ -193,6 +209,11 @@ impl DoctorReport {
                 check.detail,
                 name_width = name_width,
             );
+        }
+        if self.exit_code == 0 && self.warnings == 0 {
+            println!("Ready. Run `squeezy` to start.");
+        } else {
+            println!("See TROUBLESHOOTING.md (crates/squeezy-skills/external-docs/) for fixes.");
         }
     }
 

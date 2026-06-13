@@ -302,12 +302,37 @@ pub(crate) fn checkpoint_path(session_id: &str) -> PathBuf {
 /// restore" so a bad file can never block launch.
 pub(crate) fn load(session_id: &str) -> Option<UiStateCheckpoint> {
     let path = checkpoint_path(session_id);
-    let text = std::fs::read_to_string(&path).ok()?;
-    let checkpoint = toml::from_str::<UiStateCheckpoint>(&text).ok()?;
+    // The common "no checkpoint exists" case stays silent — a fresh session has
+    // nothing to restore. Every *other* failure (a file that exists but is
+    // unreadable, malformed, newer-schema, or for a different session) is logged
+    // once at debug so a silently-discarded UI state is at least traceable.
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            tracing::debug!(%err, "ui checkpoint unreadable; using defaults");
+            return None;
+        }
+    };
+    let checkpoint = match toml::from_str::<UiStateCheckpoint>(&text) {
+        Ok(checkpoint) => checkpoint,
+        Err(err) => {
+            tracing::debug!(%err, "ui checkpoint corrupt; using defaults");
+            return None;
+        }
+    };
     if checkpoint.version > CHECKPOINT_SCHEMA_VERSION {
+        tracing::debug!(
+            found = checkpoint.version,
+            current = CHECKPOINT_SCHEMA_VERSION,
+            "ui checkpoint ignored: newer schema; using defaults"
+        );
         return None;
     }
     if !checkpoint.matches_session(session_id) {
+        // Don't log the id itself — a session id is treated as sensitive; the
+        // message alone is enough to trace a discarded checkpoint.
+        tracing::debug!("ui checkpoint ignored: session id mismatch");
         return None;
     }
     Some(checkpoint)

@@ -616,7 +616,10 @@ fn format_budget(app: &TuiApp) -> String {
     if app.metrics.budget_denials == 0 {
         "budget ok".to_string()
     } else {
-        format!("budget denied:{}", app.metrics.budget_denials)
+        // Phrased as a live count for the active turn (the counter resets each
+        // turn), with the `✖` error glyph so a nonzero state reads as a current
+        // in-turn block rather than a stale tally.
+        format!("budget: {} blocked ✖", app.metrics.budget_denials)
     }
 }
 
@@ -657,34 +660,46 @@ pub(crate) fn render_status_details(app: &TuiApp) -> String {
 /// Render the `cost ...` segment with optional cap and percent.
 ///
 /// When `cap_unenforceable` is `true` (the active model has no pricing and
-/// a session cap is configured) an `unpriced` suffix is appended so the
-/// status line shows a persistent reminder without requiring the user to
-/// scroll back to the one-shot transcript notice.
+/// a session cap is configured) the cap is rendered as inert rather than as
+/// a percentage: an unpriced cap cannot advance, so a `0.0%` next to the
+/// cap would read as reassuring headroom exactly when the guardrail is off.
+/// The flag self-clears on the next priced `CostUpdate`.
 pub(crate) fn format_cost_segment(
     cost: &squeezy_core::CostSnapshot,
     cap_usd_micros: Option<u64>,
     cap_unenforceable: bool,
 ) -> String {
     use crate::commands::format_cost;
-    let mut out = match cap_usd_micros {
+    match cap_usd_micros {
         Some(cap) if cap > 0 => {
-            let spent = cost.estimated_usd_micros.unwrap_or(0);
-            // Use one decimal place so small movements near a low cap are
-            // visible before a full percentage point changes.
-            let percent = ((spent as f64) / (cap as f64) * 100.0).min(999.9);
-            format!(
-                "cost {} / ${:.2} ({:.1}%)",
-                format_cost(cost),
-                cap as f64 / 1_000_000.0,
-                percent
-            )
+            let cap_dollars = cap as f64 / 1_000_000.0;
+            if cap_unenforceable {
+                // Suppress the percent: it cannot move for an unpriced model,
+                // so showing `(0.0%) ⚠ unpriced` tells two opposite stories.
+                format!(
+                    "cost {} / ${cap_dollars:.2} (cap inert: unpriced model)",
+                    format_cost(cost),
+                )
+            } else {
+                // Share the broker's integer percent and 255 ceiling
+                // (`cost_broker::cap_percent`) so the status line and the
+                // transcript cap notices never print a different overshoot.
+                let spent = cost.estimated_usd_micros.unwrap_or(0);
+                let percent = ((spent as u128 * 100) / cap as u128).min(255);
+                format!(
+                    "cost {} / ${cap_dollars:.2} ({percent}%)",
+                    format_cost(cost),
+                )
+            }
         }
-        _ => format!("cost {}", format_cost(cost)),
-    };
-    if cap_unenforceable {
-        out.push_str(" ⚠ unpriced");
+        _ => {
+            let mut out = format!("cost {}", format_cost(cost));
+            if cap_unenforceable {
+                out.push_str(" ⚠ unpriced");
+            }
+            out
+        }
     }
-    out
 }
 
 pub(crate) mod segments {
@@ -757,7 +772,9 @@ pub(crate) mod segments {
         if app.metrics.budget_denials == 0 {
             Some("budget ok".to_string())
         } else {
-            Some(format!("budget denied:{}", app.metrics.budget_denials))
+            // Live per-turn block count with the `✖` error glyph (matches the
+            // styled status-line `format_budget`).
+            Some(format!("budget: {} blocked ✖", app.metrics.budget_denials))
         }
     }
 

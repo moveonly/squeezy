@@ -138,14 +138,14 @@ fn theme_question_does_not_preview_future_provider_or_model_fields() {
     let question = rendered_line_text(render_question_line(&state));
     let summary = rendered_line_text(render_selection_summary(&state));
 
-    assert_eq!(question, "Question 1/3 Choose a theme");
+    assert_eq!(question, "Step 1 of 3 Choose a theme");
     assert!(!question.contains("Provider"));
     assert!(!question.contains("Model"));
     assert_eq!(summary, "theme default");
 }
 
 #[test]
-fn setup_progress_counts_deferred_resume_question() {
+fn setup_progress_excludes_deferred_resume_question() {
     let mut state = StartupModelPickerState::new(themes(), choices(true), "default", 1);
     state.dispatch(press(KeyCode::Enter)); // theme
     state.dispatch(press(KeyCode::Enter)); // provider
@@ -155,7 +155,7 @@ fn setup_progress_counts_deferred_resume_question() {
     assert_eq!(state.step, PickerStep::Reasoning);
     assert_eq!(
         rendered_line_text(render_question_line(&state)),
-        "Question 4/5 Choose reasoning effort"
+        "Step 4 of 4 Choose reasoning effort  · then 1 more question"
     );
 }
 
@@ -164,7 +164,7 @@ fn custom_theme_row_continues_then_opens_config_after_selection() {
     let mut themes = themes();
     themes.push(StartupThemeChoice {
         name: String::new(),
-        label: "Custom theme in /config".to_string(),
+        label: "Pick a theme later in the config screen".to_string(),
         action: StartupThemeAction::ConfigureInConfig,
     });
     let mut state = StartupModelPickerState::new(themes, choices(false), "default", 0);
@@ -200,7 +200,7 @@ fn provider_without_key_adds_key_question_and_marks_config_followup() {
 
     assert_eq!(
         rendered_line_text(render_question_line(&state)),
-        "Question 2/4 Choose a provider"
+        "Step 2 of 4 Choose a provider"
     );
     state.dispatch(press(KeyCode::Enter)); // provider
     assert_eq!(state.step, PickerStep::Key);
@@ -209,7 +209,7 @@ fn provider_without_key_adds_key_question_and_marks_config_followup() {
             .into_iter()
             .map(rendered_line_text)
             .collect::<Vec<_>>(),
-        vec!["▸ Configure ANTHROPIC_API_KEY later in /config"]
+        vec!["▸ Set ANTHROPIC_API_KEY later -- the config screen opens after setup"]
     );
     state.dispatch(press(KeyCode::Enter)); // key
     assert_eq!(state.step, PickerStep::Model);
