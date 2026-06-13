@@ -44505,7 +44505,7 @@ fn format_status_hint_base(app: &TuiApp) -> String {
             return "type your answer · Enter send · Esc cancel".to_string();
         }
         if pending.request.allow_freeform {
-            return "Up/Down choose · type selects Answer · Enter sends dotted row · Esc cancel"
+            return "Up/Down choose · type fills Answer · Enter sends the highlighted row · Esc cancel"
                 .to_string();
         }
         return "Up/Down choose · Enter select · Esc cancel".to_string();
