@@ -283,6 +283,34 @@ fn card_formats_metrics_at_the_edge_with_honest_dashes() {
     assert_eq!(running.elapsed_clock(), "1:15", "75s renders as m:ss");
     assert_eq!(running.cost_label(), "$1.500000");
 
+    // Past an hour the clock rolls minutes into an hours field instead of
+    // accumulating misleadingly large minute counts.
+    let mut hour_card = (*running).clone();
+    hour_card.elapsed_secs = Some(3905);
+    assert_eq!(
+        hour_card.elapsed_clock(),
+        "1:05:05",
+        "3905s renders as h:mm:ss, not 65:05"
+    );
+    hour_card.elapsed_secs = Some(7200);
+    assert_eq!(
+        hour_card.elapsed_clock(),
+        "2:00:00",
+        "7200s renders as 2:00:00"
+    );
+    hour_card.elapsed_secs = Some(3600);
+    assert_eq!(
+        hour_card.elapsed_clock(),
+        "1:00:00",
+        "the hour boundary rolls over"
+    );
+    hour_card.elapsed_secs = Some(3599);
+    assert_eq!(
+        hour_card.elapsed_clock(),
+        "59:59",
+        "just under an hour stays m:ss"
+    );
+
     let capped = board.cards_in(ReviewLane::Capped)[0];
     assert_eq!(
         capped.elapsed_clock(),
