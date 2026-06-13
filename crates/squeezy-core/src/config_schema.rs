@@ -1144,6 +1144,19 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
+                label: "first_run_hints",
+                toml_path: &["tui", "first_run_hints"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::Restart,
+                get: get_first_run_hints,
+                set: set_first_run_hints,
+                default_display: "true",
+                default: || FieldValue::Bool(true),
+                help: "Show the gentle first-run hints (command-palette chord, hover peek, turn jump). Each shows at most once and fades the instant you use or dismiss it; the seen-set persists across sessions. Off silences them entirely.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
                 label: "synchronized_output",
                 toml_path: &["tui", "synchronized_output"],
                 kind: FieldKind::Enum {
@@ -3146,6 +3159,19 @@ fn set_copy_on_select(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'st
     match value {
         FieldValue::Bool(v) => {
             cfg.tui.copy_on_select = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_first_run_hints(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.tui.first_run_hints)
+}
+fn set_first_run_hints(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.tui.first_run_hints = v;
             Ok(())
         }
         _ => Err("expects bool"),

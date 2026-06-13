@@ -290,3 +290,92 @@ fn slugs_are_stable_and_distinct() {
         assert!(slug.is_ascii());
     }
 }
+
+#[test]
+fn from_slug_round_trips_every_id_and_rejects_unknown() {
+    for id in HintId::ALL {
+        assert_eq!(HintId::from_slug(id.slug()), Some(id));
+    }
+    assert_eq!(HintId::from_slug("not-a-hint"), None);
+    assert_eq!(HintId::from_slug(""), None);
+}
+
+#[test]
+fn seeded_seen_set_marks_hints_seen_and_can_go_quiet() {
+    let mut engine = HintEngine::new(true);
+    engine.seed_seen([
+        "palette_chord".to_string(),
+        "unknown".to_string(),
+        " jump ".to_string(),
+    ]);
+    assert!(engine.is_seen(HintId::PaletteChord));
+    assert!(engine.is_seen(HintId::Jump), "whitespace is trimmed");
+    assert!(!engine.is_seen(HintId::Hover));
+    assert!(!engine.is_quiet(), "Hover is still pending");
+
+    engine.seed_seen(["hover".to_string()]);
+    assert!(engine.is_quiet(), "every hint seen ⇒ quiet");
+}
+
+#[test]
+fn disabled_engine_is_always_quiet_and_never_paints() {
+    let engine = HintEngine::new(false);
+    assert!(!engine.is_enabled());
+    assert!(engine.is_quiet());
+    let now = Instant::now();
+    assert_eq!(engine.active_hint(now, false), None);
+    assert_eq!(
+        engine.active_hint(now + HINT_SETTLE + Duration::from_secs(1), false),
+        None,
+        "a disabled engine never paints, even past the settle window",
+    );
+}
+
+fn temp_state_path(label: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    std::env::temp_dir().join(format!("squeezy_first_run_hints_{label}_{nonce}"))
+}
+
+#[test]
+fn seen_set_persists_across_engine_reconstruction() {
+    let path = temp_state_path("persist");
+    {
+        let mut engine = HintEngine::with_persistence(true, path.clone());
+        // The top-priority hint settles and shows, then the user dismisses it.
+        let now = Instant::now();
+        assert_eq!(engine.active_hint(now, false), None);
+        let settled = now + HINT_SETTLE + Duration::from_millis(1);
+        assert_eq!(
+            engine.active_hint(settled, false),
+            Some(HintId::PaletteChord)
+        );
+        assert_eq!(engine.dismiss(), Some(HintId::PaletteChord));
+    }
+
+    // A fresh engine reconstructed from the same path must read the dismissal as
+    // already-seen: the next candidate is Hover, never PaletteChord again.
+    let engine = HintEngine::with_persistence(true, path.clone());
+    assert!(engine.is_seen(HintId::PaletteChord));
+    let now = Instant::now();
+    assert_eq!(engine.active_hint(now, false), None);
+    assert_eq!(
+        engine.active_hint(now + HINT_SETTLE + Duration::from_millis(1), false),
+        Some(HintId::Hover),
+        "a learned hint stays learned across sessions",
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn note_used_persists_the_seen_set_to_disk() {
+    let path = temp_state_path("note-used");
+    let mut engine = HintEngine::with_persistence(true, path.clone());
+    engine.note_used(HintId::Hover);
+    let persisted = read_slugs(&path).expect("state file written");
+    assert_eq!(persisted, vec!["hover".to_string()]);
+    let _ = std::fs::remove_file(&path);
+}

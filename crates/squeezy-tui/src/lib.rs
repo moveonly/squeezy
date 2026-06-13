@@ -48196,7 +48196,16 @@ impl TuiApp {
             clickables: std::cell::RefCell::new(interaction::Registry::new()),
             gestures: interaction::Recognizer::new(),
             hover_intent: hover_intent::HoverIntentState::default(),
-            first_run_hints: first_run_hints::HintEngine::default(),
+            first_run_hints: if cfg!(test) {
+                // Tests must not read or write the real `~/.squeezy/first_run_hints`;
+                // keep the engine purely in-memory while still honoring the flag.
+                first_run_hints::HintEngine::new(config.tui.first_run_hints)
+            } else {
+                first_run_hints::HintEngine::with_persistence(
+                    config.tui.first_run_hints,
+                    squeezy_core::default_first_run_hints_state_path(),
+                )
+            },
             degraded_suggestion: degraded_mode::DegradedModeSuggestor::default(),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
             preserve_input_after_slash_command: false,

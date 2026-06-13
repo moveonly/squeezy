@@ -2632,6 +2632,15 @@ fn copy_on_select_defaults_on() {
 }
 
 #[test]
+fn first_run_hints_default_on() {
+    let config = TuiConfig::default();
+    assert!(
+        config.first_run_hints,
+        "first_run_hints must default to true so the gentle hints teach new users out of the box"
+    );
+}
+
+#[test]
 fn section_settings_cover_budgets_permissions_graph_cache_tui_and_mcp() {
     let settings = SettingsFile::from_toml_str(
         r#"
@@ -2719,6 +2728,7 @@ tool_output_verbosity = "normal"
 transcript_default = "expanded"
 show_reasoning_usage = false
 copy_on_select = false
+first_run_hints = false
 
 [mcp.servers.docs]
 enabled = true
@@ -2796,6 +2806,10 @@ reason = "docs lookups are safe"
     assert!(
         !config.tui.copy_on_select,
         "[tui] copy_on_select = false parses through"
+    );
+    assert!(
+        !config.tui.first_run_hints,
+        "[tui] first_run_hints = false parses through"
     );
     assert_eq!(config.mcp_servers["docs"].transport, McpTransport::Http);
     assert_eq!(config.mcp_servers["docs"].timeout_ms, Some(5_000));
