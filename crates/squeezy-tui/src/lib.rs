@@ -3819,6 +3819,20 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // the peek never fights another surface. Drag/scroll are handled below (they
     // dismiss any live preview).
     if let MouseEventKind::Moved = mouse.kind {
+        // Hover Preview reachability (§12.1.4): the popover paints OVER the rows
+        // beneath the previewed header yet registers no hit target, so a pointer
+        // moved onto it lands on unregistered space, the recognizer reports a
+        // `HoverLeave`, and the peek the user is reaching for is dismissed before
+        // they can read it. While the pointer is inside the popover's last-painted
+        // rect, treat the popover as part of its own hover affordance: keep it and
+        // consume the Move (no recognizer, no dismiss), so it can actually be read
+        // — and so the cost/turn meta on the answer stays put long enough to land.
+        if app.hover_preview.is_some()
+            && let Some(rect) = app.hover_preview_rect.get()
+            && smart_split::rect_contains(rect, mouse.column, mouse.row)
+        {
+            return app.needs_redraw;
+        }
         // Subagent Hover Preview (§12.8.2): a bare Move over a subagent timeline row
         // reveals the subagent preview popover after the same hover-intent dwell.
         // Checked first (and in every active source, since the pane is always
@@ -13685,6 +13699,11 @@ fn build_entry_preview_meta(app: &TuiApp, entry: &TranscriptEntry, turn: u32) ->
         if let Some(usd) = provider.estimated_usd_micros {
             parts.push(format_cost_usd(usd));
         }
+        // Name the model that did the turn's main work (when recorded), so the
+        // peek answers "what ran this, and what did it cost" in one line.
+        if let Some(model) = turn_primary_model(metrics) {
+            parts.push(model.to_string());
+        }
         if let Some(input) = provider.input_tokens {
             parts.push(format!("{} in", compact_token_count(input)));
         }
@@ -13693,6 +13712,31 @@ fn build_entry_preview_meta(app: &TuiApp, entry: &TranscriptEntry, turn: u32) ->
         }
     }
     Some(parts.join(" \u{00b7} "))
+}
+
+/// The model that did the bulk of a turn's MAIN (non-subagent) work, for the
+/// hover-preview meta line — the `model_ledger` main bucket carrying the largest
+/// priced spend (ties broken by output tokens). `None` when the turn records no
+/// per-model main spend (older sessions, or local/help turns), so the meta line
+/// simply omits the model rather than guessing.
+fn turn_primary_model(metrics: &squeezy_core::TurnMetrics) -> Option<&str> {
+    metrics
+        .model_ledger
+        .0
+        .values()
+        .filter(|bucket| {
+            let main = &bucket.main;
+            main.estimated_usd_micros.is_some()
+                || main.input_tokens.is_some()
+                || main.output_tokens.is_some()
+        })
+        .max_by_key(|bucket| {
+            (
+                bucket.main.estimated_usd_micros.unwrap_or(0),
+                bucket.main.output_tokens.unwrap_or(0),
+            )
+        })
+        .map(|bucket| bucket.model.as_str())
 }
 
 /// `Alt+1`: toggle the Hover Preview popover (§12.1.4) for the currently focused
@@ -31671,6 +31715,9 @@ fn render_tool_actions_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
 /// "noncommittal preview" the spec calls for.
 fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let Some(preview) = app.hover_preview.as_ref() else {
+        // No popover this frame: drop any stale rect so the mouse-move reachability
+        // guard can't keep a vanished popover alive.
+        app.hover_preview_rect.set(None);
         return;
     };
     // Anchor next to the previewed entry's live header row when it is on-screen;
@@ -31685,8 +31732,12 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
     // beyond the body excerpt.
     let body_rows = preview.body.len() + usize::from(preview.meta.is_some());
     let Some(rect) = hover_preview::popover_rect(area, anchor_row, body_rows) else {
+        app.hover_preview_rect.set(None);
         return;
     };
+    // Record the painted rect so the mouse-move path knows the pointer is over the
+    // popover (which registers no hit target) and keeps it alive to be read.
+    app.hover_preview_rect.set(Some(rect));
 
     // Overlay the popover region only (Clear is scoped to `rect`, never the whole
     // frame), so the transcript underneath keeps its geometry.
@@ -46733,6 +46784,15 @@ pub(crate) struct TuiApp {
     /// `ToggleHoverPreview` (`Alt+1`) keyboard verb, and cleared on hover-leave,
     /// any click/key, scroll, or a transcript change so it never goes stale.
     pub(crate) hover_preview: Option<hover_preview::HoverPreview>,
+    /// The on-screen rect the Hover Preview popover last painted into, or `None`
+    /// when no popover is showing. The popover overlays the rows beneath the
+    /// previewed header but registers no hit target, so the mouse-move path reads
+    /// this to recognize "the pointer is now over the popover itself" and keep it
+    /// alive — without it, moving the pointer onto the popover to read it lands on
+    /// unregistered space, fires a `HoverLeave`, and dismisses the very peek the
+    /// user was reaching for. Refreshed each frame by `render_hover_preview_popover`
+    /// (`Some(rect)` when painted, `None` when not).
+    pub(crate) hover_preview_rect: std::cell::Cell<Option<Rect>>,
     /// The live Subagent Hover Preview popover (§12.8.2), or `None` when none is
     /// showing (the resting state, paints nothing extra and costs nothing idle).
     /// `Some` holds the previewed subagent's pane index, name, distilled status,
@@ -47624,6 +47684,7 @@ impl TuiApp {
             action_palette: None,
             tool_actions: None,
             hover_preview: None,
+            hover_preview_rect: std::cell::Cell::new(None),
             subagent_preview: None,
             subagent_return_anchor: None,
             command_palette: None,

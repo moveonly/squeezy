@@ -43852,6 +43852,79 @@ fn hover_preview_intent_ms() -> u128 {
 }
 
 #[tokio::test]
+async fn hover_preview_survives_pointer_moving_onto_the_popover() {
+    // Regression (reachability): the popover paints OVER the rows beneath the
+    // previewed header but registers no hit target, so before the reachability
+    // guard a pointer moved onto it landed on unregistered space, fired a
+    // HoverLeave, and dismissed the peek before it could be read. Moving the
+    // pointer INTO the popover's painted rect must KEEP it (so the cost/turn meta
+    // on the answer stays put long enough to land).
+    let mut app = app_with_hover_preview(1);
+    let entry_id = active_transcript_entries(&app)[1].id;
+
+    let _ = render_to_string(&app, 100, 30);
+    let mut hover_cell = None;
+    'scan: for row in 0..30u16 {
+        for col in 0..100u16 {
+            if let Some((interaction::TargetKey::Entry(id), interaction::Action::FocusEntry(_))) =
+                app.click_target_at(col, row)
+                && id.0 == entry_id
+            {
+                hover_cell = Some((col, row));
+                break 'scan;
+            }
+        }
+    }
+    let (col, row) = hover_cell.expect("the entry header registers a focus target");
+
+    let moved = |col, row| crossterm::event::MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    // Reveal the preview via a settled hover.
+    handle_mouse(&mut app, moved(col, row));
+    tokio::time::sleep(std::time::Duration::from_millis(
+        (hover_preview_intent_ms() + 40) as u64,
+    ))
+    .await;
+    handle_mouse(&mut app, moved(col, row));
+    assert!(
+        app.hover_preview.is_some(),
+        "a settled hover reveals the preview",
+    );
+
+    // Render so the popover caches its painted rect, then aim a Move at a cell
+    // strictly inside that rect — exactly the spot a user moves to to read it,
+    // and a cell that registers NO Entry target (it overlays the body below).
+    let _ = render_to_string(&app, 100, 30);
+    let rect = app
+        .hover_preview_rect
+        .get()
+        .expect("the painted popover caches its rect");
+    let inside_col = rect.x + rect.width / 2;
+    let inside_row = rect.y + rect.height / 2;
+    assert!(
+        inside_row != row,
+        "the popover sits on a different row than the previewed header",
+    );
+    handle_mouse(&mut app, moved(inside_col, inside_row));
+    assert!(
+        app.hover_preview.is_some(),
+        "moving the pointer onto the popover keeps it (reachable, not self-dismissing)",
+    );
+
+    // Leaving the popover for empty space still dismisses it, as before.
+    handle_mouse(&mut app, moved(99, 29));
+    handle_mouse(&mut app, moved(99, 28));
+    assert!(
+        app.hover_preview.is_none(),
+        "moving fully off the popover and every target dismisses it",
+    );
+}
+
+#[tokio::test]
 async fn hover_preview_renders_across_resizes_without_overflow() {
     let mut app = app_with_hover_preview(1);
     let mut agent = test_agent(SessionMode::Build);
@@ -49386,5 +49459,86 @@ fn entry_preview_meta_shows_turn_size_and_cost() {
     assert!(
         answer_meta.contains("2 lines"),
         "the answer shows its size: {answer_meta}",
+    );
+}
+
+/// The meta line names the model that did the turn's main work, when the turn
+/// recorded one — pairing "what ran this" with "what it cost" in the same peek.
+#[test]
+fn entry_preview_meta_names_the_turns_model() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("hi")); // turn 1
+    app.push_transcript_item(TranscriptItem::assistant("there"));
+
+    let mut metrics = squeezy_core::TurnMetrics::default();
+    metrics.provider.estimated_usd_micros = Some(12_340);
+    let mut main_cost = squeezy_core::CostSnapshot::default();
+    main_cost.estimated_usd_micros = Some(12_340);
+    main_cost.output_tokens = Some(340);
+    metrics.model_ledger.record(
+        "anthropic",
+        "claude-opus-4-8",
+        squeezy_core::CostOrigin::Main,
+        &main_cost,
+    );
+    app.turn_costs.insert(1, metrics);
+
+    let entries = active_transcript_entries(&app);
+    let answer_meta =
+        build_entry_preview_meta(&app, &entries[1], turn_for_entry_index(entries, 1)).unwrap();
+    assert!(
+        answer_meta.contains("claude-opus-4-8"),
+        "the meta names the turn's model: {answer_meta}",
+    );
+}
+
+/// `turn_primary_model` picks the main bucket with the largest priced spend (so an
+/// escalation names the model that did the bulk of the work), ignores
+/// subagent-only spend, and returns `None` for a turn with no per-model main cost.
+#[test]
+fn turn_primary_model_picks_the_dominant_main_bucket() {
+    let mut metrics = squeezy_core::TurnMetrics::default();
+    let mut cheap = squeezy_core::CostSnapshot::default();
+    cheap.estimated_usd_micros = Some(100);
+    cheap.output_tokens = Some(50);
+    let mut pricey = squeezy_core::CostSnapshot::default();
+    pricey.estimated_usd_micros = Some(9_000);
+    pricey.output_tokens = Some(800);
+    metrics.model_ledger.record(
+        "anthropic",
+        "claude-haiku-4-5",
+        squeezy_core::CostOrigin::Main,
+        &cheap,
+    );
+    metrics.model_ledger.record(
+        "anthropic",
+        "claude-opus-4-8",
+        squeezy_core::CostOrigin::Main,
+        &pricey,
+    );
+    assert_eq!(
+        turn_primary_model(&metrics),
+        Some("claude-opus-4-8"),
+        "the pricier main bucket wins after an escalation",
+    );
+
+    let mut subagent_only = squeezy_core::TurnMetrics::default();
+    let mut sub = squeezy_core::CostSnapshot::default();
+    sub.estimated_usd_micros = Some(50_000);
+    subagent_only.model_ledger.record(
+        "anthropic",
+        "explore-model",
+        squeezy_core::CostOrigin::Subagent,
+        &sub,
+    );
+    assert_eq!(
+        turn_primary_model(&subagent_only),
+        None,
+        "subagent-only spend names no main model",
+    );
+    assert_eq!(
+        turn_primary_model(&squeezy_core::TurnMetrics::default()),
+        None,
+        "a turn with no per-model cost names no model",
     );
 }
