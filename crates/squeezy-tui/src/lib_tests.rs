@@ -48500,6 +48500,58 @@ async fn cmd_c_copies_the_composer_selection_and_clears_it() {
     );
 }
 
+#[tokio::test]
+async fn shift_arrow_then_ctrl_c_copies_the_composer_selection() {
+    // The user's exact repro: select in the prompt with Shift+Arrow, then plain
+    // Ctrl+C. This drives the WHOLE path end-to-end — Shift+Right building the
+    // composer selection, then the Ctrl+C arm (NOT the ⌘C intercept) routing
+    // through copy_any_active_selection → copy_input_selection → the clipboard.
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    set_input(&mut app, "hello world".to_string());
+    app.input_cursor = 0;
+
+    for _ in 0..5 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+        )
+        .await
+        .expect("shift+right");
+    }
+    assert_eq!(
+        input::input_selected_text(&app).as_deref(),
+        Some("hello"),
+        "Shift+Right builds the composer selection",
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl+c");
+
+    assert_eq!(
+        writes.lock().unwrap().as_slice(),
+        ["hello"],
+        "plain Ctrl+C copies the Shift-selected composer text",
+    );
+    assert!(
+        !app.exit_confirm_armed,
+        "Ctrl+C with a composer selection copies, never arms exit",
+    );
+}
+
 #[test]
 fn composer_selection_highlight_paints_reversed_cells() {
     let mut app = test_app(SessionMode::Build);

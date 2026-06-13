@@ -22526,14 +22526,20 @@ fn build_terminal_diagnostic(app: &TuiApp, sync_policy: TuiSynchronizedOutput) -
     };
     rows.push(("mouse capture", mouse.to_string()));
 
-    // Clipboard method
-    rows.push((
-        "clipboard",
+    // Clipboard method — report the chain the copy funnel ACTUALLY uses, not a
+    // hardcoded guess. On a local session the verifiable platform command
+    // (pbcopy/wl-copy/…) leads and OSC 52 is only a fallback; over SSH/remote
+    // OSC 52 leads (the terminal must honour it). This is the row to check when
+    // "copy isn't working": if it says pbcopy and ⌘C/Ctrl+C still don't paste,
+    // the running binary is stale (relaunch) — not a clipboard problem.
+    let clipboard = if app.clipboard_chain.prefers_osc52() {
+        format!("OSC52 (remote/SSH; cap {OSC52_MAX_PAYLOAD_BYTES} bytes; terminal must honour it)")
+    } else {
         format!(
-            "OSC52 (cap {} bytes; terminal acceptance not verifiable)",
-            OSC52_MAX_PAYLOAD_BYTES
-        ),
-    ));
+            "platform command (pbcopy/wl-copy/…) — verifiable; OSC52 fallback (cap {OSC52_MAX_PAYLOAD_BYTES} bytes)"
+        )
+    };
+    rows.push(("clipboard", clipboard));
 
     // Notifications — use the resolved backend from the live notifier.
     // `resolved()` only returns None, Some(Bel), or Some(Osc9); Auto and
