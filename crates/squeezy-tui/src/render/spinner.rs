@@ -71,7 +71,7 @@ impl SpinnerStyle {
             Self::Twinkle | Self::Scintillate => self.frame(elapsed_ms),
             Self::Drift => {
                 const TWINKLE: &[&str] = &["✦", "✧"];
-                TWINKLE[((elapsed_ms / 600) as usize) % TWINKLE.len()]
+                TWINKLE[((elapsed_ms / self.interval_ms()) as usize) % TWINKLE.len()]
             }
         }
     }
