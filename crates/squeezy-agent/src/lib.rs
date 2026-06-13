@@ -11325,10 +11325,9 @@ async fn run_subagent(
                 let _ = parent_tx.try_send(event);
                 continue;
             }
-            // Other interesting events surface to the parent transcript
-            // as a compact SubagentActivity line so a watching user can
-            // see the subagent's tool churn without seeing its raw
-            // events.
+            // Other interesting events surface to the parent transcript only as
+            // completed tool results (below), so a watching user sees the
+            // subagent's tool churn without its raw intermediate events.
             let Some(id) = activity_id else {
                 continue;
             };
@@ -18402,15 +18401,9 @@ pub enum AgentEvent {
         agent: String,
         prompt: String,
     },
-    SubagentActivity {
-        turn_id: TurnId,
-        id: SubagentId,
-        agent: String,
-        message: String,
-    },
     /// A subagent's completed tool result, forwarded with its full structure so
     /// the parent can render it as a rail card in the subagent's transcript
-    /// view (rather than the flat `completed X` line `SubagentActivity` carried).
+    /// view rather than a flat `completed X` status line.
     SubagentToolResult {
         turn_id: TurnId,
         id: SubagentId,

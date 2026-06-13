@@ -248,11 +248,6 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         crate::compact_text(&prompt, 140)
                     ));
                 }
-                AgentEvent::SubagentActivity {
-                    id, agent, message, ..
-                } => {
-                    app.note_subagent_activity(id, agent, message);
-                }
                 AgentEvent::SubagentToolResult {
                     id, agent, result, ..
                 } => {

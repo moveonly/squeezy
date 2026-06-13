@@ -48471,6 +48471,11 @@ impl TuiApp {
         self.clamp_subagent_selection();
     }
 
+    /// Append a free-form activity line to a subagent's record (updating its
+    /// `latest` and stored transcript). Live nested status now flows through
+    /// `note_subagent_tool_result`; this remains the fixture the subagent-pane
+    /// tests use to seed a record's activity.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn note_subagent_activity(
         &mut self,
         id: SubagentId,
