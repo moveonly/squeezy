@@ -18,15 +18,15 @@ use crate::render::{cache, highlight};
 /// shaped intermediate "for symmetry" with non-TUI consumers; ratatui already
 /// carries `Style` structurally and any ANSI encode/decode hop is pure cost.
 pub fn render_markdown(source: &str) -> Vec<Line<'static>> {
-    cache::get_or_compute_markdown(source, || render_markdown_uncached(source))
+    cache::get_or_compute_markdown(source, MarkdownMode::Compact.cache_discriminant(), || {
+        render_markdown_with_mode(source, MarkdownMode::Compact)
+    })
 }
 
 pub(crate) fn render_markdown_full(source: &str) -> Vec<Line<'static>> {
-    render_markdown_with_mode(source, MarkdownMode::Full)
-}
-
-fn render_markdown_uncached(source: &str) -> Vec<Line<'static>> {
-    render_markdown_with_mode(source, MarkdownMode::Compact)
+    cache::get_or_compute_markdown(source, MarkdownMode::Full.cache_discriminant(), || {
+        render_markdown_with_mode(source, MarkdownMode::Full)
+    })
 }
 
 fn render_markdown_with_mode(source: &str, mode: MarkdownMode) -> Vec<Line<'static>> {
@@ -42,6 +42,18 @@ fn render_markdown_with_mode(source: &str, mode: MarkdownMode) -> Vec<Line<'stat
 enum MarkdownMode {
     Compact,
     Full,
+}
+
+impl MarkdownMode {
+    /// Discriminant byte folded into the markdown cache key. Compact and
+    /// Full render the same source into different line output, so they must
+    /// occupy distinct cache slots rather than colliding on `(hash, theme)`.
+    fn cache_discriminant(self) -> u8 {
+        match self {
+            MarkdownMode::Compact => 0,
+            MarkdownMode::Full => 1,
+        }
+    }
 }
 
 struct Writer {

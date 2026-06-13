@@ -19,13 +19,13 @@ fn markdown_hits_on_repeat() {
     let calls = AtomicUsize::new(0);
     let key = unique("md_hits", 0);
 
-    let first = get_or_compute_markdown(&key, || {
+    let first = get_or_compute_markdown(&key, 0, || {
         calls.fetch_add(1, Ordering::SeqCst);
         vec![Line::from("first")]
     });
     assert_eq!(line_text(&first[0]), "first");
 
-    let second = get_or_compute_markdown(&key, || {
+    let second = get_or_compute_markdown(&key, 0, || {
         calls.fetch_add(1, Ordering::SeqCst);
         vec![Line::from("MISS")]
     });
@@ -38,6 +38,54 @@ fn markdown_hits_on_repeat() {
         calls.load(Ordering::SeqCst),
         1,
         "second call should not invoke the compute closure"
+    );
+}
+
+#[test]
+fn markdown_keys_on_render_mode() {
+    // Compact (0) and Full (1) render the same source into different line
+    // output, so they must mint separate cache slots even when the source
+    // and theme are identical. Otherwise the first render to land would
+    // shadow the other mode's output for that source.
+    let calls = AtomicUsize::new(0);
+    let key = unique("md_mode", 0);
+
+    let compact = get_or_compute_markdown(&key, 0, || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        vec![Line::from("compact")]
+    });
+    assert_eq!(line_text(&compact[0]), "compact");
+
+    let full = get_or_compute_markdown(&key, 1, || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        vec![Line::from("full")]
+    });
+    assert_eq!(
+        line_text(&full[0]),
+        "full",
+        "Full mode must compute its own slot rather than hitting the Compact entry"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "Compact and Full on the same source+theme must compute separately"
+    );
+
+    // Each mode now hits its own slot on repeat.
+    let compact_again = get_or_compute_markdown(&key, 0, || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        vec![Line::from("MISS")]
+    });
+    assert_eq!(line_text(&compact_again[0]), "compact");
+    let full_again = get_or_compute_markdown(&key, 1, || {
+        calls.fetch_add(1, Ordering::SeqCst);
+        vec![Line::from("MISS")]
+    });
+    assert_eq!(line_text(&full_again[0]), "full");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "repeat lookups of each mode must hit their own cached slot"
     );
 }
 
@@ -112,7 +160,7 @@ fn markdown_evicts_at_capacity() {
 
     for i in 0..=super::MARKDOWN_CAPACITY {
         let key = format!("{probe}::{i}");
-        let _ = get_or_compute_markdown(&key, || vec![Line::from(key.clone())]);
+        let _ = get_or_compute_markdown(&key, 0, || vec![Line::from(key.clone())]);
     }
     // Cap on the global cache (other tests may add entries too) bounds the
     // total size. This is a loose invariant — the strict guarantee is that

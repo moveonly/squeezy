@@ -54,7 +54,11 @@ const DIFF_CAPACITY: usize = 64;
 const ENTRY_CAPACITY: usize = 1024;
 
 type LineVec = Arc<Vec<Line<'static>>>;
-type MarkdownKey = (u64, u64);
+/// `(content_hash, theme_generation, render_mode)`. The `render_mode`
+/// discriminant separates Compact and Full renders of the same source +
+/// theme, which produce different line output and would otherwise collide
+/// on a shared slot.
+type MarkdownKey = (u64, u64, u8);
 type HighlightKey = (u64, &'static str, u64);
 type DiffKey = (PathBuf, u64, u64);
 type MarkdownCache = Mutex<LruCache<MarkdownKey, LineVec>>;
@@ -163,11 +167,13 @@ pub(crate) fn entry_len() -> usize {
 
 pub(crate) fn get_or_compute_markdown(
     content: &str,
+    render_mode: u8,
     compute: impl FnOnce() -> Vec<Line<'static>>,
 ) -> Vec<Line<'static>> {
     let key = (
         hash_content(content.as_bytes()),
         crate::render::theme::theme_generation(),
+        render_mode,
     );
     if let Ok(mut cache) = markdown_cache().lock()
         && let Some(value) = cache.get(&key)

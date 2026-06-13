@@ -34401,6 +34401,20 @@ pub(crate) struct PinnedCompareDiffCache {
     rows: Vec<Line<'static>>,
 }
 
+/// Memoised result of `pending_assistant_display_content`. The sanitizer
+/// (`assistant_content_without_repeated_tool_output` + fence normalization)
+/// runs on every redraw and is also invoked while building the main-render
+/// cache key (via `main_render_tail_anim_phase`), so it executes at least
+/// twice per frame at animation rate. Keyed on the hashes of the pending
+/// assistant text and the recent shell tool outputs — the only two inputs
+/// the sanitizer consumes — so any streaming chunk or new tool result
+/// invalidates it.
+#[derive(Debug, Default)]
+pub(crate) struct PendingDisplayContentCache {
+    key: Option<(u64, u64)>,
+    content: Option<String>,
+}
+
 /// Render the full-screen transcript overlay. Replaces the normal
 /// transcript + prompt layout while `app.transcript_overlay` is `Some`.
 fn render_transcript_overlay_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -37443,9 +37457,22 @@ pub(crate) fn dedupe_assistant_repeated_tool_output(
 }
 
 fn assistant_content_without_repeated_tool_output(app: &TuiApp, content: &str) -> String {
-    let mut content = normalize_fence_boundaries(content);
     let outputs = recent_shell_tool_outputs(app);
-    for output in &outputs {
+    assistant_content_without_repeated_tool_output_with_outputs(content, &outputs)
+}
+
+/// Sanitizer core: strip any recent shell/verify tool output the assistant
+/// echoed back, after normalizing fence boundaries. Split out from the
+/// `&TuiApp` wrapper above so the per-frame memo in
+/// `pending_assistant_display_content` can pass the `recent_shell_tool_outputs`
+/// it already hashed for the cache key, instead of walking the transcript a
+/// second time.
+fn assistant_content_without_repeated_tool_output_with_outputs(
+    content: &str,
+    outputs: &[String],
+) -> String {
+    let mut content = normalize_fence_boundaries(content);
+    for output in outputs {
         if let Some(stripped) = strip_repeated_raw_tool_output(&content, output) {
             content = stripped;
         }
@@ -37495,12 +37522,39 @@ fn normalize_fence_boundaries(content: &str) -> String {
 }
 
 fn pending_assistant_display_content(app: &TuiApp) -> Option<String> {
+    // The cheap empty-tail short-circuit stays ahead of the memo: an empty
+    // pending tail never paints, so it must not occupy or churn the cache slot.
     if app.pending_assistant.trim_is_empty() {
         return None;
     }
     let text = app.pending_assistant.text();
-    let content = assistant_content_without_repeated_tool_output(app, &text);
-    (!content.trim().is_empty()).then_some(content)
+    let outputs = recent_shell_tool_outputs(app);
+
+    // Key on the same inputs the sanitizer consumes — the pending text and the
+    // recent shell outputs — hashed with `DefaultHasher` (matching
+    // `main_render_key`). A hit clones the cached `Option<String>` rather than
+    // re-running the strip/normalize passes, which otherwise fire ≥2×/frame at
+    // animation rate (once directly, once via `main_render_tail_anim_phase`).
+    let key = {
+        let mut text_hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut text_hasher);
+        let mut outputs_hasher = std::collections::hash_map::DefaultHasher::new();
+        outputs.hash(&mut outputs_hasher);
+        (text_hasher.finish(), outputs_hasher.finish())
+    };
+    {
+        let cache = app.pending_display_content_cache.borrow();
+        if cache.key == Some(key) {
+            return cache.content.clone();
+        }
+    }
+
+    let content = assistant_content_without_repeated_tool_output_with_outputs(&text, &outputs);
+    let result = (!content.trim().is_empty()).then_some(content);
+    let mut cache = app.pending_display_content_cache.borrow_mut();
+    cache.key = Some(key);
+    cache.content = result.clone();
+    result
 }
 
 fn recent_shell_tool_outputs(app: &TuiApp) -> Vec<String> {
@@ -45021,6 +45075,12 @@ pub(crate) struct TuiApp {
     /// overlay is open. Keyed on the width + a content hash of both plain panes,
     /// so any content edit or resize invalidates it. See `pinned_compare_diff_lines`.
     pub(crate) pinned_compare_diff_cache: std::cell::RefCell<PinnedCompareDiffCache>,
+    /// Memoized pending-assistant display content so the per-frame sanitizer
+    /// (`assistant_content_without_repeated_tool_output` + fence normalization)
+    /// is not recomputed on every redraw — and again while building the
+    /// main-render cache key. Keyed on `(hash(pending text), hash(recent shell
+    /// outputs))`. See `pending_assistant_display_content`.
+    pub(crate) pending_display_content_cache: std::cell::RefCell<PendingDisplayContentCache>,
     /// Per-frame snapshot of the MAIN transcript scrollbar gutter so a mouse
     /// click/drag can map to a `from_bottom` without re-deriving the layout.
     /// Set at the end of `render_transcript`; `None` when content fits.
@@ -46578,6 +46638,9 @@ impl TuiApp {
             pinned_compare: None,
             pinned_compare_rect_cache: std::cell::Cell::new(None),
             pinned_compare_diff_cache: std::cell::RefCell::new(PinnedCompareDiffCache::default()),
+            pending_display_content_cache: std::cell::RefCell::new(
+                PendingDisplayContentCache::default(),
+            ),
             main_scrollbar_cache: std::cell::Cell::new(None),
             main_text_area_cache: std::cell::Cell::new(None),
             last_frame_size: std::cell::Cell::new(None),
