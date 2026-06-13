@@ -49008,3 +49008,104 @@ async fn shift_cmd_down_extends_selection_to_doc_end() {
         "Shift+⌘↓ extends from the caret to the document end",
     );
 }
+
+// =====================================================================
+// Cut — ⌘X / Ctrl+Shift+X
+// =====================================================================
+
+#[tokio::test]
+async fn cmd_x_cuts_the_composer_selection() {
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    set_input(&mut app, "hello world".to_string());
+    input::begin_input_selection(&mut app, 0);
+    input::extend_input_selection(&mut app, "hello ".len());
+
+    press(
+        &mut app,
+        &mut agent,
+        KeyCode::Char('x'),
+        KeyModifiers::SUPER,
+    )
+    .await;
+
+    assert_eq!(
+        writes.lock().unwrap().as_slice(),
+        ["hello "],
+        "⌘X copies the cut text to the clipboard",
+    );
+    assert_eq!(
+        app.input, "world",
+        "⌘X removes the selected text from the input"
+    );
+    assert_eq!(app.input_cursor, 0, "caret lands at the cut point");
+    assert!(
+        app.input_selection.is_none(),
+        "the selection is cleared after the cut"
+    );
+}
+
+#[tokio::test]
+async fn ctrl_shift_x_also_cuts_the_composer_selection() {
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    set_input(&mut app, "hello world".to_string());
+    input::begin_input_selection(&mut app, "hello ".len());
+    input::extend_input_selection(&mut app, "hello world".len());
+
+    press(
+        &mut app,
+        &mut agent,
+        KeyCode::Char('x'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    )
+    .await;
+
+    assert_eq!(writes.lock().unwrap().as_slice(), ["world"]);
+    assert_eq!(app.input, "hello ");
+}
+
+#[tokio::test]
+async fn cmd_x_with_no_selection_is_inert_and_types_nothing() {
+    let mut agent = test_agent(SessionMode::Build);
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    set_input(&mut app, "hello".to_string());
+
+    press(
+        &mut app,
+        &mut agent,
+        KeyCode::Char('x'),
+        KeyModifiers::SUPER,
+    )
+    .await;
+
+    assert!(
+        writes.lock().unwrap().is_empty(),
+        "⌘X with no selection copies nothing"
+    );
+    assert_eq!(
+        app.input, "hello",
+        "⌘X with no selection must not type an 'x' or delete"
+    );
+}

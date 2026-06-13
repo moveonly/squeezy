@@ -4819,6 +4819,33 @@ fn is_copy_chord(key: &KeyEvent) -> bool {
         || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
 }
 
+/// The system-convention CUT chords: `⌘X` and `Ctrl+Shift+X`. Same exact-match
+/// + letter-case rules as [`is_copy_chord`].
+fn is_cut_chord(key: &KeyEvent) -> bool {
+    if !matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X')) {
+        return false;
+    }
+    key.modifiers == KeyModifiers::SUPER
+        || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+}
+
+/// Cut the composer selection: copy it, delete the selected byte range from the
+/// input, place the caret at the cut point, clear the selection. Returns `true`
+/// only when there was a composer selection to cut (read-only surfaces have
+/// nothing to delete, so the caller falls back to copy-only there).
+fn cut_input_selection(app: &mut TuiApp) -> bool {
+    let Some(range) = input::input_selection_range(app) else {
+        return false;
+    };
+    if !copy_input_selection(app) {
+        return false;
+    }
+    app.input.drain(range.clone());
+    app.input_cursor = range.start;
+    input::note_input_edited(app);
+    true
+}
+
 /// Multi-Cursor-Like Transcript Selection (§12.1.6): commit the live visual
 /// selection into the disjoint [`TuiApp::selection_set`] and clear the live one
 /// so the next gesture starts a fresh non-contiguous range. Returns `true` when
@@ -7938,6 +7965,25 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             app.terminal_title_state = TerminalTitleState::Cleared;
         }
         if copy_any_active_selection(app) {
+            clear_all_text_selections(app);
+        } else {
+            app.status = "nothing selected — drag with the mouse to select text".to_string();
+        }
+        app.needs_redraw = true;
+        return Ok(false);
+    }
+
+    // `⌘X` / `Ctrl+Shift+X` — cut. A composer selection is copied + deleted;
+    // a read-only transcript/screen selection has nothing to delete, so it
+    // degrades to copy. Matched before normalisation for the same reason as the
+    // copy chord. No selection → consumed no-op hint (never types an 'x').
+    if is_cut_chord(&key) {
+        if app.terminal_title_state == TerminalTitleState::Notification {
+            app.terminal_title_state = TerminalTitleState::Cleared;
+        }
+        if cut_input_selection(app) {
+            // composer selection cut (copied + removed)
+        } else if copy_any_active_selection(app) {
             clear_all_text_selections(app);
         } else {
             app.status = "nothing selected — drag with the mouse to select text".to_string();
