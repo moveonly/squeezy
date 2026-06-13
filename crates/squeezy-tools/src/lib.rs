@@ -2378,7 +2378,11 @@ impl ToolRegistry {
                     if paths.is_empty() {
                         "*".to_string()
                     } else {
-                        paths.join(", ")
+                        // Newline-delimited so a filename containing a comma
+                        // (legal on every platform) round-trips intact through
+                        // the approval renderer, which splits this value back
+                        // into a path list. Filenames cannot contain newlines.
+                        paths.join("\n")
                     },
                 );
                 if let Some(diff) = args.as_ref().and_then(render_apply_patch_diff) {

@@ -850,14 +850,14 @@ fn apply_patch_summary_and_metadata_walk_operations_shape() {
     let request = registry.permission_request(&call);
     assert_eq!(
         request.metadata["paths"],
-        "crates/squeezy-eval/OLD.md, \
-         crates/squeezy-eval/README-PROBE.md, \
-         crates/squeezy-eval/README-PROBE2.md, \
-         crates/squeezy-eval/lib.rs, \
-         src/new_name.rs, \
+        "crates/squeezy-eval/OLD.md\n\
+         crates/squeezy-eval/README-PROBE.md\n\
+         crates/squeezy-eval/README-PROBE2.md\n\
+         crates/squeezy-eval/lib.rs\n\
+         src/new_name.rs\n\
          src/old_name.rs",
-        "approval metadata `paths` must mirror the summary so the audit \
-         line and the metadata stay in sync",
+        "approval metadata `paths` is newline-delimited so a comma in a \
+         filename survives the round-trip through the approval renderer",
     );
     // Multi-path operations land on the generic workspace target rather
     // than collapsing to a single file path.

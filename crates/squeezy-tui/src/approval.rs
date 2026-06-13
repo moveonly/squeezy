@@ -322,8 +322,10 @@ fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
         .cloned()
         .or_else(|| permission.metadata.get("path").cloned())
         .unwrap_or_else(|| permission.target.clone());
+    // Paths arrive newline-delimited so a comma inside a filename is not
+    // mistaken for a separator. Filenames cannot contain newlines.
     let path_list: Vec<&str> = paths
-        .split(['\n', ','])
+        .split('\n')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();

@@ -278,11 +278,31 @@ fn edit_preview_lists_paths() {
         "edit",
         PermissionCapability::Edit,
         "crates/squeezy-tui/src/lib.rs",
-        &[("paths", "crates/foo/a.rs,crates/foo/b.rs")],
+        &[("paths", "crates/foo/a.rs\ncrates/foo/b.rs")],
     );
     let out = flatten(&render_preview(&req));
     assert!(out.contains("✎ crates/foo/a.rs"), "{out}");
     assert!(out.contains("✎ crates/foo/b.rs"), "{out}");
+}
+
+#[test]
+fn edit_preview_keeps_comma_in_filename_as_one_path() {
+    // A comma is a legal filename character; the newline-delimited `paths`
+    // value must not be split on the comma into two phantom entries.
+    let req = request_with(
+        "edit",
+        PermissionCapability::Edit,
+        "a,b.txt",
+        &[("paths", "a,b.txt\nc.txt")],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(out.contains("✎ a,b.txt"), "comma-bearing path split: {out}");
+    assert!(out.contains("✎ c.txt"), "{out}");
+    assert_eq!(
+        out.matches('✎').count(),
+        2,
+        "expected exactly two paths: {out}"
+    );
 }
 
 #[test]
@@ -291,7 +311,7 @@ fn edit_preview_surfaces_hidden_paths_over_cap() {
         "edit",
         PermissionCapability::Edit,
         "a.rs",
-        &[("paths", "a.rs,b.rs,c.rs,d.rs,e.rs,f.rs")],
+        &[("paths", "a.rs\nb.rs\nc.rs\nd.rs\ne.rs\nf.rs")],
     );
     let out = flatten(&render_preview(&req));
     // The first four targets render; the rest are summarised, never silently
