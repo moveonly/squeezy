@@ -263,13 +263,28 @@ pub(crate) fn render_lines(
         // A collapsed group's member rows stay in place (so the windowing and the
         // hit-target rects never drift) but read as folded — the preview is
         // replaced by the group name on the first member and dimmed elsewhere.
-        // The member count leads the name (`×N` ahead of the label) so it is the
-        // most useful at-a-glance fact and survives truncation: a long group name
-        // takes the ellipsis at the tail rather than eating the count.
-        let body = if let Some(g) = group.filter(|g| g.collapsed) {
-            format!("{:>2}. ⊟ ×{} {}", index + 1, g.members.len(), g.name)
-        } else {
-            format!("{:>2}. {}", index + 1, preview(item))
+        // The header leads with the member count (`×N` ahead of the label) so the
+        // most useful fact survives truncation; only the group's first member shows
+        // it, later members fold to a quiet continuation rule so the header never
+        // repeats down the stack.
+        let collapsed_g = group.filter(|g| g.collapsed);
+        let is_first_collapsed_member = collapsed_g.is_some()
+            && groups
+                .and_then(|g| index.checked_sub(1).and_then(|p| g.get(p)))
+                .copied()
+                .flatten()
+                .map(|prev| prev.id)
+                != collapsed_g.map(|g| g.id);
+        let (body, body_style) = match collapsed_g {
+            Some(g) if is_first_collapsed_member => (
+                format!("{:>2}. ⊟ ×{} {}", index + 1, g.members.len(), g.name),
+                style,
+            ),
+            Some(_) => (
+                format!("{:>2}.  ┊", index + 1),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            None => (format!("{:>2}. {}", index + 1, preview(item)), style),
         };
         let mut spans = vec![
             Span::styled(
@@ -300,7 +315,7 @@ pub(crate) fn render_lines(
             let body = truncate_to_width(&body, body_budget);
             let body_w = UnicodeWidthStr::width(body.as_str());
             let pad = body_budget.saturating_sub(body_w);
-            spans.push(Span::styled(body, style));
+            spans.push(Span::styled(body, body_style));
             if pad > 0 {
                 spans.push(Span::raw(" ".repeat(pad)));
             }
@@ -309,7 +324,7 @@ pub(crate) fn render_lines(
                 Style::default().fg(crate::render::theme::quiet()),
             ));
         } else {
-            spans.push(Span::styled(body, style));
+            spans.push(Span::styled(body, body_style));
         }
         lines.push(Line::from(spans));
     }

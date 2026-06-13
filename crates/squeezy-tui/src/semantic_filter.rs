@@ -132,7 +132,7 @@ pub(crate) fn step(
         Some(i) => (i + 1) % len,
         // Not in the cycle: forward → first real filter, backward → last.
         None if backward => len - 1,
-        None => 0,
+        None => 1,
     };
     cats[next_index]
 }

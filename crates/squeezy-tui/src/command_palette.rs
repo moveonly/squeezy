@@ -224,6 +224,32 @@ impl CommandPalette {
         self.selected = (selected + 1).min(count - 1);
     }
 
+    /// Jump the cursor to the first visible row.
+    pub(crate) fn move_to_top(&mut self) {
+        self.selected = 0;
+    }
+
+    /// Jump the cursor to the last visible row (clamped via `visible_len`).
+    pub(crate) fn move_to_bottom(&mut self) {
+        self.selected = self.visible_len().saturating_sub(1);
+    }
+
+    /// Page the cursor a fixed step (10 rows) up or down, clamped to the visible
+    /// list — a single PgUp/PgDn covers a screenful of the long command registry.
+    pub(crate) fn page(&mut self, down: bool) {
+        let count = self.visible_len();
+        if count == 0 {
+            self.selected = 0;
+            return;
+        }
+        let cur = self.selected();
+        self.selected = if down {
+            (cur + 10).min(count - 1)
+        } else {
+            cur.saturating_sub(10)
+        };
+    }
+
     /// Append a character to the query and re-park the cursor at the top of the
     /// freshly filtered list (the best match), so a narrowed list never strands
     /// the cursor past its end.

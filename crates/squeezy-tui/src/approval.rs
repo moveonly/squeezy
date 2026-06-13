@@ -179,9 +179,12 @@ fn risk_style(risk: PermissionRisk) -> Style {
 
 fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
     if let Some(command) = permission.metadata.get("command") {
-        lines.push(plain_white(format!("$ {}", middle_truncate(command, 160))));
+        lines.push(plain_white(format!(
+            "$ {}",
+            middle_truncate(&command.replace('\n', " "), 160)
+        )));
     } else {
-        lines.push(plain_white(permission.target.clone()));
+        lines.push(plain_white(compact_text(&permission.target, 160)));
     }
     if let Some(cwd) = permission.metadata.get("cwd") {
         lines.push(dim(format!("cwd {cwd}")));
@@ -280,6 +283,9 @@ fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
         .collect();
     for path in path_list.iter().copied().take(4) {
         lines.push(plain_white(format!("✎ {path}")));
+    }
+    if path_list.len() > 4 {
+        lines.push(dim(format!("… (+{} more file(s))", path_list.len() - 4)));
     }
     if let Some(root) = permission.metadata.get("write_root") {
         lines.push(dim(format!("write root {root}")));

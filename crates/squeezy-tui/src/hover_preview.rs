@@ -273,7 +273,7 @@ impl HoverPreview {
     /// honest about whether double-click/Enter does anything here.
     pub(crate) fn activate_hint(&self) -> &'static str {
         if self.primary.is_some() {
-            "double-click / Enter to open"
+            "double-click / Ctrl+Enter to open"
         } else {
             "click to select"
         }

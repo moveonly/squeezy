@@ -390,6 +390,12 @@ fn summary_reports_lanes_collapsed_and_errors() {
             is_error: true,
             preview: "boom".to_string(),
         },
+        LaneEntry {
+            id: LaneId::Error,
+            line_count: 1,
+            is_error: true,
+            preview: "kaboom".to_string(),
+        },
     ];
     let mut panel = LanePanel::new();
     panel.rebuild_if_stale(
@@ -399,9 +405,9 @@ fn summary_reports_lanes_collapsed_and_errors() {
         &store,
     );
     let summary = panel.summary();
-    assert!(summary.starts_with("3 lanes"), "{summary}");
+    assert!(summary.starts_with("4 lanes"), "{summary}");
     assert!(summary.contains("1 collapsed"), "{summary}");
-    assert!(summary.contains("1 error"), "{summary}");
+    assert!(summary.contains("2 errors"), "{summary}");
 }
 
 #[test]

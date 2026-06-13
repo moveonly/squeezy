@@ -121,8 +121,8 @@ fn step_recovers_from_a_stale_tool_index() {
     // never stuck on a filter the transcript can no longer satisfy.
     let names = vec!["shell".to_string(), "edit".to_string()];
     let forward = step(SemanticCategory::Tool(5), &names, false);
-    assert_eq!(forward, cycle(&names)[0]);
-    assert_eq!(forward, SemanticCategory::All);
+    assert_eq!(forward, cycle(&names)[1]);
+    assert_eq!(forward, SemanticCategory::UserTurns);
     let backward = step(SemanticCategory::Tool(5), &names, true);
     assert_eq!(backward, *cycle(&names).last().unwrap());
 }

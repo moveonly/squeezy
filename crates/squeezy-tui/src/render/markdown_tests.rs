@@ -1,4 +1,4 @@
-use super::{render_markdown, render_markdown_full};
+use super::{render_markdown, render_markdown_full, truncate_chars};
 use ratatui::style::Modifier;
 use ratatui::text::Line;
 
@@ -42,6 +42,16 @@ fn markdown_truncates_long_link_urls() {
         !joined.contains("wrap/badly/in/a/narrow"),
         "long url should be abbreviated in the terminal render: {joined}"
     );
+}
+
+#[test]
+fn truncate_chars_keeps_char_boundary_on_multibyte() {
+    assert_eq!(truncate_chars("a\u{65e5}bX", 3), "...");
+    assert_eq!(
+        truncate_chars("\u{1f600}\u{1f600}\u{1f600}\u{1f600}", 3),
+        "..."
+    );
+    assert_eq!(truncate_chars("h\u{e9}llo", 4), "h...");
 }
 
 #[test]

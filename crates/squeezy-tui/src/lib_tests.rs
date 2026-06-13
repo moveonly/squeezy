@@ -9312,7 +9312,7 @@ fn plan_mode_question_marks_freeform_answer_when_selected() {
         allow_freeform: true,
     };
 
-    let lines = format_request_user_input_menu_lines(&request, request.choices.len(), "lm");
+    let lines = format_request_user_input_menu_lines(&request, request.choices.len(), "lm", 2);
     let answer = lines
         .iter()
         .find(|line| {
@@ -9353,7 +9353,7 @@ fn plan_mode_question_selected_choice_uses_amber_dot_not_yellow_label() {
         allow_freeform: false,
     };
 
-    let lines = format_request_user_input_menu_lines(&request, 0, "");
+    let lines = format_request_user_input_menu_lines(&request, 0, "", 0);
     let selected = lines
         .iter()
         .find(|line| {
@@ -15087,6 +15087,47 @@ async fn ctrl_up_with_multiline_composer_moves_cursor_not_entry_focus() {
     assert!(
         app.selected_entry.is_none(),
         "Ctrl+Up must NOT move the transcript entry-focus cursor while editing",
+    );
+}
+
+/// Vertical cursor motion keys the column by CHARACTER, not byte: arrowing up or
+/// down through multi-byte text (here each Greek letter is two bytes) must land
+/// on the same visual column and on a char boundary, never mid-glyph.
+#[tokio::test]
+async fn vertical_cursor_motion_tracks_character_column_across_multibyte_lines() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    // Down from char column 3 of an ASCII line into a Greek line: a byte column
+    // would land at byte 3 (inside the second glyph) and snap left; the char
+    // column lands at the boundary after the third letter.
+    set_input(&mut app, "abc\nαβγδ".to_string());
+    app.input_cursor = "abc".len();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down across multibyte line");
+    assert_eq!(
+        app.input_cursor,
+        "abc\nαβγ".len(),
+        "Down keeps the third-character column on the multi-byte line",
+    );
+
+    // Up back onto the ASCII line returns to the same character column.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("up across multibyte line");
+    assert_eq!(
+        app.input_cursor,
+        "abc".len(),
+        "Up restores the third-character column on the ASCII line",
     );
 }
 
@@ -34763,8 +34804,9 @@ async fn r_on_already_front_prompt_runs_now_when_idle_without_reorder() {
 
 #[tokio::test]
 async fn r_on_already_front_prompt_while_busy_is_inert() {
-    // Front + busy: nothing to move and nothing to run — a quiet no-op that still
-    // consumes the key (the overlay stays open, the composer stays untouched).
+    // Front + busy: nothing to move and nothing to run, but the key was consumed,
+    // so it reports that the front prompt already runs next (the overlay stays
+    // open, the composer stays untouched).
     let mut app = queue_app(&["front", "tail"]);
     let mut agent = test_agent(SessionMode::Build);
     let (_tx, rx) = mpsc::channel(8);
@@ -34789,6 +34831,10 @@ async fn r_on_already_front_prompt_while_busy_is_inert() {
     );
     assert!(app.input.is_empty(), "no key leaks into the composer");
     assert!(app.prompt_queue_undo.is_empty());
+    assert_eq!(
+        app.status, "already at the front — it runs next when the turn finishes",
+        "consumed key gives feedback instead of a silent no-op"
+    );
 }
 
 #[tokio::test]
@@ -38187,7 +38233,7 @@ async fn duplicate_folds_alt_u_opens_overlay_and_lists_folds() {
     assert_eq!(app.duplicate_folds.spans()[0].count(), 3, "three members");
     assert_eq!(app.duplicate_folds.hidden_count(), 2, "two hidden");
     // The summary appears in the header and a row shows the fold count.
-    assert!(out.contains("x3 output"), "fold count row:\n{out}");
+    assert!(out.contains("x3 outputs"), "fold count row:\n{out}");
 }
 
 #[tokio::test]
@@ -43591,7 +43637,7 @@ async fn hover_preview_alt_1_opens_popover_for_focused_unit() {
         "a keyboard-sourced preview names itself pinned in the header:\n{out}",
     );
     assert!(
-        out.contains("double-click / Enter to open"),
+        out.contains("double-click / Ctrl+Enter to open"),
         "activation hint paints:\n{out}",
     );
     assert!(

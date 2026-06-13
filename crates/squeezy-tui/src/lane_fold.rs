@@ -490,7 +490,8 @@ impl LanePanel {
         }
         let errors = self.error_count();
         if errors > 0 {
-            parts.push(format!("{errors} error"));
+            let error_word = if errors == 1 { "error" } else { "errors" };
+            parts.push(format!("{errors} {error_word}"));
         }
         parts.join(" \u{00b7} ")
     }

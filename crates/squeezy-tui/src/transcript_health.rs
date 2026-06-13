@@ -176,18 +176,18 @@ fn cap_message(s: &str) -> String {
     format!("{prefix}\u{2026}")
 }
 
-/// Human-format a byte count compactly (`"512 B"`, `"4.0 KB"`, `"2.5 MB"`).
+/// Human-format a byte count compactly (`"512B"`, `"4.0KB"`, `"2.5MB"`).
 /// Self-contained so the pure module has no dependency on the renderer's
 /// formatter; only used to build marker messages.
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;
     if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
+        format!("{:.1}MB", bytes as f64 / MB as f64)
     } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
+        format!("{:.1}KB", bytes as f64 / KB as f64)
     } else {
-        format!("{bytes} B")
+        format!("{bytes}B")
     }
 }
 

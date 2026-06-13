@@ -238,6 +238,45 @@ fn cursor_moves_and_clamps_within_visible_list() {
 }
 
 #[test]
+fn paging_and_home_end_jump_within_visible_list() {
+    let mut palette = idle_palette();
+    let last = palette.visible_len() - 1;
+
+    // End jumps to the last visible row, Home back to the first.
+    palette.move_to_bottom();
+    assert_eq!(palette.selected(), last);
+    palette.move_to_top();
+    assert_eq!(palette.selected(), 0);
+
+    // A page down advances a fixed step (10) and clamps at the bottom.
+    palette.page(true);
+    assert_eq!(palette.selected(), 10);
+    palette.page(false);
+    assert_eq!(palette.selected(), 0, "page up clamps at the top");
+    for _ in 0..palette.len() {
+        palette.page(true);
+    }
+    assert_eq!(palette.selected(), last, "page down clamps at the bottom");
+    palette.page(false);
+    assert_eq!(palette.selected(), last.saturating_sub(10));
+}
+
+#[test]
+fn paging_and_home_end_are_safe_on_an_empty_list() {
+    let mut palette = idle_palette();
+    for ch in "zzqqxx-not-a-command".chars() {
+        palette.push_char(ch);
+    }
+    assert_eq!(palette.visible_len(), 0);
+    palette.move_to_bottom();
+    assert_eq!(palette.selected(), 0);
+    palette.page(true);
+    palette.page(false);
+    palette.move_to_top();
+    assert_eq!(palette.selected(), 0);
+}
+
+#[test]
 fn typing_reparks_cursor_at_top_of_filtered_list() {
     let mut palette = idle_palette();
     palette.move_down();

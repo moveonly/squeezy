@@ -87,13 +87,13 @@ impl HintId {
 
     /// The hint body, with `{chord}` substituted for the live key binding the
     /// caller passes (so a rebound key shows the user's actual chord, never a
-    /// stale default). `Hover` carries no chord, so its text ignores the argument.
+    /// stale default). `Hover` substitutes the live focus chord too.
     /// Kept terse — one short clause — so the strip never grows past a single dim
     /// line.
     pub(crate) fn message(self, chord: &str) -> String {
         match self {
             HintId::PaletteChord => format!("tip: press {chord} for the command palette"),
-            HintId::Hover => "tip: focus a card (Ctrl+\u{2191}/\u{2193}) to peek it".to_string(),
+            HintId::Hover => format!("tip: focus a card ({chord}) to peek it"),
             HintId::Jump => format!("tip: {chord} jumps between turns"),
         }
     }

@@ -18,9 +18,9 @@ fn good_geometry(width: u16, height: u16) -> LayoutGeometry {
         subagent_height: 0,
         attachment_height: 0,
         transcript_prompt_gap_height: 0,
-        // Reserve a 1-row composer + a transcript that fits the rest, so the
-        // geometry is valid for the area.
-        transcript_height: height.saturating_sub(1),
+        // Reserve a 1-row composer + the fixed status block + a transcript that
+        // fits the rest, so the geometry exactly fills the area and is valid.
+        transcript_height: height.saturating_sub(1 + STATUS_BLOCK_HEIGHT),
         show_completed_turn_divider: false,
         input_height: 1,
     }
@@ -302,7 +302,7 @@ fn reserved_height_sums_every_block_with_saturation() {
         show_completed_turn_divider: false,
         input_height: 2,
     };
-    assert_eq!(geom.reserved_height(), 3 + 2 + 1 + 4 + 2 + 1 + 5 + 2);
+    assert_eq!(geom.reserved_height(), 3 + 2 + 1 + 4 + 2 + 1 + 5 + 2 + 2);
 
     // Saturating: an absurd combination can never wrap to a small number.
     let huge = LayoutGeometry {

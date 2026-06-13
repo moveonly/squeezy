@@ -143,7 +143,7 @@ impl PaletteAction {
             PaletteAction::CopyToolOutput => "copy tool output",
             PaletteAction::QuoteToCompose => "quote into composer",
             PaletteAction::Annotate => "annotate entry",
-            PaletteAction::OpenInDetail => "open in detail (Ctrl+T)",
+            PaletteAction::OpenInDetail => "open in detail",
             PaletteAction::ToggleFold => {
                 if collapsed {
                     "expand entry"

@@ -201,6 +201,23 @@ fn edit_preview_lists_paths() {
 }
 
 #[test]
+fn edit_preview_surfaces_hidden_paths_over_cap() {
+    let req = request_with(
+        "edit",
+        PermissionCapability::Edit,
+        "a.rs",
+        &[("paths", "a.rs,b.rs,c.rs,d.rs,e.rs,f.rs")],
+    );
+    let out = flatten(&render_preview(&req));
+    // The first four targets render; the rest are summarised, never silently
+    // dropped, so the user sees the full write scope before approving.
+    assert!(out.contains("✎ a.rs"), "{out}");
+    assert!(out.contains("✎ d.rs"), "{out}");
+    assert!(!out.contains("✎ e.rs"), "{out}");
+    assert!(out.contains("… (+2 more file(s))"), "{out}");
+}
+
+#[test]
 fn network_preview_shows_method_and_url() {
     let req = request_with(
         "webfetch",

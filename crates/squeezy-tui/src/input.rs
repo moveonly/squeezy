@@ -594,6 +594,9 @@ pub(crate) fn refresh_mention_popup(app: &mut TuiApp) {
         .map(|cache| mention::rank_files(&query.query, cache.files()))
         .unwrap_or_default();
     if matches.is_empty() {
+        if !query.query.is_empty() && app.workspace_file_cache.is_some() {
+            app.status = format!("no files match @{}", query.query);
+        }
         app.mention_popup = None;
         // Make an empty result explicit so a typo'd `@path` reads as "found
         // nothing" rather than "the popup feature is off here". Only once the

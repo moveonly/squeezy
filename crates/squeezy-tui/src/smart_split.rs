@@ -70,7 +70,7 @@ pub(crate) const MIN_SIDE_WIDTH: u16 = 64;
 pub(crate) const MIN_STACK_HEIGHT: u16 = 7;
 
 /// One row/column of separator drawn between the transcript and the pane.
-const SEPARATOR: u16 = 1;
+pub(crate) const SEPARATOR: u16 = 1;
 
 /// The aspect-ratio threshold, expressed as `width * 10 / height`, at or above
 /// which a terminal is "wide enough" that a side split reads better than a

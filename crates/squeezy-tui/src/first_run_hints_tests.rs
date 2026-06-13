@@ -267,16 +267,16 @@ fn priority_order_is_palette_then_hover_then_jump() {
 }
 
 #[test]
-fn message_substitutes_the_live_chord_for_palette_and_jump() {
+fn message_substitutes_the_live_chord_for_every_hint() {
     let palette = HintId::PaletteChord.message("Ctrl+Alt+P");
     assert!(palette.contains("Ctrl+Alt+P"), "{palette}");
     assert!(palette.contains("command palette"), "{palette}");
     let jump = HintId::Jump.message("Alt+Down");
     assert!(jump.contains("Alt+Down"), "{jump}");
     assert!(jump.contains("jump"), "{jump}");
-    // The Hover hint carries no chord, so the substitution argument is ignored.
-    let hover = HintId::Hover.message("ignored");
-    assert!(!hover.contains("ignored"), "{hover}");
+    // The Hover hint substitutes the live focus chord too.
+    let hover = HintId::Hover.message("Alt+\u{2191}/Alt+\u{2193}");
+    assert!(hover.contains("Alt+\u{2191}/Alt+\u{2193}"), "{hover}");
     assert!(hover.to_lowercase().contains("peek"), "{hover}");
 }
 

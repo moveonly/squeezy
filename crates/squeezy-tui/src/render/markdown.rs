@@ -902,8 +902,8 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
         out.push(ch);
     }
     if chars.next().is_some() && max_chars >= 3 {
-        out.truncate(out.len().saturating_sub(3));
-        out.push_str("...");
+        let kept: String = text.chars().take(max_chars - 3).collect();
+        return format!("{kept}...");
     }
     out
 }

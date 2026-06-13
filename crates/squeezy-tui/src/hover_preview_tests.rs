@@ -167,7 +167,7 @@ fn preview_new_bounds_body_lines_and_widths() {
         "the title is whitespace-collapsed",
     );
     assert!(preview.can_activate(), "an open-in-detail verb activates");
-    assert_eq!(preview.activate_hint(), "double-click / Enter to open");
+    assert_eq!(preview.activate_hint(), "double-click / Ctrl+Enter to open");
 }
 
 /// A preview with no primary verb reports read-only and a click-to-select hint.

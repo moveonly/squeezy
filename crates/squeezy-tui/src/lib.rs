@@ -5167,7 +5167,10 @@ fn toggle_snippets(app: &mut TuiApp) {
     app.snippets_open = !app.snippets_open;
     app.status = if app.snippets_open {
         if app.snippets.is_empty() {
-            "snippets (empty) — save one with Alt+3 over a selection · Esc to close".to_string()
+            format!(
+                "snippets (empty) — save one with {} over a selection · Esc to close",
+                key_hint(app, keymap::Action::SaveSnippetFromSelection)
+            )
         } else {
             format!(
                 "snippets: {} — ↑↓ select · Enter insert · q queue · d delete · c clear · Esc close",
@@ -5316,12 +5319,16 @@ fn toggle_scratchpad(app: &mut TuiApp) {
 /// the buffer is blank, else a count plus the in-pane verb legend.
 fn scratchpad_open_status(app: &TuiApp) -> String {
     if app.scratchpad.is_empty() {
-        "scratchpad (empty) — type notes · Ctrl+L append selection · Esc/Alt+4 close".to_string()
+        format!(
+            "scratchpad (empty) — type notes · Ctrl+L append selection · Esc/{} close",
+            key_hint(app, keymap::Action::ToggleScratchpad)
+        )
     } else {
         format!(
-            "scratchpad: {} chars, {} lines — Ctrl+I insert to composer · Ctrl+Q queue · Esc close",
+            "scratchpad: {} chars, {} lines — Ctrl+I insert · Ctrl+Q queue · Ctrl+L append · Ctrl+K clear · Esc/{} close",
             app.scratchpad.char_count(),
             app.scratchpad.line_count(),
+            key_hint(app, keymap::Action::ToggleScratchpad),
         )
     }
 }
@@ -11156,7 +11163,7 @@ fn keybinding_editor_browse_status(app: &TuiApp) -> String {
     };
     match editor.selected_row() {
         Some(row) => format!(
-            "{} = {} — ↑↓ select · Enter rebind · r reset · Esc close",
+            "{} = {} — ↑↓/kj select · PgUp/PgDn/Home/End · Enter rebind · r/Del reset · Esc close",
             row.action.slug(),
             row.binding.display(),
         ),
@@ -12968,9 +12975,10 @@ fn toggle_subagent_compare(app: &mut TuiApp) {
     // Opening the compare view closes the timeline panel: the compare view owns
     // the surface, so leaving the panel open behind it would fight for routing.
     app.subagent_timeline_open = false;
-    app.status =
-        "compare subagents: Tab focus \u{00b7} scroll keys move active pane \u{00b7} x diff \u{00b7} Alt+7/Esc close"
-            .to_string();
+    app.status = format!(
+        "compare subagents: Tab focus \u{00b7} scroll keys move active pane \u{00b7} x diff \u{00b7} {}/Esc close",
+        key_hint(app, keymap::Action::ToggleSubagentCompare)
+    );
     app.needs_redraw = true;
 }
 
@@ -12993,6 +13001,14 @@ pub(crate) fn close_subagent_compare(app: &mut TuiApp) {
 fn handle_subagent_compare_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if app.subagent_compare.is_none() {
         return false;
+    }
+    // A marked subagent's record can vanish (prune/clear) while the view is open;
+    // the render path then stops painting, so heal the invisible-but-modal view to
+    // closed on the next key rather than silently swallowing it.
+    if !subagent_compare_records_present(app) {
+        close_subagent_compare(app);
+        app.status = "compare closed — a marked subagent is no longer tracked".to_string();
+        return true;
     }
     // The view's own toggle chord (`Alt+7` by default) closes it, so the same key
     // both opens and closes — without leaking to the global keymap, which this
@@ -13259,6 +13275,15 @@ fn handle_subagent_compare_mouse(
     app: &mut TuiApp,
     mouse: crossterm::event::MouseEvent,
 ) -> Option<bool> {
+    // A marked subagent's record can vanish (prune/clear) while the view is open;
+    // the render path then stops painting, so heal the invisible-but-modal view to
+    // closed before the rect-cache `?` returns (which would consume the event
+    // without ever healing it).
+    if !subagent_compare_records_present(app) {
+        close_subagent_compare(app);
+        app.status = "compare closed — a marked subagent is no longer tracked".to_string();
+        return Some(true);
+    }
     let state = app.subagent_compare?;
     let (first, second) = app.subagent_compare_rect_cache.get()?;
     // `first` is the active pane, `second` the other (see the render).
@@ -13700,12 +13725,15 @@ fn toggle_hover_preview(app: &mut TuiApp) {
     };
     let hint = preview.activate_hint();
     let verb = if preview.can_activate() {
-        "Enter opens"
+        "Ctrl+Enter opens"
     } else {
         "read-only"
     };
     app.hover_preview = Some(preview);
-    app.status = format!("preview ({verb}) \u{00b7} {hint} \u{00b7} Esc / Alt+1 close");
+    app.status = format!(
+        "preview ({verb}) \u{00b7} {hint} \u{00b7} Esc / {} close",
+        key_hint(app, keymap::Action::ToggleHoverPreview)
+    );
     app.needs_redraw = true;
     // Opening a peek is the user demonstrating they already know the hover/focus
     // affordance, so the §12.1.8 Hover hint fades — once used.
@@ -14037,7 +14065,10 @@ fn toggle_subagent_preview(app: &mut TuiApp) {
         "read-only".to_string()
     };
     app.subagent_preview = Some(preview);
-    app.status = format!("subagent preview ({verb}) \u{00b7} {hint} \u{00b7} Esc / Alt+6 close");
+    app.status = format!(
+        "subagent preview ({verb}) \u{00b7} {hint} \u{00b7} Esc / {} close",
+        key_hint(app, keymap::Action::PreviewSubagent)
+    );
     app.needs_redraw = true;
 }
 
@@ -14535,9 +14566,13 @@ fn first_run_hint_message(app: &TuiApp, id: first_run_hints::HintId) -> String {
         // representative chord shown, matching how the breadcrumbs/jump family names
         // its forward verb.
         first_run_hints::HintId::Jump => key_hint(app, keymap::Action::JumpNextUserTurn),
-        // The Hover hint carries no chord (it names the focus keys inline), so the
-        // substitution argument is ignored.
-        first_run_hints::HintId::Hover => String::new(),
+        // Focusing a card has two verbs (prev/next entry); the hint names both so
+        // the "↑/↓" affordance survives a rebind of either direction.
+        first_run_hints::HintId::Hover => format!(
+            "{}/{}",
+            key_hint(app, keymap::Action::FocusPrevEntry),
+            key_hint(app, keymap::Action::FocusNextEntry)
+        ),
     };
     id.message(&chord)
 }
@@ -14795,6 +14830,34 @@ fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         KeyCode::Down | KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(palette) = app.command_palette.as_mut() {
                 palette.move_down();
+            }
+            app.needs_redraw = true;
+        }
+        // Page/Home/End jump the cursor across the long registry (~150 rows, far
+        // more than fit on screen) so a command near the bottom is a few keypresses
+        // away, not ~130. The Ctrl+P/Ctrl+N arms above are CONTROL-guarded, so these
+        // plain keys never collide with typed query characters.
+        KeyCode::Home => {
+            if let Some(palette) = app.command_palette.as_mut() {
+                palette.move_to_top();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::End => {
+            if let Some(palette) = app.command_palette.as_mut() {
+                palette.move_to_bottom();
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::PageUp => {
+            if let Some(palette) = app.command_palette.as_mut() {
+                palette.page(false);
+            }
+            app.needs_redraw = true;
+        }
+        KeyCode::PageDown => {
+            if let Some(palette) = app.command_palette.as_mut() {
+                palette.page(true);
             }
             app.needs_redraw = true;
         }
@@ -15056,7 +15119,7 @@ fn lane_fold_set_all(app: &mut TuiApp, collapse: bool) {
 
 // ---- Reading Position Bookmarks (§12.2.4) ----
 
-/// `Alt+t`: drop a Reading Position Bookmark at the entry currently at the top of
+/// `Alt+;`: drop a Reading Position Bookmark at the entry currently at the top of
 /// the viewport (§12.2.4). The bookmark anchors to the entry's stable id, so it
 /// survives every later append, resize, fold, and filter. Dropped anonymous (the
 /// overlay can name it later). A no-op (status hint) on an empty transcript.
@@ -15088,7 +15151,7 @@ fn toggle_bookmarks(app: &mut TuiApp) {
         // at the rebuild site instead.
         app.bookmarks_selected = bookmark_cursor_near_current(app);
         app.status = if app.bookmarks.is_empty() {
-            "bookmarks (none yet) — Alt+t to drop one \u{00b7} Esc close".to_string()
+            "bookmarks (none yet) — Alt+; to drop one \u{00b7} Esc close".to_string()
         } else {
             format!(
                 "bookmarks: {} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter jump \u{00b7} r rename \u{00b7} d delete \u{00b7} Esc close",
@@ -18259,7 +18322,7 @@ fn queue_cycle_condition_by_id(app: &mut TuiApp, id: u64) -> bool {
     app.status = if now.is_always() {
         "queued prompt runs always (condition cleared)".to_string()
     } else {
-        format!("queued prompt runs {} (§ condition)", now.label())
+        format!("queued prompt runs {} (condition set)", now.label())
     };
     app.needs_redraw = true;
     true
@@ -18349,6 +18412,12 @@ fn queue_run_selected_next(app: &mut TuiApp) -> bool {
             "selected prompt will run next ({} queued)",
             app.prompt_queue.len()
         );
+        app.needs_redraw = true;
+    } else {
+        // Front + busy: nothing moved and nothing armed, but the key was
+        // consumed, so confirm the front prompt is already what runs next
+        // (after the live turn finishes) rather than leaving `r` looking dead.
+        app.status = "already at the front — it runs next when the turn finishes".to_string();
         app.needs_redraw = true;
     }
     changed
@@ -22651,7 +22720,8 @@ fn deliver_copy_via_chain(app: &mut TuiApp, text: &str, label: &str, primary_err
     let (toast_msg, variant) = outcome.toast();
     match &outcome {
         clipboard::CopyOutcome::Copied { provider, .. } => {
-            app.status = format!("copied {label} ({chars} chars)");
+            let copied = format!("copied {label} ({chars} chars)");
+            app.status = copied.clone();
             // Dogfood telemetry (§12.10.3): bucket the copy by the
             // bounded provider kind that serviced it (never the bytes).
             app.dogfood_metrics
@@ -22659,6 +22729,10 @@ fn deliver_copy_via_chain(app: &mut TuiApp, text: &str, label: &str, primary_err
             // In-app clipboard history (§12.6.1): the chain landed it too, so
             // record it for recovery just like the fast-path success above.
             app.clipboard_history.record(text, label);
+            // Status and toast describe the same copy with the same metric;
+            // the generic line-count toast at the tail is for the other arms.
+            app.toasts.push(copied, toast::ToastVariant::Success);
+            return;
         }
         clipboard::CopyOutcome::WroteTempFile { .. } => {
             app.status = toast_msg.clone();
@@ -25357,6 +25431,7 @@ fn format_request_user_input_menu_lines(
     request: &RequestUserInputRequest,
     selected: usize,
     input: &str,
+    answer_cursor: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![{
         let mut spans = vec![Span::styled(
@@ -25445,14 +25520,19 @@ fn format_request_user_input_menu_lines(
                 Style::default().fg(crate::render::theme::quiet()),
             ));
         } else {
-            // Render the answer with an inline cursor block. The cursor
-            // sits at `answer_cursor` bytes, which we don't have here —
-            // approximate by drawing the whole answer followed by a
-            // block. Accurate cursor placement is the caller's job; for
-            // now this gives the user a visible "I'm typing in the right
-            // box" affordance.
-            spans.push(Span::styled(compact_text(input, 200), entry_style));
+            // Render the answer with an inline cursor block at the real
+            // edit position. Split the raw answer at the byte cursor and
+            // compact each half independently so the block lands exactly
+            // where the user is typing, even mid-text.
+            let mut cursor = answer_cursor.min(input.len());
+            while cursor > 0 && !input.is_char_boundary(cursor) {
+                cursor -= 1;
+            }
+            let head = compact_text(&input[..cursor], 200);
+            let tail = compact_text(&input[cursor..], 200);
+            spans.push(Span::styled(head, entry_style));
             spans.push(Span::styled("▌", cursor_style));
+            spans.push(Span::styled(tail, entry_style));
         }
         lines.push(Line::from(spans));
     }
@@ -25739,7 +25819,7 @@ fn main_transcript_layout(
         .saturating_add(input_height)
         .saturating_add(plan_indicator_height)
         .saturating_add(subagent_height)
-        .saturating_add(2);
+        .saturating_add(layout_fallback::STATUS_BLOCK_HEIGHT);
     let optional_height = area.height.saturating_sub(required_height);
     let attachment_height = attachment_panel_height(app, optional_height);
     // Adaptive Density (§12.4.1): the base call decides *whether* a
@@ -26248,7 +26328,7 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     if approval_height > 0 {
         constraints.push(Constraint::Length(approval_height));
     }
-    constraints.push(Constraint::Length(2));
+    constraints.push(Constraint::Length(layout_fallback::STATUS_BLOCK_HEIGHT));
     if subagent_height > 0 {
         constraints.push(Constraint::Length(subagent_height));
     }
@@ -27099,9 +27179,10 @@ fn render_keybinding_editor_list(
     }
     let visible = list_rect.height as usize;
     let selected = editor.selected_index();
-    // Scroll the window so the selected row stays visible.
+    // Scroll the window so the selected row stays roughly centered.
+    let half = visible / 2;
     let start = selected
-        .saturating_sub(visible.saturating_sub(1))
+        .saturating_sub(half)
         .min(rows.len().saturating_sub(visible.min(rows.len())));
     let end = (start + visible).min(rows.len());
     // Pad the slug column so the bindings line up.
@@ -29775,11 +29856,15 @@ fn render_related_links_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
     let list_bottom = inner.y.saturating_add(inner.height).saturating_sub(1);
     let rows = list_bottom.saturating_sub(list_top) as usize;
 
-    for (index, relation) in relations.iter().enumerate().take(rows) {
+    // Scroll the relation list so the selected row stays visible when an entry has
+    // more relations than fit the modal — the jump-list must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (offset, relation) in relations.iter().enumerate().skip(first).take(rows) {
+        let index = offset;
         let is_selected = index == selected;
         let row_rect = Rect {
             x: inner.x,
-            y: list_top + index as u16,
+            y: list_top + (offset - first) as u16,
             width: inner.width,
             height: 1,
         };
@@ -29899,11 +29984,21 @@ fn render_duplicate_folds_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
     let list_bottom = inner.y.saturating_add(inner.height);
     let rows = list_bottom.saturating_sub(list_top) as usize;
 
-    for (index, span) in app.duplicate_folds.spans().iter().enumerate().take(rows) {
+    // Scroll the fold list so the selected row stays visible when detected folds
+    // exceed the visible rows — the jump-list must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (index, span) in app
+        .duplicate_folds
+        .spans()
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+    {
         let is_selected = index == selected;
         let row_rect = Rect {
             x: inner.x,
-            y: list_top + index as u16,
+            y: list_top + (index - first) as u16,
             width: inner.width,
             height: 1,
         };
@@ -29929,7 +30024,7 @@ fn render_duplicate_folds_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
             ),
             Span::styled(format!("{state} "), label_style),
             Span::styled(
-                format!("{:<18}", format!("x{} output", span.count())),
+                format!("{:<18}", format!("x{} outputs", span.count())),
                 label_style,
             ),
             Span::styled(
@@ -30006,11 +30101,22 @@ fn render_error_lens_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let list_bottom = inner.y.saturating_add(inner.height);
     let rows = list_bottom.saturating_sub(list_top) as usize;
 
-    for (index, lens) in app.error_lenses.lenses().iter().enumerate().take(rows) {
+    // Scroll the lens list so the selected row stays visible when lenses exceed the
+    // visible rows — the jump-list must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (offset, lens) in app
+        .error_lenses
+        .lenses()
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+    {
+        let index = offset;
         let is_selected = index == selected;
         let row_rect = Rect {
             x: inner.x,
-            y: list_top + index as u16,
+            y: list_top + (offset - first) as u16,
             width: inner.width,
             height: 1,
         };
@@ -30128,11 +30234,21 @@ fn render_health_markers_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp
     let list_bottom = inner.y.saturating_add(inner.height);
     let rows = list_bottom.saturating_sub(list_top) as usize;
 
-    for (index, marker) in app.health_markers.markers().iter().enumerate().take(rows) {
+    // Scroll the marker list so the selected row stays visible when markers exceed
+    // the visible rows — the jump-list must follow the cursor.
+    let first = selected.saturating_sub(rows.saturating_sub(1));
+    for (index, marker) in app
+        .health_markers
+        .markers()
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows)
+    {
         let is_selected = index == selected;
         let row_rect = Rect {
             x: inner.x,
-            y: list_top + index as u16,
+            y: list_top + (index - first) as u16,
             width: inner.width,
             height: 1,
         };
@@ -30716,7 +30832,7 @@ fn subagent_timeline_status_style(status: subagent_timeline::SubagentTimelineSta
 fn render_subagent_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let filter_note = match app.subagent_timeline.filter() {
         Some(status) => format!("\u{2014} filter [{}] ", status.label()),
-        None => "\u{2014} running + completed subagents ".to_string(),
+        None => "\u{2014} all subagents ".to_string(),
     };
     let title = Line::from(vec![
         Span::styled(
@@ -30966,8 +31082,9 @@ fn render_subagent_compare_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
         return;
     };
     let mode_note = format!(
-        "\u{2014} {} \u{00b7} Tab focus \u{00b7} x diff \u{00b7} Alt+7/Esc close ",
+        "\u{2014} {} \u{00b7} Tab focus \u{00b7} x diff \u{00b7} {}/Esc close ",
         state.mode.label(),
+        key_hint(app, keymap::Action::ToggleSubagentCompare),
     );
     let title = Line::from(vec![
         Span::styled(
@@ -31989,7 +32106,7 @@ fn render_bookmarks_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         ])
     } else if count == 0 {
         Line::from(Span::styled(
-            "No bookmarks yet \u{2014} Alt+t drops one at the current position.",
+            "No bookmarks yet \u{2014} Alt+; drops one at the current position.",
             Style::default().fg(crate::render::theme::quiet()),
         ))
     } else {
@@ -32151,7 +32268,7 @@ fn render_command_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
     } else {
         Line::from(Span::styled(
             format!(
-                "{visible_count}/{total} \u{00b7} \u{2191}\u{2193} select \u{00b7} Enter run \u{00b7} Esc close",
+                "{visible_count}/{total} \u{00b7} \u{2191}\u{2193} select \u{00b7} PgUp/PgDn page \u{00b7} Enter run \u{00b7} Esc close",
             ),
             Style::default()
                 .fg(crate::render::theme::secondary())
@@ -33472,6 +33589,7 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
                 &pending.request,
                 pending.selection_index,
                 &pending.answer,
+                pending.answer_cursor,
             ),
             width,
         )
@@ -33528,6 +33646,7 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
             &pending.request,
             pending.selection_index,
             &pending.answer,
+            pending.answer_cursor,
         )
     } else if let Some(pending) = app.pending_plan_choice.as_ref() {
         format_plan_choice_menu_lines(pending)
@@ -44810,7 +44929,7 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         };
     }
     if app.subagent_pane.focused {
-        return "Up/Down switch · Enter scroll · Del clear done · type/Esc back to prompt"
+        return "Up/Down switch · Enter open · Del clear done · type/Esc back to prompt"
             .to_string();
     }
     if let Some(pending) = app.pending_request_user_input.as_ref() {
@@ -44818,7 +44937,7 @@ fn format_status_hint_base(app: &TuiApp) -> String {
             return "type your answer · Enter send · Esc cancel".to_string();
         }
         if pending.request.allow_freeform {
-            return "Up/Down choose · type selects Answer · Enter sends dotted row · Esc cancel"
+            return "Up/Down choose · type fills Answer · Enter sends the highlighted row · Esc cancel"
                 .to_string();
         }
         return "Up/Down choose · Enter select · Esc cancel".to_string();

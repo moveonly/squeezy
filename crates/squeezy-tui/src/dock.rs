@@ -29,7 +29,7 @@
 
 use ratatui::layout::Rect;
 
-use crate::smart_split::{LayoutSolver, Orientation, PaneKind, SplitRatio};
+use crate::smart_split::{LayoutSolver, Orientation, PaneKind, SEPARATOR, SplitRatio};
 
 /// Which auxiliary panel is the dock target (§12.4.4). The spec calls out the
 /// scratchpad, the subagent timeline, and the focused-entry detail as the
@@ -174,9 +174,10 @@ impl DockEdge {
     }
 
     /// Whether the panel sits *before* the transcript on the split axis (a left
-    /// dock), so the renderer swaps the solver's `main`/`pane` rects. The solver
-    /// always returns the transcript first (left / top); `Left` is the only edge
-    /// that mirrors it.
+    /// dock), so the placement reflects the solver's `main`/`pane` geometry about
+    /// the content (the small pane keeps its share on the leading edge). The
+    /// solver always returns the transcript first (left / top); `Left` is the only
+    /// edge that mirrors it.
     fn panel_first(self) -> bool {
         matches!(self, DockEdge::Left)
     }
@@ -339,17 +340,37 @@ impl DockState {
             edge.orientation(),
             SplitRatio::NEUTRAL,
         );
-        // The solver always returns the transcript first (left column / top band).
-        // A `Left` dock mirrors that: the panel takes the transcript's slot and the
-        // transcript takes the panel's slot, with the separator unchanged.
-        let (main, panel) = match (placement.main(), placement.pane()) {
-            (transcript, Some(pane)) if edge.panel_first() => (pane, Some(transcript)),
-            (transcript, pane) => (transcript, pane),
+        // The solver always returns the transcript first (left column / top band)
+        // with the larger share. A `Left` dock mirrors that geometry — not the
+        // rect *assignments* — so the small pane keeps its share on the leading
+        // edge: reflect the pane/main/separator x-positions about the content,
+        // keeping each rect's solver-chosen width. The single-column fallback
+        // (no pane) carries the solver placement through unchanged.
+        let (main, panel, separator) = match (placement.main(), placement.pane()) {
+            (transcript, Some(pane)) if edge.panel_first() => {
+                let panel = Rect {
+                    x: area.x,
+                    width: pane.width,
+                    ..pane
+                };
+                let separator = Rect {
+                    x: area.x + pane.width,
+                    width: SEPARATOR,
+                    ..pane
+                };
+                let main = Rect {
+                    x: area.x + pane.width + SEPARATOR,
+                    width: transcript.width,
+                    ..transcript
+                };
+                (main, Some(panel), Some(separator))
+            }
+            (transcript, pane) => (transcript, pane, placement.separator()),
         };
         DockPlacement {
             main,
             panel,
-            separator: placement.separator(),
+            separator,
             edge,
         }
     }

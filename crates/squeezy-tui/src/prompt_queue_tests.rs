@@ -217,6 +217,33 @@ fn render_lines_header_is_base_hint_with_no_group() {
     assert!(!header.contains("delete group"));
 }
 
+#[test]
+fn render_lines_collapsed_group_shows_its_header_once() {
+    use std::collections::BTreeSet;
+
+    use crate::queue_groups::QueueGroup;
+
+    let state = PromptQueueState::new();
+    let queue = queue_of(&["alpha", "beta", "gamma"]);
+    let group = QueueGroup {
+        id: 7,
+        name: "Group 1".to_string(),
+        members: BTreeSet::from([0, 1, 2]),
+        collapsed: true,
+        paused: false,
+    };
+    let by_row = [Some(&group), Some(&group), Some(&group)];
+    let lines = render_lines(&state, &queue, None, Some(&by_row), None, None, None);
+    let header_rows = lines
+        .iter()
+        .filter(|l| l.spans.iter().any(|s| s.content.contains('⊟')))
+        .count();
+    assert_eq!(
+        header_rows, 1,
+        "a collapsed group paints its ⊟ header on exactly one row, not every member"
+    );
+}
+
 // ---- visible_window: the single-source-of-truth overlay windowing ----------
 //
 // `render_lines` (painting) and `register_queue_item_targets` (hit rects) both
