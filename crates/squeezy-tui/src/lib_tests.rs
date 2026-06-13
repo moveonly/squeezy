@@ -6705,6 +6705,19 @@ fn format_cost_command_renders_by_model_drill() {
             ..CostSnapshot::default()
         },
     );
+    // Permission-gate (AI reviewer) spend attributed to the active model so the
+    // drill must surface a reviewer row that reconciles with the Σ total.
+    model_ledger.record(
+        "anthropic",
+        "claude-opus-4-8",
+        CostOrigin::AiReviewer,
+        &CostSnapshot {
+            input_tokens: Some(12_000),
+            output_tokens: Some(300),
+            estimated_usd_micros: Some(50_000),
+            ..CostSnapshot::default()
+        },
+    );
 
     let metrics = SessionMetrics {
         subagent_calls: 1,
@@ -6750,11 +6763,13 @@ fn format_cost_command_renders_by_model_drill() {
     assert!(output.contains("anthropic:claude-haiku-4-5"), "{output}");
     assert!(output.contains("main usd="), "{output}");
     assert!(output.contains("subagent usd="), "{output}");
+    assert!(output.contains("reviewer usd="), "{output}");
     assert!(output.contains("cache_read=210000"), "{output}");
     assert!(output.contains("cache_write=90000"), "{output}");
-    // Σ total == cost.estimated_usd (910000) + subagent_provider (48000) == 958000
-    // == sum of every ledger bucket. This invariant keeps the drill honest.
-    assert!(output.contains("total usd=$0.958000"), "{output}");
+    // Σ total == main aggregate (910000) + subagent (48000) + reviewer (50000)
+    // == 1008000 == sum of every ledger bucket and origin. This invariant keeps
+    // the drill honest: the visible per-origin rows reconcile with the total.
+    assert!(output.contains("total usd=$1.008000"), "{output}");
 }
 
 #[tokio::test]

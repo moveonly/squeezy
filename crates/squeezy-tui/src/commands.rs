@@ -157,9 +157,14 @@ pub(crate) fn format_cost_command(snapshot: &SessionAccountingSnapshot) -> Strin
             } else {
                 style::accent(&model_label)
             };
-            // One row per non-empty origin so the main-vs-subagent split is
-            // explicit; a model with both prints two rows under one label.
-            for (scope, slot) in [("main", &bucket.main), ("subagent", &bucket.subagent)] {
+            // One row per non-empty origin so the main/subagent/reviewer split
+            // is explicit; a model with several prints several rows under one
+            // label and the visible rows reconcile with the Σ total.
+            for (scope, slot) in [
+                ("main", &bucket.main),
+                ("subagent", &bucket.subagent),
+                ("reviewer", &bucket.reviewer),
+            ] {
                 if !cost_snapshot_has_data(slot) {
                     continue;
                 }
@@ -1153,7 +1158,7 @@ fn style_u64_emphasize_nonzero_err(value: u64) -> String {
 }
 
 /// Whether a per-model ledger slot carries any spend worth a row — used to
-/// suppress an empty main/subagent sub-row in the "By model" drill.
+/// suppress an empty main/subagent/reviewer sub-row in the "By model" drill.
 fn cost_snapshot_has_data(cost: &squeezy_core::CostSnapshot) -> bool {
     cost.estimated_usd_micros.unwrap_or(0) > 0
         || cost.input_tokens.unwrap_or(0) > 0

@@ -14624,10 +14624,10 @@ impl ModelLedger {
         self.0.values()
     }
 
-    /// Combined cost across every bucket and both origins (main + subagent).
-    /// Used for the `/cost` "By model" Σ total row; equals the session's
-    /// `provider` + `subagent_provider` aggregate by construction, so the
-    /// drill's total matches the headline.
+    /// Combined cost across every bucket and all origins (main + subagent +
+    /// reviewer). Used for the `/cost` "By model" Σ total row; equals the
+    /// session's `provider` + `subagent_provider` aggregate by construction, so
+    /// the drill's total matches the headline.
     pub fn totals(&self) -> CostSnapshot {
         let mut total = CostSnapshot::default();
         for bucket in self.0.values() {
