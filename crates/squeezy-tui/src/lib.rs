@@ -12868,6 +12868,14 @@ fn handle_subagent_compare_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if app.subagent_compare.is_none() {
         return false;
     }
+    // A marked subagent's record can vanish (prune/clear) while the view is open;
+    // the render path then stops painting, so heal the invisible-but-modal view to
+    // closed on the next key rather than silently swallowing it.
+    if !subagent_compare_records_present(app) {
+        close_subagent_compare(app);
+        app.status = "compare closed — a marked subagent is no longer tracked".to_string();
+        return true;
+    }
     // The view's own toggle chord (`Alt+7` by default) closes it, so the same key
     // both opens and closes — without leaking to the global keymap, which this
     // modal swallows below.
@@ -13133,6 +13141,15 @@ fn handle_subagent_compare_mouse(
     app: &mut TuiApp,
     mouse: crossterm::event::MouseEvent,
 ) -> Option<bool> {
+    // A marked subagent's record can vanish (prune/clear) while the view is open;
+    // the render path then stops painting, so heal the invisible-but-modal view to
+    // closed before the rect-cache `?` returns (which would consume the event
+    // without ever healing it).
+    if !subagent_compare_records_present(app) {
+        close_subagent_compare(app);
+        app.status = "compare closed — a marked subagent is no longer tracked".to_string();
+        return Some(true);
+    }
     let state = app.subagent_compare?;
     let (first, second) = app.subagent_compare_rect_cache.get()?;
     // `first` is the active pane, `second` the other (see the render).
