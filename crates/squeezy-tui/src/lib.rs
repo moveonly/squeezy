@@ -38060,7 +38060,27 @@ fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     // the startup card lives in scrollback and cannot be rewritten, so
     // repeating fields such as directory/model/languages here makes the
     // first frame stale and visually redundant.
-    vec![startup_phase_strip(width as usize, app.version)]
+    let mut lines = vec![startup_phase_strip(width as usize, app.version)];
+    // Compact density suppresses the status detail line, which is the only
+    // place provider:model is shown, so the empty first frame would carry no
+    // model at all. Record a single dim badge on the startup card to keep the
+    // active provider:model visible. Presentation Mode deliberately withholds
+    // metadata from a screen-share, so it is left out there.
+    if !app.effective_density().shows_status_detail()
+        && !app.presentation.suppresses_metadata()
+        && let Some(badge) =
+            status::resolve_status_item(app, status::StatusLineItem::ProviderAndModel)
+    {
+        let pad = (width as usize).saturating_sub(badge.chars().count()) / 2;
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(pad)),
+            Span::styled(
+                badge,
+                Style::default().fg(crate::render::theme::secondary()),
+            ),
+        ]));
+    }
+    lines
 }
 
 fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {

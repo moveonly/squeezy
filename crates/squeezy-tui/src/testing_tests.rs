@@ -117,6 +117,48 @@ fn harness_status_line_uses_real_provider_name_not_eval_harness() {
     );
 }
 
+#[test]
+fn compact_startup_card_keeps_provider_model_badge() {
+    // Compact density suppresses the status detail line, the only place
+    // provider:model is shown. The empty startup frame must still surface it,
+    // so the card records a dim badge.
+    let config = AppConfig {
+        model: "test-model".to_string(),
+        ..AppConfig::default()
+    };
+    let provider: Arc<dyn LlmProvider> = Arc::new(NamedProvider("anthropic"));
+    let mut harness = TuiHarness::new(config, SessionMode::default(), provider, 80, 32, None)
+        .expect("build TuiHarness");
+    harness.app_mut().density_override = crate::density::DensityMode::Compact;
+    let snapshot = harness.render_frame().expect("render frame");
+    let plain = snapshot.plain_text;
+    assert!(
+        plain.contains("anthropic:test-model"),
+        "compact startup frame must still carry `anthropic:test-model`, frame was:\n{plain}"
+    );
+}
+
+#[test]
+fn default_startup_card_does_not_duplicate_model_badge() {
+    // At default density the detail line carries provider:model, so the startup
+    // card must not add a second copy.
+    let config = AppConfig {
+        model: "test-model".to_string(),
+        ..AppConfig::default()
+    };
+    let provider: Arc<dyn LlmProvider> = Arc::new(NamedProvider("anthropic"));
+    let mut harness = TuiHarness::new(config, SessionMode::default(), provider, 120, 36, None)
+        .expect("build TuiHarness");
+    harness.app_mut().density_override = crate::density::DensityMode::Default;
+    let snapshot = harness.render_frame().expect("render frame");
+    let plain = snapshot.plain_text;
+    assert_eq!(
+        plain.matches("anthropic:test-model").count(),
+        1,
+        "default density must show provider:model exactly once (detail line only), frame was:\n{plain}"
+    );
+}
+
 /// Regression for squeezy-tje9. Before the fix `pump_until_idle` burned
 /// its 180s deadline on a parked `pending_approval` because the loop
 /// only watched `turn_rx`/`prompt_queue`. The harness must:
