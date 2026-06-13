@@ -287,6 +287,22 @@ fn left_dock_mirrors_right_panel_on_the_left() {
         "main sits right of the panel + separator"
     );
     assert!(main.width < area.width);
+    // The panel keeps the small share — a left dock mirrors geometry, it does not
+    // hand the panel the transcript's wide slot.
+    assert!(
+        panel.width < main.width,
+        "a left-docked panel keeps the small share, not the transcript's"
+    );
+    // And it mirrors the right dock exactly: the same panel, same width, just on
+    // the other edge.
+    let right = DockState::from_slug("scratchpad:right")
+        .unwrap()
+        .placement(area);
+    assert_eq!(
+        panel.width,
+        right.panel().expect("right dock splits too").width,
+        "left and right docks give the panel the same width"
+    );
 }
 
 #[test]
