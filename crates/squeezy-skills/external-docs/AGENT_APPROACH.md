@@ -7,10 +7,12 @@ response compact enough to preserve model context.
 ## Local Help First
 
 Questions about Squeezy itself are handled before provider work starts when they
-look like product-help requests. `/help <topic>` and matching natural-language
-questions are answered from this external docs corpus plus redacted
-`squeezy config inspect` output. If the topic is not covered locally, Squeezy
-refuses to guess and points to the public docs and repository.
+look like product-help requests. `/help <topic>` and natural-language questions
+that match a curated topic are answered from this external docs corpus plus
+redacted `squeezy config inspect` output. For an explicit `/help <topic>` whose
+topic is not covered locally, Squeezy refuses to guess and points to the public
+docs and repository. A free-text question that matches no curated topic is not
+intercepted at all — it falls through to the model like any other prompt.
 
 Implementation and debugging requests that merely mention Squeezy stay on the
 normal agent path so code work is not replaced with canned help.
