@@ -23146,11 +23146,18 @@ fn export_to_file(
 /// file under `<workspace>/<name>/`. The `dir` name is already validated
 /// (workspace-relative, no traversal) by `parse_export_request`, so this only
 /// composes the final path.
+/// Unix timestamp in milliseconds for export/bundle filenames. Millisecond
+/// granularity keeps two writes in the same wall-clock second from resolving
+/// to the same path and silently clobbering one another. Takes `now` so the
+/// builders stay unit-testable with distinct instants.
+fn export_timestamp_millis(now: std::time::SystemTime) -> u128 {
+    now.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 fn configured_dir_export_path(app: &TuiApp, dir: &str, format: copy::CopyFormat) -> PathBuf {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let ts = export_timestamp_millis(std::time::SystemTime::now());
     app.workspace_root
         .join(dir)
         .join(format!("transcript-{ts}.{}", format.file_extension()))
@@ -23164,10 +23171,7 @@ fn default_export_path(app: &TuiApp, agent: &Agent, format: copy::CopyFormat) ->
         .session_id()
         .or_else(|| app.session_id.clone())
         .unwrap_or_else(|| "default".to_string());
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let ts = export_timestamp_millis(std::time::SystemTime::now());
     app.workspace_root
         .join(".squeezy")
         .join("exports")
@@ -23198,8 +23202,8 @@ fn export_tmp_path(target: &Path) -> PathBuf {
 /// When `force` is `false` an already-existing `target` is refused with
 /// [`std::io::ErrorKind::AlreadyExists`] *before* any tmp file is written, so a
 /// `/export md notes.md` can never silently clobber a workspace source. The
-/// timestamped destinations (and `/bundle`) pass `force = true` because their
-/// paths are collision-free by construction.
+/// millisecond-stamped destinations (and `/bundle`) pass `force = true`
+/// because their paths embed a millisecond timestamp keyed by session id.
 fn write_export_atomically(target: &Path, content: &str, force: bool) -> std::io::Result<()> {
     if !force && target.exists() {
         return Err(std::io::Error::new(
@@ -23264,8 +23268,9 @@ fn handle_bundle_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
     );
 
     let target = bundle_export_path(app, &meta, request.format);
-    // The bundle path is timestamped and collision-free, so overwrite-guarding it
-    // would only ever produce a false positive; write with `force = true`.
+    // The bundle path embeds a millisecond timestamp keyed by session id, so
+    // overwrite-guarding it would only ever produce a false positive; write
+    // with `force = true`.
     match write_export_atomically(&target, &bundle.artifact, true) {
         Ok(()) => {
             app.status = format!(
@@ -23358,15 +23363,15 @@ fn bundle_export_path(
     meta: &session_bundle::BundleMeta,
     format: session_bundle::BundleFormat,
 ) -> PathBuf {
+    // The manifest keeps `generated_at_unix` in seconds for human reading, but
+    // the file name needs millisecond granularity so two `/bundle` calls in the
+    // same second land on distinct paths instead of clobbering each other.
+    let ts = export_timestamp_millis(std::time::SystemTime::now());
     app.workspace_root
         .join(".squeezy")
         .join("bundles")
         .join(&meta.session_id)
-        .join(format!(
-            "session-bundle-{}.{}",
-            meta.generated_at_unix,
-            format.file_extension()
-        ))
+        .join(format!("session-bundle-{}.{}", ts, format.file_extension()))
 }
 
 /// Build a compact terminal diagnostic string for the `/terminal` command.

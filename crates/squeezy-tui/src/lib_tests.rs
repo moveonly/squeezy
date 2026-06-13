@@ -20,6 +20,18 @@ use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus};
 use super::*;
 
 #[test]
+fn export_timestamp_millis_distinguishes_subsecond_instants() {
+    let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let a = export_timestamp_millis(base);
+    let b = export_timestamp_millis(base + Duration::from_millis(1));
+    assert_eq!(a, 1_700_000_000_000);
+    assert_ne!(
+        a, b,
+        "two instants 1ms apart must produce distinct export timestamps"
+    );
+}
+
+#[test]
 fn app_starts_ready_with_empty_transcript() {
     let config = test_config(SessionMode::Build);
     let app = TuiApp::new_with_clipboard(
