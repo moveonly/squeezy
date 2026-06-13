@@ -20711,6 +20711,22 @@ impl Clipboard for RecordingClipboard {
     }
 }
 
+/// Clipboard double whose `read_text` returns a canned value, for exercising the
+/// in-app paste chord without touching the real system clipboard.
+struct ReadableClipboard {
+    read: Option<String>,
+}
+
+impl Clipboard for ReadableClipboard {
+    fn copy_text(&mut self, _text: &str) -> std::result::Result<(), String> {
+        Ok(())
+    }
+
+    fn read_text(&mut self) -> Option<String> {
+        self.read.clone()
+    }
+}
+
 fn test_agent(mode: SessionMode) -> Agent {
     // Use a fresh empty temp workspace so the agent's tool registry doesn't
     // crawl the entire repo (which adds seconds per test, especially on
@@ -48484,6 +48500,80 @@ fn transcript_press_clears_a_stale_screen_selection() {
     );
 }
 
+#[test]
+fn global_pre_pass_arms_a_screen_selection_on_chrome_via_handle_mouse() {
+    // The GLOBAL pre-pass at the top of `handle_mouse` arms a screen selection on
+    // any non-interactive cell that isn't the transcript/composer text. With no
+    // render yet there are no area caches and no registered click-targets, so the
+    // whole surface reads as selectable chrome — a press arms, a drag extends.
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_mouse(&mut app, left_down(5, 1, KeyModifiers::NONE)));
+    assert!(
+        app.screen_selection.is_some(),
+        "a press on chrome arms a screen-buffer selection",
+    );
+
+    handle_mouse(&mut app, left_drag(20, 1));
+    let sel = app.screen_selection.expect("still armed");
+    assert_eq!(
+        (sel.cursor_col, sel.cursor_row),
+        (20, 1),
+        "the drag extends the screen selection's moving end",
+    );
+}
+
+#[test]
+fn screen_selection_arms_while_an_overlay_owns_the_surface() {
+    // Regression: overlays (here the clipboard-history picker) used to swallow
+    // every mouse event, so chrome under them was unselectable. The global
+    // pre-pass now runs first, so selection works on top of any overlay.
+    let mut app = test_app(SessionMode::Build);
+    app.clipboard_history_open = true;
+
+    assert!(handle_mouse(&mut app, left_down(5, 1, KeyModifiers::NONE)));
+    assert!(
+        app.screen_selection.is_some(),
+        "selection arms even while an overlay owns the surface",
+    );
+}
+
+#[test]
+fn screen_selection_works_on_the_config_page() {
+    // The user's explicit example: select text on /config. Config paints into the
+    // shared frame buffer and `render_surfaces` clears the main/composer caches
+    // before it draws, so the page reads as selectable chrome (minus its own
+    // click-target rows, which still take clicks).
+    let mut app = test_app(SessionMode::Build);
+    app.config_screen = Some(config_screen::ConfigScreenState::new(
+        test_config(SessionMode::Build),
+        None,
+    ));
+    // Render so config registers its click-targets and the area caches clear.
+    let _ = render_full_to_buffer(&app, 80, 30);
+
+    // Find a non-interactive config cell (not a registered click-target).
+    let mut spot = None;
+    'outer: for row in 0..30u16 {
+        for col in 0..80u16 {
+            if cell_is_chrome(&app, col, row) && app.click_target_at(col, row).is_none() {
+                spot = Some((col, row));
+                break 'outer;
+            }
+        }
+    }
+    let (col, row) = spot.expect("the config page has selectable, non-interactive text");
+
+    assert!(handle_mouse(
+        &mut app,
+        left_down(col, row, KeyModifiers::NONE)
+    ));
+    assert!(
+        app.screen_selection.is_some(),
+        "a press on config-page chrome arms a screen selection (selection works on /config)",
+    );
+}
+
 // =====================================================================
 // Composer native-grade cursor motion: ⌘ line, ⌘↑↓ / Ctrl+Home/End doc,
 // with Shift-extend.
@@ -48669,4 +48759,99 @@ async fn cmd_x_with_no_selection_is_inert_and_types_nothing() {
         app.input, "hello",
         "⌘X with no selection must not type an 'x' or delete"
     );
+}
+
+// =====================================================================
+// Paste — ⌘V / Ctrl+Shift+V (the chord path; bracketed paste is separate)
+// =====================================================================
+
+#[tokio::test]
+async fn cmd_v_pastes_clipboard_text_into_the_composer_at_the_cursor() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.clipboard = Box::new(ReadableClipboard {
+        read: Some("WORLD".to_string()),
+    });
+    set_input(&mut app, "hello ".to_string());
+    app.input_cursor = app.input.len();
+
+    press(
+        &mut app,
+        &mut agent,
+        KeyCode::Char('v'),
+        KeyModifiers::SUPER,
+    )
+    .await;
+
+    assert_eq!(
+        app.input, "hello WORLD",
+        "⌘V inserts the clipboard text at the caret",
+    );
+}
+
+#[tokio::test]
+async fn ctrl_shift_v_also_pastes_the_clipboard() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.clipboard = Box::new(ReadableClipboard {
+        read: Some("pasted".to_string()),
+    });
+
+    press(
+        &mut app,
+        &mut agent,
+        KeyCode::Char('v'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    )
+    .await;
+
+    assert_eq!(app.input, "pasted", "Ctrl+Shift+V pastes too");
+}
+
+#[tokio::test]
+async fn paste_chord_with_empty_clipboard_is_a_consumed_no_op() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    // An empty (but present) clipboard must not fall through to the platform
+    // helpers and must never type a stray 'v'.
+    app.clipboard = Box::new(ReadableClipboard {
+        read: Some(String::new()),
+    });
+    set_input(&mut app, "keep".to_string());
+    app.input_cursor = app.input.len();
+
+    press(
+        &mut app,
+        &mut agent,
+        KeyCode::Char('v'),
+        KeyModifiers::SUPER,
+    )
+    .await;
+
+    assert_eq!(
+        app.input, "keep",
+        "an empty clipboard pastes nothing and types no 'v'",
+    );
+}
+
+#[test]
+fn paste_chord_matches_super_and_ctrl_shift_v_only() {
+    assert!(is_paste_chord(&KeyEvent::new(
+        KeyCode::Char('v'),
+        KeyModifiers::SUPER
+    )));
+    assert!(is_paste_chord(&KeyEvent::new(
+        KeyCode::Char('V'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT
+    )));
+    // Bare Ctrl+V is readline "quoted insert", not paste.
+    assert!(!is_paste_chord(&KeyEvent::new(
+        KeyCode::Char('v'),
+        KeyModifiers::CONTROL
+    )));
+    // A superset of modifiers is not the exact chord.
+    assert!(!is_paste_chord(&KeyEvent::new(
+        KeyCode::Char('v'),
+        KeyModifiers::SUPER | KeyModifiers::ALT
+    )));
 }

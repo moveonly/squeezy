@@ -407,6 +407,98 @@ where
     }
 }
 
+/// Platform clipboard *read* (paste) command candidates — the read side of
+/// [`platform_commands`]. Each is tried in turn; a spawn error or non-zero exit
+/// falls through to the next. Env-closure-driven for the same Wayland-vs-X11
+/// reason, and the same testability.
+pub(crate) fn platform_read_commands<F>(env_get: F) -> Vec<PlatformCommand>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    #[cfg(target_os = "macos")]
+    {
+        let _ = env_get;
+        vec![PlatformCommand {
+            program: "pbpaste",
+            args: &[],
+        }]
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = env_get;
+        vec![PlatformCommand {
+            program: "powershell",
+            args: &["-NoProfile", "-Command", "Get-Clipboard -Raw"],
+        }]
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // Mirror the write-side ordering: Wayland first when advertised, then the
+        // X11 helpers, then wl-paste once more as a long shot. `--no-newline`
+        // keeps wl-paste from appending its own trailing LF; the X11 tools emit
+        // the selection verbatim.
+        let wayland = env_get("WAYLAND_DISPLAY").is_some();
+        let mut cmds = Vec::new();
+        if wayland {
+            cmds.push(PlatformCommand {
+                program: "wl-paste",
+                args: &["--no-newline"],
+            });
+        }
+        cmds.push(PlatformCommand {
+            program: "xclip",
+            args: &["-selection", "clipboard", "-o"],
+        });
+        cmds.push(PlatformCommand {
+            program: "xsel",
+            args: &["--clipboard", "--output"],
+        });
+        if !wayland {
+            cmds.push(PlatformCommand {
+                program: "wl-paste",
+                args: &["--no-newline"],
+            });
+        }
+        cmds
+    }
+}
+
+/// Read the host clipboard text via the first [`platform_read_commands`]
+/// candidate that succeeds. `None` when no helper is available or all fail
+/// (e.g. a headless box with no clipboard tool); an empty clipboard yields
+/// `Some(String::new())`. This is the in-app paste source for the ⌘V /
+/// Ctrl+Shift+V chord — the fallback for terminals that forward the chord to
+/// the app instead of running their own paste (e.g. iTerm2 with Command remapped
+/// to Super, which is exactly the remap that makes in-app ⌘C work).
+pub(crate) fn read_system_clipboard() -> Option<String> {
+    use std::process::{Command, Stdio};
+    let env_get = |k: &str| std::env::var_os(k);
+    for cmd in platform_read_commands(env_get) {
+        let Ok(out) = Command::new(cmd.program)
+            .args(cmd.args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        // PowerShell's `Get-Clipboard -Raw` appends a trailing newline that is
+        // not part of the clipboard payload; drop exactly one (CRLF or LF).
+        if cmd.program == "powershell" && text.ends_with('\n') {
+            text.pop();
+            if text.ends_with('\r') {
+                text.pop();
+            }
+        }
+        return Some(text);
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Providers + chain
 // ---------------------------------------------------------------------------

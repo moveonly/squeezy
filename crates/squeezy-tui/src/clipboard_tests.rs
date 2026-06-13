@@ -634,6 +634,30 @@ fn platform_commands_are_nonempty_and_consult_env_on_linux() {
     }
 }
 
+#[test]
+fn platform_read_commands_are_nonempty_and_consult_env_on_linux() {
+    // The paste side mirrors the copy side: macOS/Windows ignore env, Linux
+    // consults WAYLAND_DISPLAY, and the list is always non-empty.
+    let with_wayland = platform_read_commands(env_map(&[("WAYLAND_DISPLAY", "wayland-0")]));
+    assert!(!with_wayland.is_empty());
+    let without = platform_read_commands(env_map(&[]));
+    assert!(!without.is_empty());
+
+    #[cfg(target_os = "macos")]
+    assert_eq!(without[0].program, "pbpaste");
+
+    #[cfg(target_os = "windows")]
+    assert_eq!(without[0].program, "powershell");
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // Wayland present -> wl-paste is preferred (first).
+        assert_eq!(with_wayland[0].program, "wl-paste");
+        // Without it, the X11 reader leads.
+        assert_eq!(without[0].program, "xclip");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // default_chain ordering
 // ---------------------------------------------------------------------------
