@@ -11,11 +11,11 @@ use tokio::sync::broadcast;
 
 use crate::{
     PendingApproval, PendingMcpElicitation, PendingPlanChoice, PendingRequestUserInput,
-    TranscriptItem, TuiApp, TurnVisualState, compaction_status_line, context_window_pct,
-    current_turn_of, dedupe_assistant_repeated_tool_output, format_approval_status_line,
-    format_error_status, format_mcp_elicitation_status_line, format_mcp_status_snapshot, input,
-    is_control_tool_name, proposed_plan, refresh_search, render, strip_plan_handoff_prefix,
-    tool_call_label, tool_result_status_text, turn_metrics_priced,
+    TranscriptItem, TuiApp, TurnVisualState, active_subagent_record, compaction_status_line,
+    context_window_pct, current_turn_of, dedupe_assistant_repeated_tool_output,
+    format_approval_status_line, format_error_status, format_mcp_elicitation_status_line,
+    format_mcp_status_snapshot, input, is_control_tool_name, proposed_plan, refresh_search, render,
+    strip_plan_handoff_prefix, tool_call_label, tool_result_status_text, turn_metrics_priced,
 };
 
 pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
@@ -561,6 +561,16 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     if app.last_turn_had_edits {
                         app.push_log(edit_recovery_hint(app).to_string());
                         app.last_turn_had_edits = false;
+                    }
+                    // Settle the live streamed partial into the transcript as a
+                    // cancelled assistant item so it survives the clear below,
+                    // mirroring the Completed arm. A subagent's partial belongs to
+                    // its own record, not the main transcript, so skip those.
+                    if active_subagent_record(app).is_none()
+                        && !app.pending_assistant.trim_is_empty()
+                    {
+                        let partial = app.pending_assistant.text();
+                        app.push_transcript_item(TranscriptItem::assistant_cancelled(partial));
                     }
                     app.pending_assistant.clear();
                     app.pending_reasoning.clear();

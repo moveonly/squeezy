@@ -3356,6 +3356,80 @@ async fn cancelled_turn_auto_drains_next_queued_prompt() {
 }
 
 #[tokio::test]
+async fn cancelled_turn_settles_live_partial_into_transcript() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    tx.send(AgentEvent::AssistantDelta {
+        turn_id: TurnId::new(1),
+        delta: "partial answer".to_string(),
+    })
+    .await
+    .expect("send delta");
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        session_cost: None,
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let last_message = app
+        .transcript
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Message(item) => Some(item),
+            _ => None,
+        })
+        .expect("cancel must settle the partial as a transcript message");
+    assert_eq!(last_message.role, Role::Assistant);
+    assert_eq!(last_message.content, "partial answer");
+    assert!(
+        last_message.cancelled,
+        "settled partial must be flagged cancelled",
+    );
+    assert!(
+        app.pending_assistant.trim_is_empty(),
+        "pending_assistant must be cleared after cancel",
+    );
+}
+
+#[tokio::test]
+async fn cancelled_turn_with_no_partial_adds_no_assistant_item() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        session_cost: None,
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let assistant_items = app
+        .transcript
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.kind, TranscriptEntryKind::Message(item) if item.role == Role::Assistant)
+        })
+        .count();
+    assert_eq!(
+        assistant_items, 0,
+        "an empty partial must not produce an assistant transcript item",
+    );
+}
+
+#[tokio::test]
 async fn status_line_cost_ticks_live_and_survives_cancel() {
     let mut app = test_app(SessionMode::Build);
     assert_eq!(
