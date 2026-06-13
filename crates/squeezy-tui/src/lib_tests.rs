@@ -33987,6 +33987,54 @@ async fn drain_pump_drops_skip_bound_prompt_without_running_a_turn() {
     );
 }
 
+#[test]
+fn editing_a_queued_prompt_parks_the_drain_pump() {
+    // While a queued prompt is being edited in the composer (`editing_queue_id`
+    // is set) the drain pump must stay parked so the stale, pre-edit text can't
+    // run before the user saves.
+    let mut app = queue_app(&["foo", "bar"]);
+    assert!(!prompt_queue_drain_blocked(&app));
+    let id_front = queue_id_at(&app, 0);
+    assert!(begin_queue_edit(&mut app, id_front), "edit begins");
+    assert_eq!(app.editing_queue_id, Some(id_front));
+    assert!(
+        prompt_queue_drain_blocked(&app),
+        "drain is parked while an edit is in flight"
+    );
+    // Saving the edit clears the edit state and releases the pump again.
+    assert!(save_queue_edit(&mut app, "foo-edited".to_string()));
+    assert_eq!(app.editing_queue_id, None);
+    assert!(!prompt_queue_drain_blocked(&app));
+    assert_eq!(
+        queue_texts(&app),
+        vec!["foo-edited".to_string(), "bar".to_string()],
+        "the edited text replaced the queued item in place"
+    );
+}
+
+#[tokio::test]
+async fn drain_does_not_run_a_prompt_being_edited() {
+    // End-to-end: with an outcome that would otherwise satisfy the front prompt,
+    // beginning an edit on it keeps the pump from spawning a turn for the stale
+    // text. The item stays queued until the edit is saved.
+    let mut app = queue_app(&["foo", "bar"]);
+    let mut agent = test_agent(SessionMode::Build);
+    app.prompt_queue_overlay = None;
+    app.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+        succeeded: true,
+        had_edits: false,
+    });
+    let id_front = queue_id_at(&app, 0);
+    assert!(begin_queue_edit(&mut app, id_front), "edit begins");
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+    assert!(app.turn_rx.is_none(), "no turn spawned while editing");
+    assert_eq!(
+        queue_texts(&app),
+        vec!["foo".to_string(), "bar".to_string()],
+        "the unedited prompt is still queued"
+    );
+}
+
 #[tokio::test]
 async fn manual_condition_blocks_drain_until_run_next() {
     // A `Manual` prompt is never auto-drained — it blocks the pump even with a

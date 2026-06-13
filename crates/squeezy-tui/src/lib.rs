@@ -18613,7 +18613,9 @@ fn begin_queue_edit(app: &mut TuiApp, id: u64) -> bool {
     app.input_cursor = app.input.len();
     app.editing_queue_id = Some(pick.id);
     // Pulling the prompt into the composer closes the overlay and abandons any
-    // in-flight reorder; the queue keeps draining normally meanwhile.
+    // in-flight reorder. While `editing_queue_id` is set the drain pump is
+    // parked (`prompt_queue_drain_blocked`), so the stale text can't run before
+    // the user saves or abandons the edit.
     app.prompt_queue_overlay = None;
     app.prompt_queue_drag = None;
     app.status = "editing queued prompt — Enter saves the change".to_string();
@@ -24509,6 +24511,7 @@ fn prompt_queue_drain_blocked(app: &TuiApp) -> bool {
         || app.pending_request_user_input.is_some()
         || app.pending_plan_choice.is_some()
         || app.pending_feedback.is_some()
+        || app.editing_queue_id.is_some()
 }
 
 async fn submit_queued_input(app: &mut TuiApp, agent: &mut Agent, raw_input: String) {
