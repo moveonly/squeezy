@@ -18286,7 +18286,7 @@ fn toggle_prompt_queue_overlay(app: &mut TuiApp) {
     }
     app.status = if app.prompt_queue_overlay.is_some() {
         format!(
-            "prompt queue ({} queued) · ↑↓ focus · Space tag · g group · z fold · p pause · Enter/e edit · r run next · Del remove · Esc close",
+            "prompt queue ({} queued) — see the cheatsheet above; Esc closes",
             app.prompt_queue.len()
         )
     } else {
