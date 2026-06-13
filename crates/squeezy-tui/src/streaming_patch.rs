@@ -301,11 +301,12 @@ pub fn render_streaming_preview(partial: &PatchPartial) -> Vec<Line<'static>> {
         ]));
     }
     let mut diff_text = String::new();
+    let mut truncated = false;
     if let Some(search) = partial.search.as_deref() {
-        append_diff_lines(&mut diff_text, '-', search);
+        truncated |= append_diff_lines(&mut diff_text, '-', search);
     }
     if let Some(replace) = partial.replace.as_deref() {
-        append_diff_lines(&mut diff_text, '+', replace);
+        truncated |= append_diff_lines(&mut diff_text, '+', replace);
     }
     if !diff_text.is_empty() {
         let hint = partial
@@ -317,26 +318,59 @@ pub fn render_streaming_preview(partial: &PatchPartial) -> Vec<Line<'static>> {
             lines.push(line);
         }
     }
+    if truncated {
+        // The preview is cosmetic — the full patch is shown at the
+        // approval prompt — so clamp the in-flight body and tell the
+        // user the cut is intentional rather than a dropped stream.
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "… (full patch shown at approval)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
     lines
 }
 
-fn append_diff_lines(buf: &mut String, sign: char, body: &str) {
+/// Maximum diff rows rendered per field (`search` / `replace`) in the
+/// in-flight preview. A multi-hundred-line patch body would otherwise
+/// fill the viewport mid-stream before the user reaches the real
+/// approval prompt; the structural [`PatchPartial`] stays unbounded and
+/// only the rendered rows are clamped.
+const PREVIEW_MAX_LINES_PER_FIELD: usize = 40;
+
+/// Append one signed diff row per line of `body`, capped at
+/// [`PREVIEW_MAX_LINES_PER_FIELD`]. Returns `true` when the body was
+/// clamped so the caller can append a truncation note.
+fn append_diff_lines(buf: &mut String, sign: char, body: &str) -> bool {
     if body.is_empty() {
-        return;
+        return false;
     }
     let body_ends_with_newline = body.ends_with('\n');
     let mut parts = body.split('\n').peekable();
+    let mut emitted = 0usize;
     while let Some(line) = parts.next() {
         let is_last = parts.peek().is_none();
         if is_last && line.is_empty() && body_ends_with_newline {
             // Trailing `\n` produces a phantom empty element; suppress it
-            // so the diff body isn't padded with a sign-only line.
+            // so the diff body isn't padded with a sign-only line. Checked
+            // before the cap so an exactly-capped body with a trailing
+            // newline isn't falsely flagged as truncated.
             break;
+        }
+        if emitted >= PREVIEW_MAX_LINES_PER_FIELD {
+            // A real line beyond the cap exists: drop the remaining rows but
+            // report truncation so the caller appends the "shown at approval"
+            // note.
+            return true;
         }
         buf.push(sign);
         buf.push_str(line);
         buf.push('\n');
+        emitted += 1;
     }
+    false
 }
 
 fn ends_with_patches_key(buf: &str) -> bool {

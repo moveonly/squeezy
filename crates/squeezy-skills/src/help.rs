@@ -227,13 +227,6 @@ impl SqueezyHelp {
     }
 
     fn unsupported(&self, topic: &str) -> HelpAnswer {
-        let mut topic_list = String::new();
-        for t in TOPICS {
-            if !topic_list.is_empty() {
-                topic_list.push_str(", ");
-            }
-            topic_list.push_str(t.id);
-        }
         let did_you_mean = {
             let candidates = top_topics_for_text(topic, 3);
             if candidates.is_empty() {
@@ -262,7 +255,7 @@ impl SqueezyHelp {
             topic: topic.trim().to_string(),
             status: HelpStatus::Unsupported,
             body: format!(
-                "No local help coverage for `{}`.{did_you_mean}{slash_did_you_mean}\n\nTry one of these topics: {topic_list}.\n\nFor current or broader documentation: {SQUEEZY_WEBSITE_URL} or {SQUEEZY_REPO_URL}.",
+                "No local help coverage for `{}`.{did_you_mean}{slash_did_you_mean}\n\nRun `/help` with no argument to see all topics grouped by category.\n\nFor current or broader documentation: {SQUEEZY_WEBSITE_URL} or {SQUEEZY_REPO_URL}.",
                 topic.trim()
             ),
             citations: Vec::new(),
@@ -1393,15 +1386,6 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         capability_note: Some("Requires: [edit, destructive]"),
         related: &["checkpoints"],
     },
-    SlashCommandHelp {
-        name: "/parent",
-        what: "Force the next turn to use the parent (non-cheap) model, overriding any active routing.",
-        syntax: "/parent",
-        examples: &["/parent  — run next turn with the full-tier model"],
-        available_during_turn: true,
-        capability_note: None,
-        related: &["providers", "config"],
-    },
 ];
 
 /// Return the slash command names that have a curated local help entry.
@@ -1716,12 +1700,17 @@ fn extract_doc_intro(content: &str, max_chars: usize) -> &str {
     } else {
         trimmed
     };
-    // Find end of first paragraph (first blank line = two consecutive newlines)
-    let end = after_heading
-        .find("\n\n")
-        .unwrap_or(after_heading.len())
-        .min(max_chars);
-    &after_heading[..end]
+    // Find end of first paragraph (first blank line = two consecutive newlines).
+    // `find`/`len` yield byte offsets and both land on char boundaries.
+    let para_end = after_heading.find("\n\n").unwrap_or(after_heading.len());
+    let para = &after_heading[..para_end];
+    // Cap at `max_chars` *characters*; `char_indices().nth()` yields a
+    // char-boundary byte index, so the final slice never splits a multi-byte char.
+    let end = para
+        .char_indices()
+        .nth(max_chars)
+        .map_or(para.len(), |(i, _)| i);
+    &para[..end]
 }
 
 /// How many top-scoring bundled docs to include when the lexical scorer is

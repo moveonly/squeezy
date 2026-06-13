@@ -64,6 +64,19 @@ fn capped_and_blocked_are_the_attention_lanes() {
 }
 
 #[test]
+fn lane_gloss_distinguishes_blocked_from_capped() {
+    // The two attention lanes look like "failure" but imply different
+    // remediations; the gloss must spell out the distinction.
+    assert_eq!(ReviewLane::Blocked.gloss(), "Blocked — ran and failed");
+    assert_eq!(
+        ReviewLane::Capped.gloss(),
+        "Capped — refused before start (concurrency cap)"
+    );
+    assert!(ReviewLane::Running.gloss().starts_with("Running"));
+    assert!(ReviewLane::Completed.gloss().starts_with("Completed"));
+}
+
+#[test]
 fn rebuild_groups_cards_lane_major_in_board_order() {
     let sources = fanout();
     let mut board = ReviewBoard::new();
@@ -282,7 +295,7 @@ fn card_formats_metrics_at_the_edge_with_honest_dashes() {
         "no cost → dash, never an invented number"
     );
     // A blank source latest falls back to the cleaned "(status)" label.
-    assert_eq!(capped.latest, "(capped)");
+    assert_eq!(capped.latest, "(rejected)");
 }
 
 #[test]

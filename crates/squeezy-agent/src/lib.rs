@@ -15380,6 +15380,13 @@ async fn permission_decision_for_request(
         mode_forced_ask = true;
         verdict = mode_verdict;
     }
+    // When the structural pre-classifier raises a permissive verdict to an Ask
+    // floor, remember its raw reason (e.g. `dangerous interpreter "sudo"`). If
+    // the AI reviewer then denies, we thread this forward so the user can tell a
+    // structural hazard apart from a context-weighed refusal — two different
+    // remediations (rephrase vs. argue the context) that would otherwise collapse
+    // to the reviewer's reason alone.
+    let mut pre_classifier_ask_reason: Option<String> = None;
     // The structural pre-classifier runs for every shell call, not just those
     // whose policy verdict is already Ask. Its hazardous-shape floor
     // (dangerous interpreter, destructive verb, sensitive path) must be able to
@@ -15428,6 +15435,9 @@ async fn permission_decision_for_request(
                     PermissionAction::Deny => PermissionAction::Deny,
                 };
                 if tightened != verdict.action {
+                    // Carry the raw structural reason forward in case the AI
+                    // reviewer denies this same request below.
+                    pre_classifier_ask_reason = Some(reason.clone());
                     let reason = format!("pre-classifier requires approval: {reason}");
                     log_session_event(
                         context.session_log.as_ref(),
@@ -15499,7 +15509,20 @@ async fn permission_decision_for_request(
         reviewer_usd_micros = reviewer_usd_micros
             .saturating_add(reviewer_result.cost.estimated_usd_micros.unwrap_or(0));
         match reviewer_result.outcome {
-            ai_reviewer::AiReviewerOutcome::Verdict(reviewed) => {
+            ai_reviewer::AiReviewerOutcome::Verdict(mut reviewed) => {
+                // When the pre-classifier raised this request to an Ask *and* the
+                // reviewer denied it, name both nodes of the decision tree so the
+                // user sees the structural hazard was the floor and the reviewer
+                // agreed — not just the reviewer's text replacing the structural
+                // reason wholesale.
+                if reviewed.action == PermissionAction::Deny
+                    && let Some(structural) = pre_classifier_ask_reason.as_deref()
+                {
+                    reviewed.reason = format!(
+                        "{structural} (pre-classified) · reviewer agreed: {}",
+                        reviewed.reason
+                    );
+                }
                 log_session_event(
                     context.session_log.as_ref(),
                     &context.redactor,

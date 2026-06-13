@@ -258,3 +258,26 @@ fn text_of_returns_full_payload_for_re_copy() {
     assert_eq!(store.text_of(id), Some("the full payload\nwith two lines"));
     assert_eq!(store.text_of(id + 100), None);
 }
+
+#[test]
+fn promote_to_front_moves_existing_entry_and_returns_its_label() {
+    let mut store = ClipboardHistoryStore::new();
+    let target = store.record("payload", "selection");
+    store.record("newer", "viewport");
+    // The re-copy target is the older row; promoting it must move it to the
+    // front, point the cursor at it, and hand back its ORIGINAL scope label so
+    // the funnel re-records it under "selection", not a generic relabel.
+    assert_eq!(
+        store.promote_to_front(target),
+        Some(("payload".to_string(), "selection".to_string())),
+    );
+    assert_eq!(store.entries()[0].text, "payload");
+    assert_eq!(store.entries()[0].id, target, "id is preserved");
+    assert_eq!(store.selected_index(), 0);
+    // Re-delivering with the returned label collapses onto the promoted front
+    // row (same text *and* label) instead of inserting a payload-identical twin.
+    let again = store.record("payload", "selection");
+    assert_eq!(again, target, "re-record collapses onto the promoted entry");
+    assert_eq!(store.len(), 2, "no duplicate row from the re-copy");
+    assert_eq!(store.promote_to_front(9_999), None, "unknown id is a no-op");
+}

@@ -134,7 +134,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "FORMAT",
-        help = "Non-interactive output format for --prompt: 'default' (text deltas) or 'json' (one event per line). Experimental; schema may change.",
+        help = "Non-interactive output format for --prompt: 'default' (text deltas) or 'json' (one JSON LlmEvent per line; type + data, see squeezy-llm). Experimental; schema may change.",
         default_value = "default"
     )]
     format: PromptFormat,
@@ -143,7 +143,7 @@ struct Cli {
         value_name = "MODE",
         value_enum,
         default_value_t = PromptPermissionMode::AutoApprove,
-        help = "Permission behavior for non-interactive --prompt runs: auto-approve-ask, deny-ask, or fail-on-ask"
+        help = "Permission behavior for non-interactive --prompt runs: auto-approve-ask (default; approve each request once), deny-ask (deny but continue), fail-on-ask (deny and exit non-zero)"
     )]
     prompt_permission_mode: PromptPermissionMode,
     #[arg(

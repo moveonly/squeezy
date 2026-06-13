@@ -168,6 +168,26 @@ fn shell_rule_preview_names_command_prefix_instead_of_internal_capability() {
 }
 
 #[test]
+fn rule_preview_names_project_wide_persistence() {
+    // "Always allow" writes the rule to the project settings file and applies
+    // it to every future matching request, so the preview must say so — not
+    // leave the durable, project-wide reach to surface only in squeezy.toml.
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[("command", "cargo test --workspace")],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(out.contains("Rule: command prefix cargo test"), "{out}");
+    assert!(
+        out.contains("saved to squeezy.toml")
+            && out.contains("applies to all matching requests in this project"),
+        "persistence note missing under Rule line: {out}"
+    );
+}
+
+#[test]
 fn edit_preview_lists_paths() {
     let req = request_with(
         "edit",
@@ -248,7 +268,10 @@ fn context_field_is_rendered_above_rule_preview() {
 }
 
 #[test]
-fn missing_context_keeps_existing_preview_layout() {
+fn missing_context_emits_no_rationale_placeholder() {
+    // When the request carries no rationale, the block keeps a stable shape:
+    // a single `Why: (no rationale provided)` row so the absence is stated,
+    // not silently implied by a vanished line.
     let req = request_with(
         "shell",
         PermissionCapability::Shell,
@@ -257,7 +280,29 @@ fn missing_context_keeps_existing_preview_layout() {
     );
     let out = flatten(&render_preview(&req));
     assert!(!out.contains("context:"), "stray context label: {out}");
-    assert!(!out.contains("Why:"), "stray rationale label: {out}");
+    assert!(out.contains("Why: "), "rationale label missing: {out}");
+    assert!(
+        out.contains("(no rationale provided)"),
+        "honest placeholder missing: {out}"
+    );
+}
+
+#[test]
+fn whitespace_context_emits_no_rationale_placeholder() {
+    // A whitespace-only snippet is treated as "no rationale" too — the
+    // placeholder keeps the layout stable instead of dropping the row.
+    let mut req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "ls",
+        &[("command", "ls")],
+    );
+    req.context = Some("   \n  ".to_string());
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("(no rationale provided)"),
+        "whitespace context should fall back to the placeholder: {out}"
+    );
 }
 
 #[test]
@@ -294,10 +339,20 @@ fn approval_preview_separates_rationale_command_rule_and_choices() {
         .position(|line| line.contains("Rule: command prefix cargo test"))
         .expect("rule line");
 
-    assert!(why < command && command < rule, "{rendered:#?}");
-    // The rationale → command → rule group is tight: no blank lines between
-    // them (the old loose layout was confusing to read).
-    for line in &rendered[why..=rule] {
+    // The dim persistence note sits directly under the rule line so users see
+    // that "Always allow" authors a durable, project-wide rule.
+    let persist = rendered
+        .iter()
+        .position(|line| line.contains("saved to squeezy.toml"))
+        .expect("persistence note line");
+
+    assert!(
+        why < command && command < rule && rule + 1 == persist,
+        "{rendered:#?}"
+    );
+    // The rationale → command → rule → note group is tight: no blank lines
+    // between them (the old loose layout was confusing to read).
+    for line in &rendered[why..=persist] {
         assert_ne!(
             line.as_str(),
             "",
@@ -305,7 +360,7 @@ fn approval_preview_separates_rationale_command_rule_and_choices() {
         );
     }
     // A single trailing blank separates the preview from the decision options.
-    assert_eq!(rendered.get(rule + 1).map(String::as_str), Some(""));
+    assert_eq!(rendered.get(persist + 1).map(String::as_str), Some(""));
 }
 
 #[test]
@@ -550,9 +605,10 @@ fn edit_preview_renders_unified_diff_with_gutter() {
 #[test]
 fn edit_preview_caps_long_diff_body_with_summary_tail() {
     // Diff bodies longer than `APPROVAL_DIFF_BODY_CAP` must be
-    // truncated and tagged with a "… (N more lines)" summary so the
-    // approval prompt stays scannable on short terminals. Reviewers
-    // who want the full patch can still run `/diff` after approving.
+    // truncated and tagged with a "… (N more lines — full diff via /diff)"
+    // summary so the approval prompt stays scannable on short terminals and
+    // names where the rest lives. Reviewers who want the full patch can still
+    // run `/diff` after approving.
     //
     // The path uses an unrecognised extension so the cap test does not
     // also exercise the syntax highlighter on every diff line — that
@@ -582,16 +638,23 @@ fn edit_preview_caps_long_diff_body_with_summary_tail() {
         !out.contains("new_line_59"),
         "diff was not capped — final line leaked through: {out}"
     );
-    // The summary tail names the omitted-line count exactly.
+    // The summary tail names the omitted-line count exactly and points at the
+    // recovery verb (`/diff`) so the rest is reachable before deciding.
     assert!(
-        out.contains("more lines)"),
+        out.contains("more lines"),
         "cap summary tail missing: {out}"
+    );
+    assert!(
+        out.contains("full diff via /diff"),
+        "cap summary tail should name the /diff recovery: {out}"
     );
     let total = 60 * 2; // 60 added + 60 removed
     let expected_more = total - APPROVAL_DIFF_BODY_CAP;
     assert!(
-        out.contains(&format!("({expected_more} more lines)")),
-        "expected exact summary `({expected_more} more lines)`: {out}"
+        out.contains(&format!(
+            "({expected_more} more lines — full diff via /diff)"
+        )),
+        "expected exact summary `({expected_more} more lines — full diff via /diff)`: {out}"
     );
 }
 

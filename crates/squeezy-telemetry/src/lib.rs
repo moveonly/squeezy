@@ -639,7 +639,8 @@ async fn enqueue_event(state: Arc<TelemetryState>, mut event: TelemetryEvent) {
         TelemetryAction::Schedule => {
             tokio::spawn(async move {
                 time::sleep(FLUSH_INTERVAL).await;
-                if let Ok(mut queue) = state.queue.try_lock() {
+                {
+                    let mut queue = state.queue.lock().await;
                     queue.flush_scheduled = false;
                 }
                 let _ = send_pending_summaries(state).await;

@@ -4,8 +4,8 @@
 //! instructional chrome.
 //!
 //! Each crumb is a clickable AND keyboard-focusable jump/action target: a click
-//! (or Enter while the crumb is keyboard-focused) navigates to the location the
-//! crumb stands for. The trail is *derived from model state each frame*
+//! (or `Shift+Enter` while the crumb is keyboard-focused) navigates to the
+//! location the crumb stands for. The trail is *derived from model state each frame*
 //! ([`BreadcrumbModel::build`]) — never cached across frames — so it can never go
 //! stale after a resize, a scroll, a fold, or a Ctrl+T toggle (the spec's "derive
 //! from model each frame" risk mitigation).
@@ -18,8 +18,9 @@
 //! the transcript home/tail, the open overlay, or the active search), never a
 //! screen coordinate. The renderer registers each crumb's rect in the hit-test
 //! registry by its 0-based index and the dispatch maps that index back to the
-//! crumb's target, so the keyboard path (Left/Right to move the focus, Enter to
-//! activate) and the mouse path reach the same navigation by construction.
+//! crumb's target, so the keyboard path (Left/Right to move the focus,
+//! `Shift+Enter` to activate) and the mouse path reach the same navigation by
+//! construction.
 //!
 //! **Zero idle cost.** The trail is built only while the breadcrumb strip is
 //! shown (the `Alt+2` focus mode is on); a closed strip builds nothing and the

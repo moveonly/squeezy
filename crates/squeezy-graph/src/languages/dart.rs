@@ -442,7 +442,7 @@ impl SemanticGraph {
         let caller = self.symbols.get(caller_id)?;
         // Look for `<Type> <receiver>` or `<Type>? <receiver>` in the signature.
         let signature = &caller.signature;
-        if let Some(idx) = signature.find(receiver) {
+        if let Some(idx) = find_identifier(signature, receiver) {
             // Walk backwards from the receiver name to find a type identifier.
             let before = &signature[..idx];
             let prev_token = before

@@ -87,6 +87,16 @@ where
 
 fn acquire_named_lock(key: &Path) -> Arc<Mutex<()>> {
     let mut map = MUTATION_LOCKS.lock().unwrap_or_else(|err| err.into_inner());
+    // Opportunistically reclaim idle entries while we hold the outer lock.
+    // An entry whose `Arc` strong-count is 1 is referenced only by the map
+    // itself: no outstanding `lock_owned` guard exists for it, so dropping
+    // it cannot race away a lock that is in use. Any entry with a live guard
+    // (including the requested `key` if another caller currently holds it)
+    // has strong-count >= 2 and survives. This bounds the map by the number
+    // of concurrently-held locks rather than the number of paths ever
+    // touched; a subsequent mutation of a pruned path simply re-inserts a
+    // fresh mutex.
+    map.retain(|_, v| Arc::strong_count(v) > 1);
     if let Some(lock) = map.get(key) {
         return Arc::clone(lock);
     }

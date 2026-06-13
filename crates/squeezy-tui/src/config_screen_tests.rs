@@ -838,22 +838,20 @@ async fn filter_jump_keeps_active_scope_and_reaches_field_less_section() {
 
 #[test]
 fn filter_below_threshold_is_the_panel_index() {
-    // Just-opened (empty) and one-character queries show every section as a
-    // panel index — no field rows — so the box doesn't collapse to noise
-    // before the user has typed enough to filter.
+    // The just-opened (empty) query shows every section as a panel index —
+    // no field rows — so the box doesn't collapse to noise before the user
+    // has typed anything. Name matching activates on the first keystroke.
     let cfg = AppConfig::default();
-    for query in ["", "t"] {
-        let matches = compute_search_matches(&cfg, query);
-        assert_eq!(
-            matches.len(),
-            CONFIG_SECTIONS.len(),
-            "below {FILTER_MIN_QUERY} chars the list is the full panel index"
-        );
-        assert!(
-            matches.iter().all(|m| m.target == SearchTarget::Section),
-            "panel-index rows are section-level"
-        );
-    }
+    let matches = compute_search_matches(&cfg, "");
+    assert_eq!(
+        matches.len(),
+        CONFIG_SECTIONS.len(),
+        "below {FILTER_MIN_QUERY} chars the list is the full panel index"
+    );
+    assert!(
+        matches.iter().all(|m| m.target == SearchTarget::Section),
+        "panel-index rows are section-level"
+    );
 }
 
 #[test]
@@ -1270,7 +1268,7 @@ fn secret_entry_editor_inserts_and_backspaces_multibyte() {
         provider_label: "OpenAI".to_string(),
         draft: String::new(),
         cursor: 0,
-        reveal: false,
+        reveal: SecretReveal::Hidden,
     };
     for c in ['s', 'k', '-', 'é'] {
         entry.insert_char(c);

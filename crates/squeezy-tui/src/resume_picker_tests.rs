@@ -253,6 +253,48 @@ fn picker_signals_cross_project_switch() {
 }
 
 #[test]
+fn picker_teaches_tab_when_scoped_view_is_empty_but_other_projects_exist() {
+    // No session for the current cwd, but one in a sibling repo: the scoped
+    // view has no rows, yet the picker must still surface the Tab toggle.
+    let elsewhere = summary_at("elsewhere", "/other/place");
+    let state = ResumePickerState::new(vec![elsewhere], cwd());
+    assert!(
+        state.candidates.is_empty(),
+        "scoped view hides the cross-project session by default",
+    );
+    let text = render_state_to_text(&state, 90, 18);
+    assert!(
+        text.contains("session in other projects"),
+        "the empty scoped view advertises the Tab toggle:\n{text}"
+    );
+}
+
+#[test]
+fn picker_footer_warns_that_cross_project_rows_change_cwd() {
+    let here = summary_at("here", "/work/repo");
+    let there = summary_at("there", "/other/place");
+    let mut state = ResumePickerState::new(vec![here, there], cwd());
+    state.dispatch(press(KeyCode::Tab)); // cross-project view
+    let text = render_state_to_text(&state, 100, 18);
+    assert!(
+        text.contains("change your working directory"),
+        "the cross-project footer spells out the cwd consequence:\n{text}"
+    );
+}
+
+#[test]
+fn picker_legends_the_branch_load_failed_marker() {
+    let mut broken = summary("broken");
+    broken.branch_load_failed = true;
+    let state = ResumePickerState::new(vec![broken], cwd());
+    let text = render_state_to_text(&state, 90, 18);
+    assert!(
+        text.contains("branch data unavailable"),
+        "a `!` row gets a footer legend:\n{text}"
+    );
+}
+
+#[test]
 fn picker_ellipsises_long_labels_instead_of_hard_cropping() {
     let mut long = summary("long");
     long.first_user_task = Some("verylongsessiontitlewithnospaces".repeat(12));

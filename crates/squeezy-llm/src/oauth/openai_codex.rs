@@ -341,7 +341,7 @@ fn base64_decode_loose(input: &str) -> Option<Vec<u8>> {
         match ch {
             '-' => value.push('+'),
             '_' => value.push('/'),
-            c if c.is_alphanumeric() || c == '+' || c == '/' => value.push(c),
+            c if c.is_ascii_alphanumeric() || c == '+' || c == '/' => value.push(c),
             '=' => break,
             _ => return None,
         }

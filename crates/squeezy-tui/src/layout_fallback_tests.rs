@@ -231,6 +231,36 @@ fn repeated_degenerate_frames_keep_falling_back_and_counting() {
     assert_eq!(store.fallback_count(), 3, "the counter never resets");
 }
 
+#[test]
+fn the_first_fallback_notice_fires_exactly_once_per_session() {
+    let store = LastGoodLayout::default();
+    // No substitution yet: nothing to announce.
+    assert!(!store.take_first_fallback_notice());
+
+    let good = good_geometry(80, 24);
+    let _ = store.resolve(good);
+    let mut broken = good_geometry(80, 24);
+    broken.input_height = 0;
+
+    // First substitution: the one-shot cue is owed exactly once.
+    let _ = store.resolve(broken);
+    assert!(
+        store.take_first_fallback_notice(),
+        "first fallback is announced"
+    );
+    assert!(
+        !store.take_first_fallback_notice(),
+        "the notice is consumed and never re-armed"
+    );
+
+    // A later substitution storm never re-arms the cue.
+    let _ = store.resolve(broken);
+    assert!(
+        !store.take_first_fallback_notice(),
+        "subsequent fallbacks stay silent"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Diagnostics line.
 // ---------------------------------------------------------------------------

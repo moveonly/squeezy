@@ -118,6 +118,20 @@ impl ReviewLane {
     pub(crate) fn is_attention(self) -> bool {
         matches!(self, ReviewLane::Blocked | ReviewLane::Capped)
     }
+
+    /// A one-line gloss for the focused lane, naming the lifecycle the label
+    /// stands for and the remediation it implies. `Blocked` and `Capped` both
+    /// read as "failure" at a glance, but a capped worker only needs a retry
+    /// once capacity frees up while a blocked one ran and failed — the gloss
+    /// makes that distinction explicit when a lane is focused.
+    pub(crate) fn gloss(self) -> &'static str {
+        match self {
+            ReviewLane::Running => "Running — in flight, no terminal event yet",
+            ReviewLane::Blocked => "Blocked — ran and failed",
+            ReviewLane::Capped => "Capped — refused before start (concurrency cap)",
+            ReviewLane::Completed => "Completed — finished with a result",
+        }
+    }
 }
 
 /// One worker card on the board: a flattened, board-ordered projection of a source

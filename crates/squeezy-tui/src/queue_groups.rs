@@ -218,7 +218,7 @@ pub(crate) fn groups_summary(groups: &QueueGroups) -> String {
 
 /// The marker glyph painted at the head of a grouped overlay row. A loose row
 /// (no group) gets blanks so columns stay aligned with the multi-select marker;
-/// a grouped row gets a compact tag reflecting paused (`⏸`) / running (`▸`)
+/// a grouped row gets a compact tag reflecting paused (`[P]`) / running (`[G]`)
 /// state. Kept here next to the state so the render and the tests agree on the
 /// exact glyph.
 pub(crate) fn group_marker_glyph(group: Option<&QueueGroup>) -> &'static str {
@@ -229,14 +229,17 @@ pub(crate) fn group_marker_glyph(group: Option<&QueueGroup>) -> &'static str {
     }
 }
 
-/// Style the group marker: a paused group is drawn in the warn colour so a
-/// held-back batch reads at a glance; a running group in the accent colour; a
-/// loose row is invisible (blanks).
+/// Style the group marker: a paused group is drawn in quiet (it is a deliberate
+/// "held" state, not a failure — warn is reserved for skip-bound conditions and
+/// error chrome); a running group in the accent colour; a loose row is invisible
+/// (blanks).
 pub(crate) fn group_marker_span(group: Option<&QueueGroup>) -> Span<'static> {
     let glyph = group_marker_glyph(group);
     let color = match group {
         None => crate::render::theme::quiet(),
-        Some(g) if g.paused => crate::render::theme::warn(),
+        // Held, not broken: a quiet marker so a parked batch never reads as an
+        // error the way the warn colour would.
+        Some(g) if g.paused => crate::render::theme::quiet(),
         Some(_) => crate::render::theme::accent(),
     };
     Span::styled(

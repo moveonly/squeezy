@@ -753,7 +753,7 @@ impl GraphStore {
         let write = self.begin_write()?;
         {
             let mut table = write.open_table(GRAPH_PARTITIONS).map_err(store_error)?;
-            insert_json(&mut table, file_id.0.as_str(), partition)?;
+            insert_graph(&mut table, file_id.0.as_str(), partition)?;
         }
         write.commit().map_err(store_error)
     }
@@ -764,7 +764,7 @@ impl GraphStore {
             Ok(table) => table,
             Err(_) => return Ok(None),
         };
-        read_table_json(&table, file_id.0.as_str())
+        read_graph(&table, file_id.0.as_str())
     }
 
     /// Decode every stored graph partition into `T`, keyed by its `FileId`.
@@ -782,7 +782,7 @@ impl GraphStore {
         let mut entries = Vec::new();
         for entry in table.iter().map_err(store_error)? {
             let (key, value) = entry.map_err(store_error)?;
-            let decoded: T = decode(value.value())?;
+            let decoded: T = decode_graph(value.value())?;
             entries.push((FileId(key.value().to_string()), decoded));
         }
         Ok(entries)
@@ -861,7 +861,7 @@ impl GraphStore {
             Ok(table) => table,
             Err(_) => return Ok(None),
         };
-        read_table_json(&table, file_id.0.as_str())
+        read_graph(&table, file_id.0.as_str())
     }
 
     pub fn resolver_entries_for<T: DeserializeOwned>(
@@ -875,7 +875,7 @@ impl GraphStore {
         };
         let mut out = Vec::with_capacity(file_ids.len());
         for file_id in file_ids {
-            if let Some(value) = read_table_json(&table, file_id.0.as_str())? {
+            if let Some(value) = read_graph(&table, file_id.0.as_str())? {
                 out.push((file_id.clone(), value));
             }
         }
@@ -908,7 +908,7 @@ impl GraphStore {
             Ok(table) => table,
             Err(_) => return Ok(None),
         };
-        read_table_json(&table, "resolver_import_graph")
+        read_graph(&table, "resolver_import_graph")
     }
 
     fn begin_write(&self) -> Result<redb::WriteTransaction> {
@@ -956,7 +956,7 @@ impl GraphWriteBatch {
         file_id: &FileId,
         partition: &T,
     ) -> Result<()> {
-        let encoded = encode(partition)?;
+        let encoded = encode_graph(partition)?;
         self.upserts.push((file_id.0.clone(), encoded));
         Ok(())
     }
@@ -970,7 +970,7 @@ impl GraphWriteBatch {
         file_id: &FileId,
         entry: &T,
     ) -> Result<()> {
-        let encoded = encode(entry)?;
+        let encoded = encode_graph(entry)?;
         self.resolver_upserts.push((file_id.0.clone(), encoded));
         Ok(())
     }
@@ -983,7 +983,7 @@ impl GraphWriteBatch {
     /// graph. Committed in the same transaction as any resolver-entry
     /// upserts/removals so all resolver-cache state lands atomically.
     pub fn set_import_graph<T: Serialize>(&mut self, graph: &T) -> Result<()> {
-        self.import_graph = Some(encode(graph)?);
+        self.import_graph = Some(encode_graph(graph)?);
         Ok(())
     }
 
@@ -1851,6 +1851,59 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 fn decode<T: DeserializeOwned>(value: &[u8]) -> Result<T> {
     serde_json::from_slice(value)
         .map_err(|err| SqueezyError::Tool(format!("store decode failed: {err}")))
+}
+
+/// Compressed codec for the large per-repo graph tables (`GRAPH_PARTITIONS`,
+/// `RESOLVER_SNAPSHOT_PER_FILE`, `RESOLVER_IMPORT_GRAPH`). Partition values are
+/// highly repetitive JSON (field names, identifiers, paths, keywords repeated
+/// across thousands of symbols), so DEFLATE shrinks them by ~an order of
+/// magnitude on disk and cuts the bytes redb must read back at warm start. The
+/// `meta` table (which holds the `graph_metadata` format-version gate) and
+/// every state.redb table stay on the plain-JSON `encode`/`decode` so the
+/// version check is always readable and resumable sessions are never
+/// invalidated by a graph-codec change. Bumping `graph_format_version` rebuilds
+/// any pre-compression cache, so a reader never inflates plain-JSON bytes.
+fn encode_graph<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    let json = serde_json::to_vec(value)
+        .map_err(|err| SqueezyError::Tool(format!("store graph encode failed: {err}")))?;
+    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder
+        .write_all(&json)
+        .map_err(|err| SqueezyError::Tool(format!("store graph compress failed: {err}")))?;
+    encoder
+        .finish()
+        .map_err(|err| SqueezyError::Tool(format!("store graph compress failed: {err}")))
+}
+
+fn decode_graph<T: DeserializeOwned>(value: &[u8]) -> Result<T> {
+    use std::io::Read as _;
+    let mut json = Vec::new();
+    flate2::read::DeflateDecoder::new(value)
+        .read_to_end(&mut json)
+        .map_err(|err| SqueezyError::Tool(format!("store graph decompress failed: {err}")))?;
+    serde_json::from_slice(&json)
+        .map_err(|err| SqueezyError::Tool(format!("store graph decode failed: {err}")))
+}
+
+fn insert_graph<T: Serialize>(
+    table: &mut redb::Table<'_, &str, &[u8]>,
+    key: &str,
+    value: &T,
+) -> Result<()> {
+    let encoded = encode_graph(value)?;
+    table.insert(key, encoded.as_slice()).map_err(store_error)?;
+    Ok(())
+}
+
+fn read_graph<T: DeserializeOwned, K: AsRef<str>>(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: K,
+) -> Result<Option<T>> {
+    let Some(value) = table.get(key.as_ref()).map_err(store_error)? else {
+        return Ok(None);
+    };
+    decode_graph(value.value()).map(Some)
 }
 
 fn store_error(error: impl std::fmt::Display) -> SqueezyError {

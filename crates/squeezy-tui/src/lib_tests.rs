@@ -10065,11 +10065,11 @@ fn approval_keybind_hint_lives_in_block_not_status() {
         100,
     ));
     assert!(block.contains("approve once"), "{block}");
-    assert!(block.contains("always approve repo"), "{block}");
+    assert!(block.contains("always allow"), "{block}");
 
     // The status hint row no longer carries the approval keybindings.
     let hints = format_status_hints(&app);
-    assert!(!hints.contains("always approve repo"), "{hints}");
+    assert!(!hints.contains("always allow"), "{hints}");
     assert!(!hints.contains("approve once"), "{hints}");
 }
 
@@ -10218,7 +10218,7 @@ fn verbose_status_surfaces_budget_and_cache_details() {
     assert!(status.contains("cost $0.000042"), "{status}");
     assert!(status.contains("tok 10/5"), "{status}");
     assert!(status.contains("tools 2"), "{status}");
-    assert!(status.contains("budget denied:1"), "{status}");
+    assert!(status.contains("budget: 1 blocked"), "{status}");
     assert!(status.contains("cfg defaults"), "{status}");
     assert!(status.contains("read 1024B"), "{status}");
     assert!(status.contains("receipts 1"), "{status}");
@@ -20856,10 +20856,12 @@ impl Clipboard for RecordingClipboard {
     }
 }
 
-/// Clipboard double whose `read_text` returns a canned value, for exercising the
-/// in-app paste chord without touching the real system clipboard.
+/// Clipboard double whose `read_text` / `read_image` return canned values, for
+/// exercising the in-app paste chord without touching the real system clipboard.
+#[derive(Default)]
 struct ReadableClipboard {
     read: Option<String>,
+    image: Option<(Vec<u8>, String)>,
 }
 
 impl Clipboard for ReadableClipboard {
@@ -20869,6 +20871,10 @@ impl Clipboard for ReadableClipboard {
 
     fn read_text(&mut self) -> Option<String> {
         self.read.clone()
+    }
+
+    fn read_image(&mut self) -> Option<(Vec<u8>, String)> {
+        self.image.clone()
     }
 }
 
@@ -21699,12 +21705,15 @@ fn mention_popup_footer_warns_when_workspace_walk_truncated() {
     );
 
     let footer = mention_popup_lines(&app)
-        .last()
-        .expect("footer line")
-        .spans
         .iter()
-        .map(|s| s.content.as_ref())
-        .collect::<String>();
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .find(|line| line.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+        .expect("idx/total footer line");
     assert!(
         footer.contains("more files not shown"),
         "footer should warn about truncated candidates, got: {footer:?}"
@@ -21720,12 +21729,15 @@ fn mention_popup_footer_has_no_hint_when_not_truncated() {
 
     insert_input_text(&mut app, "@graph");
     let footer = mention_popup_lines(&app)
-        .last()
-        .expect("footer line")
-        .spans
         .iter()
-        .map(|s| s.content.as_ref())
-        .collect::<String>();
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .find(|line| line.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+        .expect("idx/total footer line");
     assert!(
         !footer.contains("more files not shown"),
         "untruncated popup must not show the hint, got: {footer:?}"
@@ -22806,8 +22818,9 @@ fn status_details_render_via_segments_match_legacy_format() {
 #[test]
 fn cost_segment_renders_cap_and_percent_when_configured() {
     // When `max_session_cost_usd_micros` is set, the cost segment must show
-    // the spend, the cap, and one-decimal percent so the user can see where
-    // they stand without opening the /cost overlay.
+    // the spend, the cap, and an integer percent (shared with the broker's
+    // `cap_percent`) so the user can see where they stand without opening
+    // the /cost overlay.
     let mut config = test_config(SessionMode::Build);
     config.max_session_cost_usd_micros = Some(500_000); // $0.50 cap
     let mut app = test_app_with_config(&config, SessionMode::Build);
@@ -22815,7 +22828,7 @@ fn cost_segment_renders_cap_and_percent_when_configured() {
 
     let details = format_status_details(&app);
     assert!(
-        details.contains("cost $0.125000 / $0.50 (25.0%)"),
+        details.contains("cost $0.125000 / $0.50 (25%)"),
         "unexpected status: {details}"
     );
 }
@@ -25106,6 +25119,37 @@ fn render_streaming_preview_for_empty_snapshot_is_empty() {
     assert!(
         lines.is_empty(),
         "empty partial must render no preview lines: {lines:?}",
+    );
+}
+
+#[test]
+fn render_streaming_preview_caps_large_bodies_with_note() {
+    use super::streaming_patch::{PatchPartial, render_streaming_preview};
+
+    // A multi-hundred-line patch field must not fill the viewport mid-stream:
+    // the previewed body is clamped and a faint note tells the user the cut is
+    // cosmetic (the full patch is shown at approval).
+    let big_search = (0..500)
+        .map(|i| format!("old line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let partial = PatchPartial {
+        index: 0,
+        path: Some("src/lib.rs".to_string()),
+        search: Some(big_search),
+        replace: None,
+    };
+    let lines = render_streaming_preview(&partial);
+    let text = lines_to_string(&lines);
+    assert!(
+        text.contains("full patch shown at approval"),
+        "a truncated preview must surface the cosmetic-cut note: {text}",
+    );
+    // Far fewer rows than the 500-line body: header + capped rows + note.
+    assert!(
+        lines.len() < 60,
+        "previewed body must be clamped, not rendered in full: {} rows",
+        lines.len(),
     );
 }
 
@@ -39916,6 +39960,47 @@ async fn breadcrumbs_does_not_eat_h_l_or_enter_while_typing() {
     );
 }
 
+/// `Shift+Enter` is the keyboard twin of clicking a crumb: with the strip shown,
+/// it activates the focused crumb (reporting a breadcrumb jump), where bare Enter
+/// falls through to the composer. This restores the mouse/keyboard parity the
+/// strip's own status hint promises.
+#[tokio::test]
+async fn breadcrumbs_shift_enter_activates_focused_crumb() {
+    let mut app = app_with_breadcrumbs();
+    let mut agent = test_agent(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("show strip");
+    assert!(app.breadcrumbs_open, "precondition: strip shown");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift+enter");
+    assert!(
+        app.status.contains("breadcrumbs"),
+        "Shift+Enter activates the focused crumb and reports a jump: {}",
+        app.status,
+    );
+    assert!(
+        app.input.is_empty(),
+        "Shift+Enter does not leak into the composer: {:?}",
+        app.input,
+    );
+    assert!(
+        app.breadcrumbs_open,
+        "the strip stays shown after Shift+Enter activation",
+    );
+}
+
 #[tokio::test]
 async fn breadcrumbs_mouse_click_focuses_and_jumps() {
     let mut app = app_with_breadcrumbs();
@@ -40908,7 +40993,7 @@ async fn subagent_timeline_alt_5_opens_panel_and_lists_subagents() {
     assert!(out.contains("done"), "completed status tag:\n{out}");
     assert!(out.contains("running"), "running status tag:\n{out}");
     assert!(out.contains("failed"), "failed status tag:\n{out}");
-    assert!(out.contains("capped"), "cap-rejected status tag:\n{out}");
+    assert!(out.contains("rejected"), "cap-rejected status tag:\n{out}");
     assert!(out.contains("tools 4"), "child tool count:\n{out}");
     assert!(out.contains("$1.500000"), "child-reported cost:\n{out}");
     // The cap-rejected row has no honest timing/cost: a dash, never a fake number.
@@ -43548,8 +43633,16 @@ async fn hover_preview_alt_1_opens_popover_for_focused_unit() {
     assert!(out.contains("Preview"), "popover header paints:\n{out}");
     assert!(out.contains("tool output"), "kind tag paints:\n{out}");
     assert!(
+        out.contains("pinned"),
+        "a keyboard-sourced preview names itself pinned in the header:\n{out}",
+    );
+    assert!(
         out.contains("double-click / Ctrl+Enter to open"),
         "activation hint paints:\n{out}",
+    );
+    assert!(
+        out.contains("for actions"),
+        "a keyboard-pinned preview names the action-palette chord in context:\n{out}",
     );
 }
 
@@ -48752,6 +48845,69 @@ fn screen_selection_works_on_the_config_page() {
     );
 }
 
+#[test]
+fn drag_from_a_clickable_row_retroactively_selects_text() {
+    // A press on an interactive row fires its click on Down (no selection yet);
+    // moving the pointer before release turns the gesture into a text selection.
+    // Driven on the clipboard-history picker, whose entry rows are click-targets.
+    let mut app = test_app(SessionMode::Build);
+    app.clipboard_history.record("ENTRY payload text", "entry");
+    app.clipboard_history_open = true;
+    let _ = render_full_to_buffer(&app, 80, 30);
+
+    // A cell that is chrome AND a registered clipboard-entry click-target.
+    let mut spot = None;
+    'outer: for row in 0..30u16 {
+        for col in 0..80u16 {
+            if cell_is_chrome(&app, col, row)
+                && matches!(
+                    app.click_target_at(col, row),
+                    Some((interaction::TargetKey::ClipboardEntry(_), _))
+                )
+            {
+                spot = Some((col, row));
+                break 'outer;
+            }
+        }
+    }
+    let (col, row) = spot.expect("the picker has a clickable entry row");
+
+    // Press: the picker handles the click; no screen selection is armed.
+    handle_mouse(&mut app, left_down(col, row, KeyModifiers::NONE));
+    assert!(
+        app.screen_selection.is_none(),
+        "a press on a clickable row fires its click, not a selection",
+    );
+
+    // Drag off the press cell: retroactively becomes a text selection.
+    handle_mouse(&mut app, left_drag(col.saturating_add(4), row));
+    assert!(
+        app.screen_selection.is_some(),
+        "dragging from a clickable row selects its text",
+    );
+}
+
+#[test]
+fn retroactive_drag_arm_does_not_hijack_a_transcript_selection() {
+    // The guard: while a transcript selection is live, a drag must extend THAT
+    // selection (app.selection), never spawn a screen-buffer selection.
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("selectable body text here"));
+    let buffer = render_full_to_buffer(&app, 60, 24);
+    let (tx, ty) = find_text_cell(&buffer, "selectable body").expect("painted");
+
+    handle_mouse(&mut app, left_down(tx, ty, KeyModifiers::NONE));
+    assert!(
+        app.selection.is_some(),
+        "transcript press armed its selection"
+    );
+    handle_mouse(&mut app, left_drag(tx + 5, ty));
+    assert!(
+        app.screen_selection.is_none(),
+        "the retroactive arm must not hijack a live transcript selection",
+    );
+}
+
 // =====================================================================
 // Composer native-grade cursor motion: ⌘ line, ⌘↑↓ / Ctrl+Home/End doc,
 // with Shift-extend.
@@ -48984,6 +49140,7 @@ async fn cmd_v_pastes_clipboard_text_into_the_composer_at_the_cursor() {
     let mut app = test_app(SessionMode::Build);
     app.clipboard = Box::new(ReadableClipboard {
         read: Some("WORLD".to_string()),
+        ..Default::default()
     });
     set_input(&mut app, "hello ".to_string());
     app.input_cursor = app.input.len();
@@ -49008,6 +49165,7 @@ async fn ctrl_shift_v_also_pastes_the_clipboard() {
     let mut app = test_app(SessionMode::Build);
     app.clipboard = Box::new(ReadableClipboard {
         read: Some("pasted".to_string()),
+        ..Default::default()
     });
 
     press(
@@ -49029,6 +49187,7 @@ async fn paste_chord_with_empty_clipboard_is_a_consumed_no_op() {
     // helpers and must never type a stray 'v'.
     app.clipboard = Box::new(ReadableClipboard {
         read: Some(String::new()),
+        ..Default::default()
     });
     set_input(&mut app, "keep".to_string());
     app.input_cursor = app.input.len();
@@ -49067,6 +49226,67 @@ fn paste_chord_matches_super_and_ctrl_shift_v_only() {
         KeyCode::Char('v'),
         KeyModifiers::SUPER | KeyModifiers::ALT
     )));
+}
+
+#[tokio::test]
+async fn cmd_v_attaches_a_clipboard_image() {
+    // ⌘V of a screenshot attaches it as an image token (Claude Code parity).
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
+    app.clipboard = Box::new(ReadableClipboard {
+        image: Some((png.clone(), "image/png".to_string())),
+        ..Default::default()
+    });
+
+    press(
+        &mut app,
+        &mut agent,
+        KeyCode::Char('v'),
+        KeyModifiers::SUPER,
+    )
+    .await;
+
+    assert!(
+        app.input.contains("[Image clipboard]"),
+        "⌘V of a clipboard image inserts an image placeholder: {:?}",
+        app.input,
+    );
+    assert_eq!(app.prompt_attachments.len(), 1, "one image attachment");
+    match &app.prompt_attachments[0].payload {
+        PromptAttachmentPayload::Image { media_type, bytes } => {
+            assert_eq!(media_type, "image/png");
+            assert_eq!(bytes.as_ref(), png.as_slice());
+        }
+        other => panic!("expected an image attachment, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cmd_v_prefers_a_clipboard_image_over_text() {
+    // A copied image leaves the text clipboard set too on some platforms; the
+    // image wins so ⌘V attaches the screenshot rather than typing stray text.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    app.clipboard = Box::new(ReadableClipboard {
+        read: Some("stale text".to_string()),
+        image: Some((png, "image/png".to_string())),
+    });
+
+    press(
+        &mut app,
+        &mut agent,
+        KeyCode::Char('v'),
+        KeyModifiers::SUPER,
+    )
+    .await;
+
+    assert!(
+        app.input.contains("[Image clipboard]") && !app.input.contains("stale text"),
+        "the image is attached, not the text: {:?}",
+        app.input,
+    );
 }
 
 // ===========================================================================

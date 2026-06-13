@@ -79,7 +79,13 @@ fn handle_list(
         return Ok(());
     }
     if entries.is_empty() {
-        println!("(no providers match the filter)");
+        if args.configured {
+            println!(
+                "(no providers configured yet) — set an API key with `squeezy auth set <provider>` or add an inline api_key in settings.toml"
+            );
+        } else {
+            println!("(no providers match the filter)");
+        }
         return Ok(());
     }
     let name_w = entries

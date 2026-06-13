@@ -103,7 +103,7 @@ impl PickerStep {
         match self {
             Self::Theme => "Choose a theme",
             Self::Provider => "Choose a provider",
-            Self::Key => "Add provider key",
+            Self::Key => "Provider key",
             Self::Model => "Choose a model",
             Self::Reasoning => "Choose reasoning effort",
         }
@@ -203,7 +203,7 @@ impl StartupModelPickerState {
             .iter()
             .position(|step| *step == self.step)
             .unwrap_or(0);
-        (index + 1, steps.len() + self.trailing_question_count)
+        (index + 1, steps.len())
     }
 
     fn move_cursor(&mut self, delta: isize) {
@@ -453,9 +453,9 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &StartupModelPickerState
 
 fn render_question_line(state: &StartupModelPickerState) -> Line<'static> {
     let (current, total) = state.progress();
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(
-            format!("Question {current}/{total} "),
+            format!("Step {current} of {total} "),
             Style::default()
                 .fg(theme::secondary())
                 .add_modifier(Modifier::BOLD),
@@ -464,7 +464,19 @@ fn render_question_line(state: &StartupModelPickerState) -> Line<'static> {
             state.step.prompt(),
             Style::default().fg(theme::foreground()),
         ),
-    ])
+    ];
+    if state.trailing_question_count > 0 {
+        let plural = if state.trailing_question_count == 1 {
+            "question"
+        } else {
+            "questions"
+        };
+        spans.push(Span::styled(
+            format!("  · then {} more {plural}", state.trailing_question_count),
+            Style::default().fg(theme::quiet()),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn render_selection_summary(state: &StartupModelPickerState) -> Line<'static> {
@@ -570,7 +582,9 @@ fn key_options(state: &StartupModelPickerState) -> Vec<String> {
         .provider()
         .and_then(|provider| provider.credential.env_var())
         .unwrap_or("provider API key");
-    vec![format!("Configure {env} later in /config")]
+    vec![format!(
+        "Set {env} later -- the config screen opens after setup"
+    )]
 }
 
 fn render_choice_row(label: &str, active: bool) -> Line<'static> {
@@ -604,16 +618,23 @@ fn render_footer(state: &StartupModelPickerState) -> Line<'static> {
         PickerStep::Model | PickerStep::Reasoning => "confirm",
     };
     Line::from(vec![
-        Span::styled("↑/↓ ", Style::default().fg(theme::secondary())),
-        Span::styled("move  ", Style::default().fg(theme::quiet())),
-        Span::styled("←/→ ", Style::default().fg(theme::secondary())),
-        Span::styled("question  ", Style::default().fg(theme::quiet())),
-        Span::styled("Enter ", Style::default().fg(theme::secondary())),
+        Span::styled(
+            "Enter ",
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             format!("{enter_label}  "),
-            Style::default().fg(theme::quiet()),
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("Esc/Q ", Style::default().fg(theme::secondary())),
+        Span::styled("↑/↓ ", Style::default().fg(theme::quiet())),
+        Span::styled("move  ", Style::default().fg(theme::quiet())),
+        Span::styled("←/→ ", Style::default().fg(theme::quiet())),
+        Span::styled("question  ", Style::default().fg(theme::quiet())),
+        Span::styled("Esc/Q ", Style::default().fg(theme::quiet())),
         Span::styled("quit", Style::default().fg(theme::quiet())),
     ])
 }

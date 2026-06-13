@@ -976,7 +976,13 @@ impl TerminalGuard {
         }
         let backend = self.term().backend_mut();
         match &desired {
-            Some(title) => write!(backend, "\x1b]0;{title}\x07"),
+            // Scrub the title before placing it inside the OSC 0 string. An OSC
+            // string is terminated by BEL (0x07) or ST (ESC `\`), so a raw BEL or
+            // ESC in the workspace path (POSIX-legal) would terminate/escape the
+            // sequence early and emit the trailing path bytes as raw control
+            // sequences. Mirrors `notification::sanitized_message`, which strips
+            // exactly these bytes before its OSC 9 write for the same reason.
+            Some(title) => write!(backend, "\x1b]0;{}\x07", sanitize_osc_text(title)),
             None => write!(backend, "\x1b]0;\x07"),
         }
         .and_then(|_| backend.flush())
@@ -984,6 +990,27 @@ impl TerminalGuard {
         app.last_terminal_title = desired;
         Ok(())
     }
+}
+
+/// Strip bytes that would either terminate the OSC 0 title string early (BEL,
+/// `ESC \\`) or break out into raw escape sequences, mirroring
+/// [`crate::notification`]'s OSC 9 scrubber. The title is built from the
+/// user's workspace path, which is POSIX-legal to contain a raw BEL (0x07) or
+/// ESC (0x1b); without this scrub such a byte would close the OSC string early
+/// and emit the trailing path bytes as a raw control stream every spinner tick.
+/// Control characters below 0x20 are dropped (newline / tab map to a space) so
+/// no C0 byte can leak into the title sequence.
+fn sanitize_osc_text(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    for ch in title.chars() {
+        match ch {
+            '\u{07}' | '\u{1b}' => {}
+            '\n' | '\t' => out.push(' '),
+            c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 impl Drop for TerminalGuard {
@@ -1043,3 +1070,7 @@ impl Drop for TerminalGuard {
         signal_teardown::restore_previous_panic_hook();
     }
 }
+
+#[cfg(test)]
+#[path = "terminal_guard_tests.rs"]
+mod tests;

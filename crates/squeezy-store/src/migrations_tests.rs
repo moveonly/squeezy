@@ -126,3 +126,35 @@ fn v1_and_v2_migrations_are_distinct() {
     assert_eq!(V2AddResolverTables.version(), 2);
     assert_eq!(V3SplitGraphCache.version(), 3);
 }
+
+#[test]
+fn v1_migration_stamps_its_declared_version_not_schema_constant() {
+    // Regression: the v1 migrate() used to call `initialize_schema`, which
+    // re-stamps `schema_version = SCHEMA_VERSION` (currently 3). Running V1
+    // alone must leave the store stamped at exactly its declared
+    // `version()` (1) so the per-version idempotency / resume contract
+    // holds — a registry re-entered after only V1 committed must still see
+    // 1 and go on to run V2/V3 rather than skipping them.
+    let cwd = temp_workspace("v1-stamp");
+    let mut registry = MigrationRegistry::new();
+    registry.register(InitializeStoreSchemaV1);
+
+    let applied = run_registry(&registry, &cwd).expect("run v1-only registry");
+    assert_eq!(
+        applied, 1,
+        "v1-only registry should apply exactly one migration"
+    );
+
+    let stamped = crate::migrations::current_store_schema_version(&cwd)
+        .expect("read on-disk schema version")
+        .expect("v1 migration must stamp a schema_version");
+    assert_eq!(
+        stamped,
+        InitializeStoreSchemaV1.version(),
+        "v1 must leave the store stamped at its declared version, not SCHEMA_VERSION",
+    );
+    assert!(
+        stamped < crate::SCHEMA_VERSION,
+        "v1 alone must not jump the on-disk stamp to the crate-wide SCHEMA_VERSION",
+    );
+}

@@ -203,6 +203,12 @@ pub(crate) struct LastGoodLayout {
     /// frame this session. A bounded counter for the diagnostics line; never
     /// resets.
     fallback_count: Cell<u64>,
+    /// Latches once the first substitution of the session has been announced via
+    /// the one-shot recovery toast, so the cue fires exactly once and never nags
+    /// on a resize storm. `false` until [`take_first_fallback_notice`] consumes it.
+    ///
+    /// [`take_first_fallback_notice`]: LastGoodLayout::take_first_fallback_notice
+    first_fallback_announced: Cell<bool>,
 }
 
 impl LastGoodLayout {
@@ -253,6 +259,19 @@ impl LastGoodLayout {
     #[allow(dead_code)]
     pub(crate) fn fallback_count(&self) -> u64 {
         self.fallback_count.get()
+    }
+
+    /// Whether the caller should emit the one-shot "layout regenerated" cue. Returns
+    /// `true` exactly once per session — the first time a substitution has happened
+    /// and the notice has not yet been consumed — and `false` forever after, so a
+    /// run of degenerate frames (a sub-usable resize storm) surfaces a single quiet
+    /// toast rather than a stream. Cheap: two `Cell` reads and at most one write.
+    pub(crate) fn take_first_fallback_notice(&self) -> bool {
+        if self.fallback_count.get() > 0 && !self.first_fallback_announced.get() {
+            self.first_fallback_announced.set(true);
+            return true;
+        }
+        false
     }
 
     /// One-line, allocation-light diagnostics for the hidden HUD: whether a good

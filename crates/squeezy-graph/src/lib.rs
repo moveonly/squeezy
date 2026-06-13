@@ -49,7 +49,11 @@ use crate::languages::{
 
 pub const CRATE_NAME: &str = "squeezy-graph";
 const BODY_HIT_TRIGRAM_INDEX_MAX_HITS: usize = 100_000;
-const GRAPH_FORMAT_VERSION: u64 = 1;
+// v2: graph partitions and resolver-cache rows are now stored DEFLATE-compressed
+// (squeezy-store `encode_graph`/`decode_graph`) instead of plain JSON. Bumping
+// this invalidates any v1 plain-JSON cache via the metadata gate so it is wiped
+// and rebuilt in the compressed format — a reader never inflates plain bytes.
+const GRAPH_FORMAT_VERSION: u64 = 2;
 
 pub fn crate_name() -> &'static str {
     CRATE_NAME

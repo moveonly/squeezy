@@ -4,9 +4,10 @@
 //! kind (shell, apply_patch, web, mcp) and shows the proposed rule that
 //! "Allow Project" would create.
 //!
-//! Decision keys: `Y` / `Enter` approve once, `A` / `P` always approve
-//! for the project, `N` / `D` deny. The hint row surfaces Y / A / N;
-//! P and D are silent aliases kept for muscle-memory compatibility.
+//! Decision keys: `Y` / `Enter` approve once, `A` / `P` always allow
+//! for the project, `N` / `D` deny. The hint row leads with the primary
+//! verbs (`Enter` approve once, `A` always allow, `N` deny); `Y`, `P` and
+//! `D` stay bound as silent aliases for muscle-memory compatibility.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -27,7 +28,8 @@ const APPROVAL_CONTEXT_WRAP: usize = 96;
 /// the decision options — when the terminal is too short to show everything.
 pub(crate) struct PreviewParts {
     pub header: Line<'static>,
-    /// The `Why: …` rationale (empty when the request carries no context).
+    /// The `Why: …` rationale (a single `(no rationale provided)` row when the
+    /// request carries no context, so the block's shape stays stable).
     pub context: Vec<Line<'static>>,
     /// The capability subject — `$ command`, `✎ path`, diff body, etc.
     pub subject: Vec<Line<'static>>,
@@ -40,8 +42,28 @@ pub(crate) fn render_preview_parts(request: &ToolApprovalRequest) -> PreviewPart
     let permission = &request.permission;
     let header = header_line(request);
     let mut context = Vec::new();
-    if let Some(ctx) = request.context.as_deref() {
-        append_context(&mut context, ctx);
+    let has_rationale = request
+        .context
+        .as_deref()
+        .is_some_and(|ctx| append_context(&mut context, ctx));
+    if !has_rationale {
+        // Keep the block's shape stable across requests: when no rationale is
+        // available (first turn, subagent with no transcript, or a
+        // whitespace-only snippet) state the absence rather than dropping the
+        // row, so a missing `Why:` reads as "none provided", not "I missed it".
+        context.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "Why: ",
+                Style::default()
+                    .fg(crate::render::theme::quiet())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "(no rationale provided)",
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]));
     }
     let mut subject = Vec::new();
     match permission.capability {
@@ -218,15 +240,7 @@ fn append_shell(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) 
         }
         _ => None,
     } {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                text,
-                Style::default()
-                    .fg(crate::render::theme::red())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        lines.push(warn_line(text.to_string()));
     }
     // On linux-direct-syscalls the seccomp filter blocks AF_UNIX, so
     // `squeezy ask` cannot be used from inside this sandboxed shell child.
@@ -292,7 +306,12 @@ fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
             lines.push(line);
         }
         if total > shown {
-            lines.push(dim(format!("… ({} more lines)", total - shown)));
+            // Carry the recovery verb so a clipped diff names where the rest
+            // lives before the user decides, rather than stopping at a count.
+            lines.push(dim(format!(
+                "… ({} more lines — full diff via /diff)",
+                total - shown
+            )));
         }
     } else if let Some(diff_lines) = permission.metadata.get("diff_lines") {
         // Fallback for tool emitters that only know the line count, not the
@@ -372,6 +391,13 @@ fn append_rule_preview(lines: &mut Vec<Line<'static>>, permission: &PermissionRe
             Style::default().fg(crate::render::theme::foreground()),
         ),
     ]));
+    // "Always allow" persists this rule to the project settings file (every
+    // approval prompt offers the project-scope option), so name the durable,
+    // project-wide reach rather than letting the scope only surface later in
+    // squeezy.toml. Indented under `Rule:` and dimmed so it reads as a caveat.
+    lines.push(dim(
+        "(saved to squeezy.toml — applies to all matching requests in this project)".to_string(),
+    ));
 }
 
 fn format_rule(permission: &PermissionRequest, rule: &PermissionRule) -> String {
@@ -407,13 +433,19 @@ fn dim(text: String) -> Line<'static> {
     ])
 }
 
+/// A red+bold caution line for "posture that leaves approval as the
+/// enforcement boundary" — the genuine-caution tier. Both the Windows
+/// sandbox-posture text and the filesystem write-isolation warnings route
+/// through here so one underlying fact ("your reads/network aren't isolated")
+/// never renders in two severities. Informational posture (backend/mode/
+/// network-policy) stays on the dim tier via [`dim`].
 fn warn_line(text: String) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
         Span::styled(
             text,
             Style::default()
-                .fg(crate::render::theme::cyan())
+                .fg(crate::render::theme::red())
                 .add_modifier(Modifier::BOLD),
         ),
     ])

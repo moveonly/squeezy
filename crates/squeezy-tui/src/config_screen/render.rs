@@ -749,19 +749,39 @@ fn render_mcp_add_form(
         } else {
             Style::default()
         };
-        let value_display = if value.is_empty() {
-            "—".to_string()
-        } else {
-            (*value).to_string()
-        };
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::raw(prefix),
             Span::styled(
                 format!("{:<10}", label),
                 Style::default().fg(crate::render::theme::quiet()),
             ),
-            Span::styled(value_display, val_style),
-        ]));
+        ];
+        // The transport row is a cycle control, not a text field. Render it
+        // as an inline option set with the active choice bracketed so it
+        // reads as a selector at a glance: `[stdio]  http  sse`.
+        if idx == 1 {
+            for (opt_idx, opt) in super::McpAddTransport::all().iter().enumerate() {
+                if opt_idx > 0 {
+                    spans.push(Span::raw("  "));
+                }
+                if *opt == form.transport {
+                    spans.push(Span::styled(format!("[{}]", opt.as_str()), val_style));
+                } else {
+                    spans.push(Span::styled(
+                        format!(" {} ", opt.as_str()),
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ));
+                }
+            }
+        } else {
+            let value_display = if value.is_empty() {
+                "—".to_string()
+            } else {
+                (*value).to_string()
+            };
+            spans.push(Span::styled(value_display, val_style));
+        }
+        lines.push(Line::from(spans));
     }
     lines.push(Line::raw(""));
     let mode_label = if form.session_only {
@@ -1092,6 +1112,10 @@ fn render_theme_editor_lines(editor: &ThemeEditor) -> Vec<Line<'static>> {
                     "RGB as r,g,b · Enter to commit · Esc to cancel",
                     Style::default().fg(crate::render::theme::quiet()),
                 )),
+                Line::from(Span::styled(
+                    "Tip: Ctrl+Alt+E opens the live channel editor (±/arrows, instant preview).",
+                    Style::default().fg(crate::render::theme::quiet()),
+                )),
             ]
         }
     }
@@ -1285,6 +1309,42 @@ fn render_discard_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScree
             Span::raw(path.display().to_string()),
         ]));
     }
+    // Sampled preview of the most significant reverts, mirroring Reset's diff
+    // so the user confirms against impact, not just a file list.
+    let preview = state.discard_preview();
+    if !preview.is_empty() {
+        lines.push(Line::raw(""));
+        let plural = if preview.len() == 1 { "" } else { "s" };
+        lines.push(Line::from(vec![Span::styled(
+            format!("  {} field{plural} revert:", preview.len()),
+            Style::default().fg(crate::render::theme::accent()),
+        )]));
+        let max_rows = 8usize;
+        for entry in preview.iter().take(max_rows) {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    format!("{}.{}: ", entry.section_label, entry.field_label),
+                    Style::default().fg(muted_fg()),
+                ),
+                Span::styled(
+                    entry.before.clone(),
+                    Style::default().fg(crate::render::theme::secondary()),
+                ),
+                Span::styled("  →  ", Style::default().fg(crate::render::theme::quiet())),
+                Span::styled(
+                    entry.after.clone(),
+                    Style::default().fg(crate::render::theme::green()),
+                ),
+            ]));
+        }
+        if preview.len() > max_rows {
+            lines.push(Line::from(Span::styled(
+                format!("    … and {} more", preview.len() - max_rows),
+                Style::default().fg(crate::render::theme::quiet()),
+            )));
+        }
+    }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "  Each tier file is restored to the bytes captured when /config opened.",
@@ -1356,11 +1416,20 @@ fn secret_caret_line(display: &str, cursor: usize) -> Line<'static> {
 }
 
 fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntryState) {
-    let display: String = if entry.reveal {
-        // F2 toggle — show the full plaintext for verification.
-        entry.draft.clone()
-    } else {
-        "•".repeat(entry.char_len())
+    // The mask stays 1:1 with `draft` chars so `secret_caret_line` can index
+    // the cursor straight into it. `LastFour` masks all but the trailing four
+    // so the user can verify a pasted key's suffix without exposing the whole
+    // secret.
+    let len = entry.char_len();
+    let display: String = match entry.reveal {
+        super::SecretReveal::Full => entry.draft.clone(),
+        super::SecretReveal::Hidden => "•".repeat(len),
+        super::SecretReveal::LastFour => {
+            let tail = 4.min(len);
+            let masked = "•".repeat(len - tail);
+            let suffix: String = entry.draft.chars().skip(len - tail).collect();
+            format!("{masked}{suffix}")
+        }
     };
     let lines = vec![
         Line::from(vec![
@@ -1401,10 +1470,10 @@ fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntrySta
                 Style::default().fg(crate::render::theme::secondary()),
             ),
             Span::styled(
-                if entry.reveal {
-                    "hide key  "
-                } else {
-                    "reveal full key  "
+                match entry.reveal {
+                    super::SecretReveal::Hidden => "show last 4  ",
+                    super::SecretReveal::LastFour => "reveal full key  ",
+                    super::SecretReveal::Full => "hide key  ",
                 },
                 Style::default().fg(crate::render::theme::quiet()),
             ),
@@ -1698,6 +1767,10 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerSt
         }
     }
     lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "tags: pcache=prompt-cache · rsn=reasoning · vis=vision · tools=tool-calls · json=json-mode",
+        Style::default().fg(crate::render::theme::quiet()),
+    )));
     lines.push(Line::from(Span::styled(
         "Type filter · ↑/↓ move · Enter commit (or custom id if no match) · Tab all-providers · Esc cancel",
         Style::default().fg(crate::render::theme::quiet()),

@@ -396,7 +396,9 @@ impl GitHubCopilotUrls {
 /// rewritten to `api.`.
 pub fn base_url_from_token(token: &str) -> Option<String> {
     for part in token.split(';') {
-        let (key, value) = part.split_once('=')?;
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
         if key.trim() == "proxy-ep" {
             let host = value.trim();
             if host.is_empty() {

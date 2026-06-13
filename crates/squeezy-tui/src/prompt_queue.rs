@@ -201,14 +201,28 @@ pub(crate) fn render_lines(
     let group_active = tagged.is_some_and(|t| t.iter().any(|&b| b));
     let any_group = groups.is_some_and(|g| g.iter().any(|m| m.is_some()));
     let any_condition = conditions.is_some_and(|c| c.iter().any(|cond| !cond.is_always()));
-    let hint = if group_active {
-        "  Space tag · g group · Del delete group · Shift+↑↓ move group · m merge · c clear"
+    // `g form group` (not the noun `g group`) so the create semantics read like
+    // its siblings `z fold` / `p pause` / `G dissolve` — the key *forms* a group
+    // from the tagged rows.
+    let hint: String = if queue.is_empty() {
+        // No rows to select / tag / reorder yet: explain how the queue fills
+        // instead of teaching keys that act on a list that does not exist.
+        "  queue fills as you Enter prompts while a turn runs · Esc close".to_string()
+    } else if group_active {
+        // Multi-select and conditions are orthogonal — a queue can have tagged
+        // rows *and* gated rows at once — so keep the `v cond` pointer here when
+        // any row carries a condition rather than hiding the correctness-relevant
+        // feature behind the transient one.
+        let cond_note = if any_condition { " · v cond" } else { "" };
+        format!(
+            "  Space tag · g form group · Del delete group · Shift+↑↓ move group · m merge · c clear{cond_note}"
+        )
     } else if any_group {
-        "  ↑↓ select · g group · z fold · p pause · G dissolve · v cond · r run next · Del remove · Esc"
+        "  ↑↓ select · g form group · z fold · p pause · G dissolve · v cond · r run next · Del remove · Esc".to_string()
     } else if any_condition {
-        "  ↑↓ select · v condition · g group · Shift+↑↓ reorder · Enter/e edit · r run next · Del remove · Esc"
+        "  ↑↓ select · v condition · g form group · Shift+↑↓ reorder · Enter/e edit · r run next · Del remove · Esc".to_string()
     } else {
-        "  ↑↓ select · Space tag · g group · v cond · Shift+↑↓ reorder · Enter/e edit · r run next · Del · Esc"
+        "  ↑↓ select · Space tag · g form group · v cond · Shift+↑↓ reorder · Enter/e edit · r run next · Del · Esc".to_string()
     };
     let header = Line::from(vec![
         Span::styled(
@@ -249,6 +263,10 @@ pub(crate) fn render_lines(
         // A collapsed group's member rows stay in place (so the windowing and the
         // hit-target rects never drift) but read as folded — the preview is
         // replaced by the group name on the first member and dimmed elsewhere.
+        // The header leads with the member count (`×N` ahead of the label) so the
+        // most useful fact survives truncation; only the group's first member shows
+        // it, later members fold to a quiet continuation rule so the header never
+        // repeats down the stack.
         let collapsed_g = group.filter(|g| g.collapsed);
         let is_first_collapsed_member = collapsed_g.is_some()
             && groups
@@ -259,7 +277,7 @@ pub(crate) fn render_lines(
                 != collapsed_g.map(|g| g.id);
         let (body, body_style) = match collapsed_g {
             Some(g) if is_first_collapsed_member => (
-                format!("{:>2}. ⊟ {} ({})", index + 1, g.name, g.members.len()),
+                format!("{:>2}. ⊟ ×{} {}", index + 1, g.members.len(), g.name),
                 style,
             ),
             Some(_) => (
@@ -355,7 +373,9 @@ mod tests;
 /// colour so the strip "shows next/paused/blocked groups and item counts".
 pub(crate) fn indicator_line(
     queue: &VecDeque<String>,
-    turn_running: bool,
+    // The hint no longer varies with the turn state (it stays stable across turn
+    // boundaries), but the caller still threads this in; kept for the signature.
+    _turn_running: bool,
     overlay_open: bool,
     groups: Option<&str>,
 ) -> Option<Line<'static>> {
@@ -368,10 +388,11 @@ pub(crate) fn indicator_line(
     } else {
         ButtonState::Collapsed
     };
+    // Keep the keybinding hint stable across turn boundaries: the strip is meant
+    // to read as settled, so it no longer grows an `Esc cancels current` clause
+    // when a turn starts (Esc already carries its own affordance elsewhere).
     let hint = if overlay_open {
         "Ctrl+X Q to close"
-    } else if turn_running {
-        "Ctrl+X Q to reorder · Esc cancels current (queue keeps draining)"
     } else {
         "Ctrl+X Q to reorder"
     };

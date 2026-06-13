@@ -384,14 +384,54 @@ impl GateKind {
             GateKind::KeyboardReachability => "keyboard_reachability",
         }
     }
+
+    /// One terse sentence naming *why* this gate exists, printed alongside the
+    /// label in a failure report. The audience is whoever just broke the gate in
+    /// CI — usually unfamiliar with its intent — so the explainer turns a bare
+    /// symptom into the reasoning plus a fix direction.
+    pub(crate) fn explanation(self) -> &'static str {
+        match self {
+            GateKind::Contrast => {
+                "low-contrast text is unreadable for low-vision users and on dim displays; \
+                 pick colors that clear the minimum ratio against their background"
+            }
+            GateKind::ScreenReaderText => {
+                "screen readers extract text only; meaning carried by color or glyph shape \
+                 alone is invisible to them, so spell it out in words"
+            }
+            GateKind::MinimalGlyph => {
+                "chrome must stay within the bounded glyph set so it renders on minimal/no-color \
+                 terminals; replace the exotic glyph with an ASCII-safe equivalent"
+            }
+            GateKind::KeyboardReachability => {
+                "every action must be reachable without a mouse; give this affordance a key \
+                 binding or a documented keyboard path"
+            }
+        }
+    }
 }
 
 /// One gate failure: which gate, and a human-readable detail naming the
 /// offending cell/text/affordance.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Violation {
     pub(crate) gate: GateKind,
     pub(crate) detail: String,
+}
+
+impl std::fmt::Debug for Violation {
+    /// Print each violation as `label + why + detail` so the `{:#?}` failure
+    /// report a contributor reads in CI states which gate tripped, why it
+    /// matters, and the specific offending cell/text/affordance — not just the
+    /// symptom. The `gate` field stays a real enum value for `of_kind` filtering;
+    /// this only enriches the rendered form.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Violation")
+            .field("gate", &self.gate.label())
+            .field("why", &self.gate.explanation())
+            .field("detail", &self.detail)
+            .finish()
+    }
 }
 
 /// The result of auditing one surface: every violation found. An empty list is
@@ -591,7 +631,24 @@ fn keyboard_reachability_gate_with(
                     });
                 }
             }
-            Some(KeyboardPath::Always(_)) => {}
+            Some(KeyboardPath::Always(label)) => {
+                // The global keymap does not own this overlay/modal handler, so the
+                // gate cannot round-trip it the way a `Keymap` arm is verified — the
+                // backstop is the overlay's own `*_tests.rs`, which drives the key
+                // path end to end (see `keyboard_equivalent`'s doc block). The one
+                // thing checkable here is that the affordance still names a path at
+                // all: a handler that was dropped and left an empty documentation
+                // string must not pass silently as "reachable".
+                if label.trim().is_empty() {
+                    out.push(Violation {
+                        gate: GateKind::KeyboardReachability,
+                        detail: format!(
+                            "mouse affordance {mouse_action:?} declares an empty keyboard path; \
+                             name the overlay key handler that reaches it"
+                        ),
+                    });
+                }
+            }
         }
     }
 }
@@ -601,6 +658,26 @@ fn keyboard_reachability_gate_with(
 /// (which the gate then flags). Mirrors the dispatch parity that
 /// [`interaction`](crate::interaction) documents: every wired mouse action
 /// shares its handler with a keyboard verb.
+///
+/// ## How the `Always` arms are kept honest
+///
+/// A [`KeyboardPath::Keymap`] arm is *verified* by the gate — the cited action's
+/// default binding must round-trip back to it through the keymap. A
+/// [`KeyboardPath::Always`] arm names an overlay/modal key handler the global
+/// keymap does not own, so the gate cannot round-trip it; the string is prose,
+/// not a checked claim. The regression backstop for those arms lives elsewhere by
+/// convention: every overlay below has a same-named `*_tests.rs` suite
+/// (`clipboard_history_tests.rs`, `snippet_store_tests.rs`, `scratchpad_tests.rs`,
+/// `prompt_queue_tests.rs` / `queue_edit_tests.rs` / `queue_run_next_tests.rs` /
+/// `queue_conditions_tests.rs`, `paste_preview_tests.rs` /
+/// `paste_transform_tests.rs`, `prompt_template_tests.rs`,
+/// `keybinding_editor_tests.rs`, `theme_editor_tests.rs`, the per-overlay
+/// transcript-navigation suites, …) that drives the key path end to end, so a
+/// renamed/moved/dropped handler breaks that overlay's suite rather than slipping
+/// past this gate on the prose alone. The gate still rejects an *empty* `Always`
+/// label so a blanked path cannot pass as reachable. When you add an `Always`
+/// arm, give it a real, non-empty label and make sure the overlay's suite
+/// exercises the key it names.
 pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<KeyboardPath> {
     use interaction::Action as A;
     Some(match action {

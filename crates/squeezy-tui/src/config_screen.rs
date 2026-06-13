@@ -436,6 +436,32 @@ impl PromptEditorState {
     }
 }
 
+/// How much of a secret the entry overlay discloses. F2 cycles
+/// `Hidden → LastFour → Full → Hidden`, so the user can verify a pasted
+/// key by its suffix (the common "did the right key land?" check) without
+/// exposing the whole secret on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SecretReveal {
+    /// Every character masked (`••••`).
+    #[default]
+    Hidden,
+    /// Mask all but the last four characters (`••••…abc123`).
+    LastFour,
+    /// Full plaintext, the user's own deliberate disclosure.
+    Full,
+}
+
+impl SecretReveal {
+    /// F2 cycle order: `Hidden → LastFour → Full → Hidden`.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Hidden => Self::LastFour,
+            Self::LastFour => Self::Full,
+            Self::Full => Self::Hidden,
+        }
+    }
+}
+
 /// Masked text entry for an API key. The plaintext lives only in `draft`
 /// and is written to the OS keychain on commit — never to TOML, the
 /// transcript, or any log. Render shows `•` per character with an optional
@@ -451,11 +477,9 @@ pub(crate) struct SecretEntryState {
     /// pastes; converted to a byte index on the fly when we need to mutate
     /// `draft`.
     pub cursor: usize,
-    /// When `true`, render the full plaintext key for sanity-checking
-    /// what was pasted. Toggled explicitly with Ctrl+T — both the toggle
-    /// and the disclosure are the user's own action, so reveal in full
-    /// rather than hiding the suffix.
-    pub reveal: bool,
+    /// How much of the key the render discloses. F2 cycles through the three
+    /// states; the user starts fully masked and opts into more on purpose.
+    pub reveal: SecretReveal,
 }
 
 #[derive(Debug, Clone)]
@@ -1172,6 +1196,81 @@ impl ConfigScreenState {
         }
         out
     }
+
+    /// Compute the `name → reverted-value` reverts a session-wide Discard
+    /// would apply, by diffing each plain field's current effective value
+    /// against the value it would resolve to once every tier file is rolled
+    /// back to its opening (baseline) bytes. Used by the Discard confirmation
+    /// so the user confirms against impact, not just a file list.
+    ///
+    /// Only plain `toml_path` leaves are diffed — the same kinds the Reset
+    /// preview skips (`Info` / `TableArray` / `ProviderSubTabs` / `Secret`,
+    /// plus the runtime-keyed `["*"]` routing/limit rows whose value reads off
+    /// the live config) are left out so the preview never reports a lossy diff.
+    /// Env-shadowed fields are skipped — Discard can't move them.
+    pub(crate) fn discard_preview(&self) -> Vec<DiscardPreviewEntry> {
+        // Re-parse the opening bytes into a tier chain, mirroring the order in
+        // `baseline` ([user, project, repo]). A file that failed to parse (or
+        // didn't exist) contributes nothing, exactly like an absent tier.
+        let parse = |bytes: Option<&Vec<u8>>| -> Option<squeezy_core::TierSource> {
+            let text = std::str::from_utf8(bytes?.as_slice()).ok()?;
+            let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+            Some(squeezy_core::TierSource {
+                path: PathBuf::new(),
+                doc,
+            })
+        };
+        let user = self.baseline.first().and_then(|(_, b)| parse(b.as_ref()));
+        let project = self.baseline.get(1).and_then(|(_, b)| parse(b.as_ref()));
+        let repo = self.baseline.get(2).and_then(|(_, b)| parse(b.as_ref()));
+        // Highest priority first: repo (Local) → project (Repo) → user.
+        let baseline_chain: [Option<&squeezy_core::TierSource>; 3] =
+            [repo.as_ref(), project.as_ref(), user.as_ref()];
+
+        let mut out: Vec<DiscardPreviewEntry> = Vec::new();
+        for section in CONFIG_SECTIONS {
+            if section.id == SectionId::Reset {
+                continue;
+            }
+            for field in section.fields {
+                if matches!(
+                    field.kind,
+                    FieldKind::Info
+                        | FieldKind::TableArray { .. }
+                        | FieldKind::ProviderSubTabs
+                        | FieldKind::Secret { .. }
+                ) {
+                    continue;
+                }
+                // Runtime-keyed `["*"]` rows read their value off the live
+                // config, not the tier docs, so a baseline-doc walk can't
+                // represent them faithfully — leave them out of the preview.
+                if matches!(
+                    field.toml_path,
+                    ["providers", "*", _] | ["model_limits", "*", _]
+                ) {
+                    continue;
+                }
+                let (before, before_src) = self.effective_value_full(field);
+                if before_src == FieldSource::Env {
+                    continue;
+                }
+                let after = baseline_chain
+                    .into_iter()
+                    .find_map(|tier| tier.and_then(|t| tier_value_at_path(t, field)))
+                    .unwrap_or_else(field.default);
+                if before != after {
+                    out.push(DiscardPreviewEntry {
+                        section_label: section.label,
+                        field_label: field.label,
+                        before: before.as_display(),
+                        after: after.as_display(),
+                    });
+                }
+            }
+        }
+        out
+    }
 }
 
 /// One row of the Reset preview shown inside the y/n confirmation.
@@ -1184,6 +1283,18 @@ pub(crate) struct ResetPreviewEntry {
     pub before: String,
     pub after: String,
     pub after_source: FieldSource,
+}
+
+/// One revert the session-wide Discard would apply: `before` is the current
+/// effective value, `after` is the value once every tier rolls back to its
+/// opening bytes. Rendered as a sampled, capped preview in the Discard
+/// confirmation so the user sees what changes, not just which files.
+#[derive(Debug, Clone)]
+pub(crate) struct DiscardPreviewEntry {
+    pub section_label: &'static str,
+    pub field_label: &'static str,
+    pub before: String,
+    pub after: String,
 }
 
 /// Parse the `FieldValue` for `field` out of a tier's `DocumentMut`.
@@ -1378,6 +1489,12 @@ impl McpAddTransport {
             Self::Http => Self::Sse,
             Self::Sse => Self::Stdio,
         }
+    }
+
+    /// Every transport choice, in cycle order — rendered as an inline
+    /// option set so the row reads as a selector, not a text field.
+    pub(crate) fn all() -> [Self; 3] {
+        [Self::Stdio, Self::Http, Self::Sse]
     }
 }
 
@@ -1999,8 +2116,10 @@ pub(crate) fn provider_inline_api_key(provider: &squeezy_core::ProviderConfig) -
 
 /// Minimum query length before the filter narrows the list. Below this the
 /// box stays open (showing what was typed) and the list is the full panel
-/// index, so a stray first keystroke doesn't collapse the view to noise.
-pub(crate) const FILTER_MIN_QUERY: usize = 2;
+/// index. Name matching activates on the first keystroke (a single-character
+/// name substring like `p` → `permissions`/`provider` is highly selective);
+/// the looser value/description channels stay gated by [`HELP_MIN_QUERY`].
+pub(crate) const FILTER_MIN_QUERY: usize = 1;
 
 /// Minimum query length before description (help-text) matching kicks in.
 /// Help matching is a permissive substring test, and a two-character query is

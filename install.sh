@@ -47,6 +47,10 @@ info() {
   printf 'install.sh: %s\n' "$*"
 }
 
+warn() {
+  printf 'install.sh: %s\n' "$*" >&2
+}
+
 have() {
   command -v "$1" >/dev/null 2>&1
 }
@@ -174,13 +178,18 @@ mv "$tmpdir/squeezy" "$INSTALL_DIR/squeezy"
 chmod +x "$INSTALL_DIR/squeezy"
 info "installed $INSTALL_DIR/squeezy"
 
+if ! "$INSTALL_DIR/squeezy" --version >/dev/null 2>&1; then
+  err "installed binary at $INSTALL_DIR/squeezy did not run ($INSTALL_DIR/squeezy --version failed)"
+fi
+
 case ":${PATH:-}:" in
-  *":$INSTALL_DIR:"*) ;;
+  *":$INSTALL_DIR:"*)
+    info "installed and ready -- run 'squeezy --help' to get started"
+    ;;
   *)
-    printf '\n'
-    info "$INSTALL_DIR is not on your PATH yet. Add it with:"
-    printf '\n  export PATH="%s:$PATH"\n\n' "$INSTALL_DIR"
+    printf '\n' >&2
+    warn "squeezy is installed at $INSTALL_DIR but not on your PATH yet. Add it with:"
+    printf '\n  export PATH="%s:$PATH"\n\n' "$INSTALL_DIR" >&2
+    warn "then run 'squeezy --help' to get started"
     ;;
 esac
-
-info "run 'squeezy --help' to get started"

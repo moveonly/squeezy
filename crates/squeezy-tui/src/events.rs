@@ -434,6 +434,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 AgentEvent::CostWarning { status, .. } => {
                     let notice = format_warn_threshold_notice(status);
                     app.push_transcript_item(TranscriptItem::system(notice));
+                    // Off-tab attention: a cost-cap crossing silently blocks the
+                    // next round, so ping the desktop surface too (no-op unless
+                    // the user opted into `[tui].desktop_notifications`).
+                    app.notify_cost_pressure(&format!(
+                        "squeezy cost warning: {}% of cap",
+                        status.percent
+                    ));
                 }
                 AgentEvent::CostCapUnenforceable {
                     provider, model, ..
@@ -589,6 +596,15 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // A hard turn failure is the error tier (red ✖), not a cyan
                     // ⚠ warning — it stands out and keeps its reason visible.
                     app.push_error(format!("turn failed: {}", app.status));
+                    // Off-tab attention: a cost-cap or pressure-gate stop ends
+                    // the turn without the user asking, so ping the desktop
+                    // surface (no-op unless `[tui].desktop_notifications` is on).
+                    // The broker's reason strings are the stable detector here.
+                    if app.status.contains("session cost cap reached") {
+                        app.notify_cost_pressure("squeezy paused: cost cap reached");
+                    } else if app.status.contains("session cost approaching cap") {
+                        app.notify_cost_pressure("squeezy paused: approaching cost cap");
+                    }
                     if app.last_turn_had_edits {
                         app.last_turn_had_edits = false;
                     }

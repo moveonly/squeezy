@@ -184,7 +184,13 @@ impl SessionBundle {
     /// redaction status without dumping the whole (possibly large) artifact.
     pub(crate) fn preview(&self, meta: &BundleMeta) -> String {
         let redaction = if self.report.redacted {
-            format!("redacted ({} masked)", self.report.redactions)
+            // Redaction is on by default; surface the opt-out keyword inline so a
+            // user wanting an unmasked local bundle does not have to already know
+            // it exists.
+            format!(
+                "redacted ({} masked) — pass no-redact for an unmasked local bundle",
+                self.report.redactions
+            )
         } else {
             "NOT redacted (local share only)".to_string()
         };

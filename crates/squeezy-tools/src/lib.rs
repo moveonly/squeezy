@@ -2342,6 +2342,25 @@ impl ToolRegistry {
                 suggested_rules,
             };
         }
+        // Mirror the executor's `prepare_arguments` hook on a clone before
+        // deriving the approval target/metadata, so the path-bearing tools'
+        // approval card and `outside_workspace` metadata reflect the
+        // canonical `path` the executor will actually operate on. Without
+        // this, a model that supplies the path under an alias
+        // (`filepath`/`file_path`/`file`) would surface `path:*` and skip the
+        // outside-workspace escalation, since the alias-folding hook only runs
+        // later in `execute_for_group_with_options`. The hook is idempotent
+        // and `path`-wins, so this cannot loosen the execution-time
+        // `assess_write_path`/`join_workspace` checks. On hook failure we fall
+        // back to the raw arguments — the executor will surface the same
+        // prepare error, and the approval card stays conservative.
+        let normalized_arguments = {
+            let mut cloned = call.arguments.clone();
+            match self.prepare_arguments_for(&call.name) {
+                Some(hook) if hook(&mut cloned).is_ok() => cloned,
+                _ => call.arguments.clone(),
+            }
+        };
         let (capability, target, risk) = match call.name.as_str() {
             "apply_patch" => {
                 let args = serde_json::from_value::<ApplyPatchArgs>(call.arguments.clone()).ok();
@@ -2382,8 +2401,7 @@ impl ToolRegistry {
                 PermissionRisk::High,
             ),
             "write_file" | "notebook_edit" => {
-                let path = call
-                    .arguments
+                let path = normalized_arguments
                     .get("path")
                     .and_then(Value::as_str)
                     .unwrap_or("*")
@@ -2393,7 +2411,8 @@ impl ToolRegistry {
                 if self.raw_path_targets_outside_workspace(&path) {
                     metadata.insert("outside_workspace".to_string(), "true".to_string());
                 }
-                let args = serde_json::from_value::<WriteFileArgs>(call.arguments.clone()).ok();
+                let args =
+                    serde_json::from_value::<WriteFileArgs>(normalized_arguments.clone()).ok();
                 if let Some(diff) = args
                     .as_ref()
                     .and_then(|args| render_write_file_diff(&args.path, &args.content))
@@ -2414,8 +2433,7 @@ impl ToolRegistry {
                 )
             }
             "read_file" => {
-                let path = call
-                    .arguments
+                let path = normalized_arguments
                     .get("path")
                     .and_then(Value::as_str)
                     .unwrap_or("*")
@@ -2432,7 +2450,7 @@ impl ToolRegistry {
                         Some("approved outside workspace read".to_string()),
                     ));
                     (PermissionCapability::Read, target, PermissionRisk::Medium)
-                } else if self.read_file_targets_ignored_policy(&call.arguments) {
+                } else if self.read_file_targets_ignored_policy(&normalized_arguments) {
                     (
                         PermissionCapability::Search,
                         "ignored:*".to_string(),

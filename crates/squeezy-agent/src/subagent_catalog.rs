@@ -147,14 +147,15 @@ impl SubagentCatalog {
         let mut by_name: BTreeMap<String, SubagentDefinition> = BTreeMap::new();
         for entry in entries {
             match by_name.get(&entry.name) {
-                Some(existing) if existing.source.precedence() > entry.source.precedence() => {
+                Some(existing) if existing.source.precedence() >= entry.source.precedence() => {
                     warn!(
                         target: "squeezy_agent::subagent_catalog",
                         name = %entry.name,
                         kept = %existing.source.as_str(),
-                        shadowed = %entry.source.as_str(),
-                        shadowed_path = ?entry.file_path,
-                        "subagent name reused at lower precedence; shadowed definition will not load"
+                        kept_path = ?existing.file_path,
+                        dropped = %entry.source.as_str(),
+                        dropped_path = ?entry.file_path,
+                        "duplicate subagent name at equal-or-lower precedence; later definition will not load"
                     );
                 }
                 _ => {
@@ -246,9 +247,16 @@ fn load_dir(dir: &Path, source: SubagentSource, out: &mut Vec<SubagentDefinition
             return;
         }
     };
+    // Collect and sort the directory entries by path before loading so a
+    // same-precedence name collision (two files in this dir declaring the
+    // same `name:`) resolves deterministically: `fs::read_dir` order is
+    // filesystem-dependent, but dedupe keeps the first-seen entry, so a
+    // stable iteration order makes the survivor reproducible across runs
+    // and machines.
+    let mut dir_entries: Vec<fs::DirEntry> = Vec::new();
     for entry in read {
-        let entry = match entry {
-            Ok(entry) => entry,
+        match entry {
+            Ok(entry) => dir_entries.push(entry),
             Err(error) => {
                 warn!(
                     target: "squeezy_agent::subagent_catalog",
@@ -256,9 +264,11 @@ fn load_dir(dir: &Path, source: SubagentSource, out: &mut Vec<SubagentDefinition
                     error = %error,
                     "skipping subagent directory entry due to read error"
                 );
-                continue;
             }
-        };
+        }
+    }
+    dir_entries.sort_by_key(fs::DirEntry::path);
+    for entry in dir_entries {
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;

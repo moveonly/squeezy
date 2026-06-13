@@ -598,6 +598,14 @@ pub(crate) fn refresh_mention_popup(app: &mut TuiApp) {
             app.status = format!("no files match @{}", query.query);
         }
         app.mention_popup = None;
+        // Make an empty result explicit so a typo'd `@path` reads as "found
+        // nothing" rather than "the popup feature is off here". Only once the
+        // workspace walk has completed (cache present) and the user has typed a
+        // needle — while the cache is still building, or right after `@`, an
+        // empty list is expected and silence is correct.
+        if !query.query.is_empty() && app.workspace_file_cache.is_some() {
+            app.status = format!("no files match @{}", query.query);
+        }
         return;
     }
     app.mention_popup = Some(mention::MentionPopup::from_query(
@@ -1037,18 +1045,20 @@ pub(crate) fn move_input_cursor_up(app: &mut TuiApp) -> bool {
     if curr_start == 0 {
         return false;
     }
-    let col = app.input[curr_start..cursor].chars().count();
+    let col_chars = app.input[curr_start..cursor].chars().count();
     let prev_end = curr_start - 1;
     let prev_start = app.input[..prev_end]
         .rfind('\n')
         .map(|i| i + 1)
         .unwrap_or(0);
-    let prev = &app.input[prev_start..prev_end];
-    app.input_cursor = prev
-        .char_indices()
-        .nth(col)
-        .map(|(i, _)| prev_start + i)
-        .unwrap_or(prev_end);
+    let prev_len = prev_end - prev_start;
+    let prev_line = &app.input[prev_start..prev_end];
+    app.input_cursor = prev_start
+        + prev_line
+            .char_indices()
+            .nth(col_chars)
+            .map(|(b, _)| b)
+            .unwrap_or(prev_len);
     true
 }
 
@@ -1057,7 +1067,7 @@ pub(crate) fn move_input_cursor_up(app: &mut TuiApp) -> bool {
 pub(crate) fn move_input_cursor_down(app: &mut TuiApp) -> bool {
     let cursor = input_cursor(app);
     let curr_start = line_start_before_cursor(&app.input, cursor);
-    let col = app.input[curr_start..cursor].chars().count();
+    let col_chars = app.input[curr_start..cursor].chars().count();
     let Some(next_start) = app.input[curr_start..]
         .find('\n')
         .map(|offset| curr_start + offset + 1)
@@ -1068,12 +1078,14 @@ pub(crate) fn move_input_cursor_down(app: &mut TuiApp) -> bool {
         .find('\n')
         .map(|offset| next_start + offset)
         .unwrap_or(app.input.len());
-    let next = &app.input[next_start..next_end];
-    app.input_cursor = next
-        .char_indices()
-        .nth(col)
-        .map(|(i, _)| next_start + i)
-        .unwrap_or(next_end);
+    let next_len = next_end - next_start;
+    let next_line = &app.input[next_start..next_end];
+    app.input_cursor = next_start
+        + next_line
+            .char_indices()
+            .nth(col_chars)
+            .map(|(b, _)| b)
+            .unwrap_or(next_len);
     true
 }
 
@@ -1186,6 +1198,10 @@ pub(crate) fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirectio
             set_input(app, draft);
             app.input_history_index = None;
             app.slash_menu_index = 0;
+            // Stepping down past the newest entry drops back into the user's own
+            // stashed draft — name it so the boundary isn't read as just another
+            // (silent) history entry.
+            app.status = "draft".to_string();
             return true;
         }
         (Some(index), HistoryDirection::Next) => Some(index + 1),
@@ -1197,6 +1213,9 @@ pub(crate) fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirectio
         app.input_history_index = Some(index);
         app.selected_entry = None;
         app.slash_menu_index = 0;
+        // Show how deep into the ring this recall lands (1-based, newest = last)
+        // so the user can tell whether another Up will do anything.
+        app.status = format!("history {}/{}", index + 1, app.input_history.len());
     }
     true
 }

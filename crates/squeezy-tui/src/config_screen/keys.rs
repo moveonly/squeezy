@@ -8,10 +8,10 @@ use squeezy_core::{
 use super::{
     ConfigFeedback, ConfigScope, ConfigScreenState, EditorOutcome, FieldEditor, KeyOutcome,
     ModelPickerState, PromptEditorState, SYNTHETIC_KEY_ROW, SearchOverlayState, SearchTarget,
-    SecretEntryState, Severity as NotifySeverity, ThemeEditor, ThemeRow, clear_scope_override,
-    clear_scope_override_silent, compute_search_matches, cycle_to_next_registry_model,
-    discard_all_session_writes, handle_editor_key, model_field_meta, open_editor_for,
-    perform_reset, picker_matches, provider_api_key_env, provider_inline_api_key,
+    SecretEntryState, SecretReveal, Severity as NotifySeverity, ThemeEditor, ThemeRow,
+    clear_scope_override, clear_scope_override_silent, compute_search_matches,
+    cycle_to_next_registry_model, discard_all_session_writes, handle_editor_key, model_field_meta,
+    open_editor_for, perform_reset, picker_matches, provider_api_key_env, provider_inline_api_key,
     provider_section_name, save_field, save_field_silent, save_inline_provider_api_key,
     save_theme_color, save_theme_delete, save_theme_rename, save_theme_selection,
     save_theme_snapshot, undo_last_write, unset_theme_color,
@@ -241,7 +241,13 @@ pub(crate) fn handle_key(
                 if let Some(next) = next_value {
                     if (field.set)(&mut state.effective, next.clone()).is_ok() {
                         state.dirty = true;
+                        let from = current_value.as_display();
+                        let to = next.as_display();
                         save_field_silent(state, agent, notifications, field, current_value, next);
+                        notifications.push(
+                            format!("{}: {from} → {to}", field.label),
+                            NotifySeverity::Info,
+                        );
                     }
                     return KeyOutcome::KeepOpen;
                 }
@@ -281,7 +287,13 @@ pub(crate) fn handle_key(
             if let Some(next) = next {
                 if (field.set)(&mut state.effective, next.clone()).is_ok() {
                     state.dirty = true;
+                    let from = current_value.as_display();
+                    let to = next.as_display();
                     save_field_silent(state, agent, notifications, field, current_value, next);
+                    notifications.push(
+                        format!("{}: {from} → {to}", field.label),
+                        NotifySeverity::Info,
+                    );
                 }
             } else {
                 notifications.push(
@@ -966,7 +978,10 @@ fn open_theme_rename_editor(
 }
 
 fn next_theme_name(state: &ConfigScreenState) -> String {
-    for i in 1..1000 {
+    // Loop until a free name is found rather than capping the search: a fixed
+    // ceiling would fall back to a name guaranteed to collide on commit, and
+    // the duplicate check would then refuse with an opaque "already exists".
+    for i in 1.. {
         let candidate = if i == 1 {
             "custom-theme".to_string()
         } else {
@@ -976,7 +991,8 @@ fn next_theme_name(state: &ConfigScreenState) -> String {
             return candidate;
         }
     }
-    "custom-theme".to_string()
+    // `1..` (RangeFrom) only terminates by `return`; the loop always yields.
+    unreachable!("an unused custom-theme-N name always exists")
 }
 
 fn handle_theme_editor_key(
@@ -1147,7 +1163,7 @@ fn open_api_key_entry_for_current_provider(
                 provider_label: label.to_string(),
                 draft,
                 cursor,
-                reveal: false,
+                reveal: SecretReveal::Hidden,
             });
         }
         None => {
@@ -1173,7 +1189,7 @@ fn handle_secret_entry_key(
             state.secret_entry = None;
         }
         (KeyCode::F(2), _) => {
-            entry.reveal = !entry.reveal;
+            entry.reveal = entry.reveal.next();
         }
         (KeyCode::Backspace, _) => {
             entry.backspace();
