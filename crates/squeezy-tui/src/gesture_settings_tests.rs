@@ -336,6 +336,50 @@ fn configured_dwell_drives_the_recognizer_hover_intent() {
     );
 }
 
+#[test]
+fn set_dwell_ms_overrides_the_recognizer_arm_threshold() {
+    // A non-default dwell pushed onto the recognizer via `set_dwell_ms` is the
+    // threshold the live input path uses: a Move past the OLD default dwell but
+    // before the configured one must NOT arm; one at/after the configured dwell
+    // does. This is what makes a tuned `hover_dwell_ms` actually take effect.
+    let configured = HOVER_INTENT_MS + 200;
+    assert!(
+        configured > HOVER_INTENT_MS,
+        "the configured dwell is longer than the default"
+    );
+    let mut rec = Recognizer::new();
+    rec.set_dwell_ms(configured);
+    let target = TargetKey::Entry(EntryId(1));
+
+    let base = Instant::now();
+    let _ = rec.recognize(Phase::Move, Some((target, dummy_action())), base);
+
+    // Past the OLD default but before the configured dwell: still not armed.
+    let between = ahead(
+        base,
+        Duration::from_millis(u64::try_from(HOVER_INTENT_MS + 1).unwrap_or(u64::MAX)),
+    );
+    let mid = rec.recognize(Phase::Move, Some((target, dummy_action())), between);
+    assert!(
+        matches!(mid, crate::interaction::Gesture::None),
+        "a Move past the default but before the configured dwell does not arm"
+    );
+
+    // At/after the configured dwell: arms.
+    let after = ahead(
+        base,
+        Duration::from_millis(u64::try_from(configured + 1).unwrap_or(u64::MAX)),
+    );
+    let armed = rec.recognize(Phase::Move, Some((target, dummy_action())), after);
+    assert!(
+        matches!(
+            armed,
+            crate::interaction::Gesture::HoverEnter { target: t } if t == target
+        ),
+        "a Move at/after the configured dwell arms HoverEnter: {armed:?}"
+    );
+}
+
 /// A throwaway action for feeding the recognizer; its identity is irrelevant to
 /// the hover-timing assertions.
 fn dummy_action() -> crate::interaction::Action {

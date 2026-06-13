@@ -1043,6 +1043,12 @@ async fn run_inner_with_terminal(
     // session that never picked one keeps the built-in Unicode default; a malformed
     // value is ignored.
     restore_glyph_mode(&mut app);
+    // Gesture Settings (§12.7.5): load the saved gesture/input accommodations
+    // (wheel step, Shift-wheel pan, hover dwell, double-click routing, drag-select)
+    // before the first event so the live input path honours them without the user
+    // re-opening the editor. A session that never customized gestures keeps the
+    // built-in default.
+    restore_gesture_settings(&mut app);
     // Adaptive Density (§12.4.1): restore the density override the user pinned in
     // a prior session from the user-scope config before the first paint, so a
     // session opens at the chosen density (or `Auto`, the default) without
@@ -3907,6 +3913,11 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             let now = std::time::Instant::now();
             let hit = app.click_target_at(mouse.column, mouse.row);
             let previewable = hit.filter(|(key, _)| hover_preview::policy_for(*key).hover_preview);
+            // Honour the configured hover dwell (§12.7.5) on the live recognizer
+            // before it classifies this Move, so a tuned `hover_dwell_ms` drives
+            // the arm threshold instead of the built-in default.
+            app.gestures
+                .set_dwell_ms(u128::from(app.effective_gesture_settings().hover_dwell_ms));
             // ONE recognizer Move drives BOTH the Hover Preview popover (§12.1.4)
             // and the Mouse Hover Intent affordance (§12.1.3): the same debounced
             // `HoverEnter`/`HoverLeave` gesture, so they can never disagree about
@@ -4080,7 +4091,14 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // through the cell→`Pos` mapping AND the word/row snapping below, so a
     // single press (which both maps the cell and may snap a word/row) rebuilds
     // the transcript row list once instead of two or three times.
-    if app.transcript_overlay.is_none() && app.config_screen.is_none() {
+    if app.transcript_overlay.is_none()
+        && app.config_screen.is_none()
+        // §12.7.5 `drag_select`: a press only arms a main-text selection when the
+        // user has left drag-select on (the default). With it off the press falls
+        // through (a header click still focuses above), and the Drag/Up arms below
+        // no-op because no main selection is ever live to extend or release.
+        && app.effective_gesture_settings().drag_select
+    {
         match mouse.kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 let rows = main_surface_rows(app);
@@ -4275,6 +4293,7 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // wrapped view. Shift+ScrollUp pans left (toward column 0), Shift+ScrollDown
     // pans right (toward the line end), mirroring the vertical-wheel direction.
     if mouse.modifiers.contains(KeyModifiers::SHIFT)
+        && app.effective_gesture_settings().shift_wheel_pan
         && app.transcript_overlay.is_none()
         && app.config_screen.is_none()
         && app.status_line_setup.is_none()
@@ -4298,22 +4317,23 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // their own offset), not always main's, so wheeling a selected subagent
     // transcript still reports the change and triggers a redraw.
     //
-    // Each wheel notch moves a fixed 3 lines; a burst of N notches sums to N
-    // steps because each event scrolls independently.
-    const WHEEL_STEP_LINES: usize = 3;
+    // Each wheel notch moves the configured number of lines (§12.7.5
+    // `scroll_lines`, default 3); a burst of N notches sums to N steps because
+    // each event scrolls independently.
+    let wheel_step_lines = app.effective_gesture_settings().scroll_lines as usize;
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             // A wheel scroll is the pointer sweeping content, not dwelling on a
             // target: §12.1.3 says it must suppress (and hide) any hover reveal.
             hover_suppress_scroll(app);
             let before = active_transcript_scroll(app);
-            scroll_transcript_up(app, WHEEL_STEP_LINES);
+            scroll_transcript_up(app, wheel_step_lines);
             active_transcript_scroll(app) != before
         }
         MouseEventKind::ScrollDown => {
             hover_suppress_scroll(app);
             let before = active_transcript_scroll(app);
-            scroll_transcript_down(app, WHEEL_STEP_LINES);
+            scroll_transcript_down(app, wheel_step_lines);
             active_transcript_scroll(app) != before
         }
         _ => false,
@@ -6918,6 +6938,18 @@ fn read_persisted_glyph_mode(app: &TuiApp) -> Option<glyph_mode::GlyphMode> {
 fn restore_glyph_mode(app: &mut TuiApp) {
     if let Some(mode) = read_persisted_glyph_mode(app) {
         app.glyph_mode = mode;
+    }
+}
+
+/// Gesture Settings (§12.7.5): load the persisted `[tui.gestures]` override into
+/// the live `gesture_settings_override` before the first event, so the input path
+/// (wheel step, Shift-wheel pan, hover dwell, double-click routing, drag-select)
+/// honours the user's saved accommodations without re-opening the editor. A
+/// session that never customized gestures keeps `None` (the built-in default); a
+/// malformed table collapses to `None`.
+fn restore_gesture_settings(app: &mut TuiApp) {
+    if let Some(settings) = read_persisted_gesture_settings(app) {
+        app.gesture_settings_override = Some(settings);
     }
 }
 
@@ -19441,6 +19473,16 @@ fn dispatch_card_gesture(app: &mut TuiApp, gesture: interaction::Gesture) -> Car
             action: Some(interaction::Action::ToggleEntryCollapsed(id)),
             ..
         } => {
+            // §12.7.5 `double_click` picks what the double-click does. `None`
+            // leaves it inert (treated as two single clicks — the caret's single-
+            // click toggle already ran on the first press, so falling through is a
+            // no-op for the second). `Expand` keeps the established default: expand
+            // a collapsed card, else open it in detail. `OpenDetail` always opens
+            // the entry in the Ctrl+T detail overlay regardless of collapsed state.
+            let double_click = app.effective_gesture_settings().double_click;
+            if matches!(double_click, gesture_settings::DoubleClickAction::None) {
+                return CardPress::Ignored;
+            }
             // A live preview is dismissed the moment a gesture activates.
             dismiss_hover_preview(app);
             let collapsed = active_transcript_entries(app)
@@ -19448,7 +19490,9 @@ fn dispatch_card_gesture(app: &mut TuiApp, gesture: interaction::Gesture) -> Car
                 .find(|entry| entry.id == id.0)
                 .is_some_and(|entry| entry.collapsed);
             let policy = hover_preview::policy_for(interaction::TargetKey::Entry(id));
-            if collapsed {
+            let expand_first =
+                matches!(double_click, gesture_settings::DoubleClickAction::Expand) && collapsed;
+            if expand_first {
                 dispatch_click_action(app, interaction::Action::ExpandEntry(id));
             } else if policy.activates_on_double_click()
                 && let Some(action) = policy.primary_activate
@@ -48475,6 +48519,16 @@ impl TuiApp {
         self.settings_path_override
             .clone()
             .unwrap_or_else(squeezy_core::default_settings_path)
+    }
+
+    /// The gesture settings the live input path should honour (§12.7.5): the
+    /// persisted/in-session override when one is set, else the built-in default.
+    /// Always clamped so a stale value can never push a consumer (wheel step,
+    /// hover dwell) out of range.
+    pub(crate) fn effective_gesture_settings(&self) -> gesture_settings::GestureSettings {
+        self.gesture_settings_override
+            .unwrap_or(gesture_settings::GestureSettings::DEFAULT)
+            .clamped()
     }
 
     /// Pin the user-scope settings path. Used by the eval harness so

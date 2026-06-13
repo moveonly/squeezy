@@ -989,13 +989,25 @@ struct HoverState {
 
 /// The gesture recognizer. Owned by `TuiApp`. Turns the raw `Press/Drag/
 /// Release/Move` stream into semantic [`Gesture`]s. It holds only model-space
-/// state: last-press timing/key/multiplicity, an optional drag, and an
-/// optional hover-intent. It owns no live cursor coordinates as authority.
-#[derive(Debug, Default)]
+/// state: last-press timing/key/multiplicity, an optional drag, an optional
+/// hover-intent, and the hover dwell threshold. It owns no live cursor
+/// coordinates as authority.
+#[derive(Debug)]
 pub(crate) struct Recognizer {
     last_press: Option<PressState>,
     drag: Option<DragState>,
     hover: Option<HoverState>,
+    /// How long the pointer must rest on a key before a `HoverEnter` arms
+    /// (§12.7.5 `hover_dwell_ms`). Seeded from [`HOVER_INTENT_MS`]; the input
+    /// loop overrides it with the effective gesture settings via
+    /// [`Recognizer::set_dwell_ms`].
+    dwell_ms: u128,
+}
+
+impl Default for Recognizer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Recognizer {
@@ -1004,7 +1016,15 @@ impl Recognizer {
             last_press: None,
             drag: None,
             hover: None,
+            dwell_ms: HOVER_INTENT_MS,
         }
+    }
+
+    /// Set the hover dwell threshold (§12.7.5). Called from the input loop with
+    /// the effective gesture settings so a configured dwell drives the live
+    /// recognizer; defaults to [`HOVER_INTENT_MS`] when never set.
+    pub(crate) fn set_dwell_ms(&mut self, dwell_ms: u128) {
+        self.dwell_ms = dwell_ms;
     }
 
     /// The in-flight drag, if any. The dispatch layer reads this to render the
@@ -1143,7 +1163,7 @@ impl Recognizer {
                 // Same key, intent delay elapsed: arm and emit enter.
                 Some(h)
                     if h.target == key
-                        && now.duration_since(h.since).as_millis() >= HOVER_INTENT_MS =>
+                        && now.duration_since(h.since).as_millis() >= self.dwell_ms =>
                 {
                     self.hover = Some(HoverState {
                         target: key,
