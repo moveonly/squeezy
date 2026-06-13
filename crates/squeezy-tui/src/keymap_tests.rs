@@ -1036,3 +1036,19 @@ fn keymap_report_includes_overrides_and_warnings() {
     assert!(report.contains("Unknown action names"));
     assert!(report.contains("nope"));
 }
+
+#[test]
+fn keybindings_doc_lists_accessibility_actions() {
+    let doc = include_str!("../../../docs/internal/KEYBINDINGS.md");
+    for action in [
+        Action::OpenTerminalProfile,
+        Action::OpenGestureSettings,
+        Action::OpenGlyphMode,
+    ] {
+        let slug = action.slug();
+        assert!(
+            doc.contains(&format!("`{slug}`")),
+            "KEYBINDINGS.md is missing a row for the `{slug}` accessibility action",
+        );
+    }
+}

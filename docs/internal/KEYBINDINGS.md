@@ -62,6 +62,9 @@ new variants are added.
 | `page_down`                         | `PageDown`      | Scroll the transcript one page down.                                    |
 | `transcript_home`                   | `Home`          | Jump to the top of the transcript when the composer is empty.           |
 | `transcript_end`                    | `End`           | Jump to the bottom of the transcript when the composer is empty.        |
+| `open_terminal_profile`             | `Ctrl+Alt+G`    | Open the terminal capability profile editor (mouse, color, glyphs).     |
+| `open_gesture_settings`             | `Ctrl+Alt+I`    | Open the gesture/input accessibility settings editor.                   |
+| `open_glyph_mode`                   | `Ctrl+Alt+U`    | Open the minimal glyph (ASCII) mode selector.                           |
 
 Use `/keymap` inside the TUI to inspect the live resolution and see which
 entries are overrides. The card also reports unknown action names, malformed
