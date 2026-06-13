@@ -8767,22 +8767,34 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         // `[tui.keymap]`. When dispatch returned `false` for Home/End
         // (composer non-empty) the line-cursor cases below execute.
         KeyCode::Home => {
-            // Shift+Home extends the composer selection to the line start; a
-            // bare Home clears it (see `move_composer_cursor`).
+            // Home → line start; Ctrl+Home → document start (Win/Linux). Shift
+            // extends the composer selection; a bare press clears it (see
+            // `move_composer_cursor`).
             let extend = key.modifiers.contains(KeyModifiers::SHIFT);
-            move_composer_cursor(app, extend, move_input_cursor_line_start);
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                move_composer_cursor(app, extend, |a| a.input_cursor = 0);
+            } else {
+                move_composer_cursor(app, extend, move_input_cursor_line_start);
+            }
             Ok(false)
         }
         KeyCode::End => {
+            // End → line end; Ctrl+End → document end (Win/Linux).
             let extend = key.modifiers.contains(KeyModifiers::SHIFT);
-            move_composer_cursor(app, extend, move_input_cursor_line_end);
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                move_composer_cursor(app, extend, |a| a.input_cursor = a.input.len());
+            } else {
+                move_composer_cursor(app, extend, move_input_cursor_line_end);
+            }
             Ok(false)
         }
         KeyCode::Left => {
-            // Shift extends the composer selection; ALT/CONTROL pick the by-word
-            // motion (Shift+Ctrl/Alt+Left extends by a word).
+            // Precedence: SUPER (⌘) → line start (macOS); ALT/CONTROL (⌥ / Win
+            // Ctrl) → word; else char. Shift extends the composer selection.
             let extend = key.modifiers.contains(KeyModifiers::SHIFT);
-            if key
+            if key.modifiers.contains(KeyModifiers::SUPER) {
+                move_composer_cursor(app, extend, move_input_cursor_line_start);
+            } else if key
                 .modifiers
                 .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
             {
@@ -8793,8 +8805,11 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             Ok(false)
         }
         KeyCode::Right => {
+            // SUPER (⌘) → line end (macOS); ALT/CONTROL → word; else char.
             let extend = key.modifiers.contains(KeyModifiers::SHIFT);
-            if key
+            if key.modifiers.contains(KeyModifiers::SUPER) {
+                move_composer_cursor(app, extend, move_input_cursor_line_end);
+            } else if key
                 .modifiers
                 .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
             {
@@ -8805,6 +8820,13 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             Ok(false)
         }
         KeyCode::Up => {
+            // ⌘Up → document (composer) start, Shift+⌘Up extends there. Checked
+            // before the slash-menu / transcript-extend / history paths.
+            if key.modifiers.contains(KeyModifiers::SUPER) {
+                let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+                move_composer_cursor(app, extend, |a| a.input_cursor = 0);
+                return Ok(false);
+            }
             if move_slash_menu_selection(app, SelectionDirection::Previous) {
                 return Ok(false);
             }
@@ -8822,6 +8844,12 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             Ok(false)
         }
         KeyCode::Down => {
+            // ⌘Down → document (composer) end, Shift+⌘Down extends there.
+            if key.modifiers.contains(KeyModifiers::SUPER) {
+                let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+                move_composer_cursor(app, extend, |a| a.input_cursor = a.input.len());
+                return Ok(false);
+            }
             if move_slash_menu_selection(app, SelectionDirection::Next) {
                 return Ok(false);
             }

@@ -48922,3 +48922,89 @@ fn transcript_press_clears_a_stale_screen_selection() {
         "the transcript selection armed instead"
     );
 }
+
+// =====================================================================
+// Composer native-grade cursor motion: ⌘ line, ⌘↑↓ / Ctrl+Home/End doc,
+// with Shift-extend.
+// =====================================================================
+
+async fn press(app: &mut TuiApp, agent: &mut Agent, code: KeyCode, mods: KeyModifiers) {
+    handle_key(app, agent, KeyEvent::new(code, mods))
+        .await
+        .expect("key");
+}
+
+#[tokio::test]
+async fn cmd_left_right_jump_to_line_ends_in_multiline_composer() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "abc\ndefg".to_string()); // line 2 = bytes 4..8
+    app.input_cursor = 6; // between 'e' and 'f' on line 2
+
+    press(&mut app, &mut agent, KeyCode::Left, KeyModifiers::SUPER).await;
+    assert_eq!(app.input_cursor, 4, "⌘← → line start (of the current line)");
+
+    press(&mut app, &mut agent, KeyCode::Right, KeyModifiers::SUPER).await;
+    assert_eq!(app.input_cursor, 8, "⌘→ → line end (of the current line)");
+}
+
+#[tokio::test]
+async fn cmd_up_down_and_ctrl_home_end_jump_to_doc_ends() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "abc\ndefg".to_string());
+    app.input_cursor = 6;
+
+    press(&mut app, &mut agent, KeyCode::Up, KeyModifiers::SUPER).await;
+    assert_eq!(app.input_cursor, 0, "⌘↑ → document start");
+    press(&mut app, &mut agent, KeyCode::Down, KeyModifiers::SUPER).await;
+    assert_eq!(app.input_cursor, 8, "⌘↓ → document end");
+
+    app.input_cursor = 6;
+    press(&mut app, &mut agent, KeyCode::Home, KeyModifiers::CONTROL).await;
+    assert_eq!(app.input_cursor, 0, "Ctrl+Home → document start");
+    press(&mut app, &mut agent, KeyCode::End, KeyModifiers::CONTROL).await;
+    assert_eq!(app.input_cursor, 8, "Ctrl+End → document end");
+}
+
+#[tokio::test]
+async fn shift_cmd_right_extends_selection_to_line_end() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "hello world".to_string());
+    app.input_cursor = 0;
+
+    press(
+        &mut app,
+        &mut agent,
+        KeyCode::Right,
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    )
+    .await;
+    assert_eq!(
+        input::input_selected_text(&app).as_deref(),
+        Some("hello world"),
+        "Shift+⌘→ selects from the caret to the line end",
+    );
+}
+
+#[tokio::test]
+async fn shift_cmd_down_extends_selection_to_doc_end() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "abc\ndefg".to_string());
+    app.input_cursor = 4; // start of line 2
+
+    press(
+        &mut app,
+        &mut agent,
+        KeyCode::Down,
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    )
+    .await;
+    assert_eq!(
+        input::input_selected_text(&app).as_deref(),
+        Some("defg"),
+        "Shift+⌘↓ extends from the caret to the document end",
+    );
+}
