@@ -710,7 +710,8 @@ pub(crate) fn render_status_details(app: &TuiApp) -> String {
 /// a session cap is configured) the cap is rendered as inert rather than as
 /// a percentage: an unpriced cap cannot advance, so a `0.0%` next to the
 /// cap would read as reassuring headroom exactly when the guardrail is off.
-/// The flag self-clears on the next priced `CostUpdate`.
+/// The flag self-clears on the next priced provider spend — either a mid-turn
+/// `CostUpdate` or a completed turn whose provider cost is positive.
 pub(crate) fn format_cost_segment(
     cost: &squeezy_core::CostSnapshot,
     cap_usd_micros: Option<u64>,

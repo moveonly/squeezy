@@ -417,6 +417,14 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.cost = session_cost;
                     }
                     app.metrics = metrics;
+                    // A turn that completed with positive provider spend proves
+                    // the active model is priced, so the unpriced-cap marker is
+                    // stale even on short turns that never crossed a CostUpdate
+                    // stride. Mirror the CostUpdate `> 0` gate so genuinely
+                    // unpriced models keep the inert badge.
+                    if app.metrics.provider.estimated_usd_micros.unwrap_or(0) > 0 {
+                        app.cap_unenforceable = false;
+                    }
                     // Record this turn's priced cost into the per-turn ledger so a
                     // settled prompt/answer can show its turn's spend on hover,
                     // keyed by the same turn ordinal the session timeline uses. Only

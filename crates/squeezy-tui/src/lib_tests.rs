@@ -3618,6 +3618,81 @@ async fn completed_turn_with_cost_does_not_append_cost_footer() {
 }
 
 #[tokio::test]
+async fn priced_completed_turn_clears_cap_unenforceable_without_a_tool_stride() {
+    let mut app = test_app(SessionMode::Build);
+    app.cap_unenforceable = true;
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+
+    // A short, no-tool turn never crosses the CostUpdate tool stride, so the
+    // only clear path is the terminal Completed handler. Positive provider
+    // spend proves the active model is priced.
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics {
+            provider: CostSnapshot {
+                estimated_usd_micros: Some(123),
+                ..CostSnapshot::default()
+            },
+            ..TurnMetrics::default()
+        },
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+        session_cost: None,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert!(
+        !app.cap_unenforceable,
+        "a priced completed turn must clear the inert-cap marker even with zero tool calls"
+    );
+}
+
+#[tokio::test]
+async fn unpriced_completed_turn_keeps_cap_unenforceable() {
+    let mut app = test_app(SessionMode::Build);
+    app.cap_unenforceable = true;
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+
+    // No provider USD means the active model is still unpriced; the inert-cap
+    // badge must survive turn completion.
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics {
+            provider: CostSnapshot {
+                estimated_usd_micros: None,
+                ..CostSnapshot::default()
+            },
+            ..TurnMetrics::default()
+        },
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+        session_cost: None,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert!(
+        app.cap_unenforceable,
+        "an unpriced completed turn must keep the inert-cap marker"
+    );
+}
+
+#[tokio::test]
 async fn cancelled_turn_with_cost_does_not_append_cost_footer() {
     let mut app = test_app(SessionMode::Build);
     let (tx, rx) = mpsc::channel(4);
