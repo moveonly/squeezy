@@ -13603,7 +13603,10 @@ fn toggle_hover_preview(app: &mut TuiApp) {
         "read-only"
     };
     app.hover_preview = Some(preview);
-    app.status = format!("preview ({verb}) \u{00b7} {hint} \u{00b7} Esc / Alt+1 close");
+    app.status = format!(
+        "preview ({verb}) \u{00b7} {hint} \u{00b7} Esc / {} close",
+        key_hint(app, keymap::Action::ToggleHoverPreview)
+    );
     app.needs_redraw = true;
     // Opening a peek is the user demonstrating they already know the hover/focus
     // affordance, so the §12.1.8 Hover hint fades — once used.
