@@ -11065,7 +11065,7 @@ fn toggle_clipboard_history(app: &mut TuiApp) {
             "clipboard history (empty) — Esc to close".to_string()
         } else {
             format!(
-                "clipboard history: {} — ↑↓ select · Enter re-copy · d delete · c clear · Esc close",
+                "clipboard history: {} — ↑↓ select · Enter re-copy · d delete · p pin · c clear · Esc close",
                 count_label_entries(app.clipboard_history.len()),
             )
         }
