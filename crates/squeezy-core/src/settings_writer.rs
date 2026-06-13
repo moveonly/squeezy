@@ -275,6 +275,12 @@ fn apply_set_table_entry(
             promoted.insert(k, Item::Value(v.clone()));
         }
         parent.insert(key, Item::Table(promoted));
+    } else if !matches!(parent.get(key), Some(Item::Table(_))) {
+        // Existing key but not a table (scalar/array/array-of-tables) —
+        // overwrite. Loses prior decor but this is a misuse case, matching
+        // how descend_or_create_table and apply_append_array_of_tables treat
+        // non-table values.
+        parent.insert(key, Item::Table(Table::new()));
     }
     let entry_table = parent
         .get_mut(key)
@@ -436,6 +442,11 @@ fn theme_colors_table<'a>(doc: &'a mut DocumentMut, theme: &str) -> &'a mut Tabl
             promoted.insert(k, Item::Value(v.clone()));
         }
         themes.insert(theme, Item::Table(promoted));
+    } else if !matches!(themes.get(theme), Some(Item::Table(_))) {
+        // Existing key but not a table (scalar/array/array-of-tables) —
+        // overwrite. Loses prior decor but this is a misuse case, matching
+        // how descend_or_create_table treats non-table values.
+        themes.insert(theme, Item::Table(Table::new()));
     }
     let theme_table = themes
         .get_mut(theme)

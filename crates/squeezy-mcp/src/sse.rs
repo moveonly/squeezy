@@ -388,8 +388,19 @@ where
     Err(SseTransportError::MissingEndpointEvent)
 }
 
-/// Join a relative endpoint path against the SSE URL, or return the absolute
-/// URL untouched. Falls back to a typed error on malformed input.
+/// Join a relative endpoint path against the SSE URL, or accept an absolute
+/// URL only when it shares the SSE URL's origin. Falls back to a typed error
+/// on malformed input or a cross-origin endpoint.
+///
+/// The advertised endpoint comes straight from the server's untrusted
+/// `event: endpoint` `data:` payload. `Url::join` returns an absolute URL
+/// verbatim, so without an origin check a server (or an on-path attacker
+/// against a plaintext `http://` SSE URL) could redirect the JSON-RPC POSTs —
+/// which carry the configured bearer token and any secret custom headers — to
+/// an arbitrary host. We therefore require the resolved endpoint to match the
+/// configured SSE URL's scheme, host, and port before any secret-bearing POST
+/// is sent there. Relative paths (the common case) resolve to the same origin
+/// and are unaffected.
 pub(crate) fn resolve_endpoint_url(
     sse_url: &str,
     advertised: &str,
@@ -410,6 +421,18 @@ pub(crate) fn resolve_endpoint_url(
             url: advertised.to_string(),
             message: err.to_string(),
         })?;
+    if joined.scheme() != base.scheme()
+        || joined.host_str() != base.host_str()
+        || joined.port_or_known_default() != base.port_or_known_default()
+    {
+        return Err(SseTransportError::InvalidUrl {
+            url: joined.to_string(),
+            message: format!(
+                "cross-origin endpoint rejected: advertised endpoint does not share the \
+                 origin (scheme/host/port) of the configured sse url {sse_url:?}"
+            ),
+        });
+    }
     Ok(joined.to_string())
 }
 

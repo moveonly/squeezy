@@ -9061,7 +9061,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
                 app.slash_menu_index = 0;
                 return Ok(false);
             }
-            if handle_inline_slash_command(app, agent, &raw_input).await {
+            if handle_inline_slash_command(app, agent, &raw_input, true).await {
                 return Ok(false);
             }
             if reject_unknown_slash_command(app, &input) {
@@ -20393,7 +20393,54 @@ fn set_status_with_notice(app: &mut TuiApp, status: impl Into<String>, notice: i
     app.push_transcript_item(TranscriptItem::system(notice.into()));
 }
 
-async fn handle_inline_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
+/// A snapshot of the live composer surface (`app.input` + cursor/selection +
+/// staged prompt attachments + the in-progress queued-prompt edit id) so the
+/// queue-drain path can run an inline slash command that was authored inside a
+/// *dequeued* prompt without mutating the user's unrelated live draft. The
+/// Enter-key path drives the composer directly and never captures/restores.
+struct ComposerSnapshot {
+    input: String,
+    input_cursor: usize,
+    input_selection: Option<(usize, usize)>,
+    prompt_attachments: Vec<PromptAttachment>,
+    editing_queue_id: Option<u64>,
+}
+
+impl ComposerSnapshot {
+    fn capture(app: &TuiApp) -> Self {
+        Self {
+            input: app.input.clone(),
+            input_cursor: app.input_cursor,
+            input_selection: app.input_selection,
+            prompt_attachments: app.prompt_attachments.clone(),
+            editing_queue_id: app.editing_queue_id,
+        }
+    }
+
+    fn restore(self, app: &mut TuiApp) {
+        app.input = self.input;
+        app.input_cursor = self.input_cursor;
+        app.input_selection = self.input_selection;
+        app.prompt_attachments = self.prompt_attachments;
+        app.editing_queue_id = self.editing_queue_id;
+    }
+}
+
+/// Run an inline slash command embedded in `input` (e.g. `do X /attach foo`).
+///
+/// `drives_composer` is `true` only on the Enter-key path, where `input` is a
+/// clone of the live `app.input` and the byte offsets returned by the parser
+/// therefore index the live composer. On the queue-drain path it is `false`:
+/// `input` is a dequeued prompt that is independent of the live composer, so
+/// the handler must NOT apply those offsets to (or otherwise clobber) the
+/// user's live draft — it resolves the command against `input` and submits the
+/// stripped remainder as a turn instead.
+async fn handle_inline_slash_command(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    input: &str,
+    drives_composer: bool,
+) -> bool {
     let Some(occurrence) = input::find_inline_slash_dispatch_command(input) else {
         return false;
     };
@@ -20416,26 +20463,51 @@ async fn handle_inline_slash_command(app: &mut TuiApp, agent: &mut Agent, input:
         return true;
     }
     match slash {
-        "/attach" => {
-            handle_inline_attach_command(app, agent, input, occurrence.start, occurrence.end)
-        }
+        "/attach" => handle_inline_attach_command(
+            app,
+            agent,
+            input,
+            occurrence.start,
+            occurrence.end,
+            drives_composer,
+        ),
         "/help" | "/plan" | "/build" => {
             let command_input =
                 inline_prompt_command_input(input, occurrence.start, occurrence.end, slash);
+            // The composer-clearing bookkeeping below is written for the
+            // Enter-key path, where the command text lived in the live composer
+            // and `input == app.input`. On the queue-drain path the command came
+            // from a dequeued prompt, so snapshot the user's unrelated live draft
+            // and restore it afterwards — both the outer `clear_input` here AND
+            // any inner `clear_input` inside `apply_dispatch_command`'s
+            // `/plan <prompt>` / `/build <prompt>` arms would otherwise silently
+            // wipe a draft the user typed while the turn was running.
+            let drain_snapshot = (!drives_composer).then(|| ComposerSnapshot::capture(app));
             let before_command_input = app.input.clone();
             if handle_slash_command_on_surface(app, agent, &command_input, SlashSurface::TuiInline)
                 .await
             {
-                let preserve_input =
-                    app.preserve_input_after_slash_command || app.input != before_command_input;
-                app.preserve_input_after_slash_command = false;
-                if !preserve_input {
-                    clear_input(app);
+                if let Some(snapshot) = drain_snapshot {
+                    // The drain path never owns the composer; the turn (if any)
+                    // was already started from `command_input`, so just put the
+                    // user's draft back exactly as it was.
+                    app.preserve_input_after_slash_command = false;
+                    snapshot.restore(app);
+                } else {
+                    let preserve_input =
+                        app.preserve_input_after_slash_command || app.input != before_command_input;
+                    app.preserve_input_after_slash_command = false;
+                    if !preserve_input {
+                        clear_input(app);
+                    }
+                    app.input_history_index = None;
+                    app.input_history_draft.clear();
+                    app.slash_menu_index = 0;
                 }
-                app.input_history_index = None;
-                app.input_history_draft.clear();
-                app.slash_menu_index = 0;
                 return true;
+            }
+            if let Some(snapshot) = drain_snapshot {
+                snapshot.restore(app);
             }
             false
         }
@@ -20464,10 +20536,11 @@ fn inline_prompt_command_input(input: &str, start: usize, end: usize, slash: &st
 
 fn handle_inline_attach_command(
     app: &mut TuiApp,
-    agent: &Agent,
+    agent: &mut Agent,
     input: &str,
     command_start: usize,
     command_end: usize,
+    drives_composer: bool,
 ) -> bool {
     let Some((path, path_end)) = inline_attach_path(input, command_end) else {
         record_slash_command_telemetry(
@@ -20481,6 +20554,30 @@ fn handle_inline_attach_command(
         set_status_notice(app, "usage: /attach <path>");
         return true;
     };
+    // `command_start`/`path_end` are byte offsets into `input`. They only index
+    // the live composer when this came from the Enter-key path, where `input`
+    // is a clone of `app.input`. On the queue-drain path `input` is a dequeued
+    // prompt that is independent of the live composer, so applying the offsets
+    // to `app.input` would panic (`replace_range` out of bounds / off a char
+    // boundary) or silently corrupt the user's draft. Detect that case (and any
+    // future offset mismatch) and route through the non-composer drain path
+    // instead, which strips the command from `input` and submits the remainder.
+    let composer_edit = drives_composer
+        && command_start <= path_end
+        && path_end <= app.input.len()
+        && app.input.is_char_boundary(command_start)
+        && app.input.is_char_boundary(path_end)
+        && app.input == input;
+    if !composer_edit {
+        return handle_inline_attach_command_drain(
+            app,
+            agent,
+            input,
+            command_start,
+            path_end,
+            &path,
+        );
+    }
     let original_input = app.input.clone();
     let original_cursor = app.input_cursor;
     app.input.replace_range(command_start..path_end, "");
@@ -20509,6 +20606,84 @@ fn handle_inline_attach_command(
             app.input = original_input;
             app.input_cursor = original_cursor;
             app.preserve_input_after_slash_command = true;
+            app.status = format!("attach failed: {error}");
+        }
+    }
+    true
+}
+
+/// Resolve an inline `/attach` that arrived inside a *dequeued* prompt (the
+/// queue-drain path). The byte offsets index `input`, NOT the live composer, so
+/// we must never `replace_range` `app.input` here. Instead we strip the
+/// `/attach <path>` token out of `input`, stage the attachment, submit the
+/// remaining text as a turn, and leave the user's live composer draft untouched.
+fn handle_inline_attach_command_drain(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    input: &str,
+    command_start: usize,
+    path_end: usize,
+    path: &str,
+) -> bool {
+    // Build the prompt with the command stripped. `command_start`/`path_end` are
+    // valid char-boundary offsets into `input` (derived from it by the parser),
+    // so this slice never panics. Collapse the seam to a single space so a
+    // leading "do X " + trailing " rest" reads as "do X rest".
+    let before = input[..command_start].trim_end();
+    let after = input[path_end..].trim_start();
+    let remaining = if before.is_empty() {
+        after.to_string()
+    } else if after.is_empty() {
+        before.to_string()
+    } else {
+        format!("{before} {after}")
+    };
+
+    // Swap a throwaway composer holding `remaining` in place of the user's live
+    // draft so `insert_file_prompt_attachment` (which inserts a placeholder token
+    // at the cursor and stages the attachment) operates on the dequeued prompt,
+    // then restore the real draft afterwards. The attachment is resolved when the
+    // turn is submitted while the throwaway composer is still installed.
+    let snapshot = ComposerSnapshot::capture(app);
+    app.input = remaining;
+    app.input_cursor = app.input.len();
+    app.input_selection = None;
+    app.editing_queue_id = None;
+    // `app.prompt_attachments` is left as-is (the user's already-staged set) so
+    // any placeholders that survive in `remaining` still resolve; the new
+    // attachment is appended onto it by `insert_file_prompt_attachment`.
+
+    match insert_file_prompt_attachment(app, path) {
+        Ok(status) => {
+            record_slash_command_telemetry(
+                agent,
+                "/attach",
+                SlashSurface::TuiInline,
+                SlashOutcome::Accepted,
+                SlashAliasKind::Canonical,
+                SlashArgShape::Path,
+            );
+            let turn_input = app.input.clone();
+            app.cancelled_prompt = Some(turn_input.clone());
+            // Resolve + start the turn while the throwaway composer (text +
+            // staged attachment) is installed, then restore the live draft.
+            start_user_turn(app, agent, turn_input);
+            snapshot.restore(app);
+            app.prune_prompt_attachments();
+            app.status = status;
+        }
+        Err(error) => {
+            record_slash_command_telemetry(
+                agent,
+                "/attach",
+                SlashSurface::TuiInline,
+                SlashOutcome::Error,
+                SlashAliasKind::Canonical,
+                SlashArgShape::Path,
+            );
+            // Nothing was submitted: put the live composer back exactly as it was
+            // (this also drops the half-installed throwaway text + attachment).
+            snapshot.restore(app);
             app.status = format!("attach failed: {error}");
         }
     }
@@ -23937,7 +24112,7 @@ async fn submit_queued_input(app: &mut TuiApp, agent: &mut Agent, raw_input: Str
         app.slash_menu_index = 0;
         return;
     }
-    if handle_inline_slash_command(app, agent, &raw_input).await {
+    if handle_inline_slash_command(app, agent, &raw_input, false).await {
         return;
     }
     if reject_unknown_slash_command(app, &input) {

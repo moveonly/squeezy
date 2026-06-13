@@ -26,7 +26,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
@@ -292,26 +292,45 @@ fn apply_patch_op_kind(op: &ApplyPatchOperation) -> &'static str {
 /// both ops `"applied"`. Repeated `search_replace` ops on one path are the one
 /// safe overlap (their edits accumulate into a single staged file), so they
 /// are exempt; any other multi-touch of a path is rejected up front.
+///
+/// Conflicts are keyed on the **canonical realpath** each endpoint resolves to,
+/// mirroring the staging/lock phase (which canonicalizes via
+/// `resolve_existing`/`resolve_for_write` → `mutation_key`). Keying on the raw
+/// textual spelling would let two aliases for the same file slip through — e.g.
+/// `src/a.rs` and `src/./a.rs`, or a symlink and its target — and stage
+/// independently against the original on-disk bytes, so the in-order apply
+/// would clobber one with the other while still reporting both `"applied"`.
+/// Endpoints that cannot be resolved to a realpath (e.g. a create target whose
+/// parent does not exist) fall back to the textual key; any genuinely invalid
+/// path is rejected later by the staging phase.
 fn detect_apply_patch_path_conflict(
+    root: &Path,
     ops: &[ApplyPatchOperation],
 ) -> Option<(String, &'static str, &'static str)> {
-    let mut seen: BTreeMap<String, &'static str> = BTreeMap::new();
+    // Each key maps to the op kind that first claimed it plus the display
+    // string to surface in the error if a conflict is found.
+    let mut seen: BTreeMap<PathBuf, (&'static str, String)> = BTreeMap::new();
     for op in ops {
         let kind = apply_patch_op_kind(op);
         let (first, second) = apply_patch_op_path_refs(op);
         for endpoint in [Some(first), second].into_iter().flatten() {
-            let Some(norm) = normalize_workspace_path_str(endpoint) else {
+            let Some(display) = normalize_workspace_path_str(endpoint) else {
                 continue;
             };
-            match seen.get(&norm) {
-                Some(&prior_kind) if prior_kind == "search_replace" && kind == "search_replace" => {
+            // Collapse `.` components and resolve symlinks the same way the
+            // staging phase does, so path aliases map to one key.
+            let key = crate::file_mutation_queue::mutation_key(&root.join(endpoint));
+            match seen.get(&key) {
+                Some((prior_kind, _))
+                    if *prior_kind == "search_replace" && kind == "search_replace" =>
+                {
                     // Repeated search/replace on the same file: edits merge.
                 }
-                Some(&prior_kind) => {
-                    return Some((norm, prior_kind, kind));
+                Some((prior_kind, prior_display)) => {
+                    return Some((prior_display.clone(), *prior_kind, kind));
                 }
                 None => {
-                    seen.insert(norm, kind);
+                    seen.insert(key, (kind, display));
                 }
             }
         }
@@ -780,7 +799,9 @@ impl ToolRegistry {
         // `search_replace` then `move_file` on the same source discards the
         // edit) while reporting both `"applied"`. Repeated `search_replace`
         // ops on one path are exempt — their edits accumulate.
-        if let Some((path, first_kind, second_kind)) = detect_apply_patch_path_conflict(&raw_ops) {
+        if let Some((path, first_kind, second_kind)) =
+            detect_apply_patch_path_conflict(&self.root, &raw_ops)
+        {
             return make_result(
                 call,
                 ToolStatus::Error,
@@ -921,7 +942,8 @@ impl ToolRegistry {
         let mut staged = StagedApply::default();
         let mut preview_ops = Vec::new();
         for (index, op) in raw_ops.iter().enumerate() {
-            match self.stage_apply_patch_op(call, index, op, &mut staged, &mut preview_ops) {
+            match self.stage_apply_patch_op(call, index, op, &mut staged, &mut preview_ops, dry_run)
+            {
                 Ok(()) => {}
                 Err(result) => return result,
             }

@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
 use squeezy_core::{
-    SeparatedSources, SqueezyError, load_separated_settings_sources,
+    OpenAiCompatiblePreset, SeparatedSources, SqueezyError, load_separated_settings_sources,
     settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits},
 };
 use squeezy_llm::{
@@ -125,6 +125,15 @@ const KNOWN_PROVIDERS: &[KnownProvider] = &[
         cli: "deepinfra",
         env: "DEEPINFRA_API_KEY",
         fallback_env: Some("DEEPINFRA_TOKEN"),
+    },
+    // Baseten's autoload env (`default_api_key_env`) is `BASETEN_API_KEY` with
+    // no documented alias (`preset_api_key_env_aliases` is empty), so mirror
+    // the runtime primary directly and leave the fallback slot unset.
+    KnownProvider {
+        section: "baseten",
+        cli: "baseten",
+        env: "BASETEN_API_KEY",
+        fallback_env: None,
     },
     // Local self-hosted OpenAI-compatible servers. They typically run without
     // authentication on a loopback port; the inline-key slot exists so users
@@ -881,30 +890,16 @@ pub(crate) fn provider_section_for(provider: &str) -> squeezy_core::Result<&'sta
 }
 
 fn static_section_name(provider: &str) -> &'static str {
-    // The set of OpenAI-compatible preset names is closed; resolve each to
-    // a literal &'static str instead of leaking the heap string.
-    match provider {
-        "openrouter" => "openrouter",
-        "vercel" => "vercel",
-        "portkey" => "portkey",
-        "groq" => "groq",
-        "xai" => "xai",
-        "deepseek" => "deepseek",
-        "vertex" => "vertex",
-        "mistral" => "mistral",
-        "together" => "together",
-        "fireworks" => "fireworks",
-        "cerebras" => "cerebras",
-        "deepinfra" => "deepinfra",
-        "lmstudio" => "lmstudio",
-        "vllm" => "vllm",
-        "llamacpp" => "llamacpp",
-        "openai_compatible" => "openai_compatible",
-        // Last-resort: fail closed if the caller passed something we
-        // can't statically map. A future provider should be wired into
-        // this match rather than silently leaking memory.
-        _ => "",
-    }
+    // Drive the section name straight from the registry so the CLI list can
+    // never drift from the providers the core resolver actually consumes:
+    // `OpenAiCompatiblePreset::as_str()` is the canonical `[providers.<section>]`
+    // name (e.g. "cloudflare_workers_ai", "cloudflare_ai_gateway", "baseten"),
+    // and `parse` also accepts the same aliases as the runtime. Fail closed to
+    // an empty string for genuinely unknown ids so the callers' empty-section
+    // guards keep rejecting them.
+    OpenAiCompatiblePreset::parse(provider)
+        .map(|preset| preset.as_str())
+        .unwrap_or("")
 }
 
 pub(crate) fn handle_auth_set(
@@ -1638,6 +1633,38 @@ fn current_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod section_round_trip_tests {
+    // Regression: cloudflare_workers_ai / cloudflare_ai_gateway / baseten are
+    // first-class OpenAI-compatible presets (`OpenAiCompatiblePreset::as_str`),
+    // and the core resolver reads `[providers.<section>].api_key` for each. The
+    // CLI must round-trip these ids to their canonical TOML section the same way
+    // `auth_set_resolves_deepinfra_to_canonical_section_name` documents for
+    // deepinfra; before the fix they fell through to "" and surfaced a
+    // misleading "unknown provider" error from set/remove/status.
+    use super::{KNOWN_PROVIDERS, provider_section_for};
+
+    #[test]
+    fn provider_section_for_round_trips_registry_presets() {
+        for id in ["cloudflare_workers_ai", "cloudflare_ai_gateway", "baseten"] {
+            let section = provider_section_for(id).expect("known provider");
+            assert_eq!(section, id, "{id} must map to its own TOML section");
+        }
+    }
+
+    #[test]
+    fn baseten_listed_in_known_providers_for_status() {
+        // `auth status baseten` looks up KNOWN_PROVIDERS by the resolved
+        // section, so the row must exist for the per-provider status view.
+        let baseten = KNOWN_PROVIDERS
+            .iter()
+            .find(|p| p.section == "baseten")
+            .expect("baseten known provider row");
+        assert_eq!(baseten.cli, "baseten");
+        assert_eq!(baseten.env, "BASETEN_API_KEY");
+    }
 }
 
 #[cfg(test)]

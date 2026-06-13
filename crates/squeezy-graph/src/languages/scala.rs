@@ -180,27 +180,26 @@ impl SemanticGraph {
             return None;
         }
         let candidates = self.symbols_by_name.get(&call.name)?;
-        let receiver_type = scala_call_receiver_type(call);
-        for candidate_id in candidates {
-            let Some(candidate) = self.symbols.get(candidate_id) else {
-                continue;
-            };
-            if !candidate
-                .attributes
-                .iter()
-                .any(|attribute| attribute == "scala:extension")
-            {
-                continue;
-            }
-            if let Some(receiver_type) = receiver_type.as_deref()
-                && let Some(identity) = candidate.language_identity.as_deref()
-                && identity != receiver_type
-            {
-                continue;
-            }
-            return Some(candidate.id.clone());
-        }
-        None
+        // Require a positive receiver-type match before binding. When the
+        // receiver type cannot be inferred we decline rather than guessing,
+        // mirroring Swift's `swift_extension_receiver_method` and Kotlin's
+        // `kotlin_extension_function_call`. Otherwise any unrelated
+        // `extension (x: T) def foo` would hijack a regular `obj.foo()`.
+        let receiver_type = scala_call_receiver_type(call)?;
+        let matches = candidates
+            .iter()
+            .filter_map(|candidate_id| self.symbols.get(candidate_id))
+            .filter(|candidate| {
+                candidate
+                    .attributes
+                    .iter()
+                    .any(|attribute| attribute == "scala:extension")
+                    && candidate.language_identity.as_deref() == Some(receiver_type.as_str())
+            })
+            .map(|candidate| candidate.id.clone());
+        // Use `single_symbol` so ambiguous matches do not silently bind to
+        // the first symbol by insertion order.
+        single_symbol(matches)
     }
 
     /// Top-level-def lookup: a Scala 3 `def`/`val`/`given` declared at file

@@ -4014,6 +4014,7 @@ impl ToolRegistry {
     /// validation failure, the returned `Err` is the final tool result the
     /// caller should return verbatim — no writes have happened yet.
     #[allow(clippy::result_large_err)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn stage_apply_patch_op(
         &self,
         call: &ToolCall,
@@ -4021,6 +4022,7 @@ impl ToolRegistry {
         op: &ApplyPatchOperation,
         staged: &mut StagedApply,
         preview_ops: &mut Vec<Value>,
+        dry_run: bool,
     ) -> std::result::Result<(), ToolResult> {
         match op {
             ApplyPatchOperation::SearchReplace {
@@ -4180,7 +4182,64 @@ impl ToolRegistry {
                     // if it would apply, materialise the result by reading the
                     // file after a real `git apply --3way`. The sha256 gate
                     // remains in place because we still recompute hashes.
+                    //
+                    // Under `dry_run` the apply phase is skipped and no
+                    // checkpoint snapshot was captured, so we must NOT invoke
+                    // the mutating `git apply` here: that would rewrite the
+                    // worktree during a contractual no-op preview with nothing
+                    // to roll back. Instead we run the non-mutating
+                    // `--check` preflight and record a preview-only op,
+                    // leaving `state.current` (and the file on disk)
+                    // untouched.
                     if matches!(fallback, Some(SearchReplaceFallback::UnifiedDiff)) {
+                        if dry_run {
+                            match self.vcs.preflight_unified_diff(search) {
+                                Ok(outcome) if outcome.applied => {
+                                    staged.mark_last_op_inexact(Some("unified_diff"));
+                                    preview_ops.push(json!({
+                                        "patch_index": index,
+                                        "kind": "search_replace",
+                                        "path": rel,
+                                        "fallback": "unified_diff",
+                                        "applied_via": "git_apply_3way_check",
+                                        "would_apply": true,
+                                        "exact": false,
+                                    }));
+                                    return Ok(());
+                                }
+                                Ok(outcome) => {
+                                    return Err(make_result(
+                                        call,
+                                        ToolStatus::Stale,
+                                        json!({
+                                            "error": "unified-diff fallback could not apply cleanly",
+                                            "path": rel,
+                                            "patch_index": index,
+                                            "conflicted_paths": outcome.conflicted_paths,
+                                            "skipped_paths": outcome.skipped_paths,
+                                            "stderr": outcome.stderr,
+                                        }),
+                                        ToolCostHint::default(),
+                                        Some(before_sha256),
+                                    ));
+                                }
+                                Err(err) => {
+                                    return Err(make_result(
+                                        call,
+                                        ToolStatus::Stale,
+                                        json!({
+                                            "error": format!(
+                                                "unified-diff fallback invocation failed: {err}"
+                                            ),
+                                            "path": rel,
+                                            "patch_index": index,
+                                        }),
+                                        ToolCostHint::default(),
+                                        Some(before_sha256),
+                                    ));
+                                }
+                            }
+                        }
                         match self.vcs.apply_unified_diff(search) {
                             Ok(outcome) if outcome.applied => {
                                 // Re-read after git apply mutated the file in

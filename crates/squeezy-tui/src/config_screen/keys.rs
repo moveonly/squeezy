@@ -97,10 +97,19 @@ pub(crate) fn handle_key(
         }
         (KeyCode::Tab, _) => {
             state.scope = state.scope.next();
+            // Permissions row visibility is per-scope (the displayed mode is
+            // resolved against the active tab's precedence chain), so the new
+            // tab can show fewer rows than the one we left. Clamp the cursor so
+            // later field-editing keys (Enter/Space/Ctrl+R) never call
+            // current_field() with an out-of-bounds index and panic.
+            state.field_index = state.field_index.min(state.row_count().saturating_sub(1));
             KeyOutcome::KeepOpen
         }
         (KeyCode::BackTab, _) => {
             state.scope = state.scope.prev();
+            // See the Tab arm: clamp the cursor to the new tab's row count to
+            // avoid an out-of-bounds current_field() panic.
+            state.field_index = state.field_index.min(state.row_count().saturating_sub(1));
             KeyOutcome::KeepOpen
         }
         (KeyCode::Left, _) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {

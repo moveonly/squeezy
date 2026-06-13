@@ -77,10 +77,21 @@ fn resolve_endpoint_url_joins_relative_path() {
 }
 
 #[test]
-fn resolve_endpoint_url_preserves_absolute_url() {
-    let joined = resolve_endpoint_url("https://example.test/sse", "https://other.test/post")
+fn resolve_endpoint_url_preserves_same_origin_absolute_url() {
+    // An absolute endpoint that shares the SSE url's origin is accepted verbatim.
+    let joined = resolve_endpoint_url("https://example.test/sse", "https://example.test/post")
         .expect("resolves");
-    assert_eq!(joined, "https://other.test/post");
+    assert_eq!(joined, "https://example.test/post");
+}
+
+#[test]
+fn resolve_endpoint_url_rejects_cross_origin_absolute_url() {
+    // A server-advertised endpoint on a different origin must be refused: the
+    // JSON-RPC POSTs carry the bearer token and secret headers, so honoring a
+    // cross-origin endpoint would leak them to an attacker-controlled host.
+    let err = resolve_endpoint_url("https://example.test/sse", "https://other.test/post")
+        .expect_err("cross-origin rejected");
+    assert!(matches!(err, SseTransportError::InvalidUrl { .. }));
 }
 
 #[test]

@@ -4440,7 +4440,15 @@ fn split_unified_patch(
         if let Some(path) = path {
             let truncated = buffer.len() > max_bytes;
             let text = if truncated {
-                buffer[..max_bytes].to_string()
+                // `max_bytes` is a raw byte cap; snap it down to the nearest
+                // UTF-8 char boundary so slicing never lands mid-codepoint.
+                // Indices 0..=max_bytes are valid here (max_bytes <= len) and
+                // 0 is always a boundary, so the search always succeeds.
+                let end = (0..=max_bytes)
+                    .rev()
+                    .find(|&i| buffer.is_char_boundary(i))
+                    .unwrap_or(0);
+                buffer[..end].to_string()
             } else {
                 std::mem::take(buffer)
             };

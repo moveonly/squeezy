@@ -234,7 +234,10 @@ fn copy_tree_ignore_respecting(source: &Path, target: &Path) -> Result<(), EvalE
 /// run still reading files there.
 fn github_scratch_dir(scratch_root: &Path, repo: &str, sha: &str) -> PathBuf {
     let slug = sanitize(repo);
-    let short_sha = &sha[..short_sha_len(sha)];
+    // Truncate on a char boundary, not a byte index: `sha` is untrusted
+    // scenario input and slicing `&sha[..12]` would panic when byte 12
+    // lands inside a multibyte UTF-8 char. Mirrors `view::short`.
+    let short_sha: String = sha.chars().take(12).collect();
     let ns_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -258,10 +261,6 @@ fn sanitize(repo: &str) -> String {
         .chars()
         .take(40)
         .collect()
-}
-
-fn short_sha_len(sha: &str) -> usize {
-    sha.len().min(12)
 }
 
 fn run_git(args: &[&str]) -> Result<(), EvalError> {

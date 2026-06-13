@@ -339,7 +339,13 @@ fn changed_byte_ranges_from_patch(patch: &str, text: &str) -> Vec<ChangedByteRan
             new_line = parse_hunk_new_start(line).unwrap_or(1);
             continue;
         }
-        if new_line == 0 || line.starts_with("+++") || line.starts_with("---") {
+        // Before the first `@@`, `new_line == 0`, which already skips the
+        // unified-diff file headers (`+++ b/file`, `--- a/file`). Inside a
+        // hunk every body line carries a single-char prefix (`+`/`-`/` `), so
+        // classifying by that prefix alone correctly handles content lines
+        // whose text begins with `++`/`--` (e.g. `+++…` for an added `++i;`
+        // or a `+++` frontmatter delimiter, `----` for a deleted `---` rule).
+        if new_line == 0 {
             continue;
         }
         if line.starts_with('+') {
@@ -4652,6 +4658,45 @@ impl ToolRegistry {
         payload.insert("available".to_string(), json!(true));
         payload.insert("files".to_string(), json!(files));
         Value::Object(payload)
+    }
+}
+
+#[cfg(test)]
+mod changed_byte_ranges_from_patch_tests {
+    use super::{ChangedByteRange, changed_byte_ranges_from_patch};
+
+    #[test]
+    fn added_line_whose_content_starts_with_plus_plus_is_recorded_without_off_by_one() {
+        // New file content (post-edit). Line 2 (`++i;`) was added, so git emits
+        // it as `+` + `++i;` = `+++i;`, which the old `starts_with("+++")` guard
+        // wrongly treated as a file header: it dropped the range AND failed to
+        // advance new_line, throwing later line numbers off by one.
+        let text = "a\n++i;\nc";
+        let patch = "@@ -1,2 +1,3 @@\n a\n+++i;\n c\n";
+        let ranges = changed_byte_ranges_from_patch(patch, text);
+        // Exactly one modified range covering line 2 (the added `++i;`).
+        assert_eq!(
+            ranges,
+            vec![ChangedByteRange::new(2, 7, 2, 2, "modified")],
+            "added `++` content line must be recorded at the correct line number",
+        );
+    }
+
+    #[test]
+    fn deleted_line_whose_content_starts_with_dashes_is_recorded() {
+        // A `---` frontmatter/rule line was deleted, so git emits `-` + `---`
+        // = `----`, which the old `starts_with("---")` guard silently dropped.
+        let text = "a\nb";
+        let patch = "@@ -1,3 +1,2 @@\n a\n----\n b\n";
+        let ranges = changed_byte_ranges_from_patch(patch, text);
+        // The deletion is recorded (at new-side line 2, where it would land).
+        assert_eq!(
+            ranges.len(),
+            1,
+            "deleted `---` content line must be recorded"
+        );
+        assert_eq!(ranges[0].status, "deleted");
+        assert_eq!(ranges[0].start_line, 2);
     }
 }
 

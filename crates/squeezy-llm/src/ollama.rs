@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{
     CostSnapshot, OllamaConfig, OllamaRoute, OpenAiCompatiblePreset, ProviderTransportConfig,
-    Result, SqueezyError,
+    ReasoningEffort, Result, SqueezyError,
 };
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -219,12 +219,17 @@ fn think_value_for_request(request: &LlmRequest) -> Option<Value> {
         return None;
     }
     if is_gpt_oss {
-        // gpt-oss takes the OpenAI-style effort string. Default to "medium"
-        // when the caller did not specify so we still engage thinking.
-        let level = request
-            .reasoning_effort
-            .map(|effort| effort.as_str())
-            .unwrap_or("medium");
+        // gpt-oss on the native route only accepts `"low" | "medium" |
+        // "high"`, so we cannot forward `ReasoningEffort::as_str()` verbatim
+        // — `XHigh` would emit `"xhigh"`, which Ollama rejects. Clamp `XHigh`
+        // down to `"high"`, and default to `"medium"` when the caller did not
+        // specify so we still engage thinking. (The OpenAI-compat path, where
+        // `"xhigh"` is valid, is untouched.)
+        let level = match request.reasoning_effort {
+            Some(ReasoningEffort::Low) => "low",
+            Some(ReasoningEffort::High) | Some(ReasoningEffort::XHigh) => "high",
+            Some(ReasoningEffort::Medium) | None => "medium",
+        };
         return Some(Value::String(level.to_string()));
     }
     Some(Value::Bool(true))

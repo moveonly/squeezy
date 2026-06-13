@@ -100,10 +100,12 @@ fn dangerous_interpreter(segment: &str) -> Option<&'static str> {
         }
         break tok;
     };
-    let interpreter = match head {
-        "python" => "python",
-        "python2" => "python2",
-        "python3" => "python3",
+    // Normalize the head so path-qualified (`/usr/bin/python3`, `./python`)
+    // and version-suffixed (`python3.11`) invocations are not trivially
+    // mistaken for unknown programs. Strip directory components and, on
+    // Windows, a trailing `.exe`.
+    let program = interpreter_program_name(head);
+    let interpreter = match program {
         "node" => "node",
         "deno" => "deno",
         "ruby" => "ruby",
@@ -116,7 +118,11 @@ fn dangerous_interpreter(segment: &str) -> Option<&'static str> {
         "exec" => "exec",
         "sudo" => "sudo",
         "doas" => "doas",
-        _ => return None,
+        // Python ships under many version-suffixed names
+        // (`python`, `python2`, `python2.7`, `python3`, `python3.11`, …);
+        // collapse them to the major-series label so inline-code forms
+        // surface regardless of the suffix.
+        other => python_series_label(other)?,
     };
     // `sudo`, `doas`, `eval`, `exec` are always elevation/arbitrary-code
     // verbs regardless of args, so deny on bare head match.
@@ -137,6 +143,60 @@ fn dangerous_interpreter(segment: &str) -> Option<&'static str> {
         Some(interpreter)
     } else {
         None
+    }
+}
+
+/// Reduces an argv head to its program name for interpreter/elevation
+/// matching: strips POSIX (`/`) and Windows (`\`) directory components so
+/// `/usr/bin/python3` and `.\sudo.exe` are matched the same as their bare
+/// forms, and trims a trailing `.exe` (case-insensitive) so Windows
+/// executable names line up with the lowercase table above. This keeps the
+/// structural safety floor from being defeated by a leading path or an
+/// `.exe` suffix.
+fn interpreter_program_name(head: &str) -> &str {
+    let base = head
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|component| !component.is_empty())
+        .unwrap_or(head);
+    // Trim a trailing `.exe` case-insensitively (`.exe`, `.EXE`, `.Exe`, …)
+    // without allocating in the common (no-suffix) path. Compare the final
+    // four bytes directly so we never slice at a non-char boundary: a match
+    // means those bytes are the ASCII `.exe` suffix, which is a valid cut.
+    if let Some(cut) = base.len().checked_sub(4) {
+        let suffix = &base.as_bytes()[cut..];
+        if suffix.eq_ignore_ascii_case(b".exe") {
+            return &base[..cut];
+        }
+    }
+    base
+}
+
+/// Maps a Python program name to its major-series label, accepting the
+/// version-suffixed names interpreters ship under (`python`, `python2`,
+/// `python2.7`, `python3`, `python3.11`, …). Returns `None` for anything
+/// that is not part of the Python family so callers can fall through.
+fn python_series_label(program: &str) -> Option<&'static str> {
+    if program == "python" {
+        return Some("python");
+    }
+    // After the `python` prefix the remainder must be a series digit
+    // (`2`/`3`) optionally followed by a dotted minor version
+    // (`.7`, `.11`), e.g. `python3`, `python3.11`. This avoids matching
+    // unrelated programs that merely begin with `python` (`pythonista`).
+    let series = program.strip_prefix("python")?;
+    let (major, rest) = series.split_at(series.find('.').unwrap_or(series.len()));
+    if let Some(minor) = rest.strip_prefix('.') {
+        if minor.is_empty() || !minor.chars().all(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+    } else if !rest.is_empty() {
+        return None;
+    }
+    match major {
+        "2" => Some("python2"),
+        "3" => Some("python3"),
+        _ => None,
     }
 }
 

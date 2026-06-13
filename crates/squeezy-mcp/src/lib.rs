@@ -1478,19 +1478,27 @@ impl McpClientRegistry {
     ) -> McpResult<Vec<Resource>> {
         let mut collected = Vec::new();
         let mut cursor = None;
+        let mut seen: BTreeSet<String> = BTreeSet::new();
         loop {
             let result = self
                 .list_resources_page(server_name, server, cursor.clone(), cancel.clone())
                 .await?;
             collected.extend(result.resources);
             match result.next_cursor {
-                Some(next) if cursor.as_ref() == Some(&next) => {
-                    return Err(McpError::Transport {
-                        server: server_name.to_string(),
-                        message: "resources/list returned duplicate cursor".to_string(),
-                    });
+                Some(next) => {
+                    // Guard against a malicious/buggy server cycling cursors
+                    // (e.g. A -> B -> A -> ...) which would otherwise loop
+                    // forever and grow `collected` until OOM. Tracking every
+                    // cursor we have already requested catches cycles of any
+                    // length, including immediate self-repeats.
+                    if !seen.insert(next.clone()) {
+                        return Err(McpError::Transport {
+                            server: server_name.to_string(),
+                            message: "resources/list returned a repeating cursor".to_string(),
+                        });
+                    }
+                    cursor = Some(next);
                 }
-                Some(next) => cursor = Some(next),
                 None => return Ok(collected),
             }
         }
@@ -1504,19 +1512,28 @@ impl McpClientRegistry {
     ) -> McpResult<Vec<rmcp::model::ResourceTemplate>> {
         let mut collected = Vec::new();
         let mut cursor = None;
+        let mut seen: BTreeSet<String> = BTreeSet::new();
         loop {
             let result = self
                 .list_resource_templates_page(server_name, server, cursor.clone(), cancel.clone())
                 .await?;
             collected.extend(result.resource_templates);
             match result.next_cursor {
-                Some(next) if cursor.as_ref() == Some(&next) => {
-                    return Err(McpError::Transport {
-                        server: server_name.to_string(),
-                        message: "resources/templates/list returned duplicate cursor".to_string(),
-                    });
+                Some(next) => {
+                    // Guard against a malicious/buggy server cycling cursors
+                    // (e.g. A -> B -> A -> ...) which would otherwise loop
+                    // forever and grow `collected` until OOM. Tracking every
+                    // cursor we have already requested catches cycles of any
+                    // length, including immediate self-repeats.
+                    if !seen.insert(next.clone()) {
+                        return Err(McpError::Transport {
+                            server: server_name.to_string(),
+                            message: "resources/templates/list returned a repeating cursor"
+                                .to_string(),
+                        });
+                    }
+                    cursor = Some(next);
                 }
-                Some(next) => cursor = Some(next),
                 None => return Ok(collected),
             }
         }

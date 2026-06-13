@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::LazyLock,
     time::{Duration, Instant, SystemTime},
@@ -168,8 +168,23 @@ impl WebHttpClient for ReqwestWebHttpClient {
 
     fn get<'a>(&'a self, url: Url, max_response_bytes: usize) -> WebHttpFuture<'a> {
         Box::pin(async move {
-            let response = self
-                .client
+            // Resolve and SSRF-validate the host ourselves, then pin the dialed
+            // IP to the validated address so reqwest does not perform a second,
+            // independent DNS lookup (which an attacker could rebind to an
+            // internal IP between validation and connect — DNS-rebinding TOCTOU).
+            let pinned_ip = ensure_url_allowed(&url).await?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| "URL has no host".to_string())?;
+            // Port 0 tells reqwest to use the URL's port (or the scheme default),
+            // while the IP is fixed to the address we already validated. This
+            // preserves the Host header and TLS SNI from the original hostname.
+            let client = reqwest::Client::builder()
+                .redirect(Policy::none())
+                .resolve(host, SocketAddr::new(pinned_ip, 0))
+                .build()
+                .map_err(|err| format!("failed to create HTTP client: {err}"))?;
+            let response = client
                 .get(url)
                 .header(
                     ACCEPT,
@@ -1008,12 +1023,27 @@ fn parse_http_url(raw: &str) -> std::result::Result<Url, String> {
 
 /// True for addresses that must never be reached by `webfetch`: loopback,
 /// unspecified, link-local (incl. cloud IMDS `169.254.169.254` and IPv6
-/// `fe80::/10`), and private / unique-local ranges (RFC1918, `fc00::/7`).
-/// This blocks SSRF to internal hosts and instance-metadata endpoints.
+/// `fe80::/10`), private / unique-local ranges (RFC1918, `fc00::/7`),
+/// shared/CGNAT space (`100.64.0.0/10`, RFC 6598), the `0.0.0.0/8`
+/// "this network" block, IETF protocol assignments (`192.0.0.0/24`), and the
+/// limited broadcast address. This blocks SSRF to internal/shared-tenancy
+/// hosts and instance-metadata endpoints.
 fn ip_is_blocked(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_unspecified() || v4.is_link_local() || v4.is_private()
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_link_local()
+                || v4.is_private()
+                // 0.0.0.0/8 "this network" (is_unspecified only matches 0.0.0.0).
+                || o[0] == 0
+                // 100.64.0.0/10 shared address space / CGNAT (RFC 6598).
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                // 192.0.0.0/24 IETF protocol assignments (RFC 6890).
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                // Limited broadcast 255.255.255.255.
+                || v4.is_broadcast()
         }
         IpAddr::V6(v6) => {
             v6.is_loopback()
@@ -1028,11 +1058,19 @@ fn ip_is_blocked(ip: &IpAddr) -> bool {
     }
 }
 
-/// Rejects `webfetch` targets that resolve to internal addresses. Literal-IP
-/// hosts are checked directly; hostnames (including `localhost`) are resolved
-/// and rejected if *any* resolved address is internal, defeating DNS rebinding.
-/// Re-run on every redirect hop, since the host can change between hops.
-async fn ensure_url_allowed(url: &Url) -> std::result::Result<(), String> {
+/// Rejects `webfetch` targets that resolve to internal addresses and returns
+/// the single validated IP that the caller must dial. Literal-IP hosts are
+/// checked directly; hostnames (including `localhost`) are resolved and
+/// rejected if *any* resolved address is internal (defeating DNS round-robin
+/// where every record is returned in one lookup).
+///
+/// The returned address must be pinned for the actual connection (see
+/// `ReqwestWebHttpClient::get`). This is what prevents DNS rebinding: without
+/// pinning, reqwest would perform its own second DNS lookup at connect time
+/// and an attacker controlling the host's DNS could return a public IP here
+/// and an internal IP for the connect — a TOCTOU bypass. Re-run on every
+/// redirect hop, since the host can change between hops.
+async fn ensure_url_allowed(url: &Url) -> std::result::Result<IpAddr, String> {
     let host = url
         .host_str()
         .ok_or_else(|| "URL has no host".to_string())?;
@@ -1042,24 +1080,25 @@ async fn ensure_url_allowed(url: &Url) -> std::result::Result<(), String> {
         return if ip_is_blocked(&ip) {
             Err(blocked)
         } else {
-            Ok(())
+            Ok(ip)
         };
     }
 
     let port = url.port_or_known_default().unwrap_or(0);
-    let mut resolved = tokio::net::lookup_host((host, port))
+    let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
         .map_err(|err| format!("failed to resolve host: {err}"))?
-        .peekable();
-    if resolved.peek().is_none() {
-        return Err("failed to resolve host".to_string());
-    }
-    for addr in resolved {
+        .collect();
+    let first = resolved
+        .first()
+        .ok_or_else(|| "failed to resolve host".to_string())?
+        .ip();
+    for addr in &resolved {
         if ip_is_blocked(&addr.ip()) {
             return Err(blocked);
         }
     }
-    Ok(())
+    Ok(first)
 }
 
 pub(crate) fn web_url_host(raw: &str) -> std::result::Result<String, String> {
@@ -1340,3 +1379,48 @@ enum WebFetchOutcome {
 #[cfg(test)]
 #[path = "web_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod ssrf_range_tests {
+    use super::*;
+
+    #[test]
+    fn ip_is_blocked_covers_cgnat_this_network_and_broadcast() {
+        // RFC 6598 shared address space / CGNAT and the rest of 0.0.0.0/8 were
+        // previously not blocked, allowing SSRF to internal/shared-tenancy
+        // services. They must now be refused.
+        let blocked = [
+            "100.64.0.1",
+            "100.96.0.1",
+            "100.127.255.255",
+            "0.1.2.3",
+            "192.0.0.1",
+            "255.255.255.255",
+        ];
+        for raw in blocked {
+            let ip: IpAddr = raw.parse().expect("parse ip");
+            assert!(ip_is_blocked(&ip), "expected {raw} to be blocked");
+        }
+
+        // Adjacent public addresses just outside the CGNAT range stay allowed.
+        let allowed = ["100.63.255.255", "100.128.0.1"];
+        for raw in allowed {
+            let ip: IpAddr = raw.parse().expect("parse ip");
+            assert!(!ip_is_blocked(&ip), "expected {raw} to be allowed");
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_url_allowed_returns_validated_literal_ip() {
+        // The validated IP is returned so the caller can pin the dialed
+        // address, closing the DNS-rebinding TOCTOU.
+        let url = Url::parse("http://1.1.1.1/").expect("parse url");
+        assert_eq!(
+            ensure_url_allowed(&url).await,
+            Ok(IpAddr::from([1, 1, 1, 1]))
+        );
+
+        let url = Url::parse("http://100.64.0.1/").expect("parse url");
+        assert!(ensure_url_allowed(&url).await.is_err());
+    }
+}

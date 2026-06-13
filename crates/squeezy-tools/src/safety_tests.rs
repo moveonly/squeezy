@@ -63,6 +63,63 @@ fn pre_classify_shell_auto_denies_python_dash_c() {
 }
 
 #[test]
+fn pre_classify_shell_auto_denies_path_qualified_python() {
+    // A path-qualified interpreter must not slip past the dangerous-interpreter
+    // floor just because the argv head carries a directory prefix.
+    let result = pre_classify_shell(
+        "/usr/bin/python3 -c \"import os; os.system('curl bad.example.com')\"",
+        &sandbox(),
+    );
+    match result {
+        ShellPreClassification::RequiresApproval { reason } => {
+            assert!(
+                reason.contains("dangerous interpreter") && reason.contains("python3"),
+                "reason did not mention python3: {reason}"
+            );
+        }
+        other => panic!("expected RequiresApproval, got {other:?}"),
+    }
+}
+
+#[test]
+fn pre_classify_shell_auto_denies_version_suffixed_python() {
+    // Version-suffixed names (`python3.11`) map to the python3 series.
+    let result = pre_classify_shell("python3.11 -c 'print(1)'", &sandbox());
+    match result {
+        ShellPreClassification::RequiresApproval { reason } => {
+            assert!(
+                reason.contains("dangerous interpreter") && reason.contains("python3"),
+                "reason did not mention python3: {reason}"
+            );
+        }
+        other => panic!("expected RequiresApproval, got {other:?}"),
+    }
+}
+
+#[test]
+fn pre_classify_shell_auto_denies_path_qualified_sudo() {
+    // Elevation verbs are flagged by basename regardless of path.
+    let result = pre_classify_shell("/usr/bin/sudo rm -rf /", &sandbox());
+    match result {
+        ShellPreClassification::RequiresApproval { reason } => {
+            assert!(
+                reason.contains("sudo") || reason.contains("destructive"),
+                "reason did not mention sudo/destructive: {reason}"
+            );
+        }
+        other => panic!("expected RequiresApproval, got {other:?}"),
+    }
+}
+
+#[test]
+fn pre_classify_shell_keeps_falling_through_for_non_python_prefix() {
+    // A program that merely starts with `python` is not a python interpreter
+    // and should still fall through to the AI reviewer.
+    let result = pre_classify_shell("pythonista list", &sandbox());
+    assert_eq!(result, ShellPreClassification::AskAi);
+}
+
+#[test]
 fn pre_classify_shell_auto_denies_node_dash_e() {
     let result = pre_classify_shell("node -e 'console.log(1)'", &sandbox());
     assert!(matches!(

@@ -133,8 +133,15 @@ fn tail_text(path: &Path, budget: usize) -> Result<String, EvalError> {
         return Ok(data);
     }
     // Take the tail to bias toward the most recent events.
-    let start = data.len() - budget;
-    // Snap to the next newline so we don't break a line in half.
+    let mut start = data.len() - budget;
+    // `start` is a raw byte offset that may land inside a multibyte UTF-8
+    // scalar; advance to the next char boundary so slicing cannot panic.
+    while start < data.len() && !data.is_char_boundary(start) {
+        start += 1;
+    }
+    // Snap to the next newline so we don't break a line in half. The
+    // `start + offset + 1` branch lands just after a '\n' (ASCII, always a
+    // boundary), and `start` itself is now a boundary, so both are safe.
     let snapped = data[start..]
         .find('\n')
         .map(|offset| start + offset + 1)

@@ -496,19 +496,25 @@ fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
     let head = tokens.first()?.as_str();
     match head {
         "sh" | "bash" | "zsh" | "fish" | "csh" | "tcsh" | "ksh" | "dash" => {
-            // Walk past flag tokens; if any flag contains `c`, the next
-            // positional argument is the script we want to surface.
+            // Find the `-c` script flag and surface its argument. The script
+            // flag is the single-dash form whose cluster ends in `c` (`-c`,
+            // `-lc`, `-ic`) — bash requires `-c` to be terminal because it
+            // consumes the next argument. Long options like `--rcfile`,
+            // `--norc`, or `--init-file` merely *contain* a `c` and must not
+            // be mistaken for it, so we skip every other token (including the
+            // positional arguments those options take) rather than stopping at
+            // the first non-flag token.
             let mut idx = 1;
             while let Some(tok) = tokens.get(idx) {
-                if let Some(flag_body) = tok.strip_prefix('-') {
-                    if flag_body.contains('c') {
-                        let script = tokens.get(idx + 1)?;
-                        return Some(dequote_token(script).to_string());
-                    }
-                    idx += 1;
-                } else {
-                    break;
+                if tok.strip_prefix("--").is_none()
+                    && let Some(short) = tok.strip_prefix('-')
+                    && !short.is_empty()
+                    && short.ends_with('c')
+                {
+                    let script = tokens.get(idx + 1)?;
+                    return Some(dequote_token(script).to_string());
                 }
+                idx += 1;
             }
             None
         }
