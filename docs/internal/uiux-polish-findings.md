@@ -20,7 +20,7 @@ Disposition legend: ✅ **fix** = scheduled as a commit in this PR · 🕓 **def
 | high | bug | prompt-queue | `collapsed-group-duplicate-header` | ✅ fix |
 | high | bug | sessions-history-nav | `bookmark-drop-hint-wrong-key` | ✅ fix |
 | high | bug | subagents | `compare-invisible-modal-eats-input` | ✅ fix |
-| medium | polish | clipboard-selection | `clipboard-clear-no-confirm-wipes-pins` | 🕓 deferred |
+| medium | polish | clipboard-selection | `clipboard-clear-no-confirm-wipes-pins` | ✅ fix |
 | medium | consistency | clipboard-selection | `copy-status-toast-unit-mismatch` | ✅ fix |
 | medium | bug | config-settings | `mcp-add-transport-backspace-clobbers-name` | ✅ fix |
 | medium | bug | diff-review-approval | `edit-approval-paths-silently-capped` | ✅ fix |
@@ -35,66 +35,66 @@ Disposition legend: ✅ **fix** = scheduled as a commit in this PR · 🕓 **def
 | medium | bug | lib-hints-help | `scratchpad-hardcoded-alt4` | ✅ fix |
 | medium | bug | lib-hints-help | `snippets-hardcoded-alt3` | ✅ fix |
 | medium | improvement | palettes-commands | `command-palette-no-paging-keys` | ✅ fix |
-| medium | bug | palettes-commands | `command-palette-overwrites-composer-draft` | 🕓 deferred |
+| medium | bug | palettes-commands | `command-palette-overwrites-composer-draft` | ✅ fix |
 | medium | consistency | palettes-commands | `palette-vim-j-divergent-meaning` | 🕓 deferred |
 | medium | consistency | prompt-queue | `open-status-vs-header-hint-divergence` | ✅ fix |
 | medium | polish | prompt-queue | `run-next-front-busy-silent-noop` | ✅ fix |
 | medium | bug | prompt-queue | `section-glyph-in-condition-status` | ✅ fix |
 | medium | accessibility | render-theme | `highcontrast-selection-surface-invisible` | ✅ fix |
-| medium | bug | render-theme | `table-width-cjk-miscount` | 🕓 deferred |
-| medium | bug | sessions-history-nav | `resume-picker-label-truncate-char-vs-width` | 🕓 deferred |
+| medium | bug | render-theme | `table-width-cjk-miscount` | ✅ fix |
+| medium | bug | sessions-history-nav | `resume-picker-label-truncate-char-vs-width` | ✅ fix |
 | medium | consistency | sessions-history-nav | `semantic-filter-stale-step-lands-on-all` | ✅ fix |
 | medium | bug | subagents | `promote-fence-language-tag-leak` | ✅ fix |
 | medium | consistency | subagents | `timeline-unfiltered-title-misleading` | ✅ fix |
-| low | polish | clipboard-selection | `clipboard-clear-empty-false-feedback` | 🕓 deferred |
-| low | consistency | clipboard-selection | `clipboard-history-open-hint-missing-pin` | 🕓 deferred |
-| low | consistency | config-settings | `esc-unsaved-edits-message-contradictory` | 🕓 deferred |
+| low | polish | clipboard-selection | `clipboard-clear-empty-false-feedback` | ✅ fix |
+| low | consistency | clipboard-selection | `clipboard-history-open-hint-missing-pin` | ✅ fix |
+| low | consistency | config-settings | `esc-unsaved-edits-message-contradictory` | ✅ fix |
 | low | consistency | config-settings | `mcp-add-row-enter-ignores-session-only` | 🕓 deferred |
 | low | improvement | config-settings | `secret-entry-repo-scope-refused-too-late` | 🕓 deferred |
 | low | consistency | config-settings | `secret-reveal-doc-comment-stale-ctrl-t` | 🕓 deferred |
-| low | polish | config-settings | `statusline-list-no-scroll-indicators` | 🕓 deferred |
-| low | polish | config-settings | `theme-detail-rows-dead-term` | 🕓 deferred |
-| low | bug | diff-review-approval | `annotation-cursor-skips-current-entry-notes` | 🕓 deferred |
+| low | polish | config-settings | `statusline-list-no-scroll-indicators` | ✅ fix |
+| low | polish | config-settings | `theme-detail-rows-dead-term` | ✅ fix |
+| low | bug | diff-review-approval | `annotation-cursor-skips-current-entry-notes` | ✅ fix |
 | low | bug | diff-review-approval | `edit-approval-path-comma-split` | 🕓 deferred |
-| low | polish | diff-review-approval | `review-card-elapsed-no-hour-rollover` | 🕓 deferred |
+| low | polish | diff-review-approval | `review-card-elapsed-no-hour-rollover` | ✅ fix |
 | low | consistency | feedback-onboarding-a11y | `cachehit-doc-vs-render-mismatch` | 🕓 deferred |
-| low | polish | feedback-onboarding-a11y | `startup-picker-height2-no-below-affordance` | 🕓 deferred |
+| low | polish | feedback-onboarding-a11y | `startup-picker-height2-no-below-affordance` | ✅ fix |
 | low | consistency | input-composer | `freeform-hint-dotted-row-wording` | ✅ fix |
 | low | consistency | input-composer | `history-down-no-feedback` | ❌ rejected |
-| low | consistency | input-composer | `mention-popup-no-wrap-inconsistent` | 🕓 deferred |
-| low | consistency | input-composer | `paste-summary-stat-order-divergence` | 🕓 deferred |
+| low | consistency | input-composer | `mention-popup-no-wrap-inconsistent` | ✅ fix |
+| low | consistency | input-composer | `paste-summary-stat-order-divergence` | ✅ fix |
 | low | consistency | keybindings | `editor-browse-status-hint-stale` | ✅ fix |
 | low | polish | keybindings | `editor-pagekey-fixed-10` | 🕓 deferred |
 | low | consistency | keybindings | `gesture-key-doc-inverted` | 🕓 deferred |
 | low | consistency | keybindings | `gesture-settings-no-vim-nav` | 🕓 deferred |
 | low | bug | keybindings | `shift-alnum-binding-dead` | ❌ rejected |
-| low | bug | layout-panes | `breadcrumb-label-cap-char-vs-cell` | 🕓 deferred |
-| low | polish | layout-panes | `breadcrumb-search-label-double-clean` | 🕓 deferred |
-| low | bug | layout-panes | `breadcrumb-two-crumb-no-truncation` | 🕓 deferred |
-| low | polish | layout-panes | `model-overlay-blank-footer-row` | 🕓 deferred |
+| low | bug | layout-panes | `breadcrumb-label-cap-char-vs-cell` | ✅ fix |
+| low | polish | layout-panes | `breadcrumb-search-label-double-clean` | ✅ fix |
+| low | bug | layout-panes | `breadcrumb-two-crumb-no-truncation` | ✅ fix |
+| low | polish | layout-panes | `model-overlay-blank-footer-row` | ✅ fix |
 | low | consistency | layout-panes | `smart-split-stacked-floor-comment` | 🕓 deferred |
-| low | consistency | lib-hints-help | `feedback-ready-status-omits-yn` | 🕓 deferred |
+| low | consistency | lib-hints-help | `feedback-ready-status-omits-yn` | ✅ fix |
 | low | polish | lib-hints-help | `request-userinput-dotted-row-copy` | ✅ fix |
 | low | consistency | lib-hints-help | `scratchpad-nonempty-hint-incomplete` | ✅ fix |
-| low | improvement | palettes-commands | `command-palette-double-rescore-per-frame` | 🕓 deferred |
+| low | improvement | palettes-commands | `command-palette-double-rescore-per-frame` | ✅ fix |
 | low | polish | palettes-commands | `command-palette-hint-omits-ctrl-pn` | 🕓 deferred |
 | low | polish | prompt-queue | `merge-verb-undiscoverable` | 🕓 deferred |
-| low | consistency | prompt-queue | `multiselect-empty-checkbox-always-on` | 🕓 deferred |
-| low | bug | render-theme | `ansi-fallback-leaves-non-csi-escapes` | 🕓 deferred |
-| low | accessibility | render-theme | `ansi16-quantize-missing-bright-colors` | 🕓 deferred |
-| low | consistency | render-theme | `button-ignores-glyph-and-unicode-mode` | 🕓 deferred |
-| low | polish | render-theme | `spinner-drift-rail-interval-mismatch` | 🕓 deferred |
-| low | polish | render-theme | `table-partial-label-coloring` | 🕓 deferred |
+| low | consistency | prompt-queue | `multiselect-empty-checkbox-always-on` | ✅ fix |
+| low | bug | render-theme | `ansi-fallback-leaves-non-csi-escapes` | ✅ fix |
+| low | accessibility | render-theme | `ansi16-quantize-missing-bright-colors` | ✅ fix |
+| low | consistency | render-theme | `button-ignores-glyph-and-unicode-mode` | ✅ fix |
+| low | polish | render-theme | `spinner-drift-rail-interval-mismatch` | ✅ fix |
+| low | polish | render-theme | `table-partial-label-coloring` | ✅ fix |
 | low | bug | render-theme | `truncate-chars-byte-trim-panic` | ✅ fix |
-| low | polish | sessions-history-nav | `timeline-clock-column-minutes-unbounded` | 🕓 deferred |
+| low | polish | sessions-history-nav | `timeline-clock-column-minutes-unbounded` | ✅ fix |
 | low | consistency | subagents | `compare-hardcoded-alt7-hint` | ✅ fix |
 | low | consistency | subagents | `subagent-preview-hardcoded-alt6-hint` | ✅ fix |
 | low | consistency | terminal-lifecycle | `cancel-edit-hint-double-surfaced` | ❌ rejected |
 | low | polish | terminal-lifecycle | `color-depth-no-backward-cycle` | 🕓 deferred |
-| low | improvement | terminal-lifecycle | `export-usage-omits-overwrite-token` | 🕓 deferred |
+| low | improvement | terminal-lifecycle | `export-usage-omits-overwrite-token` | ✅ fix |
 | low | polish | transcript-streaming | `dup-fold-output-plural` | ✅ fix |
 | low | consistency | transcript-streaming | `health-format-bytes-spacing` | ✅ fix |
-| low | consistency | transcript-streaming | `lane-fold-status-missing-bulk-verbs` | 🕓 deferred |
+| low | consistency | transcript-streaming | `lane-fold-status-missing-bulk-verbs` | ✅ fix |
 | low | polish | transcript-streaming | `lane-panel-error-plural` | ✅ fix |
 
 ---
@@ -159,7 +159,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `mention-popup-no-wrap-inconsistent` — @-mention popup navigation dead-ends at the ends while the slash menu wraps
 
-- **Severity:** low · **Category:** consistency · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** consistency · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/mention.rs:349`, `crates/squeezy-tui/src/mention.rs:355`
 - **Problem:** MentionPopup::move_up saturates at index 0 and move_down saturates at the last match with no wrap (mention.rs:349-359), so Down on the last entry / Up on the first is a silent no-op. The sibling slash-command menu wraps top-to-bottom (input.rs:1387-1396, move_slash_menu_selection uses modulo / wrap). Two composer popups that look and behave almost identically navigate differently, which is a small but real muscle-memory papercut.
 - **Fix:** Make the mention popup wrap to match the slash menu: in move_up, `self.selected = if self.selected == 0 { self.matches.len().saturating_sub(1) } else { self.selected - 1 };` and in move_down, `if !self.matches.is_empty() { self.selected = (self.selected + 1) % self.matches.len(); }`. Guard both against an empty match list.
@@ -168,7 +168,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `paste-summary-stat-order-divergence` — Paste preview and paste-transform headers list the same stats in different orders
 
-- **Severity:** low · **Category:** consistency · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** consistency · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/paste_preview.rs:137`, `crates/squeezy-tui/src/paste_transform.rs:327`
 - **Problem:** The very-large-paste confirmation header reads `"<chars> · <lines> · <bytes>"` (paste_preview.rs:137-144) while the structured-paste transform menu header reads `"<kind> · <lines> · <chars>"` (paste_transform.rs:327-334). Two adjacent paste questions present overlapping stats (chars/lines) in a different order and one drops bytes while the other drops kind, so a user who sees both in a session gets an inconsistent readout for the same conceptual summary.
 - **Fix:** Align the shared stats to one order. Simplest: make paste_preview's summary lead with lines then chars then bytes to match the transform menu's lines→chars ordering, i.e. `format!("{} · {} · {}", count_label(self.line_count, "line", "lines"), count_label(self.char_count, "char", "chars"), count_label(self.byte_count, "byte", "bytes"))` at paste_preview.rs:138-143. Leave the transform header's leading kind label intact.
@@ -179,7 +179,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `clipboard-clear-no-confirm-wipes-pins` — `c` (clear all) wipes pinned entries with no confirmation
 
-- **Severity:** medium · **Category:** polish · **Risk:** low · **Effort:** medium · **Disposition:** 🕓 deferred
+- **Severity:** medium · **Category:** polish · **Risk:** low · **Effort:** medium · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/lib.rs:10997`, `crates/squeezy-tui/src/lib.rs:18532`, `crates/squeezy-tui/src/clipboard_history.rs:326`
 - **Problem:** `ClipboardHistoryStore::clear()` is unconditional and drops EVERY entry, pinned included (clipboard_history.rs:326-329). Both the keyboard `c` (handle_clipboard_history_key:10997-11000) and the mouse `[ Clear all ]` button (lib.rs:18532-18536) call it with zero confirmation. Pinning an entry is the user's explicit signal that it must survive cap eviction, yet a single mistyped `c` while the modal is focused irrecoverably destroys all pinned copies. Every other destructive verb in this picker (delete) only removes one row; clear is the only mass-destructive action and it is the easiest to fire by accident.
 - **Fix:** Gate `clear` behind a one-keystroke confirm when any pinned entry exists. Minimal version: in handle_clipboard_history_key, when `c` is pressed and `app.clipboard_history.entries().iter().any(|e| e.pinned)`, instead of clearing immediately, set `app.status` to a `"press c again to clear N pinned copies, Esc to cancel"` prompt and a transient `clear_armed` flag; clear only on the second consecutive `c`. If adding state is undesirable, at minimum change the unpinned-safe path: have `c` clear only unpinned entries unless pressed twice (add a `clear_unpinned` method to the store that retains pinned). Apply the same guard to the mouse `ClipboardClear` arm at lib.rs:18532.
@@ -199,7 +199,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `clipboard-clear-empty-false-feedback` — Pressing `c`/`d` on an empty clipboard history reports false action feedback
 
-- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/lib.rs:10997`
 - **Problem:** With an empty history open, pressing `c` sets the status to `"clipboard history cleared"` (handle_clipboard_history_key:10997-11000) even though nothing existed to clear — it unconditionally calls `clear()` and reports success. (`d` is correctly a silent no-op via delete_selected_clipboard_entry's early return.) The empty-state header already tells the user there is nothing here, so a "cleared" confirmation is misleading feedback for a no-op.
 - **Fix:** In the `KeyCode::Char('c')` arm (lib.rs:10997), guard on non-emptiness: `if !app.clipboard_history.is_empty() { app.clipboard_history.clear(); app.status = "clipboard history cleared".to_string(); app.needs_redraw = true; }` so an empty-history `c` is a silent no-op like `d`.
@@ -208,7 +208,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `clipboard-history-open-hint-missing-pin` — Clipboard-history open hint omits the `p pin` verb the modal advertises
 
-- **Severity:** low · **Category:** consistency · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** consistency · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/lib.rs:10936`, `crates/squeezy-tui/src/lib.rs:26603`
 - **Problem:** When the clipboard-history picker opens, the status hint lists `↑↓ select · Enter re-copy · d delete · c clear · Esc close` (lib.rs:10936) but omits `p pin`, even though `p` is a real, handled key (handle_clipboard_history_key:10994 toggles the pin) and the in-modal header line explicitly advertises it: `... · Enter re-copy · d delete · p pin · c clear` (lib.rs:26603). A user reading only the open-toast never learns the pin affordance, which is the whole point of pinned retention. The two hint strings for the same picker disagree on the verb set.
 - **Fix:** Add `· p pin` to the open-status string at lib.rs:10936 so it reads `"clipboard history: {} — ↑↓ select · Enter re-copy · d delete · p pin · c clear · Esc close"`, matching the modal header at line 26603.
@@ -236,7 +236,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `command-palette-overwrites-composer-draft` — Running a slash command from the palette silently destroys an in-progress composer draft
 
-- **Severity:** medium · **Category:** bug · **Risk:** medium · **Effort:** medium · **Disposition:** 🕓 deferred
+- **Severity:** medium · **Category:** bug · **Risk:** medium · **Effort:** medium · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/lib.rs:14785`, `crates/squeezy-tui/src/input.rs:739`
 - **Problem:** drain_command_palette_run hands a chosen slash command to the composer with input::set_input(app, text) (lib.rs:14785). set_input (input.rs:739) does `app.input = input;` — a full replace that also clears prompt attachments. The command palette can be opened at any time, including while the user has a half-typed prompt in the composer; choosing a slash command from it then wipes that draft with no warning or undo. The status line afterward only says "<cmd> — Enter to send", giving no hint that text was lost.
 - **Fix:** In drain_command_palette_run (lib.rs ~14774), when app.input is non-empty and not already a slash command, prefer a non-destructive path: stash the draft (reuse the existing cancelled_prompt mechanism) before set_input, or append the slash command instead of replacing — minimally, guard `if !app.input.trim().is_empty()` and surface a status warning like "<cmd> queued — previous draft cleared" so the loss is at least acknowledged. Lowest-risk concrete fix: only call set_input when app.input is empty or itself starts with '/'; otherwise set status "composer has a draft — clear it first" and leave the buffer intact.
@@ -254,7 +254,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `command-palette-double-rescore-per-frame` — Command palette re-runs the full fuzzy filter 2-3x per frame/keystroke
 
-- **Severity:** low · **Category:** improvement · **Risk:** low · **Effort:** medium · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** improvement · **Risk:** low · **Effort:** medium · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/command_palette.rs:160`, `crates/squeezy-tui/src/command_palette.rs:178`, `crates/squeezy-tui/src/lib.rs:31789`
 - **Problem:** Each render of the command palette calls palette.visible() (command_palette.rs:160 — scores+sorts all ~150 entries) and palette.selected() (line 190 -> visible_len(), line 178 — scores all entries again). move_down/move_up also call visible_len(). So a single keystroke against a query re-scores the entire entry list two to three times, each pass also re-allocating each entry's haystack via format!. For a 150-entry list this is wasteful on the interactive path the codebase elsewhere optimizes for. Not a correctness bug — visible() and visible_len() agree — but redundant work on every frame the palette is open.
 - **Fix:** Compute the filtered+scored visible list once per render and derive the count and selected-clamp from it, instead of re-scoring in visible_len(). E.g. in render_command_palette_surface use `let visible = palette.visible();` (already done at lib.rs:31789) and pass its len to a `selected_within(visible.len())` accessor rather than calling palette.selected() which re-scores. Optionally cache PreparedQuery + the scored indices on the palette, invalidated in push_char/pop_char, so move_down/move_up reuse it.
@@ -348,7 +348,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `esc-unsaved-edits-message-contradictory` — Esc close message claims 'unsaved edits' when /config auto-saves everything
 
-- **Severity:** low · **Category:** consistency · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** consistency · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/config_screen/keys.rs:90`
 - **Problem:** On Esc with `state.dirty`, the screen emits "Closed with unsaved edits already applied. Re-open to view current state." But /config writes every change to its TOML tier immediately on Enter/Space (see save_field at keys.rs:81 and the auto-save note at keys.rs:458 "Saves are automatic on Enter / Space"). There are no unsaved edits at close — the phrase "unsaved edits already applied" is self-contradictory and will make a careful user think work was lost or left dangling.
 - **Fix:** Reword to reflect the auto-save reality, e.g. push "Edits were saved to disk and applied as you made them." (NotifySeverity::Info) at keys.rs:91-94. No behavior change; just the message string.
@@ -384,7 +384,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `statusline-list-no-scroll-indicators` — Status-line picker list scrolls with no ▲/▼ overflow indicators
 
-- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/status_line_setup.rs:328`, `crates/squeezy-tui/src/status_line_setup.rs:333`
 - **Problem:** `render_list` computes a scroll `offset` and renders `visible.iter()...skip(offset).take(visible_rows)`, but never emits an overflow hint. When the terminal is short enough that `offset > 0` or items remain below the window, rows simply vanish off both ends with no marker. Every other scrollable surface in this domain (the /config search list at render.rs:1488/1497, the model picker at render.rs:1643/1693, the sidebar at render.rs:1716/1747) shows `▲ N more above` / `▼ N more below`, so this list is the lone inconsistency and a user on a small window can't tell that filtered items exist beyond the viewport.
 - **Fix:** After the `visible_rows`/`offset` computation, when `offset > 0` push a leading `Line` like `format!("  ▲ {offset} more above")` styled `dim()`, and when `offset + visible_rows < visible.len()` push a trailing `format!("  ▼ {} more below", visible.len() - offset - visible_rows)`. Reduce the `take(visible_rows)` budget by the number of indicator rows added so the count math stays exact, mirroring `field_row_window`'s marker accounting.
@@ -393,7 +393,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `theme-detail-rows-dead-term` — Theme section row-window reserves rows via a term that is always zero
 
-- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/config_screen/render.rs:855`
 - **Problem:** In the non-editing branch of `render_theme_section`, `detail_rows = 4usize + usize::from(state.theme_editor.is_some()) * 4`. This branch is only reached when `editing` (i.e. `state.theme_editor.is_some()`) is false, so the `usize::from(...) * 4` term is always 0 and `detail_rows` is always 4. The dead term reads as if the layout reserves 4 extra rows when an editor block is appended, but the editing case returns earlier with a fixed single-row window, so the reservation never happens. It is harmless today but misleads anyone reasoning about why the theme list doesn't overlap the editor footer.
 - **Fix:** Replace `let detail_rows = 4usize + usize::from(state.theme_editor.is_some()) * 4;` with `let detail_rows = 4usize;` (render.rs:855), or drop the local and inline the constant, since the editor-open path is handled by the earlier `if editing` arm.
@@ -413,7 +413,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `table-width-cjk-miscount` — Markdown table column widths counted in chars, misaligning CJK/wide-glyph cells and dividers
 
-- **Severity:** medium · **Category:** bug · **Risk:** medium · **Effort:** medium · **Disposition:** 🕓 deferred
+- **Severity:** medium · **Category:** bug · **Risk:** medium · **Effort:** medium · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/render/markdown.rs:133`, `crates/squeezy-tui/src/render/markdown.rs:230`, `crates/squeezy-tui/src/render/markdown.rs:269`
 - **Problem:** TableCell::char_count() sums `run.text.chars().count()` and the column-width computation (`*width = (*width).max(...char_count())`), the divider (`repeat_n('-', width)`), and the per-cell padding (`width - visible_width` of char counts) all treat every character as one display cell. A cell containing CJK, full-width punctuation, or wide dingbats actually renders at 2 cells each in the terminal, so its column overflows its computed width, the ` | ` separators and the `-+-` divider row no longer line up with the data rows, and the whole table shears to the right. The render_spans padding likewise under-pads. This is the same class of bug the codebase already guards against elsewhere via term_display_width()/unicode-width.
 - **Fix:** Replace the char-count basis with display width: in TableCell::char_count() (rename to display_width) sum `unicode_width::UnicodeWidthStr::width(run.text.as_str())`, and in render_spans compute `visible_width` and the truncation budget via UnicodeWidthStr::width rather than chars().count(). The `-` divider and ` `-padding already use width counts, so feeding them display-width values makes them align. UnicodeWidth is already a dependency.
@@ -422,7 +422,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `ansi-fallback-leaves-non-csi-escapes` — ANSI strip fallback only removes CSI sequences, leaking raw OSC/DCS escape bytes into the rendered line
 
-- **Severity:** low · **Category:** bug · **Risk:** low · **Effort:** medium · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** bug · **Risk:** low · **Effort:** medium · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/render/ansi.rs:28`, `crates/squeezy-tui/src/render/ansi.rs:9`
 - **Problem:** When ansi_to_tui's into_text() fails to parse a string, ansi_to_text falls back to strip_escape_markers(), which only recognizes `\x1b[` (CSI: ESC + '[' + ... + final alpha). Any other escape form survives as raw control bytes in the output: OSC sequences (`\x1b]...`, e.g. hyperlink/title sequences terminated by BEL or ST), DCS (`\x1bP`), single-shift/charset escapes (`\x1b(`), and a bare lone `\x1b`. Those bytes get pushed verbatim into the Text and render as garbage / can desync the terminal. The fallback's whole purpose is to produce clean plain text, but it leaves a class of escapes intact.
 - **Fix:** Generalize strip_escape_markers to consume any ESC-introduced sequence: on `\x1b`, if the next byte is '[' consume up to the final byte in 0x40..=0x7e (current behavior); if it is ']' (OSC) consume until BEL (0x07) or ST (`\x1b\\`); for other intermediates consume the standard 2-byte form; and always drop the lone ESC itself. This guarantees the fallback emits only printable text.
@@ -431,7 +431,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `ansi16-quantize-missing-bright-colors` — ANSI16 quantization only considers 8 base colors, collapsing bright/dim theme tones to muddy darks
 
-- **Severity:** low · **Category:** accessibility · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** accessibility · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/render/palette.rs:147`, `crates/squeezy-tui/src/render/palette.rs:135`
 - **Problem:** quantize_rgb_to_ansi16 picks the nearest of ANSI16_COLORS, but that table holds only the 8 dark base colors (Black, Red(128 green for green), Blue 0/0/255, ...) and omits the 8 bright/light ANSI colors. On an Ansi16 terminal every themed color is snapped to one of 8 saturated darks: the default theme's soft starlight foreground [226,230,242] maps to White, but its muted/quiet greys [150,156,184]/[86,93,120] also map to White or Blue, the warm accent [216,185,112] maps to Yellow=255/255/0, and the green diff fg [143,217,176] vs the green status both collapse to the single Green. The result is a flattened, often low-contrast palette on exactly the legacy terminals that most need legibility, and several semantically distinct roles become indistinguishable (color-only signaling collapses).
 - **Fix:** Extend ANSI16_COLORS to the full 16-entry table by adding the bright variants (Color::DarkGray/Gray plus Color::LightRed/LightGreen/LightYellow/LightBlue/LightMagenta/LightCyan/White with their canonical RGBs, mirroring rgb_components()'s own mapping). With 16 candidates the nearest-color search separates fg from muted/quiet and bright accents from their dark base, restoring contrast and per-role distinction on 16-color terminals.
@@ -440,7 +440,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `button-ignores-glyph-and-unicode-mode` — Disclosure buttons hardcode ASCII >/v, inconsistent with the Unicode triangle disclosure used elsewhere
 
-- **Severity:** low · **Category:** consistency · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** consistency · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/render/button.rs:22`, `crates/squeezy-tui/src/render/button.rs:31`
 - **Problem:** ButtonState::glyph() returns the plain ASCII `>` (Collapsed) and `v` (Expanded) unconditionally, and button_spans builds ` > Label ` from them. Everywhere else the UI uses Unicode disclosure triangles (markdown/fold markers `\u{25b8}`/`\u{25be}`, the glyph_mode `fold_collapsed`/`fold_expanded` `\u{203a}`/`\u{2304}` and `expand`/`collapse` `\u{25b6}`/`\u{25bc}`). So on a fully Unicode-capable terminal these clickable buttons still render flat ASCII arrows, visually diverging from the rest of the chrome and from the module's own doc comment which claims a shared `>`/`v` disclosure pattern. The glyph_mode token table exists precisely to supply mode-appropriate fold glyphs.
 - **Fix:** Source the glyph from the active GlyphTokens instead of a literal: have ButtonState::glyph(tokens: GlyphTokens) return `tokens.fold_collapsed` / `tokens.fold_expanded` (which already degrade to `>`/`v` in Ascii mode), or at minimum default to the Unicode triangles `\u{25b8}`/`\u{25be}` to match the markdown fold markers. Update button_spans to take/resolve the tokens. Keeps the single-button primitive but makes it honor glyph mode like the rest of the chrome.
@@ -449,7 +449,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `spinner-drift-rail-interval-mismatch` — Drift rail marker uses a 600ms phase divisor that disagrees with the spinner's 620ms interval
 
-- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/render/spinner.rs:74`, `crates/squeezy-tui/src/render/spinner.rs:53`
 - **Problem:** SpinnerStyle::interval_ms() defines Drift's cadence as 620ms and frame() advances on that interval, but rail_marker()'s Drift arm advances its `\u{2726}`/`\u{2727}` twinkle on a hardcoded `elapsed_ms / 600`. The rail marker therefore beats at a slightly different (and faster) cadence than the in-field Drift spinner, so the two on-screen Drift indicators visibly drift out of phase with each other over a turn. The literal 600 also silently diverges from the single source of truth if interval_ms is ever tuned.
 - **Fix:** Drive the rail twinkle off the style's own interval: replace `elapsed_ms / 600` with `elapsed_ms / self.interval_ms()` (or a named constant shared with interval_ms). This keeps the rail marker locked to the same clock as the spinner and removes the magic 600.
@@ -458,7 +458,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `table-partial-label-coloring` — Truncated table cell colors a partial confidence-label fragment as if it were the full label
 
-- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/render/markdown.rs:155`, `crates/squeezy-tui/src/render/markdown.rs:163`
 - **Problem:** In TableCell::render_spans, line 155 tests `confidence_label_exact_match(run.text.trim())` against the FULL run text and, on a match, patches the run's style with the label color. But line 163 then truncates the visible text to `take` chars (the remaining column budget), which can cut the label mid-word. The result is a partial token like `candida` painted in the candidate_set color even though it is no longer the recognizable label — the color cue fires on text that no longer reads as the label, which is misleading in the narrow compact-table render where truncation is common.
 - **Fix:** Only apply the exact-label color when the full label survives truncation: gate the line-155 patch on `take >= run_chars` (i.e. the run is rendered in full), or recompute confidence_label_exact_match on the already-truncated `visible` string instead of on `run.text`. Falls back to the plain run style for a clipped fragment.
@@ -496,7 +496,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `breadcrumb-label-cap-char-vs-cell` — Crumb label cap counts chars but width math counts display cells (CJK crumbs overrun)
 
-- **Severity:** low · **Category:** bug · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** bug · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/breadcrumbs.rs:99`, `crates/squeezy-tui/src/breadcrumbs.rs:247`
 - **Problem:** `clean_label` caps a label to `LABEL_CAP = 24` using `collapsed.chars().count()` and `chars().take(LABEL_CAP)`, i.e. a CHARACTER cap. But `full_width()` (and the renderer's `col` accounting) measure the painted width with `UnicodeWidthStr::width`, i.e. DISPLAY CELLS. A label of 24 wide (CJK / 2-cell) glyphs is allowed through the cap yet measures 48 cells, so the comment's promise ('short enough that the trail does not blow past the status row even with several crumbs') breaks for wide-glyph session labels / entry kinds, and the `show_all` fit decision is computed against a label far wider than 24 columns.
 - **Fix:** Make `clean_label` cap by display width instead of char count: accumulate `UnicodeWidthStr::width` of each char (via `unicode_width::UnicodeWidthChar`) and stop once the running width would exceed `LABEL_CAP`, appending the ellipsis. This keeps every crumb at most LABEL_CAP *cells* wide, matching `full_width` and the renderer's column math.
@@ -505,7 +505,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `breadcrumb-search-label-double-clean` — Search breadcrumb double-cleans its label, over-truncating the query to ~17 chars
 
-- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/breadcrumbs.rs:177`, `crates/squeezy-tui/src/breadcrumbs.rs:184`
 - **Problem:** In `BreadcrumbModel::build`, the search crumb first cleans the query (`let trimmed = clean_label(query)` — capped to LABEL_CAP=24 chars), builds `label = format!("search:{trimmed}")` (up to 31 chars), then cleans AGAIN: `clean_label(&label)`. The second clean re-caps the already-prefixed string to 24 chars, so the `search:` prefix (7 chars) eats into the budget and only ~17 query chars survive plus an ellipsis — even though the query was already individually capped at 24. The double-clean silently over-truncates the visible query and is inconsistent with every other crumb (which cleans exactly once).
 - **Fix:** Drop the outer `clean_label` on line 184 and push `label` directly (it is already built from a cleaned `trimmed` and a fixed ASCII prefix, so it needs no second pass). If a hard cap on the whole `search:<q>` token is desired, apply it once with an explicit larger budget rather than re-running the 24-char cap over the prefixed string.
@@ -514,7 +514,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `breadcrumb-two-crumb-no-truncation` — Breadcrumb strip never shortens a 2-crumb overflow; it relies on Paragraph clipping
 
-- **Severity:** low · **Category:** bug · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** bug · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/lib.rs:43725`, `crates/squeezy-tui/src/lib.rs:43731`
 - **Problem:** When `show_all` is false (full trail wider than the row), the renderer collapses the MIDDLE crumbs to a single `…` only when `count > 2` (lib.rs:43731). For a 2-crumb trail that overflows — e.g. a long session label plus a long focused-entry kind label, each up to 24 chars — the code falls through to render `first ▸ last` with no shortening at all, identical to the `show_all` branch. The combined width can exceed the row, so the deepest crumb (the user's current location, the most important one) is what gets clipped off the right edge by `Paragraph`, and its click target is silently clamped to near-zero width. The 'middle truncation' the doc promises does nothing for the 2-crumb case.
 - **Fix:** When `!show_all` and `count <= 2`, middle-truncate the individual crumb labels (or at least the deepest crumb's label) to fit `width` rather than emitting both full labels. A minimal fix: in the `else` branch, before pushing the last crumb, compute the remaining columns (`width - col - SEPARATOR width`) and truncate `last.label` to that display width with an ellipsis, so the deepest crumb is never clipped off-surface.
@@ -523,7 +523,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `model-overlay-blank-footer-row` — Model picker overlay always renders an empty footer line
 
-- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/overlay.rs:146`, `crates/squeezy-tui/src/overlay.rs:171`
 - **Problem:** `Overlay::render_lines` always appends `footer_line()`, which is a `Span::styled("", ...)` — an empty string. This adds a permanently-blank trailing row to the `/model` picker overlay every frame (and inflates the overlay's reported line count at lib.rs:42407 / 43218, which sizes the popup). It is dead chrome: it conveys nothing and just steals one row of popup height. The header already carries the full key hint ('↑↓ choose · Enter apply · Esc cancel'), so the footer is purely an empty spacer.
 - **Fix:** Either remove the `lines.push(footer_line())` call (and `footer_line`) so the picker is one row shorter, or, if a deliberate spacer is wanted, make it explicit (a single blank line constant) rather than a styled empty span — but the simplest correct fix is to drop it, since the height calculation counts it as a real row.
@@ -561,7 +561,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `lane-fold-status-missing-bulk-verbs` — Lane-folds status line omits the c/o bulk-collapse verbs the handler implements
 
-- **Severity:** low · **Category:** consistency · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** consistency · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/lib.rs:14815`, `crates/squeezy-tui/src/lib.rs:14901`, `crates/squeezy-tui/src/lib.rs:14927`
 - **Problem:** The lane-folds handler implements `c` (collapse all) and `o` (expand all) bulk verbs (lib.rs:14866-14867), and the handler's own doc comment claims they are "the bulk verbs the status line advertises" (lib.rs:14831). But the status line set on open (lib.rs:14815: `↑↓ select · Enter fold · Esc close`) and after every toggle (14901, 14927) never mentions c/o. The verbs are only discoverable from the in-overlay header (render at lib.rs:31462), so a user reading the bottom status bar — the documented advertising surface — cannot learn them. Also note Space is a synonym for Enter (14862) and is likewise unadvertised.
 - **Fix:** Extend the on-open status hint at lib.rs:14815 to match the overlay header: `"lane folds: {} — ↑↓ select · Enter fold · c/o all · Esc close"`. Optionally do the same for the post-toggle hints at 14901/14927 (append `· c/o all`).
@@ -599,7 +599,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `annotation-cursor-skips-current-entry-notes` — Opening the annotations overlay never parks the cursor on the current entry's own notes
 
-- **Severity:** low · **Category:** bug · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** bug · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/annotations.rs:225`, `crates/squeezy-tui/src/lib.rs:15271`
 - **Problem:** AnnotationStore::next uses strict `a.entry_id > from` (annotations.rs:234) and prev uses strict `a.entry_id < from` (annotations.rs:253). annotation_cursor_near_current (lib.rs:15265-15278) calls `next(current)` to position the overlay cursor at "the first annotation at or after the reading position" (per its own doc-comment), but because the comparison is strict-greater, any annotation anchored to the *current* top entry is skipped and the cursor lands on the next entry's note instead — so opening the overlay while sitting on an annotated entry never highlights that entry's note. The next() doc also claims repeated presses "cycle forward through every annotation," which is untrue when several notes share one entry_id (they are all skipped together).
 - **Fix:** Either make annotation_cursor_near_current use `first_index_for_entry(current)` first (return it when Some), or change the membership test at lib.rs:15268 and the next() comparison to `>=`/`<=` semantics that include same-entry notes. Minimal local fix: in annotation_cursor_near_current, before the next/prev branch, `if let Some(id) = current { if let Some(idx) = app.annotations.first_index_for_entry(id) { return idx; } }`.
@@ -617,7 +617,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `review-card-elapsed-no-hour-rollover` — Review board elapsed clock shows "60:00" instead of "1:00:00" for workers running over an hour
 
-- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/review_board.rs:144`
 - **Problem:** ReviewCard::elapsed_clock formats as `format!("{}:{:02}", secs / 60, secs % 60)` (review_board.rs:146). A subagent running 1h05m reads as "65:05", a 2h run as "120:00". Minutes never roll over into an hours field, so long-running workers — exactly the ones a reviewer scanning the board cares about — show a misleading clock that reads like 65 minutes-and-5-seconds only on close inspection.
 - **Fix:** Add an hours field when warranted: `match self.elapsed_secs { Some(s) if s >= 3600 => format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60), Some(s) => format!("{}:{:02}", s / 60, s % 60), None => "-".to_string() }`.
@@ -673,7 +673,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `multiselect-empty-checkbox-always-on` — Every queue row always paints an empty `[ ]` checkbox even when multi-select is never used
 
-- **Severity:** low · **Category:** consistency · **Risk:** medium · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** consistency · **Risk:** medium · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/prompt_queue_multiselect.rs:170`, `crates/squeezy-tui/src/prompt_queue.rs:266`
 - **Problem:** marker_glyph(false) returns `"[ ]"`, and render_lines unconditionally pushes marker_span(is_tagged) on every row (prompt_queue.rs:266). So an untouched queue with no multi-selection still renders an empty checkbox on every single prompt, permanently. This is inconsistent with the sibling markers right next to it: the group marker (group_marker_glyph(None)) and the condition marker (QueueCondition::Always.marker_glyph()) both collapse to invisible blanks (`"   "`) when inactive, so they only appear once the feature is engaged. The multi-select checkbox alone clutters the default view with an affordance the user may never touch. The doc comment at multiselect.rs:166 even claims it renders "two blanks" when untagged, which it does not.
 - **Fix:** Only paint the multi-select marker once a selection exists (mirroring how group/condition markers stay blank until used). In render_lines, gate the marker on whether any row is tagged: pass `group_active` (already computed at line 201) into the per-row marker, and when nothing is tagged render `"   "` blanks instead of `marker_span(is_tagged)`. Update the stale comment at multiselect.rs:166 to match the actual `[ ]`/`[x]` glyphs. If the test at prompt_queue_tests.rs:155 must keep asserting `[ ]`, tag a row in that test first.
@@ -693,7 +693,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `resume-picker-label-truncate-char-vs-width` — Resume picker truncates session labels by char count, not display width — wide/CJK titles overflow into the scrollbar
 
-- **Severity:** medium · **Category:** bug · **Risk:** low · **Effort:** medium · **Disposition:** 🕓 deferred
+- **Severity:** medium · **Category:** bug · **Risk:** low · **Effort:** medium · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/resume_picker.rs:930`, `crates/squeezy-tui/src/resume_picker.rs:881`
 - **Problem:** render_candidate_row computes the label budget and truncates the label in CHARS, but the terminal lays the row out in display COLUMNS. `truncate_label` (resume_picker.rs:930) does `label.chars().count() <= max` / `label.chars().take(max-1)`, and the fixed-width math (resume_picker.rs:881-885) uses `.chars().count()` throughout. A label made of wide glyphs (CJK, many emoji = 2 cells each) therefore measures up to ~2x its char count in columns, so a label that 'fits' the char budget still overruns the real content width — exactly what the budget comment claims to prevent: 'so long session titles never hard-crop into the scrollbar and the ↪ cross-project marker stays visible' (resume_picker.rs:866-868). In practice a Chinese/Japanese session title or emoji-heavy `/session rename` will paint past the content column and either hard-crop into the scrollbar or push the trailing `#labels`/`↪ project` markers off-screen. The crate already depends on `unicode-width` and uses it for exactly this purpose in breadcrumbs.rs (UnicodeWidthStr::width).
 - **Fix:** Make `truncate_label` width-aware: import `unicode_width::UnicodeWidthChar`, accumulate `c.width().unwrap_or(0)` while taking chars until adding the next char (plus 1 for the ellipsis) would exceed `max`, then append '…'. Correspondingly, change the `.chars().count()` measurements of `label`/markers in the budget calc (resume_picker.rs:870-885) to `UnicodeWidthStr::width(...)` so the budget and the truncation agree in columns. This mirrors breadcrumbs.rs:254-256.
@@ -711,7 +711,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `timeline-clock-column-minutes-unbounded` — Session timeline clock renders minutes unbounded (e.g. '120:05') and pads to a width a long session can exceed
 
-- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/session_timeline.rs:186`, `crates/squeezy-tui/src/lib.rs:30162`
 - **Problem:** TimelineEvent::clock() formats `m:ss` with the minutes field unbounded: `let minutes = secs / 60; format!("{minutes}:{seconds:02}")` (session_timeline.rs:186-194). For a session that runs past an hour this prints values like '90:05' or '120:33' instead of an h:mm:ss form, which reads as a malformed clock. The renderer right-pads the column to 6 cells (`format!("{:>6} ", event.clock())`, lib.rs:30162), so once the string reaches 6+ chars (>= 100 minutes, e.g. '100:00') the padding stops aligning and a longer value ('1000:00') breaks the column grid against the fixed-width turn/kind/status columns that follow. (Note: today build_timeline_sources always passes `timestamp: None` so production rows currently show '--:--', but the code path is live and unit-tested, and any future wiring of real timestamps inherits this.)
 - **Fix:** In clock(), roll minutes into hours past 59: when `secs >= 3600` format as `{h}:{mm:02}:{ss:02}`, else keep `{m}:{ss:02}`. Bound the column to the widest expected form (or widen the `{:>6}` pad at lib.rs:30162 accordingly). Keep the `--:--` None case unchanged.
@@ -795,7 +795,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `startup-picker-height2-no-below-affordance` — Startup picker at 2-row list height drops the "↓ more" affordance when scrolled into the list
 
-- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** polish · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/startup_model_picker.rs:632-638`
 - **Problem:** In `visible_window` the `height == 2` case (startup_model_picker.rs:632-637) matches `(cursor > 0, _) => (cursor, cursor + 1, true, false)` — when the cursor is anywhere past the first item it always shows the "↑ more" indicator and renders exactly one list item, but it never sets `show_below = true` even when there are items below the cursor (`cursor + 1 < total`). So a user navigating a long provider/model/theme list in a 2-row-tall list region sees "↑ more" + one item with no signal that more options exist below, hiding discoverability of the items they have not reached yet. (Height 3+ handles both affordances correctly via the loop below.)
 - **Fix:** In the `height == 2` arm, surface the below-affordance when the cursor is not at the end. Replace the `(true, _) => (cursor, cursor + 1, true, false)` arm so it computes `show_below`: e.g. `(true, _) => (cursor, cursor + 1, true, cursor + 1 < total)`. Note this would need two indicator rows + the item to fit; given the 2-row budget, the simpler honest fix is to drop the item to make room when both apply, or prefer showing the below-hint. At minimum, document the limitation. Lowest-risk change: when `cursor > 0 && cursor + 1 < total`, prefer `(cursor, cursor + 1, false, true)` so the user always sees there is more below to reach.
@@ -824,7 +824,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `export-usage-omits-overwrite-token` — /export usage hint never mentions the force/`!` overwrite token
 
-- **Severity:** low · **Category:** improvement · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** improvement · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/export_destination.rs:78`
 - **Problem:** `EXPORT_USAGE` = "usage: /export <md|txt|json> [clipboard|stdout|dir:<name>|<path>]" is the single help string shown for any malformed `/export` invocation. A plain `/export md notes.md` refuses to clobber an existing file (by design), and the collision error path points users at `!`; but the general usage hint — the one surface that documents the command's grammar — never reveals that an overwrite is even possible or how to request it (`force`/`-f`/trailing `!`). A user who knows up-front they want to overwrite has no way to discover the syntax from `/export` help; they must trigger the collision first. The string also silently omits the `clip` and `-` aliases that `parse_destination` accepts.
 - **Fix:** Extend `EXPORT_USAGE` to surface the overwrite affordance, e.g. `"usage: /export <md|txt|json> [clipboard|stdout|dir:<name>|<path>] [!]   (append ! to overwrite an existing file)"`. This is a single-line edit in export_destination.rs; every `/export` error path already formats `{EXPORT_USAGE}` so the hint propagates everywhere automatically.
@@ -871,7 +871,7 @@ The `query.query.is_empty()` guard suppresses the message right after typing a b
 
 #### `feedback-ready-status-omits-yn` — Feedback-ready status omits the Y/N shortcuts the prompt block and footer both advertise
 
-- **Severity:** low · **Category:** consistency · **Risk:** low · **Effort:** small · **Disposition:** 🕓 deferred
+- **Severity:** low · **Category:** consistency · **Risk:** low · **Effort:** small · **Disposition:** ✅ fix
 - **Files:** `crates/squeezy-tui/src/lib.rs:21828`, `crates/squeezy-tui/src/lib.rs:25154`, `crates/squeezy-tui/src/lib.rs:44411`
 - **Problem:** When a feedback preview is prepared, the status reads `"feedback ready: Enter send · Esc discard"` (line 21828). But the feedback prompt block (line 25154: "› Enter/Y Send · Esc/N Discard") and the footer status hint (line 44411: "Enter/Y send feedback · Esc/N discard") both advertise the Y/N single-key shortcuts. The one-shot status that fires at preview time under-documents the shortcuts relative to the two persistent legends, an inconsistency for the same surface.
 - **Fix:** Align the prepared-status copy with the other two: change line 21828 to `app.status = "feedback ready: Enter/Y send · Esc/N discard".to_string();` so all three feedback legends agree.
