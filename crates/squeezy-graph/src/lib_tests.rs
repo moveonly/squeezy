@@ -803,12 +803,23 @@ fn persistent_graph_warm_start_skips_unchanged_parsing() {
     assert!(second.build_report().persisted_files_loaded > 0);
     assert!(second.build_report().resolver_entries_loaded > 0);
     assert!(second.build_report().resolver_import_graph_loaded);
+    let hello = second.graph().find_symbol_by_name("hello");
+    let hello = hello
+        .iter()
+        .find(|symbol| symbol.name == "hello")
+        .expect("hello symbol present after warm load");
+    // Regression guard: the per-symbol `file_id` is `#[serde(skip)]` in the
+    // persisted partition and backfilled on load. A broken backfill would leave
+    // it as the empty `FileId::default()`, silently breaking every file-scoped
+    // graph query on a warm-started cache.
     assert!(
-        second
-            .graph()
-            .find_symbol_by_name("hello")
-            .iter()
-            .any(|symbol| symbol.name == "hello")
+        !hello.file_id.0.is_empty(),
+        "warm-loaded symbol file_id must be backfilled, got empty"
+    );
+    assert!(
+        hello.file_id.0.contains("lib.rs"),
+        "warm-loaded symbol file_id should point at its source file, got {:?}",
+        hello.file_id
     );
 }
 

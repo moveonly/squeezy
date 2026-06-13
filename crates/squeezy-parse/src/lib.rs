@@ -95,6 +95,9 @@ impl ParsedFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedSymbol {
     pub id: SymbolId,
+    // Constant within a partition (equals the redb key); skipped on the wire
+    // and backfilled on load by squeezy-graph. Fresh parses set it directly.
+    #[serde(skip)]
     pub file_id: FileId,
     pub parent_id: Option<SymbolId>,
     pub name: String,
@@ -149,6 +152,9 @@ pub enum ImportKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedImport {
+    // Constant within a partition (equals the redb key); skipped on the wire
+    // and backfilled on load by squeezy-graph. Fresh parses set it directly.
+    #[serde(skip)]
     pub file_id: FileId,
     pub owner_id: Option<SymbolId>,
     pub path: String,
@@ -177,6 +183,9 @@ pub struct ParsedImport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedCall {
+    // Constant within a partition (equals the redb key); skipped on the wire
+    // and backfilled on load by squeezy-graph. Fresh parses set it directly.
+    #[serde(skip)]
     pub file_id: FileId,
     pub caller_id: Option<SymbolId>,
     pub name: String,
@@ -198,6 +207,9 @@ pub enum ParsedCallKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedReference {
+    // Constant within a partition (equals the redb key); skipped on the wire
+    // and backfilled on load by squeezy-graph. Fresh parses set it directly.
+    #[serde(skip)]
     pub file_id: FileId,
     pub owner_id: Option<SymbolId>,
     pub text: String,
@@ -217,6 +229,9 @@ pub enum ReferenceKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BodyHit {
+    // Constant within a partition (equals the redb key); skipped on the wire
+    // and backfilled on load by squeezy-graph. Fresh parses set it directly.
+    #[serde(skip)]
     pub file_id: FileId,
     pub owner_id: Option<SymbolId>,
     pub text: String,
