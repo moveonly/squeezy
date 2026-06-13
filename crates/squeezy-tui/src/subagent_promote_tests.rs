@@ -132,6 +132,19 @@ fn project_drops_code_fence_rows() {
 }
 
 #[test]
+fn project_drops_fence_opener_language_tag() {
+    let source = PromoteSource::new(
+        "explore #1".to_string(),
+        PromoteStatus::Done,
+        "```rust\nlet x = 1;\n```".to_string(),
+    );
+    let prompt = source.project();
+    // The info-string opener vanishes; its language tag never leaks into the body.
+    assert!(prompt.ends_with("let x = 1;"), "{prompt}");
+    assert!(!prompt.contains("rust"), "{prompt}");
+}
+
+#[test]
 fn project_bounds_body_to_excerpt_cap() {
     let long = "word ".repeat(400); // ~2000 chars
     let source = PromoteSource::new("explore #1".to_string(), PromoteStatus::Done, long);

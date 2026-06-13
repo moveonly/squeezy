@@ -208,14 +208,17 @@ pub(crate) fn clean_body(raw: &str) -> String {
 }
 
 /// Strip the leading decoration from a single line and return its bare text. A
-/// pure code-fence row (` ``` `) or an empty line returns `""`.
+/// code-fence row (` ``` ` or an info-string opener like ` ```rust `) or an
+/// empty line returns `""`.
 fn clean_line(line: &str) -> String {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return String::new();
     }
-    // A code-fence row carries no content — drop it entirely.
-    if trimmed.trim_start_matches('`').is_empty() {
+    // A code-fence row carries no content — drop it entirely, including an
+    // opener that carries an info string (e.g. ```rust) whose language tag must
+    // not leak into the promoted body.
+    if trimmed.starts_with("```") {
         return String::new();
     }
     let mut text = trimmed;
