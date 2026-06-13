@@ -2079,6 +2079,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.pending_approval.is_some()
         || app.pending_mcp_elicitation.is_some()
         || app.pending_plan_choice.is_some()
+        || app.pending_request_user_input.is_some()
         || app.pending_feedback.is_some()
         || app.config_screen.is_some()
         || app.status_line_setup.is_some()
@@ -10008,6 +10009,20 @@ fn dispatch_keymap_action_inner(
         && action != keymap::Action::ToggleLatencyOverlay
         && action != keymap::Action::ToggleDogfoodMetrics
         && action != keymap::Action::ToggleLayoutFallbackDiag
+    {
+        return false;
+    }
+    // A pending question/approval modal owns the surface. Its keys are routed by
+    // the dedicated handlers (handle_request_user_input_key, handle_plan_choice_key,
+    // handle_approval_key, handle_mcp_elicitation_key, handle_feedback_prompt_key)
+    // which run after this dispatch; each consumes raw key codes, not keymap
+    // actions. Blocking every keymap action here keeps an overlay-opening chord
+    // (e.g. ToggleSnippets) from firing on top of the modal.
+    if app.pending_request_user_input.is_some()
+        || app.pending_plan_choice.is_some()
+        || app.pending_approval.is_some()
+        || app.pending_mcp_elicitation.is_some()
+        || app.pending_feedback.is_some()
     {
         return false;
     }

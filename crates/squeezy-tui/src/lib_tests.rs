@@ -1434,6 +1434,63 @@ async fn freeform_modal_keeps_typing_out_of_main_composer() {
 }
 
 #[tokio::test]
+async fn plan_choice_modal_blocks_overlay_opening_keymap_action() {
+    let mut agent = test_agent(SessionMode::Plan);
+    let mut app = test_app(SessionMode::Plan);
+    app.pending_plan_choice = Some(PendingPlanChoice {
+        plan_id: "plan-abc".to_string(),
+        plan_path: app.workspace_root.join("plan-abc.md"),
+        selection_index: 0,
+    });
+    assert!(!app.snippets_open, "starts closed");
+
+    handle_key(&mut app, &mut agent, toggle_snippets_key())
+        .await
+        .expect("handle key");
+
+    assert!(
+        !app.snippets_open,
+        "the snippets overlay must not open over a pending plan-choice modal"
+    );
+    assert!(
+        app.pending_plan_choice.is_some(),
+        "the plan-choice modal must stay up"
+    );
+}
+
+#[tokio::test]
+async fn request_user_input_modal_blocks_session_quick_switch() {
+    let mut agent = test_agent(SessionMode::Plan);
+    let mut app = test_app(SessionMode::Plan);
+    let request = RequestUserInputRequest {
+        question: "Which file?".to_string(),
+        choices: Vec::new(),
+        allow_freeform: true,
+    };
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 0,
+        answer: String::new(),
+        answer_cursor: 0,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("handle key");
+
+    assert!(
+        app.pending_request_user_input.is_some(),
+        "Alt+1 must not switch sessions while a request_user_input modal is up"
+    );
+}
+
+#[tokio::test]
 async fn freeform_modal_enter_submits_dotted_choice_even_with_typed_answer() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Plan);
