@@ -27067,7 +27067,7 @@ fn dock_panel_body_lines(
 /// A single docked-panel body line, clipped to `avail` columns so a wide line
 /// never paints past the panel border.
 fn dock_text_line(text: &str, avail: usize) -> Line<'static> {
-    let clipped: String = text.chars().take(avail).collect();
+    let clipped = truncate_label_to_cells(text, avail);
     Line::from(Span::styled(
         clipped,
         Style::default().fg(crate::render::theme::foreground()),

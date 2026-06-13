@@ -51108,3 +51108,34 @@ fn annotation_editor_tail_keeps_caret_counter_and_hints_visible() {
         "painted header width {painted} exceeds inner width {inner_width}",
     );
 }
+
+#[test]
+fn dock_text_line_clips_by_display_cells_not_chars() {
+    let cell_width = |line: &Line<'static>| -> usize {
+        line.spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum()
+    };
+
+    // Four wide CJK glyphs occupy eight cells; in a four-cell budget the painted
+    // width must stay within the panel, never the eight cells chars().take(4) keeps.
+    let wide = dock_text_line("\u{4f60}\u{597d}\u{4f60}\u{597d}", 4);
+    assert!(
+        cell_width(&wide) <= 4,
+        "wide-glyph dock body must fit the cell budget: {} cells",
+        cell_width(&wide),
+    );
+
+    // Mixed ASCII + wide content is likewise bounded by cells.
+    let mixed = dock_text_line("ab\u{4f60}\u{597d}cd", 4);
+    assert!(
+        cell_width(&mixed) <= 4,
+        "mixed-width dock body must fit the cell budget: {} cells",
+        cell_width(&mixed),
+    );
+
+    // Content that already fits is left intact (no spurious ellipsis).
+    let fits = dock_text_line("abcd", 4);
+    assert_eq!(fits.spans[0].content.as_ref(), "abcd");
+}
