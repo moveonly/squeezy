@@ -22519,7 +22519,8 @@ fn deliver_copy_via_chain(app: &mut TuiApp, text: &str, label: &str, primary_err
     let (toast_msg, variant) = outcome.toast();
     match &outcome {
         clipboard::CopyOutcome::Copied { provider, .. } => {
-            app.status = format!("copied {label} ({chars} chars)");
+            let copied = format!("copied {label} ({chars} chars)");
+            app.status = copied.clone();
             // Dogfood telemetry (§12.10.3): bucket the copy by the
             // bounded provider kind that serviced it (never the bytes).
             app.dogfood_metrics
@@ -22527,6 +22528,10 @@ fn deliver_copy_via_chain(app: &mut TuiApp, text: &str, label: &str, primary_err
             // In-app clipboard history (§12.6.1): the chain landed it too, so
             // record it for recovery just like the fast-path success above.
             app.clipboard_history.record(text, label);
+            // Status and toast describe the same copy with the same metric;
+            // the generic line-count toast at the tail is for the other arms.
+            app.toasts.push(copied, toast::ToastVariant::Success);
+            return;
         }
         clipboard::CopyOutcome::WroteTempFile { .. } => {
             app.status = toast_msg.clone();
