@@ -15,3 +15,7 @@ unparseable = "unparseable"
 # typos when typos-cli tokenises identifiers on digits.
 tje = "tje"
 ba = "ba"
+# Fragments from the generated UI/UX findings report: the `ctrl-pn` finding
+# slug (Ctrl+P/N) and the hyphen-split `mis-` prefix (mis-placing, etc.).
+pn = "pn"
+mis = "mis"
