@@ -66,10 +66,10 @@ availability. The JSON files remain the source of truth: if the redb index is
 missing, stale, or unreadable, `SessionStore::list` falls back to scanning
 session directories and rebuilds the index opportunistically.
 
-`start_session` (`sessions.rs:315-332`) allocates the id and timestamps
+`start_session` (`sessions.rs:590-607`) allocates the id and timestamps
 but never touches disk — the handle returns in `InnerState::Pending`
 and only materialises on the first substantive append. `open_session`
-(`sessions.rs:334-366`) is the read-side complement: it pre-seeds
+(`sessions.rs:609-641`) is the read-side complement: it pre-seeds
 counters from `metadata.json` and the replay tape so the first event
 after resume doesn't re-trigger `first_user_task` or restart the
 event counter from zero.
@@ -83,7 +83,7 @@ Once found, that snapshot becomes the conversation baseline and the
 function forward-applies only events after it:
 
 ```rust
-// crates/squeezy-store/src/sessions.rs:1524-1591
+// crates/squeezy-store/src/sessions.rs:2158-2206
 pub fn replay_resume_state(&self) -> Result<SessionResumeState> {
     // ... pending-session early return ...
     let (events, _warnings) = read_jsonl(&self.dir().join("events.jsonl"))?;
@@ -141,7 +141,7 @@ ContextCompacted {
 `replay_tape` reads it in one shot with no per-event re-parsing:
 
 ```rust
-// crates/squeezy-store/src/sessions.rs:599-608
+// crates/squeezy-store/src/sessions.rs:1069-1078
 pub fn replay_tape(&self, session_id: &str) -> Result<SessionReplayTape> {
     let (events, warnings) =
         read_replay_jsonl(&self.locate_session_dir(session_id).join("replay.jsonl"))?;
@@ -165,7 +165,7 @@ post-compaction state at zero LLM cost. The parent's
 child records the parent id:
 
 ```rust
-// crates/squeezy-store/src/sessions.rs:377-429
+// crates/squeezy-store/src/sessions.rs:652-690
 pub fn fork_session(&self, parent_session_id: &str,
                     mut metadata: SessionMetadata) -> Result<SessionHandle> {
     let parent_dir = self.session_dir(parent_session_id);
@@ -216,10 +216,9 @@ target lowercase `~/.squeezy/memory.md`. They remain useful Rust primitives,
 but they are no longer the complete prompt-ingestion story:
 
 ```rust
-// crates/squeezy-store/src/sessions.rs:111-114
+// crates/squeezy-store/src/sessions.rs:280-282
 pub fn memory_path() -> Option<PathBuf> {
-    let home = env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".squeezy").join("memory.md"))
+    Some(fs_util::user_squeezy_dir()?.join("memory.md"))
 }
 ```
 
@@ -228,16 +227,17 @@ is a no-op; the file is forced to end with a newline before each
 append so remembered lines stay row-aligned:
 
 ```rust
-// crates/squeezy-store/src/sessions.rs:127-154
+// crates/squeezy-store/src/sessions.rs:295-323
 pub fn remember(line: &str) -> Result<usize> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Ok(0);
     }
     let Some(path) = Self::memory_path() else {
-        return Err(SqueezyError::Agent(
-            "remember requires HOME to be set to locate ~/.squeezy/memory.md".to_string(),
-        ));
+        return Err(SqueezyError::Agent(format!(
+            "remember requires a user profile directory to be set ({})",
+            fs_util::user_squeezy_dir_detail()
+        )));
     };
     if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
     let needs_leading_newline = match fs::metadata(&path) {
@@ -296,18 +296,19 @@ prompt file.
 
 Per-project sessions live under each workspace's `.squeezy/sessions/`,
 so a resume picker that shows sessions from sibling repos needs a
-cross-project surface. That surface is `~/.squeezy/sessions/index.jsonl`:
+cross-project surface. `global_index_path` resolves it through
+`xdg_global_index_path`: when `XDG_STATE_HOME` is set to an absolute
+path the surface is `$XDG_STATE_HOME/squeezy/sessions/index.jsonl`;
+otherwise it is the user-global Squeezy directory
+(`$HOME/.squeezy/sessions/index.jsonl`, or the Windows
+profile/app-data fallback). `list_global_index` additionally merges
+the legacy `$HOME/.squeezy/sessions/index.jsonl` path so sessions
+recorded before an XDG move stay visible:
 
 ```rust
-// crates/squeezy-store/src/sessions.rs:193-201
+// crates/squeezy-store/src/sessions.rs:370-372
 pub fn global_index_path() -> Option<PathBuf> {
-    let home = env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".squeezy")
-            .join("sessions")
-            .join("index.jsonl"),
-    )
+    xdg_global_index_path()
 }
 ```
 

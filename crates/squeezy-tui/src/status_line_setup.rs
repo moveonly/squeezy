@@ -325,22 +325,51 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, state: &StatusLineSetupState) 
         "─".repeat(area.width as usize),
         dim(),
     )));
-    // The list pane height limits how many rows we can draw. Compute a
-    // scroll offset so the cursor row stays visible.
-    let visible_rows = area.height.saturating_sub(2) as usize;
-    let cursor_in_items = state.cursor.saturating_sub(1);
-    let offset = cursor_in_items.saturating_sub(visible_rows.saturating_sub(1));
-    for (vi, &idx) in visible.iter().enumerate().skip(offset).take(visible_rows) {
-        let (item, enabled) = state.items[idx];
-        let accent = StatusLineAccent::for_item(item);
-        let item_style = Style::default().fg(accent.fallback_color());
-        lines.push(row_line(
-            state.cursor == vi + 1,
-            enabled,
-            item.slug(),
-            item.description(),
-            item_style,
-        ));
+    // The list pane height limits how many rows we can draw. Scroll the window
+    // around the cursor so navigating past the visible region keeps the
+    // highlighted row on-screen, surfacing overflow markers (mirrors the
+    // /config filter list).
+    let total = visible.len();
+    if total > 0 {
+        let cursor_in_items = state.cursor.saturating_sub(1).min(total - 1);
+        // Reserve a row for each potential overflow marker so the count math
+        // stays exact when the list spills past the pane.
+        let budget = area.height.saturating_sub(2).max(1) as usize;
+        let rows = if total <= budget {
+            budget
+        } else {
+            budget.saturating_sub(2).max(1)
+        };
+        let start = if cursor_in_items + 1 > rows {
+            (cursor_in_items + 1 - rows).min(total.saturating_sub(rows))
+        } else {
+            0
+        };
+        let end = (start + rows).min(total);
+        if start > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  ▲ {start} more above"),
+                Style::default().fg(crate::render::theme::quiet()),
+            )));
+        }
+        for (vi, &idx) in visible.iter().enumerate().take(end).skip(start) {
+            let (item, enabled) = state.items[idx];
+            let accent = StatusLineAccent::for_item(item);
+            let item_style = Style::default().fg(accent.fallback_color());
+            lines.push(row_line(
+                state.cursor == vi + 1,
+                enabled,
+                item.slug(),
+                item.description(),
+                item_style,
+            ));
+        }
+        if end < total {
+            lines.push(Line::from(Span::styled(
+                format!("  ▼ {} more below", total - end),
+                Style::default().fg(crate::render::theme::quiet()),
+            )));
+        }
     }
     frame.render_widget(Paragraph::new(lines), area);
 }

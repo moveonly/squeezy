@@ -544,13 +544,15 @@ Variants (`kind`):
 | `context_compacted` | `report` | /compact ran |
 | `task_state_updated` | `snapshot` | agent reports a task-state update |
 | `subagent_event` | `event` | subagent started / completed / failed |
-| `mcp_server_event` | server event payload | MCP server discovery/status changed |
-| `job_event` | job event payload | background job event reached the TUI |
-| `cost_update` | cost payload | cost broker emitted an update |
-| `ai_reviewer_tripped` | reviewer payload | AI-reviewer guard tripped |
+| `mcp_status_updated` | `servers`, `generated_unix_millis` | MCP server discovery/status changed |
+| `job_updated` | `job` | background job snapshot reached the TUI |
+| `job_notification` | `job_id`, `job_kind`, `status`, `title`, `summary`, `notification_ts_unix_ms` | a background job posted a notification |
+| `cost_update` | `tool_count`, `input_tokens`, `micro_usd` | per-turn cost progress emitted every few tool calls |
+| `cost_warning` | `spent_usd_micros`, `cap_usd_micros`, `percent` | cost broker crossed a cap threshold |
+| `ai_reviewer_tripped` | `reason` | AI-reviewer guard tripped |
 | `slash_command` | `command` | a slash_command action fired |
 | `action_step` | `action`, `status` | any other action |
-| `snapshot` | `snapshot_kind`, `payload` | misc snapshots (mcp_status, jobs, cost_warning, ai_reviewer_tripped) |
+| `snapshot` | `snapshot_kind`, `payload` | catch-all kept so older traces deserialize; producers emit the typed variants above instead |
 | `perf_sample` | `label`, `ms` | reserved for future per-call timing |
 | `finding` | `rule_id`, `severity`, `summary` | embedded finding for downstream tooling |
 

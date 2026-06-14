@@ -15,7 +15,7 @@ Squeezy is a Rust-first coding agent optimized around low cost and high-signal s
 
 - Implementation language: Rust only.
 - Semantic navigation source languages: Rust, Python, Java, Kotlin, Scala, C#/.NET, Go, C/C++, JavaScript/TypeScript, PHP, Ruby, Swift, and Dart.
-- Supported platforms: macOS, Linux, and Windows (x86_64). On Windows the shell sandbox is Job-Object-only and degrades filesystem and network isolation to best-effort-unavailable; `mode = "required"` denies pre-spawn.
+- Supported platforms: macOS, Linux, and Windows (x86_64). On Windows the shell sandbox defaults to a `restricted_token` tier (capability-SID ACLs enforcing filesystem writes, always available) with an opt-in `elevated` tier (hidden sandbox users plus WFP egress filters enforcing full read/write/network isolation); only the `disabled` level is Job-Object-only with best-effort-unavailable filesystem and network isolation. `mode = "required"` denies pre-spawn when the `disabled` level is selected, or when `elevated` is selected before `--sandbox-setup` has provisioned it; the default `restricted_token` tier always satisfies it.
 - UI: TUI.
 - Unsupported source languages fall back to ordinary bounded read/grep/list tools; do not fake graph confidence for them.
 - "Navigation tools" means tree-sitter-backed semantic graph operations such as declarations, references, hierarchy, call candidates, dependency paths, impact, and exact read slices.

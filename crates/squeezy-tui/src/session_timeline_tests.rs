@@ -99,6 +99,12 @@ fn clock_renders_mmss_or_dashes_for_missing_timestamp() {
     assert_eq!(event_for_source(&src, 0).clock(), "1:15");
     src.timestamp = Some(605);
     assert_eq!(event_for_source(&src, 0).clock(), "10:05");
+    // Past an hour the minutes field rolls into hours rather than printing
+    // a runaway "90:05" that would break the fixed-width column.
+    src.timestamp = Some(3600);
+    assert_eq!(event_for_source(&src, 0).clock(), "1:00:00");
+    src.timestamp = Some(5405);
+    assert_eq!(event_for_source(&src, 0).clock(), "1:30:05");
     // The spec's "missing timestamps" case: honest dashes, never a fake 0:00.
     src.timestamp = None;
     assert_eq!(event_for_source(&src, 0).clock(), "--:--");

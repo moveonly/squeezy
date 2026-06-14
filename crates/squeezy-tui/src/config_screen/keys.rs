@@ -89,7 +89,7 @@ pub(crate) fn handle_key(
         (KeyCode::Esc, _) => {
             if state.dirty {
                 notifications.push(
-                    "Closed with unsaved edits already applied. Re-open to view current state.",
+                    "Changes were saved as you made them. Re-open to view current state.",
                     NotifySeverity::Info,
                 );
             }
@@ -343,6 +343,12 @@ pub(crate) fn handle_key(
                     NotifySeverity::Info,
                 );
                 return KeyOutcome::KeepOpen;
+            }
+            // The status-line field opens the rich `/statusline` builder (the same
+            // discoverable picker the command uses) instead of the raw
+            // comma-separated list editor — both entry points share one UI.
+            if field.toml_path == ["tui", "status_line"] {
+                return KeyOutcome::OpenStatusLineSetup;
             }
             // The model field opens a registry-driven picker; the per-provider
             // routing model fields stay free-text (a short id/alias like

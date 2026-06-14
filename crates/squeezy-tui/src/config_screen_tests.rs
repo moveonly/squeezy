@@ -464,6 +464,33 @@ fn space_toggles_bool_field() {
 }
 
 #[test]
+fn config_status_line_field_opens_the_rich_picker_not_the_text_editor() {
+    // Editing the status_line field from config must defer to the rich
+    // `/statusline` builder (the same discoverable picker the command opens),
+    // not the raw comma-separated StringList editor.
+    let mut state = temp_config_state(Some(SectionId::Verbosity));
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    state.field_index = field_index(SectionId::Verbosity, &["tui", "status_line"]);
+
+    let outcome = handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+
+    assert!(
+        matches!(outcome, KeyOutcome::OpenStatusLineSetup),
+        "Enter on status_line asks the host to open the rich picker",
+    );
+    assert!(
+        state.editor.is_none(),
+        "no raw text editor is opened for status_line",
+    );
+}
+
+#[test]
 fn string_list_editor_round_trips_via_commit() {
     use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldKind, FieldValue, SectionId as SId};
     // Find the Graph section and its languages field.

@@ -347,14 +347,19 @@ impl MentionPopup {
     }
 
     pub(crate) fn move_up(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
+        if self.matches.is_empty() {
+            return;
         }
+        self.selected = if self.selected == 0 {
+            self.matches.len() - 1
+        } else {
+            self.selected - 1
+        };
     }
 
     pub(crate) fn move_down(&mut self) {
-        if self.selected + 1 < self.matches.len() {
-            self.selected += 1;
+        if !self.matches.is_empty() {
+            self.selected = (self.selected + 1) % self.matches.len();
         }
     }
 

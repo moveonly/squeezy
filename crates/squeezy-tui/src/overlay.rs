@@ -148,7 +148,6 @@ impl Overlay {
         match self {
             Overlay::Model(o) => lines.extend(o.render(|e| e.label())),
         }
-        lines.push(footer_line());
         lines
     }
 }
@@ -166,13 +165,6 @@ fn header_line(title: &'static str) -> Line<'static> {
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ])
-}
-
-fn footer_line() -> Line<'static> {
-    Line::from(Span::styled(
-        "",
-        Style::default().fg(crate::render::theme::quiet()),
-    ))
 }
 
 #[derive(Debug, Clone)]

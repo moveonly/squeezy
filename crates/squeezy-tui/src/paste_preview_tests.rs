@@ -59,14 +59,14 @@ fn into_text_returns_the_pending_text_verbatim() {
 #[test]
 fn summary_is_singular_plural_aware_and_grouped() {
     let single_line = PastePreview::new("x".to_string());
-    assert_eq!(single_line.summary(), "1 char · 1 line · 1 byte");
+    assert_eq!(single_line.summary(), "1 line · 1 char · 1 byte");
 
     let multi = PastePreview::new("ab\ncd".to_string());
-    assert_eq!(multi.summary(), "5 chars · 2 lines · 5 bytes");
+    assert_eq!(multi.summary(), "2 lines · 5 chars · 5 bytes");
 
     // Large counts get thousands separators.
     let big = PastePreview::new("y".repeat(3_420));
-    assert_eq!(big.summary(), "3,420 chars · 1 line · 3,420 bytes");
+    assert_eq!(big.summary(), "1 line · 3,420 chars · 3,420 bytes");
 }
 
 #[test]

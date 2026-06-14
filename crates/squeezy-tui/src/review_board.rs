@@ -153,10 +153,14 @@ pub(crate) struct ReviewCard {
 }
 
 impl ReviewCard {
-    /// The elapsed time as a compact `m:ss` clock, or `"-"` when the source carried
-    /// no start time (an honest "no timing" rendering for a cap-rejected worker).
+    /// The elapsed time as a compact `m:ss` clock (rolling over to `h:mm:ss` once
+    /// past an hour), or `"-"` when the source carried no start time (an honest
+    /// "no timing" rendering for a cap-rejected worker).
     pub(crate) fn elapsed_clock(&self) -> String {
         match self.elapsed_secs {
+            Some(secs) if secs >= 3600 => {
+                format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+            }
             Some(secs) => format!("{}:{:02}", secs / 60, secs % 60),
             None => "-".to_string(),
         }

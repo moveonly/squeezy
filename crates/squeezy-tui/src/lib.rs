@@ -2000,6 +2000,14 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
             return;
         }
     };
+    // A file touch that leaves the effective settings unchanged must not
+    // announce a reload. The watcher already ignores byte-identical re-saves;
+    // this also covers a comment- or whitespace-only external edit whose parsed
+    // config matches what is already live, so an idle session never accumulates
+    // a stack of "settings reloaded from disk" status lines.
+    if new_cfg == *agent.config() {
+        return;
+    }
     // Mirror an external theme edit into the runtime palette override
     // immediately — the agent's config_snapshot already carries the new
     // value, but the palette layer reads the override directly.
@@ -3819,6 +3827,20 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // the peek never fights another surface. Drag/scroll are handled below (they
     // dismiss any live preview).
     if let MouseEventKind::Moved = mouse.kind {
+        // Hover Preview reachability (§12.1.4): the popover paints OVER the rows
+        // beneath the previewed header yet registers no hit target, so a pointer
+        // moved onto it lands on unregistered space, the recognizer reports a
+        // `HoverLeave`, and the peek the user is reaching for is dismissed before
+        // they can read it. While the pointer is inside the popover's last-painted
+        // rect, treat the popover as part of its own hover affordance: keep it and
+        // consume the Move (no recognizer, no dismiss), so it can actually be read
+        // — and so the cost/turn meta on the answer stays put long enough to land.
+        if app.hover_preview.is_some()
+            && let Some(rect) = app.hover_preview_rect.get()
+            && smart_split::rect_contains(rect, mouse.column, mouse.row)
+        {
+            return app.needs_redraw;
+        }
         // Subagent Hover Preview (§12.8.2): a bare Move over a subagent timeline row
         // reveals the subagent preview popover after the same hover-intent dwell.
         // Checked first (and in every active source, since the pane is always
@@ -8818,25 +8840,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
-    // While the config screen is open, route all other keys to it.
-    if app.config_screen.is_some() {
-        let mut feedback = config_screen::ConfigFeedback::new();
-        let outcome = {
-            let state = app.config_screen.as_mut().expect("checked above");
-            config_screen::handle_key(state, agent, &mut feedback, key)
-        };
-        // Drain any MCP actions staged by `/mcp` key bindings before
-        // the next draw so the user sees status updates immediately
-        // rather than waiting for the next animation tick.
-        drain_mcp_actions(app, agent, &mut feedback);
-        if matches!(outcome, config_screen::KeyOutcome::Close) {
-            close_config_screen(app, agent, "config closed");
-        }
-        forward_config_feedback(app, feedback);
-        return Ok(false);
-    }
-
-    // `/statusline` overlay swallows all keys until closed.
+    // `/statusline` overlay swallows all keys until closed. Checked BEFORE the
+    // config screen so that when it was opened FROM config's `status_line` field
+    // (config stays open underneath), the overlay — not config — handles keys;
+    // closing it then returns to config.
     if app.status_line_setup.is_some() {
         let outcome = app
             .status_line_setup
@@ -8856,8 +8863,42 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             } => {
                 app.status_line_setup = None;
                 save_status_line(app, agent, items, use_colors, scope);
+                // If opened from the config screen (still open beneath), refresh
+                // its snapshot so the `status_line` row shows the saved value.
+                sync_config_status_line(app, agent);
             }
         }
+        return Ok(false);
+    }
+
+    // While the config screen is open, route all other keys to it.
+    if app.config_screen.is_some() {
+        let mut feedback = config_screen::ConfigFeedback::new();
+        let outcome = {
+            let state = app.config_screen.as_mut().expect("checked above");
+            config_screen::handle_key(state, agent, &mut feedback, key)
+        };
+        // Drain any MCP actions staged by `/mcp` key bindings before
+        // the next draw so the user sees status updates immediately
+        // rather than waiting for the next animation tick.
+        drain_mcp_actions(app, agent, &mut feedback);
+        match outcome {
+            config_screen::KeyOutcome::Close => {
+                close_config_screen(app, agent, "config closed");
+            }
+            // Editing the `status_line` field opens the rich `/statusline`
+            // builder over the (still-open) config screen — the same picker the
+            // `/statusline` command uses — instead of a raw text editor.
+            config_screen::KeyOutcome::OpenStatusLineSetup => {
+                app.status_line_setup = Some(status_line_setup::StatusLineSetupState::new(
+                    app.status_line_items.as_deref(),
+                    app.status_line_use_colors,
+                ));
+                app.status = "/statusline".to_string();
+            }
+            config_screen::KeyOutcome::KeepOpen => {}
+        }
+        forward_config_feedback(app, feedback);
         return Ok(false);
     }
 
@@ -11059,12 +11100,13 @@ fn toggle_minimap(app: &mut TuiApp) {
 /// the new state. Sets `needs_redraw` so the toggle paints immediately.
 fn toggle_clipboard_history(app: &mut TuiApp) {
     app.clipboard_history_open = !app.clipboard_history_open;
+    app.clipboard_clear_armed = false;
     app.status = if app.clipboard_history_open {
         if app.clipboard_history.is_empty() {
             "clipboard history (empty) — Esc to close".to_string()
         } else {
             format!(
-                "clipboard history: {} — ↑↓ select · Enter re-copy · d delete · c clear · Esc close",
+                "clipboard history: {} — ↑↓ select · Enter re-copy · d delete · p pin · c clear · Esc close",
                 count_label_entries(app.clipboard_history.len()),
             )
         }
@@ -11089,6 +11131,48 @@ fn count_label_entries(count: usize) -> String {
 /// before-the-global-keymap consumption: Esc/Alt+p close, Up/Down move the
 /// selection, Enter re-copies the selected entry, `d` deletes it, `p` toggles its
 /// pin, and `c` clears the whole history.
+///
+/// The clipboard-history `clear` verb, shared by the keyboard `c` and the
+/// `[ Clear all ]` mouse button. With no pinned entries it wipes immediately —
+/// the one-action privacy escape the picker promises. The instant any entry is
+/// pinned (the user's explicit "keep this" signal) the first invocation only
+/// arms a confirm; the caller commits on the second consecutive `c`. An
+/// already-empty history is a silent no-op, matching `d`.
+fn clear_clipboard_history(app: &mut TuiApp) {
+    if app.clipboard_history.is_empty() {
+        app.clipboard_clear_armed = false;
+        return;
+    }
+    let pinned = app
+        .clipboard_history
+        .entries()
+        .iter()
+        .filter(|e| e.pinned)
+        .count();
+    if pinned > 0 && !app.clipboard_clear_armed {
+        app.clipboard_clear_armed = true;
+        app.status = format!(
+            "press c again to wipe {}, Esc to cancel",
+            count_label_pins(pinned),
+        );
+        app.needs_redraw = true;
+        return;
+    }
+    app.clipboard_history.clear();
+    app.clipboard_clear_armed = false;
+    app.status = "clipboard history cleared".to_string();
+    app.needs_redraw = true;
+}
+
+/// `"N pinned copies"` / `"1 pinned copy"` for the clear-confirm prompt.
+fn count_label_pins(count: usize) -> String {
+    if count == 1 {
+        "1 pinned copy".to_string()
+    } else {
+        format!("{count} pinned copies")
+    }
+}
+
 fn handle_clipboard_history_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     if !app.clipboard_history_open {
         return false;
@@ -11098,9 +11182,15 @@ fn handle_clipboard_history_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     // modal swallows below.
     if app.keymap.lookup(key.code, key.modifiers) == Some(keymap::Action::ToggleClipboardHistory) {
         app.clipboard_history_open = false;
+        app.clipboard_clear_armed = false;
         app.status = "clipboard history closed".to_string();
         app.needs_redraw = true;
         return true;
+    }
+    // The clear-confirm latch only survives a second consecutive `c`; any other
+    // key (including Esc) disarms it so a stray follow-up can't commit the wipe.
+    if !matches!(key.code, KeyCode::Char('c')) {
+        app.clipboard_clear_armed = false;
     }
     match key.code {
         KeyCode::Esc => {
@@ -11126,9 +11216,7 @@ fn handle_clipboard_history_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             toggle_pin_selected_clipboard_entry(app);
         }
         KeyCode::Char('c') => {
-            app.clipboard_history.clear();
-            app.status = "clipboard history cleared".to_string();
-            app.needs_redraw = true;
+            clear_clipboard_history(app);
         }
         // Swallow every other key so the picker is modal: a stray keystroke
         // cannot leak into the composer underneath while the overlay owns focus.
@@ -13704,6 +13792,11 @@ fn build_entry_preview_meta(app: &TuiApp, entry: &TranscriptEntry, turn: u32) ->
         if let Some(usd) = provider.estimated_usd_micros {
             parts.push(format_cost_usd(usd));
         }
+        // Name the model that did the turn's main work (when recorded), so the
+        // peek answers "what ran this, and what did it cost" in one line.
+        if let Some(model) = turn_primary_model(metrics) {
+            parts.push(model.to_string());
+        }
         if let Some(input) = provider.input_tokens {
             parts.push(format!("{} in", compact_token_count(input)));
         }
@@ -13712,6 +13805,31 @@ fn build_entry_preview_meta(app: &TuiApp, entry: &TranscriptEntry, turn: u32) ->
         }
     }
     Some(parts.join(" \u{00b7} "))
+}
+
+/// The model that did the bulk of a turn's MAIN (non-subagent) work, for the
+/// hover-preview meta line — the `model_ledger` main bucket carrying the largest
+/// priced spend (ties broken by output tokens). `None` when the turn records no
+/// per-model main spend (older sessions, or local/help turns), so the meta line
+/// simply omits the model rather than guessing.
+fn turn_primary_model(metrics: &squeezy_core::TurnMetrics) -> Option<&str> {
+    metrics
+        .model_ledger
+        .0
+        .values()
+        .filter(|bucket| {
+            let main = &bucket.main;
+            main.estimated_usd_micros.is_some()
+                || main.input_tokens.is_some()
+                || main.output_tokens.is_some()
+        })
+        .max_by_key(|bucket| {
+            (
+                bucket.main.estimated_usd_micros.unwrap_or(0),
+                bucket.main.output_tokens.unwrap_or(0),
+            )
+        })
+        .map(|bucket| bucket.model.as_str())
 }
 
 /// `Alt+1`: toggle the Hover Preview popover (§12.1.4) for the currently focused
@@ -14985,6 +15103,19 @@ async fn drain_command_palette_run(app: &mut TuiApp, agent: &mut Agent) -> Resul
             // slash-menu / cursor invariants). A parameter command leaves a trailing
             // space and parks the user there to complete it; a parameterless command
             // is filled in ready to send with Enter.
+            //
+            // `set_input` is a full replace, so seeding the command over a half-typed
+            // prompt would silently discard the user's draft (and its attachments).
+            // When the composer holds a real draft (non-blank and not itself a slash
+            // command), leave it intact and tell the user to clear it first instead.
+            let draft_present =
+                !app.input.trim().is_empty() && !app.input.trim_start().starts_with('/');
+            if draft_present {
+                app.status =
+                    format!("composer has a draft — clear it (Ctrl+U) before running {name}");
+                app.needs_redraw = true;
+                return Ok(());
+            }
             let text = if has_parameter {
                 format!("{name} ")
             } else {
@@ -15020,7 +15151,7 @@ fn toggle_lane_fold(app: &mut TuiApp) {
             "lane folds (no entry to fold) — Esc to close".to_string()
         } else {
             format!(
-                "lane folds: {} — \u{2191}\u{2193} select \u{00b7} Enter fold \u{00b7} Esc close",
+                "lane folds: {} — \u{2191}\u{2193} select \u{00b7} Enter fold \u{00b7} c/o all \u{00b7} Esc close",
                 app.lane_panel.summary(),
             )
         };
@@ -15466,12 +15597,17 @@ fn toggle_annotations(app: &mut TuiApp) {
 }
 
 /// The list index of the annotation nearest the current top-of-view reading
-/// position, so the overlay opens with its cursor where the user is. Prefers the
-/// first annotation at or after the position; when the view sits past every
-/// annotation it parks on the last one via the reverse walk instead of wrapping
-/// to the top. `0` on an empty store.
+/// position, so the overlay opens with its cursor where the user is. Prefers a
+/// note anchored to the current entry, then the first annotation after the
+/// position; when the view sits past every annotation it parks on the last one
+/// via the reverse walk instead of wrapping to the top. `0` on an empty store.
 fn annotation_cursor_near_current(app: &TuiApp) -> usize {
     let current = current_top_entry_id(app);
+    if let Some(id) = current
+        && let Some(idx) = app.annotations.first_index_for_entry(id)
+    {
+        return idx;
+    }
     let after_is_real = current
         .map(|id| app.annotations.list().iter().any(|a| a.entry_id > id))
         .unwrap_or(true);
@@ -18739,22 +18875,23 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // construction. Select resolves the row by its stable id; re-copy/delete
         // act on it; clear wipes the whole history.
         interaction::Action::ClipboardSelect(id) => {
+            app.clipboard_clear_armed = false;
             if app.clipboard_history.select_id(id) {
                 app.needs_redraw = true;
             }
         }
         interaction::Action::ClipboardRecopy(id) => {
+            app.clipboard_clear_armed = false;
             app.clipboard_history.select_id(id);
             recopy_clipboard_entry(app, id);
         }
         interaction::Action::ClipboardDelete(id) => {
+            app.clipboard_clear_armed = false;
             app.clipboard_history.select_id(id);
             delete_selected_clipboard_entry(app);
         }
         interaction::Action::ClipboardClear => {
-            app.clipboard_history.clear();
-            app.status = "clipboard history cleared".to_string();
-            app.needs_redraw = true;
+            clear_clipboard_history(app);
         }
         // Prompt Snippets picker (§12.3.2). Each routes through the same handler
         // the keyboard verb drives, so mouse/keyboard parity holds by
@@ -20241,6 +20378,18 @@ fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: String) {
 /// Persist the picker's selection to `[tui].status_line` /
 /// `[tui].status_line_use_colors` in the chosen scope (user or project
 /// settings file) and apply it in-memory immediately.
+/// After the `/statusline` builder saves while the config screen is open beneath
+/// it (the field was edited from config), refresh the config screen's in-memory
+/// `effective` snapshot so its `status_line` row shows the just-saved value
+/// rather than the pre-edit list. No-op when config isn't open.
+fn sync_config_status_line(app: &mut TuiApp, agent: &Agent) {
+    if let Some(state) = app.config_screen.as_mut() {
+        let cfg = agent.config_snapshot();
+        state.effective.tui.status_line = cfg.tui.status_line.clone();
+        state.effective.tui.status_line_use_colors = cfg.tui.status_line_use_colors;
+    }
+}
+
 fn save_status_line(
     app: &mut TuiApp,
     agent: &mut Agent,
@@ -22066,7 +22215,7 @@ async fn handle_feedback_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
                     feedback.message
                 );
                 app.pending_feedback = Some(feedback);
-                app.status = "feedback ready: Enter send · Esc discard".to_string();
+                app.status = "feedback ready: Enter/Y send · Esc/N discard".to_string();
                 app.push_transcript_item(TranscriptItem::system(preview));
             }
             Err(error) => set_status_notice(app, format!("feedback preview failed: {error}")),
@@ -30594,7 +30743,7 @@ fn render_session_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
                 }),
             ),
             Span::styled(
-                format!("{:>6} ", event.clock()),
+                format!("{:>7} ", event.clock()),
                 Style::default().fg(crate::render::theme::quiet()),
             ),
             Span::styled(
@@ -31690,6 +31839,9 @@ fn render_tool_actions_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
 /// "noncommittal preview" the spec calls for.
 fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let Some(preview) = app.hover_preview.as_ref() else {
+        // No popover this frame: drop any stale rect so the mouse-move reachability
+        // guard can't keep a vanished popover alive.
+        app.hover_preview_rect.set(None);
         return;
     };
     // Anchor next to the previewed entry's live header row when it is on-screen;
@@ -31704,8 +31856,12 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
     // beyond the body excerpt.
     let body_rows = preview.body.len() + usize::from(preview.meta.is_some());
     let Some(rect) = hover_preview::popover_rect(area, anchor_row, body_rows) else {
+        app.hover_preview_rect.set(None);
         return;
     };
+    // Record the painted rect so the mouse-move path knows the pointer is over the
+    // popover (which registers no hit target) and keeps it alive to be read.
+    app.hover_preview_rect.set(Some(rect));
 
     // Overlay the popover region only (Clear is scoped to `rect`, never the whole
     // frame), so the transcript underneath keeps its geometry.
@@ -32307,9 +32463,10 @@ fn render_command_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
         return;
     }
 
-    // Clamp the cursor to the visible count so a command that vanished (e.g. after a
-    // query change) can never leave the cursor past the end.
-    let selected = palette.selected().min(visible_count - 1);
+    // Clamp the cursor to the already-computed visible count so a command that
+    // vanished (e.g. after a query change) can never leave the cursor past the end,
+    // without re-scoring every entry a second time this frame.
+    let selected = palette.selected_within(visible_count);
     let list_top = inner.y.saturating_add(3);
     let list_bottom = inner.y.saturating_add(inner.height);
     let rows = list_bottom.saturating_sub(list_top) as usize;
@@ -33937,7 +34094,7 @@ fn search_status_text(state: &search::SearchState) -> String {
 }
 
 /// Width (in cells) of the disclosure-caret hit zone at the start of a card
-/// header row. The caret glyph (`>`/`v`, see [`render::button`]) plus its
+/// header row. The fold disclosure glyph (see [`render::button`]) plus its
 /// padding occupy the leading columns; a click there toggles the entry's fold,
 /// while a click on the rest of the header focuses the entry.
 const CARD_CARET_WIDTH: u16 = 3;
@@ -41297,7 +41454,7 @@ fn diff_output_line(content: &str, mut spans: Vec<Span<'static>>) -> Line<'stati
     Line::from(spans)
 }
 
-fn strip_ansi_escape_sequences(input: &str) -> String {
+pub(crate) fn strip_ansi_escape_sequences(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -43648,6 +43805,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         app.turn_rx.is_some(),
         queue_open,
         Some(queue_groups_summary.as_str()),
+        app.glyph_mode.tokens(),
     );
     let extra_height = queue_overlay_lines.len()
         + overlay_lines.len()
@@ -44222,6 +44380,37 @@ fn register_attention_indicator_target(app: &TuiApp, status_area: Rect) {
     );
 }
 
+/// Truncate `label` to at most `cells` display columns, appending an ellipsis
+/// when a cut is needed (the ellipsis itself costs one cell, so the result is
+/// never wider than `cells`). Width-aware so a wide-glyph (CJK / 2-cell) label
+/// is bounded by columns painted, not chars; used by the breadcrumb renderer's
+/// overflow branch so the deepest crumb stays on-surface rather than being
+/// clipped off the right edge by `Paragraph`.
+fn truncate_label_to_cells(label: &str, cells: usize) -> String {
+    if cells == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(label) <= cells {
+        return label.to_string();
+    }
+    if cells == 1 {
+        return "\u{2026}".to_string();
+    }
+    let budget = cells - 1;
+    let mut out = String::new();
+    let mut running = 0usize;
+    for ch in label.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if running + w > budget {
+            break;
+        }
+        out.push(ch);
+        running += w;
+    }
+    out.push('\u{2026}');
+    out
+}
+
 /// Paint the Clickable Breadcrumbs strip (§12.1.5) on a single `row` and register
 /// one [`interaction::ChromeKey::BreadcrumbCrumb`] click target per crumb. The
 /// trail is BUILT FRESH from the current model here (never cached), so it always
@@ -44294,6 +44483,8 @@ fn render_breadcrumbs_strip(frame: &mut Frame<'_>, row: Rect, app: &TuiApp) {
     } else {
         // Root … deepest. Always show the first and last crumb; collapse the
         // middle to a single ellipsis so the trail still orients on a narrow row.
+        // The deepest crumb is then truncated to whatever columns remain so it —
+        // the user's current location — is never clipped off the right edge.
         if let Some(first) = model.get(0) {
             push_crumb(&mut spans, &mut crumb_rects, &mut col, 0, &first.label);
         }
@@ -44303,10 +44494,15 @@ fn render_breadcrumbs_strip(frame: &mut Frame<'_>, row: Rect, app: &TuiApp) {
             col += 1;
         }
         if count > 1 {
-            push_sep(&mut spans, &mut col);
+            let used = col + UnicodeWidthStr::width(breadcrumbs::SEPARATOR);
+            let avail = width.saturating_sub(used);
             let last = count - 1;
-            if let Some(crumb) = model.get(last) {
-                push_crumb(&mut spans, &mut crumb_rects, &mut col, last, &crumb.label);
+            if avail > 0
+                && let Some(crumb) = model.get(last)
+            {
+                push_sep(&mut spans, &mut col);
+                let label = truncate_label_to_cells(&crumb.label, avail);
+                push_crumb(&mut spans, &mut crumb_rects, &mut col, last, &label);
             }
         }
     }
@@ -46256,6 +46452,12 @@ pub(crate) struct TuiApp {
     /// picker owns key/mouse routing. Toggled by the `ToggleClipboardHistory`
     /// keymap action.
     pub(crate) clipboard_history_open: bool,
+    /// Confirm latch for the clipboard-history `clear` verb when pinned entries
+    /// are present (§12.6.1). The first `c` (or `[ Clear all ]` click) arms this
+    /// and asks for confirmation rather than wiping; the second consecutive `c`
+    /// commits. Any other key, Esc, or closing the picker disarms it, so a single
+    /// mistyped `c` can never destroy a pinned copy.
+    pub(crate) clipboard_clear_armed: bool,
     /// Prompt Snippets From Selection (§12.3.2): a bounded, session-scoped store
     /// of named prompt snippets captured from transcript selections. Drives the
     /// picker overlay; starts empty and stays cheap at idle.
@@ -46765,6 +46967,15 @@ pub(crate) struct TuiApp {
     /// `ToggleHoverPreview` (`Alt+1`) keyboard verb, and cleared on hover-leave,
     /// any click/key, scroll, or a transcript change so it never goes stale.
     pub(crate) hover_preview: Option<hover_preview::HoverPreview>,
+    /// The on-screen rect the Hover Preview popover last painted into, or `None`
+    /// when no popover is showing. The popover overlays the rows beneath the
+    /// previewed header but registers no hit target, so the mouse-move path reads
+    /// this to recognize "the pointer is now over the popover itself" and keep it
+    /// alive — without it, moving the pointer onto the popover to read it lands on
+    /// unregistered space, fires a `HoverLeave`, and dismisses the very peek the
+    /// user was reaching for. Refreshed each frame by `render_hover_preview_popover`
+    /// (`Some(rect)` when painted, `None` when not).
+    pub(crate) hover_preview_rect: std::cell::Cell<Option<Rect>>,
     /// The live Subagent Hover Preview popover (§12.8.2), or `None` when none is
     /// showing (the resting state, paints nothing extra and costs nothing idle).
     /// `Some` holds the previewed subagent's pane index, name, distilled status,
@@ -47575,6 +47786,7 @@ impl TuiApp {
             clipboard_chain: build_clipboard_chain(Box::new(clipboard::RealSink)),
             clipboard_history: clipboard_history::ClipboardHistoryStore::new(),
             clipboard_history_open: false,
+            clipboard_clear_armed: false,
             snippets: snippet_store::SnippetStore::new(),
             snippets_open: false,
             scratchpad: scratchpad::Scratchpad::new(),
@@ -47658,6 +47870,7 @@ impl TuiApp {
             action_palette: None,
             tool_actions: None,
             hover_preview: None,
+            hover_preview_rect: std::cell::Cell::new(None),
             subagent_preview: None,
             subagent_return_anchor: None,
             command_palette: None,

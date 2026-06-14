@@ -652,7 +652,8 @@ fn visible_window(total: usize, cursor: usize, height: usize) -> (usize, usize, 
     }
     if height == 2 {
         return match (cursor > 0, cursor + 1 < total) {
-            (true, _) => (cursor, cursor + 1, true, false),
+            (true, true) => (cursor, cursor + 1, false, true),
+            (true, false) => (cursor, cursor + 1, true, false),
             (false, true) => (cursor, cursor + 1, false, true),
             (false, false) => (cursor, cursor + 1, false, false),
         };

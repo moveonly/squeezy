@@ -117,12 +117,14 @@ fn unrelated_keys_are_ignored() {
 
 #[test]
 fn indicator_line_present_when_queue_non_empty() {
+    let tokens = crate::glyph_mode::GlyphMode::Unicode.tokens();
     let queue = queue_of(&["a", "b"]);
-    assert!(indicator_line(&queue, true, false, None).is_some());
-    assert!(indicator_line(&queue, true, true, None).is_some());
-    assert!(indicator_line(&VecDeque::new(), true, false, None).is_none());
+    assert!(indicator_line(&queue, true, false, None, tokens).is_some());
+    assert!(indicator_line(&queue, true, true, None, tokens).is_some());
+    assert!(indicator_line(&VecDeque::new(), true, false, None, tokens).is_none());
     // A group summary rides along in the strip when present.
-    let line = indicator_line(&queue, false, false, Some("Group 1 (2, paused)")).expect("line");
+    let line =
+        indicator_line(&queue, false, false, Some("Group 1 (2, paused)"), tokens).expect("line");
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(
         text.contains("Group 1 (2, paused)"),

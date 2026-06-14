@@ -872,7 +872,7 @@ fn render_theme_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
     let (row_start, row_end, hidden_above, hidden_below) = if editing {
         (state.field_index, state.field_index + 1, 0, 0)
     } else {
-        let detail_rows = 4usize + usize::from(state.theme_editor.is_some()) * 4;
+        let detail_rows = 4usize;
         let row_area = (area.height as usize).saturating_sub(detail_rows);
         let (start, end) = field_row_window(total_rows, state.field_index, row_area);
         (start, end, start, total_rows.saturating_sub(end))

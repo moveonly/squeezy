@@ -45,7 +45,7 @@ keeps only the diagnostics that name an error, warning, or
 `failure-note`:
 
 ```rust
-// crates/squeezy-tools/src/shell_output.rs:116–187
+// crates/squeezy-tools/src/shell_output.rs:131–207
 fn parse_cargo_or_rustc_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
     let mut kept = Vec::new();
     let mut plain_lines = Vec::new();
@@ -58,7 +58,7 @@ fn parse_cargo_or_rustc_json(stdout: &str, stderr: &str) -> Option<(String, Stri
             // JSON stream. Preserve those signal lines so shaped output still
             // surfaces test failures.
             if libtest_signal_line(line) {
-                plain_lines.push(trim_shaped_block(line.trim_end(), 4_000));
+                plain_lines.push(trim_shaped_block(line.trim_end(), 8_000));
             }
             continue;
         };
@@ -81,7 +81,7 @@ fn parse_cargo_or_rustc_json(stdout: &str, stderr: &str) -> Option<(String, Stri
                     .or_else(|| message.get("message").and_then(Value::as_str))
                     .unwrap_or("");
                 if !text.trim().is_empty() {
-                    kept.push(trim_shaped_block(text, 4_000));
+                    kept.push(trim_shaped_block(text, 8_000));
                 }
             }
             Some("build-finished") => {
@@ -111,7 +111,7 @@ Three reduction levers are doing the work here:
    includes the relevant note/help spans inline.
 3. **Plain-line carve-out.** Lines that don't parse as JSON are matched
    against `libtest_signal_line`
-   (`shell_output.rs:189–212`), which keeps panic backtraces,
+   (`shell_output.rs:209–232`), which keeps panic backtraces,
    `failures:` block headers, `---- name stdout ----` markers,
    and the non-empty `test result:` rows while dropping the empty
    `test result: ok. 0 passed; 0 failed` rows that cargo prints for
@@ -125,13 +125,13 @@ shaper's dedupe accounting.
 
 ### Nextest aggregation
 
-`parse_nextest_json` (`shell_output.rs:214–267`) treats nextest's
+`parse_nextest_json` (`shell_output.rs:234–291`) treats nextest's
 per-test JSON event stream as a sequence of state updates and emits a
 single summary line plus the events whose `event`, `status`, or
 embedded strings match `line_has_signal`:
 
 ```rust
-// crates/squeezy-tools/src/shell_output.rs:214–268
+// crates/squeezy-tools/src/shell_output.rs:234–290
 fn parse_nextest_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
     let mut kept = Vec::new();
     let mut parsed = 0usize;
@@ -169,7 +169,7 @@ fn parse_nextest_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
             last_summary = Some(value.clone());
         }
         if line_has_signal(event) || line_has_signal(status) || value_contains_signal(&value) {
-            kept.push(trim_shaped_block(&value.to_string(), 4_000));
+            kept.push(trim_shaped_block(&value.to_string(), 8_000));
         }
     }
     if parsed == 0 {
@@ -182,18 +182,18 @@ fn parse_nextest_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
         ));
     }
     if let Some(summary) = last_summary {
-        summary_parts.push(trim_shaped_block(&summary.to_string(), 4_000));
+        summary_parts.push(trim_shaped_block(&summary.to_string(), 8_000));
     }
     kept.insert(0, summary_parts.join(" "));
     Some((join_shaped_lines(kept), String::new()))
 }
 ```
 
-The `line_has_signal` predicate (`shell_output.rs:506–517`) is the
+The `line_has_signal` predicate (`shell_output.rs:553–564`) is the
 gatekeeper for what survives:
 
 ```rust
-// crates/squeezy-tools/src/shell_output.rs:506–517
+// crates/squeezy-tools/src/shell_output.rs:553–564
 fn line_has_signal(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("error")
@@ -208,7 +208,7 @@ fn line_has_signal(line: &str) -> bool {
 }
 ```
 
-Note the `value_contains_signal` recursion (`shell_output.rs:349–358`):
+Note the `value_contains_signal` recursion (`shell_output.rs:396–405`):
 nextest sometimes embeds the failure marker deep inside a struct
 (e.g. `"outcome": { "status": "fail" }`), so the predicate walks the
 JSON tree rather than only inspecting the top-level `status`/`event`
@@ -218,12 +218,12 @@ ran.
 
 ### Pytest, Jest, Vitest
 
-`parse_test_report_json` (`shell_output.rs:270–283`) handles the
+`parse_test_report_json` (`shell_output.rs:293–306`) handles the
 JS/Python test runners by parsing a single JSON document and walking
 it for signal-bearing strings:
 
 ```rust
-// crates/squeezy-tools/src/shell_output.rs:270–324
+// crates/squeezy-tools/src/shell_output.rs:293–371
 fn parse_test_report_json(stdout: &str, stderr: &str, family: &str) -> Option<(String, String)> {
     // jest/pytest/vitest emit a single JSON document on either stdout or
     // stderr. Combining them with a newline produces invalid JSON when both
@@ -265,7 +265,7 @@ fn json_test_summary(value: &Value, family: &str) -> String {
 }
 ```
 
-`collect_json_signal_lines` (`shell_output.rs:326–347`) annotates each
+`collect_json_signal_lines` (`shell_output.rs:373–394`) annotates each
 extracted string with its JSON path (e.g.
 `$.testResults[2].assertionResults[0].failureMessages[0]: ...`), which
 matters because pytest's failure body and Jest's stack traces both
@@ -274,7 +274,7 @@ correlate the failure text with the file/test it came from without
 having to read the full JSON.
 
 The fallback to `parse_first_valid_json` on the *other* stream
-(`shell_output.rs:285–299`) addresses a real failure mode: npm prints
+(`shell_output.rs:308–325`) addresses a real failure mode: npm prints
 deprecation warnings on stderr while Jest emits its report on stdout,
 or pytest in CI flips the streams. Concatenating them would yield
 invalid JSON; trying each independently recovers the report.
@@ -284,7 +284,7 @@ invalid JSON; trying each independently recovers the report.
 Every shaped string runs through `trim_shaped_block`:
 
 ```rust
-// crates/squeezy-tools/src/shell_output.rs:519–531
+// crates/squeezy-tools/src/shell_output.rs:566–578
 fn trim_shaped_block(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.trim().to_string();
@@ -300,9 +300,9 @@ fn trim_shaped_block(text: &str, max_chars: usize) -> String {
 }
 ```
 
-Cargo, rustc, nextest, and the JS test runners pass `4_000`. The
+Cargo, rustc, nextest, and the JS test runners pass `8_000`. The
 unstructured shaper in `shape_unstructured_stream` passes `2_000`
-(`shell_output.rs:425`). The asymmetry matches the expected information
+(`shell_output.rs:472`). The asymmetry matches the expected information
 density: a single shaped cargo diagnostic that includes the rendered
 ANSI label, the source span, and the help text easily clears 2 KB; an
 unstructured line almost never carries that much signal.
@@ -326,7 +326,7 @@ Both paths are served by `read_tool_output`, which accepts exactly one of
 `handle` or `path` plus optional `offset` / `limit`.
 
 ```rust
-// crates/squeezy-tools/src/shell_spillover.rs:1–34
+// crates/squeezy-tools/src/shell_spillover.rs:1–39
 //! Per-session tempfile spillover for shell-tool output that exceeds
 //! the truncation budget.
 //!
@@ -353,7 +353,7 @@ plus a sanitised call id, written under the session directory, and returned
 as a `ShellSpilloverInfo { path, bytes }`:
 
 ```rust
-// crates/squeezy-tools/src/shell_spillover.rs:115–146
+// crates/squeezy-tools/src/shell_spillover.rs:243–274
 pub(crate) fn spill(
     &self,
     call_id: &str,
@@ -446,12 +446,12 @@ The cap stack:
   minified JS, and accidental binary matches can't blow the budget on
   one match.
 - **Total byte cap.** `DEFAULT_OUTPUT_BYTE_CAP = 48_000`
-  (`file_ops.rs:25`) is the default; callers can raise it up to 128 KB
+  (`file_ops.rs:30`) is the default; callers can raise it up to 128 KB
   via `output_byte_cap`. Every prospective match is serialised, the
   serialised length is measured, and if it would push `output_bytes`
   past the cap the search short-circuits with `truncated = true`.
 - **`BTreeSet` dedup of paths.** In `FilesWithMatches` mode the result
-  set is a `BTreeSet<String>` (`file_ops.rs:321`), so the same path
+  set is a `BTreeSet<String>` (`file_ops.rs:762`), so the same path
   matched by many lines counts once and the output remains sorted —
   cheaper for the model to scan than an unsorted dup list.
 
@@ -466,7 +466,7 @@ Both glob and read_file accept a `diff_only` flag that restricts results
 to the worktree's changed files:
 
 ```rust
-// crates/squeezy-tools/src/file_ops.rs:167–172 (glob)
+// crates/squeezy-tools/src/file_ops.rs:503–508 (glob)
 let include_ignored = args.include_ignored.unwrap_or(false);
 let diff_only = args.diff_only.unwrap_or(false);
 let diff_paths = if diff_only {
@@ -477,11 +477,11 @@ let diff_paths = if diff_only {
 ```
 
 The walker then skips any path not in `diff_paths`
-(`file_ops.rs:213–216`). `read_file` enforces the same gate, but
+(`file_ops.rs:603`). `read_file` enforces the same gate, but
 returns a structured refusal instead of silently emptying the result:
 
 ```rust
-// crates/squeezy-tools/src/file_ops.rs:526–538
+// crates/squeezy-tools/src/file_ops.rs:1511–1523
 if args.diff_only.unwrap_or(false) {
     let diff_paths =
         diff_path_set(&self.diff_snapshot(DiffMode::Worktree, DiffOptions::default()));
@@ -509,7 +509,7 @@ paging in only the files the agent itself just touched.
 already had to read for the exclusion check:
 
 ```rust
-// crates/squeezy-tools/src/file_ops.rs:27–47
+// crates/squeezy-tools/src/file_ops.rs:33–53
 /// Detect the canonical image MIME type from a byte prefix using magic
 /// numbers. Supports PNG, JPEG, GIF (87a/89a), and WEBP (RIFF / WEBP
 /// container) — the set of formats the upstream vision providers
@@ -537,7 +537,7 @@ When the prefix matches, the read switches to a structured payload that
 the agent wraps as `LlmInputItem::Image`:
 
 ```rust
-// crates/squeezy-tools/src/file_ops.rs:558–600
+// crates/squeezy-tools/src/file_ops.rs:1543–1603
 // F18: detect image MIME via magic bytes on the prefix we already
 // read for policy checks. PNG, JPEG, GIF, and WEBP all surface in
 // the first 12 bytes, so the policy-prefix read covers detection
@@ -576,7 +576,7 @@ if let Some(mime) = prefix_bytes.as_deref().and_then(detect_image_mime) {
 
 Two non-obvious cost properties: the detection reuses the prefix the
 exclusion check already loaded (`POLICY_PREFIX_BYTES = 4096`, see
-`crates/squeezy-tools/src/lib.rs:166`), so detection is free; and the
+`crates/squeezy-tools/src/lib.rs:293`), so detection is free; and the
 base64 payload is treated by the model as an image input rather than
 text, which avoids the mojibake the naïve UTF-8 path would have
 produced and lets the vision provider page the bytes against image
@@ -601,7 +601,7 @@ the JSON.
    `libtest_signal_line`.
 3. **Shaped block trim.** Each retained `rendered` string runs through
    `trim_shaped_block(text, 8_000)`
-   (`shell_output.rs:151`). One particularly verbose error span
+   (`shell_output.rs:171`). One particularly verbose error span
    crosses 8,000 chars and gets a trailing `[truncated shaped block;
    recover full block via read_tool_output {"path":
    "<spillover-path>"}]` marker; the others fit.
@@ -611,7 +611,7 @@ the JSON.
    `kind=structured` flows out to the shell-tool result.
 5. **Spillover.** Because the raw capture exceeded `output_cap`, the
    shell tool calls `ShellSpilloverStore::spill` with the full 80 KB
-   buffer (`shell_spillover.rs:115`). The store sha256-prefixes the
+   buffer (`shell_spillover.rs:243`). The store sha256-prefixes the
    payload, writes
    `$TMPDIR/squeezy-spillover/<pid>-<ts>-<n>/<call_id>-<sha16>.txt`,
    and the path is appended to the result via the spillover footer.
@@ -621,7 +621,7 @@ the JSON.
    error was truncated mid-rendered.
 7. **Recovery.** The model calls
    `read_tool_output {"path": "<spillover-path>", "offset": 0, "limit": 65536}`.
-   `ShellSpilloverStore::read_range` (`shell_spillover.rs:152`)
+   `ShellSpilloverStore::read_range` (`shell_spillover.rs:329`)
    canonicalises the path, confirms it lives under the session dir,
    reads the window, and returns the full bytes. The model now has
    the third error's complete rendered span without ever having paid
@@ -636,7 +636,7 @@ round-trip and gained nothing from it.
 ## Edge cases & limits
 
 - **Unrecognised commands.** `shell_output_family`
-  (`shell_output.rs:61–91`) only routes `cargo`, `cargo nextest`,
+  (`shell_output.rs:61–103`) only routes `cargo`, `cargo nextest`,
   `rustc`, `pytest`, `jest`, and `vitest` through structured parsers.
   Everything else returns `"shell"` and falls through to
   `shape_unstructured_stream`, which still applies head/tail capping,
@@ -650,7 +650,7 @@ round-trip and gained nothing from it.
   (`shell_output.rs:46–58`). This protects against a misclassified
   command emitting useful text but no JSON.
 - **Spillover budget exhaustion.** `try_reserve` returns `false`
-  once `bytes_used + size > budget_bytes` (`shell_spillover.rs:175–189`),
+  once `bytes_used + size > budget_bytes` (`shell_spillover.rs:352–366`),
   and `spill` returns `None`. The result still ships with the shaped
   output but no recovery path — the model loses the ability to fetch
   the raw bytes for the remainder of the session. With a 100 MiB
@@ -661,7 +661,7 @@ round-trip and gained nothing from it.
   multi-megabyte `data_base64` payload into the response.
 - **Grep dedup false negatives.** The
   `FilesWithMatches` mode dedupes by `rel_str.clone()`
-  (`file_ops.rs:454`); two paths that point to the same file via
+  (`file_ops.rs:905`); two paths that point to the same file via
   different prefixes (rare in practice — the walker always emits one
   canonical relative path per entry) would count twice. The
   `Content` mode does not dedupe by line text, so identical matches
@@ -679,7 +679,7 @@ round-trip and gained nothing from it.
   relative to the bytes saved to be unambiguously worth it.
 - **Diff snapshot cost.** `diff_only=true` triggers
   `self.diff_snapshot(DiffMode::Worktree, ...)`
-  (`file_ops.rs:168–172, 527–528`). The diff is recomputed per call;
+  (`file_ops.rs:503–508, 1512–1513`). The diff is recomputed per call;
   on a large worktree this is non-trivial CPU work, but the savings
   on the read budget dwarf the cost in any reasonable scenario.
 

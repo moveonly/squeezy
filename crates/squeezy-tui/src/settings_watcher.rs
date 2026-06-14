@@ -10,6 +10,8 @@
 //! once per minute; we already wake every tick to redraw, so checking three
 //! `stat()` calls every ~1s is negligible.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -24,6 +26,12 @@ pub(crate) struct SettingsWatcher {
 struct WatchedFile {
     path: PathBuf,
     mtime: Option<SystemTime>,
+    /// Hash of the file's bytes at the last observed mtime (`None` when the
+    /// file is absent). The mtime is only a cheap pre-filter: when it moves we
+    /// compare digests so a metadata-only touch — a sync agent rewriting the
+    /// file, `$EDITOR` saving identical bytes, an idempotent re-save by a
+    /// sibling process — does not masquerade as a real edit.
+    digest: Option<u64>,
 }
 
 impl SettingsWatcher {
@@ -35,22 +43,35 @@ impl SettingsWatcher {
             .into_iter()
             .map(|path| {
                 let mtime = current_mtime(&path);
-                WatchedFile { path, mtime }
+                let digest = file_digest(&path);
+                WatchedFile {
+                    path,
+                    mtime,
+                    digest,
+                }
             })
             .collect();
         Self { files }
     }
 
-    /// Returns `true` when any tracked file's mtime moved (or the file
-    /// appeared / disappeared) since the previous call. Updates the cached
-    /// mtimes in place so consecutive polls don't keep re-firing on the
-    /// same edit.
+    /// Returns `true` when any tracked file's *content* changed (or it appeared
+    /// / disappeared) since the previous call. The mtime is a pre-filter only:
+    /// when it moves we re-hash the bytes and report a change solely when the
+    /// digest differs, so an identical re-save or a metadata touch stays quiet
+    /// (no reload, no status line). Updates the cached mtime + digest in place
+    /// so consecutive polls don't re-fire on the same edit.
     pub(crate) fn poll(&mut self) -> bool {
         let mut changed = false;
         for file in &mut self.files {
             let current = current_mtime(&file.path);
-            if current != file.mtime {
-                file.mtime = current;
+            if current == file.mtime {
+                // mtime unchanged → nothing was written; skip the content read.
+                continue;
+            }
+            file.mtime = current;
+            let digest = file_digest(&file.path);
+            if digest != file.digest {
+                file.digest = digest;
                 changed = true;
             }
         }
@@ -76,6 +97,16 @@ fn current_mtime(path: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(path)
         .ok()
         .and_then(|metadata| metadata.modified().ok())
+}
+
+/// Stable hash of a file's bytes, or `None` when it can't be read (absent or
+/// unreadable). Only used to compare a file against its own previous content
+/// within one process, so any deterministic hasher suffices.
+fn file_digest(path: &std::path::Path) -> Option<u64> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = DefaultHasher::new();
+    hasher.write(&bytes);
+    Some(hasher.finish())
 }
 
 #[cfg(test)]

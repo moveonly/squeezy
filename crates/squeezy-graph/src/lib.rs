@@ -3381,6 +3381,12 @@ fn load_persisted_partitions(
         match store.graph_partition::<ParsedFile>(&record.id)? {
             Some(mut persisted) if persisted_partition_matches(&persisted, record) => {
                 persisted.file = record.clone();
+                // The per-element `file_id` is `#[serde(skip)]` in the persisted
+                // partition (it is constant within a file and equals the redb
+                // key), so restore it from the record here — this is the only
+                // site that deserializes a full `ParsedFile` from the store, and
+                // it runs before the partition is merged into the graph.
+                backfill_element_file_ids(&mut persisted, &record.id);
                 parsed.push(persisted);
             }
             _ => missed_records.push(record.clone()),
@@ -3393,6 +3399,29 @@ fn load_persisted_partitions(
         loaded_files,
         rebuilt: false,
     })
+}
+
+/// Restore the `#[serde(skip)]` per-element `file_id` on a partition loaded from
+/// the store. The id is constant within a file and equals the partition key, so
+/// it is stamped from `file_id` rather than persisted on every symbol/import/
+/// call/reference/body_hit. Fresh (in-memory) parses set it directly via the
+/// extractors and never go through this path.
+fn backfill_element_file_ids(parsed: &mut ParsedFile, file_id: &FileId) {
+    for symbol in &mut parsed.symbols {
+        symbol.file_id = file_id.clone();
+    }
+    for import in &mut parsed.imports {
+        import.file_id = file_id.clone();
+    }
+    for call in &mut parsed.calls {
+        call.file_id = file_id.clone();
+    }
+    for reference in &mut parsed.references {
+        reference.file_id = file_id.clone();
+    }
+    for hit in &mut parsed.body_hits {
+        hit.file_id = file_id.clone();
+    }
 }
 
 fn persisted_partition_matches(parsed: &ParsedFile, record: &FileRecord) -> bool {

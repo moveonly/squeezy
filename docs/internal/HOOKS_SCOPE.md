@@ -33,13 +33,15 @@ the outcome. Skill hook stdout is always ignored; mutations are only available
 to typed in-process `AgentHook` handlers.
 
 Skill hook commands run through `/bin/sh -c` (absolute path on POSIX, `sh` on
-Windows) from the skill directory with `SQUEEZY_HOOK_PAYLOAD`,
-`SQUEEZY_SKILL_DIR`, and `SQUEEZY_SKILL_NAME` set. The child process is placed
+Windows) from the skill directory with `SQUEEZY_SKILL_DIR` and
+`SQUEEZY_SKILL_NAME` set, plus the JSON payload. The child process is placed
 in its own process group (`process_group(0)` on Unix) so a timeout signal
 reaches all grandchildren. A per-hook `timeout` (default 30 s) is enforced via
 a background thread; on expiry the process group receives `SIGKILL` and the
-hook returns deny. Payloads larger than 32 KB are truncated before the env var
-is set to stay within Linux `execve` environment limits. Spawn errors are
+hook returns deny. Payloads up to 8 KiB are passed inline in
+`SQUEEZY_HOOK_PAYLOAD`; larger payloads are written to a temp file delivered
+via `SQUEEZY_HOOK_PAYLOAD_FILE`, with `SQUEEZY_HOOK_PAYLOAD` cleared. Spawn
+errors are
 fail-open by default; set `fail_open = false` in the frontmatter spec for
 enforcement hooks that must not silently pass when the interpreter is missing.
 

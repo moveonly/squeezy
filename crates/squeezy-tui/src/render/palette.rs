@@ -144,7 +144,7 @@ fn quantize_rgb_to_ansi16(target: (u8, u8, u8)) -> Color {
         .unwrap_or(Color::Reset)
 }
 
-const ANSI16_COLORS: [(Color, (u8, u8, u8)); 8] = [
+const ANSI16_COLORS: [(Color, (u8, u8, u8)); 16] = [
     (Color::Black, (0, 0, 0)),
     (Color::Red, (255, 0, 0)),
     (Color::Green, (0, 128, 0)),
@@ -153,6 +153,14 @@ const ANSI16_COLORS: [(Color, (u8, u8, u8)); 8] = [
     (Color::Magenta, (255, 0, 255)),
     (Color::Cyan, (0, 255, 255)),
     (Color::White, (255, 255, 255)),
+    (Color::DarkGray, (80, 80, 80)),
+    (Color::Gray, (128, 128, 128)),
+    (Color::LightRed, (255, 128, 128)),
+    (Color::LightGreen, (128, 255, 128)),
+    (Color::LightYellow, (255, 255, 128)),
+    (Color::LightBlue, (128, 128, 255)),
+    (Color::LightMagenta, (255, 128, 255)),
+    (Color::LightCyan, (128, 255, 255)),
 ];
 
 fn perceptual_distance(a: (u8, u8, u8), b: (u8, u8, u8)) -> f32 {

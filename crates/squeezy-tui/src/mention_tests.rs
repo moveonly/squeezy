@@ -172,7 +172,7 @@ fn mention_rank_keeps_filename_prefix_priority() {
 }
 
 #[test]
-fn popup_navigation_clamps_at_bounds() {
+fn popup_navigation_wraps_at_bounds() {
     let q = MentionQuery {
         start: 0,
         end: 4,
@@ -181,10 +181,9 @@ fn popup_navigation_clamps_at_bounds() {
     let mut popup =
         MentionPopup::from_query(q, vec![PathBuf::from("a"), PathBuf::from("b")], 2, false);
     popup.move_up();
-    assert_eq!(popup.selected, 0);
+    assert_eq!(popup.selected, 1, "should wrap to last");
     popup.move_down();
-    popup.move_down();
-    assert_eq!(popup.selected, 1, "should clamp");
+    assert_eq!(popup.selected, 0, "should wrap to first");
 }
 
 #[test]

@@ -27,6 +27,7 @@ use squeezy_store::{
     EventBranchTip, GlobalSessionIndexEntry, SessionMetadata, SessionQuery, SessionStore,
     detect_branches, paths_same,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::modal;
 
@@ -930,15 +931,17 @@ fn render_candidate_row(
     // Ellipsise the label to the width left after the fixed prefix and the
     // trailing markers, so long session titles never hard-crop into the
     // scrollbar and the ↪ cross-project marker stays visible.
-    let branch_len =
-        branch_marker.as_ref().map_or(0, |m| m.chars().count()) + branch_warn.chars().count();
+    let branch_len = branch_marker
+        .as_ref()
+        .map_or(0, |m| UnicodeWidthStr::width(m.as_str()))
+        + UnicodeWidthStr::width(branch_warn);
     let hint_len = if label_hint.is_empty() {
         0
     } else {
-        2 + label_hint.chars().count()
+        2 + UnicodeWidthStr::width(label_hint.as_str())
     };
     let cross_len = if cross_project {
-        4 + project_hint.chars().count()
+        4 + UnicodeWidthStr::width(project_hint.as_str())
     } else {
         0
     };
@@ -992,13 +995,22 @@ fn render_candidate_row(
 /// Truncate a single-line label to `max` display columns, appending an
 /// ellipsis when it overflows so the cut is visibly intentional.
 fn truncate_label(label: &str, max: usize) -> String {
-    if label.chars().count() <= max {
+    if UnicodeWidthStr::width(label) <= max {
         return label.to_string();
     }
     if max == 0 {
         return String::new();
     }
-    let mut out: String = label.chars().take(max - 1).collect();
+    let mut out = String::new();
+    let mut width = 0;
+    for c in label.chars() {
+        let cw = c.width().unwrap_or(0);
+        if width + cw > max - 1 {
+            break;
+        }
+        out.push(c);
+        width += cw;
+    }
     out.push('…');
     out
 }

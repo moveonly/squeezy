@@ -26,7 +26,7 @@
 //! shown (the `Alt+2` focus mode is on); a closed strip builds nothing and the
 //! model is never touched on an idle frame.
 
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// What activating a crumb navigates to. Every variant maps to an existing jump
 /// path in `lib.rs` so a click and the keyboard reach the same handler:
@@ -81,7 +81,7 @@ pub(crate) struct BreadcrumbContext {
     pub(crate) search_query: Option<String>,
 }
 
-/// Largest number of characters retained in a crumb `label`. One short token:
+/// Largest number of display cells retained in a crumb `label`. One short token:
 /// long enough to disambiguate, short enough that the trail does not blow past
 /// the status row even with several crumbs.
 const LABEL_CAP: usize = 24;
@@ -91,16 +91,28 @@ const LABEL_CAP: usize = 24;
 pub(crate) const SEPARATOR: &str = " \u{25b8} ";
 
 /// Clean a raw crumb-label source into a bounded one-line token: collapse
-/// interior whitespace, trim, and cap to [`LABEL_CAP`] chars on a char boundary
-/// (appending an ellipsis when cut). Deterministic and total — an empty source
-/// yields an empty string, which the builder never feeds in (it always supplies a
-/// non-empty fallback).
+/// interior whitespace, trim, and cap to [`LABEL_CAP`] display cells (appending
+/// an ellipsis when cut), so a wide-glyph (CJK / 2-cell) label can never paint
+/// past the budget the renderer's column math assumes. Deterministic and total —
+/// an empty source yields an empty string, which the builder never feeds in (it
+/// always supplies a non-empty fallback).
 pub(crate) fn clean_label(raw: &str) -> String {
     let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= LABEL_CAP {
+    if UnicodeWidthStr::width(collapsed.as_str()) <= LABEL_CAP {
         return collapsed;
     }
-    let prefix: String = collapsed.chars().take(LABEL_CAP).collect();
+    // Reserve one cell for the ellipsis so the result stays <= LABEL_CAP cells.
+    let budget = LABEL_CAP.saturating_sub(1);
+    let mut prefix = String::new();
+    let mut running = 0usize;
+    for ch in collapsed.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if running.saturating_add(w) > budget {
+            break;
+        }
+        prefix.push(ch);
+        running += w;
+    }
     format!("{prefix}\u{2026}")
 }
 
@@ -182,7 +194,7 @@ impl BreadcrumbModel {
                 format!("search:{trimmed}")
             };
             crumbs.push(Crumb {
-                label: clean_label(&label),
+                label,
                 target: BreadcrumbTarget::Search,
             });
         }

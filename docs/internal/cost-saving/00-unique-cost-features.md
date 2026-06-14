@@ -102,7 +102,7 @@ pub struct ParsedSymbol {
 
 vs `read_file` on the same 1500-line file: ~7000 tokens every time it is re-sent in history.
 
-**Resident-read dedup** (`graph_tools.rs` ~3367–3410): if the model already read bytes `[0, 50000)` and asks for `[12000, 15000)` from the same unchanged file SHA, `read_slice` returns a **receipt stub** pointing at `same_as_call_id` with `bytes_returned: 0` — no re-billing of duplicate content.
+**Resident-read dedup** (`graph_tools.rs` ~4002–4031): if the model already read bytes `[0, 50000)` and asks for `[12000, 15000)` from the same unchanged file SHA, `read_slice` returns a **receipt stub** pointing at `same_as_call_id` with `bytes_returned: 0` — no re-billing of duplicate content.
 
 **Read routing (§13.4):** on a **single small file**, repeated `read_slice` calls can cost more than one `read_file` because each turn re-bills the growing transcript. Squeezy steers toward one whole-file read in that narrow case; cross-file tasks stay graph-first.
 
@@ -124,12 +124,14 @@ Plus **receipt stubs** (SHA dedup) that run alongside compaction: direct tool pa
 
 #### Tier A — Macro compaction (`context_compaction.rs`)
 
-**Trigger:** post-turn only (or via forced overflow). Fires at
-`summarize_at_percent` (default **95%**) of the effective window —
-`min(model_context_window or fallback_window_tokens, max_context_tokens)` —
-once `min_items` (default 16) is satisfied, held 16K below the window so the
-next reply fits. Summarize never runs mid-turn; mid-turn pressure is handled
-by trim (Tier B).
+**Trigger:** post-turn only (or via forced overflow). Fires at the **full
+effective window** — the raw window (`model_context_window` or
+`fallback_window_tokens`) reduced to `effective_context_window_percent`
+(default **95%**), minus `baseline_reserve_tokens` (default **12K**), then
+bounded by the optional `max_context_tokens` economy cap — once `min_items`
+(default 16) is satisfied. The reserve carved out of the effective window is
+what keeps room for the next reply. Summarize never runs mid-turn; mid-turn
+pressure is handled by trim (Tier B).
 
 **What survives:** pinned items + last `keep_recent_items`; dropped slice → synthetic head with `## Goal / ## Progress / ## Decisions / ## Next`, durable tool-call lines, receipt table, file lineage (`<read-files>` / `<modified-files>`), attachment previews.
 
@@ -424,9 +426,9 @@ flowchart TD
   DEDUP -->|hit| STUB[receipt stub]
   DEDUP -->|miss| CONV[Append to conversation]
   STUB --> CONV
-  CONV --> MC{60% window?}
+  CONV --> MC{trim_at 40%?}
   MC -->|yes| MICRO[micro-compact old outputs]
-  MC -->|no| MACRO{80% window?}
+  MC -->|no| MACRO{full effective window?}
   MICRO --> MACRO
   MACRO -->|yes| COMPACT[macro summary head]
   MACRO -->|no| API[Provider API + cache read/write]
