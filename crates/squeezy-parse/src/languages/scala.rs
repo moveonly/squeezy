@@ -261,6 +261,18 @@ fn scala_symbol_from_node(
         attributes.extend(scala_derives_attributes(node, ctx.source));
         attributes.extend(scala_self_type_attributes(node, ctx.source));
     }
+    if matches!(
+        kind,
+        SymbolKind::Class
+            | SymbolKind::Struct
+            | SymbolKind::Trait
+            | SymbolKind::Enum
+            | SymbolKind::Function
+            | SymbolKind::Method
+            | SymbolKind::TypeAlias
+    ) {
+        attributes.extend(scala_type_parameter_bound_attributes(node, ctx.source));
+    }
     if is_case_class {
         attributes.push("scala:case-class".to_string());
     }
@@ -765,6 +777,115 @@ fn scala_self_type_attributes(node: Node<'_>, source: &str) -> Vec<String> {
         }
     }
     attributes
+}
+
+/// Extract type-parameter bounds as structured attributes:
+/// - context (`T: Ordering`) and view (`T <% X`) bounds → `bound:<Typeclass>`
+/// - upper bounds (`T <: Foo`) → `upper-bound:<Foo>`
+/// - lower bounds (`T >: Bar`) → `lower-bound:<Bar>`
+///
+/// Bounds appear on the `type_parameters` node directly (the `bound` field) and
+/// on each variant param child (`covariant_type_parameter` /
+/// `contravariant_type_parameter`). For functions the `type_parameters` node is
+/// one of the (multiple) `parameters` field entries; for classes/traits/enums
+/// it is the dedicated `type_parameters` field.
+fn scala_type_parameter_bound_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut attributes = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for type_params in scala_type_parameter_nodes(node) {
+        scala_collect_type_parameter_bounds(type_params, source, &mut attributes, &mut seen);
+    }
+    attributes
+}
+
+/// Collect every `type_parameters` node attached to a declaration: the
+/// dedicated `type_parameters` field (classes/traits/enums/type aliases) and any
+/// `type_parameters` appearing among a function's `parameters` field entries.
+fn scala_type_parameter_nodes<'a>(node: Node<'a>) -> Vec<Node<'a>> {
+    let mut nodes = Vec::new();
+    if let Some(direct) = node.child_by_field_name("type_parameters") {
+        nodes.push(direct);
+    }
+    let mut cursor = node.walk();
+    for child in node.children_by_field_name("parameters", &mut cursor) {
+        if child.kind() == "type_parameters" {
+            nodes.push(child);
+        }
+    }
+    nodes
+}
+
+/// Walk a `type_parameters` node, mapping its `bound` field entries and the
+/// bounds nested in variant param children to structured attributes.
+fn scala_collect_type_parameter_bounds(
+    type_params: Node<'_>,
+    source: &str,
+    attributes: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let mut cursor = type_params.walk();
+    for bound in type_params.children_by_field_name("bound", &mut cursor) {
+        scala_push_bound_attribute(bound, source, attributes, seen);
+    }
+    let mut child_cursor = type_params.walk();
+    for child in type_params.named_children(&mut child_cursor) {
+        if matches!(
+            child.kind(),
+            "covariant_type_parameter" | "contravariant_type_parameter"
+        ) {
+            let mut inner = child.walk();
+            for bound in child.children_by_field_name("bound", &mut inner) {
+                scala_push_bound_attribute(bound, source, attributes, seen);
+            }
+        }
+    }
+}
+
+/// Map a single bound node to its attribute prefix and push one attribute per
+/// constraint type. Unknown bound kinds are ignored.
+fn scala_push_bound_attribute(
+    bound: Node<'_>,
+    source: &str,
+    attributes: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let prefix = match bound.kind() {
+        // Context/view bounds name a typeclass the parameter must satisfy.
+        "context_bound" | "view_bound" => "bound",
+        "upper_bound" => "upper-bound",
+        "lower_bound" => "lower-bound",
+        _ => return,
+    };
+    let Some(type_node) = bound.child_by_field_name("type") else {
+        return;
+    };
+    // Record the head type name (the typeclass / bound type itself), not the
+    // nested type arguments — `T: Numeric` and `T <: Comparable[T]` should
+    // record `Numeric` / `Comparable`, not the parameter `T`.
+    let Some(name) = scala_head_type_name(type_node, source) else {
+        return;
+    };
+    let attribute = format!("{prefix}:{name}");
+    if seen.insert(attribute.clone()) {
+        attributes.push(attribute);
+    }
+}
+
+/// The head (constructor) type name of a type node: for a plain
+/// `type_identifier` it is the identifier; for a `generic_type` /
+/// `applied_constructor_type` it is the applied constructor, ignoring the type
+/// arguments. Returns `None` for shapes with no leading nominal type.
+fn scala_head_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    if matches!(node.kind(), "type_identifier" | "stable_type_identifier") {
+        return node_text(node, source)
+            .ok()
+            .and_then(scala_type_name_from_text);
+    }
+    // `generic_type` / `applied_constructor_type` (and any other wrapper) defer
+    // to their first child that yields a nominal head type.
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| scala_head_type_name(child, source))
 }
 
 fn collect_scala_type_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {

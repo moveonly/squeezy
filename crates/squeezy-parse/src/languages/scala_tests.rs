@@ -143,3 +143,30 @@ fn records_self_type_required_mixins() {
         service.attributes
     );
 }
+
+#[test]
+fn records_type_parameter_bounds() {
+    // Context bounds and upper bounds are recorded as structured attributes so
+    // `def sort[T: Ordering]` carries the Ordering constraint and `[A <: Animal]`
+    // carries its upper bound — not just a bare Type mention.
+    let parsed = parse_scala("object M {\n  def sort[T: Ordering](xs: List[T]): List[T] = xs\n}");
+    let sort = scala_symbol(&parsed, "sort");
+    assert!(
+        sort.attributes.iter().any(|a| a == "bound:Ordering"),
+        "expected bound:Ordering, got {:?}",
+        sort.attributes
+    );
+
+    let bounded = parse_scala("class Cage[A <: Animal, B >: Puppy]");
+    let cage = scala_symbol(&bounded, "Cage");
+    assert!(
+        cage.attributes.iter().any(|a| a == "upper-bound:Animal"),
+        "expected upper-bound:Animal, got {:?}",
+        cage.attributes
+    );
+    assert!(
+        cage.attributes.iter().any(|a| a == "lower-bound:Puppy"),
+        "expected lower-bound:Puppy, got {:?}",
+        cage.attributes
+    );
+}
