@@ -108,7 +108,8 @@ pub(crate) fn visit_python_node(
         return;
     }
 
-    if let Some(symbol) = python_symbol_from_node(node, ctx, parent_symbol.as_ref()) {
+    if let Some(mut symbol) = python_symbol_from_node(node, ctx, parent_symbol.as_ref()) {
+        python_refine_symbol(node, &mut symbol);
         extract_python_symbol_facts(node, &symbol, ctx);
         let next_parent = Some((symbol.id.clone(), symbol.kind));
         let next_owner = if symbol.body_span.is_some() {
@@ -147,6 +148,57 @@ pub(crate) fn visit_python_children(
     for child in node.named_children(&mut cursor) {
         visit_python_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
     }
+}
+
+/// Post-process a freshly-built Python symbol with signals that need the live
+/// tree-sitter node (rather than just the signature string): coroutine vs
+/// generator status. `python_symbol_from_node` lives in the shared dispatch and
+/// only inspects decorators, so these node-level modifiers are normalised here.
+pub(crate) fn python_refine_symbol(node: Node<'_>, symbol: &mut ParsedSymbol) {
+    if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
+        return;
+    }
+    // `async def` — the `async` keyword is an anonymous leading token, so the
+    // signature (which starts at the function node) begins with `async`.
+    if symbol
+        .signature
+        .trim_start()
+        .strip_prefix("async")
+        .map(|rest| rest.starts_with(|ch: char| ch.is_whitespace()))
+        .unwrap_or(false)
+    {
+        symbol.attributes.push("python:async".to_string());
+    }
+    // A `yield`/`yield from` anywhere in the body (but not inside a nested
+    // function/lambda) makes this a generator.
+    if let Some(body) = node.child_by_field_name("body")
+        && python_body_has_yield(body)
+    {
+        symbol.attributes.push("python:generator".to_string());
+    }
+    symbol.attributes.sort();
+    symbol.attributes.dedup();
+}
+
+/// True when `node`'s subtree contains a `yield` expression that belongs to the
+/// enclosing function, i.e. not nested inside another `function_definition` or
+/// `lambda` (those own their own `yield`s). Generator expressions do not use
+/// `yield`, so they need no special handling here.
+fn python_body_has_yield(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "yield" => return true,
+            // Nested callables own their own yields; do not descend.
+            "function_definition" | "lambda" => continue,
+            _ => {
+                if python_body_has_yield(child) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 pub(crate) fn extract_python_import(
