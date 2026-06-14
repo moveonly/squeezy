@@ -389,13 +389,15 @@ pub(crate) fn read_tool_output_spec() -> ToolSpec {
 pub(crate) fn repo_map_spec() -> ToolSpec {
     ToolSpec {
         name: "repo_map".to_string(),
-        description: "Return a compact semantic architecture map from the local graph: hierarchy, language counts, and unsupported files.".to_string(),
+        description: "Return a compact semantic architecture map from the local graph: hierarchy, language counts, and unsupported files. Pass path to scope the map to one subtree and language to restrict the counts/hierarchy to one language family.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
+                "path": {"type": "string", "description": "Optional workspace-relative subtree to scope the map to."},
+                "language": {"type": "string", "description": "Optional language or language family filter such as Rust, Python, js-ts."},
                 "max_depth": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_DEPTH},
                 "max_files": {"type": "integer", "minimum": 1, "maximum": 200}
             }
@@ -424,12 +426,16 @@ pub(crate) fn decl_search_spec() -> ToolSpec {
             "additionalProperties": false,
             "properties": {
                 "query": {"type": "string", "description": "Optional text to match against indexed declaration names and signatures. Omit it when using filters for counts."},
-                "kind": {"type": "string", "description": "Optional symbol kind such as callable, function, method, struct, module, trait, class."},
+                "kind": {"type": "string", "description": "Optional symbol kind such as callable, function, method, struct, module, trait, class. Pipe-separate to match several (e.g. struct|enum)."},
                 "path": {"type": "string", "description": "Optional workspace-relative path filter. Multi-segment values (e.g. `gson/src/main/java`) match by strict directory prefix; single tokens (e.g. `squeezy_graph`) fall back to fuzzy segment matching."},
                 "language": {"type": "string", "description": "Optional language or language family filter such as Rust, Python, js-ts."},
                 "visibility": {"type": "string"},
                 "attribute": {"type": "string"},
                 "transitive": {"type": "boolean", "description": "With an inheritance attribute (base:/iface:/mixin:), return the full transitive subtype closure instead of only the direct subtypes."},
+                "exclude_tests": {"type": "boolean", "description": "When true, drop declarations in test files/modules from the results."},
+                "tests_only": {"type": "boolean", "description": "When true, keep only declarations in test files/modules."},
+                "unused": {"type": "boolean", "description": "When true, keep only declarations with no inbound references in the graph (possible dead code)."},
+                "max_callers": {"type": "integer", "minimum": 0, "description": "Per-declaration cap on inbound caller counts reported alongside each match."},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
                 "offset": {"type": "integer", "minimum": 0}
             }
@@ -452,10 +458,13 @@ pub(crate) fn definition_search_spec() -> ToolSpec {
             "properties": {
                 "query": {"type": "string"},
                 "symbol_id": {"type": "string"},
-                "kind": {"type": "string"},
+                "kind": {"type": "string", "description": "Optional symbol kind. Pipe-separate to match several (e.g. struct|enum)."},
                 "path": {"type": "string"},
                 "language": {"type": "string"},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS}
+                "exclude_tests": {"type": "boolean", "description": "When true, drop definitions in test files/modules."},
+                "tests_only": {"type": "boolean", "description": "When true, keep only definitions in test files/modules."},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
+                "offset": {"type": "integer", "minimum": 0}
             }
         })),
         prepare_arguments: None,
@@ -465,7 +474,7 @@ pub(crate) fn definition_search_spec() -> ToolSpec {
 pub(crate) fn reference_search_spec() -> ToolSpec {
     ToolSpec {
         name: "reference_search".to_string(),
-        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when a prior graph call returned one. One call returns every callsite — prefer it over N greps for the same symbol name. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
+        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when a prior graph call returned one. One call returns every callsite — prefer it over N greps for the same symbol name. `path` scopes the returned reference packets to one subtree; `reference_kind` (or the edge-flavored `edge_kind`) narrows to one relation such as call/import/read. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -475,7 +484,12 @@ pub(crate) fn reference_search_spec() -> ToolSpec {
                 "symbol_id": {"type": "string"},
                 "text": {"type": "string"},
                 "query": {"type": "string"},
-                "path": {"type": "string"},
+                "path": {"type": "string", "description": "Optional workspace-relative path filter; also scopes the returned reference packets to that subtree."},
+                "language": {"type": "string", "description": "Optional language or language family filter such as Rust, Python, js-ts."},
+                "edge_kind": {"type": "string", "description": "Optional graph edge kind to keep, such as call, import, read, write. Pipe-separate to match several."},
+                "reference_kind": {"type": "string", "description": "Optional reference flavor to keep, such as call, import, read, write. Pipe-separate to match several."},
+                "exclude_tests": {"type": "boolean", "description": "When true, drop references found in test files/modules."},
+                "tests_only": {"type": "boolean", "description": "When true, keep only references found in test files/modules."},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
                 "offset": {"type": "integer", "minimum": 0}
             }
@@ -487,7 +501,7 @@ pub(crate) fn reference_search_spec() -> ToolSpec {
 pub(crate) fn upstream_flow_spec() -> ToolSpec {
     ToolSpec {
         name: "upstream_flow".to_string(),
-        description: "Return compact callers (bounded BFS up to max_depth, each packet tagged with `depth`) and direct inbound references for a resolved symbol. Use for 'who calls X?' or 'who calls X within N hops?'. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query.".to_string(),
+        description: "Return compact callers (bounded BFS up to max_depth, each packet tagged with `depth`) and direct inbound references for a resolved symbol. Use for 'who calls X?' or 'who calls X within N hops?'. `path` scopes the returned caller packets to one subtree; `kind` is pipe-separable. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -496,10 +510,15 @@ pub(crate) fn upstream_flow_spec() -> ToolSpec {
             "properties": {
                 "symbol_id": {"type": "string"},
                 "query": {"type": "string"},
-                "kind": {"type": "string"},
-                "path": {"type": "string"},
+                "kind": {"type": "string", "description": "Optional symbol kind. Pipe-separate to match several (e.g. function|method)."},
+                "path": {"type": "string", "description": "Optional workspace-relative path filter; also scopes the returned caller packets to that subtree."},
+                "language": {"type": "string", "description": "Optional language or language family filter such as Rust, Python, js-ts."},
+                "edge_kind": {"type": "string", "description": "Optional graph edge kind to traverse, such as call, import, read, write. Pipe-separate to match several."},
+                "exclude_tests": {"type": "boolean", "description": "When true, drop callers in test files/modules."},
+                "tests_only": {"type": "boolean", "description": "When true, keep only callers in test files/modules."},
                 "max_depth": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_DEPTH},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS}
+                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
+                "offset": {"type": "integer", "minimum": 0}
             }
         })),
         prepare_arguments: None,
@@ -509,7 +528,7 @@ pub(crate) fn upstream_flow_spec() -> ToolSpec {
 pub(crate) fn downstream_flow_spec() -> ToolSpec {
     ToolSpec {
         name: "downstream_flow".to_string(),
-        description: "Return compact callees (bounded BFS up to max_depth, each packet tagged with `depth`), outgoing reference/import edges, and an explicit call chain when target_symbol_id or target_query is supplied. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query.".to_string(),
+        description: "Return compact callees (bounded BFS up to max_depth, each packet tagged with `depth`), outgoing reference/import edges, and an explicit call chain when target_symbol_id or target_query is supplied. `path` scopes the returned callee packets to one subtree; `kind` is pipe-separable. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -518,12 +537,17 @@ pub(crate) fn downstream_flow_spec() -> ToolSpec {
             "properties": {
                 "symbol_id": {"type": "string"},
                 "query": {"type": "string"},
-                "kind": {"type": "string"},
-                "path": {"type": "string"},
+                "kind": {"type": "string", "description": "Optional symbol kind. Pipe-separate to match several (e.g. function|method)."},
+                "path": {"type": "string", "description": "Optional workspace-relative path filter; also scopes the returned callee packets to that subtree."},
+                "language": {"type": "string", "description": "Optional language or language family filter such as Rust, Python, js-ts."},
+                "edge_kind": {"type": "string", "description": "Optional graph edge kind to traverse, such as call, import, read, write. Pipe-separate to match several."},
+                "exclude_tests": {"type": "boolean", "description": "When true, drop callees in test files/modules."},
+                "tests_only": {"type": "boolean", "description": "When true, keep only callees in test files/modules."},
                 "target_symbol_id": {"type": "string"},
                 "target_query": {"type": "string"},
                 "max_depth": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_DEPTH},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS}
+                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
+                "offset": {"type": "integer", "minimum": 0}
             }
         })),
         prepare_arguments: None,
@@ -533,7 +557,7 @@ pub(crate) fn downstream_flow_spec() -> ToolSpec {
 pub(crate) fn hierarchy_spec() -> ToolSpec {
     ToolSpec {
         name: "hierarchy".to_string(),
-        description: "Return graph containment hierarchy (file → module → class → members) for the workspace, a symbol_id, or a declaration query — the tool for enumerating what a scope contains. For every method/field/variant of one class, call `hierarchy(symbol_id=<class>)` first to enumerate the member set before reading bodies, replacing member-by-member reads or greps. This is containment, NOT inheritance — for subclasses/implementers/Dart mixers use `decl_search` with `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or `mixin:<Type>` (Dart `with`); prefix-free `attribute=\"<Type>\"` matches all three, and for supertypes/ancestors use `inheritance_hierarchy`.".to_string(),
+        description: "Return graph containment hierarchy (file → module → class → members) for the workspace, a symbol_id, or a declaration query — the tool for enumerating what a scope contains. For every method/field/variant of one class, call `hierarchy(symbol_id=<class>)` first to enumerate the member set before reading bodies, replacing member-by-member reads or greps. This is containment, NOT inheritance — for subclasses/implementers/Dart mixers use `decl_search` with `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or `mixin:<Type>` (Dart `with`); prefix-free `attribute=\"<Type>\"` matches all three, and for supertypes/ancestors use `inheritance_hierarchy`. `path` scopes the returned hierarchy packets to one subtree; `kind` is pipe-separable.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -542,10 +566,14 @@ pub(crate) fn hierarchy_spec() -> ToolSpec {
             "properties": {
                 "symbol_id": {"type": "string"},
                 "query": {"type": "string"},
-                "kind": {"type": "string"},
-                "path": {"type": "string"},
+                "kind": {"type": "string", "description": "Optional symbol kind. Pipe-separate to match several (e.g. class|interface)."},
+                "path": {"type": "string", "description": "Optional workspace-relative path filter; also scopes the returned hierarchy packets to that subtree."},
+                "language": {"type": "string", "description": "Optional language or language family filter such as Rust, Python, js-ts."},
+                "exclude_tests": {"type": "boolean", "description": "When true, drop nodes in test files/modules."},
+                "tests_only": {"type": "boolean", "description": "When true, keep only nodes in test files/modules."},
                 "max_depth": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_DEPTH},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS}
+                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
+                "offset": {"type": "integer", "minimum": 0}
             }
         })),
         prepare_arguments: None,
@@ -555,7 +583,7 @@ pub(crate) fn hierarchy_spec() -> ToolSpec {
 pub(crate) fn inheritance_hierarchy_spec() -> ToolSpec {
     ToolSpec {
         name: "inheritance_hierarchy".to_string(),
-        description: "Return inheritance relationships for one class-like symbol. Default returns transitive supertypes through UsesTrait/Extends/Implements edges; set subtypes=true for first-generation direct inheritors. Use for inheritance questions, not containment — for the FULL transitive subtype closure use decl_search attribute=\"base:<Type>\" (or iface:/mixin:) with transitive=true.".to_string(),
+        description: "Return inheritance relationships for one class-like symbol. Default returns transitive supertypes through UsesTrait/Extends/Implements edges; set subtypes=true for direct inheritors, and add transitive=true (with max_depth) to walk the subtype closure across generations. Pass `member` to resolve overrides/implementations of one method across the subtype set instead of class-level relationships. Use for inheritance questions, not containment — for the FULL transitive subtype closure you can also use decl_search attribute=\"base:<Type>\" (or iface:/mixin:) with transitive=true.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -565,7 +593,11 @@ pub(crate) fn inheritance_hierarchy_spec() -> ToolSpec {
                 "symbol_id": {"type": "string"},
                 "query": {"type": "string"},
                 "subtypes": {"type": "boolean"},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS}
+                "transitive": {"type": "boolean", "description": "With subtypes=true, walk the full transitive subtype closure across generations instead of only direct inheritors."},
+                "member": {"type": "string", "description": "Optional member name; resolves overrides/implementations of that method across the (transitive) subtype set instead of class-level relationships."},
+                "max_depth": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_DEPTH, "description": "Bound on transitive subtype walk depth when transitive=true."},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
+                "offset": {"type": "integer", "minimum": 0}
             }
         })),
         prepare_arguments: None,
@@ -575,7 +607,7 @@ pub(crate) fn inheritance_hierarchy_spec() -> ToolSpec {
 pub(crate) fn impact_spec() -> ToolSpec {
     ToolSpec {
         name: "impact".to_string(),
-        description: "Return graph-computed impact for a changed symbol or file path: changed files, reverse-import affected files, affected symbols, tests, and evidence packets. Use before edits or reviews that need a bounded blast-radius view. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
+        description: "Return graph-computed impact for a changed symbol or file path: changed files, reverse-import affected files, affected symbols, tests, and evidence packets. Use before edits or reviews that need a bounded blast-radius view. Set direct_only=true to report only direct importers/references and skip the transitive reverse-import closure. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -585,8 +617,13 @@ pub(crate) fn impact_spec() -> ToolSpec {
                 "symbol_id": {"type": "string"},
                 "query": {"type": "string"},
                 "path": {"type": "string"},
+                "language": {"type": "string", "description": "Optional language or language family filter such as Rust, Python, js-ts."},
                 "extra_paths": {"type": "array", "items": {"type": "string"}},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS}
+                "direct_only": {"type": "boolean", "description": "When true, report only direct importers/references and skip the transitive reverse-import closure."},
+                "exclude_tests": {"type": "boolean", "description": "When true, drop affected symbols/files in test files/modules."},
+                "tests_only": {"type": "boolean", "description": "When true, keep only affected symbols/files in test files/modules."},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
+                "offset": {"type": "integer", "minimum": 0}
             }
         })),
         prepare_arguments: None,
@@ -626,7 +663,7 @@ pub(crate) fn read_slice_spec() -> ToolSpec {
 pub(crate) fn symbol_context_spec() -> ToolSpec {
     ToolSpec {
         name: "symbol_context".to_string(),
-        description: "Return compact graph-backed context for symbols matching a declaration query: callers, callees, references, dirty/diff annotations, and evidence packets. Use for relationships, callers, references, or impact. Avoid for simple definition/file lookup that definition_search answers. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
+        description: "Return compact graph-backed context for symbols matching a declaration query: callers, callees, references, dirty/diff annotations, and evidence packets. Use for relationships, callers, references, or impact. Avoid for simple definition/file lookup that definition_search answers. `path` scopes the returned context packets to one subtree. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -635,10 +672,14 @@ pub(crate) fn symbol_context_spec() -> ToolSpec {
             "properties": {
                 "query": {"type": "string", "description": "Text to match against indexed symbol signatures."},
                 "symbol_id": {"type": "string", "description": "Exact graph symbol id from a prior packet to anchor context directly instead of re-resolving by name."},
-                "path": {"type": "string", "description": "Optional workspace-relative file path filter."},
+                "path": {"type": "string", "description": "Optional workspace-relative file path filter; also scopes the returned context packets to that subtree."},
+                "language": {"type": "string", "description": "Optional language or language family filter such as Rust, Python, js-ts."},
                 "diff_only": {"type": "boolean", "description": "When true, return only symbols touched by the current Git diff."},
+                "exclude_tests": {"type": "boolean", "description": "When true, drop symbols/references in test files/modules."},
+                "tests_only": {"type": "boolean", "description": "When true, keep only symbols/references in test files/modules."},
                 "max_references": {"type": "integer", "minimum": 1, "maximum": 50},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS}
+                "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
+                "offset": {"type": "integer", "minimum": 0}
             },
             "required": ["query"]
         })),
