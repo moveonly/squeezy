@@ -312,6 +312,30 @@ pub(crate) fn extract_c_family_symbol_facts(
         }
     }
 
+    // `enum class E : uint8_t {…}` carries its underlying integral type in the
+    // `base` field. Record it as a Type reference (skipping the built-in
+    // integer spellings) so the enum's dependency on a user-defined alias is
+    // visible to reference queries.
+    if symbol.kind == SymbolKind::Enum
+        && let Some(base) = node.child_by_field_name("base")
+        && let Ok(text) = node_text(base, ctx.source)
+    {
+        let name = c_family_last_name(text);
+        if !name.is_empty() && !c_family_builtin_type(&name) {
+            ctx.references.push(ParsedReference {
+                file_id: ctx.file.id.clone(),
+                owner_id: Some(symbol.id.clone()),
+                text: name,
+                kind: ReferenceKind::Type,
+                span: span_from_node(base),
+                provenance: Provenance::new(
+                    c_family_parser_name(ctx.file.language),
+                    "enum underlying type",
+                ),
+            });
+        }
+    }
+
     if matches!(
         symbol.kind,
         SymbolKind::Function | SymbolKind::Method | SymbolKind::Field | SymbolKind::TypeAlias
@@ -868,6 +892,9 @@ pub(crate) fn c_family_attributes_for_node(
             attributes.push("preprocessor:opaque".to_string());
         }
         "template_declaration" => attributes.push("c++:template".to_string()),
+        "enum_specifier" if c_family_enum_is_scoped(node) => {
+            attributes.push("c++:scoped-enum".to_string())
+        }
         _ => {}
     }
 
@@ -944,6 +971,16 @@ pub(crate) fn c_family_is_template_specialization(node: Node<'_>) -> bool {
         return false;
     };
     name.kind() == "template_type"
+}
+
+/// Detect a C++ scoped enum (`enum class E` / `enum struct E`). tree-sitter-cpp
+/// emits the `class`/`struct` token as an anonymous child between the `enum`
+/// keyword and the name field, so we scan the immediate children for it rather
+/// than reading a field that does not exist.
+pub(crate) fn c_family_enum_is_scoped(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| matches!(child.kind(), "class" | "struct"))
 }
 
 /// Emit `base:<Leaf>` inheritance attributes for each base class of a C++
