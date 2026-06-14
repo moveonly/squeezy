@@ -2,12 +2,9 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
-    path::{Path, PathBuf},
+    path::Path,
     process::Stdio,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+    sync::{Arc, OnceLock, atomic::Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -21,20 +18,20 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use squeezy_core::{
     PermissionCapability, PermissionRisk, Redactor, ShellSandboxConfig, ShellSandboxMode,
-    StreamRedactor, sensitive_pattern_base,
+    sensitive_pattern_base,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
     sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit},
     time,
 };
 use tokio_util::sync::CancellationToken;
 
-#[cfg(unix)]
-use crate::ipc;
-use crate::ipc::IpcListener;
 use crate::sha256_hex;
+use crate::shell_ask_server::ShellAskServer;
+use crate::shell_capture::{
+    ShellStreamCapture, drain_or_abort, read_limited_pipe, split_shell_output,
+};
 use crate::shell_output::{insert_content_field, shape_shell_output};
 use crate::shell_parse::{
     analyze_shell_command, dequote_token, expand_wrapper_segments, is_destructive_shell_segment,
@@ -52,11 +49,11 @@ use crate::win_job::ShellJob;
 #[cfg(windows)]
 use crate::win_sandbox_spec::build_win_spec;
 use crate::{
-    DEFAULT_SHELL_OUTPUT_BYTE_CAP, DEFAULT_SHELL_TIMEOUT_MS, IO_DRAIN_TIMEOUT_MS, IpcEndpoint,
-    IpcStream, MAX_SHELL_OUTPUT_BYTE_CAP, MAX_SHELL_TIMEOUT_MS, OutputMode,
-    SQUEEZY_ASK_CALL_ID_ENV, SQUEEZY_ASK_SOCKET_ENV, ShellAskApprover, ShellAskDecision,
-    ShellAskRequest, ShellPermissionAnalysis, ToolCall, ToolCostHint, ToolRegistry, ToolResult,
-    ToolStatus, make_result, shell_exit_signal, tool_arg_error, tool_error,
+    DEFAULT_SHELL_OUTPUT_BYTE_CAP, DEFAULT_SHELL_TIMEOUT_MS, IO_DRAIN_TIMEOUT_MS,
+    MAX_SHELL_OUTPUT_BYTE_CAP, MAX_SHELL_TIMEOUT_MS, OutputMode, SQUEEZY_ASK_CALL_ID_ENV,
+    SQUEEZY_ASK_SOCKET_ENV, ShellAskApprover, ShellPermissionAnalysis, ToolCall, ToolCostHint,
+    ToolRegistry, ToolResult, ToolStatus, make_result, shell_exit_signal, tool_arg_error,
+    tool_error,
 };
 
 pub(crate) struct ShellRunOutcome {
@@ -1957,166 +1954,6 @@ fn open_shell_pty() -> std::io::Result<ShellPty> {
     })
 }
 
-struct ShellAskServer {
-    endpoint: IpcEndpoint,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl ShellAskServer {
-    async fn start(
-        root: &Path,
-        call_id: &str,
-        parent_command: &str,
-        workdir: &Path,
-        approver: ShellAskApprover,
-        cancel: CancellationToken,
-    ) -> std::io::Result<Self> {
-        let sanitized = sanitize_shell_call_id(call_id);
-        #[cfg(unix)]
-        {
-            let run_dir = root.join(".squeezy").join("run");
-            fs::create_dir_all(&run_dir)?;
-        }
-        let primary = IpcEndpoint::for_shell_ask(root, &sanitized);
-        let (endpoint, listener) = match IpcListener::bind(&primary) {
-            Ok(listener) => (primary, listener),
-            #[cfg(unix)]
-            Err(err) if ipc::is_path_too_long(&err) => {
-                let digest = sha256_hex(format!("{}:{call_id}", root.display()));
-                let fallback = IpcEndpoint::unix_short_fallback(&digest[..16]);
-                let listener = IpcListener::bind(&fallback)?;
-                (fallback, listener)
-            }
-            Err(err) => return Err(err),
-        };
-        let call_id = call_id.to_string();
-        let parent_command = parent_command.to_string();
-        let workdir = workdir.to_path_buf();
-        let task = tokio::spawn(async move {
-            shell_ask_server_loop(listener, call_id, parent_command, workdir, approver, cancel)
-                .await;
-        });
-        Ok(Self { endpoint, task })
-    }
-
-    fn env_value(&self) -> std::ffi::OsString {
-        self.endpoint.as_env_value()
-    }
-}
-
-impl Drop for ShellAskServer {
-    fn drop(&mut self) {
-        self.task.abort();
-        // Synchronously remove the Unix sock so callers that observe the
-        // path immediately after server-drop see it gone. Tokio's task
-        // abort is async — relying on `IpcListener::Drop` inside the
-        // spawned future races with the assertion. No-op on Windows.
-        self.endpoint.remove_local_artifacts();
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ShellAskWireRequest {
-    command: String,
-    justification: String,
-}
-
-async fn shell_ask_server_loop(
-    listener: IpcListener,
-    call_id: String,
-    parent_command: String,
-    workdir: PathBuf,
-    approver: ShellAskApprover,
-    cancel: CancellationToken,
-) {
-    loop {
-        let accepted = tokio::select! {
-            _ = cancel.cancelled() => break,
-            accepted = listener.accept() => accepted,
-        };
-        let Ok(stream) = accepted else {
-            break;
-        };
-        let request_call_id = call_id.clone();
-        let request_parent = parent_command.clone();
-        let request_workdir = workdir.clone();
-        let request_approver = approver.clone();
-        tokio::spawn(async move {
-            let _ = handle_shell_ask_client(
-                stream,
-                request_call_id,
-                request_parent,
-                request_workdir,
-                request_approver,
-            )
-            .await;
-        });
-    }
-}
-
-async fn handle_shell_ask_client(
-    mut stream: IpcStream,
-    call_id: String,
-    parent_command: String,
-    workdir: PathBuf,
-    approver: ShellAskApprover,
-) -> std::io::Result<()> {
-    const MAX_ASK_REQUEST_BYTES: usize = 16 * 1024;
-    let mut bytes = Vec::new();
-    let mut buffer = [0u8; 1024];
-    loop {
-        let count = stream.read(&mut buffer).await?;
-        if count == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..count]);
-        if bytes.len() > MAX_ASK_REQUEST_BYTES {
-            let response = ShellAskDecision::deny("in-flight permission request is too large");
-            stream
-                .write_all(&serde_json::to_vec(&response).map_err(std::io::Error::other)?)
-                .await?;
-            stream.shutdown().await?;
-            return Ok(());
-        }
-    }
-
-    let decision = match serde_json::from_slice::<ShellAskWireRequest>(&bytes) {
-        Ok(wire) if !wire.command.trim().is_empty() => {
-            approver(ShellAskRequest {
-                call_id,
-                parent_command,
-                command: wire.command,
-                justification: wire.justification,
-                workdir,
-            })
-            .await
-        }
-        Ok(_) => ShellAskDecision::deny("in-flight permission command must not be empty"),
-        Err(err) => ShellAskDecision::deny(format!("invalid in-flight permission request: {err}")),
-    };
-    stream
-        .write_all(&serde_json::to_vec(&decision).map_err(std::io::Error::other)?)
-        .await?;
-    stream.shutdown().await?;
-    Ok(())
-}
-
-fn sanitize_shell_call_id(call_id: &str) -> String {
-    let mut out = String::new();
-    for ch in call_id.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "call".to_string()
-    } else {
-        out
-    }
-}
-
 /// A spawned shell child. Abstracts over the standard `tokio` process (macOS,
 /// Linux, and the non-sandboxed Windows path) and the Windows restricted-token
 /// / elevated sandbox child, which is spawned via raw Win32 and therefore
@@ -2315,208 +2152,4 @@ pub(crate) fn shell_env_should_preserve(name: &str, allowlist: &[String]) -> boo
             name == pattern
         }
     })
-}
-
-#[derive(Clone, Default)]
-struct ShellStreamCapture {
-    bytes: Arc<Mutex<Vec<u8>>>,
-    len: Arc<AtomicUsize>,
-    truncated: Arc<AtomicBool>,
-}
-
-impl ShellStreamCapture {
-    async fn append(&self, chunk: &[u8], cap: usize) {
-        if chunk.is_empty() {
-            return;
-        }
-        if self.len.load(Ordering::Acquire) >= cap {
-            self.truncated.store(true, Ordering::Relaxed);
-            return;
-        }
-        let mut bytes = self.bytes.lock().await;
-        let keep = chunk.len().min(cap.saturating_sub(bytes.len()));
-        if keep > 0 {
-            bytes.extend_from_slice(&chunk[..keep]);
-            self.len.store(bytes.len(), Ordering::Release);
-        }
-        if keep < chunk.len() {
-            self.truncated.store(true, Ordering::Relaxed);
-        }
-    }
-
-    fn mark_truncated(&self) {
-        self.truncated.store(true, Ordering::Relaxed);
-    }
-
-    async fn snapshot(&self) -> (Vec<u8>, bool) {
-        (
-            self.bytes.lock().await.clone(),
-            self.truncated.load(Ordering::Relaxed),
-        )
-    }
-}
-
-async fn read_limited_pipe<R>(
-    mut reader: Option<R>,
-    cap: usize,
-    capture: ShellStreamCapture,
-    raw_sidecar: Option<RawSidecar>,
-    redactor: Arc<Redactor>,
-) -> std::result::Result<(), std::io::Error>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let Some(mut reader) = reader.take() else {
-        return Ok(());
-    };
-    let mut buffer = vec![0u8; 8192];
-    // The in-memory `capture` keeps at most `cap` bytes; everything past it
-    // is dropped from the live result. When a sidecar is wired, mirror the
-    // *full* redacted stream into it so a later `read_tool_output` can
-    // recover the pre-cap bytes. The sidecar stays empty until the stream
-    // actually overflows the cap (zero cost for in-budget output): redacted
-    // text accumulates in `pending` and is only flushed to disk once the
-    // raw byte total crosses `cap`.
-    let mut sidecar = raw_sidecar.map(|sink| RawStreamMirror::new(sink, redactor));
-
-    loop {
-        let count = match reader.read(&mut buffer).await {
-            Ok(count) => count,
-            Err(err) if err.raw_os_error() == Some(libc::EIO) => break,
-            Err(err) => return Err(err),
-        };
-        if count == 0 {
-            break;
-        }
-        if let Some(sidecar) = sidecar.as_mut() {
-            sidecar.ingest(&buffer[..count], cap).await;
-        }
-        capture.append(&buffer[..count], cap).await;
-    }
-
-    if let Some(sidecar) = sidecar.as_mut() {
-        sidecar.finish(cap).await;
-    }
-
-    Ok(())
-}
-
-/// Streams the full redacted pipe output into a [`RawSidecar`], deferring
-/// any disk write until the *combined* stdout+stderr raw byte total exceeds
-/// the in-memory cap (the same budget the live truncation enforces).
-struct RawStreamMirror {
-    sink: RawSidecar,
-    redactor: StreamRedactor,
-    /// Redacted text produced before the cap was crossed, held in memory
-    /// (bounded by ~`cap`) so a stream that never overflows writes nothing.
-    pending: String,
-    overflowed: bool,
-}
-
-impl RawStreamMirror {
-    fn new(sink: RawSidecar, redactor: Arc<Redactor>) -> Self {
-        Self {
-            sink,
-            redactor: StreamRedactor::new(redactor),
-            pending: String::new(),
-            overflowed: false,
-        }
-    }
-
-    async fn ingest(&mut self, chunk: &[u8], cap: usize) {
-        // Record the raw bytes against the shared cross-stream total first so
-        // the overflow trigger fires even when stdout and stderr each stay
-        // under the cap but together exceed it.
-        let over = self.sink.note_raw_and_overflowed(chunk.len(), cap).await;
-        let emitted = self.redactor.push(&String::from_utf8_lossy(chunk)).text;
-        if self.overflowed {
-            self.sink.write_chunk(&emitted).await;
-            return;
-        }
-        self.pending.push_str(&emitted);
-        if over {
-            // First overflow: persist the redacted prefix accumulated so far,
-            // then switch to streaming each subsequent chunk straight to disk.
-            self.flush_pending().await;
-        }
-    }
-
-    async fn finish(&mut self, cap: usize) {
-        let tail = self.redactor.finish().text;
-        // The redactor may have buffered a trailing secret-guard window; only
-        // its `finish()` reveals the true byte total, so re-check overflow
-        // before deciding whether the (now complete) prefix must be persisted.
-        let over = self.sink.note_raw_and_overflowed(0, cap).await;
-        if self.overflowed || over {
-            if !self.overflowed {
-                self.flush_pending().await;
-            }
-            self.sink.write_chunk(&tail).await;
-        }
-    }
-
-    async fn flush_pending(&mut self) {
-        self.overflowed = true;
-        let pending = std::mem::take(&mut self.pending);
-        self.sink.write_chunk(&pending).await;
-    }
-}
-
-async fn drain_or_abort(
-    mut handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
-    capture: ShellStreamCapture,
-    timeout: Duration,
-) -> std::result::Result<(Vec<u8>, bool), std::io::Error> {
-    match time::timeout(timeout, &mut handle).await {
-        Ok(joined) => {
-            joined.map_err(|err| {
-                std::io::Error::other(format!("shell output reader failed: {err}"))
-            })??;
-        }
-        Err(_) => {
-            handle.abort();
-            capture.mark_truncated();
-        }
-    }
-    Ok(capture.snapshot().await)
-}
-
-fn split_shell_output(
-    mut stdout: Vec<u8>,
-    stdout_truncated: bool,
-    mut stderr: Vec<u8>,
-    stderr_truncated: bool,
-    output_cap: usize,
-) -> (Vec<u8>, bool, Vec<u8>, bool) {
-    if output_cap == 0 || stdout.len().saturating_add(stderr.len()) <= output_cap {
-        return (stdout, stdout_truncated, stderr, stderr_truncated);
-    }
-
-    let stdout_floor = if output_cap >= 24 * 1024 {
-        (output_cap / 3).max(8 * 1024)
-    } else {
-        (output_cap / 3).max(1)
-    }
-    .min(output_cap);
-    let stdout_len = stdout.len();
-    let stderr_len = stderr.len();
-    let mut stdout_take = stdout_len.min(stdout_floor);
-    let mut stderr_take = stderr_len.min(output_cap.saturating_sub(stdout_take));
-    let mut remaining = output_cap.saturating_sub(stdout_take + stderr_take);
-    let extra_stdout = remaining.min(stdout_len.saturating_sub(stdout_take));
-    stdout_take += extra_stdout;
-    remaining = remaining.saturating_sub(extra_stdout);
-    let extra_stderr = remaining.min(stderr_len.saturating_sub(stderr_take));
-    stderr_take += extra_stderr;
-
-    let final_stdout_truncated = stdout_truncated || stdout_take < stdout_len;
-    let final_stderr_truncated = stderr_truncated || stderr_take < stderr_len;
-    stdout.truncate(stdout_take);
-    stderr.truncate(stderr_take);
-    (
-        stdout,
-        final_stdout_truncated,
-        stderr,
-        final_stderr_truncated,
-    )
 }

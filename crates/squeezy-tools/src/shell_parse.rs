@@ -25,12 +25,10 @@ pub(crate) struct ParsedShellCommand {
 /// structural answers (is `arg[2]` `-f`? does the command write to
 /// `/dev/null`?) should use this typed payload instead.
 ///
-/// Currently only the unit tests consume this surface. The follow-up work to
-/// route the existing classifiers through `&CommandUnit` is tracked alongside
-/// the F05-cc-tree-sitter-richer-command-extraction audit finding; until
-/// that lands, the fields are `#[allow(dead_code)]` so the `pub(crate)` API
-/// stays available without tripping the `-D warnings` CI gate.
-#[allow(dead_code)]
+/// The shell policy analyzer consumes these units through
+/// [`ShellPolicyInput`], then renders them into the legacy segment strings
+/// used by the existing risk classifiers. That keeps behavior stable while
+/// making the policy boundary explicit and parser-backed.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct CommandUnit {
     /// First `command_name` child, with surrounding quotes stripped. Empty
@@ -54,7 +52,6 @@ pub(crate) struct CommandUnit {
     pub(crate) has_substitution: bool,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Redirect {
     /// Redirect operator as it appears in source, normalised to ASCII:
@@ -68,11 +65,19 @@ pub(crate) struct Redirect {
     pub(crate) fd: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellPolicyInput {
+    parser_backed: bool,
+    dynamic: bool,
+    heredoc_prefix: bool,
+    segments: Vec<String>,
+    units: Vec<CommandUnit>,
+}
+
 /// Walks the bash parse tree and returns one `CommandUnit` per `command`
 /// node. Returns an empty vector when tree-sitter cannot parse the input.
 /// A single-pass extraction covers command arguments, env vars, and
 /// security-relevant AST features in one walk.
-#[allow(dead_code)]
 pub(crate) fn extract_command_units(command: &str) -> Vec<CommandUnit> {
     let mut parser = Parser::new();
     if parser
@@ -93,7 +98,6 @@ pub(crate) fn extract_command_units(command: &str) -> Vec<CommandUnit> {
 /// Recursive walker. `enclosing` carries redirects attached to a
 /// `redirected_statement` parent so they appear on the inner command unit
 /// even though the tree-sitter grammar nests them on the wrapper.
-#[allow(dead_code)]
 fn collect_command_units(
     node: Node<'_>,
     bytes: &[u8],
@@ -145,7 +149,6 @@ fn collect_command_units(
     }
 }
 
-#[allow(dead_code)]
 fn build_command_unit(node: Node<'_>, bytes: &[u8]) -> CommandUnit {
     let mut unit = CommandUnit::default();
     let mut cursor = node.walk();
@@ -183,7 +186,6 @@ fn build_command_unit(node: Node<'_>, bytes: &[u8]) -> CommandUnit {
     unit
 }
 
-#[allow(dead_code)]
 fn parse_variable_assignment(node: Node<'_>, bytes: &[u8]) -> Option<(String, String)> {
     let name_node = node.child_by_field_name("name")?;
     let value_node = node.child_by_field_name("value")?;
@@ -193,7 +195,6 @@ fn parse_variable_assignment(node: Node<'_>, bytes: &[u8]) -> Option<(String, St
     ))
 }
 
-#[allow(dead_code)]
 fn parse_redirect(node: Node<'_>, bytes: &[u8]) -> Option<Redirect> {
     let fd = node
         .child_by_field_name("descriptor")
@@ -265,6 +266,55 @@ fn child_has_substitution(node: Node<'_>) -> bool {
     node.named_children(&mut cursor).any(child_has_substitution)
 }
 
+fn shell_policy_input(command: &str, normalized: &str) -> ShellPolicyInput {
+    let parsed = parse_shell_command(command);
+    let units = extract_command_units(command);
+    let parser_backed = parsed.is_some() || !units.is_empty();
+    let (dynamic, heredoc_prefix, parsed_segments) = match parsed {
+        Some(parsed) => (parsed.dynamic, parsed.heredoc_prefix, parsed.segments),
+        None => (false, false, Vec::new()),
+    };
+    let unit_segments = command_units_to_segments(&units);
+    let raw_segments = if !unit_segments.is_empty() {
+        unit_segments
+    } else if !parsed_segments.is_empty() {
+        parsed_segments
+    } else {
+        shell_segments(normalized)
+    };
+    ShellPolicyInput {
+        parser_backed,
+        dynamic: dynamic || units.iter().any(|unit| unit.has_substitution),
+        heredoc_prefix,
+        segments: expand_wrapper_segments(raw_segments),
+        units,
+    }
+}
+
+fn command_units_to_segments(units: &[CommandUnit]) -> Vec<String> {
+    units.iter().filter_map(command_unit_to_segment).collect()
+}
+
+fn command_unit_to_segment(unit: &CommandUnit) -> Option<String> {
+    let mut tokens = Vec::new();
+    for (name, value) in &unit.env {
+        tokens.push(format!("{name}={value}"));
+    }
+    if !unit.name.is_empty() {
+        tokens.push(unit.name.clone());
+    }
+    tokens.extend(unit.args.iter().cloned());
+    for redirect in &unit.redirects {
+        let fd = redirect.fd.map(|fd| fd.to_string()).unwrap_or_default();
+        tokens.push(format!("{fd}{}{}", redirect.op, redirect.target));
+    }
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(" "))
+    }
+}
+
 pub(crate) fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
     let normalized = collapse_whitespace(command);
     // Permission flow calls analyze_shell_command twice for the same
@@ -286,23 +336,15 @@ pub(crate) fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
     }) {
         return hit;
     }
-    let parsed = parse_shell_command(command);
-    let (parser_backed, dynamic, heredoc_prefix, raw_segments) = match parsed {
-        Some(parsed) => {
-            let segments = if parsed.segments.is_empty() {
-                shell_segments(&normalized)
-            } else {
-                parsed.segments
-            };
-            (true, parsed.dynamic, parsed.heredoc_prefix, segments)
-        }
-        None => (false, false, false, shell_segments(&normalized)),
-    };
-    // Wrappers (sh -c "...", env BAR=v cmd, nohup cmd, xargs cmd, ...) hide
-    // the real command behind boilerplate. Append the recursively unwrapped
-    // inner commands so destructive/network/compiler checks fire on the
-    // actual payload, not just the wrapper.
-    let segments = expand_wrapper_segments(raw_segments);
+    let input = shell_policy_input(command, &normalized);
+    let ShellPolicyInput {
+        parser_backed,
+        dynamic,
+        heredoc_prefix,
+        segments,
+        units,
+    } = input;
+    let _unit_count = units.len();
     let first = segments
         .first()
         .map(|segment| shell_command_prefix(segment))

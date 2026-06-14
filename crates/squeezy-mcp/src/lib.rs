@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
-    pin::Pin,
     process::Stdio,
     sync::{
         Arc, Mutex,
@@ -39,59 +38,43 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod elicitation;
+mod resources;
 mod schema_compaction;
 mod sse;
+mod transport;
 
+use elicitation::{
+    AutoElicitationDecision, MCP_AUDIT_LOG_CAPACITY, classify_elicitation, elicitation_kind,
+    elicitation_request_for_ui, push_elicitation_audit,
+};
+pub use elicitation::{
+    McpElicitationAction, McpElicitationAuditEvent, McpElicitationAuditOutcome,
+    McpElicitationHandler, McpElicitationKind, McpElicitationRequest, McpElicitationResponse,
+};
+#[cfg(test)]
+use resources::RESOURCE_READ_CACHE_CAPACITY;
+use resources::{
+    CachedResourceDeclarations, CachedResourceRead, RESOURCE_DECLARATION_CACHE_TTL,
+    RESOURCE_READ_CACHE_TTL, insert_resource_read,
+};
 use schema_compaction::{compact_tool_schema, schema_object};
-
-const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
-
-/// Timeout applied to MCP tool discovery (including the implicit session
-/// bring-up on the first call). Falls back to `timeout_ms`, then to the
-/// crate-wide default.
-fn discovery_timeout_ms(server: &McpServerConfig) -> u64 {
-    server
-        .discovery_timeout_ms
-        .or(server.timeout_ms)
-        .unwrap_or(DEFAULT_MCP_TIMEOUT_MS)
-}
-
-/// Timeout applied to MCP tool invocations and follow-on requests (tool
-/// calls, resource listing, resource reads). Falls back to `timeout_ms`,
-/// then to the crate-wide default.
-fn tool_call_timeout_ms(server: &McpServerConfig) -> u64 {
-    server
-        .tool_call_timeout_ms
-        .or(server.timeout_ms)
-        .unwrap_or(DEFAULT_MCP_TIMEOUT_MS)
-}
+use transport::{discovery_timeout_ms, tool_call_timeout_ms};
 
 const MCP_TOOL_CACHE_SCHEMA_VERSION: u64 = 1;
 const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
 const HASH_SUFFIX_BYTES: usize = 12;
-const RESOURCE_READ_CACHE_TTL: Duration = Duration::from_secs(300);
-const RESOURCE_DECLARATION_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Maximum number of stderr lines kept per stdio MCP session.
 const STDERR_RING_CAPACITY: usize = 20;
 /// Maximum bytes per stderr line before truncation. Lines from an untrusted
 /// child process are capped before logging or surfacing to avoid log injection
 /// and unbounded memory growth from long unterminated writes.
 const STDERR_LINE_MAX_BYTES: usize = 256;
-/// Cap on retained resource-read cache entries. The registry lives for the
-/// whole session, so without a bound a server (or agent loop) that reads many
-/// distinct URIs would accumulate their full bodies indefinitely. Mirrors the
-/// `MCP_AUDIT_LOG_CAPACITY` defense: prune expired entries, then evict the
-/// oldest, so memory stays bounded by the working set.
-const RESOURCE_READ_CACHE_CAPACITY: usize = 256;
 const MAX_TOOL_SCHEMA_BYTES: usize = 4096;
 
 pub type McpResult<T> = Result<T, McpError>;
 
 type McpService = rmcp::service::RunningService<RoleClient, SqueezyMcpClientHandler>;
-type McpElicitationFuture = Pin<Box<dyn Future<Output = McpElicitationResponse> + Send>>;
-pub type McpElicitationHandler =
-    Arc<dyn Fn(McpElicitationRequest) -> McpElicitationFuture + Send + Sync>;
-
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
     #[error("MCP server {server:?} is missing command for stdio transport")]
@@ -196,109 +179,6 @@ pub struct McpRefreshOutcome {
     pub status: McpStatusSnapshot,
     pub discovery_stats: Option<McpDiscoveryStats>,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum McpElicitationKind {
-    Form,
-    Url,
-}
-
-impl McpElicitationKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Form => "form",
-            Self::Url => "url",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpElicitationRequest {
-    pub server: String,
-    pub request_id: String,
-    pub kind: McpElicitationKind,
-    pub message: String,
-    pub schema: Option<Value>,
-    pub url: Option<String>,
-    pub elicitation_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum McpElicitationAction {
-    Accept,
-    Decline,
-    Cancel,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpElicitationResponse {
-    pub action: McpElicitationAction,
-    pub content: Option<Value>,
-}
-
-impl McpElicitationResponse {
-    pub fn accept(content: Option<Value>) -> Self {
-        Self {
-            action: McpElicitationAction::Accept,
-            content,
-        }
-    }
-
-    pub fn decline() -> Self {
-        Self {
-            action: McpElicitationAction::Decline,
-            content: None,
-        }
-    }
-
-    pub fn cancel() -> Self {
-        Self {
-            action: McpElicitationAction::Cancel,
-            content: None,
-        }
-    }
-}
-
-/// Outcome of a single elicitation policy check, surfaced for audit/UI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum McpElicitationAuditOutcome {
-    /// Policy + content allowed silent acceptance; no user was prompted.
-    AutoAccepted,
-    /// Policy denied without prompting.
-    AutoDeclined,
-    /// Forwarded to the host handler (UI) for a user decision.
-    Forwarded,
-}
-
-impl McpElicitationAuditOutcome {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::AutoAccepted => "auto_accepted",
-            Self::AutoDeclined => "auto_declined",
-            Self::Forwarded => "forwarded",
-        }
-    }
-}
-
-/// Record emitted every time the MCP client takes an elicitation decision.
-///
-/// Provides a structured audit trail so a malicious server spamming empty
-/// `Form` elicitations cannot silently flip behavior — each decision is
-/// observable from the host without scraping `tracing` logs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpElicitationAuditEvent {
-    pub server: String,
-    pub request_id: String,
-    pub kind: McpElicitationKind,
-    pub policy: PermissionMode,
-    pub outcome: McpElicitationAuditOutcome,
-    pub unix_millis: u128,
-}
-
-/// Cap on retained audit entries. Older records are dropped FIFO; this is
-/// purely a defense against runaway memory if a misbehaving server floods
-/// elicitations — the host is expected to drain via `audit_log_snapshot`.
-const MCP_AUDIT_LOG_CAPACITY: usize = 256;
 
 #[derive(Clone)]
 pub struct McpClientRegistry {
@@ -1669,21 +1549,6 @@ struct SessionEntry {
     stderr_ring: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
 }
 
-#[derive(Debug)]
-struct CachedResourceRead {
-    value: Value,
-    fetched_at: Instant,
-}
-
-#[derive(Debug, Clone)]
-struct CachedResourceDeclarations {
-    resource_uris: BTreeSet<String>,
-    resource_templates: Vec<String>,
-    resource_uris_complete: bool,
-    resource_templates_complete: bool,
-    fetched_at: Instant,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct McpToolCacheRecord {
     schema_version: u64,
@@ -2726,119 +2591,6 @@ fn service_error_to_mcp(server: &str, err: rmcp::ServiceError) -> McpError {
     McpError::Transport {
         server: server.to_string(),
         message,
-    }
-}
-
-fn can_auto_accept_elicitation(request: &CreateElicitationRequestParams) -> bool {
-    match request {
-        CreateElicitationRequestParams::FormElicitationParams {
-            requested_schema, ..
-        } => requested_schema
-            .required
-            .as_ref()
-            .map(|required| required.is_empty())
-            .unwrap_or(true),
-        CreateElicitationRequestParams::UrlElicitationParams { .. } => false,
-    }
-}
-
-fn elicitation_kind(request: &CreateElicitationRequestParams) -> McpElicitationKind {
-    match request {
-        CreateElicitationRequestParams::FormElicitationParams { .. } => McpElicitationKind::Form,
-        CreateElicitationRequestParams::UrlElicitationParams { .. } => McpElicitationKind::Url,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AutoElicitationDecision {
-    AutoAccept,
-    AutoDecline,
-    Forward,
-}
-
-/// Resolve the per-request elicitation decision against the host policy. Pure
-/// function so the gate can be exercised in tests without spinning up an
-/// `rmcp` peer; the audit ring and tracing are applied around it.
-fn classify_elicitation(
-    policy: PermissionMode,
-    request: &CreateElicitationRequestParams,
-) -> AutoElicitationDecision {
-    match policy {
-        PermissionMode::Deny => AutoElicitationDecision::AutoDecline,
-        PermissionMode::Allow if can_auto_accept_elicitation(request) => {
-            AutoElicitationDecision::AutoAccept
-        }
-        PermissionMode::Allow | PermissionMode::Ask => AutoElicitationDecision::Forward,
-    }
-}
-
-fn push_elicitation_audit(
-    log: &Arc<Mutex<std::collections::VecDeque<McpElicitationAuditEvent>>>,
-    event: McpElicitationAuditEvent,
-) {
-    if let Ok(mut log) = log.lock() {
-        if log.len() >= MCP_AUDIT_LOG_CAPACITY {
-            log.pop_front();
-        }
-        log.push_back(event);
-    }
-}
-
-/// Insert a resource-read entry while keeping the cache bounded. Expired
-/// entries are dropped first (cheap, and keeps the working set roughly
-/// proportional to one TTL window), then — if still at capacity — the oldest
-/// surviving entry by `fetched_at` is evicted so a session that reads many
-/// distinct URIs cannot grow the map without limit.
-fn insert_resource_read(
-    cache: &mut BTreeMap<(String, String), CachedResourceRead>,
-    key: (String, String),
-    entry: CachedResourceRead,
-) {
-    cache.retain(|_, v| v.fetched_at.elapsed() <= RESOURCE_READ_CACHE_TTL);
-    while cache.len() >= RESOURCE_READ_CACHE_CAPACITY
-        && let Some(oldest) = cache
-            .iter()
-            .min_by_key(|(_, v)| v.fetched_at)
-            .map(|(k, _)| k.clone())
-    {
-        cache.remove(&oldest);
-    }
-    cache.insert(key, entry);
-}
-
-fn elicitation_request_for_ui(
-    server: &str,
-    context: &RequestContext<RoleClient>,
-    request: &CreateElicitationRequestParams,
-) -> McpElicitationRequest {
-    match request {
-        CreateElicitationRequestParams::FormElicitationParams {
-            message,
-            requested_schema,
-            ..
-        } => McpElicitationRequest {
-            server: server.to_string(),
-            request_id: format!("{:?}", context.id),
-            kind: McpElicitationKind::Form,
-            message: message.clone(),
-            schema: serde_json::to_value(requested_schema).ok(),
-            url: None,
-            elicitation_id: None,
-        },
-        CreateElicitationRequestParams::UrlElicitationParams {
-            message,
-            url,
-            elicitation_id,
-            ..
-        } => McpElicitationRequest {
-            server: server.to_string(),
-            request_id: format!("{:?}", context.id),
-            kind: McpElicitationKind::Url,
-            message: message.clone(),
-            schema: None,
-            url: Some(url.clone()),
-            elicitation_id: Some(elicitation_id.clone()),
-        },
     }
 }
 

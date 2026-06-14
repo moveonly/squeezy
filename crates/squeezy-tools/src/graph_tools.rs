@@ -17,10 +17,20 @@ use squeezy_graph::{
     SourceCache,
 };
 use squeezy_vcs::{
-    DiffFileStatus, DiffHunk, DiffMode, DiffOptions, DiffSnapshot, canonicalize_workspace_root,
+    DiffFileStatus, DiffMode, DiffOptions, DiffSnapshot, canonicalize_workspace_root,
 };
 use squeezy_workspace::ExclusionReason;
 
+use crate::graph_tools_diff_ranges::{
+    ChangedByteRange, byte_diff_ranges, changed_byte_ranges_from_patch, diff_hunks_to_byte_ranges,
+    line_number_for_byte,
+};
+use crate::graph_tools_filters::path_matches_filter;
+use crate::graph_tools_packets::{DiffNextActionKind, read_diff_next_action};
+use crate::graph_tools_read_slice::{
+    DiffReadBaseline, LastReceiptDiffOutcome, ReadSliceArgs, ReadSliceDiffCtx, ReadSliceReadMode,
+    ReadSliceSpanKind, diff_read_baseline_str,
+};
 use crate::{
     DEFAULT_GRAPH_MAX_DEPTH, DEFAULT_GRAPH_MAX_RESULTS, DEFAULT_READ_LIMIT,
     GRAPH_READ_SLICE_MAX_LINE_SCAN_BYTES, MAX_GRAPH_MAX_DEPTH, MAX_GRAPH_MAX_RESULTS,
@@ -298,155 +308,6 @@ struct InheritanceHierarchyArgs {
     offset: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ReadSliceArgs {
-    pub(crate) path: Option<String>,
-    symbol_id: Option<String>,
-    span_kind: Option<ReadSliceSpanKind>,
-    read_mode: Option<ReadSliceReadMode>,
-    diff_baseline: Option<DiffReadBaseline>,
-    max_ranges: Option<usize>,
-    start_byte: Option<usize>,
-    end_byte: Option<usize>,
-    start_line: Option<u32>,
-    end_line: Option<u32>,
-    context_lines: Option<u32>,
-    offset: Option<usize>,
-    limit: Option<usize>,
-    diff_only: Option<bool>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ReadSliceReadMode {
-    #[default]
-    Slice,
-    Diff,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum DiffReadBaseline {
-    #[default]
-    Worktree,
-    #[serde(alias = "branch")]
-    BranchBase,
-    Index,
-    LastReceipt,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ReadSliceSpanKind {
-    #[default]
-    Signature,
-    Body,
-}
-
-fn diff_read_baseline_str(baseline: DiffReadBaseline) -> &'static str {
-    match baseline {
-        DiffReadBaseline::Worktree => "worktree",
-        DiffReadBaseline::BranchBase => "branch_base",
-        DiffReadBaseline::Index => "index",
-        DiffReadBaseline::LastReceipt => "last_receipt",
-    }
-}
-
-enum LastReceiptDiffOutcome {
-    Result(Box<ToolResult>),
-    Fallback(&'static str),
-}
-
-/// Bundle of arguments shared by the three `read_mode=diff` helpers. Grouping
-/// them keeps each helper under `clippy::too_many_arguments` and removes the
-/// duplicated argument forwarding between `execute_read_slice_diff_blocking`
-/// → `read_slice_git_diff` / `read_slice_last_receipt_diff` plus the
-/// `LastReceipt` → `Worktree` fallback re-call.
-struct ReadSliceDiffCtx<'a> {
-    call: &'a ToolCall,
-    args: &'a ReadSliceArgs,
-    path: &'a Path,
-    rel: &'a str,
-    graph_available: bool,
-    graph_status: &'static str,
-    confidence: Confidence,
-    provenance: Vec<Provenance>,
-    span: Option<SourceSpan>,
-    /// Policy-exclusion reason for this file, mirrored from slice mode so the
-    /// diff payload can advertise `ignored`/`ignored_reason` too. Slice mode
-    /// surfaces this; without it a model can't tell a policy-excluded file
-    /// apart from a clean one when reading in diff mode.
-    ignored_reason: Option<&'static str>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ChangedByteRange {
-    start: usize,
-    end: usize,
-    start_line: u32,
-    end_line: u32,
-    status: &'static str,
-}
-
-impl ChangedByteRange {
-    fn new(start: usize, end: usize, start_line: u32, end_line: u32, status: &'static str) -> Self {
-        Self {
-            start,
-            end,
-            start_line,
-            end_line,
-            status,
-        }
-    }
-}
-
-/// Next-action recommendation for a diff packet. Diff ranges that already
-/// carry the changed bytes inline should not steer the model back to
-/// `read_slice` in slice mode for the same path — that just re-fetches the
-/// same content. Prefer `symbol_context` (Rust graph available) so the model
-/// can pull the enclosing symbol's callers/callees instead.
-#[derive(Debug, Clone, Copy)]
-enum DiffNextActionKind {
-    /// Recommend the slice mode of `read_slice` for cases that did not
-    /// already include source bytes (binary files, deleted files, empty
-    /// range lists). Surrounding context still needs a real fetch.
-    ReadSlice,
-    /// Recommend either `symbol_context` (when the Rust semantic graph is
-    /// available for this path) or the slice mode of `read_slice` (as a
-    /// language-agnostic fallback). Used when the diff range already includes
-    /// `content` inline.
-    SymbolContextOrSlice { rust_graph: bool },
-}
-
-fn read_diff_next_action(path: &str, kind: DiffNextActionKind) -> Value {
-    match kind {
-        DiffNextActionKind::ReadSlice => json!({
-            "tool": "read_slice",
-            "arguments": {
-                "path": path,
-                "read_mode": "slice"
-            },
-            "reason": "read the exact current source slice if surrounding context is needed"
-        }),
-        DiffNextActionKind::SymbolContextOrSlice { rust_graph: true } => json!({
-            "tool": "symbol_context",
-            "arguments": {
-                "path": path
-            },
-            "reason": "look up the enclosing symbol's callers and callees instead of refetching the same diff bytes"
-        }),
-        DiffNextActionKind::SymbolContextOrSlice { rust_graph: false } => json!({
-            "tool": "read_slice",
-            "arguments": {
-                "path": path,
-                "read_mode": "slice"
-            },
-            "reason": "read additional surrounding source if context beyond the diff bytes is needed"
-        }),
-    }
-}
-
 fn read_diff_packet(
     path: &str,
     span: Option<SourceSpan>,
@@ -476,183 +337,6 @@ fn read_diff_packet(
         object.insert("confidence".to_string(), json!(confidence.id()));
     }
     packet
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ChangedLineRange {
-    start_line: u32,
-    end_line: u32,
-    status: &'static str,
-}
-
-fn changed_byte_ranges_from_patch(patch: &str, text: &str) -> Vec<ChangedByteRange> {
-    let mut line_ranges = Vec::<ChangedLineRange>::new();
-    let mut new_line = 0u32;
-    for line in patch.lines() {
-        if line.starts_with("@@") {
-            new_line = parse_hunk_new_start(line).unwrap_or(1);
-            continue;
-        }
-        // Before the first `@@`, `new_line == 0`, which already skips the
-        // unified-diff file headers (`+++ b/file`, `--- a/file`). Inside a
-        // hunk every body line carries a single-char prefix (`+`/`-`/` `), so
-        // classifying by that prefix alone correctly handles content lines
-        // whose text begins with `++`/`--` (e.g. `+++…` for an added `++i;`
-        // or a `+++` frontmatter delimiter, `----` for a deleted `---` rule).
-        if new_line == 0 {
-            continue;
-        }
-        if line.starts_with('+') {
-            push_changed_line(&mut line_ranges, new_line, "modified");
-            new_line = new_line.saturating_add(1);
-        } else if line.starts_with('-') {
-            push_changed_line(&mut line_ranges, new_line.max(1), "deleted");
-        } else if line.starts_with(' ') {
-            new_line = new_line.saturating_add(1);
-        }
-    }
-    let modified_ranges = line_ranges
-        .iter()
-        .filter(|range| range.status == "modified")
-        .cloned()
-        .collect::<Vec<_>>();
-    line_ranges
-        .into_iter()
-        .filter(|range| {
-            range.status != "deleted"
-                || !modified_ranges.iter().any(|modified| {
-                    range.start_line <= modified.end_line && range.end_line >= modified.start_line
-                })
-        })
-        .map(|range| line_range_to_byte_range(text, range))
-        .collect()
-}
-
-fn push_changed_line(ranges: &mut Vec<ChangedLineRange>, line: u32, status: &'static str) {
-    if let Some(last) = ranges.last_mut()
-        && last.status == status
-        && line <= last.end_line.saturating_add(1)
-    {
-        last.end_line = last.end_line.max(line);
-        return;
-    }
-    ranges.push(ChangedLineRange {
-        start_line: line,
-        end_line: line,
-        status,
-    });
-}
-
-fn parse_hunk_new_start(line: &str) -> Option<u32> {
-    let plus = line.find('+')?;
-    let rest = line.get(plus + 1..)?;
-    let end = rest
-        .find(|ch: char| ch == ',' || ch.is_ascii_whitespace())
-        .unwrap_or(rest.len());
-    rest.get(..end)?.parse().ok()
-}
-
-fn diff_hunks_to_byte_ranges(hunks: &[DiffHunk], text: &str) -> Vec<ChangedByteRange> {
-    hunks
-        .iter()
-        .map(|hunk| {
-            let start_line = hunk.start_line.saturating_add(1).max(1);
-            let end_line = hunk.end_line.saturating_add(1).max(start_line);
-            line_range_to_byte_range(
-                text,
-                ChangedLineRange {
-                    start_line,
-                    end_line,
-                    status: "modified",
-                },
-            )
-        })
-        .collect()
-}
-
-fn line_range_to_byte_range(text: &str, range: ChangedLineRange) -> ChangedByteRange {
-    let offsets = line_start_offsets(text);
-    let start = byte_for_line(&offsets, text.len(), range.start_line);
-    let end = if range.status == "deleted" {
-        start
-    } else {
-        byte_after_line(&offsets, text.len(), range.end_line)
-    };
-    ChangedByteRange::new(
-        start,
-        end.max(start),
-        range.start_line,
-        range.end_line,
-        range.status,
-    )
-}
-
-fn line_start_offsets(text: &str) -> Vec<usize> {
-    let mut offsets = vec![0usize];
-    for (index, byte) in text.bytes().enumerate() {
-        if byte == b'\n' && index + 1 < text.len() {
-            offsets.push(index + 1);
-        }
-    }
-    offsets
-}
-
-fn byte_for_line(offsets: &[usize], text_len: usize, line: u32) -> usize {
-    offsets
-        .get(line.saturating_sub(1) as usize)
-        .copied()
-        .unwrap_or(text_len)
-}
-
-fn byte_after_line(offsets: &[usize], text_len: usize, line: u32) -> usize {
-    offsets.get(line as usize).copied().unwrap_or(text_len)
-}
-
-fn byte_diff_ranges(old: &[u8], new: &[u8]) -> Vec<ChangedByteRange> {
-    if old == new {
-        return Vec::new();
-    }
-    let mut prefix = 0usize;
-    while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
-        prefix += 1;
-    }
-    let mut old_suffix = old.len();
-    let mut new_suffix = new.len();
-    while old_suffix > prefix && new_suffix > prefix && old[old_suffix - 1] == new[new_suffix - 1] {
-        old_suffix -= 1;
-        new_suffix -= 1;
-    }
-    let mut start = prefix;
-    while start > 0 && new[start - 1] != b'\n' {
-        start -= 1;
-    }
-    let mut end = new_suffix.max(start);
-    while end < new.len() && new[end.saturating_sub(1)] != b'\n' {
-        end += 1;
-    }
-    // Compute line numbers honestly so the resulting range stands on its own
-    // (callers can still overwrite, but the type no longer lies about being
-    // line-aware). `new` here is the window-local current bytes; the caller
-    // is responsible for offsetting to file-absolute lines if needed.
-    let start_line = line_number_for_byte_bytes(new, start);
-    let end_line =
-        line_number_for_byte_bytes(new, end.saturating_sub(1).max(start)).max(start_line);
-    vec![ChangedByteRange::new(
-        start, end, start_line, end_line, "modified",
-    )]
-}
-
-fn line_number_for_byte(text: &str, byte: usize) -> u32 {
-    line_number_for_byte_bytes(text.as_bytes(), byte)
-}
-
-fn line_number_for_byte_bytes(bytes: &[u8], byte: usize) -> u32 {
-    let clamped = byte.min(bytes.len());
-    bytes[..clamped]
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count()
-        .saturating_add(1) as u32
 }
 
 /// Count the number of newlines strictly before `offset` in `path`. Used to
@@ -755,60 +439,6 @@ fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> boo
         return true;
     };
     path_matches_filter(symbol.file_id.0.as_str(), filter)
-}
-
-/// Normalise Windows-style backslash separators in a user-supplied filter to
-/// forward slashes. Graph paths are always slash-normalised by workspace
-/// discovery, so this lets users paste paths from Explorer, PowerShell,
-/// `cargo` output, or MSBuild output without learning the internal convention.
-///
-/// Returns the input unchanged (zero allocation) when it contains no `\`.
-/// Match `path` against a model-supplied `filter`.
-///
-/// Filters that look like a directory path (contain `/` or `\`) match by
-/// strict prefix with a directory boundary — `gson/src/main/java` matches
-/// files under that tree but not siblings like `gson/src/test/java/...`.
-/// Windows-pasted filters such as `gson\src\main\java` are normalised to
-/// forward slashes first so they match the slash-normalised graph paths.
-///
-/// Single-token filters (no directory separator) keep the loose
-/// trailing-segment + fuzzy fallback so casual "find a crate" queries
-/// still resolve. The fuzzy path was the source of cross-tree noise only
-/// when the model already wrote a real prefix; gating on separators removes
-/// that noise without regressing the bareword UX.
-fn path_matches_filter(path: &str, filter: &str) -> bool {
-    // Normalize backslashes and leading `./` once before all comparisons so
-    // Windows-style input like `.\src\app.cs` resolves against `src/app.cs`.
-    let filter_owned = normalize_path_filter(filter);
-    let filter = filter_owned.as_ref();
-    if filter.contains('/') {
-        let filter = filter.trim_end_matches('/');
-        if filter.is_empty() {
-            return true;
-        }
-        if path == filter
-            || (path.starts_with(filter) && path.as_bytes().get(filter.len()) == Some(&b'/'))
-        {
-            return true;
-        }
-        // Case-insensitive prefix match on Windows.
-        #[cfg(target_os = "windows")]
-        {
-            let filter_lower = filter.to_ascii_lowercase();
-            let path_lower = path.to_ascii_lowercase();
-            if path.eq_ignore_ascii_case(filter)
-                || (path_lower.starts_with(filter_lower.as_str())
-                    && path_lower.as_bytes().get(filter_lower.len()) == Some(&b'/'))
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-    if path_matches_exact_or_suffix(path, filter) {
-        return true;
-    }
-    squeezy_rank::fuzzy::fuzzy_path_score(path, filter).is_some()
 }
 
 fn annotate_graph(manager: &mut GraphManager, snapshot: &DiffSnapshot) {
@@ -2576,55 +2206,6 @@ fn reference_matches_path(hit: &ReferenceHit, filter: &str) -> bool {
     path_matches_filter(hit.reference.file_id.0.as_str(), filter)
 }
 
-/// Normalize a user-supplied path filter: replace backslashes with forward
-/// slashes and strip leading `./` or `.\` so that Windows-style input like
-/// `.\src\lib.rs` matches the indexed `src/lib.rs`.
-fn normalize_path_filter(filter: &str) -> std::borrow::Cow<'_, str> {
-    let s = if filter.contains('\\') {
-        std::borrow::Cow::Owned(filter.replace('\\', "/"))
-    } else {
-        std::borrow::Cow::Borrowed(filter)
-    };
-    // Strip a leading `./` produced by shell tab-completion or model output.
-    if let Some(rest) = s.strip_prefix("./") {
-        std::borrow::Cow::Owned(rest.to_string())
-    } else {
-        s
-    }
-}
-
-fn path_matches_exact_or_suffix(path: &str, filter: &str) -> bool {
-    let filter = normalize_path_filter(filter);
-    let filter = filter.as_ref();
-    if path == filter {
-        return true;
-    }
-    // Case-insensitive comparison on Windows where the filesystem ignores case.
-    #[cfg(target_os = "windows")]
-    if path.eq_ignore_ascii_case(filter) {
-        return true;
-    }
-    if path
-        .strip_suffix(filter)
-        .is_some_and(|prefix| prefix.ends_with('/'))
-    {
-        return true;
-    }
-    // Case-insensitive suffix match on Windows.
-    #[cfg(target_os = "windows")]
-    {
-        let path_lower = path.to_ascii_lowercase();
-        let filter_lower = filter.to_ascii_lowercase();
-        if path_lower
-            .strip_suffix(filter_lower.as_str())
-            .is_some_and(|prefix| prefix.ends_with('/'))
-        {
-            return true;
-        }
-    }
-    false
-}
-
 fn call_edge_packet(
     graph: &squeezy_graph::SemanticGraph,
     hit: &CallEdgeHit,
@@ -3729,46 +3310,7 @@ fn span_json(span: squeezy_core::SourceSpan) -> Value {
 }
 
 impl ToolRegistry {
-    pub(crate) fn is_graph_tool_name(name: &str) -> bool {
-        matches!(
-            name,
-            "repo_map"
-                | "decl_search"
-                | "definition_search"
-                | "reference_search"
-                | "upstream_flow"
-                | "downstream_flow"
-                | "symbol_context"
-                | "hierarchy"
-                | "inheritance_hierarchy"
-                | "impact"
-                | "symbol_at"
-                | "read_slice"
-        )
-    }
-
-    pub(crate) async fn execute_graph_tool(&self, call: &ToolCall) -> ToolResult {
-        let registry = self.clone();
-        let call = call.clone();
-        // Preserve the original `call_id` and tool name so the agent loop can
-        // still match a join failure back to the model's tool call and so
-        // telemetry classifies it under the right tool family instead of a
-        // generic `graph_tool` bucket.
-        let fallback_call = call.clone();
-        tokio::task::spawn_blocking(move || registry.execute_graph_tool_blocking(&call))
-            .await
-            .unwrap_or_else(|err| {
-                make_result(
-                    &fallback_call,
-                    ToolStatus::Error,
-                    json!({ "error": format!("graph tool join failed: {err}") }),
-                    ToolCostHint::default(),
-                    None,
-                )
-            })
-    }
-
-    fn execute_graph_tool_blocking(&self, call: &ToolCall) -> ToolResult {
+    pub(crate) fn execute_graph_tool_blocking(&self, call: &ToolCall) -> ToolResult {
         let mode = graph_tool_diff_mode(call);
         let snapshot = self.diff_snapshot(mode, DiffOptions::default());
         // Bug #1: a path-only `read_slice` never consults the graph, so don't
