@@ -25,8 +25,9 @@ use squeezy_parse::{
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
 use squeezy_workspace::{
-    CrawlOptions, FileRecord, IndexCoverage, IndexingDecision, PathConflict, PriorFileMeta,
-    PriorFileMetadata, VCS_AND_CACHE_DIR_NAMES, WorkspaceCrawler, filesystem_paths_match,
+    CompiledIndexingPolicy, CrawlOptions, FileRecord, IndexCoverage, IndexingDecision, PathConflict,
+    PriorFileMeta, PriorFileMetadata, VCS_AND_CACHE_DIR_NAMES, WorkspaceCrawler,
+    filesystem_paths_match,
 };
 use tracing::{error, warn};
 
@@ -2695,10 +2696,11 @@ impl GraphManager {
         let watcher_config = watcher_config.with_default_root(manager.root.clone());
         let handle = Arc::clone(&manager.pending_changed_paths);
         let watched_root = manager.root.clone();
+        let policy = Arc::clone(manager.crawler.policy());
         let native_result = watcher::FileWatcher::start(watcher_config.clone(), move |batch| {
             if let Ok(mut paths) = handle.lock() {
                 for path in batch.modified.into_iter().chain(batch.removed) {
-                    if watcher_path_should_enqueue(&watched_root, &path) {
+                    if watcher_path_should_enqueue(&watched_root, &policy, &path) {
                         paths.insert(path);
                     }
                 }
@@ -2707,10 +2709,11 @@ impl GraphManager {
         let polling_start = || {
             let handle = Arc::clone(&manager.pending_changed_paths);
             let watched_root = manager.root.clone();
+            let policy = Arc::clone(manager.crawler.policy());
             watcher::FileWatcher::start_polling(watcher_config, move |batch| {
                 if let Ok(mut paths) = handle.lock() {
                     for path in batch.modified.into_iter().chain(batch.removed) {
-                        if watcher_path_should_enqueue(&watched_root, &path) {
+                        if watcher_path_should_enqueue(&watched_root, &policy, &path) {
                             paths.insert(path);
                         }
                     }
@@ -3091,8 +3094,9 @@ impl GraphManager {
             .unwrap_or_default();
         // Pre-compute canonical forms for all pending event paths once so the
         // matching loops below do not repeatedly call canonicalize on the same
-        // event path.
-        let pending_canonicals = PendingCanonicals::from_paths(&pending_changed_paths);
+        // event path. Policy-pruned paths skip canonicalization entirely.
+        let pending_canonicals =
+            PendingCanonicals::from_paths(&self.root, self.crawler.policy(), &pending_changed_paths);
         let mut supported_changed_records = current
             .values()
             .filter(|record| record.language != LanguageKind::Unsupported)
@@ -3347,14 +3351,12 @@ impl GraphManager {
     }
 }
 
-fn watcher_path_should_enqueue(root: &Path, path: &Path) -> bool {
+fn watcher_path_should_enqueue(root: &Path, policy: &CompiledIndexingPolicy, path: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
-    // Conservative filter: drop only VCS metadata and Squeezy's own cache
-    // (`VCS_AND_CACHE_DIR_NAMES`) so persisting the graph cannot self-trigger
-    // a refresh loop. Heavy-churn build dirs like `target/` and
-    // `node_modules/` stay visible because an `include` glob may re-enable
-    // a subset of them; the crawler does the policy-aware filtering.
-    !relative.components().any(|component| {
+    // Hard guard: always drop VCS metadata and Squeezy's own cache
+    // (`VCS_AND_CACHE_DIR_NAMES`) regardless of policy so persisting the graph
+    // can never self-trigger a refresh loop.
+    if relative.components().any(|component| {
         let std::path::Component::Normal(name) = component else {
             return false;
         };
@@ -3362,7 +3364,26 @@ fn watcher_path_should_enqueue(root: &Path, path: &Path) -> bool {
             return false;
         };
         VCS_AND_CACHE_DIR_NAMES.contains(&name)
-    })
+    }) {
+        return false;
+    }
+    // Policy-aware prune: a watcher event under a default-pruned dir
+    // (`target/`, `node_modules/`, `dist/`, …) is high-churn noise that the
+    // crawl would skip anyway, so enqueuing it just burns refresh budget. Reuse
+    // the crawler's keep/prune decision (`path_reason`) instead of a bare dir-
+    // name check so an `include` glob that re-enables a subset is honoured: when
+    // the policy would still index this path, `path_reason` returns `None` and
+    // we keep it.
+    let relative_str = relative.to_string_lossy();
+    let relative_str = if relative_str.contains('\\') {
+        relative_str.replace('\\', "/")
+    } else {
+        relative_str.into_owned()
+    };
+    if relative_str.is_empty() {
+        return true;
+    }
+    policy.path_reason(&relative_str, false).is_none()
 }
 
 struct LoadedPartitions {
@@ -4617,10 +4638,23 @@ struct PendingCanonicals {
 }
 
 impl PendingCanonicals {
-    fn from_paths(paths: &HashSet<PathBuf>) -> Self {
+    /// Build the canonical-path cache, but skip the `canonicalize` (a stat +
+    /// readlink syscall) for any path the indexing policy would prune: those
+    /// paths can never match a kept crawl record, so their canonical form is
+    /// dead weight. Skipping them keeps the syscall count proportional to the
+    /// paths that can actually match instead of to every churny build-dir event
+    /// that slipped into the pending set.
+    fn from_paths(root: &Path, policy: &CompiledIndexingPolicy, paths: &HashSet<PathBuf>) -> Self {
         let entries = paths
             .iter()
-            .map(|p| (p.clone(), std::fs::canonicalize(p).ok()))
+            .map(|p| {
+                let canonical = if watcher_path_should_enqueue(root, policy, p) {
+                    std::fs::canonicalize(p).ok()
+                } else {
+                    None
+                };
+                (p.clone(), canonical)
+            })
             .collect();
         Self { entries }
     }

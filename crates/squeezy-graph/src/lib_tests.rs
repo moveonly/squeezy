@@ -2448,28 +2448,62 @@ fn graph_manager_returns_config_error_for_invalid_policy_glob() {
 }
 
 #[test]
-fn watcher_paths_skip_vcs_and_squeezy_cache_only() {
+fn watcher_paths_skip_vcs_cache_and_policy_pruned_dirs() {
     let root = PathBuf::from("/workspace/project");
+    let policy = CompiledIndexingPolicy::empty();
 
-    assert!(watcher_path_should_enqueue(&root, &root.join("src/lib.rs")));
+    // Ordinary source under the default policy is always enqueued.
     assert!(watcher_path_should_enqueue(
         &root,
-        &root.join("vendor/allowed/lib.rs")
+        &policy,
+        &root.join("src/lib.rs")
     ));
-    assert!(watcher_path_should_enqueue(
-        &root,
-        &root.join("target/generated.rs")
-    ));
+
+    // VCS metadata and Squeezy's own cache are always dropped.
     for path in [
         root.join(".squeezy/cache/graph.redb"),
         root.join(".git/index"),
     ] {
         assert!(
-            !watcher_path_should_enqueue(&root, &path),
+            !watcher_path_should_enqueue(&root, &policy, &path),
             "{} should not enqueue a graph refresh",
             path.display()
         );
     }
+
+    // Default-pruned build/dependency dirs are now dropped (policy-aware
+    // prune), not enqueued, because the crawl would skip them anyway.
+    for path in [
+        root.join("vendor/allowed/lib.rs"),
+        root.join("target/generated.rs"),
+        root.join("node_modules/pkg/index.js"),
+    ] {
+        assert!(
+            !watcher_path_should_enqueue(&root, &policy, &path),
+            "{} should be pruned by default policy",
+            path.display()
+        );
+    }
+
+    // An `include` glob that re-enables a subset of a pruned dir keeps those
+    // paths enqueueable.
+    let include_policy = IndexingPolicy {
+        include: vec!["vendor/allowed/**".to_string()],
+        ..Default::default()
+    }
+    .compile()
+    .expect("policy compiles");
+    assert!(watcher_path_should_enqueue(
+        &root,
+        &include_policy,
+        &root.join("vendor/allowed/lib.rs")
+    ));
+    // A sibling pruned path the include does not cover is still dropped.
+    assert!(!watcher_path_should_enqueue(
+        &root,
+        &include_policy,
+        &root.join("vendor/other/lib.rs")
+    ));
 }
 
 #[test]
