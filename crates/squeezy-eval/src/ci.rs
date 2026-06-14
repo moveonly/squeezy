@@ -62,6 +62,9 @@ pub struct CheckOptions {
     /// setup: `provider = "mock"` and `hermetic = true`. Everything else is
     /// skipped (and logged). Used by the offline CI job.
     pub hermetic_only: bool,
+    /// Emit one line as each scenario completes. This keeps long CI runs from
+    /// looking wedged while preserving the final sorted report.
+    pub emit_progress: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -250,6 +253,7 @@ impl Default for CheckOptions {
             parallelism: None,
             input_regression: InputRegression::default(),
             hermetic_only: false,
+            emit_progress: false,
         }
     }
 }
@@ -423,9 +427,14 @@ pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
     let mut report = CheckReport::default();
     for handle in handles {
         match handle.await {
-            Ok(result) => report.results.push(result),
+            Ok(result) => {
+                if opts.emit_progress {
+                    emit_progress(&result);
+                }
+                report.results.push(result);
+            }
             Err(err) => {
-                report.results.push(ScenarioResult {
+                let result = ScenarioResult {
                     name: "<panicked>".into(),
                     path: PathBuf::new(),
                     passed: !opts.fail_on.errors,
@@ -435,7 +444,11 @@ pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
                     elapsed_ms: 0,
                     input_tokens: None,
                     input_regression: None,
-                });
+                };
+                if opts.emit_progress {
+                    emit_progress(&result);
+                }
+                report.results.push(result);
             }
         }
     }
@@ -455,6 +468,14 @@ pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
         write_junit(junit_path, &report)?;
     }
     Ok(report)
+}
+
+fn emit_progress(result: &ScenarioResult) {
+    let status = if result.passed { "PASS" } else { "FAIL" };
+    eprintln!(
+        "check progress: {status} {:<40} {}ms",
+        result.name, result.elapsed_ms
+    );
 }
 
 /// Compare each run's input tokens against the stored baseline, annotate the

@@ -304,6 +304,7 @@ async fn check_cmd(
             update_baseline,
         },
         hermetic_only: hermetic,
+        emit_progress: true,
     };
     let report = squeezy_eval::ci::run_check(opts).await?;
     let total = report.results.len();
