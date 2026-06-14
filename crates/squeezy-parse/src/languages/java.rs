@@ -145,7 +145,7 @@ pub(crate) fn java_symbol_from_node(
     } else {
         None
     };
-    let mut attributes = java_attributes_for_node(node, ctx.source);
+    let mut attributes = java_modifier_attributes(node, ctx.source);
     if is_java_test_symbol(&ctx.file.relative_path, kind, &name, &attributes) {
         attributes.push("java:test".to_string());
     }
@@ -184,7 +184,7 @@ pub(crate) fn java_field_symbols_from_node(
     ctx: &ExtractContext<'_>,
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
 ) -> Vec<ParsedSymbol> {
-    let mut attributes = java_attributes_for_node(node, ctx.source);
+    let mut attributes = java_modifier_attributes(node, ctx.source);
     if let Some(field_type) = java_field_type(node, ctx.source) {
         attributes.push(format!("type:{field_type}"));
     }
@@ -518,6 +518,31 @@ pub(crate) fn dedup_java_facts(ctx: &mut ExtractContext<'_>) {
     let mut body_hits: HashSet<(u32, BodyHitKind)> = HashSet::new();
     ctx.body_hits
         .retain(|hit| body_hits.insert((hit.span.start_byte, hit.kind)));
+}
+
+/// Annotation tags (delegated to the shared helper) plus the keyword modifiers
+/// the grammar exposes as *anonymous* children of the `modifiers` node
+/// (`abstract`, `final`, `static`, `default`, `sealed`, …). Tree-sitter only
+/// lists `annotation`/`marker_annotation` as named children, so the keyword
+/// tokens are reachable through the full `children` walk only — mirroring how
+/// `java_visibility_text` reads `public`/`protected`/`private`. Each keyword is
+/// pushed as `java:<kw>` so `decl_search` can filter abstract-vs-concrete,
+/// static-vs-instance, and sealed declarations.
+pub(crate) fn java_modifier_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut attributes = java_attributes_for_node(node, source);
+    let Some(modifiers) = java_modifiers_node(node) else {
+        return attributes;
+    };
+    let mut cursor = modifiers.walk();
+    for child in modifiers.children(&mut cursor) {
+        let keyword = match child.kind() {
+            "abstract" | "final" | "static" | "default" | "sealed" | "non-sealed"
+            | "synchronized" | "native" | "transient" | "volatile" | "strictfp" => child.kind(),
+            _ => continue,
+        };
+        attributes.push(format!("java:{keyword}"));
+    }
+    attributes
 }
 
 /// Lower a type declaration's supertypes into `base:`/`iface:` attributes.
