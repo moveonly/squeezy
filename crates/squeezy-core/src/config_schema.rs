@@ -31,9 +31,9 @@ use crate::{
     DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL, DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
     DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
     DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_TUI_SPINNER_NAME,
-    DEFAULT_TUI_THEME_NAME, DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode,
-    PermissionPolicyMode, ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode,
-    SessionResumePicker, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault,
+    DEFAULT_TUI_THEME_NAME, DEFAULT_WEBSEARCH_PROVIDER, NotificationMethod, OpenAiCompatiblePreset,
+    PermissionMode, PermissionPolicyMode, ProviderConfig, ReasoningEffort, ResponseVerbosity,
+    SessionMode, SessionResumePicker, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault,
     TuiSynchronizedOutput, normalize_tui_spinner_name, normalize_tui_theme_name,
 };
 
@@ -393,6 +393,7 @@ pub const STATUS_VERBOSITY_OPTIONS: &[&str] = &["compact", "verbose"];
 pub const RESPONSE_VERBOSITY_OPTIONS: &[&str] = &["concise", "normal", "verbose"];
 pub const TOOL_OUTPUT_VERBOSITY_OPTIONS: &[&str] = &["compact", "normal", "verbose"];
 pub const TRANSCRIPT_DEFAULT_OPTIONS: &[&str] = &["compact", "expanded"];
+pub const DESKTOP_NOTIFICATIONS_OPTIONS: &[&str] = &["off", "bel", "osc9", "auto"];
 pub const SYNCHRONIZED_OUTPUT_OPTIONS: &[&str] = &["auto", "always", "never"];
 pub const PERMISSION_POLICY_MODE_OPTIONS: &[&str] =
     &["default", "auto_review", "full_access", "custom"];
@@ -1156,6 +1157,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default_display: "compact",
                 default: || FieldValue::Enum("compact"),
                 help: "Whether new transcript entries start collapsed or expanded.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "desktop_notifications",
+                toml_path: &["tui", "desktop_notifications"],
+                kind: FieldKind::Enum {
+                    options: DESKTOP_NOTIFICATIONS_OPTIONS,
+                },
+                tier: ApplyTier::Immediate,
+                get: get_desktop_notifications,
+                set: set_desktop_notifications,
+                default_display: "off",
+                default: || FieldValue::Enum("off"),
+                help: "Bell/desktop notification when a turn finishes or needs approval.",
                 env_override: None,
                 secret: false,
             },
@@ -3167,6 +3183,19 @@ fn set_transcript_default(cfg: &mut AppConfig, value: FieldValue) -> Result<(), 
         "expanded" => TranscriptDefault::Expanded,
         _ => return Err("invalid transcript_default"),
     };
+    Ok(())
+}
+
+fn get_desktop_notifications(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.tui.desktop_notifications.as_str())
+}
+fn set_desktop_notifications(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::Enum(s) => s,
+        _ => return Err("expects enum"),
+    };
+    cfg.tui.desktop_notifications =
+        NotificationMethod::parse(s).ok_or("invalid desktop_notifications")?;
     Ok(())
 }
 

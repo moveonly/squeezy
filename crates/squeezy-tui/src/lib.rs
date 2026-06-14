@@ -49334,6 +49334,8 @@ impl TuiApp {
         self.transcript_default = config.tui.transcript_default;
         self.show_reasoning_usage = config.tui.show_reasoning_usage;
         self.coalesce_tool_runs = config.tui.coalesce_tool_runs;
+        self.desktop_notifier
+            .set_method(config.tui.desktop_notifications);
         self.copy_on_select = config.tui.copy_on_select;
         self.permissions = PermissionStatus::from_policy(&config.permissions);
         self.telemetry = TelemetryStatus::from_config(&config.telemetry);
