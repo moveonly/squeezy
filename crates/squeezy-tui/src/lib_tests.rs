@@ -23611,8 +23611,8 @@ async fn glyph_mode_overlay_paints_on_tiny_and_wide_terminals() {
 }
 
 /// Render the main transcript (with an overflowing, scrolled buffer) for a given
-/// glyph mode and collect the symbols painted in the rightmost (scrollbar) column.
-fn main_scrollbar_column_symbols(mode: glyph_mode::GlyphMode) -> Vec<String> {
+/// glyph mode and collect the cells painted in the rightmost (scrollbar) column.
+fn main_scrollbar_column_cells(mode: glyph_mode::GlyphMode) -> Vec<(String, Color, Modifier)> {
     let mut app = test_app(SessionMode::Build);
     app.glyph_mode = mode;
     for index in 0..200 {
@@ -23646,7 +23646,17 @@ fn main_scrollbar_column_symbols(mode: glyph_mode::GlyphMode) -> Vec<String> {
     let buffer = terminal.backend().buffer();
     // The scrollbar lives in the last column (a one-cell gutter at x = width - 1).
     (0..height)
-        .map(|y| buffer[(width - 1, y)].symbol().to_string())
+        .map(|y| {
+            let cell = &buffer[(width - 1, y)];
+            (cell.symbol().to_string(), cell.fg, cell.modifier)
+        })
+        .collect()
+}
+
+fn main_scrollbar_column_symbols(mode: glyph_mode::GlyphMode) -> Vec<String> {
+    main_scrollbar_column_cells(mode)
+        .into_iter()
+        .map(|(symbol, _, _)| symbol)
         .collect()
 }
 
@@ -23696,6 +23706,36 @@ fn main_scrollbar_keeps_unicode_block_glyphs_in_unicode_mode() {
             "unexpected scrollbar cell {s:?} in Unicode mode: {symbols:?}"
         );
     }
+}
+
+#[test]
+fn main_scrollbar_uses_terminal_gray_colors() {
+    let cells = main_scrollbar_column_cells(glyph_mode::GlyphMode::Unicode);
+    let mut saw_thumb = false;
+    let mut saw_track = false;
+    for (symbol, fg, modifier) in cells {
+        match symbol.as_str() {
+            "\u{2588}" => {
+                saw_thumb = true;
+                assert_eq!(fg, Color::Gray, "main scrollbar thumb is neutral gray");
+                assert!(
+                    modifier.contains(Modifier::BOLD),
+                    "main scrollbar thumb stays visually distinct"
+                );
+            }
+            "\u{2591}" => {
+                saw_track = true;
+                assert_eq!(
+                    fg,
+                    Color::DarkGray,
+                    "main scrollbar track is subdued terminal gray"
+                );
+            }
+            other => panic!("unexpected main scrollbar symbol {other:?}"),
+        }
+    }
+    assert!(saw_thumb, "main scrollbar thumb painted");
+    assert!(saw_track, "main scrollbar track painted");
 }
 
 /// Open the scratchpad on a wide terminal for a given glyph mode and return the
@@ -25918,6 +25958,45 @@ fn transcript_overlay_renders_right_scrollbar_for_overflow() {
         output.contains('░'),
         "overflowing transcript overlay should render a scrollbar track: {output}"
     );
+
+    let width = 80u16;
+    let height = 12u16;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| render(frame, &app)).expect("draw");
+    let buffer = terminal.backend().buffer();
+    let mut saw_thumb = false;
+    let mut saw_track = false;
+    for y in 0..height {
+        for x in 0..width {
+            let cell = &buffer[(x, y)];
+            match cell.symbol() {
+                "█" => {
+                    saw_thumb = true;
+                    assert_eq!(
+                        cell.fg,
+                        Color::Gray,
+                        "overlay scrollbar thumb is neutral gray"
+                    );
+                    assert!(
+                        cell.modifier.contains(Modifier::BOLD),
+                        "overlay scrollbar thumb stays visually distinct"
+                    );
+                }
+                "░" => {
+                    saw_track = true;
+                    assert_eq!(
+                        cell.fg,
+                        Color::DarkGray,
+                        "overlay scrollbar track is subdued terminal gray"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_thumb, "overlay scrollbar thumb painted");
+    assert!(saw_track, "overlay scrollbar track painted");
 }
 
 #[test]

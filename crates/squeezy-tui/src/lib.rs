@@ -36519,8 +36519,20 @@ fn transcript_main_text_and_scrollbar_areas(area: Rect) -> (Rect, Option<Rect>) 
     (text_area, Some(scrollbar_area))
 }
 
-/// Draw the main-view scrollbar thumb (`█`, accent bold) on a quiet `░` track.
-/// Shares glyphs/style with `render_transcript_overlay_scrollbar`.
+/// Fixed terminal-native scrollbar colors. Transcript scrollbars are positional
+/// chrome, not semantic emphasis, so keep them independent of the active theme.
+fn transcript_scrollbar_thumb_style() -> Style {
+    Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn transcript_scrollbar_track_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+/// Draw the main-view scrollbar thumb on a quiet track.
+/// Shares style with `render_transcript_overlay_scrollbar`.
 fn render_main_scrollbar(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -36538,17 +36550,9 @@ fn render_main_scrollbar(
         .map(|offset| {
             let in_thumb = offset >= thumb_offset && offset < thumb_end;
             let (symbol, style) = if in_thumb {
-                (
-                    tokens.scrollbar_thumb,
-                    Style::default()
-                        .fg(crate::render::theme::accent())
-                        .add_modifier(Modifier::BOLD),
-                )
+                (tokens.scrollbar_thumb, transcript_scrollbar_thumb_style())
             } else {
-                (
-                    tokens.scrollbar_track,
-                    Style::default().fg(crate::render::theme::quiet()),
-                )
+                (tokens.scrollbar_track, transcript_scrollbar_track_style())
             };
             Line::from(Span::styled(symbol, style))
         })
@@ -37839,14 +37843,9 @@ fn render_transcript_overlay_scrollbar(
         .map(|offset| {
             let in_thumb = offset >= geometry.thumb_top && offset < thumb_end;
             let (symbol, style) = if in_thumb {
-                (
-                    "█",
-                    Style::default()
-                        .fg(crate::render::theme::accent())
-                        .add_modifier(Modifier::BOLD),
-                )
+                ("█", transcript_scrollbar_thumb_style())
             } else {
-                ("░", Style::default().fg(crate::render::theme::quiet()))
+                ("░", transcript_scrollbar_track_style())
             };
             Line::from(Span::styled(symbol, style))
         })
