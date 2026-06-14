@@ -55,11 +55,12 @@ use squeezy_core::{
     detect_image_mime,
 };
 use squeezy_llm::{LlmInputItem, LlmProvider};
-use squeezy_skills::{HelpStatus, PromptTemplateCatalog, SqueezyHelp};
+use squeezy_skills::{HelpAnswerSource, HelpStatus, PromptTemplateCatalog, SqueezyHelp};
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
 use squeezy_telemetry::{
-    ConfigApplyTier, ConfigChangeKind, ConfigChangeReport, ConfigScopeKind, PreparedFeedback,
-    SlashAliasKind, SlashArgShape, SlashOutcome, SlashSurface, StartupRoute, TelemetryClient,
+    ConfigApplyTier, ConfigChangeKind, ConfigChangeReport, ConfigScopeKind, HelpAnswerSourceKind,
+    HelpRatingKind, PreparedFeedback, SlashAliasKind, SlashArgShape, SlashOutcome, SlashSurface,
+    StartupRoute, TelemetryClient,
 };
 use squeezy_tools::{
     McpElicitationKind, McpElicitationRequest, McpElicitationResponse, McpServerStatus,
@@ -113,6 +114,7 @@ mod focus_resize;
 mod fuzzy;
 mod gesture_settings;
 mod glyph_mode;
+mod help_links;
 mod history;
 mod hover_intent;
 mod hover_preview;
@@ -4162,6 +4164,28 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             // Focused the header entry but let the selection path arm too.
             CardPress::FocusedThenFallThrough | CardPress::Ignored => {}
         }
+    }
+
+    // Actionable help command links (ITEM 3): a left-press on a `squeezy:cmd:`
+    // command-link span prefills the composer with that command. Hit-tested in the
+    // same absolute screen coordinates against the `CommandLink` targets
+    // `render_transcript` registered this frame, and fully consumed (like the
+    // caret zone) so the click prefills rather than also arming a text selection.
+    // Only on the MAIN transcript: the targets are registered over the main
+    // painted rows, and `handle_command_hyperlink` is surface-agnostic (it only
+    // touches the composer), so the source check just keeps the affordance scoped
+    // to where the spans actually paint.
+    if app.transcript_overlay.is_none()
+        && app.config_screen.is_none()
+        && matches!(app.subagent_pane.active, ConversationSource::Main)
+        && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && let Some((
+            interaction::TargetKey::Chrome(interaction::ChromeKey::CommandLink(_, _)),
+            action,
+        )) = app.click_target_at(mouse.column, mouse.row)
+    {
+        dispatch_click_action(app, action);
+        return true;
     }
 
     // Visual selection over the MAIN transcript text area. Only outside the
@@ -8991,6 +9015,26 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         && let Some(slot) = ch.to_digit(10)
         && (1..=9).contains(&slot)
         && handle_session_quick_switch(app, agent, slot as usize).await
+    {
+        return Ok(false);
+    }
+
+    // Help-answer rating chords (§help-rating): Ctrl+G = 👍, Ctrl+B = 👎 on the
+    // most recent LOCAL `/help` answer. Probed BEFORE the keymap/legacy
+    // dispatch, but ONLY consumed when the last assistant message was a help
+    // answer (`rate_help_answer` returns false otherwise). So Ctrl+B keeps its
+    // emacs cursor-left meaning in the composer, and Ctrl+G is otherwise a
+    // harmless no-op. Each rating fires one anonymous `help_answer_rated` event
+    // and clears the slot so the same answer is never double-counted.
+    if key.modifiers == KeyModifiers::CONTROL
+        && key.code == KeyCode::Char('g')
+        && rate_help_answer(app, agent, HelpRatingKind::Up)
+    {
+        return Ok(false);
+    }
+    if key.modifiers == KeyModifiers::CONTROL
+        && key.code == KeyCode::Char('b')
+        && rate_help_answer(app, agent, HelpRatingKind::Down)
     {
         return Ok(false);
     }
@@ -18926,6 +18970,48 @@ fn begin_queue_edit(app: &mut TuiApp, id: u64) -> bool {
     true
 }
 
+/// Route a clicked hyperlink whose target uses the internal `squeezy:cmd:` scheme
+/// (ITEM 3 — actionable help answers): prefill the composer with the referenced
+/// slash command so the user can review and press Enter. Returns `true` when the
+/// URI was one of ours and was handled, `false` when it is a foreign scheme the
+/// caller should keep routing as a normal URL/file link.
+///
+/// This deliberately *only prefills* — it never auto-executes the command — so a
+/// stray click on a help link can never run a destructive verb on its own. It
+/// refuses to clobber an in-progress draft (a `/`-prefixed composer is treated as
+/// a fresh command line and is safe to replace; any other non-empty draft is
+/// protected, mirroring `begin_queue_edit`'s data-loss guard).
+///
+/// Reached from the live click path: `render_transcript` registers a
+/// frame-local `interaction` hit target ([`interaction::ChromeKey::CommandLink`])
+/// over each detected command span via [`register_command_link_targets`], and a
+/// press on one routes through [`dispatch_click_action`]'s `PrefillCommand` arm to
+/// here (with `uri == command_uri(cmd)`). The OSC 8-wrapped form
+/// ([`help_links::command_hyperlink_span`]) carries the same `squeezy:cmd:` scheme
+/// only on the raw scrollback-mirror writer path — the terminal cannot service an
+/// internal scheme, so the in-Buffer render path uses this hit-target route
+/// instead (never baking OSC 8 escapes into spans that flow into the ratatui
+/// `Buffer`, which would corrupt per-cell width math).
+fn handle_command_hyperlink(app: &mut TuiApp, uri: &str) -> bool {
+    let Some(action) = help_links::parse_command_uri(uri) else {
+        return false;
+    };
+    // Protect a real in-progress draft. A composer that is empty, or that already
+    // holds only a slash-command line the user is mid-typing, is safe to overwrite
+    // with the chosen command.
+    let draft_is_protected = !app.input.is_empty() && !app.input.starts_with('/');
+    if draft_is_protected {
+        app.status = "clear the composer before opening a command link".to_string();
+        app.needs_redraw = true;
+        return true;
+    }
+    app.input = action.command;
+    app.input_cursor = app.input.len();
+    app.status = "command ready in composer — press Enter to run".to_string();
+    app.needs_redraw = true;
+    true
+}
+
 /// Save the composer draft back onto the queued item being edited (§11G.8).
 /// Resolves `editing_queue_id` to its live slot and replaces the text *by id*
 /// (so a drain/reorder since editing began can't misdirect the save), then
@@ -19562,6 +19648,17 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         // `smart_split::SplitField::ALL`, matching the row's click target.
         interaction::Action::SmartSplitAdjustField(index) => {
             smart_split_adjust_field(app, index);
+        }
+        // ITEM 3: a click on a `squeezy:cmd:` command-link span inside a rendered
+        // answer prefills the composer with that command (never auto-runs it). The
+        // index is into `input::SLASH_COMMANDS`, resolved back to the command name
+        // here and routed through the SAME `handle_command_hyperlink` the OSC 8
+        // scrollback-mirror link would, so the click and the link share one path. A
+        // stale index (registry rebuilt only at draw time) resolves to a no-op.
+        interaction::Action::PrefillCommand(index) => {
+            if let Some(command) = input::SLASH_COMMANDS.get(index) {
+                handle_command_hyperlink(app, &help_links::command_uri(command.name));
+            }
         }
     }
 }
@@ -22518,11 +22615,121 @@ fn handle_help_command(app: &mut TuiApp, agent: &mut Agent, rest: &str) {
         && answer.status == HelpStatus::Answered
     {
         app.push_transcript_item(TranscriptItem::system(answer.render_markdown()));
-        app.status = format!("help: {}", answer.topic);
+        // Track the rateable answer (anonymous topic id + source only) so the
+        // thumbs-up / thumbs-down chords can fire `help_answer_rated` telemetry.
+        app.last_help_answer = Some((answer.topic.clone(), answer.source));
+        app.status = format!("help: {} · Ctrl+G 👍 / Ctrl+B 👎", answer.topic);
         return;
     }
     // Topic not covered locally — fall back to a model turn (network).
+    // A model-backed answer is not tracked for rating here: the rating chords
+    // only cover the deterministic local-help surface this function rendered.
     start_user_turn(app, agent, prompt);
+}
+
+/// Map the skills crate's help-answer source onto the telemetry-local enum so
+/// the telemetry crate stays independent of `squeezy-skills`.
+fn help_source_kind(source: HelpAnswerSource) -> HelpAnswerSourceKind {
+    match source {
+        HelpAnswerSource::LocalCurated => HelpAnswerSourceKind::LocalCurated,
+        HelpAnswerSource::DocHelpModel => HelpAnswerSourceKind::DocHelpModel,
+        // A web-fallback answer is still a model-generated doc-help answer for
+        // rating telemetry; the telemetry enum has no separate web kind, so it
+        // folds into `DocHelpModel`. Reached now that model-backed answers
+        // (which arrive as a plain assistant message) are tracked for rating —
+        // see `note_help_answer_from_assistant`.
+        HelpAnswerSource::DocHelpWeb => HelpAnswerSourceKind::DocHelpModel,
+    }
+}
+
+/// Best-effort detect whether a completed assistant message is a model-backed
+/// `/help` answer and, if so, record it as the rateable `last_help_answer` so the
+/// Ctrl+G / Ctrl+B chords can fire `help_answer_rated` telemetry for it too.
+///
+/// ## Why this seam
+///
+/// Local curated `/help` answers are tracked directly in `handle_help_command`,
+/// which holds the structured [`squeezy_skills::HelpAnswer`] (topic + source).
+/// Model-backed answers (`DocHelpModel` / `DocHelpWeb`) are produced by the
+/// agent's doc-help turn and reach the TUI only as an ordinary assistant
+/// transcript message on `AgentEvent::Completed` — the agent emits no topic/source
+/// on that event (it is a normal completed turn). The single carried signal is the
+/// rendered markdown's trailing `*<source label>*` line that
+/// [`squeezy_skills::HelpAnswer::render_markdown`] appends. We match that label via
+/// [`HelpAnswerSource::from_rendered_label`] (the labels live in one place in the
+/// skills crate, so this is not a fragile re-hardcoded parse) and, when it is one
+/// of the model-backed sources, mark the message rateable. Curated answers are NOT
+/// matched here: they never traverse this path (they are pushed as a system item
+/// in `handle_help_command`), so matching them would be dead, and a real model turn
+/// whose body merely quoted the curated label is not itself a curated answer.
+///
+/// The topic is unknown at this seam (the event carries none), so we use a stable
+/// best-effort id, keeping the anonymous-telemetry contract intact: topic id +
+/// source + rating + version only, never the answer text.
+///
+/// Returns `true` when it recorded a rateable help answer, so the caller can show
+/// the rating-hint status line after it has set its own turn-complete status.
+fn note_help_answer_from_assistant(app: &mut TuiApp, content: &str) -> bool {
+    let Some(source) = HelpAnswerSource::from_rendered_label(content) else {
+        return false;
+    };
+    // Curated answers do not flow through assistant `Completed` events; only the
+    // model-backed sources do. Ignore a curated label here so a real model turn
+    // that happened to echo it is not mis-tracked, and so the curated path stays
+    // the sole owner of curated-answer rating.
+    if matches!(source, HelpAnswerSource::LocalCurated) {
+        return false;
+    }
+    app.last_help_answer = Some(("doc-help".to_string(), source));
+    true
+}
+
+/// Outcome of attempting to rate the last help answer. Pure data so the rating
+/// decision is unit-testable without standing up a `TuiApp` or an `Agent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HelpRatingOutcome {
+    pub(crate) topic: String,
+    pub(crate) source: HelpAnswerSourceKind,
+    pub(crate) rating: HelpRatingKind,
+    pub(crate) confirmation: String,
+}
+
+/// Decide whether the `last_help_answer` slot can be rated, and if so consume it
+/// (so the same answer is not double-counted) and return the anonymous telemetry
+/// dimensions plus a confirmation line. Returns `None` — a no-op — when the last
+/// assistant message was NOT a help answer, so the rating chords fall through to
+/// their normal key meaning in every other context.
+pub(crate) fn rate_last_help_answer(
+    last_help_answer: &mut Option<(String, HelpAnswerSource)>,
+    rating: HelpRatingKind,
+) -> Option<HelpRatingOutcome> {
+    let (topic, source) = last_help_answer.take()?;
+    let confirmation = match rating {
+        HelpRatingKind::Up => format!("Thanks — marked the `{topic}` help answer helpful."),
+        HelpRatingKind::Down => format!(
+            "Thanks — marked the `{topic}` help answer not helpful. Maintainers will see the anonymous signal."
+        ),
+    };
+    Some(HelpRatingOutcome {
+        topic,
+        source: help_source_kind(source),
+        rating,
+        confirmation,
+    })
+}
+
+/// Rate the most recent local `/help` answer (thumbs up/down), emit anonymous
+/// `help_answer_rated` telemetry, and show a brief confirmation. Returns `true`
+/// when a rateable help answer was present (the chord is consumed); `false` when
+/// there is nothing to rate so the caller lets the key keep its normal meaning.
+fn rate_help_answer(app: &mut TuiApp, agent: &Agent, rating: HelpRatingKind) -> bool {
+    let Some(outcome) = rate_last_help_answer(&mut app.last_help_answer, rating) else {
+        return false;
+    };
+    agent.record_help_answer_rated_telemetry(&outcome.topic, outcome.source, outcome.rating);
+    app.status = outcome.confirmation;
+    app.needs_redraw = true;
+    true
 }
 
 async fn handle_feedback_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
@@ -34902,6 +35109,84 @@ fn register_transcript_card_targets(
     }
 }
 
+/// Register a frame-local click target over every actionable `squeezy:cmd:`
+/// command-link span (ITEM 3) painted in the current viewport, so a click on a
+/// slash-command token inside a rendered assistant/help answer prefills the
+/// composer with that command.
+///
+/// This is the in-Buffer render path's twin of the OSC 8 scrollback-mirror link
+/// in [`help_links`]: per the module's contract, the OSC 8 escapes must NEVER be
+/// baked into spans that flow into the ratatui `Buffer` (they corrupt per-cell
+/// width math), so the live path instead leaves the span text plain and registers
+/// a hit target over the same cells. [`help_links::detect_command_links`] is the
+/// shared *detector* (which spans, which command); this function owns the *where
+/// on screen*, and [`dispatch_click_action`]'s `PrefillCommand` arm owns the *do
+/// it*.
+///
+/// `lines` is the SAME painted row `Vec` `render_transcript` slices for the
+/// `Paragraph`, in wrapped-row units; `top`/`viewport_h` bound the visible window
+/// the slice draws. We only handle soft-wrap mode (the default): there the painted
+/// span column is the screen column, so a span's `(x, y)` is exact. In no-wrap
+/// mode the horizontal pan (`h_offset`) and off-screen overflow make per-span cell
+/// math unreliable, so we skip registration rather than register a wrong rect —
+/// the command is still reachable by typing it (the documented keyboard twin).
+fn register_command_link_targets(
+    app: &TuiApp,
+    text_area: Rect,
+    lines: &[Line<'static>],
+    top: usize,
+    viewport_h: usize,
+    soft_wrap: bool,
+) {
+    if !soft_wrap || text_area.width == 0 || text_area.height == 0 {
+        return;
+    }
+    let bottom = lines.len().min(top + viewport_h);
+    for (row_index, line) in lines.iter().enumerate().take(bottom).skip(top) {
+        // Reuse the shared detector so the "which spans are commands" rule has one
+        // source of truth (the same one the OSC 8 mirror and the unit tests use).
+        let detected = help_links::detect_command_links(std::slice::from_ref(line));
+        if detected.is_empty() {
+            continue;
+        }
+        let screen_y = text_area.y + (row_index - top) as u16;
+        for link in &detected {
+            let Some(command_index) = input::slash_command_index(&link.command) else {
+                continue;
+            };
+            // Column = sum of the display widths of the spans before this one.
+            let col_offset: usize = line.spans[..link.span]
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum();
+            let span_width = UnicodeWidthStr::width(line.spans[link.span].content.as_ref());
+            if span_width == 0 || col_offset >= text_area.width as usize {
+                continue;
+            }
+            let screen_x = text_area.x + col_offset as u16;
+            // Clamp the width to the text area so the rect never spills past the
+            // gutter on a span that wraps to the edge.
+            let max_w = text_area.width.saturating_sub(col_offset as u16);
+            let width = (span_width as u16).min(max_w);
+            if width == 0 {
+                continue;
+            }
+            app.register_click(
+                Rect {
+                    x: screen_x,
+                    y: screen_y,
+                    width,
+                    height: 1,
+                },
+                interaction::TargetKey::Chrome(interaction::ChromeKey::CommandLink(
+                    screen_x, screen_y,
+                )),
+                interaction::Action::PrefillCommand(command_index),
+            );
+        }
+    }
+}
+
 /// Paint the small inline annotation markers (§12.2.5) on the header rows of the
 /// currently-visible transcript entries that carry a note, and register each as an
 /// [`interaction::ChromeKey::EntryAnnotationMarker`] click target (opening the
@@ -35349,6 +35634,14 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
         viewport_h,
         from_bottom,
     );
+
+    // Register a click target over each actionable `squeezy:cmd:` command-link span
+    // (ITEM 3) visible in this window, so a click on a slash command inside a
+    // rendered answer prefills the composer. Built from the SAME `lines` the paint
+    // slices below; the later selection/search highlight passes only restyle cells
+    // (they never change span text or counts), so the column/width math here stays
+    // valid for the painted rows.
+    register_command_link_targets(app, text_area, &lines, top, viewport_h, soft_wrap);
 
     // Overlay the visual-selection highlight on the painted rows when a MAIN
     // selection is active. `rows_with_selection_highlight` restyles the selected
@@ -47396,6 +47689,14 @@ pub(crate) struct TuiApp {
     pub(crate) last_turn_had_edits: bool,
     pub(crate) mcp_elicitation_selection_index: usize,
     pub(crate) pending_feedback: Option<PreparedFeedback>,
+    /// The most recent locally-answered `/help` topic, as `(topic id, source)`.
+    /// Set whenever a curated/local help answer is rendered into the transcript;
+    /// drives the thumbs-up / thumbs-down rating chords (Ctrl+G / Ctrl+B). It is
+    /// `None` until the first help answer and is left intact afterwards so the
+    /// last answer stays rateable while the user reads it. Cleared once rated so
+    /// the same answer is not double-counted. Holds only the anonymous topic id
+    /// + source — never the answer body.
+    pub(crate) last_help_answer: Option<(String, HelpAnswerSource)>,
     pub(crate) pending_report: Option<BugReportBundle>,
     pub(crate) clipboard: Box<dyn Clipboard>,
     /// Resolved clipboard provider chain for semantic copy/export
@@ -48752,6 +49053,7 @@ impl TuiApp {
             last_turn_had_edits: false,
             mcp_elicitation_selection_index: 0,
             pending_feedback: None,
+            last_help_answer: None,
             pending_report: None,
             clipboard,
             clipboard_chain: build_clipboard_chain(Box::new(clipboard::RealSink)),

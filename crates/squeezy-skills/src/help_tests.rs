@@ -1,8 +1,9 @@
 use std::{collections::BTreeSet, fs, path::Path};
 
 use super::{
-    HelpAnswerSource, HelpCitation, HelpStatus, SqueezyHelp, bundled_doc_paths, bundled_docs,
-    extract_doc_intro, matches_squeezy_help_input, relevant_docs_for_input,
+    BundledDoc, HelpAnswer, HelpAnswerSource, HelpCitation, HelpStatus, SqueezyHelp,
+    bundled_doc_paths, bundled_docs, chunk_doc_sections, extract_doc_intro,
+    matches_squeezy_help_input, relevant_doc_sections_for_input, relevant_docs_for_input,
 };
 
 #[test]
@@ -737,6 +738,39 @@ fn bundled_skill_docs_do_not_advertise_nonexistent_slash_skill() {
 }
 
 #[test]
+fn chunk_doc_sections_splits_on_atx_headings() {
+    let doc = BundledDoc {
+        path: "docs/external/EXAMPLE.md",
+        content: "# Title\n\nintro body\n\n## Alpha\n\nalpha body\n\n### Beta\n\nbeta body\n",
+    };
+    let sections = chunk_doc_sections(&doc);
+    let headings: Vec<&str> = sections.iter().map(|s| s.heading).collect();
+    assert_eq!(headings, vec!["# Title", "## Alpha", "### Beta"]);
+
+    // Each section borrows from the doc and includes its heading line + body.
+    assert!(sections[0].content.starts_with("# Title"));
+    assert!(sections[0].content.contains("intro body"));
+    assert!(!sections[0].content.contains("## Alpha"));
+
+    let alpha = sections
+        .iter()
+        .find(|s| s.heading == "## Alpha")
+        .expect("alpha section");
+    assert!(alpha.content.contains("alpha body"));
+    assert!(!alpha.content.contains("beta body"));
+    assert_eq!(alpha.path, "docs/external/EXAMPLE.md");
+
+    // All section content slices borrow from the doc's static content.
+    for section in &sections {
+        assert!(
+            doc.content.contains(section.content),
+            "section content must be a subslice of the doc: {:?}",
+            section.content
+        );
+    }
+}
+
+#[test]
 fn prompt_templates_topic_describes_real_slash_activation() {
     let help = SqueezyHelp::new("");
     let body = help.answer_topic("prompt-templates").body;
@@ -750,5 +784,206 @@ fn prompt_templates_topic_describes_real_slash_activation() {
     assert!(
         body.contains("/review"),
         "prompt-templates summary must show the real `/<name>` slash form: {body}"
+    );
+}
+
+#[test]
+fn chunk_doc_sections_keeps_leading_preamble_as_headingless_section() {
+    let doc = BundledDoc {
+        path: "docs/external/PRE.md",
+        content: "preamble text before any heading\n\n## First\n\nbody\n",
+    };
+    let sections = chunk_doc_sections(&doc);
+    assert_eq!(sections.len(), 2);
+    assert_eq!(sections[0].heading, "");
+    assert!(sections[0].content.contains("preamble text"));
+    assert_eq!(sections[1].heading, "## First");
+}
+
+#[test]
+fn chunk_doc_sections_skips_empty_doc() {
+    let doc = BundledDoc {
+        path: "docs/external/EMPTY.md",
+        content: "   \n\n  \n",
+    };
+    assert!(chunk_doc_sections(&doc).is_empty());
+}
+
+#[test]
+fn relevant_doc_sections_scopes_to_matched_topic() {
+    // Explicit /help providers → sections must come only from the providers
+    // topic's cited docs + anchors, never from an unrelated doc like SESSIONS.md.
+    let sections = relevant_doc_sections_for_input("/help providers");
+    assert!(!sections.is_empty(), "providers topic must yield sections");
+
+    let paths: BTreeSet<&str> = sections.iter().map(|s| s.path).collect();
+    assert!(
+        paths.contains("docs/external/PROVIDERS.md"),
+        "providers sections must include PROVIDERS.md: {paths:?}"
+    );
+    assert!(
+        !paths.contains("docs/external/SESSIONS.md"),
+        "providers sections must NOT include unrelated SESSIONS.md: {paths:?}"
+    );
+
+    // Every returned section path must be one of the candidate docs for this
+    // topic (sections are scoped, not drawn from the whole corpus).
+    let candidate_paths: BTreeSet<&str> = relevant_docs_for_input("/help providers")
+        .iter()
+        .map(|d| d.path)
+        .collect();
+    for section in &sections {
+        assert!(
+            candidate_paths.contains(section.path),
+            "section path {} must be a candidate doc",
+            section.path
+        );
+    }
+}
+
+#[test]
+fn relevant_doc_sections_ranks_on_topic_section_first() {
+    // A query token that strongly matches one specific section's content should
+    // surface an on-topic section near the top. Use the providers topic and a
+    // token ("anthropic") that appears in the PROVIDERS doc.
+    let sections = relevant_doc_sections_for_input("/help providers anthropic bedrock");
+    assert!(!sections.is_empty());
+
+    // The highest-ranked section should mention one of the query tokens.
+    let top = &sections[0];
+    let top_lower = top.content.to_ascii_lowercase();
+    assert!(
+        top_lower.contains("anthropic")
+            || top_lower.contains("bedrock")
+            || top_lower.contains("provider"),
+        "top section should be on-topic: heading={:?}",
+        top.heading
+    );
+
+    // Section count stays bounded (cap is ~10).
+    assert!(
+        sections.len() <= 10,
+        "section count must respect the cap: got {}",
+        sections.len()
+    );
+}
+
+#[test]
+fn relevant_doc_sections_keeps_doc_diversity() {
+    // A topic whose cited docs + anchors span multiple files should return
+    // sections from more than one doc (diversity pass), not all from one doc.
+    let sections = relevant_doc_sections_for_input("/help permissions");
+    assert!(!sections.is_empty());
+    let distinct_docs: BTreeSet<&str> = sections.iter().map(|s| s.path).collect();
+    assert!(
+        distinct_docs.len() >= 2,
+        "permissions sections should span multiple docs for diversity: {distinct_docs:?}"
+    );
+}
+
+#[test]
+fn help_citation_url_serde_round_trips_as_kind_url() {
+    let citation = HelpCitation::Url("https://squeezyagent.com/docs/".to_string());
+    let json = serde_json::to_value(&citation).expect("serialize Url citation");
+    assert_eq!(json["kind"], "url", "{json}");
+    assert_eq!(json["value"], "https://squeezyagent.com/docs/", "{json}");
+
+    let back: HelpCitation = serde_json::from_value(json).expect("deserialize Url citation");
+    assert_eq!(back, citation);
+}
+
+#[test]
+fn help_citation_url_renders_bare_url_not_markdown_link() {
+    let citation = HelpCitation::Url("https://example.com/page".to_string());
+    let rendered = citation.render();
+    // Bare URL only: the TUI auto-linkifies plain https text, so a markdown
+    // `[text](url)` wrapper would double-render.
+    assert!(rendered.contains("https://example.com/page"), "{rendered}");
+    assert!(
+        !rendered.contains("]("),
+        "must not be a markdown link: {rendered}"
+    );
+    assert!(
+        !rendered.contains('['),
+        "must not be a markdown link: {rendered}"
+    );
+}
+
+#[test]
+fn help_answer_source_doc_help_web_label() {
+    assert_eq!(HelpAnswerSource::DocHelpWeb.label(), "doc-help web answer");
+    // Sanity-check the siblings stay stable alongside the new variant.
+    assert_eq!(
+        HelpAnswerSource::LocalCurated.label(),
+        "local curated answer"
+    );
+    assert_eq!(
+        HelpAnswerSource::DocHelpModel.label(),
+        "doc-help model answer"
+    );
+}
+
+#[test]
+fn from_rendered_label_recovers_the_source_from_a_rendered_answer() {
+    // Round-trip: a rendered answer's trailing `*<label>*` line decodes back to
+    // its source, so the TUI can re-derive the source of a model-backed answer
+    // that reached it as a plain assistant message.
+    for source in [
+        HelpAnswerSource::LocalCurated,
+        HelpAnswerSource::DocHelpModel,
+        HelpAnswerSource::DocHelpWeb,
+    ] {
+        let answer = HelpAnswer {
+            topic: "round-trip".to_string(),
+            status: HelpStatus::Answered,
+            body: "Body text.".to_string(),
+            citations: Vec::new(),
+            config_sections: Vec::new(),
+            source,
+        };
+        let rendered = answer.render_markdown();
+        assert_eq!(
+            HelpAnswerSource::from_rendered_label(&rendered),
+            Some(source),
+            "round-trip failed for {source:?}: {rendered}"
+        );
+    }
+    // No known label → no source (an ordinary assistant message is not a help
+    // answer).
+    assert_eq!(
+        HelpAnswerSource::from_rendered_label("Just a normal answer with no label."),
+        None
+    );
+}
+
+#[test]
+fn help_answer_renders_url_citation_in_sources_list() {
+    let answer = HelpAnswer {
+        topic: "web".to_string(),
+        status: HelpStatus::Answered,
+        body: "Web-grounded answer body.".to_string(),
+        citations: vec![HelpCitation::Url("https://example.com/article".to_string())],
+        config_sections: Vec::new(),
+        source: HelpAnswerSource::DocHelpWeb,
+    };
+    let rendered = answer.render_markdown();
+    assert!(rendered.contains("**Sources:**"), "{rendered}");
+    assert!(
+        rendered.contains("https://example.com/article"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("doc-help web answer"), "{rendered}");
+}
+
+#[test]
+fn repo_url_and_slug_stay_consistent() {
+    // SQUEEZY_REPO_SLUG is the single source of truth for the published repo;
+    // the URL must end with it so callers can build raw/api/host strings from
+    // either without them drifting apart on a rename.
+    assert!(
+        super::SQUEEZY_REPO_URL.ends_with(super::SQUEEZY_REPO_SLUG),
+        "SQUEEZY_REPO_URL ({}) must end with SQUEEZY_REPO_SLUG ({})",
+        super::SQUEEZY_REPO_URL,
+        super::SQUEEZY_REPO_SLUG,
     );
 }

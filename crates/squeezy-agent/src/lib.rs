@@ -39,8 +39,8 @@ use squeezy_llm::{
     provider_honors_output_schema,
 };
 use squeezy_skills::{
-    BundledDoc, HelpAnswer, HelpCitation, HelpStatus, SkillActivationKind, SqueezyHelp,
-    matches_squeezy_help_input, relevant_docs_for_input,
+    DocSection, HelpAnswer, HelpCitation, HelpStatus, SkillActivationKind, SqueezyHelp,
+    matches_squeezy_help_input, relevant_doc_sections_for_input,
 };
 use squeezy_store::{
     BugReportBundle, BugReportOptions, HydratedTranscriptItem, ResumeItem, SessionEvent,
@@ -49,12 +49,13 @@ use squeezy_store::{
     SessionStatus, SessionStore, SqueezyStore,
 };
 use squeezy_telemetry::{
-    ConfigChangeReport, ErrorKind, FeedbackClient, FeedbackSubmitResult, McpDiscoveryReport,
-    PreparedFeedback, ProviderErrorKind, ReportUpload,
-    SessionStatusKind as TelemetrySessionStatusKind, SessionTelemetryReport, SkillActivationReport,
-    SlashAliasKind, SlashArgShape, SlashOutcome, SlashSurface, SlashTelemetryReport, StartupRoute,
-    TelemetryClient, TelemetryEvent, ToolCostProperties, ToolStatusKind as TelemetryToolStatusKind,
-    ToolTelemetryReport, WebRequestReport, prepare_feedback,
+    ConfigChangeReport, ErrorKind, FeedbackClient, FeedbackSubmitResult, HelpAnswerRatedReport,
+    HelpAnswerSourceKind, HelpRatingKind, McpDiscoveryReport, PreparedFeedback, ProviderErrorKind,
+    ReportUpload, SessionStatusKind as TelemetrySessionStatusKind, SessionTelemetryReport,
+    SkillActivationReport, SlashAliasKind, SlashArgShape, SlashOutcome, SlashSurface,
+    SlashTelemetryReport, StartupRoute, TelemetryClient, TelemetryEvent, ToolCostProperties,
+    ToolStatusKind as TelemetryToolStatusKind, ToolTelemetryReport, WebRequestReport,
+    prepare_feedback,
 };
 use squeezy_tools::{
     McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
@@ -2931,6 +2932,24 @@ impl Agent {
             .spawn(TelemetryEvent::config_change_committed(report));
     }
 
+    /// Fire anonymous `help_answer_rated` telemetry for a thumbs-up / -down on
+    /// the most recent `/help` answer. `topic` is the curated topic id, `source`
+    /// is how the answer was produced, and `rating` is the direction. No prompt
+    /// or answer text crosses this boundary — see [`HelpAnswerRatedReport`].
+    pub fn record_help_answer_rated_telemetry(
+        &self,
+        topic: &str,
+        source: HelpAnswerSourceKind,
+        rating: HelpRatingKind,
+    ) {
+        self.telemetry
+            .spawn(TelemetryEvent::help_answer_rated(HelpAnswerRatedReport {
+                topic,
+                source,
+                rating,
+            }));
+    }
+
     /// Fire `prompt_template_expanded` telemetry for a template that matched
     /// a user's slash input. `source_token` is the safe token for the template
     /// source (e.g. `"user"` or `"project"`), `arg_count` is the number of
@@ -4843,6 +4862,14 @@ impl Agent {
                 // Cheap pre-check first so unrelated coding turns do not pay for a
                 // full `inspect_redacted()` rendering on every turn.
                 if matches_squeezy_help_input(&task_title) {
+                    // Snapshot a short, redacted hint about the recent session
+                    // (last assistant message / last tool error) so the DocHelp
+                    // subagent can answer "why did that fail?"-style questions
+                    // with awareness. Lock-and-release here so the conversation
+                    // mutex is not held across the help turn. Curated answers
+                    // ignore this field entirely.
+                    let recent_context =
+                        build_recent_help_context(&*conversation_state.lock().await, &redactor);
                     let outcome = resolve_help_turn(
                         &task_title,
                         &HelpResolutionDeps {
@@ -4859,6 +4886,7 @@ impl Agent {
                             subagents: subagents.clone(),
                             hooks: hooks.clone(),
                             tx: tx.clone(),
+                            recent_context,
                         },
                     )
                     .await;
@@ -5213,6 +5241,28 @@ async fn resolve_help_turn(task_title: &str, deps: &HelpResolutionDeps) -> HelpT
     let subagent = run_doc_help_subagent(task_title, deps).await;
 
     if let Some(answer) = subagent.answer {
+        // The local bundled-doc pass produced an answer. If it is the explicit
+        // "Not covered in local docs." sentinel and the web fallback is armed,
+        // try one more pass over docs fetched from the published repo. The
+        // fallback NEVER makes /help worse: on any failure it returns this same
+        // local answer unchanged (and folds in whatever extra spend it made).
+        if answer
+            .body
+            .trim()
+            .starts_with(DOC_HELP_NOT_COVERED_SENTINEL)
+            && run_doc_help_web_fallback_enabled(&deps.config)
+        {
+            return run_doc_help_web_fallback(
+                task_title,
+                deps,
+                HelpTurnOutcome {
+                    answer,
+                    metrics: subagent.metrics,
+                    cost: subagent.cost,
+                },
+            )
+            .await;
+        }
         return HelpTurnOutcome {
             answer,
             metrics: subagent.metrics,
@@ -5227,6 +5277,195 @@ async fn resolve_help_turn(task_title: &str, deps: &HelpResolutionDeps) -> HelpT
         metrics: subagent.metrics,
         cost: subagent.cost,
     }
+}
+
+/// The DocHelp web fallback. Triggered only after the local bundled-doc DocHelp
+/// pass returned the "Not covered in local docs." sentinel AND the gate
+/// ([`run_doc_help_web_fallback_enabled`]) is open.
+///
+/// `local_outcome` is the original local answer with its already-accrued
+/// metrics/cost. On ANY failure path (no doc chosen, every fetch empty/errored,
+/// the second pass empty or itself the sentinel) this returns `local_outcome`
+/// with whatever extra webfetch/subagent spend was incurred folded in — the
+/// fallback must never degrade /help.
+async fn run_doc_help_web_fallback(
+    task_title: &str,
+    deps: &HelpResolutionDeps,
+    mut local_outcome: HelpTurnOutcome,
+) -> HelpTurnOutcome {
+    // The bundled docs did not cover this question, so SEARCH the published
+    // repository (source code, docs, and issues) for an answer rather than
+    // re-fetching the same bundled docs we already missed on. Run a web search
+    // biased toward the repo, then keep only results that actually live in the
+    // Squeezy repo — the model never supplies a URL, so the fetch host is
+    // structurally allowlisted to the repo via the centralized slug.
+    let search_call = ToolCall {
+        call_id: "doc-help-web-search".to_string(),
+        name: "websearch".to_string(),
+        arguments: json!({ "query": squeezy_repo_search_query(task_title), "num_results": 6 }),
+    };
+    let search = deps.tools.execute(search_call, deps.cancel.clone()).await;
+    // `execute` is the RAW executor: a missing search backend / offline / error
+    // comes back as a ToolResult with status != Success, never a panic. Fold the
+    // spend and degrade to the local answer when search is unavailable.
+    fold_tool_result_into_metrics(&mut local_outcome.metrics, &search);
+    if search.status != ToolStatus::Success {
+        return local_outcome;
+    }
+    let mut seen_urls = std::collections::HashSet::new();
+    let chosen_urls: Vec<String> = search
+        .content
+        .get("source_urls")
+        .and_then(Value::as_array)
+        .map(|urls| {
+            urls.iter()
+                .filter_map(Value::as_str)
+                .filter(|url| is_squeezy_repo_url(url))
+                .filter(|url| seen_urls.insert(url.to_string()))
+                .take(2)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if chosen_urls.is_empty() {
+        // No result inside the repo we trust: degrade to the local answer.
+        return local_outcome;
+    }
+
+    // Fetch the chosen repo pages and assemble the corpus for the second pass.
+    let mut fetched_markdown = String::new();
+    let mut source_urls: Vec<String> = Vec::new();
+    for url in &chosen_urls {
+        let call = ToolCall {
+            call_id: format!("doc-help-web-fetch-{}", source_urls.len() + 1),
+            name: "webfetch".to_string(),
+            arguments: json!({ "url": url, "format": "text" }),
+        };
+        let result = deps.tools.execute(call, deps.cancel.clone()).await;
+        fold_tool_result_into_metrics(&mut local_outcome.metrics, &result);
+        if result.status != ToolStatus::Success {
+            continue;
+        }
+        let content = result
+            .content
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if content.trim().is_empty() {
+            continue;
+        }
+        if !fetched_markdown.is_empty() {
+            fetched_markdown.push_str("\n\n");
+        }
+        fetched_markdown.push_str("---\nSOURCE: ");
+        fetched_markdown.push_str(url);
+        fetched_markdown.push_str("\n\n");
+        fetched_markdown.push_str(content.trim());
+        source_urls.push(url.clone());
+    }
+
+    // Nothing usable fetched: degrade gracefully to the original local answer.
+    if source_urls.is_empty() {
+        return local_outcome;
+    }
+
+    let primary_source = source_urls[0].clone();
+    let prompt = doc_help_web_subagent_prompt(
+        task_title,
+        &fetched_markdown,
+        &primary_source,
+        deps.recent_context.as_deref().unwrap_or(""),
+    );
+    let request = SubagentRequest {
+        prompt,
+        scope: Some(format!(
+            "External docs fetched from the published repository: {}",
+            source_urls.join(", ")
+        )),
+        thoroughness: None,
+        system_override: None,
+    };
+
+    // Toolless second pass — same ToolExecutionContext construction as
+    // run_doc_help_subagent.
+    let mut all_tool_specs = core_control_tools(
+        &deps.config.subagents,
+        load_session_mode(&deps.session_mode),
+    );
+    all_tool_specs.extend(deps.tools.specs().iter().cloned().map(advertised_tool));
+    retain_non_excluded_tools(&mut all_tool_specs, &deps.config.tools);
+    let jobs = JobRegistry::new();
+    let parent = ToolExecutionContext {
+        turn_id: TurnId::new(0),
+        origin: ToolOrigin::Subagent,
+        provider: deps.provider.clone(),
+        tools: &deps.tools,
+        jobs: &jobs,
+        config: &deps.config,
+        telemetry: deps.telemetry.clone(),
+        redactor: deps.redactor.clone(),
+        tx: deps.tx.clone(),
+        cancel: deps.cancel.clone(),
+        approval_ids: deps.approval_ids.clone(),
+        session_rules: deps.session_rules.clone(),
+        ai_reviewer_state: deps.ai_reviewer_state.clone(),
+        session_mode: deps.session_mode.clone(),
+        session_log: None,
+        conversation_state: None,
+        task_state: Arc::new(Mutex::new(None)),
+        all_tool_specs: &all_tool_specs,
+        loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
+        exploration_state: Arc::new(Mutex::new(ExplorationTurnState::from_plan(None))),
+        subagents: deps.subagents.clone(),
+        store: None,
+        hooks: deps.hooks.clone(),
+    };
+    let execution = run_subagent(&parent, SubagentKind::DocHelp, request, None).await;
+
+    // Fold the second-pass subagent spend regardless of outcome.
+    local_outcome
+        .metrics
+        .merge_subagent_tool_metrics(&execution.metrics);
+    local_outcome.metrics.subagent_calls += 1;
+    if execution.status != ToolStatus::Success {
+        local_outcome.metrics.subagent_failures += 1;
+    }
+    merge_cost(&mut local_outcome.cost, &execution.metrics.provider);
+
+    // If the second pass is empty or itself the sentinel, keep the original
+    // local answer (now carrying the extra spend).
+    let body = execution.summary.trim();
+    if execution.status != ToolStatus::Success
+        || body.is_empty()
+        || body.starts_with(DOC_HELP_NOT_COVERED_SENTINEL)
+    {
+        return local_outcome;
+    }
+
+    let answer = HelpAnswer {
+        topic: "doc-help-web".to_string(),
+        status: HelpStatus::Answered,
+        body: execution.summary,
+        citations: vec![HelpCitation::Url(primary_source)],
+        config_sections: Vec::new(),
+        source: squeezy_skills::HelpAnswerSource::DocHelpWeb,
+    };
+    HelpTurnOutcome {
+        answer,
+        metrics: local_outcome.metrics,
+        cost: local_outcome.cost,
+    }
+}
+
+/// Fold a single (webfetch) tool result's counters into `metrics` as
+/// subagent-attributed I/O, mirroring how the DocHelp subagent's own tool
+/// metrics are rolled up. The web fallback's webfetch is dispatched directly
+/// (not inside a subagent loop), so it would otherwise be unaccounted.
+fn fold_tool_result_into_metrics(metrics: &mut TurnMetrics, result: &ToolResult) {
+    metrics.subagent_tool_calls += 1;
+    metrics.subagent_bytes_read += result.cost_hint.bytes_read;
+    metrics.subagent_files_scanned += result.cost_hint.files_scanned;
+    metrics.subagent_model_output_bytes += result.cost_hint.output_bytes;
 }
 
 struct DocHelpResolution {
@@ -5259,6 +5498,78 @@ struct HelpResolutionDeps {
     subagents: SubagentRegistry,
     hooks: Option<Arc<HookRegistry>>,
     tx: mpsc::Sender<AgentEvent>,
+    /// Short, already-redacted snapshot of the recent session (most recent
+    /// assistant message and/or most recent tool failure). Only the DocHelp
+    /// subagent path consumes this; curated-topic answers never see it.
+    /// `None` on a fresh session (no prior turns) or when nothing relevant
+    /// was found. Built by [`build_recent_help_context`] at the call site so
+    /// the conversation lock is released before the help turn runs.
+    recent_context: Option<String>,
+}
+
+/// Maximum length of the redacted recent-session context appended to the
+/// DocHelp prompt. Kept small so it never crowds out the bundled docs and so
+/// it stays a hint rather than a transcript replay.
+const RECENT_HELP_CONTEXT_MAX_CHARS: usize = 700;
+
+/// Build a short, redacted snapshot of the recent conversation for the
+/// DocHelp subagent: the most recent assistant message and, if present, the
+/// most recent tool failure. Returns `None` when neither is available (fresh
+/// session) so callers can skip the prompt section entirely.
+///
+/// The result is redacted via `redactor` and capped at
+/// [`RECENT_HELP_CONTEXT_MAX_CHARS`] so secrets never leak into the subagent
+/// prompt and the hint stays bounded.
+fn build_recent_help_context(state: &ConversationState, redactor: &Redactor) -> Option<String> {
+    // Most recent assistant message (skip empties from cancelled/reasoning-only
+    // turns).
+    let last_assistant = state.conversation.iter().rev().find_map(|item| match item {
+        LlmInputItem::AssistantText(text) if !text.trim().is_empty() => Some(text.as_str()),
+        _ => None,
+    });
+    // Most recent tool failure, if any.
+    let last_tool_error = state.conversation.iter().rev().find_map(|item| match item {
+        LlmInputItem::FunctionCallOutput {
+            output, is_error, ..
+        } if *is_error && !output.trim().is_empty() => Some(output.as_str()),
+        _ => None,
+    });
+
+    if last_assistant.is_none() && last_tool_error.is_none() {
+        return None;
+    }
+
+    let mut section = String::new();
+    if let Some(text) = last_assistant {
+        section.push_str("Last assistant message: ");
+        section.push_str(text.trim());
+        section.push('\n');
+    }
+    if let Some(error) = last_tool_error {
+        section.push_str("Most recent tool error: ");
+        section.push_str(error.trim());
+        section.push('\n');
+    }
+
+    let redacted = redactor.redact(section.trim()).text;
+    let trimmed = redacted.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Cap on char boundaries so the redacted hint stays bounded without
+    // splitting a multi-byte char.
+    let capped = if trimmed.chars().count() > RECENT_HELP_CONTEXT_MAX_CHARS {
+        let mut out: String = trimmed
+            .chars()
+            .take(RECENT_HELP_CONTEXT_MAX_CHARS)
+            .collect();
+        out.push('…');
+        out
+    } else {
+        trimmed.to_string()
+    };
+    Some(capped)
 }
 
 /// Scan `body` for inline `docs/external/<name>.md` path citations that the
@@ -5291,8 +5602,13 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
         return DocHelpResolution::skipped();
     }
     let config_inspect = deps.config.inspect_redacted();
-    let relevant = relevant_docs_for_input(task_title);
-    let prompt = doc_help_subagent_prompt(task_title, &config_inspect, &relevant);
+    let sections = relevant_doc_sections_for_input(task_title);
+    let prompt = doc_help_subagent_prompt(
+        task_title,
+        &config_inspect,
+        &sections,
+        deps.recent_context.as_deref(),
+    );
     let request = SubagentRequest {
         prompt,
         scope: Some(
@@ -5369,32 +5685,120 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
     }
 }
 
-fn doc_help_subagent_prompt(task_title: &str, config_inspect: &str, docs: &[BundledDoc]) -> String {
-    // Inlining the bundled docs is what makes this subagent actually work at
-    // runtime: end users run Squeezy outside the source tree, so docs/external
-    // does not exist on disk for filesystem tools to find. The doc corpus is
-    // ~120KB total; that is acceptable for a help turn the user explicitly
-    // invoked.
-    let mut prompt = String::with_capacity(config_inspect.len() + 4096 + docs_total_len(docs));
+fn doc_help_subagent_prompt(
+    task_title: &str,
+    config_inspect: &str,
+    sections: &[DocSection],
+    recent_context: Option<&str>,
+) -> String {
+    // Inlining the bundled doc sections is what makes this subagent actually
+    // work at runtime: end users run Squeezy outside the source tree, so
+    // docs/external does not exist on disk for filesystem tools to find. We
+    // inline only the most on-topic markdown sections (not whole docs) so the
+    // model gets tight, relevant context for the help turn the user invoked.
+    let mut prompt =
+        String::with_capacity(config_inspect.len() + 4096 + sections_total_len(sections));
     prompt.push_str("User help request:\n");
     prompt.push_str(task_title.trim());
+    // Recent session context (already redacted by the caller) goes between the
+    // request and the heavy config/doc dump so the model reads it as a hint
+    // about *this* session before the static corpus. Clearly delimited and
+    // explicitly marked as possibly-irrelevant so the model only leans on it
+    // when it actually answers the question.
+    if let Some(context) = recent_context.map(str::trim).filter(|c| !c.is_empty()) {
+        prompt
+            .push_str("\n\nRecent session context (may or may not be relevant to the question):\n");
+        prompt.push_str(context);
+        prompt.push('\n');
+    }
     prompt.push_str("\n\nRedacted config inspect:\n```toml\n");
     prompt.push_str(config_inspect.trim());
-    prompt.push_str("\n```\n\nBundled docs corpus (each section is the full content of one bundled doc; cite by the listed path):\n");
-    for doc in docs {
-        prompt.push_str("\n---\nPATH: ");
-        prompt.push_str(doc.path);
-        prompt.push_str("\n\n");
-        prompt.push_str(doc.content.trim_end());
+    prompt.push_str("\n```\n\nRelevant bundled doc sections (each block is one markdown section; cite by the listed PATH):\n");
+    for section in sections {
+        prompt.push_str("\n--- PATH: ");
+        prompt.push_str(section.path);
+        if !section.heading.is_empty() {
+            prompt.push_str(" — ");
+            prompt.push_str(section.heading);
+        }
+        prompt.push('\n');
+        prompt.push_str(section.content.trim_end());
         prompt.push('\n');
     }
     prompt
 }
 
-fn docs_total_len(docs: &[BundledDoc]) -> usize {
-    docs.iter()
-        .map(|doc| doc.content.len() + doc.path.len() + 16)
+fn sections_total_len(sections: &[DocSection]) -> usize {
+    sections
+        .iter()
+        .map(|section| section.content.len() + section.path.len() + section.heading.len() + 24)
         .sum()
+}
+
+/// Sentinel the DocHelp subagent emits when neither the local bundled corpus
+/// nor (in the web pass) the fetched docs cover the question. Trimmed equality
+/// against this string is what arms the web-fallback escalation.
+const DOC_HELP_NOT_COVERED_SENTINEL: &str = "Not covered in local docs.";
+
+/// Web-search query for the fallback: the user's question biased toward the
+/// published Squeezy repository so the search targets the project's own source,
+/// docs, and issues rather than the whole web. Results are host-filtered to the
+/// repo afterward ([`is_squeezy_repo_url`]); this only steers the search.
+fn squeezy_repo_search_query(task_title: &str) -> String {
+    format!("{} {}", task_title.trim(), squeezy_skills::SQUEEZY_REPO_URL)
+}
+
+/// True when `url` points inside the published Squeezy repository — the only
+/// host the web fallback will fetch from. Recognizes the github.com repo URL and
+/// its raw.githubusercontent.com form, both built from the centralized
+/// [`squeezy_skills::SQUEEZY_REPO_SLUG`] so a repo rename is a one-line change.
+fn is_squeezy_repo_url(url: &str) -> bool {
+    let slug = squeezy_skills::SQUEEZY_REPO_SLUG;
+    url == squeezy_skills::SQUEEZY_REPO_URL
+        || url.starts_with(&format!("https://github.com/{slug}/"))
+        || url.starts_with(&format!("https://raw.githubusercontent.com/{slug}/"))
+}
+
+/// Build the second-pass DocHelp prompt over docs fetched from the web. Unlike
+/// [`doc_help_subagent_prompt`], the corpus here is the fetched markdown
+/// (labeled with its source URL), and the instruction tells the model to answer
+/// ONLY from these fetched docs, cite the source URL, and still emit the
+/// "Not covered in local docs." sentinel if even these docs do not cover it.
+fn doc_help_web_subagent_prompt(
+    task_title: &str,
+    fetched_markdown: &str,
+    source_url: &str,
+    recent_context: &str,
+) -> String {
+    let mut prompt = String::with_capacity(
+        fetched_markdown.len() + recent_context.len() + source_url.len() + 1024,
+    );
+    prompt.push_str("User help request:\n");
+    prompt.push_str(task_title.trim());
+    let recent = recent_context.trim();
+    if !recent.is_empty() {
+        prompt.push_str("\n\nRecent conversation context (for disambiguation only):\n");
+        prompt.push_str(recent);
+    }
+    prompt.push_str("\n\nThe local bundled documentation did not cover this question, so the following content was fetched from the LATEST state of the project's published repository (source code, docs, and issues) — it may be newer than the installed version. Answer the request using ONLY the fetched content below, and note when behavior may differ by version. Cite the source URL in your answer. If even this content does not cover the question, reply with exactly: ");
+    prompt.push_str(DOC_HELP_NOT_COVERED_SENTINEL);
+    prompt.push_str("\n\nFetched repository content (source: ");
+    prompt.push_str(source_url);
+    prompt.push_str("):\n\n");
+    prompt.push_str(fetched_markdown.trim());
+    prompt.push('\n');
+    prompt
+}
+
+/// Pure gating predicate for the DocHelp web fallback. Off by default: every
+/// condition must hold or the fallback is skipped and the original local answer
+/// is returned unchanged. Factored out so the gate is unit-testable without a
+/// live network.
+fn run_doc_help_web_fallback_enabled(config: &AppConfig) -> bool {
+    config.subagents.enabled
+        && config.subagents.help_web_fallback
+        && !config.subagents.help_strict_local
+        && config.permissions.web != squeezy_core::PermissionMode::Deny
 }
 
 async fn complete_squeezy_help_turn(
@@ -13102,7 +13506,7 @@ fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> Strin
             format!("{base}\n\nThoroughness: {thoroughness}.")
         }
         SubagentKind::DocHelp => {
-            "You are Squeezy's doc-help subagent. Answer the user's Squeezy help question using ONLY the inlined bundled doc corpus and config snapshot in the user prompt. No tools available; the corpus is already in context.\n\nOutput valid GitHub-flavored Markdown. The answer is rendered directly in a terminal, so malformed Markdown shows raw symbols to the user:\n- Put a blank line between every block (heading, paragraph, list, code block).\n- Fenced code blocks must sit on their own lines: a line that is exactly ```lang (e.g. ```bash, ```toml), then the code, then a closing ``` alone on its line. Never open a fence mid-sentence and never leave one unclosed.\n- Use `inline code` (single backticks) for commands, flags, file names, and config keys; use **bold** only for key terms.\n- Use `-` bullets for steps, one item per line.\n\nFormat rules:\n- Answer in 100–200 words maximum (concise by default; a follow-up question can get more detail).\n- Use bullet points for step-by-step procedures.\n- Do not dump config TOML unless the question is specifically about configuration values.\n- Cite bundled doc paths inline using the PATH labels (e.g. `docs/external/PROVIDERS.md`).\n- If the inlined corpus does not cover the question, say exactly: \"Not covered in local docs.\" then point to https://squeezyagent.com/docs/ and suggest a related `/help <topic>` if one exists.\n- Do not mention internal agent mechanics, do not invent file paths, do not ask follow-up questions.".to_string()
+            "You are Squeezy's doc-help subagent. Answer the user's Squeezy help question using ONLY the inlined bundled doc corpus and config snapshot in the user prompt. No tools available; the corpus is already in context.\n\nOutput valid GitHub-flavored Markdown. The answer is rendered directly in a terminal, so malformed Markdown shows raw symbols to the user:\n- Put a blank line between every block (heading, paragraph, list, code block).\n- Fenced code blocks must sit on their own lines: a line that is exactly ```lang (e.g. ```bash, ```toml), then the code, then a closing ``` alone on its line. Never open a fence mid-sentence and never leave one unclosed.\n- Use `inline code` (single backticks) for commands, flags, file names, and config keys; use **bold** only for key terms.\n- Use `-` bullets for steps, one item per line.\n\nFormat rules:\n- Answer in 100–200 words maximum (concise by default; a follow-up question can get more detail).\n- Use bullet points for step-by-step procedures.\n- Do not dump config TOML unless the question is specifically about configuration values.\n- Cite bundled doc paths inline using the PATH labels (e.g. `docs/external/PROVIDERS.md`).\n- If a \"Recent session context\" section is present, use it only when it is clearly relevant to the question (e.g. interpreting \"why did that fail?\"); otherwise ignore it entirely and answer from the docs.\n- If the inlined corpus does not cover the question, say exactly: \"Not covered in local docs.\" then point to https://squeezyagent.com/docs/ and suggest a related `/help <topic>` if one exists.\n- Do not mention internal agent mechanics, do not invent file paths, do not ask follow-up questions.".to_string()
         }
         SubagentKind::Plan => {
             let base = role_config(SubagentRole::Planner).instructions;
@@ -13142,11 +13546,26 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
             .clone()
             .map(|model| resolve_model_alias_owned(provider, model))
             .unwrap_or_else(|| cheap_model_for(provider, config).unwrap_or(parent_model.clone())),
-        // Use the cheap tier when one is known; fall back to the parent model so
-        // DocHelp still works in test configs that have no provider configured.
-        (SubagentKind::DocHelp, _) => cheap_model_for(provider, config)
-            .filter(|m| !m.is_empty())
-            .unwrap_or(parent_model),
+        // `/help` is user-facing, so DocHelp defaults to the session's
+        // configured main/parent model for parent-grade answers. The
+        // `subagents.doc_help_model` knob overrides this: `"cheap"` drops to
+        // the provider's small-fast tier (falling back to parent when none is
+        // known), an explicit id resolves through the alias table, and
+        // `None`/`"auto"` keep the parent model.
+        (SubagentKind::DocHelp, _) => match config
+            .subagents
+            .doc_help_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) if value.eq_ignore_ascii_case("cheap") => cheap_model_for(provider, config)
+                .filter(|m| !m.is_empty())
+                .unwrap_or(parent_model),
+            Some(value) if value.eq_ignore_ascii_case("auto") => parent_model,
+            Some(explicit) => resolve_model_alias_owned(provider, explicit.to_string()),
+            None => parent_model,
+        },
         // Skill subagents run the skill author's own instructions on
         // the parent model so the body's expectations about capability
         // hold — falling to a cheap tier here would change behavior

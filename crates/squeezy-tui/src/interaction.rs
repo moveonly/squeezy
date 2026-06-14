@@ -346,6 +346,13 @@ pub(crate) enum ChromeKey {
     /// [`crate::PLAN_CHOICES`]. A click selects + activates that choice (the mouse
     /// twin of its `[e]`/`[c]`/`[r]`/`[d]` key).
     PlanChoiceOption(usize),
+    /// An actionable `squeezy:cmd:` command-link span inside a rendered assistant
+    /// or help answer (ITEM 3), keyed by its painted `(column, row)` cell so two
+    /// links to the same command (or the same command on adjacent rows) stay
+    /// distinct targets. Recomputed from the live painted window each frame, so a
+    /// scroll/resize re-registers it at a fresh cell — the key is never a
+    /// remembered coordinate across frames.
+    CommandLink(u16, u16),
 }
 
 /// What a click on a registered target does. This unifies the two action
@@ -732,6 +739,16 @@ pub(crate) enum Action {
     /// the event loop drains it where the agent is in scope — the mouse twin of the
     /// choice's key.
     PlanChoiceActivate(usize),
+    /// Prefill the composer with the slash command at this 0-based index into
+    /// [`crate::input::SLASH_COMMANDS`] (ITEM 3 actionable help links). Fed by a
+    /// click on a `squeezy:cmd:` command-link span inside a rendered assistant/help
+    /// answer; routes through the same `handle_command_hyperlink` the OSC 8
+    /// scrollback-mirror link would, which prefills (never auto-runs) the command.
+    /// Carried as an index (not a `String`) so [`Action`] stays `Copy`; the
+    /// dispatch arm resolves it back to the command name. The keyboard twin is
+    /// simply typing the command in the composer — the click is a discoverability
+    /// shortcut, not a unique capability.
+    PrefillCommand(usize),
 }
 
 impl Action {
@@ -829,6 +846,7 @@ impl Action {
         Action::RequestUserInputActivate(0),
         Action::McpElicitationActivate(0),
         Action::PlanChoiceActivate(0),
+        Action::PrefillCommand(0),
     ];
 }
 

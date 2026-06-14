@@ -51561,3 +51561,299 @@ fn turn_primary_model_picks_the_dominant_main_bucket() {
         "a turn with no per-model cost names no model",
     );
 }
+
+#[test]
+fn rate_last_help_answer_is_noop_when_no_help_answer_tracked() {
+    // No help answer recorded → the rating chord must be a no-op so it can fall
+    // through to its normal key meaning (e.g. Ctrl+B emacs cursor-left).
+    let mut slot: Option<(String, HelpAnswerSource)> = None;
+    assert!(rate_last_help_answer(&mut slot, HelpRatingKind::Up).is_none());
+    assert!(rate_last_help_answer(&mut slot, HelpRatingKind::Down).is_none());
+    assert!(slot.is_none());
+}
+
+#[test]
+fn rate_last_help_answer_reports_anonymous_dimensions_and_consumes_slot() {
+    let mut slot = Some(("providers".to_string(), HelpAnswerSource::LocalCurated));
+
+    let outcome = rate_last_help_answer(&mut slot, HelpRatingKind::Down)
+        .expect("a tracked help answer is rateable");
+    assert_eq!(outcome.topic, "providers");
+    assert_eq!(outcome.source, HelpAnswerSourceKind::LocalCurated);
+    assert_eq!(outcome.rating, HelpRatingKind::Down);
+    assert!(outcome.confirmation.contains("providers"));
+    // The slot is consumed so the same answer cannot be double-rated.
+    assert!(slot.is_none());
+    assert!(rate_last_help_answer(&mut slot, HelpRatingKind::Up).is_none());
+}
+
+#[test]
+fn rate_last_help_answer_maps_doc_help_model_source() {
+    let mut slot = Some(("tui".to_string(), HelpAnswerSource::DocHelpModel));
+    let outcome =
+        rate_last_help_answer(&mut slot, HelpRatingKind::Up).expect("rateable answer present");
+    assert_eq!(outcome.source, HelpAnswerSourceKind::DocHelpModel);
+    assert_eq!(outcome.rating, HelpRatingKind::Up);
+}
+
+#[test]
+fn rate_last_help_answer_maps_doc_help_web_source() {
+    // A web-fallback answer is a model-generated doc-help answer for rating
+    // telemetry; the telemetry enum has no separate web kind, so it folds into
+    // `DocHelpModel`.
+    let mut slot = Some(("doc-help".to_string(), HelpAnswerSource::DocHelpWeb));
+    let outcome =
+        rate_last_help_answer(&mut slot, HelpRatingKind::Down).expect("rateable answer present");
+    assert_eq!(outcome.source, HelpAnswerSourceKind::DocHelpModel);
+    assert_eq!(outcome.rating, HelpRatingKind::Down);
+    assert!(slot.is_none(), "the slot is consumed on rate");
+}
+
+// ---------------------------------------------------------------------------
+// Model-backed help answers (ITEM 5): an assistant `Completed` message whose
+// rendered body carries a doc-help source label becomes rateable too.
+// ---------------------------------------------------------------------------
+
+/// Mirror of `squeezy_skills::HelpAnswer::render_markdown`'s trailing label for a
+/// given source, so the test feeds the SAME shape the agent's help turn emits.
+fn rendered_help_body(body: &str, source: HelpAnswerSource) -> String {
+    format!("{body}\n\n*{}*", source.label())
+}
+
+#[test]
+fn doc_help_model_answer_becomes_rateable() {
+    let mut app = test_app(SessionMode::Build);
+    assert!(app.last_help_answer.is_none());
+
+    let content = rendered_help_body(
+        "Here is how routing works in squeezy.",
+        HelpAnswerSource::DocHelpModel,
+    );
+    let tracked = note_help_answer_from_assistant(&mut app, &content);
+    assert!(tracked, "a doc-help model answer is tracked for rating");
+
+    // It is now rateable, and the anonymous source maps to the doc-help kind.
+    let outcome = rate_last_help_answer(&mut app.last_help_answer, HelpRatingKind::Up)
+        .expect("the recorded model answer is rateable");
+    assert_eq!(outcome.source, HelpAnswerSourceKind::DocHelpModel);
+    assert_eq!(outcome.topic, "doc-help");
+    assert!(app.last_help_answer.is_none(), "rating consumes the slot");
+}
+
+#[test]
+fn doc_help_web_answer_becomes_rateable() {
+    let mut app = test_app(SessionMode::Build);
+
+    let content = rendered_help_body(
+        "Grounded on a live web lookup.",
+        HelpAnswerSource::DocHelpWeb,
+    );
+    let tracked = note_help_answer_from_assistant(&mut app, &content);
+    assert!(tracked, "a doc-help web answer is tracked for rating");
+    assert_eq!(
+        app.last_help_answer,
+        Some(("doc-help".to_string(), HelpAnswerSource::DocHelpWeb))
+    );
+
+    // The web source still rates as the doc-help kind (the telemetry enum has no
+    // separate web kind), keeping the anonymous contract intact.
+    let outcome = rate_last_help_answer(&mut app.last_help_answer, HelpRatingKind::Down)
+        .expect("the recorded web answer is rateable");
+    assert_eq!(outcome.source, HelpAnswerSourceKind::DocHelpModel);
+}
+
+#[test]
+fn ordinary_assistant_message_is_not_tracked_as_a_help_answer() {
+    let mut app = test_app(SessionMode::Build);
+    // A normal answer with no doc-help source label must not arm the rating slot,
+    // so Ctrl+G / Ctrl+B keep their normal key meaning after a regular turn.
+    let tracked = note_help_answer_from_assistant(&mut app, "Just a normal model answer.");
+    assert!(!tracked);
+    assert!(app.last_help_answer.is_none());
+}
+
+#[test]
+fn curated_label_on_assistant_message_is_not_tracked_here() {
+    let mut app = test_app(SessionMode::Build);
+    // Curated answers never traverse the assistant `Completed` path (they are a
+    // system item from `handle_help_command`); a model turn that merely echoed the
+    // curated label must not be mis-tracked as a curated answer at this seam.
+    let content = rendered_help_body("Echoing a label.", HelpAnswerSource::LocalCurated);
+    let tracked = note_help_answer_from_assistant(&mut app, &content);
+    assert!(!tracked);
+    assert!(app.last_help_answer.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Actionable help answers (ITEM 3): squeezy:cmd: hyperlink → composer prefill
+// ---------------------------------------------------------------------------
+
+#[test]
+fn command_hyperlink_prefills_the_composer_without_executing() {
+    let mut app = test_app(SessionMode::Build);
+    assert!(app.input.is_empty());
+
+    let handled = handle_command_hyperlink(&mut app, "squeezy:cmd:/theme");
+    assert!(handled, "an internal command URI is handled in-app");
+    // Prefilled, NOT executed: the command sits in the composer with the cursor
+    // at the end, awaiting an explicit Enter.
+    assert_eq!(app.input, "/theme");
+    assert_eq!(app.input_cursor, "/theme".len());
+}
+
+#[test]
+fn command_hyperlink_ignores_foreign_schemes() {
+    let mut app = test_app(SessionMode::Build);
+    let handled = handle_command_hyperlink(&mut app, "https://example.com/theme");
+    assert!(
+        !handled,
+        "a web URL is not ours; the caller keeps routing it as a normal link"
+    );
+    assert!(app.input.is_empty(), "the composer is untouched");
+}
+
+#[test]
+fn command_hyperlink_protects_an_in_progress_draft() {
+    let mut app = test_app(SessionMode::Build);
+    app.input = "an important half-typed prompt".to_string();
+    app.input_cursor = app.input.len();
+
+    let handled = handle_command_hyperlink(&mut app, "squeezy:cmd:/theme");
+    assert!(handled, "the URI is recognised (and consumed)");
+    // The non-command draft is preserved; nothing was overwritten.
+    assert_eq!(app.input, "an important half-typed prompt");
+}
+
+#[test]
+fn command_hyperlink_replaces_a_slash_command_draft() {
+    let mut app = test_app(SessionMode::Build);
+    // A composer that already holds a slash-command line is a fresh command line
+    // the user is mid-choosing; swapping in the clicked command is safe.
+    app.input = "/he".to_string();
+    app.input_cursor = app.input.len();
+
+    let handled = handle_command_hyperlink(&mut app, "squeezy:cmd:/help");
+    assert!(handled);
+    assert_eq!(app.input, "/help");
+}
+
+#[test]
+fn slash_command_index_round_trips_with_lookup() {
+    // The actionable-help click path carries the SLASH_COMMANDS index (so the
+    // Action stays Copy); the index must resolve back to the same command name.
+    for (i, command) in input::SLASH_COMMANDS.iter().enumerate() {
+        assert_eq!(input::slash_command_index(command.name), Some(i));
+        assert_eq!(input::SLASH_COMMANDS[i].name, command.name);
+    }
+    assert_eq!(
+        input::slash_command_index("/definitely-not-a-command"),
+        None
+    );
+}
+
+#[test]
+fn prefill_command_action_routes_to_the_composer_prefill() {
+    // A click on a command-link span dispatches PrefillCommand(index); it must
+    // resolve the index to the command and prefill the composer (not run it),
+    // sharing the exact handle_command_hyperlink path the URI would.
+    let mut app = test_app(SessionMode::Build);
+    let theme_index = input::slash_command_index("/theme").expect("/theme is registered");
+
+    dispatch_click_action(&mut app, interaction::Action::PrefillCommand(theme_index));
+    assert_eq!(app.input, "/theme");
+    assert_eq!(app.input_cursor, "/theme".len());
+}
+
+#[test]
+fn prefill_command_action_with_a_stale_index_is_a_noop() {
+    // A registry rebuilt-at-draw stale index (out of range) must resolve to a
+    // no-op rather than panic or prefill a wrong command.
+    let mut app = test_app(SessionMode::Build);
+    let out_of_range = input::SLASH_COMMANDS.len() + 10;
+    dispatch_click_action(&mut app, interaction::Action::PrefillCommand(out_of_range));
+    assert!(
+        app.input.is_empty(),
+        "an out-of-range index prefills nothing"
+    );
+}
+
+#[test]
+fn prefill_command_action_has_a_keyboard_twin() {
+    // §12.10.5 accessibility audit: the new mouse affordance must resolve to a
+    // keyboard path so the keyboard-reachability gate stays green.
+    assert!(
+        crate::accessibility::keyboard_equivalent(interaction::Action::PrefillCommand(0)).is_some(),
+        "PrefillCommand must have a keyboard equivalent"
+    );
+}
+
+#[test]
+fn register_command_link_targets_registers_a_clickable_span_in_soft_wrap() {
+    // Build a painted line with a `/theme` code span and register command-link
+    // targets over the visible window; a hit-test at the span's first cell must
+    // resolve to PrefillCommand(/theme).
+    let app = test_app(SessionMode::Build);
+    let theme_index = input::slash_command_index("/theme").expect("/theme is registered");
+    let lines = vec![Line::from(vec![
+        Span::raw("Try "), // 4 cells: columns 0..4
+        Span::styled("/theme", Style::default()),
+        Span::raw(" to switch."),
+    ])];
+    let text_area = Rect {
+        x: 2,
+        y: 3,
+        width: 40,
+        height: 5,
+    };
+    app.begin_frame_clickables();
+    register_command_link_targets(&app, text_area, &lines, 0, 5, true);
+
+    // The `/theme` span starts at column 4 within the line → screen x = 2 + 4 = 6,
+    // screen y = text_area.y + (row 0 - top 0) = 3.
+    let hit = app
+        .click_target_at(6, 3)
+        .expect("the command span is clickable");
+    assert_eq!(hit.1, interaction::Action::PrefillCommand(theme_index));
+    assert!(
+        matches!(
+            hit.0,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::CommandLink(6, 3))
+        ),
+        "keyed by painted (column, row): {:?}",
+        hit.0
+    );
+    // A cell on the prose before the span is not a command-link target.
+    assert!(app.click_target_at(2, 3).is_none());
+}
+
+#[test]
+fn register_command_link_targets_skips_rows_outside_the_window_and_no_wrap() {
+    let app = test_app(SessionMode::Build);
+    let lines = vec![
+        Line::from(vec![Span::styled("/theme", Style::default())]),
+        Line::from(vec![Span::styled("/router", Style::default())]),
+    ];
+    let text_area = Rect {
+        x: 0,
+        y: 0,
+        width: 40,
+        height: 1,
+    };
+    // Window shows only row 0 (top=0, viewport_h=1): row 1 must not register.
+    app.begin_frame_clickables();
+    register_command_link_targets(&app, text_area, &lines, 0, 1, true);
+    assert!(app.click_target_at(0, 0).is_some(), "visible row registers");
+    assert!(
+        app.click_target_at(0, 1).is_none(),
+        "off-window row does not register"
+    );
+
+    // No-wrap mode is skipped entirely (per-span cell math is unreliable under a
+    // horizontal pan), so the command stays reachable only by typing it.
+    app.begin_frame_clickables();
+    register_command_link_targets(&app, text_area, &lines, 0, 2, false);
+    assert!(
+        app.click_target_at(0, 0).is_none(),
+        "no-wrap mode registers no command-link targets"
+    );
+}

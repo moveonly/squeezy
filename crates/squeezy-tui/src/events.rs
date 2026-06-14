@@ -390,7 +390,16 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     session_cost,
                     ..
                 } => {
+                    // A model-backed `/help` answer arrives here as a plain
+                    // assistant message (the agent emits no topic/source on a
+                    // completed turn); detect it from the rendered trailing source
+                    // label so it becomes rateable, exactly like a local curated
+                    // answer. The status hint is set after the turn-complete status
+                    // below so it isn't overwritten.
+                    let mut tracked_help_answer = false;
                     if let Some(message) = dedupe_assistant_repeated_tool_output(app, message) {
+                        tracked_help_answer =
+                            crate::note_help_answer_from_assistant(app, &message.content);
                         app.push_transcript_item(message);
                     }
                     app.pending_assistant.clear();
@@ -434,6 +443,12 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                             .insert(current_turn_of(&app.transcript), app.metrics.clone());
                     }
                     app.status = "ready".to_string();
+                    // A rateable model-backed help answer overrides the plain
+                    // "ready" with the same rating-hint the curated `/help` path
+                    // shows, so the Ctrl+G / Ctrl+B chords are discoverable.
+                    if tracked_help_answer {
+                        app.status = "help: doc-help · Ctrl+G 👍 / Ctrl+B 👎".to_string();
+                    }
                     app.turn_visual = TurnVisualState::Succeeded;
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;

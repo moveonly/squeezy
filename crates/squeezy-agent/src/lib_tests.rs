@@ -3726,6 +3726,235 @@ async fn doc_help_subagent_gets_its_own_output_budget_not_summary_cap() {
     );
 }
 
+#[test]
+fn doc_help_subagent_prompt_includes_recent_context_when_provided() {
+    let docs = [DocSection {
+        path: "docs/external/PROVIDERS.md",
+        heading: "Provider setup",
+        content: "Provider setup notes.",
+    }];
+    let with_context = doc_help_subagent_prompt(
+        "/help why did that fail?",
+        "[model]\nname = \"demo\"",
+        &docs,
+        Some("Last assistant message: I edited the config."),
+    );
+    assert!(
+        with_context
+            .contains("Recent session context (may or may not be relevant to the question):"),
+        "prompt must include the recent-context section header: {with_context:?}"
+    );
+    assert!(
+        with_context.contains("Last assistant message: I edited the config."),
+        "prompt must inline the provided recent context: {with_context:?}"
+    );
+
+    let without_context = doc_help_subagent_prompt(
+        "/help why did that fail?",
+        "[model]\nname = \"demo\"",
+        &docs,
+        None,
+    );
+    assert!(
+        !without_context.contains("Recent session context"),
+        "prompt must omit the recent-context section when None: {without_context:?}"
+    );
+    // An empty/whitespace-only context behaves like None.
+    let blank_context = doc_help_subagent_prompt(
+        "/help why did that fail?",
+        "[model]\nname = \"demo\"",
+        &docs,
+        Some("   "),
+    );
+    assert!(
+        !blank_context.contains("Recent session context"),
+        "prompt must omit the recent-context section for blank context: {blank_context:?}"
+    );
+}
+
+#[test]
+fn squeezy_repo_search_query_biases_to_the_repo() {
+    // The query steers the web search at the project's own repo so the fallback
+    // searches the codebase/docs/issues, not the whole web.
+    let q = squeezy_repo_search_query("  how do I rotate session logs?  ");
+    assert!(q.contains("how do I rotate session logs?"), "{q}");
+    assert!(q.contains(squeezy_skills::SQUEEZY_REPO_URL), "{q}");
+    assert!(!q.starts_with(' ') && !q.ends_with(' '), "trimmed: {q:?}");
+}
+
+#[test]
+fn is_squeezy_repo_url_allowlists_only_the_repo() {
+    // Accept the repo on github.com and its raw form (both built from the
+    // centralized slug); reject every other host.
+    assert!(is_squeezy_repo_url(
+        "https://github.com/esqueezy/squeezy/blob/main/crates/squeezy-agent/src/lib.rs"
+    ));
+    assert!(is_squeezy_repo_url(
+        "https://raw.githubusercontent.com/esqueezy/squeezy/main/README.md"
+    ));
+    assert!(is_squeezy_repo_url(squeezy_skills::SQUEEZY_REPO_URL));
+    // Foreign hosts and look-alike owners are rejected.
+    assert!(!is_squeezy_repo_url(
+        "https://github.com/evil/squeezy/blob/main/x.rs"
+    ));
+    assert!(!is_squeezy_repo_url("https://example.com/esqueezy/squeezy"));
+    assert!(!is_squeezy_repo_url(
+        "https://github.com/esqueezy/squeezy-evil/x"
+    ));
+}
+
+#[test]
+fn build_recent_help_context_redacts_and_caps() {
+    let redactor = Redactor::default();
+    let mut state = ConversationState::default();
+    state.conversation.push(LlmInputItem::AssistantText(
+        "Try setting the model.".to_string(),
+    ));
+    // A tool failure carrying a secret-looking token must be redacted before it
+    // ever reaches the subagent prompt.
+    state.conversation.push(LlmInputItem::FunctionCallOutput {
+        call_id: "call_1".to_string(),
+        output: "auth failed with key sk-ant-AAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        content_parts: None,
+        is_error: true,
+    });
+
+    let context =
+        build_recent_help_context(&state, &redactor).expect("context should be built from history");
+    assert!(
+        context.contains("Last assistant message: Try setting the model."),
+        "context must surface the last assistant message: {context:?}"
+    );
+    assert!(
+        context.contains("Most recent tool error:"),
+        "context must surface the last tool error: {context:?}"
+    );
+    assert!(
+        !context.contains("sk-ant-AAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        "the secret token must be redacted out of the recent context: {context:?}"
+    );
+
+    // A fresh session has nothing relevant to share.
+    let empty = ConversationState::default();
+    assert!(
+        build_recent_help_context(&empty, &redactor).is_none(),
+        "fresh session must yield no recent context"
+    );
+
+    // Non-error tool outputs are ignored; only assistant text + errors count.
+    let mut only_success = ConversationState::default();
+    only_success
+        .conversation
+        .push(LlmInputItem::FunctionCallOutput {
+            call_id: "call_ok".to_string(),
+            output: "ran fine".to_string(),
+            content_parts: None,
+            is_error: false,
+        });
+    assert!(
+        build_recent_help_context(&only_success, &redactor).is_none(),
+        "successful tool output alone must not produce recent context"
+    );
+
+    // The redacted context is bounded by RECENT_HELP_CONTEXT_MAX_CHARS.
+    let mut long_state = ConversationState::default();
+    long_state
+        .conversation
+        .push(LlmInputItem::AssistantText("z".repeat(5_000)));
+    let capped = build_recent_help_context(&long_state, &redactor).expect("capped context");
+    assert!(
+        capped.chars().count() <= RECENT_HELP_CONTEXT_MAX_CHARS + 1,
+        "recent context must be capped near RECENT_HELP_CONTEXT_MAX_CHARS, got {}",
+        capped.chars().count()
+    );
+}
+
+#[test]
+fn doc_help_web_subagent_prompt_includes_corpus_url_and_sentinel() {
+    let prompt = doc_help_web_subagent_prompt(
+        "/help quantum billing",
+        "# Quantum Billing\nFetched doc body about quantum billing.",
+        "https://raw.githubusercontent.com/esqueezy/squeezy/main/crates/squeezy-skills/external-docs/PROVIDERS.md",
+        "earlier the user asked about providers",
+    );
+    // The fetched markdown is the corpus.
+    assert!(
+        prompt.contains("Fetched doc body about quantum billing."),
+        "prompt must inline the fetched markdown: {prompt}"
+    );
+    // The source URL is labeled.
+    assert!(
+        prompt.contains(
+            "https://raw.githubusercontent.com/esqueezy/squeezy/main/crates/squeezy-skills/external-docs/PROVIDERS.md"
+        ),
+        "prompt must cite the source URL: {prompt}"
+    );
+    // The recent context is woven in.
+    assert!(
+        prompt.contains("earlier the user asked about providers"),
+        "prompt must include recent context: {prompt}"
+    );
+    // The sentinel instruction is preserved so even the web docs can decline.
+    assert!(
+        prompt.contains("Not covered in local docs."),
+        "prompt must keep the sentinel instruction: {prompt}"
+    );
+    // The "answer ONLY from fetched content" guard rail.
+    assert!(
+        prompt.contains("ONLY the fetched content"),
+        "prompt must restrict the model to the fetched docs: {prompt}"
+    );
+}
+
+#[test]
+fn doc_help_web_fallback_is_off_by_default() {
+    // The gate must be CLOSED on a default config: the fallback never fires
+    // unless explicitly enabled. This is the unit-testable seam that proves the
+    // default /help path makes zero network calls.
+    let config = AppConfig::default();
+    assert!(
+        !config.subagents.help_web_fallback,
+        "help_web_fallback must default to false"
+    );
+    assert!(
+        !run_doc_help_web_fallback_enabled(&config),
+        "fallback gate must be closed by default"
+    );
+}
+
+#[test]
+fn doc_help_web_fallback_gate_requires_all_conditions() {
+    // With every precondition satisfied the gate opens; flipping any single
+    // condition closes it. No network is touched — this exercises only the
+    // pure predicate.
+    let mut config = AppConfig::default();
+    config.subagents.enabled = true;
+    config.subagents.help_web_fallback = true;
+    config.subagents.help_strict_local = false;
+    config.permissions.web = PermissionMode::Ask;
+    assert!(run_doc_help_web_fallback_enabled(&config));
+
+    // web = Deny closes it.
+    config.permissions.web = PermissionMode::Deny;
+    assert!(!run_doc_help_web_fallback_enabled(&config));
+    config.permissions.web = PermissionMode::Allow;
+    assert!(run_doc_help_web_fallback_enabled(&config));
+
+    // strict-local closes it.
+    config.subagents.help_strict_local = true;
+    assert!(!run_doc_help_web_fallback_enabled(&config));
+    config.subagents.help_strict_local = false;
+
+    // subagents disabled closes it.
+    config.subagents.enabled = false;
+    assert!(!run_doc_help_web_fallback_enabled(&config));
+    config.subagents.enabled = true;
+
+    // fallback flag off closes it.
+    config.subagents.help_web_fallback = false;
+    assert!(!run_doc_help_web_fallback_enabled(&config));
+}
+
 #[tokio::test]
 async fn bang_command_completes_locally_without_provider_request() {
     let root = temp_workspace("agent_local_bang");
@@ -7065,6 +7294,64 @@ fn explore_model_alias_resolves_before_subagent_dispatch() {
     config.subagents.explore_model = Some("haiku".to_string());
 
     let model = subagent_model_for_kind("anthropic", &config, SubagentKind::Explore);
+
+    assert_eq!(model, "claude-haiku-4-5-20251001");
+}
+
+#[test]
+fn doc_help_defaults_to_parent_model() {
+    // `/help` is user-facing, so with no `doc_help_model` override DocHelp must
+    // run on the session's configured main/parent model — NOT the cheap tier.
+    // (`doc_help_model` defaults to `None`.)
+    let config = AppConfig {
+        model: "claude-opus-4-7".to_string(),
+        ..Default::default()
+    };
+
+    let model = subagent_model_for_kind("anthropic", &config, SubagentKind::DocHelp);
+
+    assert_eq!(model, "claude-opus-4-7");
+}
+
+#[test]
+fn doc_help_auto_uses_parent_model() {
+    // The literal "auto" is the explicit spelling of the default behavior.
+    let mut config = AppConfig {
+        model: "claude-opus-4-7".to_string(),
+        ..Default::default()
+    };
+    config.subagents.doc_help_model = Some("auto".to_string());
+
+    let model = subagent_model_for_kind("anthropic", &config, SubagentKind::DocHelp);
+
+    assert_eq!(model, "claude-opus-4-7");
+}
+
+#[test]
+fn doc_help_cheap_uses_cheap_tier() {
+    // `doc_help_model = "cheap"` opts down to the provider's small-fast tier.
+    let mut config = AppConfig {
+        model: "claude-opus-4-7".to_string(),
+        ..Default::default()
+    };
+    config.subagents.doc_help_model = Some("cheap".to_string());
+
+    let model = subagent_model_for_kind("anthropic", &config, SubagentKind::DocHelp);
+
+    assert_eq!(model, "claude-haiku-4-5-20251001");
+}
+
+#[test]
+fn doc_help_explicit_id_resolves_through_alias() {
+    // Any non-keyword value is an explicit model id, resolved through the
+    // provider's alias table (here the "haiku" alias).
+    let mut config = AppConfig {
+        model: "claude-opus-4-7".to_string(),
+        ..Default::default()
+    };
+    config.subagents.doc_help_model = Some("haiku".to_string());
+
+    let model = subagent_model_for_kind("anthropic", &config, SubagentKind::DocHelp);
 
     assert_eq!(model, "claude-haiku-4-5-20251001");
 }

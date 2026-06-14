@@ -602,6 +602,66 @@ max_summary_tokens = 333
 }
 
 #[test]
+fn help_web_fallback_defaults_off() {
+    assert!(!SubagentConfig::default().help_web_fallback);
+    let config = AppConfig::from_settings_and_env_vars(SettingsFile::default(), |_| None);
+    assert!(!config.subagents.help_web_fallback);
+}
+
+#[test]
+fn help_web_fallback_parses_from_toml() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[subagents]
+help_web_fallback = true
+"#,
+        "test",
+    )
+    .expect("settings");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert!(config.subagents.help_web_fallback);
+}
+
+#[test]
+fn help_web_fallback_parses_from_env() {
+    let config =
+        AppConfig::from_settings_and_env_vars(SettingsFile::default(), |name| match name {
+            "SQUEEZY_HELP_WEB_FALLBACK" => Some("true".to_string()),
+            _ => None,
+        });
+    assert!(config.subagents.help_web_fallback);
+}
+
+#[test]
+fn help_web_fallback_misspelled_key_is_rejected() {
+    // `from_toml_str` records unknown keys into UNKNOWN_FIELDS (drained via
+    // `take_unknown_fields`) so the loader can warn instead of silently
+    // accepting a typo. A misspelled `help_web_fallback` must not be honored.
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[subagents]
+help_web_fallbck = true
+"#,
+        "test",
+    )
+    .expect("settings parse (unknown keys warn, not error)");
+    let unknown = take_unknown_fields();
+    assert!(
+        unknown.iter().any(|f| f == "subagents.help_web_fallbck"),
+        "misspelled help_web_fallback key must be reported as unknown: {unknown:?}"
+    );
+    // The typo must not silently enable the real flag.
+    assert!(
+        settings
+            .subagents
+            .as_ref()
+            .and_then(|s| s.help_web_fallback)
+            .is_none(),
+        "misspelled key must not set help_web_fallback"
+    );
+}
+
+#[test]
 fn shell_sandbox_settings_parse_and_round_trip() {
     let root = std::env::temp_dir().join(format!(
         "squeezy_shell_roots_{}_{}",

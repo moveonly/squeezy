@@ -926,6 +926,94 @@ fn slash_command_event_sanitizes_unknown_command_heads() {
 }
 
 #[test]
+fn help_answer_rated_event_carries_only_anonymous_dimensions() {
+    let event = TelemetryEvent::help_answer_rated(HelpAnswerRatedReport {
+        topic: "providers",
+        source: HelpAnswerSourceKind::LocalCurated,
+        rating: HelpRatingKind::Down,
+    });
+    let text = serde_json::to_string(&event).unwrap();
+
+    assert!(text.contains("squeezy_help_answer_rated"));
+    assert!(text.contains("\"help_topic\":\"providers\""));
+    assert!(text.contains("\"help_source\":\"local_curated\""));
+    assert!(text.contains("\"help_rating\":\"down\""));
+    // The squeezy version rides along so weak answers can be scoped to a release.
+    assert!(text.contains(&format!(
+        "\"squeezy_version\":\"{}\"",
+        env!("CARGO_PKG_VERSION")
+    )));
+    // Anonymous by construction: no prompt or answer body fields exist.
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let props = value.get("properties").unwrap().as_object().unwrap();
+    assert!(props.get("body").is_none());
+    assert!(props.get("answer").is_none());
+    assert!(props.get("prompt").is_none());
+}
+
+#[test]
+fn help_answer_rated_event_does_not_leak_user_text() {
+    // A topic id that smuggled in free text / secrets would collapse to the
+    // safe `unknown` token rather than serialize verbatim.
+    let event = TelemetryEvent::help_answer_rated(HelpAnswerRatedReport {
+        topic: "how do I leak my api key sk-secret123?",
+        source: HelpAnswerSourceKind::DocHelpModel,
+        rating: HelpRatingKind::Up,
+    });
+    let text = serde_json::to_string(&event).unwrap();
+
+    assert!(text.contains("\"help_topic\":\"unknown\""));
+    assert!(text.contains("\"help_source\":\"doc_help_model\""));
+    assert!(text.contains("\"help_rating\":\"up\""));
+    assert!(!text.contains("sk-secret123"));
+    assert!(!text.contains("api key"));
+}
+
+#[test]
+fn help_answer_rated_slash_topic_keeps_leading_slash() {
+    let event = TelemetryEvent::help_answer_rated(HelpAnswerRatedReport {
+        topic: "/theme",
+        source: HelpAnswerSourceKind::LocalCurated,
+        rating: HelpRatingKind::Up,
+    });
+    let text = serde_json::to_string(&event).unwrap();
+    assert!(text.contains("\"help_topic\":\"/theme\""));
+}
+
+#[test]
+fn help_rating_events_fold_into_session_summary_counts() {
+    let session = StoredTelemetrySession {
+        session_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        trace_id: "0123456789abcdef0123456789abcdef".to_string(),
+        started_at_ms: 0,
+        ended_at_ms: Some(10),
+        clean_end: true,
+        summary_id: None,
+    };
+    let events = vec![
+        TelemetryEvent::help_answer_rated(HelpAnswerRatedReport {
+            topic: "providers",
+            source: HelpAnswerSourceKind::LocalCurated,
+            rating: HelpRatingKind::Down,
+        }),
+        TelemetryEvent::help_answer_rated(HelpAnswerRatedReport {
+            topic: "providers",
+            source: HelpAnswerSourceKind::LocalCurated,
+            rating: HelpRatingKind::Down,
+        }),
+        TelemetryEvent::help_answer_rated(HelpAnswerRatedReport {
+            topic: "tui",
+            source: HelpAnswerSourceKind::DocHelpModel,
+            rating: HelpRatingKind::Up,
+        }),
+    ];
+    let summary = build_summary_from_events(&session, events, false, None);
+    let counts = summary.properties.help_rating_counts.unwrap();
+    assert_eq!(counts.get("providers:down"), Some(&2));
+    assert_eq!(counts.get("tui:up"), Some(&1));
+}
+
+#[test]
 fn config_change_event_uses_bucketed_values() {
     let event = TelemetryEvent::config_change_committed(ConfigChangeReport {
         scope: ConfigScopeKind::Project,
