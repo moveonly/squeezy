@@ -188,12 +188,23 @@ fn visit_php_node(
         }
         "function_call_expression" => {
             extract_php_function_call(node, ctx, owner_symbol.clone());
+            // `define('NAME', value)` is the canonical PHP global-constant
+            // idiom; mint a top-level `Const` symbol in addition to the call.
+            if php_call_callee_name(node, ctx.source).as_deref() == Some("define") {
+                extract_php_define_const(node, ctx, parent_symbol.as_ref(), scope);
+            }
             // Suppress descent into eval() arguments per the spec (the literal
             // body otherwise leaks as identifiers/refs the resolver cannot
             // bind).
             if php_call_callee_name(node, ctx.source).as_deref() == Some("eval") {
                 return;
             }
+        }
+        "global_declaration" | "function_static_declaration" => {
+            // `global $x;` and `static $cache = ...;` inside a function bind
+            // names into the local scope. Record the bound variables as
+            // identifier references so the binding site is visible/linkable.
+            extract_php_variable_bindings(node, ctx, owner_symbol.clone());
         }
         "member_call_expression" | "nullsafe_member_call_expression" => {
             extract_php_member_call(node, ctx, owner_symbol.clone());
@@ -1016,9 +1027,7 @@ fn extract_php_function_call(
         });
         return;
     }
-    let arity = arguments
-        .map(named_child_count)
-        .unwrap_or_default();
+    let arity = arguments.map(named_child_count).unwrap_or_default();
     let is_eval = name == "eval";
     let is_guard = matches!(
         name.as_str(),
@@ -1055,6 +1064,124 @@ fn php_call_callee_name(node: Node<'_>, source: &str) -> Option<String> {
     let function_node = node.child_by_field_name("function")?;
     let raw = node_text(function_node, source).ok()?;
     Some(last_path_segment(raw))
+}
+
+fn extract_php_define_const(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+    scope: &PhpScope,
+) {
+    // `define('NAME', value)` — the first argument is a string literal naming
+    // the global constant. Anything else (a dynamically computed name) is left
+    // as the plain call already recorded by the caller.
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = arguments.walk();
+    let Some(first_arg) = arguments.named_children(&mut cursor).next() else {
+        return;
+    };
+    if first_arg.kind() != "argument" {
+        return;
+    }
+    let Ok(arg_text) = node_text(first_arg, ctx.source) else {
+        return;
+    };
+    let Some(raw_name) = first_php_string_literal(arg_text) else {
+        return;
+    };
+    let name = raw_name.trim().to_string();
+    if name.is_empty() {
+        return;
+    }
+    // Only a constant parent (the file namespace `Module`, if any) carries a
+    // `define()`; class-scoped `define` is illegal PHP, so a non-Module parent
+    // means we are at file scope and the const stays top-level.
+    let parent_id = parent_symbol
+        .filter(|(_, kind)| matches!(kind, SymbolKind::Module))
+        .map(|(id, _)| id.clone());
+    let span = span_from_node(node);
+    let id = symbol_id(&ctx.file, parent_id.as_ref(), SymbolKind::Const, &name, span);
+    let mut attributes = vec!["php:const".to_string(), "php:define".to_string()];
+    if let Some(namespace) = scope.current_namespace() {
+        attributes.push(format!("php:namespace:{namespace}"));
+    }
+    attributes.sort();
+    attributes.dedup();
+    ctx.symbols.push(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name,
+        kind: SymbolKind::Const,
+        language_identity: None,
+        span,
+        body_span: None,
+        signature_span: None,
+        signature: node_text(node, ctx.source)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        visibility: None,
+        docs: Vec::new(),
+        attributes,
+        provenance: Provenance::new(PROVENANCE, "define constant"),
+        confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+        arity: None,
+    });
+}
+
+fn extract_php_variable_bindings(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    // `global $a, $b;` lists `variable_name` children directly;
+    // `static $x = ...;` wraps each in a `static_variable_declaration` whose
+    // `name` field is the `variable_name`. Record each bound name as an
+    // identifier reference tagged with the binding kind.
+    let reason = if node.kind() == "global_declaration" {
+        "global binding"
+    } else {
+        "static binding"
+    };
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let variable = match child.kind() {
+            "variable_name" => child,
+            "static_variable_declaration" => {
+                let Some(name_node) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                name_node
+            }
+            _ => continue,
+        };
+        let Ok(text) = node_text(variable, ctx.source) else {
+            continue;
+        };
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: owner_id.clone(),
+            text: trimmed.clone(),
+            kind: ReferenceKind::Identifier,
+            span: span_from_node(variable),
+            provenance: Provenance::new(PROVENANCE, reason),
+        });
+        ctx.body_hits.push(BodyHit {
+            file_id: ctx.file.id.clone(),
+            owner_id: owner_id.clone(),
+            text: trimmed,
+            kind: BodyHitKind::Identifier,
+            span: span_from_node(variable),
+        });
+    }
 }
 
 fn extract_php_member_call(
