@@ -3780,19 +3780,29 @@ impl ToolRegistry {
         {
             changed.insert(sym.file_id.clone());
         }
-        if let Some(path) = args.path.as_deref() {
+        // Resolve a path filter into changed file IDs. An empty/whitespace
+        // filter would otherwise match everything via the suffix/fuzzy fallback,
+        // so skip it. Try an exact (case-insensitive) lookup before scanning so
+        // a precise path resolves in O(1) without the boundary-aware fallback.
+        let mut resolve_path = |filter: &str| {
+            if filter.trim().is_empty() {
+                return;
+            }
+            if let Some(file) = graph.find_file_case_insensitive(filter) {
+                changed.insert(file.id.clone());
+                return;
+            }
             for file in graph.files.values() {
-                if file.relative_path == path || file.relative_path.ends_with(path) {
+                if path_matches_filter(&file.relative_path, filter) {
                     changed.insert(file.id.clone());
                 }
             }
+        };
+        if let Some(path) = args.path.as_deref() {
+            resolve_path(path);
         }
         for extra in &args.extra_paths {
-            for file in graph.files.values() {
-                if file.relative_path == *extra || file.relative_path.ends_with(extra.as_str()) {
-                    changed.insert(file.id.clone());
-                }
-            }
+            resolve_path(extra.as_str());
         }
 
         if changed.is_empty() {
