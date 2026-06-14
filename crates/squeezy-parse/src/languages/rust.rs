@@ -112,6 +112,10 @@ pub(crate) fn symbol_from_node(
     if kind == SymbolKind::Function && is_test_function(&attributes) {
         kind = SymbolKind::Test;
     }
+    // Doc comments must be read from the literal `#[doc = ...]`/`///` attributes
+    // before we append synthesized `derive:`/`cfg:` tokens, otherwise the
+    // `attribute_path == "doc"` filter would have to skip the new tokens too.
+    let docs = docs_from_attributes(&attributes);
     // Record the declared type of a struct field as a queryable `type:` attribute,
     // mirroring the Java/Kotlin field extractors so `decl_search attribute=type:X`
     // and field hierarchy listings expose it.
@@ -119,9 +123,14 @@ pub(crate) fn symbol_from_node(
         && let Some(field_type) = rust_field_type(node, ctx.source)
     {
         attributes.push(format!("type:{field_type}"));
-        attributes.sort();
-        attributes.dedup();
     }
+    // Normalize `#[derive(..)]`/`#[cfg(..)]` and other attribute items into
+    // queryable tokens (`derive:Serialize`, `cfg:<predicate>`, `rust:attr:<path>`)
+    // so `decl_search attribute=derive:X` and cfg filtering work, mirroring the
+    // C#/Java/JS-TS normalized-attribute passes.
+    attributes.extend(rust_semantic_attributes(&attributes));
+    attributes.sort();
+    attributes.dedup();
 
     let name = symbol_name(node, kind, ctx.source)?;
     if kind == SymbolKind::Const && name == "_" {
@@ -143,6 +152,14 @@ pub(crate) fn symbol_from_node(
     } else {
         None
     };
+    // cfg-gated items can be compiled out; downgrade their confidence to
+    // ConditionalUnknown (mirroring C/C++ `preprocessor:conditional`) since a
+    // single-config parse cannot know whether the symbol is actually present.
+    let confidence = if attributes.iter().any(|attr| attr == "rust:conditional") {
+        Confidence::ConditionalUnknown
+    } else {
+        Confidence::ExactSyntax
+    };
 
     Some(ParsedSymbol {
         id,
@@ -156,10 +173,10 @@ pub(crate) fn symbol_from_node(
         signature_span,
         signature,
         visibility,
-        docs: docs_from_attributes(&attributes),
+        docs,
         attributes,
         provenance: Provenance::new("tree-sitter-rust", format!("{} declaration", node.kind())),
-        confidence: Confidence::ExactSyntax,
+        confidence,
         freshness: Freshness::Fresh,
         arity,
     })
@@ -1740,6 +1757,72 @@ pub(crate) fn attribute_path(attribute: &str) -> Option<String> {
     } else {
         Some(path.trim_end_matches(':').to_string())
     }
+}
+
+/// Normalize the raw `#[..]` attribute strings already collected for a symbol
+/// into queryable tokens:
+///
+/// - `#[derive(Serialize, Clone)]` -> `derive:Serialize`, `derive:Clone`
+/// - `#[cfg(feature = "x")]` / `#[cfg_attr(..)]` -> `cfg:<predicate>` plus a
+///   `rust:conditional` marker used to downgrade the symbol confidence.
+/// - any other attribute path -> `rust:attr:<path>` so the bare attribute name
+///   is searchable without scanning the raw string.
+///
+/// The input is the raw attribute list (each element looks like `#[..]` or
+/// `#![..]`); the returned tokens are appended to the symbol's attributes.
+pub(crate) fn rust_semantic_attributes(raw_attributes: &[String]) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for attribute in raw_attributes {
+        let Some(path) = attribute_path(attribute) else {
+            continue;
+        };
+        let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+        match leaf {
+            "derive" => {
+                for name in rust_attribute_inner_paths(attribute) {
+                    let trait_name = last_path_segment(&name);
+                    if !trait_name.is_empty() {
+                        tokens.push(format!("derive:{trait_name}"));
+                    }
+                }
+            }
+            "cfg" | "cfg_attr" => {
+                tokens.push("rust:conditional".to_string());
+                if let Some(predicate) = rust_attribute_arguments(attribute) {
+                    let predicate = collapse_whitespace(&predicate);
+                    if !predicate.is_empty() {
+                        tokens.push(format!("cfg:{predicate}"));
+                    }
+                }
+                tokens.push(format!("rust:attr:{path}"));
+            }
+            "doc" => {}
+            _ => tokens.push(format!("rust:attr:{path}")),
+        }
+    }
+    tokens
+}
+
+/// Return the comma-separated argument list inside an attribute's `(..)`, e.g.
+/// `#[derive(Serialize, Clone)]` -> `"Serialize, Clone"`. Returns `None` for
+/// attributes with no parenthesized arguments (`#[inline]`, `#[doc = "x"]`).
+fn rust_attribute_arguments(attribute: &str) -> Option<String> {
+    let open = attribute.find('(')?;
+    let close = matching_close_paren(attribute, open)?;
+    Some(attribute[open + 1..close].trim().to_string())
+}
+
+/// Split the parenthesized arguments of a `#[derive(..)]` attribute into the
+/// individual trait paths, ignoring nested generics/commas.
+fn rust_attribute_inner_paths(attribute: &str) -> Vec<String> {
+    let Some(args) = rust_attribute_arguments(attribute) else {
+        return Vec::new();
+    };
+    split_top_level_commas(&args)
+        .into_iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
