@@ -499,6 +499,9 @@ fn extract_ruby_import(
     } else {
         raw_path.clone()
     };
+    // Leaf of the required path (e.g. `user` for `app/models/user.rb`). Kept so
+    // the resolver can fall back to leaf-name matching even though the binding
+    // is a whole-file glob.
     let imported_name = ruby_imported_name_from_path(&resolved_path);
     let provenance_label = if kind_label == "load" {
         "ruby:load"
@@ -511,12 +514,19 @@ fn extract_ruby_import(
         owner_id: owner_id.clone(),
         path: resolved_path,
         alias: None,
-        is_glob: false,
+        // `require`/`require_relative`/`load` evaluate the whole target file,
+        // exposing every top-level definition to the requiring file — the same
+        // whole-file 'expose everything' semantics as C's `#include` (which is
+        // `Wildcard` + `is_glob`). Model them as globs so the resolver routes
+        // single-candidate require edges through the glob branch (it switches on
+        // `is_glob`, not `ImportKind`) and `Wildcard` keeps the binding shape
+        // honest. `autoload` stays `Named` — it binds exactly one constant.
+        is_glob: true,
         is_reexport: false,
         is_static: false,
         span,
         provenance: Provenance::new("tree-sitter-ruby", provenance_label),
-        kind: ImportKind::Named,
+        kind: ImportKind::Wildcard,
         imported_name,
         is_global: false,
     });
