@@ -157,6 +157,15 @@ pub(crate) fn symbol_from_node(
     if kind == SymbolKind::Const && name == "_" {
         return None;
     }
+    // Store the bare self-type on the Impl symbol's `language_identity` (as a
+    // `T:<type>` token, matching the C# convention) so cross-file self-type
+    // attribution and the partials index can read a stored identity instead of
+    // re-running the impl-header string match on every query.
+    let language_identity = if kind == SymbolKind::Impl {
+        rust_impl_self_type(node, ctx.source).map(|self_type| format!("T:{self_type}"))
+    } else {
+        None
+    };
     let body = node.child_by_field_name("body");
     let span = span_from_node(node);
     let body_span = body.map(span_from_node);
@@ -188,7 +197,7 @@ pub(crate) fn symbol_from_node(
         parent_id: parent_symbol,
         name,
         kind,
-        language_identity: None,
+        language_identity,
         span,
         body_span,
         signature_span,
