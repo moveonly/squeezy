@@ -202,6 +202,21 @@ fn visit_php_node(
             extract_php_scoped_call(node, ctx, owner_symbol.clone());
         }
         "object_creation_expression" => {
+            // `new class(...) extends Base implements I { ... }` carries an
+            // `anonymous_class` child. Model it as a Partial synthetic Class so
+            // its members parent correctly and its bases produce edges, then
+            // stop the generic descent below from re-parenting the body.
+            if let Some(anon) = php_anonymous_class_child(node) {
+                extract_php_anonymous_class(
+                    node,
+                    anon,
+                    ctx,
+                    parent_symbol.as_ref(),
+                    owner_symbol.clone(),
+                    scope,
+                );
+                return;
+            }
             extract_php_object_creation(node, ctx, owner_symbol.clone());
         }
         "qualified_name" if !is_php_declaration_name(node) => {
@@ -1181,6 +1196,123 @@ fn extract_php_object_creation(
         });
     }
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+}
+
+fn php_anonymous_class_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "anonymous_class")
+}
+
+fn extract_php_anonymous_class(
+    creation_node: Node<'_>,
+    anon_node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+    owner_id: Option<SymbolId>,
+    scope: &mut PhpScope,
+) {
+    // Record the construction itself as a Partial direct call so the call site
+    // is still visible; an anonymous class has no nameable callee, so it lands
+    // as `<anonymous>` with Partial confidence.
+    let mut arg_cursor = anon_node.walk();
+    let arity = anon_node
+        .children(&mut arg_cursor)
+        .find(|child| child.kind() == "arguments")
+        .map(named_child_count)
+        .unwrap_or_default();
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name: "<anonymous>".to_string(),
+        target_text: "class".to_string(),
+        receiver: None,
+        arity,
+        kind: ParsedCallKind::Direct,
+        span: span_from_node(creation_node),
+        provenance: Provenance::new(PROVENANCE, "object_creation_expression anonymous"),
+        confidence: Confidence::Partial,
+    });
+
+    let span = span_from_node(anon_node);
+    let name = format!(
+        "__anonymous_class_{}_{}",
+        span.start.line, span.start.column
+    );
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let body = anon_node.child_by_field_name("body");
+    let signature = signature_text(anon_node, body, ctx.source);
+    let bases = php_collect_base_types(anon_node, ctx.source);
+    let mut attributes = vec![
+        "php:anonymous-class".to_string(),
+        "php:partial-parse".to_string(),
+    ];
+    for base in &bases {
+        attributes.push(format!("base:{base}"));
+    }
+    attributes.sort();
+    attributes.dedup();
+    let id = symbol_id(&ctx.file, parent_id.as_ref(), SymbolKind::Class, &name, span);
+    let symbol = ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name: name.clone(),
+        kind: SymbolKind::Class,
+        // Anonymous classes have no addressable type identity, matching how
+        // Kotlin object literals are modelled.
+        language_identity: None,
+        span,
+        body_span: body.map(span_from_node),
+        signature_span: signature_span_from_nodes(anon_node, body),
+        signature,
+        visibility: None,
+        docs: Vec::new(),
+        attributes,
+        provenance: Provenance::new(PROVENANCE, "anonymous class declaration"),
+        confidence: Confidence::Partial,
+        freshness: Freshness::Fresh,
+        arity: None,
+    };
+    // Base/interface bases also surface as Type references owned by the
+    // synthetic class so the resolver can synthesize `Extends`/`Implements`.
+    for base in bases {
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: Some(symbol.id.clone()),
+            text: base,
+            kind: ReferenceKind::Type,
+            span: symbol.span,
+            provenance: Provenance::new(PROVENANCE, "anonymous base type reference"),
+        });
+    }
+    let next_parent = Some((symbol.id.clone(), symbol.kind));
+    let next_owner = symbol.body_span.map(|_| symbol.id.clone());
+    scope.type_path.push(symbol.name.clone());
+    ctx.symbols.push(symbol);
+
+    // Descend selectively: the constructor `arguments` are evaluated in the
+    // enclosing scope, the body parents to the synthetic class, and base /
+    // interface clauses are already captured as attributes + Type refs.
+    let mut cursor = anon_node.walk();
+    for child in anon_node.named_children(&mut cursor) {
+        match child.kind() {
+            "arguments" => {
+                visit_php_children(child, ctx, parent_symbol.cloned(), owner_id.clone(), scope);
+            }
+            "base_clause" | "class_interface_clause" | "attribute_list" => {}
+            _ => {
+                visit_php_node(
+                    child,
+                    ctx,
+                    next_parent.clone(),
+                    next_owner.clone(),
+                    scope,
+                );
+            }
+        }
+    }
+    scope.type_path.pop();
 }
 
 fn extract_php_reference(
