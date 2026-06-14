@@ -109,8 +109,9 @@ pub(crate) fn visit_python_node(
     }
 
     if let Some(mut symbol) = python_symbol_from_node(node, ctx, parent_symbol.as_ref()) {
-        python_refine_symbol(node, &mut symbol);
+        python_refine_symbol(node, &mut symbol, &ctx.file);
         extract_python_symbol_facts(node, &symbol, ctx);
+        python_refine_symbol_facts(&symbol, ctx);
         let next_parent = Some((symbol.id.clone(), symbol.kind));
         let next_owner = if symbol.body_span.is_some() {
             Some(symbol.id.clone())
@@ -150,11 +151,16 @@ pub(crate) fn visit_python_children(
     }
 }
 
-/// Post-process a freshly-built Python symbol with signals that need the live
-/// tree-sitter node (rather than just the signature string): coroutine vs
-/// generator status. `python_symbol_from_node` lives in the shared dispatch and
-/// only inspects decorators, so these node-level modifiers are normalised here.
-pub(crate) fn python_refine_symbol(node: Node<'_>, symbol: &mut ParsedSymbol) {
+/// Post-process a freshly-built Python symbol with signals the shared
+/// `python_symbol_from_node` dispatch does not derive: classes are reclassified
+/// to `Enum` (and `NamedTuple`/`TypedDict` tagged) from their bases, and
+/// functions/methods gain coroutine (`python:async`) and generator
+/// (`python:generator`) markers read off the live tree-sitter node.
+pub(crate) fn python_refine_symbol(node: Node<'_>, symbol: &mut ParsedSymbol, file: &FileRecord) {
+    if symbol.kind == SymbolKind::Class {
+        python_refine_class(symbol, file);
+        return;
+    }
     if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
         return;
     }
@@ -199,6 +205,66 @@ fn python_body_has_yield(node: Node<'_>) -> bool {
         }
     }
     false
+}
+
+/// Reclassify a `class` symbol based on its declared bases (recorded as
+/// `base:<Name>` attributes by the shared dispatch): an `enum.Enum` family base
+/// promotes the class to `SymbolKind::Enum` (so its members can become
+/// `Variant`), and `NamedTuple`/`TypedDict` bases are tagged for record-style
+/// queries. Reclassifying changes the kind embedded in the symbol id, so the id
+/// is regenerated to stay consistent (children are visited with the refined id).
+fn python_refine_class(symbol: &mut ParsedSymbol, file: &FileRecord) {
+    let mut is_enum = false;
+    let mut extra = Vec::new();
+    for attribute in &symbol.attributes {
+        let Some(base) = attribute.strip_prefix("base:") else {
+            continue;
+        };
+        match base {
+            "Enum" | "IntEnum" | "StrEnum" | "Flag" | "IntFlag" | "ReprEnum" => is_enum = true,
+            "NamedTuple" => extra.push("python:namedtuple".to_string()),
+            "TypedDict" => extra.push("python:typeddict".to_string()),
+            _ => {}
+        }
+    }
+    if is_enum {
+        symbol.kind = SymbolKind::Enum;
+        extra.push("python:enum".to_string());
+        // The kind is encoded in the symbol id; regenerate it so the id, the
+        // kind, and the parent id propagated to members all agree.
+        symbol.id = symbol_id(
+            file,
+            symbol.parent_id.as_ref(),
+            SymbolKind::Enum,
+            &symbol.name,
+            symbol.span,
+        );
+    }
+    if !extra.is_empty() {
+        symbol.attributes.extend(extra);
+        symbol.attributes.sort();
+        symbol.attributes.dedup();
+    }
+}
+
+/// Emit base-class Type references for a reclassified Python `Enum`. The shared
+/// `extract_python_symbol_facts` only does this for `SymbolKind::Class`, so an
+/// enum (reclassified before facts run) would otherwise lose the references to
+/// its `Enum`/`IntEnum`/... bases that a plain class records.
+pub(crate) fn python_refine_symbol_facts(symbol: &ParsedSymbol, ctx: &mut ExtractContext<'_>) {
+    if symbol.kind != SymbolKind::Enum {
+        return;
+    }
+    for base in python_class_bases(&symbol.signature) {
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: Some(symbol.id.clone()),
+            text: base,
+            kind: ReferenceKind::Type,
+            span: symbol.span,
+            provenance: Provenance::new("tree-sitter-python", "enum base reference"),
+        });
+    }
 }
 
 pub(crate) fn extract_python_import(
