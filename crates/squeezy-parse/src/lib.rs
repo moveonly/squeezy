@@ -448,7 +448,7 @@ impl LanguageParser {
             return self.parse_records_serial(records);
         }
 
-        let jobs = records
+        let mut jobs = records
             .iter()
             .cloned()
             .enumerate()
@@ -457,20 +457,30 @@ impl LanguageParser {
                 ParseJob { index, record, old }
             })
             .collect::<Vec<_>>();
-        let chunk_size = jobs.len().div_ceil(worker_count);
+
+        // Hand the jobs to the workers largest-first so that the longest-running
+        // parses are claimed before the cheap ones.  Combined with the shared
+        // work-queue below this is a longest-processing-time schedule, which
+        // keeps every worker busy until the very end instead of stalling on a
+        // single static chunk that happens to contain a big file.
+        jobs.sort_by(|a, b| b.record.size_bytes.cmp(&a.record.size_bytes));
+
+        // Shared work-queue: each idle worker pops the next pending job under a
+        // short-lived lock, then parses outside the lock.  The lock is only held
+        // for the O(1) `pop`, so contention is negligible relative to parse
+        // time, and slow workers no longer leave fast ones idle (no tail stall).
+        let queue = std::sync::Mutex::new(jobs);
         let mut outputs = std::thread::scope(|scope| {
+            let queue = &queue;
             let mut handles = Vec::with_capacity(worker_count);
-            let mut remaining_jobs = jobs;
-            while !remaining_jobs.is_empty() {
-                let split_at = remaining_jobs.len().saturating_sub(chunk_size);
-                let chunk = remaining_jobs.split_off(split_at);
-                handles.push(scope.spawn(move || parse_job_chunk(chunk)));
+            for _ in 0..worker_count {
+                handles.push(scope.spawn(move || parse_job_queue(queue)));
             }
 
             let mut outputs = Vec::with_capacity(records.len());
             for handle in handles {
                 match handle.join() {
-                    Ok(Ok(mut chunk_outputs)) => outputs.append(&mut chunk_outputs),
+                    Ok(Ok(mut worker_outputs)) => outputs.append(&mut worker_outputs),
                     Ok(Err(err)) => return Err(err),
                     Err(_) => {
                         return Err(SqueezyError::Parse(
@@ -666,21 +676,40 @@ fn parser_for_language_kind(language: LanguageKind) -> Result<Parser> {
     }
 }
 
-// `parse_job_chunk` uses a chunk-local `ParserPool` so that grammar objects
-// are reused across the files in each parallel chunk.  Reuse across separate
-// `parse_records_parallel` calls is not currently possible because
-// `std::thread::scope` spawns a brand-new OS thread per call, discarding any
-// thread-local state from previous calls.  When a persistent worker-thread
-// pool is introduced the pool should be stored in thread-local storage so
-// that grammar initialisation (an FFI operation, more expensive on Windows)
-// is amortised across workspace refreshes.
-fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
+// `parse_job_queue` uses a worker-local `ParserPool` so that grammar objects
+// are reused across the files this worker pulls off the shared queue.  Reuse
+// across separate `parse_records_parallel` calls is not currently possible
+// because `std::thread::scope` spawns a brand-new OS thread per call,
+// discarding any thread-local state from previous calls.  When a persistent
+// worker-thread pool is introduced the pool should be stored in thread-local
+// storage so that grammar initialisation (an FFI operation, more expensive on
+// Windows) is amortised across workspace refreshes.
+//
+// Each worker repeatedly pops the next pending job from the shared queue and
+// parses it, returning only when the queue is drained.  This is a work-stealing
+// schedule: a worker that finishes a small file immediately claims the next job
+// instead of waiting for a statically assigned chunk, so a single large file no
+// longer leaves the other workers idle at the tail of the batch.
+fn parse_job_queue(queue: &std::sync::Mutex<Vec<ParseJob>>) -> Result<Vec<ParseOutput>> {
     let mut pool = ParserPool::default();
-    let mut outputs = Vec::with_capacity(jobs.len());
-    for job in jobs {
-        outputs.push(parse_record_with_cache(&mut pool, job)?);
+    let mut outputs = Vec::new();
+    loop {
+        // Hold the lock only for the O(1) pop; parse outside it.  A poisoned
+        // queue means a sibling worker already panicked, so surface that as a
+        // parse error rather than propagating the panic.
+        let job = match queue.lock() {
+            Ok(mut guard) => guard.pop(),
+            Err(_) => {
+                return Err(SqueezyError::Parse(
+                    "parallel parse work-queue was poisoned".to_string(),
+                ));
+            }
+        };
+        match job {
+            Some(job) => outputs.push(parse_record_with_cache(&mut pool, job)?),
+            None => return Ok(outputs),
+        }
     }
-    Ok(outputs)
 }
 
 fn parse_record_with_cache(parsers: &mut ParserPool, job: ParseJob) -> Result<ParseOutput> {
