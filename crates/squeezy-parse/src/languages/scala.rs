@@ -300,6 +300,17 @@ fn scala_symbol_from_node(
         // Scala 2 implicit def → implicit conversion candidate.
         attributes.push("scala:implicit-conversion".to_string());
     }
+    if matches!(node_kind, "function_definition" | "function_declaration") {
+        // Companion/object `apply` is a factory; `unapply`/`unapplySeq` is the
+        // extractor invoked by pattern-match deconstruction. Tag them so
+        // factory/extractor sites are queryable and the bare `Type(args)` →
+        // companion `apply` resolution has a marker to dispatch against.
+        match name.as_str() {
+            "apply" => attributes.push("scala:factory".to_string()),
+            "unapply" | "unapplySeq" => attributes.push("scala:extractor".to_string()),
+            _ => {}
+        }
+    }
     if scala_modifier_present(node, ctx.source, "sealed") {
         attributes.push("scala:sealed".to_string());
     }

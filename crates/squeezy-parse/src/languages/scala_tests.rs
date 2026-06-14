@@ -188,3 +188,24 @@ fn emits_unapply_call_for_case_class_pattern() {
     assert_eq!(unapply.arity, 2, "expected arity 2, got {}", unapply.arity);
     assert_eq!(unapply.confidence, Confidence::Heuristic);
 }
+
+#[test]
+fn tags_apply_and_unapply_factory_methods() {
+    // Companion `apply`/`unapply` carry factory/extractor markers so factory and
+    // extractor definition sites are queryable.
+    let parsed = parse_scala(
+        "object Email {\n  def apply(s: String): Email = new Email(s)\n  def unapply(e: Email): Option[String] = Some(e.raw)\n}",
+    );
+    let apply = scala_symbol(&parsed, "apply");
+    assert!(
+        apply.attributes.iter().any(|a| a == "scala:factory"),
+        "expected scala:factory on apply, got {:?}",
+        apply.attributes
+    );
+    let unapply = scala_symbol(&parsed, "unapply");
+    assert!(
+        unapply.attributes.iter().any(|a| a == "scala:extractor"),
+        "expected scala:extractor on unapply, got {:?}",
+        unapply.attributes
+    );
+}
