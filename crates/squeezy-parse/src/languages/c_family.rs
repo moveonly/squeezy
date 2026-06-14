@@ -797,7 +797,7 @@ pub(crate) fn c_family_declaration_is_const(node: Node<'_>, source: &str) -> boo
     let Ok(text) = node_text(node, source) else {
         return false;
     };
-    let head = text.split('=').next().unwrap_or(&text);
+    let head = text.split('=').next().unwrap_or(text);
     ["const", "constexpr", "consteval", "constinit"]
         .iter()
         .any(|keyword| signature_has_keyword(head, keyword))

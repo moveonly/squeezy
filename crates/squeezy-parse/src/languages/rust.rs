@@ -1137,18 +1137,6 @@ pub(crate) fn java_docs_for_node(node: Node<'_>, source: &str) -> Vec<String> {
     docs
 }
 
-pub(crate) fn java_type_inheritance_names(node: Node<'_>, source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    for field in ["superclass", "interfaces"] {
-        if let Some(child) = node.child_by_field_name(field) {
-            collect_java_type_names(child, source, &mut names);
-        }
-    }
-    names.sort();
-    names.dedup();
-    names
-}
-
 pub(crate) fn collect_java_type_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {
     if matches!(
         node.kind(),

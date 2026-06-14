@@ -781,11 +781,11 @@ fn extract_ruby_rails_macro(
             continue;
         }
         emitted_any = true;
-        if is_assoc {
-            if let Some(host) = ctx.symbols.iter_mut().find(|s| s.id == *parent_id) {
-                host.attributes
-                    .push(format!("assoc:{method_name}:{name}"));
-            }
+        if is_assoc
+            && let Some(host) = ctx.symbols.iter_mut().find(|s| s.id == *parent_id)
+        {
+            host.attributes
+                .push(format!("assoc:{method_name}:{name}"));
         }
         if emit_reader {
             push_synthetic_macro_accessor(ctx, parent_id, &name, method_name, span, raw);
