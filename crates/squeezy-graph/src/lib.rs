@@ -3300,11 +3300,26 @@ impl GraphManager {
         // Leave the pending paths queued (already-parsed ones become cheap
         // no-ops on the next pass) and leave `last_refresh` untouched so the
         // next `refresh_before_query` still picks them up immediately.
+        //
+        // Drain by set-difference, not a blanket `clear()`: the watcher runs on
+        // a background thread and can push new paths into the set while this
+        // refresh crawls/parses. Those concurrent events arrived *after* the
+        // snapshot we processed, so clearing everything would silently swallow
+        // them. Remove only the paths we observed at the start of this refresh
+        // and leave anything newer queued for the next pass.
         if !budget_exhausted {
+            let mut live_set_remaining = false;
             if let Ok(mut paths) = self.pending_changed_paths.lock() {
-                paths.clear();
+                paths.retain(|p| !pending_before_crawl.contains(p));
+                live_set_remaining = !paths.is_empty();
             }
-            self.last_refresh = Instant::now();
+            // Advancing `last_refresh` gates both the idle-interval skip and the
+            // debounce skip. Only advance when no concurrent events remain;
+            // otherwise the next `refresh_now` would be debounce-suppressed even
+            // though there is fresh work waiting in the live set.
+            if !live_set_remaining {
+                self.last_refresh = Instant::now();
+            }
         }
         self.build_report.path_conflicts = path_conflicts.clone();
         Ok(RefreshReport {
