@@ -1425,6 +1425,45 @@ impl SemanticGraph {
             .collect()
     }
 
+    /// Breadth-first transitive closure of [`Self::inheritance_direct_subtypes`]:
+    /// every type that inherits from `target` directly or indirectly, up to
+    /// `max_depth` hops (depth 1 = direct subtypes). `target` itself is never
+    /// included, and a `visited` set keyed by `SymbolId` keeps cyclic or
+    /// diamond hierarchies from re-emitting a type or looping forever. Results
+    /// are returned in BFS order (nearest subtypes first); `max_depth == 0`
+    /// yields an empty `Vec`.
+    pub fn inheritance_subtypes_transitive(
+        &self,
+        target: &SymbolId,
+        max_depth: usize,
+    ) -> Vec<GraphSymbol> {
+        let mut out = Vec::new();
+        if max_depth == 0 {
+            return out;
+        }
+        // `visited` tracks every id ever enqueued (including `target`) so a
+        // type reachable by two inheritance paths is emitted once and a cycle
+        // back to an ancestor is dropped.
+        let mut visited = HashSet::from([target.clone()]);
+        let mut frontier = vec![target.clone()];
+        for _ in 0..max_depth {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for current in &frontier {
+                for subtype in self.inheritance_direct_subtypes(current) {
+                    if visited.insert(subtype.id.clone()) {
+                        next.push(subtype.id.clone());
+                        out.push(subtype);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        out
+    }
+
     /// Compute the impact set for a set of changed file IDs. Returns all files
     /// reachable through reverse-import propagation starting from any file
     /// whose exports changed, together with the symbols in those files and any
