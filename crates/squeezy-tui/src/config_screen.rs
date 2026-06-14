@@ -1186,10 +1186,6 @@ impl ConfigScreenState {
     /// values they're about to lose.
     ///
     /// Env-shadowed fields are skipped — reset can't move them.
-    /// Schema kinds we don't yet render in the screen
-    /// (`TableArray`, `ProviderSubTabs`) are also skipped because
-    /// `tier_value_at_path` returns `None` for them and the diff would
-    /// be lossy.
     pub(crate) fn reset_preview(&self, scope: ConfigScope) -> Vec<ResetPreviewEntry> {
         let mut out: Vec<ResetPreviewEntry> = Vec::new();
         for section in CONFIG_SECTIONS {
@@ -1197,13 +1193,7 @@ impl ConfigScreenState {
                 continue;
             }
             for field in section.fields {
-                if matches!(
-                    field.kind,
-                    FieldKind::Info
-                        | FieldKind::TableArray { .. }
-                        | FieldKind::ProviderSubTabs
-                        | FieldKind::Secret { .. }
-                ) {
+                if matches!(field.kind, FieldKind::Info | FieldKind::Secret { .. }) {
                     continue;
                 }
                 let (before, before_src) = self.effective_value_full(field);
@@ -1232,9 +1222,9 @@ impl ConfigScreenState {
     /// so the user confirms against impact, not just a file list.
     ///
     /// Only plain `toml_path` leaves are diffed — the same kinds the Reset
-    /// preview skips (`Info` / `TableArray` / `ProviderSubTabs` / `Secret`,
-    /// plus the runtime-keyed `["*"]` routing/limit rows whose value reads off
-    /// the live config) are left out so the preview never reports a lossy diff.
+    /// preview skips (`Info` / `Secret`, plus the runtime-keyed `["*"]`
+    /// routing/limit rows whose value reads off the live config) are left out
+    /// so the preview never reports a lossy diff.
     /// Env-shadowed fields are skipped — Discard can't move them.
     pub(crate) fn discard_preview(&self) -> Vec<DiscardPreviewEntry> {
         // Re-parse the opening bytes into a tier chain, mirroring the order in
@@ -1261,13 +1251,7 @@ impl ConfigScreenState {
                 continue;
             }
             for field in section.fields {
-                if matches!(
-                    field.kind,
-                    FieldKind::Info
-                        | FieldKind::TableArray { .. }
-                        | FieldKind::ProviderSubTabs
-                        | FieldKind::Secret { .. }
-                ) {
+                if matches!(field.kind, FieldKind::Info | FieldKind::Secret { .. }) {
                     continue;
                 }
                 // Runtime-keyed `["*"]` rows read their value off the live
@@ -1327,8 +1311,7 @@ pub(crate) struct DiscardPreviewEntry {
 
 /// Parse the `FieldValue` for `field` out of a tier's `DocumentMut`.
 /// Returns `None` when the field is unset in this tier or when the leaf
-/// type can't be represented in the current schema (e.g. `TableArray` /
-/// `ProviderSubTabs`).
+/// type can't be represented in the current schema (e.g. `Info` / `Secret`).
 ///
 /// The ten granular permission fields are written to (and so read back
 /// from) `[permissions.custom].<field>`; probe that location first and
@@ -1409,10 +1392,7 @@ fn tier_value_at_explicit_path(
         FieldKind::Path { .. } => value
             .as_str()
             .map(|s| FieldValue::Path(std::path::PathBuf::from(s))),
-        FieldKind::Info
-        | FieldKind::Secret { .. }
-        | FieldKind::ProviderSubTabs
-        | FieldKind::TableArray { .. } => None,
+        FieldKind::Info | FieldKind::Secret { .. } => None,
     }
 }
 
@@ -1648,17 +1628,11 @@ pub(crate) fn open_editor_for(field: &FieldMeta, current: FieldValue) -> FieldEd
             draft: String::new(),
             cursor: 0,
         },
-        // Info / Secret / ProviderSubTabs / TableArray are not opened here —
-        // Info is read-only, the others drop into dedicated sub-modes handled
-        // by `handle_key`. Reaching this arm means a kind slipped past the
-        // editability gate; fall back to a harmless empty text editor.
-        (
-            FieldKind::Info
-            | FieldKind::Secret { .. }
-            | FieldKind::ProviderSubTabs
-            | FieldKind::TableArray { .. },
-            _,
-        ) => FieldEditor::Text {
+        // Info / Secret are not opened here — Info is read-only and Secret
+        // drops into the dedicated secret-entry flow handled by `handle_key`.
+        // Reaching this arm means a kind slipped past the editability gate;
+        // fall back to a harmless empty text editor.
+        (FieldKind::Info | FieldKind::Secret { .. }, _) => FieldEditor::Text {
             draft: String::new(),
             cursor: 0,
         },
@@ -2004,7 +1978,6 @@ pub(crate) fn provider_variant_label(provider: &squeezy_core::ProviderConfig) ->
         P::OpenAiCodex(_) => "openai_codex",
         P::GitHubCopilot(_) => "github_copilot",
         P::OpenAiCompatible(config) => config.preset.as_str(),
-        P::Faux(_) => "faux",
     }
 }
 
@@ -2073,10 +2046,9 @@ pub(crate) fn provider_api_key_env(
         P::Google(c) => Some(("Google", c.api_key_env.clone())),
         P::AzureOpenAi(c) => Some(("Azure OpenAI", c.api_key_env.clone())),
         // Bedrock uses AWS SDK creds; OAuth providers store tokens at
-        // `~/.squeezy/auth/`; the faux provider runs in-process and
-        // has no credential. None of these have an env-var keychain
+        // `~/.squeezy/auth/`. None of these have an env-var keychain
         // entry the screen can write.
-        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
+        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) => None,
         // Ollama can optionally use a bearer token for Cloud / reverse-proxy
         // deployments. Surface the key entry when api_key_env is set.
         P::Ollama(c) => {
@@ -2109,10 +2081,8 @@ pub(crate) fn provider_section_name(
         P::Google(_) => Some("google"),
         P::AzureOpenAi(_) => Some("azure_openai"),
         // OAuth provider credentials live in auth token files, not
-        // provider TOML tables. The faux provider exposes `script`
-        // instead of an api_key, which is handled by the field-level
-        // editor rather than the secret-entry path.
-        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
+        // provider TOML tables.
+        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) => None,
         // Ollama supports an optional inline api_key for Cloud / reverse-proxy
         // deployments; write it under [providers.ollama] like any key-bearing provider.
         P::Ollama(c) => {
@@ -2137,7 +2107,7 @@ pub(crate) fn provider_inline_api_key(provider: &squeezy_core::ProviderConfig) -
         P::Anthropic(c) => c.api_key.clone(),
         P::Google(c) => c.api_key.clone(),
         P::AzureOpenAi(c) => c.api_key.clone(),
-        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
+        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) => None,
         P::Ollama(c) => c.api_key.clone(),
         P::OpenAiCompatible(c) => c.api_key.clone(),
     }

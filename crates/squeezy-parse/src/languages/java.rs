@@ -155,7 +155,7 @@ pub(crate) fn java_symbol_from_node(
 ) -> Option<ParsedSymbol> {
     let kind = match node.kind() {
         "class_declaration" => SymbolKind::Class,
-        "interface_declaration" | "annotation_type_declaration" => SymbolKind::Interface,
+        "interface_declaration" | "annotation_type_declaration" => SymbolKind::Trait,
         "enum_declaration" => SymbolKind::Enum,
         "enum_constant" => SymbolKind::Variant,
         "record_declaration" => SymbolKind::Struct,

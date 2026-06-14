@@ -1460,6 +1460,12 @@ record Helper(String name) {
         parsed
             .symbols
             .iter()
+            .any(|symbol| symbol.name == "Route" && symbol.kind == SymbolKind::Trait)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
             .any(|symbol| symbol.name == "value" && symbol.kind == SymbolKind::Method)
     );
 }

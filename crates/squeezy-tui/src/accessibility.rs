@@ -711,10 +711,6 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         // the key, the same `queue_cycle_condition_by_id` the Ctrl+Right-click
         // drives.
         A::QueueCycleCondition(_) => KeyboardPath::Always("queue overlay v"),
-        // Jump to latest — `TranscriptEnd` (End default) reaches the tail.
-        A::JumpToLatest => KeyboardPath::Keymap(Action::TranscriptEnd),
-        // Scrollbar jump — page scroll keys move the same viewport.
-        A::ScrollbarJump => KeyboardPath::Keymap(Action::ScrollTranscriptPageDown),
         // Minimap turn-rail jump — the jump-navigation keys reach the same
         // "move the viewport to a turn" handler the rail click drives
         // (`jump_to_entry_id`); `JumpNextUserTurn` (Alt+Down default) is the

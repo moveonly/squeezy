@@ -12,7 +12,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use crossterm::event::KeyEvent;
-use crossterm::event::{KeyEventKind, KeyEventState};
+use crossterm::event::{Event, KeyEventKind, KeyEventState, MouseEvent};
+// `KeyModifiers` / `MouseButton` / `MouseEventKind` are only spelled by the
+// `#[cfg(test)]` event builders below, so gate the import to the same config to
+// keep a non-test build free of unused-import warnings.
+#[cfg(test)]
+use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::style::{Color, Modifier};
 use ratatui::{Terminal, backend::TestBackend};
 use squeezy_agent::{Agent, ToolApprovalDecision};
@@ -25,8 +30,8 @@ use tokio::sync::oneshot;
 use crate::{
     Clipboard, PendingMcpElicitation, TranscriptEntryKind, TuiApp, apply_theme_overrides,
     drain_agent_events, drain_job_events, drain_pending_diff, drain_prompt_queue_if_idle,
-    format_mcp_elicitation_status_line, handle_key, handle_slash_command, keymap::parse_keyspec,
-    render, start_user_turn,
+    format_mcp_elicitation_status_line, handle_input_event, handle_key, handle_slash_command,
+    keymap::parse_keyspec, render, start_user_turn,
 };
 
 /// Opaque driver wrapping a TuiApp + Agent + headless terminal.
@@ -295,6 +300,28 @@ impl TuiHarness {
         let want_exit = handle_key(&mut self.app, agent, key).await?;
         self.pump_until_idle().await?;
         Ok(want_exit)
+    }
+
+    /// Inject a single mouse event on the SAME path a real pointer event
+    /// takes. Routes through `handle_input_event` with `Event::Mouse` (the
+    /// production per-event router), not a bare `handle_mouse`, so the
+    /// agent-dependent click follow-ups run identically to a live session: a
+    /// command-palette / theme-editor click arms and drains, and a post-plan
+    /// choice click's armed `plan_choice_click_activate` replays its `Enter`
+    /// against the agent — keeping click → `dispatch_click_action` → agent-drain
+    /// parity with `send_key`. Drains both before and after so the harness sees
+    /// the same "between frames" state the production event loop does. The
+    /// mouse arm of `handle_input_event` always returns `Ok(false)` (a pointer
+    /// never quits), so this returns `()` rather than `send_key`'s exit bool.
+    pub async fn send_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        self.pump_until_idle().await?;
+        let agent = self
+            .agent
+            .as_mut()
+            .expect("agent dropped before harness; this is a bug in TuiHarness");
+        handle_input_event(&mut self.app, agent, Event::Mouse(mouse)).await?;
+        self.pump_until_idle().await?;
+        Ok(())
     }
 
     /// Dispatch a slash command (e.g. `"/config"`, `"/permissions"`,
@@ -742,6 +769,28 @@ pub fn parse_key(spec: &str) -> Option<KeyEvent> {
         kind: KeyEventKind::Press,
         state: KeyEventState::NONE,
     })
+}
+
+/// Build a left-button mouse event at `(col, row)` with no modifiers. Cuts the
+/// repetition of spelling out the full `MouseEvent` shape per click in tests:
+/// pass the `kind` (`Down(Left)` to press, `Drag(Left)` to extend, `Up(Left)`
+/// to release) and the cell. Crate-internal because only the in-crate geometry
+/// tests drive raw pointer cells; the eval driver builds its own events.
+#[cfg(test)]
+pub(crate) fn left_mouse(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column: col,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+/// A left-button press at `(col, row)` — the common case for the geometry
+/// tests, which click an option row or the overlay gutter once.
+#[cfg(test)]
+pub(crate) fn left_down(col: u16, row: u16) -> MouseEvent {
+    left_mouse(MouseEventKind::Down(MouseButton::Left), col, row)
 }
 
 struct NoopClipboard;

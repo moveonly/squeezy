@@ -1015,17 +1015,15 @@ def make():
 }
 
 #[test]
-fn graph_answers_java_navigation_queries() {
+fn graph_answers_java_interface_field_navigation_queries() {
     let mut parser = LanguageParser::new().unwrap();
     let greeter = java_record(
         "src/main/java/com/example/services/Greeter.java",
         r#"
 package com.example.services;
 
-public class Greeter {
-    public String greet(String name) {
-        return name;
-    }
+public interface Greeter {
+    String greet(String name);
 }
 "#,
     );

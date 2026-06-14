@@ -11,9 +11,8 @@ use squeezy_core::{
 };
 
 use crate::{
-    AnthropicProvider, BedrockProvider, FauxProvider, GoogleProvider, LlmInputItem, LlmProvider,
-    LlmRequest, OllamaProvider, OpenAiCodexProvider, OpenAiCompatibleProvider, OpenAiProvider,
-    XaiProvider,
+    AnthropicProvider, BedrockProvider, GoogleProvider, LlmInputItem, LlmProvider, LlmRequest,
+    OllamaProvider, OpenAiCodexProvider, OpenAiCompatibleProvider, OpenAiProvider, XaiProvider,
     limits::{ContextLimitInput, LimitConfidence, LimitSource, resolve_context_limits},
     oauth::GitHubCopilotProvider,
 };
@@ -490,7 +489,6 @@ pub fn provider_name(config: &ProviderConfig) -> &'static str {
         ProviderConfig::OpenAiCodex(_) => "openai_codex",
         ProviderConfig::GitHubCopilot(_) => "github_copilot",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
-        ProviderConfig::Faux(_) => "faux",
     }
 }
 
@@ -523,11 +521,6 @@ pub fn provider_from_config(config: &ProviderConfig) -> Result<Arc<dyn LlmProvid
             OpenAiCompatiblePreset::XAi => Ok(Arc::new(XaiProvider::from_config(config)?)),
             _ => Ok(Arc::new(OpenAiCompatibleProvider::from_config(config)?)),
         },
-        // The faux provider runs entirely in-process. `from_config`
-        // reads the configured script path (when set) and queues its
-        // turns; programmatic callers can also build an empty provider
-        // and `push_step` directly.
-        ProviderConfig::Faux(config) => Ok(Arc::new(FauxProvider::from_config(config)?)),
     }
 }
 

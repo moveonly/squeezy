@@ -26,8 +26,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
-    LlmEvent, LlmHostedTool, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
-    ReasoningKind, ReasoningPayload,
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
+    ReasoningPayload,
     anthropic_error::{NON_RETRYABLE_MARKER, status_is_retryable},
     cache_policy::{CacheRetention, ephemeral_marker, json_markers, last_stable_tool_index},
     credentials::{
@@ -431,12 +431,6 @@ impl OpenAiCompatibleProvider {
         if let Some(effort) = request.reasoning_effort {
             emit_reasoning_hints(&mut body, preset, &request.model, effort);
         }
-        if (preset == OpenAiCompatiblePreset::XAi
-            || classify(&request.model) == CompatFlavor::XaiCompat)
-            && let Some(search_parameters) = xai_search_parameters(&request.hosted_tools)
-        {
-            body["search_parameters"] = search_parameters;
-        }
         if let Some(key) = cache_spec.key.as_deref() {
             // OpenAI's Chat Completions / Responses APIs honor a top-level
             // `prompt_cache_key` that groups requests for prompt-cache
@@ -535,24 +529,6 @@ impl OpenAiCompatibleProvider {
         }
         body
     }
-}
-
-fn xai_search_parameters(hosted_tools: &[Arc<LlmHostedTool>]) -> Option<Value> {
-    hosted_tools.iter().find_map(|tool| match tool.as_ref() {
-        LlmHostedTool::WebSearch { filters } => {
-            let mut params = serde_json::Map::new();
-            if let Some(Value::Object(filters)) = filters {
-                for (key, value) in filters {
-                    params.insert(key.clone(), value.clone());
-                }
-            }
-            params
-                .entry("mode".to_string())
-                .or_insert_with(|| json!("auto"));
-            Some(Value::Object(params))
-        }
-        _ => None,
-    })
 }
 
 /// Coarse classification of an OpenAI-compatible model namespace.

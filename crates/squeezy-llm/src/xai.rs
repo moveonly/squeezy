@@ -111,11 +111,10 @@ impl LlmProvider for XaiProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
-        // H-23: xAI Live Search. The dispatcher keeps the hosted-tool
-        // intent on the full request and lets the selected wire adapter
-        // lower it: Responses appends a `web_search` hosted tool, while
-        // Chat Completions maps it to top-level `search_parameters`.
-        // Citation parsing on the chat path is tracked separately in M-31.
+        // The dispatcher routes by model id: newer Grok families speak the
+        // OpenAI-Responses wire shape, the rest fall back to Chat
+        // Completions, and image-only families are rejected with a
+        // structured error.
         match classify_route(&request.model) {
             XaiRoute::Responses => self.responses.stream_response(request, cancel),
             XaiRoute::Chat => self.chat.stream_response(request, cancel),

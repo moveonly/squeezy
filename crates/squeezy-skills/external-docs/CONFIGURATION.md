@@ -234,7 +234,6 @@ commented examples so that built-in defaults can evolve over time:
 
 [hardening]
 # disable_core_dumps = true
-# deny_debug_attach = true
 
 # [redaction]
 # custom_patterns = []
@@ -497,8 +496,8 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   the approved network request and does not serve cached remote page content
   from the receipt.
 - `[hardening]`: pre-main process hardening. Defaults disable core dumps and,
-  on macOS, request debugger attach denial while removing dynamic-loader and
-  malloc logging environment variables before the TUI or harness runs.
+  on macOS, remove dynamic-loader and malloc logging environment variables
+  before the TUI or harness runs.
 - `[mcp.servers.<name>]`: external MCP server configuration. `transport` is
   `stdio`, `http` (Streamable HTTP), or `sse` (legacy-compatible remote
   stream handling). `stdio` servers use `command`, optional `args`, and

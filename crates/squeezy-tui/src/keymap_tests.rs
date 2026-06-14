@@ -889,6 +889,24 @@ fn open_theme_editor_default_does_not_collide_with_other_actions() {
 }
 
 #[test]
+fn zen_default_is_f10_and_does_not_collide_with_other_actions() {
+    // §12.4.5 Zen toggles with a bare `F10` — a single simple keypress. `F11` is
+    // the only other function key bound by default (the config screen), so `F10`
+    // must shadow nothing.
+    let resolver = KeymapResolver::from_overrides(&BTreeMap::new());
+    assert_eq!(
+        resolver.lookup(KeyCode::F(10), KeyModifiers::NONE),
+        Some(Action::ToggleZenMode),
+    );
+    for collision in resolver.collisions() {
+        assert!(
+            !collision.1.contains(&Action::ToggleZenMode),
+            "zen F10 default collides: {collision:?}",
+        );
+    }
+}
+
+#[test]
 fn open_workspace_profile_round_trips_and_defaults_to_ctrl_alt_w() {
     // §12.7.4 Per-Workspace UI Profile: slug round-trips, is registered in `ALL`
     // (so `/keymap` and the command palette list it and overrides can target it),

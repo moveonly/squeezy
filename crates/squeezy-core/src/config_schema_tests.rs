@@ -435,6 +435,32 @@ fn context_section_fields_round_trip() {
 }
 
 #[test]
+fn anthropic_beta_opt_in_fields_round_trip_and_default_off() {
+    let models = section(SectionId::Models).expect("Models section must be registered");
+    for label in ["context_1m", "extended_thinking"] {
+        let field = models
+            .fields
+            .iter()
+            .find(|f| f.label == label)
+            .unwrap_or_else(|| panic!("Models section exposes {label}"));
+        assert!(matches!(field.kind, FieldKind::Bool), "{label} is a bool");
+        assert_eq!(
+            (field.default)(),
+            FieldValue::Bool(false),
+            "{label} defaults off"
+        );
+        assert_eq!(
+            (field.get)(&AppConfig::default()),
+            FieldValue::Bool(false),
+            "{label} off in a default config"
+        );
+        let mut cfg = AppConfig::default();
+        (field.set)(&mut cfg, FieldValue::Bool(true)).unwrap();
+        assert_eq!((field.get)(&cfg), FieldValue::Bool(true), "{label}");
+    }
+}
+
+#[test]
 fn context_percent_setters_reject_out_of_range() {
     let ctx = section(SectionId::Context).unwrap();
     let pct = ctx

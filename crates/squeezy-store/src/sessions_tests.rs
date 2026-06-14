@@ -2892,7 +2892,6 @@ fn bundle_rollout_trace_merges_events_and_replay_by_timestamp() {
         turn_id: Some("turn-1".to_string()),
         summary: Some("find a bug".to_string()),
         payload: json!({"text": "find a bug"}),
-        parent_event_sequence: None,
     }));
     events_jsonl.extend(event_line(&SessionEvent {
         ts_unix_ms: 300,
@@ -2900,7 +2899,6 @@ fn bundle_rollout_trace_merges_events_and_replay_by_timestamp() {
         turn_id: Some("turn-1".to_string()),
         summary: Some("done".to_string()),
         payload: json!({"text": "done", "response_id": "resp_1"}),
-        parent_event_sequence: None,
     }));
     fs::write(&events_path, events_jsonl).expect("write events.jsonl");
 
@@ -3244,145 +3242,6 @@ fn memory_path_uses_windows_userprofile_fallback_when_home_and_appdata_unset() {
     }
     assert_eq!(path, Some(profile.join(".squeezy").join("memory.md")));
     let _ = fs::remove_dir_all(&profile);
-}
-
-fn raw_event(
-    ts_unix_ms: u64,
-    kind: &str,
-    summary: Option<&str>,
-    parent_event_sequence: Option<u64>,
-) -> SessionEvent {
-    SessionEvent {
-        ts_unix_ms,
-        kind: kind.to_string(),
-        turn_id: None,
-        summary: summary.map(str::to_string),
-        payload: json!({}),
-        parent_event_sequence,
-    }
-}
-
-#[test]
-fn session_event_omits_parent_when_none_on_serialise() {
-    let event = SessionEvent::new("user_message", None, Some("hi".to_string()), json!({}));
-    let body = serde_json::to_string(&event).expect("serialise");
-    assert!(
-        !body.contains("parent_event_sequence"),
-        "linear events stay byte-identical: {body}",
-    );
-}
-
-#[test]
-fn session_event_round_trips_parent_event_sequence() {
-    let event = SessionEvent::new("user_message", None, Some("retry".to_string()), json!({}))
-        .with_parent_event_sequence(2);
-    let body = serde_json::to_string(&event).expect("serialise");
-    assert!(body.contains("parent_event_sequence"));
-    let parsed: SessionEvent = serde_json::from_str(&body).expect("deserialise");
-    assert_eq!(parsed.parent_event_sequence, Some(2));
-}
-
-#[test]
-fn session_event_deserialises_legacy_payload_without_parent_field() {
-    let legacy = json!({
-        "ts_unix_ms": 1_700_000_000_000_u64,
-        "kind": "user_message",
-        "turn_id": null,
-        "summary": "legacy",
-        "payload": {"text": "legacy"},
-    });
-    let event: SessionEvent = serde_json::from_value(legacy).expect("legacy deserialise");
-    assert_eq!(event.parent_event_sequence, None);
-}
-
-#[test]
-fn detect_branches_returns_empty_for_linear_log() {
-    let events = vec![
-        raw_event(10, "user_message", Some("q1"), None),
-        raw_event(20, "assistant_completed", Some("a1"), None),
-        raw_event(30, "user_message", Some("q2"), None),
-        raw_event(40, "assistant_completed", Some("a2"), None),
-    ];
-    assert!(detect_branches(&events).is_empty());
-}
-
-#[test]
-fn detect_branches_returns_empty_for_single_or_zero_events() {
-    assert!(detect_branches(&[]).is_empty());
-    let one = vec![raw_event(10, "user_message", Some("q1"), None)];
-    assert!(detect_branches(&one).is_empty());
-}
-
-#[test]
-fn detect_branches_finds_both_paths_when_user_reprompts() {
-    // Tree (linear unless noted):
-    //   0 user "q1"
-    //   1 assistant "a1"
-    //   2 user "q2 (path A)"      -> linear child of 1
-    //   3 assistant "a2-A"
-    //   4 user "q2 (path B)"      -> branched off 1 (re-prompt)
-    //   5 assistant "a2-B"
-    let events = vec![
-        raw_event(10, "user_message", Some("q1"), None),
-        raw_event(20, "assistant_completed", Some("a1"), None),
-        raw_event(30, "user_message", Some("q2 path A"), None),
-        raw_event(40, "assistant_completed", Some("a2 A"), None),
-        raw_event(50, "user_message", Some("q2 path B"), Some(1)),
-        raw_event(60, "assistant_completed", Some("a2 B"), None),
-    ];
-
-    let tips = detect_branches(&events);
-    assert_eq!(tips.len(), 2, "two leaves expected: {tips:?}");
-
-    // Newest tip first.
-    let tip_b = &tips[0];
-    let tip_a = &tips[1];
-    assert_eq!(tip_b.tip_sequence, 5);
-    assert_eq!(tip_b.branched_from_sequence, 1);
-    assert_eq!(
-        tip_b.first_message_after_branch.as_deref(),
-        Some("q2 path B"),
-    );
-    assert_eq!(tip_a.tip_sequence, 3);
-    assert_eq!(tip_a.branched_from_sequence, 1);
-    assert_eq!(
-        tip_a.first_message_after_branch.as_deref(),
-        Some("q2 path A"),
-    );
-}
-
-#[test]
-fn detect_branches_handles_three_way_fork() {
-    // 0 -> 1 -> { 2 (linear), 3 (branch), 4 (branch) }
-    let events = vec![
-        raw_event(10, "user_message", Some("root"), None),
-        raw_event(20, "assistant_completed", Some("a1"), None),
-        raw_event(30, "user_message", Some("path-1"), None),
-        raw_event(31, "user_message", Some("path-2"), Some(1)),
-        raw_event(32, "user_message", Some("path-3"), Some(1)),
-    ];
-    let tips = detect_branches(&events);
-    assert_eq!(tips.len(), 3);
-    let sequences: Vec<u64> = tips.iter().map(|t| t.tip_sequence).collect();
-    assert!(sequences.contains(&2));
-    assert!(sequences.contains(&3));
-    assert!(sequences.contains(&4));
-    for tip in &tips {
-        assert_eq!(tip.branched_from_sequence, 1);
-    }
-}
-
-#[test]
-fn detect_branches_ignores_self_or_out_of_range_parent() {
-    // Self-parent and a forward-pointing parent are both treated as the
-    // implicit linear parent so a malformed log still produces a sane
-    // tree (and no spurious "branch").
-    let events = vec![
-        raw_event(10, "user_message", Some("q1"), None),
-        raw_event(20, "assistant_completed", Some("a1"), Some(1)),
-        raw_event(30, "user_message", Some("q2"), Some(99)),
-    ];
-    assert!(detect_branches(&events).is_empty());
 }
 
 /// Seed a session directory under the store root without going through

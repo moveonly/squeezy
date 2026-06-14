@@ -31,6 +31,13 @@ impl DesktopNotifier {
         Self { method }
     }
 
+    /// Swap the active backend when `[tui].desktop_notifications` changes via
+    /// `/config` or an external settings edit, so a reload takes effect without
+    /// a restart.
+    pub(crate) fn set_method(&mut self, method: NotificationMethod) {
+        self.method = method;
+    }
+
     /// Effective backend after resolving `Auto` against the running
     /// terminal. Returns `None` when notifications are disabled.
     pub(crate) fn resolved(&self) -> Option<NotificationMethod> {

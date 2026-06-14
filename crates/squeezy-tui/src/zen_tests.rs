@@ -82,15 +82,19 @@ fn persist_round_trips_through_from_persisted() {
 #[test]
 fn minimal_status_names_the_mode_and_the_way_out() {
     let zen = ZenMode::from_persisted(Some(true));
-    let line = zen.minimal_status("openai:gpt-test");
+    let line = zen.minimal_status("openai:gpt-test", "Ctrl+Alt+.");
     assert!(line.contains("zen"), "names the mode: {line}");
     assert!(
         line.contains("openai:gpt-test"),
         "threads the session label: {line}"
     );
     assert!(
-        line.contains("Ctrl+Alt+.") && line.contains("click"),
-        "names both ways out so the exit is always on screen: {line}"
+        line.contains("Ctrl+Alt+.") && line.contains("exit"),
+        "names the keyboard way out so the exit is always on screen: {line}"
+    );
+    assert!(
+        !line.contains("click"),
+        "zen is keyboard-driven, not a click affordance: {line}"
     );
 }
 
@@ -99,7 +103,7 @@ fn minimal_status_degrades_without_a_label() {
     let zen = ZenMode::from_persisted(Some(true));
     // An empty / whitespace label drops the separator rather than printing a
     // dangling `zen ·  — …` with a bare middle dot.
-    let line = zen.minimal_status("   ");
+    let line = zen.minimal_status("   ", "Ctrl+Alt+.");
     assert!(line.starts_with("zen"), "still names the mode: {line}");
     assert!(
         !line.contains('\u{00b7}'),

@@ -11,14 +11,10 @@ and extension-runtime ideas that remain out of scope.
 
 ## Implemented surface
 
-The internal hook system has two layers:
-
-- `AgentHook` / `AgentHookBus`: typed integration hooks for Squeezy-owned
-  extensions that can mutate request, tool-call, and tool-result views.
-- `HookRegistry` / `HookHandler`: event-indexed dispatch used by skill hook
-  scripts and current agent dispatch sites. Handlers registered via
-  `register_for_event` are dispatched in O(matching handlers); handlers
-  registered via `register` observe all events.
+The internal hook system is built on `HookRegistry` / `HookHandler`:
+event-indexed dispatch used by skill hook scripts and current agent dispatch
+sites. Handlers registered via `register_for_event` are dispatched in
+O(matching handlers); handlers registered via `register` observe all events.
 
 The skill hook frontmatter parser accepts all internal hook events (PascalCase
 or snake_case aliases): `PreTurn`, `PreToolUse`, `PostToolUse`,
@@ -30,7 +26,7 @@ Enforcement semantics apply only to `PreToolUse` and `PermissionRequest`: a
 non-zero hook exit blocks the action. All other events are observation-only
 from the skill hook surface — a non-zero exit is logged but does not affect
 the outcome. Skill hook stdout is always ignored; mutations are only available
-to typed in-process `AgentHook` handlers.
+to in-process `HookHandler`s via `HookResult::mutate`.
 
 Skill hook commands run through `/bin/sh -c` (absolute path on POSIX, `sh` on
 Windows) from the skill directory with `SQUEEZY_SKILL_DIR` and
@@ -71,8 +67,8 @@ instructions before issuing requests. The durable local sources include:
   `ContextCompactionConfig::user_memory_max_bytes`.
 - Repo profile: generated machine-local repo facts from `~/.squeezy/repos.toml`.
 
-`PreTurn` typed handlers may append `extra_instructions`, and
-`UserPromptSubmit` typed handlers may rewrite the prompt. Skill shell hooks do
+In-process `PreTurn` handlers may append `extra_instructions`, and
+`UserPromptSubmit` handlers may rewrite the prompt. Skill shell hooks do
 not currently expose those mutations because their stdout is ignored.
 
 ## Still out of scope

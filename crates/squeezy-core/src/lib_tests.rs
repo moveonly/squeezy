@@ -93,6 +93,57 @@ fn context_attachment_detection_routes_canonical_images_to_vision_kind() {
 }
 
 #[test]
+fn context_attachment_detection_routes_binary_documents_by_extension() {
+    // Binary office/PDF extensions route to the document pipeline so the
+    // bytes can fan into an `LlmInputItem::Document` instead of being
+    // dropped as `UnsupportedBinary`.
+    for label in [
+        "report.PDF",
+        "memo.docx",
+        "sheet.xlsx",
+        "legacy.doc",
+        "old.xls",
+    ] {
+        assert_eq!(
+            detect_context_attachment_kind(Some(label), b"%PDF binary", None),
+            ContextAttachmentKind::Document,
+            "{label} must route to the document kind"
+        );
+    }
+    assert!(ContextAttachmentKind::Document.is_routable_document());
+    assert!(!ContextAttachmentKind::Document.is_supported_text());
+    // Text-like document extensions deliberately fall through to the
+    // existing text classification (their readable content is embedded).
+    assert_eq!(
+        detect_context_attachment_kind(
+            Some("notes.md"),
+            b"# Notes\nbody\n",
+            Some("# Notes\nbody\n")
+        ),
+        ContextAttachmentKind::Text
+    );
+}
+
+#[test]
+fn detect_binary_document_media_type_maps_known_extensions() {
+    assert_eq!(
+        detect_binary_document_media_type(Some("report.pdf")),
+        Some("application/pdf")
+    );
+    assert_eq!(
+        detect_binary_document_media_type(Some("MEMO.DOCX")),
+        Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    );
+    assert_eq!(
+        detect_binary_document_media_type(Some("data.xlsx")),
+        Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    );
+    assert_eq!(detect_binary_document_media_type(Some("notes.md")), None);
+    assert_eq!(detect_binary_document_media_type(Some("noext")), None);
+    assert_eq!(detect_binary_document_media_type(None), None);
+}
+
+#[test]
 fn detect_image_mime_recognises_each_vision_format() {
     assert_eq!(
         detect_image_mime(b"\x89PNG\r\n\x1a\nrest"),
@@ -195,7 +246,6 @@ fn config_without_env_uses_openai_provider_defaults() {
     );
     assert_eq!(config.session_mode, SessionMode::Build);
     assert!(config.hardening.disable_core_dumps);
-    assert!(config.hardening.deny_debug_attach);
     assert!(!config.store_responses);
     assert!(config.exploration_graph);
     assert_eq!(config.max_parallel_tools, DEFAULT_MAX_PARALLEL_TOOLS);
@@ -770,7 +820,6 @@ protected_metadata_names = [".git", ".meta"]
 
 [hardening]
 disable_core_dumps = false
-deny_debug_attach = false
 "#,
         "test",
     )
@@ -808,7 +857,6 @@ deny_debug_attach = false
         Some(Path::new("docs/approval.md"))
     );
     assert!(!config.hardening.disable_core_dumps);
-    assert!(!config.hardening.deny_debug_attach);
 
     let inspect = config.inspect_redacted();
     assert!(inspect.contains("[permissions.ai_reviewer]"));
@@ -816,6 +864,39 @@ deny_debug_attach = false
     assert!(inspect.contains("mode = \"external\""));
     assert!(inspect.contains("[hardening]"));
     SettingsFile::from_toml_str(&inspect, "round-trip").expect("inspect parses");
+}
+
+#[test]
+fn anthropic_beta_opt_ins_parse_default_off_and_round_trip() {
+    // Default: both off.
+    let default_config = AppConfig::from_env_vars(None, |_| None);
+    assert!(!default_config.context_1m);
+    assert!(!default_config.extended_thinking);
+
+    // TOML `[model]` flags flow through.
+    let settings = SettingsFile::from_toml_str(
+        "[model]\ncontext_1m = true\nextended_thinking = true\n",
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert!(config.context_1m);
+    assert!(config.extended_thinking);
+
+    // The redacted inspect dump is round-trippable.
+    let inspect = config.inspect_redacted();
+    assert!(inspect.contains("context_1m = true"));
+    assert!(inspect.contains("extended_thinking = true"));
+    SettingsFile::from_toml_str(&inspect, "round-trip").expect("inspect parses");
+
+    // Env overrides win over an unset TOML value.
+    let env_config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_CONTEXT_1M" => Some("true".to_string()),
+        "SQUEEZY_EXTENDED_THINKING" => Some("on".to_string()),
+        _ => None,
+    });
+    assert!(env_config.context_1m);
+    assert!(env_config.extended_thinking);
 }
 
 #[test]
@@ -6785,6 +6866,38 @@ fn check_settings_file_permissions_follows_symlink_target() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(!issues.is_empty());
     assert_eq!(issues[0].path, link);
+}
+
+#[test]
+fn early_hardening_config_honors_settings_and_falls_back_safely() {
+    let dir = std::env::temp_dir().join(format!("squeezy-early-harden-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("settings.toml");
+
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", path.to_str().unwrap()) };
+
+    // Explicit toggles in the `[hardening]` table are honored.
+    std::fs::write(&path, b"[hardening]\ndisable_core_dumps = false\n").unwrap();
+    let config = early_hardening_config();
+    assert!(!config.disable_core_dumps);
+
+    // A file without a `[hardening]` section keeps the safe defaults.
+    std::fs::write(&path, b"[model]\n").unwrap();
+    let config = early_hardening_config();
+    assert_eq!(config, HardeningConfig::default());
+
+    // A missing file keeps the safe defaults.
+    std::fs::remove_file(&path).unwrap();
+    let config = early_hardening_config();
+    assert_eq!(config, HardeningConfig::default());
+
+    unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") };
+    drop(_env_guard);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(config, HardeningConfig::default());
 }
 
 /// Guard that PROVIDER_OPTIONS in the config schema covers every provider

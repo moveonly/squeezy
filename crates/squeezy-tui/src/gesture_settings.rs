@@ -144,8 +144,10 @@ impl GestureSettings {
     pub(crate) const SCROLL_MAX: u8 = 10;
     /// Minimum / maximum hover dwell. The floor keeps the dwell perceptible (so a
     /// sweep across targets does not flicker affordances); the ceiling keeps it
-    /// from feeling broken.
-    pub(crate) const DWELL_MIN: u16 = 0;
+    /// from feeling broken. A `0` floor defeated the stable-intent debounce
+    /// entirely — the preview popped on essentially every pointer cell — so the
+    /// floor is a small non-zero value.
+    pub(crate) const DWELL_MIN: u16 = 40;
     pub(crate) const DWELL_MAX: u16 = 1000;
     /// The amount a single +/- nudge moves the dwell, so a few presses span the
     /// useful range without a press-per-millisecond grind.

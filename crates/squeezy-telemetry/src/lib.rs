@@ -3121,11 +3121,6 @@ pub enum ProviderKind {
     OpenAiCompatible,
     OpenAiCodex,
     GitHubCopilot,
-    /// In-process faux provider used by the eval harness and tests.
-    /// Reported alongside the real provider kinds so telemetry stays
-    /// honest about which sessions touched the network and which ran
-    /// against scripted fixtures.
-    Faux,
 }
 
 impl ProviderKind {
@@ -3161,7 +3156,6 @@ impl ProviderKind {
                 OpenAiCompatiblePreset::CloudflareAiGateway => Self::CloudflareAiGateway,
                 OpenAiCompatiblePreset::Custom => Self::OpenAiCompatible,
             },
-            ProviderConfig::Faux(_) => Self::Faux,
         }
     }
 }

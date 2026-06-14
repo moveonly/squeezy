@@ -97,17 +97,20 @@ impl ZenMode {
     }
 
     /// The terse one-line state zen paints where the detailed status block used to
-    /// sit. Names the mode and the way out (keyboard verb + click) so the way back
-    /// is always on screen — the spec's "minimal one-line state". `label` is the
-    /// short session descriptor the caller threads in (e.g. `provider:model`);
-    /// when empty the line degrades to just the mode + exit hint.
+    /// sit. Names the mode and the keyboard way out so the way back is always on
+    /// screen — the spec's "minimal one-line state". `label` is the short session
+    /// descriptor the caller threads in (e.g. `provider:model`); `exit_hint` is the
+    /// resolved keyboard shortcut for the zen toggle (e.g. `Ctrl+Alt+.`), so the
+    /// line stays correct under rebinds. When `label` is empty the line degrades to
+    /// just the mode + exit hint. Zen is keyboard-driven (and toggleable from
+    /// `/config`); the line is deliberately not a click affordance.
     #[must_use]
-    pub(crate) fn minimal_status(self, label: &str) -> String {
+    pub(crate) fn minimal_status(self, label: &str, exit_hint: &str) -> String {
         let label = label.trim();
         if label.is_empty() {
-            "zen — Ctrl+Alt+. / click to exit".to_string()
+            format!("zen — {exit_hint} to exit")
         } else {
-            format!("zen · {label} — Ctrl+Alt+. / click to exit")
+            format!("zen · {label} — {exit_hint} to exit")
         }
     }
 }
