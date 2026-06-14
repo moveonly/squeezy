@@ -5301,6 +5301,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
         ),
         thoroughness: None,
         system_override: None,
+        model_override: None,
     };
     let mut all_tool_specs = core_control_tools(
         &deps.config.subagents,
@@ -7645,6 +7646,36 @@ impl TurnRuntime {
         }
         if on_cheap_turn {
             broker.metrics.routed_to_cheap = true;
+            // Cache isolation FIRST: rather than switch the main loop to the cheap
+            // model (which cold-rewrites the parent's prompt cache on any later
+            // escalation), run the scoped cheap work in a subagent on its own
+            // cache namespace while the main loop stays pinned to the parent.
+            // Engaged per `[routing].cache_isolation` (default Auto: only when the
+            // prefix is large enough to pay for it). On success the subagent's
+            // summary is the answer and the turn finishes here, emitting only the
+            // `⇄ isolated` note — no redundant `↓ rerouted` note. Otherwise we
+            // fall through to announcing the reroute and running the in-loop cheap
+            // turn.
+            let caching_supported = capabilities_for(self.provider.name(), &parent_model_str)
+                .is_some_and(|caps| caps.prompt_caching);
+            let prefix_tokens = estimate_context(&conversation).estimated_tokens;
+            if turn_router::should_isolate(&self.config.routing, prefix_tokens, caching_supported)
+                && self
+                    .run_isolated_cheap_turn(
+                        &task_title,
+                        &current_model,
+                        &parent_model_str,
+                        &mut conversation,
+                        &mut broker,
+                        &mut total_cost,
+                        user_transcript.clone(),
+                        context_compaction.clone(),
+                    )
+                    .await
+                    .is_some()
+            {
+                return Ok(());
+            }
             if let Some(reason_label) = decision.reason_label() {
                 self.telemetry
                     .spawn(TelemetryEvent::routing_routed(&reason_label));
@@ -7669,36 +7700,6 @@ impl TurnRuntime {
                         effort,
                     })
                     .await;
-            }
-        }
-        // Cache isolation: rather than switch the main loop to the cheap model
-        // (which cold-rewrites the parent's prompt cache on any later
-        // escalation), run the scoped cheap work in a subagent on its own cache
-        // namespace while the main loop stays pinned to the parent. Engaged per
-        // `[routing].cache_isolation` (default Auto: only when the prefix is
-        // large enough to pay for it). On success the subagent's summary is the
-        // answer and the turn finishes here; otherwise we fall through to the
-        // normal in-loop cheap turn.
-        if on_cheap_turn {
-            let caching_supported = capabilities_for(self.provider.name(), &parent_model_str)
-                .is_some_and(|caps| caps.prompt_caching);
-            let prefix_tokens = estimate_context(&conversation).estimated_tokens;
-            if turn_router::should_isolate(&self.config.routing, prefix_tokens, caching_supported)
-                && self
-                    .run_isolated_cheap_turn(
-                        &task_title,
-                        &current_model,
-                        &parent_model_str,
-                        &mut conversation,
-                        &mut broker,
-                        &total_cost,
-                        user_transcript.clone(),
-                        context_compaction.clone(),
-                    )
-                    .await
-                    .is_some()
-            {
-                return Ok(());
             }
         }
         let mut escalation_state = turn_router::EscalationState::default();
@@ -9662,7 +9663,7 @@ impl TurnRuntime {
         parent_model_str: &str,
         conversation: &mut Vec<LlmInputItem>,
         broker: &mut CostBroker,
-        total_cost: &CostSnapshot,
+        total_cost: &mut CostSnapshot,
         user_transcript: TranscriptItem,
         context_compaction: ContextCompactionState,
     ) -> Option<()> {
@@ -9697,6 +9698,8 @@ impl TurnRuntime {
             scope: None,
             thoroughness: None,
             system_override: None,
+            // Run the exact rung the router chose (weak or mid), not always weak.
+            model_override: Some(cheap_model.to_string()),
         };
         let execution = run_subagent(&ctx, SubagentKind::Routed, request, None).await;
 
@@ -9736,6 +9739,17 @@ impl TurnRuntime {
         broker.metrics.routing_cheap_main_provider = execution.metrics.provider.clone();
         self.stamp_routing_savings(&mut broker.metrics);
 
+        // Fold the subagent's spend into the turn's headline cost and the
+        // session cap basis so an isolated turn doesn't read as ~$0. Out-of-band
+        // ONLY: the spend is already in the model ledger (CostOrigin::Subagent)
+        // and `metrics.subagent_provider`, so we must NOT re-record the ledger or
+        // `broker.metrics.provider` — that would push the `/cost` Σ above the
+        // headline. Mirrors the AI-reviewer out-of-band accounting.
+        merge_cost(total_cost, &execution.metrics.provider);
+        broker.record_out_of_band_session_cost(
+            execution.metrics.provider.estimated_usd_micros.unwrap_or(0),
+        );
+
         let summary = execution.summary;
         conversation.push(redact_input_item(
             LlmInputItem::AssistantText(summary.clone()),
@@ -9763,7 +9777,7 @@ impl TurnRuntime {
             response_id: None,
             user: user_transcript,
             assistant: message.clone(),
-            cost: total_cost,
+            cost: &*total_cost,
             metrics: &broker.metrics,
             context_compaction,
             token_calibration: broker.calibration.clone(),
@@ -11047,6 +11061,11 @@ struct SubagentRequest {
     /// [`SubagentKind::Skill`] so a fork-mode skill body becomes the
     /// subagent's system instructions verbatim; other kinds ignore it.
     system_override: Option<String>,
+    /// Explicit model the subagent must run, overriding `subagent_model_for_kind`.
+    /// Set by cache-isolation (`SubagentKind::Routed`) so the routed subagent
+    /// runs the exact rung the router chose (weak OR mid), not always the weak
+    /// tier. `None` lets the kind's default model resolution apply.
+    model_override: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -11579,6 +11598,8 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
         // Skill subagents reaching this path through `delegate`-style
         // wiring would inherit the kind's default instructions.
         system_override: None,
+        // Model is resolved per-kind for tool-call-driven subagents.
+        model_override: None,
     })
 }
 
@@ -11625,7 +11646,14 @@ async fn run_subagent(
     // Subagent inherits the parent's per-round result-bytes cap directly.
     // The previous `.min(24_000)` halved the budget for a subagent that
     // already had fewer tool calls to spend.
-    let model = subagent_model_for_kind(parent.provider.name(), &config, kind);
+    // An explicit `model_override` (cache-isolation passes the exact routed
+    // rung) wins; otherwise resolve the kind's default model.
+    let model = match request.model_override.as_deref() {
+        Some(override_model) => {
+            resolve_model_alias_owned(parent.provider.name(), override_model.to_string())
+        }
+        None => subagent_model_for_kind(parent.provider.name(), &config, kind),
+    };
     config.model = model.clone();
 
     let allowed_tools = subagent_allowed_tools(parent.all_tool_specs, kind);
@@ -11710,6 +11738,19 @@ async fn run_subagent(
             // see the subagent's tool churn without seeing its raw
             // events.
             let Some(id) = activity_id else {
+                // A cache-isolated (Routed) turn carries no activity card: its
+                // assistant prose IS the turn's answer, so stream each delta
+                // straight to the parent transcript under the parent's turn id,
+                // exactly as an in-loop turn would. All other raw events from a
+                // card-less subagent stay hidden.
+                if let AgentEvent::AssistantDelta { delta, .. } = event {
+                    let _ = parent_tx
+                        .send(AgentEvent::AssistantDelta {
+                            turn_id: parent_turn_id,
+                            delta,
+                        })
+                        .await;
+                }
                 continue;
             };
             // A completed tool's structured result is forwarded so the parent
@@ -12134,6 +12175,19 @@ async fn run_subagent_rounds(
                     let chunk = assistant_stream.push(&delta);
                     if !chunk.text.is_empty() {
                         assistant_message.push_str(&chunk.text);
+                        // Stream the redacted prose up to the parent so a cache-
+                        // isolated (Routed) turn renders live, exactly like an
+                        // in-loop turn. The drain forwards this only for the
+                        // isolated turn (which has no activity card); surfaced
+                        // subagents drop it behind their compact activity line.
+                        // Best-effort `try_send` never stalls the stream on drain
+                        // backpressure — the terminal `Completed` replaces the
+                        // pending text in full, so a dropped delta costs only a
+                        // little live smoothness, never correctness.
+                        let _ = hidden_tx.try_send(AgentEvent::AssistantDelta {
+                            turn_id: parent.turn_id,
+                            delta: chunk.text,
+                        });
                     }
                 }
                 LlmEvent::ReasoningDelta { .. } => {}

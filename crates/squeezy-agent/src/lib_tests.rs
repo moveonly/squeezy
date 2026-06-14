@@ -8486,6 +8486,7 @@ fn skill_subagent_uses_system_override_as_instructions() {
         scope: None,
         thoroughness: None,
         system_override: Some("# Skill body\nFollow these steps exactly.".to_string()),
+        model_override: None,
     };
     let instructions = super::subagent_instructions(SubagentKind::Skill, &request);
     assert!(
@@ -8501,6 +8502,7 @@ fn skill_subagent_falls_back_when_system_override_missing() {
         scope: None,
         thoroughness: None,
         system_override: None,
+        model_override: None,
     };
     let instructions = super::subagent_instructions(SubagentKind::Skill, &request);
     assert!(
@@ -8516,6 +8518,7 @@ fn plan_subagent_instructions_advertise_json_tail_contract() {
         scope: None,
         thoroughness: None,
         system_override: None,
+        model_override: None,
     };
     let plan = super::subagent_instructions(SubagentKind::Plan, &request);
     assert!(
