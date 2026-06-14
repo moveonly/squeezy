@@ -19,22 +19,13 @@
 //! falls back to the cached user credentials laid down by `gcloud
 //! auth application-default login` (the documented ADC chain).
 //!
-//! Status: NOT-YET-WIRED building block. This module deliberately
-//! does **not** wire itself into the Vertex preset — the preset's
-//! `from_config` path still calls `static_api_key_source`
-//! (`compatible.rs:227`). Switching the preset over is a product
-//! decision deferred to Phase 4I, not a review fix, so the type lives
-//! here ready to be dropped in without rewriting the call site.
-//!
-//! Because nothing internal calls [`VertexOAuthSource`] yet, the only
-//! reason it isn't flagged as dead code is that it (and
-//! [`DEFAULT_GCLOUD_COMMAND`] / [`GCLOUD_PRINT_TOKEN_ARGS`]) are `pub`
-//! and re-exported from `oauth.rs`, which counts as a use. That
-//! re-export is intentional: it keeps the building block on the public
-//! surface (and exercised by `vertex_tests.rs`) until Phase 4I wires it
-//! in. Do not add a `#[allow(dead_code)]` to silence a warning here —
-//! if one appears, the correct move is to wire the source in, not to
-//! suppress it.
+//! Status: wired for the Vertex preset when `use_oauth` is enabled.
+//! `OpenAiCompatibleProvider::from_config` constructs a
+//! [`VertexOAuthSource`] for that mode, while non-OAuth Vertex requests
+//! still use the static key source path for explicit bearer tokens.
+//! The source is also re-exported from `oauth.rs` and exercised by
+//! `vertex_tests.rs` so callers can test or customize the command path
+//! directly.
 
 use std::path::PathBuf;
 use std::process::Stdio;
