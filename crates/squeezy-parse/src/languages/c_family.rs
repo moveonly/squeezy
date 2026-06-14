@@ -250,6 +250,11 @@ pub(crate) fn c_family_symbol_from_node(
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let mut attributes = c_family_attributes_for_node(node, kind, &signature);
     attributes.extend(c_family_base_class_attributes(node, kind, ctx.source));
+    if matches!(kind, SymbolKind::Function | SymbolKind::Method)
+        && let Some(role) = c_family_special_member_role(node, &name, ctx.source)
+    {
+        attributes.push(role.to_string());
+    }
     attributes.sort();
     attributes.dedup();
     let confidence = c_family_symbol_confidence(node, &attributes);
@@ -705,6 +710,99 @@ pub(crate) fn c_declarator_inner_is_function_name(node: Node<'_>) -> bool {
 pub(crate) fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).next()
+}
+
+/// Classify a C++ special member declaration (constructor, destructor,
+/// operator, or conversion operator) by inspecting its declarator shape and,
+/// for constructors, comparing the member name against the enclosing class.
+///
+/// - `operator_cast` declarator (`operator int()`) → conversion operator.
+/// - `operator_name` declarator (`operator+`) → operator overload.
+/// - `destructor_name` declarator or a leading `~` → destructor.
+/// - member name equal to the enclosing `class`/`struct`/`union` name and not
+///   an operator/destructor → constructor.
+///
+/// Returns the role attribute string, mirroring Dart's `dart:constructor` /
+/// `dart:operator` markers so `decl_search` can filter C++ special members.
+pub(crate) fn c_family_special_member_role(
+    node: Node<'_>,
+    name: &str,
+    source: &str,
+) -> Option<&'static str> {
+    // Walk the declarator chain to the innermost name node so wrapped shapes
+    // (`Foo()` inside `function_declarator`, `operator int()` as `operator_cast`)
+    // are classified the same way.
+    let mut declarator = node.child_by_field_name("declarator").unwrap_or(node);
+    loop {
+        match declarator.kind() {
+            "operator_cast" => return Some("c++:conversion-operator"),
+            "operator_name" => return Some("c++:operator"),
+            "destructor_name" => return Some("c++:destructor"),
+            "function_declarator" | "pointer_declarator" | "reference_declarator"
+            | "parenthesized_declarator" | "init_declarator" => {
+                match declarator
+                    .child_by_field_name("declarator")
+                    .or_else(|| first_named_child(declarator))
+                {
+                    Some(inner) if inner.id() != declarator.id() => declarator = inner,
+                    _ => break,
+                }
+            }
+            _ => break,
+        }
+    }
+
+    if name.starts_with('~') {
+        return Some("c++:destructor");
+    }
+    if name.starts_with("operator") {
+        return Some("c++:operator");
+    }
+
+    // Out-of-line definition (`Foo::Foo()` / `Foo::~Foo()`): the declarator is
+    // a `qualified_identifier` whose trailing qualifier names the class. A
+    // qualifier leaf equal to the member name marks a constructor.
+    if declarator.kind() == "qualified_identifier"
+        && let Ok(text) = node_text(declarator, source)
+    {
+        let head = text.split('(').next().unwrap_or(text);
+        if let Some((qualifier, _)) = head.rsplit_once("::") {
+            let class = c_family_last_name(qualifier);
+            if !class.is_empty() && class == name {
+                return Some("c++:constructor");
+            }
+        }
+    }
+
+    // In-class constructor: bare member name matching the enclosing aggregate.
+    match c_family_enclosing_class_name(node, source) {
+        Some(class) if class == name => Some("c++:constructor"),
+        _ => None,
+    }
+}
+
+/// The leaf name of the nearest enclosing `class`/`struct`/`union` specifier,
+/// used to recognise in-class constructor declarations. Out-of-line
+/// definitions (`Foo::Foo()`) are named via the qualified declarator and never
+/// reach this path with a bare match, so they are handled by the declarator
+/// chain plus name comparison above when the qualifier is stripped.
+pub(crate) fn c_family_enclosing_class_name(node: Node<'_>, source: &str) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) && let Some(name) = parent
+            .child_by_field_name("name")
+            .and_then(|name| node_text(name, source).ok())
+            .map(c_family_last_name)
+            .filter(|name| !name.is_empty())
+        {
+            return Some(name);
+        }
+        current = parent.parent();
+    }
+    None
 }
 
 pub(crate) fn c_family_symbol_name(
