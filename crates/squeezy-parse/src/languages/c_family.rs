@@ -906,15 +906,13 @@ pub(crate) fn c_family_attributes_for_node(
         attributes.push("preprocessor:conditional".to_string());
     }
 
-    // `virtual` is only meaningful for function/method symbols, and the
-    // signature slice is already start..body_start so the search avoids
-    // scanning the full class body.
+    // Function/method modifiers. The signature slice is already
+    // start..body_start so the keyword scans never reach into the class body.
     if matches!(
         kind,
         SymbolKind::Function | SymbolKind::Method | SymbolKind::Field
-    ) && signature_has_keyword(signature, "virtual")
-    {
-        attributes.push("c++:virtual".to_string());
+    ) {
+        c_family_collect_function_modifiers(signature, &mut attributes);
     }
 
     if matches!(
@@ -948,6 +946,56 @@ fn c_family_ancestor_kinds(node: Node<'_>) -> CFamilyAncestorFlags {
         current = parent.parent();
     }
     flags
+}
+
+/// Stamp the C++ function/method modifier attributes that survive in the
+/// signature slice (`start..body_start`). Leading specifiers (`virtual`,
+/// `static`, `explicit`, `constexpr`) and the `= delete` / `= default` clauses
+/// are matched anywhere in the slice; trailing qualifiers (`const`, `override`,
+/// `final`, `noexcept`) are matched only after the last `)` so a `const`
+/// return type does not masquerade as a const member function.
+pub(crate) fn c_family_collect_function_modifiers(signature: &str, attributes: &mut Vec<String>) {
+    for (keyword, attribute) in [
+        ("virtual", "c++:virtual"),
+        ("static", "c++:static"),
+        ("explicit", "c++:explicit"),
+        ("constexpr", "c++:constexpr"),
+    ] {
+        if signature_has_keyword(signature, keyword) {
+            attributes.push(attribute.to_string());
+        }
+    }
+
+    // `= delete` / `= default`. The signature slice keeps the `= delete;`
+    // tail because such declarations have no compound-statement body.
+    if signature_has_keyword(signature, "delete") {
+        attributes.push("c++:deleted".to_string());
+    }
+    if signature_has_keyword(signature, "default") {
+        attributes.push("c++:defaulted".to_string());
+    }
+
+    // Trailing qualifiers live after the parameter list. Scan only the slice
+    // following the last close-paren to avoid return-type `const`/`noexcept`.
+    // A trailing return type (`-> const T`) starts at `->`, so truncate there
+    // before scanning so its `const` is not mistaken for a const member.
+    let mut trailing = signature
+        .rfind(')')
+        .map(|index| &signature[index + 1..])
+        .unwrap_or("");
+    if let Some(arrow) = trailing.find("->") {
+        trailing = &trailing[..arrow];
+    }
+    for (keyword, attribute) in [
+        ("const", "c++:const"),
+        ("override", "c++:override"),
+        ("final", "c++:final"),
+        ("noexcept", "c++:noexcept"),
+    ] {
+        if signature_has_keyword(trailing, keyword) {
+            attributes.push(attribute.to_string());
+        }
+    }
 }
 
 /// True when the given identifier appears as a whole-token keyword in the
