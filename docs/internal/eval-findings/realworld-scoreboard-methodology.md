@@ -44,14 +44,8 @@ These come from the `perf/cost-wins` branch (PR #290); see
 The checked-in CSVs are the current source of truth for this directory:
 
 - `mini-vs-codex-realworld.csv`: 15/15 WIN.
-- `haiku-vs-cc-realworld.csv`: 13/15 WIN, with LOSS for `c` and `go`.
+- `haiku-vs-cc-realworld.csv`: 15/15 WIN.
 
-The Haiku numbers were recomputed against CC baselines re-derived from raw CC
-stream logs with the current grader. `$0.000` timeout reps are excluded as
-invalid, not counted as wins. Older prose in this directory that says Haiku is
-8/15 or that python/java are pending is historical and predates the committed
-CSV refresh.
-
-The path to 15 for Haiku is now narrowed to `c` and `go`: fix the loss group,
-rerun affected squeezy cells, and update the CSVs. No CC re-runs are needed
-when the baseline answer logs are unchanged; CC is re-graded from raw logs.
+The Haiku numbers are computed against CC baselines derived from raw CC stream
+logs with the current grader. `$0.000` timeout reps are excluded as invalid,
+not counted as wins.

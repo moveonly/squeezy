@@ -260,3 +260,21 @@ fn provider_scroll_window_keeps_active_ollama_row_visible() {
     assert!(rows.iter().any(|row| row.contains("Ollama local")));
     assert!(rows.last().is_some_and(|row| row.contains("Ollama local")));
 }
+
+#[test]
+fn height_two_middle_cursor_signals_more_below() {
+    let (start, end, show_above, show_below) = visible_window(5, 2, 2);
+
+    assert_eq!((start, end), (2, 3));
+    assert!(!show_above);
+    assert!(show_below);
+}
+
+#[test]
+fn height_two_last_cursor_signals_more_above() {
+    let (start, end, show_above, show_below) = visible_window(5, 4, 2);
+
+    assert_eq!((start, end), (4, 5));
+    assert!(show_above);
+    assert!(!show_below);
+}

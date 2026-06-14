@@ -220,6 +220,24 @@ fn clean_label_collapses_and_caps() {
 }
 
 #[test]
+fn clean_label_caps_wide_glyphs_by_display_cells() {
+    // A run of 2-cell CJK glyphs over the budget must be capped by DISPLAY CELLS,
+    // not chars: chars().count() would let LABEL_CAP wide glyphs through at 2x
+    // the columns LABEL_CAP promises, overflowing the row.
+    let wide = "\u{6f22}".repeat(20); // 20 chars, 40 cells.
+    let cleaned = clean_label(&wide);
+    assert!(
+        unicode_width::UnicodeWidthStr::width(cleaned.as_str()) <= LABEL_CAP,
+        "wide-glyph label capped to LABEL_CAP cells: {} cells",
+        unicode_width::UnicodeWidthStr::width(cleaned.as_str()),
+    );
+    assert!(
+        cleaned.ends_with('\u{2026}'),
+        "over-width label is ellipsised"
+    );
+}
+
+#[test]
 fn long_session_label_is_truncated_in_the_crumb() {
     let model = BreadcrumbModel::build(&BreadcrumbContext {
         session_label: Some("a".repeat(50)),

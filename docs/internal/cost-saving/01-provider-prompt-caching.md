@@ -58,12 +58,12 @@ the pre-retention-enum 5m default for old callers without code changes.
 #### Gating: `should_apply_caching`
 
 Before any adapter places a marker it consults `should_apply_caching` at
-`cache_policy.rs:135-139`:
+`cache_policy.rs:198-202`:
 
 ```rust
-// crates/squeezy-llm/src/cache_policy.rs:135-139
+// crates/squeezy-llm/src/cache_policy.rs:198-202
 pub(crate) fn should_apply_caching(provider: &str, request: &LlmRequest) -> bool {
-    request.effective_cache_spec().retention != CacheRetention::None
+    request.effective_cache_retention() != CacheRetention::None
         && capabilities_for(provider, &request.model)
             .is_some_and(|capabilities| capabilities.prompt_caching)
 }
@@ -76,10 +76,10 @@ the static model registry reports `prompt_caching` capability for that
 
 #### The marker shape
 
-The shared ephemeral marker literal lives at `cache_policy.rs:147-153`:
+The shared ephemeral marker literal lives at `cache_policy.rs:210-216`:
 
 ```rust
-// crates/squeezy-llm/src/cache_policy.rs:147-153
+// crates/squeezy-llm/src/cache_policy.rs:210-216
 pub(crate) fn ephemeral_marker(retention: CacheRetention) -> Value {
     if retention == CacheRetention::Long {
         json!({ "type": "ephemeral", "ttl": "1h" })
@@ -95,7 +95,7 @@ function.
 
 #### Marker placement: stable breakpoints plus a tail anchor
 
-`CachePolicy::AUTO` at `cache_policy.rs:117-124` is the only policy any
+`CachePolicy::AUTO` at `cache_policy.rs:182-187` is the only policy any
 adapter currently uses; it enables tools, system, and a
 `MessageStrategy::LatestUserMessage` choice. Native Anthropic can use up to
 four `cache_control` breakpoints per request: the three structural markers
@@ -103,16 +103,16 @@ below plus a "stable-tail anchor" behind the moving latest user block when
 the marker budget has room. Semantics: cache everything up to and including
 the marker.
 
-1. **System tail.** `system_array_with_marker` (`cache_policy.rs:206-212`)
+1. **System tail.** `system_array_with_marker` (`cache_policy.rs:269`)
    wraps the system string in the array form Anthropic requires and pins the
    marker onto the trailing text block.
 2. **Last stable tool.** `mark_last_stable_tool`
-   (`cache_policy.rs:241-255`) walks the tools array and picks the
+   (`cache_policy.rs:360`) walks the tools array and picks the
    breakpoint index via `last_stable_tool_index`
-   (`cache_policy.rs:175-190`). The index skips `mcp__`-prefixed names so a
+   (`cache_policy.rs:238-253`). The index skips `mcp__`-prefixed names so a
    dynamic tool registry refresh doesn't invalidate the cached tool prefix.
    See "Edge cases".
-3. **Last user block.** `mark_last_user_block` (`cache_policy.rs:216-234`)
+3. **Last user block.** `mark_last_user_block` (`cache_policy.rs:279`)
    walks messages back-to-front, finds the most recent user message, and
    pins the marker onto its trailing content block.
 4. **Stable-tail anchor.** `mark_stable_anchor_block` walks back from the
@@ -127,16 +127,16 @@ prefix-hash lookup walks forward until new content begins.
 
 ### Anthropic native (`anthropic.rs`)
 
-`AnthropicProvider::request_body` at `anthropic.rs:144-242` opens by deriving
+`AnthropicProvider::request_body` at `anthropic.rs:165` opens by deriving
 the retention from the request and the gate:
 
 ```rust
-// crates/squeezy-llm/src/anthropic.rs:144-152
+// crates/squeezy-llm/src/anthropic.rs:165-172
 pub(crate) fn request_body(request: &LlmRequest, auth: AnthropicAuthScheme) -> Value {
     let policy = CachePolicy::AUTO;
     let prompt_caching = should_apply_caching("anthropic", request);
     let retention = if prompt_caching {
-        request.effective_cache_spec().retention
+        request.effective_cache_retention()
     } else {
         CacheRetention::None
     };
@@ -144,24 +144,24 @@ pub(crate) fn request_body(request: &LlmRequest, auth: AnthropicAuthScheme) -> V
 
 Three placements follow:
 
-- **System** — `anthropic_system` (`anthropic.rs:296-332`) wraps the
+- **System** — `anthropic_system` (`anthropic.rs:469`) wraps the
   instructions in the array form and appends `cache_control` to the
   trailing text block. The OAuth (Claude Pro/Max) path additionally
   prepends a fixed Anthropic-required identity string as a separate text
   block *before* the cacheable user instructions.
-- **Tools** — at `anthropic.rs:224-240` the adapter calls
+- **Tools** — at `anthropic.rs:301` the adapter calls
   `json_markers::mark_last_stable_tool` once the tool array is materialized.
-- **Last user block** — `anthropic_messages` at `anthropic.rs:334-432`
+- **Last user block** — `anthropic_messages` at `anthropic.rs:507`
   builds the messages array and finishes with
-  `json_markers::mark_last_user_block` (`anthropic.rs:424-430`).
+  `json_markers::mark_last_user_block` (`anthropic.rs:628`).
 
 The response side reads `cache_read_input_tokens` and
 `cache_creation_input_tokens` from the Anthropic SSE `usage` block at
-`anthropic.rs:1044-1065`. The stream state normalizes the totals at
-`anthropic.rs:734-756`:
+`anthropic.rs:1466-1473`. The stream state normalizes the totals at
+`anthropic.rs:1029-1041`:
 
 ```rust
-// crates/squeezy-llm/src/anthropic.rs:744-756
+// crates/squeezy-llm/src/anthropic.rs:1029-1040
 let base = self.input_tokens;
 let cache_read = self.cache_read_input_tokens.unwrap_or(0);
 let cache_write = self.cache_creation_input_tokens.unwrap_or(0);
@@ -185,15 +185,18 @@ engine to bill at the right rate.
 ### OpenAI Responses API (`openai.rs`)
 
 OpenAI's prompt caching is hash-based on the server: there are no inline
-breakpoint markers in the body. Two knobs (`openai.rs:170-181`):
+breakpoint markers in the body. Two knobs (`openai.rs:343-364`):
 
 ```rust
-// crates/squeezy-llm/src/openai.rs:170-181
-let cache_spec = request.effective_cache_spec();
-if let Some(key) = cache_spec.key.as_deref() {
-    body["prompt_cache_key"] = json!(clamp_prompt_cache_key(key));
+// crates/squeezy-llm/src/openai.rs:343-364
+if request.disable_prompt_cache {
+    body["prompt_cache_key"] = json!(format!("nocache-{}", cache_bust_nonce()));
+} else if request.effective_cache_retention() != crate::CacheRetention::None {
+    if let Some(key) = request.effective_cache_key() {
+        body["prompt_cache_key"] = json!(clamp_prompt_cache_key(key));
+    }
 }
-if cache_spec.retention == crate::CacheRetention::Long {
+if request.effective_cache_retention() == crate::CacheRetention::Long {
     body["prompt_cache_retention"] = json!("24h");
 }
 ```
@@ -207,7 +210,7 @@ The 64-codepoint clamp at
 silently drops longer keys server-side — the request still succeeds, the
 cache simply never warms.
 
-Squeezy also pins routing affinity headers at `openai.rs:264-269`:
+Squeezy also pins routing affinity headers at `openai.rs:458`:
 `affinity_headers` emits `session_id` and `x-client-request-id` both set to
 the cache key. The body field is clamped to OpenAI's 64-codepoint limit;
 the headers carry up to 256 bytes of the same key, clamped on a UTF-8
@@ -217,22 +220,23 @@ balancer a larger affinity space to bin on.
 ### Bedrock typed `CachePoint` (`bedrock.rs`)
 
 Bedrock's Converse API uses typed AWS-SDK content blocks rather than inline
-JSON. `cache_point_block` (`bedrock.rs:455-462`) builds a single
+JSON. `cache_point_block` (`bedrock.rs:1185`) builds a single
 `CachePointBlock` with `CachePointType::Default`. Three placements append it:
 
-- **System** — `system_blocks` (`bedrock.rs:464-476`) pushes a
+- **System** — `system_blocks` (`bedrock.rs:1195`) pushes a
   `SystemContentBlock::CachePoint` after the text block.
 - **Tools** — `tool_configuration` inserts one `Tool::CachePoint` after the
   last non-`mcp__` tool. If every advertised tool is dynamic, the tool-level
   cache point is omitted instead of anchoring on a volatile registry tail.
 - **Last user message** — `append_cache_point_to_last_user`
-  (`bedrock.rs:583-604`) finds the last user message via `rposition`, copies
+  (`bedrock.rs:1336`) finds the last user message via `rposition`, copies
   its content, appends a `ContentBlock::CachePoint`, and rebuilds the
   immutable `Message` because the SDK requires reconstruction.
 
-The Bedrock stream state at `bedrock.rs:281-301` mirrors the Anthropic
-normalization: `usage.inputTokens` arrives as the uncached delta and gets
-folded back into the total `input_tokens` while the cached share lives in
+The Bedrock stream state at `bedrock.rs:686-707` treats `usage.inputTokens`
+as the inclusive total prompt tokens the model saw, with `cacheReadInputTokens`
+and `cacheWriteInputTokens` as subsets of that total, so it passes
+`input_tokens` through verbatim while the cached share lives in
 `cached_input_tokens` / `cache_write_input_tokens`.
 
 The Bedrock adapter now follows the same stable-tool intent as the JSON
@@ -248,10 +252,10 @@ implementation is *implicit prefix caching* on the server side, controlled
 through a separate `cachedContent` resource that has to be created with a
 distinct HTTP call. Squeezy does not currently materialize that resource.
 
-The Gemini request body at `google.rs:54-103` carries no caching fields:
+The Gemini request body at `google.rs:62` carries no caching fields:
 
 ```rust
-// crates/squeezy-llm/src/google.rs:54-72
+// crates/squeezy-llm/src/google.rs:62-80
 pub(crate) fn request_body(request: &LlmRequest) -> Value {
     let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
     let mut body = json!({
@@ -264,10 +268,10 @@ pub(crate) fn request_body(request: &LlmRequest) -> Value {
 ```
 
 What Squeezy *does* do is read the implicit-cache outcome from
-`usageMetadata.cachedContentTokenCount` at `google.rs:368`:
+`usageMetadata.cachedContentTokenCount` at `google.rs:809`:
 
 ```rust
-// crates/squeezy-llm/src/google.rs:365-370
+// crates/squeezy-llm/src/google.rs:795-824
 if let Some(usage) = value.get("usageMetadata") {
     cost.input_tokens = usage.get("promptTokenCount").and_then(Value::as_u64);
     cost.cached_input_tokens = usage.get("cachedContentTokenCount").and_then(Value::as_u64);
@@ -302,15 +306,16 @@ is configured, but suppresses retention on presets known to reject unknown
 fields such as Mistral.
 
 The flavor decision is table-driven via `COMPAT_TABLE`
-(`compatible.rs:374-403`). Each `CompatEntry` carries `model_prefix`,
-`flavor`, and a `supports_cache_control: bool`. The currently registered
-entries: `anthropic/` (cache-control on), `openai/`, `google/`, `xai/`
-(cache-control off). `compat_entry`+`supports_anthropic_caching`
-(`compatible.rs:421-437`) read the flag and the request-body assembly at
-`compatible.rs:149-153` derives:
+(`compatible.rs:632`). Each `CompatEntry` carries `model_prefix`, `flavor`,
+`supports_tool_calls`, `supports_cache_control: bool`, and
+`supports_reasoning`. The currently registered entries: `anthropic/`
+(cache-control on), `openai/`, `google/`, `xai/` (cache-control off).
+`compat_entry`+`supports_anthropic_caching` (`compatible.rs:679` and
+`compatible.rs:693`) read the flag and the request-body assembly at
+`compatible.rs:323-327` derives:
 
 ```rust
-// crates/squeezy-llm/src/compatible.rs:149-153
+// crates/squeezy-llm/src/compatible.rs:323-327
 let cache_spec = request.effective_cache_spec();
 let cache_retention = cache_spec.retention;
 let anthropic_caching =
@@ -320,14 +325,14 @@ let cache_control = anthropic_caching.then(|| ephemeral_marker(cache_retention))
 
 The three Anthropic-style markers (system, last user block, last stable
 tool — same helpers as the native Anthropic adapter, see
-`compatible.rs:178-205` and `compatible.rs:262-281`) each gate on
+`compatible.rs:342-376` and `compatible.rs:492-510`) each gate on
 `anthropic_caching`. The OpenAI-style `prompt_cache_key` is emitted whenever
 the spec sets it; long retention is emitted only for presets that accept it:
 
 ```rust
-// crates/squeezy-llm/src/compatible.rs:225-246 (abbreviated)
+// crates/squeezy-llm/src/compatible.rs:461-475 (abbreviated)
 if let Some(key) = cache_spec.key.as_deref() {
-    body["prompt_cache_key"] = json!(compatible_prompt_cache_key(key));
+    body["prompt_cache_key"] = json!(stable_prompt_cache_key(key));
 }
 if cache_retention == CacheRetention::Long
     && !preset_rejects_prompt_cache_retention(preset)
@@ -379,12 +384,12 @@ four markers exist in this request, at fixed positions (abbreviated):
 
 The first three markers are structural breakpoints:
 
-1. **System tail** — `anthropic_system` (`anthropic.rs:296-332`) attaches it
+1. **System tail** — `anthropic_system` (`anthropic.rs:469`) attaches it
    to the single system text block.
 2. **Last stable tool** — pinned on `Grep` rather than the trailing
    `mcp__github__open_pr` because `last_stable_tool_index`
-   (`cache_policy.rs:175-190`) walks back skipping the `mcp__` prefix.
-3. **Last user block** — `mark_last_user_block` (`cache_policy.rs:216-234`)
+   (`cache_policy.rs:238-253`) walks back skipping the `mcp__` prefix.
+3. **Last user block** — `mark_last_user_block` (`cache_policy.rs:279`)
    pins it onto the most recent user message.
 
 When Anthropic's four-marker budget has room, Squeezy also adds a
@@ -411,11 +416,11 @@ prefix from KV cache.
 
 ### MCP tools are excluded from the breakpoint index
 
-`cache_policy.rs:155-190` reserves the `mcp__` name prefix for dynamically
+`cache_policy.rs:224-253` reserves the `mcp__` name prefix for dynamically
 advertised MCP tools and skips them when picking the breakpoint:
 
 ```rust
-// crates/squeezy-llm/src/cache_policy.rs:155-190
+// crates/squeezy-llm/src/cache_policy.rs:224-253
 pub(crate) const DYNAMIC_TOOL_NAME_PREFIX: &str = "mcp__";
 
 pub(crate) fn last_stable_tool_index<'a, I>(names: I) -> Option<usize>
@@ -484,19 +489,19 @@ invalidators:
 Anthropic exposes a 5m (default) and 1h (`ttl: "1h"`) cache window. OpenAI's
 Responses API exposes a 24h window via `prompt_cache_retention`. Squeezy
 compresses both into `CacheRetention::Long` and emits the provider-side
-directive — `ttl: "1h"` on Anthropic (`cache_policy.rs:147-153`),
-`prompt_cache_retention: "24h"` on OpenAI (`openai.rs:179-181`). A caller
+directive — `ttl: "1h"` on Anthropic (`cache_policy.rs:210-216`),
+`prompt_cache_retention: "24h"` on OpenAI (`openai.rs:362-363`). A caller
 asking for `Long` doesn't have to know per-provider TTL constants. The
 compatible adapter mirrors this and emits both on the same request so an
 aggregator can forward the relevant one to the right upstream
-(`compatible.rs:238-246`).
+(`compatible.rs:463-475`).
 
 ### No cache-write tracking on OpenAI
 
 The Anthropic and Bedrock stream-state structs carry both
 `cache_read_input_tokens` and `cache_creation_input_tokens` (Bedrock
-`cache_write_input_tokens`); see `anthropic.rs:716-717` and
-`bedrock.rs:271-272`. The OpenAI Responses API does *not* break out
+`cache_write_input_tokens`); see `anthropic.rs:976-977` and
+`bedrock.rs:668-669`. The OpenAI Responses API does *not* break out
 cache-write tokens in `usage` — it ships only `cached_tokens` (reads). This
 means the cost engine cannot apply OpenAI's cache-write premium per-turn
 because the count is not provider-reported; on OpenAI, the "cost of the
@@ -526,10 +531,10 @@ The math flips for very short sessions: a 2-turn session is
 `(32K * 1.23 + 32K * 0.156) / (2 * 32K) = 0.69`x base — still cheaper, but
 only ~30% off. Below 2 turns the write premium isn't recovered, which is
 why `CacheRetention::None` is the default and `should_apply_caching`
-(`cache_policy.rs:135-139`) gates on the caller's explicit retention.
+(`cache_policy.rs:198-202`) gates on the caller's explicit retention.
 
 For OpenAI the per-hit math is weaker (cache reads at ~50% of base, not
 10%), so the affinity-routing investment via `prompt_cache_key` and the
-`session_id` / `x-client-request-id` headers (`openai.rs:264-269`) — what
+`session_id` / `x-client-request-id` headers (`openai.rs:458`) — what
 keeps a session pinned to the warmed backend node — is the dominant lever
 rather than marker-placement strategy.

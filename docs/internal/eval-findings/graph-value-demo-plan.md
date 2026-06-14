@@ -64,10 +64,9 @@ Where squeezy **loses** on a genuinely-graph-needing task, root-cause it:
   pricing/graders): `mini-vs-codex-realworld.csv`, `haiku-vs-cc-realworld.csv`.
 - Vendored harness + graders under `docs/internal/eval-findings/realworld-harness/`.
 
-**Historical starting board:** this plan was written before the later CSV
-refresh. The checked-in CSVs now show **mini 15/15 WIN** and **haiku 13/15
-WIN** (LOSS: `c`, `go`). Treat the older loss lists in this plan as historical
-work queue notes, not the current scoreboard.
+**Starting board:** the loss lists in this plan are work-queue notes, not the
+current scoreboard. The checked-in CSVs show **mini 15/15 WIN** and **haiku
+15/15 WIN**.
 
 **Why the residual losses happen (already investigated):** the residual-loss
 tasks are **read-heavy enumerations** ("list every X under dir Y") where grep+read

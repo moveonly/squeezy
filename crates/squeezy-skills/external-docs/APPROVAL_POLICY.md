@@ -2,8 +2,10 @@
 
 Squeezy can ask a small/fast model to review permission prompts before the user
 sees them. This reviewer is **opt-in**: it is off in the shipped
-`permissions.mode = "default"` preset (every prompt goes to the human) and is
-turned on by selecting `permissions.mode = "auto_review"`. It can also be tuned
+`permissions.mode = "default"` preset (which auto-approves workspace
+read/search/edit/shell/git/compiler and prompts the human only for
+web/mcp/destructive and out-of-workspace targets) and is turned on by selecting
+`permissions.mode = "auto_review"`. It can also be tuned
 through `[permissions.ai_reviewer]` settings (`model`, `policy_file`, `policy`,
 `allow_capabilities`, `timeout_secs`, `max_transcript_tokens`).
 

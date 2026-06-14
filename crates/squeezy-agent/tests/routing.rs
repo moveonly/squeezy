@@ -56,6 +56,16 @@ fn judge_reply(verdict: &str) -> Vec<Result<LlmEvent>> {
     ]
 }
 
+fn judge_reply_with_effort(verdict: &str, effort: &str) -> Vec<Result<LlmEvent>> {
+    vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(format!(
+            "{{\"route\":\"{verdict}\",\"effort\":\"{effort}\",\"reason\":\"test\"}}"
+        ))),
+        Ok(cheap_judge_completed_event()),
+    ]
+}
+
 fn end_turn_reply(text: &str) -> Vec<Result<LlmEvent>> {
     vec![
         Ok(LlmEvent::Started),
@@ -560,6 +570,117 @@ async fn cheap_provider_error_retries_once_on_parent() {
                 if reason == "escalated_provider_error"
         )),
         "provider error must emit an escalation routing event"
+    );
+}
+
+#[tokio::test]
+async fn tier_effort_runs_weak_rung_at_low_effort() {
+    // With tier_effort on (default) and no user pin, a weak-routed turn runs at
+    // low reasoning effort — effort tracks the rung, not one global value.
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("ok")]));
+    let agent = Agent::new(config_with_routing(), provider.clone());
+    let _ = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(&*requests[0].model, CHEAP_MODEL);
+    assert_eq!(
+        requests[0].reasoning_effort,
+        Some(squeezy_core::ReasoningEffort::Low),
+        "weak rung runs at low effort under tier_effort"
+    );
+}
+
+#[tokio::test]
+async fn explicit_effort_pin_overrides_tier_effort() {
+    // A user /effort pin is a hard override on every rung.
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("ok")]));
+    let mut config = config_with_routing();
+    config.reasoning_effort = Some(squeezy_core::ReasoningEffort::High);
+    let agent = Agent::new(config, provider.clone());
+    let _ = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+    let requests = provider.requests();
+    assert_eq!(
+        requests[0].reasoning_effort,
+        Some(squeezy_core::ReasoningEffort::High),
+        "an explicit effort pin wins over the rung default"
+    );
+}
+
+#[tokio::test]
+async fn judge_effort_sets_per_task_effort_on_the_parent_rung() {
+    // The user's case: two tasks both land on the strong/parent rung but want
+    // different depths. With judge_effort on, the judge's per-task effort drives
+    // the wire effort — here "strong"+"xhigh" runs the parent turn at xhigh.
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        judge_reply_with_effort("strong", "xhigh"),
+        end_turn_reply("deep work"),
+    ]));
+    let mut config = config_with_routing();
+    config.routing.judge_effort = true;
+    let agent = Agent::new(config, provider.clone());
+    let _ = drain_until_terminal(agent.start_turn(
+        "investigate the intermittent deadlock in the scheduler".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "judge + parent turn");
+    assert_eq!(
+        &*requests[1].model, PARENT_MODEL,
+        "strong verdict stays on parent"
+    );
+    assert_eq!(
+        requests[1].reasoning_effort,
+        Some(squeezy_core::ReasoningEffort::XHigh),
+        "judge's per-task effort drives the parent turn's depth"
+    );
+}
+
+#[tokio::test]
+async fn judge_effort_off_ignores_judge_effort_field() {
+    // Same judge reply, but judge_effort off: the effort field is ignored and the
+    // parent rung keeps the provider default (no effort on the wire).
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        judge_reply_with_effort("strong", "xhigh"),
+        end_turn_reply("default depth"),
+    ]));
+    let config = config_with_routing(); // judge_effort defaults off
+    let agent = Agent::new(config, provider.clone());
+    let _ = drain_until_terminal(agent.start_turn(
+        "investigate the intermittent deadlock in the scheduler".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+    let requests = provider.requests();
+    assert_eq!(&*requests[1].model, PARENT_MODEL);
+    assert_eq!(
+        requests[1].reasoning_effort, None,
+        "judge_effort off leaves the parent rung at the provider default"
+    );
+}
+
+#[tokio::test]
+async fn tier_effort_off_keeps_provider_default_effort() {
+    // tier_effort=false restores the pre-feature behavior: no effort field
+    // (provider default) when the user hasn't pinned one.
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("ok")]));
+    let mut config = config_with_routing();
+    config.routing.tier_effort = false;
+    let agent = Agent::new(config, provider.clone());
+    let _ = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+    let requests = provider.requests();
+    assert_eq!(
+        requests[0].reasoning_effort, None,
+        "tier_effort off sends no effort when unpinned"
     );
 }
 

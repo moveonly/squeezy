@@ -80,6 +80,16 @@ fn elapsed_clock_renders_mmss_or_dash_for_missing_time() {
     assert_eq!(entry_for_source(&src, 1).elapsed_clock(), "1:15");
     src.elapsed_secs = Some(605);
     assert_eq!(entry_for_source(&src, 1).elapsed_clock(), "10:05");
+    // Just under an hour stays m:ss; the hour boundary rolls into h:mm:ss so a
+    // long-running worker never reads as an oversized minute count (65:05).
+    src.elapsed_secs = Some(3599);
+    assert_eq!(entry_for_source(&src, 1).elapsed_clock(), "59:59");
+    src.elapsed_secs = Some(3600);
+    assert_eq!(entry_for_source(&src, 1).elapsed_clock(), "1:00:00");
+    src.elapsed_secs = Some(3905);
+    assert_eq!(entry_for_source(&src, 1).elapsed_clock(), "1:05:05");
+    src.elapsed_secs = Some(7200);
+    assert_eq!(entry_for_source(&src, 1).elapsed_clock(), "2:00:00");
     // A record that never ran (cap rejection): an honest dash, never a fake 0:00.
     src.elapsed_secs = None;
     assert_eq!(entry_for_source(&src, 1).elapsed_clock(), "-");

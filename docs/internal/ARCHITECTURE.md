@@ -33,10 +33,11 @@ LSP or `rust-analyzer`.
 - `squeezy-eval`: scenario-driven live-agent evaluation, replay, trace, and
   finding-report tooling.
 - `squeezy-workspace`, `squeezy-parse`, `squeezy-graph`, `squeezy-rank`,
-  `squeezy-store`, `squeezy-vcs`, `squeezy-telemetry`, and `squeezy-harness`:
-  workspace discovery, parsers, graph state and optional watcher support,
-  ranking helpers, split redb-backed local state, VCS/checkpoint support,
-  anonymous telemetry, and validation tasks.
+  `squeezy-store`, `squeezy-vcs`, `squeezy-telemetry`, `squeezy-harness`, and
+  `squeezy-win-sandbox`: workspace discovery, parsers, graph state and optional
+  watcher support, ranking helpers, split redb-backed local state,
+  VCS/checkpoint support, anonymous telemetry, validation tasks, and the Windows
+  OS-level shell sandbox (restricted-token and elevated tiers).
 
 ## Runtime Flow
 
@@ -148,7 +149,7 @@ non-goals; reviewers should reject PRs that move toward them.
   cross-process API. The runtime surface is the `squeezy` binary and its
   subcommands; there is no parallel API surface for embedders.
 - No new workspace members matching `*-server`, `*-client`,
-  `*-protocol`, `*-daemon`, or `sdk-*`. The 18-crate layout under
+  `*-protocol`, `*-daemon`, or `sdk-*`. The 19-crate layout under
   `crates/` is the intended scope.
 - No embedded HTTP server or inbound network listener (see the
   "Provider SDK Policy" section above for the framework-level restatement of

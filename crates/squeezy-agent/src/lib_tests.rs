@@ -5482,6 +5482,7 @@ async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy(
             None,
         ))),
         subagents: SubagentRegistry::default(),
+        store: None,
         hooks: None,
     };
 

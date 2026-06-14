@@ -287,7 +287,7 @@ env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TM
 read_roots = []
 write_roots = []
 protected_metadata_names = [".git", ".squeezy", ".agents"]
-sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*"]
+sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*", ".azure/**", "AppData/Roaming/gcloud/**", "AppData/Roaming/Microsoft/UserSecrets/**", "AppData/Roaming/Microsoft/Windows/PowerShell/**", ".nuget/credentials", ".password-store/**", ".config/sops/**", ".config/1Password/**", ".config/gcloud/**", ".config/kube/**"]
 # replace_sensitive_path_patterns = false  # default; user list EXTENDS the floor above.
 # windows_sandbox_level = "restricted_token"  # Windows only: restricted_token (default) | elevated | disabled
 ```

@@ -75,8 +75,7 @@ pub(crate) struct ExportRequest {
 
 /// Shared usage hint for `/export`. Lists every destination keyword so the
 /// error path is self-documenting.
-pub(crate) const EXPORT_USAGE: &str =
-    "usage: /export <md|txt|json> [clipboard|stdout|dir:<name>|<path>]";
+pub(crate) const EXPORT_USAGE: &str = "usage: /export <md|txt|json> [clipboard|stdout|dir:<name>|<path>] [!]   (append ! to overwrite an existing file)";
 
 /// Parse `/export <md|txt|json> [destination]`.
 ///

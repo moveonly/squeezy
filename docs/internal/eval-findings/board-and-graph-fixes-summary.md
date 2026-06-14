@@ -1,15 +1,15 @@
 # Graph-value board + correctness sweep — summary
 
-High-level outcome of the PR `perf/graph-jsts-inheritance` (#298): a set of generic
-semantic-graph correctness/efficiency fixes that also moved the haiku comprehension board
-from 9 → 13 wins, each flip tied to a concrete fix (no benchmark-specific hacks).
+A set of generic semantic-graph correctness/efficiency fixes (`perf/graph-jsts-inheritance`),
+each comprehension-board flip tied to a concrete fix (no benchmark-specific hacks). Current
+tallies live in the CSVs and `realworld-scoreboard-methodology.md`.
 
 ## Board (n=3 medians)
 
 - **mini tier** (squeezy on gpt-5.4-mini vs `codex exec -m gpt-5.4-mini`): **15/15 WIN**
   (`mini-vs-codex-realworld.csv`).
-- **haiku tier** (squeezy on claude-haiku-4-5 vs Claude Code haiku): **13/15 WIN, 2 LOSS**
-  (`haiku-vs-cc-realworld.csv`). Losses: `c`, `go`.
+- **haiku tier** (squeezy on claude-haiku-4-5 vs Claude Code haiku): **15/15 WIN**
+  (`haiku-vs-cc-realworld.csv`).
 
 ### Flips earned this effort (haiku 9 → 13)
 

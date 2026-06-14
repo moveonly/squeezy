@@ -58,7 +58,7 @@ provider = "openrouter"
 
 [providers.openrouter]
 api_key_env = "OPENROUTER_API_KEY"
-default_model = "anthropic/claude-opus-4-7"
+default_model = "anthropic/claude-sonnet-4.6"
 ```
 
 Then export the key and run `squeezy`:
@@ -123,7 +123,7 @@ they are not all universal wire controls today:
 #### `openrouter` — OpenRouter
 
 - Env: `OPENROUTER_API_KEY`. Base URL: `https://openrouter.ai/api/v1`.
-- Default model: `anthropic/claude-opus-4-7`. Catalog: 100+ models from
+- Default model: `anthropic/claude-sonnet-4.6`. Catalog: 100+ models from
   30+ underlying providers (Anthropic, OpenAI, Mistral, Llama family,
   DeepSeek V3/R1, Qwen, Gemma, command-r-plus, Yi, etc).
 - Forwards `prompt_cache_key` so Squeezy's cache-aware billing keeps
@@ -134,7 +134,7 @@ they are not all universal wire controls today:
 ```toml
 [providers.openrouter]
 api_key_env = "OPENROUTER_API_KEY"
-default_model = "anthropic/claude-opus-4-7"
+default_model = "anthropic/claude-sonnet-4.6"
 
 [providers.openrouter.headers]
 "HTTP-Referer" = "https://github.com/esqueezy/squeezy"
@@ -145,14 +145,14 @@ default_model = "anthropic/claude-opus-4-7"
 
 - Env: `AI_GATEWAY_API_KEY`. Base URL:
   `https://ai-gateway.vercel.sh/v1`.
-- Default model: `anthropic/claude-opus-4.7`.
+- Default model: `anthropic/claude-sonnet-4.6`.
 - Same OpenAI-compatible wire as OpenRouter; pricing and per-model
   capability come from Vercel's gateway catalog.
 
 ```toml
 [providers.vercel]
 api_key_env = "AI_GATEWAY_API_KEY"
-default_model = "anthropic/claude-opus-4.7"
+default_model = "anthropic/claude-sonnet-4.6"
 ```
 
 #### `portkey` — PortKey
@@ -276,7 +276,7 @@ default_model = "anthropic.claude-sonnet-4-6"
 [providers.azure_openai]
 api_key_env = "AZURE_OPENAI_API_KEY"
 base_url = "https://RESOURCE.openai.azure.com/openai/v1"
-api_version = "v1"
+api_version = "preview"
 default_model = "gpt-5.5"
 ```
 
@@ -333,7 +333,7 @@ default_model = "local-model"
 
 ```toml
 [providers.vllm]
-base_url = "http://localhost:8000/v1"
+base_url = "http://127.0.0.1:8000/v1"
 default_model = "served-model"
 ```
 
@@ -341,7 +341,7 @@ default_model = "served-model"
 
 ```toml
 [providers.llamacpp]
-base_url = "http://localhost:8080/v1"
+base_url = "http://127.0.0.1:8080/v1"
 default_model = "local-model"
 ```
 
@@ -479,7 +479,7 @@ works through this preset. Common targets:
 - Cloudflare Workers AI — `base_url` contains your account id.
 - LM Studio, vLLM, llama.cpp server — point `base_url` at the local
   endpoint (LM Studio defaults to `http://127.0.0.1:1234/v1`, vLLM to
-  `http://localhost:8000/v1`, llama.cpp to `http://localhost:8080`).
+  `http://127.0.0.1:8000/v1`, llama.cpp to `http://127.0.0.1:8080/v1`).
 - Self-hosted LiteLLM proxy — `base_url` is your deployment.
 - Cohere — partial compatibility; tool calling may differ.
 
@@ -492,24 +492,26 @@ default_model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 
 #### `cloudflare_workers_ai` — Cloudflare Workers AI
 
-- Env: `CLOUDFLARE_API_TOKEN` (or the provider's configured `api_key_env`).
+- Env: `CLOUDFLARE_API_KEY` (or the provider's configured `api_key_env`;
+  `CLOUDFLARE_API_TOKEN` is accepted as a fallback alias).
 - Requires `cloudflare_account_id`; the base URL is derived from that account.
 
 ```toml
 [providers.cloudflare_workers_ai]
-api_key_env = "CLOUDFLARE_API_TOKEN"
+api_key_env = "CLOUDFLARE_API_KEY"
 cloudflare_account_id = "ACCOUNT_ID"
 default_model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 ```
 
 #### `cloudflare_ai_gateway` — Cloudflare AI Gateway
 
-- Env: `CLOUDFLARE_API_TOKEN`. Requires `cloudflare_account_id`; `cloudflare_gateway_id`
+- Env: `CLOUDFLARE_API_KEY` (`CLOUDFLARE_API_TOKEN` is accepted as a fallback
+  alias). Requires `cloudflare_account_id`; `cloudflare_gateway_id`
   defaults to `default` when omitted.
 
 ```toml
 [providers.cloudflare_ai_gateway]
-api_key_env = "CLOUDFLARE_API_TOKEN"
+api_key_env = "CLOUDFLARE_API_KEY"
 cloudflare_account_id = "ACCOUNT_ID"
 cloudflare_gateway_id = "default"
 default_model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
@@ -543,7 +545,7 @@ squeezy providers list --configured
 squeezy providers info openrouter
 squeezy refresh-models
 squeezy doctor --probe
-squeezy --provider openrouter --model anthropic/claude-opus-4-7 --prompt "hello"
+squeezy --provider openrouter --model anthropic/claude-sonnet-4.6 --prompt "hello"
 squeezy --provider groq --model llama-3.1-8b-instant --prompt "hello"
 squeezy --provider ollama --model qwen3 --prompt "hello"
 ```
@@ -577,11 +579,11 @@ turn:
 | `bedrock` | `anthropic.claude-sonnet-4-6` | 200,000 | 64,000 |
 | `google` | `gemini-2.5-pro` | 1,048,576 | 65,536 |
 | `ollama` | `qwen3-coder` | Runtime | Runtime |
-| `openrouter` | `anthropic/claude-opus-4-7` | 200,000 | 64,000 |
-| `vercel` | `anthropic/claude-opus-4.7` | 200,000 | 64,000 |
+| `openrouter` | `anthropic/claude-sonnet-4.6` | 200,000 | 64,000 |
+| `vercel` | `anthropic/claude-sonnet-4.6` | 200,000 | 64,000 |
 | `groq` | `llama-3.3-70b-versatile` | 131,072 | 32,768 |
 | `xai` | `grok-4.3` | 256,000 | 32,768 |
-| `deepseek` | `deepseek-v4-flash` | 131,072 | 8,192 |
+| `deepseek` | `deepseek-v4-flash` | 1,048,576 | 393,216 |
 | `vertex` | `google/gemini-3.1-pro-preview` | 1,048,576 | 65,536 |
 
 Light-preset providers (`portkey`, `mistral`, `together`, `fireworks`,

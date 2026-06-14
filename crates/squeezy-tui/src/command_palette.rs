@@ -196,6 +196,17 @@ impl CommandPalette {
         }
     }
 
+    /// The cursor index clamped to a caller-supplied visible `count`. The render
+    /// path computes the visible list once and passes its length here, so the
+    /// cursor is clamped without a second full re-score of every entry.
+    pub(crate) fn selected_within(&self, count: usize) -> usize {
+        if count == 0 {
+            0
+        } else {
+            self.selected.min(count - 1)
+        }
+    }
+
     /// The currently highlighted visible entry, if any.
     pub(crate) fn selected_entry(&self) -> Option<CommandEntry> {
         let selected = self.selected();

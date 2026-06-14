@@ -132,13 +132,13 @@ impl PastePreview {
     }
 
     /// A one-line summary of the pending paste for the question header, e.g.
-    /// `"3,420 chars · 89 lines · 3,500 bytes"`. Singular/plural aware so a
+    /// `"89 lines · 3,420 chars · 3,500 bytes"`. Singular/plural aware so a
     /// one-line block reads "1 line".
     pub(crate) fn summary(&self) -> String {
         format!(
             "{} · {} · {}",
-            count_label(self.char_count, "char", "chars"),
             count_label(self.line_count, "line", "lines"),
+            count_label(self.char_count, "char", "chars"),
             count_label(self.byte_count, "byte", "bytes"),
         )
     }

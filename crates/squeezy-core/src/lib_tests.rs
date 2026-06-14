@@ -6945,3 +6945,58 @@ fn session_metrics_sums_routing_strong_baseline() {
     session.merge_turn(&turn);
     assert_eq!(session.routing_strong_baseline_usd_micros, 2_000);
 }
+
+// -- Tier × effort routing -------------------------------------------------
+
+#[test]
+fn model_tier_default_effort_maps_low_medium_high() {
+    assert_eq!(ModelTier::Weak.default_effort(), ReasoningEffort::Low);
+    assert_eq!(ModelTier::Medium.default_effort(), ReasoningEffort::Medium);
+    assert_eq!(ModelTier::Strong.default_effort(), ReasoningEffort::High);
+}
+
+#[test]
+fn routing_effort_for_tier_returns_overrides_else_none() {
+    let mut routing = AppConfig::default().routing;
+    assert_eq!(routing.effort_for_tier(ModelTier::Weak), None);
+    routing.effort_weak = Some(ReasoningEffort::Medium);
+    routing.effort_strong = Some(ReasoningEffort::XHigh);
+    assert_eq!(
+        routing.effort_for_tier(ModelTier::Weak),
+        Some(ReasoningEffort::Medium)
+    );
+    assert_eq!(routing.effort_for_tier(ModelTier::Medium), None);
+    assert_eq!(
+        routing.effort_for_tier(ModelTier::Strong),
+        Some(ReasoningEffort::XHigh)
+    );
+}
+
+#[test]
+fn routing_tier_effort_defaults_on_and_env_overrides() {
+    let base = RoutingConfig::from_settings_and_env(RoutingSettings::default(), &mut |_| None);
+    assert!(base.tier_effort, "tier_effort defaults on");
+    assert_eq!(base.effort_weak, None);
+
+    let env = std::collections::HashMap::from([
+        (
+            "SQUEEZY_ROUTING_TIER_EFFORT".to_string(),
+            "false".to_string(),
+        ),
+        (
+            "SQUEEZY_ROUTING_EFFORT_WEAK".to_string(),
+            "medium".to_string(),
+        ),
+        (
+            "SQUEEZY_ROUTING_EFFORT_STRONG".to_string(),
+            "xhigh".to_string(),
+        ),
+    ]);
+    let cfg = RoutingConfig::from_settings_and_env(RoutingSettings::default(), &mut |k| {
+        env.get(k).cloned()
+    });
+    assert!(!cfg.tier_effort);
+    assert_eq!(cfg.effort_weak, Some(ReasoningEffort::Medium));
+    assert_eq!(cfg.effort_medium, None);
+    assert_eq!(cfg.effort_strong, Some(ReasoningEffort::XHigh));
+}

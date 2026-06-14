@@ -163,9 +163,9 @@ pub(crate) fn move_group(ids: &[u64], selected: &BTreeSet<u64>, dir: MoveDir) ->
 }
 
 /// The marker glyph painted at the head of an overlay row to show its
-/// multi-select state. A tagged row gets a filled box, an untagged row two
-/// blanks (so columns stay aligned). Kept here next to the state so the render
-/// and the tests agree on the exact glyph.
+/// multi-select state. A tagged row gets a filled box `[x]`, an untagged row an
+/// empty one `[ ]` (so columns stay aligned). Kept here next to the state so the
+/// render and the tests agree on the exact glyph.
 pub(crate) fn marker_glyph(is_tagged: bool) -> &'static str {
     if is_tagged { "[x]" } else { "[ ]" }
 }

@@ -3,6 +3,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::render::{cache, highlight};
 
@@ -130,8 +131,11 @@ impl TableCell {
         });
     }
 
-    fn char_count(&self) -> usize {
-        self.runs.iter().map(|run| run.text.chars().count()).sum()
+    fn display_width(&self) -> usize {
+        self.runs
+            .iter()
+            .map(|run| UnicodeWidthStr::width(run.text.as_str()))
+            .sum()
     }
 
     fn render_spans(
@@ -141,7 +145,7 @@ impl TableCell {
         mode: MarkdownMode,
     ) -> Vec<Span<'static>> {
         let mut out = Vec::new();
-        let total = self.char_count();
+        let total = self.display_width();
         let visible_limit = if mode == MarkdownMode::Compact && total > width && width >= 3 {
             width - 3
         } else {
@@ -152,27 +156,37 @@ impl TableCell {
             if remaining == 0 {
                 break;
             }
-            let run_style = confidence_label_exact_match(run.text.trim())
-                .map(|label| {
-                    run.style
-                        .patch(Style::default().fg(confidence_label_color(label)))
-                })
-                .unwrap_or(run.style);
-            let run_chars = run.text.chars().count();
-            let take = remaining.min(run_chars);
-            let visible: String = run.text.chars().take(take).collect();
-            for span in confidence_label_spans(&visible, run_style) {
+            let run_width = UnicodeWidthStr::width(run.text.as_str());
+            let (visible, clipped) = if run_width <= remaining {
+                (run.text.clone(), false)
+            } else {
+                let mut taken = String::new();
+                let mut used = 0usize;
+                for ch in run.text.chars() {
+                    let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if used + ch_width > remaining {
+                        break;
+                    }
+                    taken.push(ch);
+                    used += ch_width;
+                }
+                (taken, true)
+            };
+            for span in confidence_label_spans(&visible, run.style) {
                 out.push(span);
             }
-            remaining -= take;
-            if take < run_chars {
+            remaining -= UnicodeWidthStr::width(visible.as_str());
+            if clipped {
                 break;
             }
         }
         if mode == MarkdownMode::Compact && total > width && width >= 3 {
             out.push(Span::styled("...", fallback_style));
         }
-        let visible_width: usize = out.iter().map(|span| span.content.chars().count()).sum();
+        let visible_width: usize = out
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
         if visible_width < width {
             out.push(Span::styled(
                 " ".repeat(width - visible_width),
@@ -226,11 +240,17 @@ impl TableBuilder {
             return Vec::new();
         }
         let mut widths = vec![0usize; col_count];
-        // Compute column widths via display char counts (treat each char as 1).
+        // Column widths are measured in terminal display cells so CJK and
+        // other wide glyphs reserve the two cells they actually render.
         for (i, width) in widths.iter_mut().enumerate() {
-            *width = (*width).max(self.headers.get(i).map(TableCell::char_count).unwrap_or(0));
+            *width = (*width).max(
+                self.headers
+                    .get(i)
+                    .map(TableCell::display_width)
+                    .unwrap_or(0),
+            );
             for row in &self.rows {
-                *width = (*width).max(row.get(i).map(TableCell::char_count).unwrap_or(0));
+                *width = (*width).max(row.get(i).map(TableCell::display_width).unwrap_or(0));
             }
             if mode == MarkdownMode::Compact {
                 *width = (*width).min(MAX_TABLE_COLUMN_WIDTH);

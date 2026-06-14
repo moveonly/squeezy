@@ -16,6 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+use crate::glyph_mode::GlyphTokens;
 use crate::render::button::{ButtonState, button_spans};
 use crate::render::palette;
 
@@ -295,7 +296,11 @@ pub(crate) fn render_lines(
                     crate::render::theme::quiet()
                 }),
             ),
-            crate::prompt_queue_multiselect::marker_span(is_tagged),
+            if group_active {
+                crate::prompt_queue_multiselect::marker_span(is_tagged)
+            } else {
+                Span::raw("   ")
+            },
             crate::queue_groups::group_marker_span(group),
             crate::queue_conditions::condition_marker_span(condition, outcome),
             Span::raw(" "),
@@ -362,10 +367,10 @@ fn truncate_to_width(text: &str, budget: usize) -> String {
 mod tests;
 
 /// One-line clickable strip shown above the composer whenever the queue
-/// is non-empty. The leading `>` / `v` glyph is rendered in a strong
-/// dark blue so the row reads as a disclosure button — `>` when the
-/// reorder overlay is closed (click to expand), `v` when it's open
-/// (click to collapse).
+/// is non-empty. The leading fold glyph (sourced from `tokens` so it honors
+/// the active glyph mode) is rendered in a strong dark blue so the row reads
+/// as a disclosure button — collapsed when the reorder overlay is closed
+/// (click to expand), expanded when it's open (click to collapse).
 ///
 /// `groups` is the Queue-Groups (§12.3.4) one-line summary
 /// ([`crate::queue_groups::groups_summary`]) — e.g. `Group 1 (2, paused)` — or
@@ -378,6 +383,7 @@ pub(crate) fn indicator_line(
     _turn_running: bool,
     overlay_open: bool,
     groups: Option<&str>,
+    tokens: GlyphTokens,
 ) -> Option<Line<'static>> {
     if queue.is_empty() {
         return None;
@@ -396,7 +402,7 @@ pub(crate) fn indicator_line(
     } else {
         "Ctrl+X Q to reorder"
     };
-    let mut spans = button_spans(&format!("queued: {n}"), state);
+    let mut spans = button_spans(&format!("queued: {n}"), state, tokens);
     // Surface the group summary (counts + paused/collapsed flags) right after the
     // count so a held-back batch is visible without opening the overlay.
     if let Some(summary) = groups.filter(|s| !s.is_empty()) {

@@ -2,7 +2,7 @@
 
 Status: historical investigation log. The committed CSVs now supersede the
 intermediate board in this document: `mini-vs-codex-realworld.csv` shows
-Mini 15/15 WIN, and `haiku-vs-cc-realworld.csv` shows Haiku 13/15 WIN. Keep
+Mini 15/15 WIN, and `haiku-vs-cc-realworld.csv` shows Haiku 15/15 WIN. Keep
 the analysis below for methodology and root-cause history; use the CSVs and
 `realworld-scoreboard-methodology.md` for current tallies.
 
@@ -162,7 +162,7 @@ gate is net `+1` win with no win lost.
 ## 4. Historical board from this investigation (n=3 medians, all fixes)
 
 Superseded by the checked-in CSVs: Mini is now 15/15 WIN and Haiku is now
-13/15 WIN. The tables below are preserved as the intermediate board that
+15/15 WIN. The tables below are preserved as the intermediate board that
 drove the follow-up fixes.
 
 WIN = recall ≥ rival **and** cost ≤ 0.95×. (`*` = coin-flip, ~parity within noise.)

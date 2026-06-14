@@ -89,7 +89,7 @@ pub(crate) fn handle_key(
         (KeyCode::Esc, _) => {
             if state.dirty {
                 notifications.push(
-                    "Closed with unsaved edits already applied. Re-open to view current state.",
+                    "Changes were saved as you made them. Re-open to view current state.",
                     NotifySeverity::Info,
                 );
             }

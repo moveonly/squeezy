@@ -65,8 +65,10 @@ Rules the catalog enforces:
 - `triggers` are matched word-bounded against the lowered user input.
 - `context: fork` marks the skill for the separate fork-skill render path;
   missing, `inline`, empty, or unrecognized values behave as inline.
-- Block scalars (`|`, `>`), trailing inline comments, anchors, and nested
-  mappings are not supported — the parser is intentionally tiny.
+- Block scalars (`|`, `>`, with chomping/indent indicators) are folded so a
+  long `description` can wrap across indented lines. Trailing inline comments,
+  anchors, and nested mappings are not supported — the parser is intentionally
+  tiny.
 
 ## Optional sidecar
 
@@ -124,10 +126,11 @@ hooks:
           once: false
 ```
 
-Accepted hook events are `PreTurn`, `PreToolUse`, `PostToolUse`, `PostTool`,
-`PreCompact`, `PostCompact`, `SubagentStart`, and `PermissionRequest`; snake
-case aliases such as `pre_tool_use` are also accepted. Only `type: command` is
-implemented.
+Accepted hook events are `PreTurn`, `PreToolUse`, `PostToolUse`,
+`PostToolUseFailure`, `PostTool`, `PreCompact`, `PostCompact`, `SubagentStart`,
+`SubagentStop`, `PermissionRequest`, `PermissionDenied`, `UserPromptSubmit`,
+`SessionStart`, `Stop`, and `Setup`; snake case aliases such as `pre_tool_use`
+are also accepted. Only `type: command` is implemented.
 
 ## Validation and installation
 

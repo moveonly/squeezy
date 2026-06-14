@@ -25,7 +25,7 @@ Every assistant turn produces a `CostSnapshot`. It is the agent's
 cross-provider record of what the API charged.
 
 ```rust
-// crates/squeezy-core/src/lib.rs:9804-9813
+// crates/squeezy-core/src/lib.rs:14438-14450
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CostSnapshot {
     pub input_tokens: Option<u64>,
@@ -62,14 +62,14 @@ Each provider's streaming state translates that wire format into the common
 
 **Anthropic** is the explicit case. The SSE `message_delta` events carry a
 `usage` object whose `input_tokens` field is the *uncached delta only*.
-`merge_usage` (`crates/squeezy-llm/src/anthropic.rs:1044-1064`) writes
+`merge_usage` (`crates/squeezy-llm/src/anthropic.rs:1453-1474`) writes
 `input_tokens`, `output_tokens`, `cache_read_input_tokens`, and
 `cache_creation_input_tokens` into the stream state on every chunk that
 carries `usage`. The state's `cost()` folds them back together at snapshot
 time:
 
 ```rust
-// crates/squeezy-llm/src/anthropic.rs:744-756
+// crates/squeezy-llm/src/anthropic.rs:1029-1040
 let base = self.input_tokens;
 let cache_read = self.cache_read_input_tokens.unwrap_or(0);
 let cache_write = self.cache_creation_input_tokens.unwrap_or(0);
@@ -85,14 +85,14 @@ CostSnapshot {
 ```
 
 The completion event emits this snapshot at `message_stop`
-(`crates/squeezy-llm/src/anthropic.rs:1024-1029`).
+(`crates/squeezy-llm/src/anthropic.rs:1374-1379`).
 
 **OpenAI** uses the Responses API's `usage` object. The provider already
 reports `input_tokens` as the total prompt, but it does not expose a
 cache-write counter:
 
 ```rust
-// crates/squeezy-llm/src/openai.rs:774-787
+// crates/squeezy-llm/src/openai.rs:1530-1543
 CostSnapshot {
     input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
     output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
@@ -119,7 +119,7 @@ so the cost estimator skips the cache-write term entirely for OpenAI.
 identical:
 
 ```rust
-// crates/squeezy-llm/src/bedrock.rs:420-429
+// crates/squeezy-llm/src/bedrock.rs:861-870
 if let Some(usage) = meta.usage {
     state.input_tokens = Some(u64::try_from(usage.input_tokens).unwrap_or(0));
     state.output_tokens = Some(u64::try_from(usage.output_tokens).unwrap_or(0));
@@ -142,7 +142,7 @@ fields; Squeezy folds them into inclusive `output_tokens` and keeps
 `reasoning_output_tokens` as the thinking subset:
 
 ```rust
-// crates/squeezy-llm/src/google.rs:365-370
+// crates/squeezy-llm/src/google.rs:808-824
 if let Some(usage) = value.get("usageMetadata") {
     cost.input_tokens = usage.get("promptTokenCount").and_then(Value::as_u64);
     cost.cached_input_tokens = usage.get("cachedContentTokenCount").and_then(Value::as_u64);
@@ -165,7 +165,7 @@ has no cache-write counter.
 pricing table from `models.json`:
 
 ```rust
-// crates/squeezy-llm/src/registry.rs:385-412
+// crates/squeezy-llm/src/registry.rs:534-561
 pub fn estimate_cost(provider: &str, model: &str, cost: &CostSnapshot) -> Option<u64> {
     let pricing = model_info_for(provider, model).and_then(|entry| entry.pricing)?;
     let cached_input_tokens = cost.cached_input_tokens.unwrap_or(0);
@@ -203,7 +203,7 @@ Provider tallies say *what was charged*. They do not say *why*. That is the
 job of `SessionAccountingSnapshot`, built from the live conversation buffer:
 
 ```rust
-// crates/squeezy-agent/src/lib.rs:534-550
+// crates/squeezy-agent/src/lib.rs:759-780
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionAccountingSnapshot {
     pub session_id: Option<String>,
@@ -223,18 +223,18 @@ pub struct SessionAccountingSnapshot {
 }
 ```
 
-`ConversationShape` (`crates/squeezy-agent/src/lib.rs:509-522`) is the
+`ConversationShape` (`crates/squeezy-agent/src/lib.rs:615-629`) is the
 byte-level breakdown by item kind. It carries item-count fields
 (`user_text`, `assistant_text`, `function_calls`, `function_outputs`,
 `reasoning_items`, `image_items`) alongside four byte counters:
 `text_bytes`, `tool_output_bytes`, `reasoning_bytes`, `image_bytes`.
 
 It is filled by one linear pass over the conversation
-(`crates/squeezy-agent/src/lib.rs:11611-11644`). Each match arm increments an
+(`crates/squeezy-agent/src/lib.rs:17096-17150`). Each match arm increments an
 item-count field and adds the wire length to one of four byte counters:
 
 ```rust
-// crates/squeezy-agent/src/lib.rs:11626-11641 (excerpt)
+// crates/squeezy-agent/src/lib.rs:17116-17143 (excerpt)
 LlmInputItem::FunctionCall { arguments, .. } => {
     shape.function_calls += 1;
     shape.text_bytes += arguments.to_string().len();
@@ -261,7 +261,7 @@ are the cuts that the verbosity knobs target.
 The `RequestTokenEstimate` carries the budget math:
 
 ```rust
-// crates/squeezy-llm/src/registry.rs:107-120
+// crates/squeezy-llm/src/registry.rs:136-148
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestTokenEstimate {
     pub input_tokens: u64,
@@ -279,9 +279,11 @@ pub struct RequestTokenEstimate {
 ```
 
 `used_input_percent_x100` is computed against `input_budget_tokens`, itself
-`effective_context_window_tokens` minus the reserved `max_output_tokens` minus
-a fixed `BASELINE_TOKENS = 12_000` headroom
-(`crates/squeezy-llm/src/registry.rs:299-322`). The `_x100` suffix preserves
+`effective_context_window_tokens` minus the reserved `max_output_tokens`
+(`crates/squeezy-llm/src/registry.rs:453-461`). The `effective_context_window_tokens`
+already folds in a 95% effective-window multiplier and a flat
+`DEFAULT_BASELINE_RESERVE_TOKENS = 12_000` reserve
+(`crates/squeezy-llm/src/limits.rs:218-225`). The `_x100` suffix preserves
 two decimal places without a float in the struct — 47.83% of budget is
 `4783`. Two estimates are built per snapshot: `transmitted_request` (what
 went over the wire after any provider-side replay of stored responses) and
@@ -366,7 +368,7 @@ turn and matches reality on every subsequent one. Same shape for Google.
 
 **Mid-stream usage emission timing.** Anthropic emits `usage` on the final
 `message_delta` and again on `message_stop`. Squeezy merges every `usage` it
-sees (`crates/squeezy-llm/src/anthropic.rs:1002`) and emits `Completed` with
+sees (`crates/squeezy-llm/src/anthropic.rs:1089`, `:1340`) and emits `Completed` with
 the consolidated `cost()` only at `message_stop`. A stream error mid-message
 leaves the partial `usage` in state but no `Completed` event — the turn is
 recorded as failed and the partial cost does not pollute the running tally.
@@ -374,16 +376,17 @@ Google emits running totals on every chunk and Squeezy overwrites, so the
 final value wins.
 
 **Attached but stripped media.** `AttachmentShape::stored_bytes` aggregates
-*all* stored bytes regardless of status (`attachment_shape`,
-`crates/squeezy-agent/src/lib.rs:11647-11662`). An attachment in `Removed`
-status still occupies the local store but is not sent on the wire, so the
-`/context` "attached context" line overcounts after a session has dropped
-attachments. The provider tally and `transmitted_request.input_tokens` are
+bytes from `Attached` attachments only (`attachment_shape`,
+`crates/squeezy-agent/src/lib.rs:17152-17169`). An attachment in `Removed`
+status is counted under `removed` and contributes no `stored_bytes`, and
+`Unsupported` lands in its own counter, so the `/context` "attached context"
+line reflects only live attachments. The provider tally and
+`transmitted_request.input_tokens` are
 unaffected — they reflect the wire payload, not the store.
 
 **Image-token estimation.** The local estimator approximates every image at a
 flat 1024 tokens plus the base64 wire size divided by `bytes_per_token`
-(`crates/squeezy-llm/src/registry.rs:478-482`). Anthropic charges roughly one
+(`crates/squeezy-llm/src/registry.rs:627-630`). Anthropic charges roughly one
 tile per 750 image pixels; OpenAI charges 85 base plus 170 per high-detail
 tile; Gemini charges 258 per image. The 1024-token floor reserves real
 budget headroom for an image without bloating text-heavy turns; the
@@ -391,9 +394,9 @@ provider's true charge arrives in the next `CostSnapshot.input_tokens` after
 the turn completes.
 
 **Calibration.** The bytes-per-token ratio is per provider, and the agent
-keeps a learned `TokenCalibration` (`crates/squeezy-agent/src/lib.rs:1941`)
+keeps a learned `TokenCalibration` (`crates/squeezy-llm/src/tokens.rs:46`)
 that reconciles each turn's local estimate against the provider's actual
-`input_tokens`. Subsequent `RequestTokenEstimate` values use the calibrated
+`input_tokens` (`crates/squeezy-agent/src/lib.rs:8281-8285`). Subsequent `RequestTokenEstimate` values use the calibrated
 ratio, so the prediction tightens turn over turn even before the model
 responds.
 

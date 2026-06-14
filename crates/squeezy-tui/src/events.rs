@@ -622,7 +622,11 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     break;
                 }
                 AgentEvent::TurnRouted {
-                    from, to, reason, ..
+                    from,
+                    to,
+                    reason,
+                    effort,
+                    ..
                 } => {
                     // A model-routing notice is TUI chrome, not turn content: push
                     // it as a dim `◦` note on the rail (one note pipeline) rather
@@ -631,16 +635,21 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // glyph makes the direction obvious at a glance: `↓` rerouted
                     // DOWN to a cheaper rung at turn start, `↑` escalated UP a rung
                     // mid-turn, `↳` kept on the parent because nothing cheaper fit.
+                    let effort_note = match effort {
+                        Some(e) => format!(", effort {}", e.as_str()),
+                        None => String::new(),
+                    };
                     let note = if let Some(signal) = reason.strip_prefix("escalated_") {
-                        format!("↑ escalated `{from}` → `{to}` ({signal})")
+                        format!("↑ escalated `{from}` → `{to}` ({signal}{effort_note})")
                     } else if reason == "reroute_skipped_context" {
                         format!("↳ kept on `{to}` (context too large to reroute)")
                     } else {
-                        format!("↓ rerouted `{from}` → `{to}` ({reason})")
+                        format!("↓ rerouted `{from}` → `{to}` ({reason}{effort_note})")
                     };
-                    // Surface the active model live in the status bar too; cleared
-                    // when the turn finishes (`note_turn_finished`).
+                    // Surface the active model + effort live in the status bar too;
+                    // cleared when the turn finishes (`note_turn_finished`).
                     app.active_routed_model = Some(to.clone());
+                    app.active_routed_effort = effort;
                     app.push_note(note);
                     // Do not clear cap_unenforceable here: the new model may also
                     // be unpriced, and the broker's latch won't re-fire within this

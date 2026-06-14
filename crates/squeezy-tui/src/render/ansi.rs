@@ -6,7 +6,7 @@ pub(crate) fn ansi_to_text(s: &str) -> Text<'static> {
     expanded
         .as_ref()
         .into_text()
-        .unwrap_or_else(|_| Text::from(strip_escape_markers(expanded.as_ref())))
+        .unwrap_or_else(|_| Text::from(crate::strip_ansi_escape_sequences(expanded.as_ref())))
 }
 
 pub(crate) fn ansi_to_line(s: &str) -> Line<'static> {
@@ -23,22 +23,4 @@ fn expand_tabs(s: &str) -> std::borrow::Cow<'_, str> {
     } else {
         std::borrow::Cow::Borrowed(s)
     }
-}
-
-fn strip_escape_markers(s: &str) -> String {
-    let mut output = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            for next in chars.by_ref() {
-                if next.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-    output
 }

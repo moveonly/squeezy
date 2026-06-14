@@ -726,6 +726,77 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
+                label: "tier_effort",
+                toml_path: &["routing", "tier_effort"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_routing_tier_effort,
+                set: set_routing_tier_effort,
+                default_display: "true",
+                default: || FieldValue::Bool(crate::DEFAULT_ROUTING_TIER_EFFORT),
+                help: "Run each routed rung at its own reasoning effort (cheap shallow, flagship deep) — effort is a cost lever orthogonal to model. A user /effort pin always wins; the parent rung keeps its provider default unless effort_strong is set. Global.",
+                env_override: Some("SQUEEZY_ROUTING_TIER_EFFORT"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "effort_weak",
+                toml_path: &["routing", "effort_weak"],
+                kind: FieldKind::OptionalEnum {
+                    options: REASONING_EFFORT_OPTIONS,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_routing_effort_weak,
+                set: set_routing_effort_weak,
+                default_display: "low",
+                default: || FieldValue::OptionalEnum(None),
+                help: "Reasoning effort for the weak rung when tier_effort is on (unset = low).",
+                env_override: Some("SQUEEZY_ROUTING_EFFORT_WEAK"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "effort_medium",
+                toml_path: &["routing", "effort_medium"],
+                kind: FieldKind::OptionalEnum {
+                    options: REASONING_EFFORT_OPTIONS,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_routing_effort_medium,
+                set: set_routing_effort_medium,
+                default_display: "medium",
+                default: || FieldValue::OptionalEnum(None),
+                help: "Reasoning effort for the mid rung when tier_effort is on (unset = medium).",
+                env_override: Some("SQUEEZY_ROUTING_EFFORT_MEDIUM"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "effort_strong",
+                toml_path: &["routing", "effort_strong"],
+                kind: FieldKind::OptionalEnum {
+                    options: REASONING_EFFORT_OPTIONS,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_routing_effort_strong,
+                set: set_routing_effort_strong,
+                default_display: "provider default",
+                default: || FieldValue::OptionalEnum(None),
+                help: "Reasoning effort for the parent rung when tier_effort is on. Unset = the provider/model default (so enabling tier_effort never silently deepens un-rerouted turns); set it to opt into a deeper flagship.",
+                env_override: Some("SQUEEZY_ROUTING_EFFORT_STRONG"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "judge_effort",
+                toml_path: &["routing", "judge_effort"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_routing_judge_effort,
+                set: set_routing_judge_effort,
+                default_display: "false",
+                default: || FieldValue::Bool(crate::DEFAULT_ROUTING_JUDGE_EFFORT),
+                help: "Let the LLM judge estimate per-task reasoning effort (overriding the tier→effort map for that turn), so two turns on the same rung can run at different depths. Off by default; needs llm_judge. A user /effort pin still wins.",
+                env_override: Some("SQUEEZY_ROUTING_JUDGE_EFFORT"),
+                secret: false,
+            },
+            FieldMeta {
                 label: "cheap_model",
                 toml_path: &["providers", "*", "cheap_model"],
                 kind: FieldKind::String { multiline: false },
@@ -3370,6 +3441,63 @@ fn set_routing_llm_judge(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &
         }
         _ => Err("expects bool"),
     }
+}
+
+fn get_routing_tier_effort(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.routing.tier_effort)
+}
+fn set_routing_tier_effort(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.routing.tier_effort = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_routing_judge_effort(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.routing.judge_effort)
+}
+fn set_routing_judge_effort(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.routing.judge_effort = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn parse_optional_effort(value: FieldValue) -> Result<Option<ReasoningEffort>, &'static str> {
+    match value {
+        FieldValue::OptionalEnum(None) | FieldValue::Unset => Ok(None),
+        FieldValue::OptionalEnum(Some(s)) | FieldValue::Enum(s) => Ok(Some(
+            ReasoningEffort::parse(s).ok_or("invalid reasoning effort")?,
+        )),
+        _ => Err("expects enum"),
+    }
+}
+fn get_routing_effort_weak(cfg: &AppConfig) -> FieldValue {
+    FieldValue::OptionalEnum(cfg.routing.effort_weak.map(|e| e.as_str()))
+}
+fn set_routing_effort_weak(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.routing.effort_weak = parse_optional_effort(value)?;
+    Ok(())
+}
+fn get_routing_effort_medium(cfg: &AppConfig) -> FieldValue {
+    FieldValue::OptionalEnum(cfg.routing.effort_medium.map(|e| e.as_str()))
+}
+fn set_routing_effort_medium(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.routing.effort_medium = parse_optional_effort(value)?;
+    Ok(())
+}
+fn get_routing_effort_strong(cfg: &AppConfig) -> FieldValue {
+    FieldValue::OptionalEnum(cfg.routing.effort_strong.map(|e| e.as_str()))
+}
+fn set_routing_effort_strong(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    cfg.routing.effort_strong = parse_optional_effort(value)?;
+    Ok(())
 }
 
 // Per-provider routing model fields. They read/write `cfg.providers[<active
