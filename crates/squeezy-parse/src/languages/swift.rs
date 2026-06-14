@@ -308,6 +308,15 @@ fn swift_symbol_from_node(
         // decl/definition search can find it; its `must_inherit` / `where`
         // constraints surface as `iface:` attributes below.
         "associatedtype_declaration" => (SymbolKind::TypeAlias, "associatedtype".to_string()),
+        // Custom operator declarations (`infix operator <=>`) and
+        // `precedencegroup` declarations are the canonical definition sites of
+        // public-API operators. They have no `name` field — the name is a
+        // `custom_operator` / `simple_identifier` child — so `swift_symbol_name`
+        // resolves them via a dedicated path below. Modelled as `Const` since
+        // they are nominal, value-like declarations with no body or callable
+        // signature.
+        "operator_declaration" => (SymbolKind::Const, "operator".to_string()),
+        "precedence_group_declaration" => (SymbolKind::Const, "precedencegroup".to_string()),
         "enum_entry" => return None, // handled separately, multiple symbols per node
         _ => return None,
     };
@@ -336,6 +345,8 @@ fn swift_symbol_from_node(
         "init_declaration" => attributes.push("swift:init".to_string()),
         "deinit_declaration" => attributes.push("swift:deinit".to_string()),
         "subscript_declaration" => attributes.push("swift:subscript".to_string()),
+        "operator_declaration" => attributes.push("swift:operator".to_string()),
+        "precedence_group_declaration" => attributes.push("swift:precedencegroup".to_string()),
         _ => {}
     }
     if matches!(
@@ -562,6 +573,26 @@ fn swift_symbol_name(
             "subscript_declaration" => return Some("subscript".to_string()),
             _ => {}
         }
+    }
+    // Operator / precedencegroup declarations carry no `name` field; their
+    // identifier is the `custom_operator` (e.g. `<=>`) or `simple_identifier`
+    // (e.g. a precedencegroup name) child.
+    if matches!(
+        node.kind(),
+        "operator_declaration" | "precedence_group_declaration"
+    ) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if matches!(child.kind(), "custom_operator" | "simple_identifier")
+                && let Ok(text) = node_text(child, source)
+            {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        return None;
     }
     let name_node = node.child_by_field_name("name")?;
     // For `class_declaration`, the `name` field on a regular type
