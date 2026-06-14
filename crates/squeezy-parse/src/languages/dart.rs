@@ -148,6 +148,19 @@ fn visit_dart_node(
     match kind {
         "call_expression" => {
             extract_dart_call(node, ctx, owner_symbol.clone());
+            // `test('desc', () {...})` / `testWidgets(...)` / `group(...)` are
+            // the standard Dart/Flutter test idioms. Lower a matching call into
+            // a `Test` symbol so `kind=test` queries surface it and the calls
+            // inside its closure attribute to the test (impact / affected_tests).
+            if let Some(test_symbol) =
+                dart_test_symbol_from_call(node, ctx, parent_symbol.as_ref())
+            {
+                let next_parent = Some((test_symbol.id.clone(), test_symbol.kind));
+                let next_owner = Some(test_symbol.id.clone());
+                ctx.symbols.push(test_symbol);
+                visit_dart_children(node, ctx, next_parent, next_owner);
+                return;
+            }
             visit_dart_children(node, ctx, parent_symbol, owner_symbol);
             return;
         }
@@ -1805,6 +1818,81 @@ fn dart_combinator_clause(node: Node<'_>, source: &str) -> (String, Vec<String>)
         }
     }
     (keyword, names)
+}
+
+/// Recognise a `package:test` / `flutter_test` test-declaration idiom call and
+/// build a `Test` symbol for it. Matches `test(...)`, `testWidgets(...)` and
+/// `group(...)` invoked as a plain function (no receiver) whose first argument
+/// is a string literal description and which passes a closure body. The symbol
+/// is named after the description so `kind=test` results read naturally.
+fn dart_test_symbol_from_call(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    let function_node = node.child_by_field_name("function")?;
+    // Only bare-identifier calls: `test(...)`, not `foo.test(...)` (which would
+    // be an unrelated method on some object).
+    if function_node.kind() != "identifier" {
+        return None;
+    }
+    let func_name = node_text(function_node, ctx.source).ok()?.trim().to_string();
+    if !matches!(func_name.as_str(), "test" | "testWidgets" | "group") {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let mut description: Option<String> = None;
+    let mut has_closure = false;
+    for child in arguments.named_children(&mut cursor) {
+        match child.kind() {
+            kind if is_dart_string_literal(kind) && description.is_none() => {
+                description = dart_uri_string(child, ctx.source);
+            }
+            "function_expression" => has_closure = true,
+            _ => {}
+        }
+    }
+    // The closure argument is what makes this a test/group body rather than an
+    // arbitrary call that merely happens to be named `test`.
+    if !has_closure {
+        return None;
+    }
+    let description = description?;
+    let span = span_from_node(node);
+    let body_span = node
+        .child_by_field_name("arguments")
+        .map(span_from_node)
+        .or(Some(span));
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    // Disambiguate same-named tests within a file by call-site byte offset
+    // (folded into `symbol_id`); keep the display name human-readable.
+    let id = symbol_id(&ctx.file, parent_id.as_ref(), SymbolKind::Test, &description, span);
+    Some(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name: description,
+        kind: SymbolKind::Test,
+        language_identity: None,
+        span,
+        body_span,
+        signature_span: None,
+        signature: String::new(),
+        visibility: Some("public".to_string()),
+        docs: Vec::new(),
+        attributes: vec!["dart:test".to_string(), format!("dart:test-idiom:{func_name}")],
+        provenance: Provenance::new("tree-sitter-dart", format!("{func_name} idiom")),
+        confidence: Confidence::Heuristic,
+        freshness: Freshness::Fresh,
+        arity: None,
+    })
+}
+
+/// True for any Dart string-literal node kind (plain, raw, single/double,
+/// single/multi-line). Used to spot a test description argument.
+fn is_dart_string_literal(kind: &str) -> bool {
+    kind == "string_literal" || (kind.contains("string_literal") && kind.contains("quotes"))
 }
 
 fn extract_dart_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
