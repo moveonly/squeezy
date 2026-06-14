@@ -292,9 +292,11 @@ impl SemanticGraph {
                 if !visited.insert(ancestor_id.clone()) {
                     continue;
                 }
-                if let Some(method) =
-                    self.java_method_on_class_or_ancestors_visited(&ancestor_id, method_name, visited)
-                {
+                if let Some(method) = self.java_method_on_class_or_ancestors_visited(
+                    &ancestor_id,
+                    method_name,
+                    visited,
+                ) {
                     return Some(method);
                 }
             }

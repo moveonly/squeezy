@@ -26,8 +26,8 @@ use squeezy_parse::{
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
 use squeezy_workspace::{
-    CompiledIndexingPolicy, CrawlOptions, FileRecord, IndexCoverage, IndexingDecision, PathConflict,
-    PriorFileMeta, PriorFileMetadata, VCS_AND_CACHE_DIR_NAMES, WorkspaceCrawler,
+    CompiledIndexingPolicy, CrawlOptions, FileRecord, IndexCoverage, IndexingDecision,
+    PathConflict, PriorFileMeta, PriorFileMetadata, VCS_AND_CACHE_DIR_NAMES, WorkspaceCrawler,
     filesystem_paths_match,
 };
 use tracing::{error, warn};
@@ -746,7 +746,8 @@ impl SemanticGraph {
         // on equal length and otherwise leave the shadow for the rebuild.
         if self.body_hit_text_lower.len() == self.body_hits.len() {
             let mut keep = self.body_hits.iter().map(|hit| &hit.file_id != file_id);
-            self.body_hit_text_lower.retain(|_| keep.next().unwrap_or(true));
+            self.body_hit_text_lower
+                .retain(|_| keep.next().unwrap_or(true));
         }
         self.body_hits.retain(|hit| &hit.file_id != file_id);
         self.java_project_facts
@@ -1964,8 +1965,7 @@ impl SemanticGraph {
                 .iter()
                 .map(|hit| hit.text.to_lowercase())
                 .collect();
-            self.body_hit_trigram_indexed =
-                self.body_hits.len() <= BODY_HIT_TRIGRAM_INDEX_MAX_HITS;
+            self.body_hit_trigram_indexed = self.body_hits.len() <= BODY_HIT_TRIGRAM_INDEX_MAX_HITS;
             if self.body_hit_trigram_indexed {
                 for (index, lower) in self.body_hit_text_lower.iter().enumerate() {
                     for trigram in unique_trigrams(lower) {
@@ -3098,8 +3098,7 @@ impl GraphManager {
             .map(|paths| paths.clone())
             .unwrap_or_default();
         if !prior_fingerprints.is_empty() && !pending_before_crawl.is_empty() {
-            let pending_relative_keys =
-                relative_keys_for_paths(&self.root, &pending_before_crawl);
+            let pending_relative_keys = relative_keys_for_paths(&self.root, &pending_before_crawl);
             if !pending_relative_keys.is_empty() {
                 prior_fingerprints.retain(|key, _| !pending_relative_keys.contains(key));
             }
@@ -3166,8 +3165,11 @@ impl GraphManager {
         // Pre-compute canonical forms for all pending event paths once so the
         // matching loops below do not repeatedly call canonicalize on the same
         // event path. Policy-pruned paths skip canonicalization entirely.
-        let pending_canonicals =
-            PendingCanonicals::from_paths(&self.root, self.crawler.policy(), &pending_changed_paths);
+        let pending_canonicals = PendingCanonicals::from_paths(
+            &self.root,
+            self.crawler.policy(),
+            &pending_changed_paths,
+        );
         let mut supported_changed_records = current
             .values()
             .filter(|record| record.language != LanguageKind::Unsupported)
@@ -4853,11 +4855,7 @@ fn impl_header_trait_name(header: &str) -> Option<String> {
         .unwrap_or_default()
         .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != ':');
     let leaf = last_path_segment(trait_part);
-    if leaf.is_empty() {
-        None
-    } else {
-        Some(leaf)
-    }
+    if leaf.is_empty() { None } else { Some(leaf) }
 }
 
 fn attribute_text_is_cfg(text: &str) -> bool {

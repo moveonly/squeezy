@@ -278,9 +278,7 @@ impl SemanticGraph {
             let Some(file) = self.files.get(&symbol.file_id) else {
                 continue;
             };
-            if let Some((prefix, root)) =
-                php_psr4_entry_from_layout(dotted, &file.relative_path)
-            {
+            if let Some((prefix, root)) = php_psr4_entry_from_layout(dotted, &file.relative_path) {
                 map.insert(prefix, root);
             }
         }
@@ -371,13 +369,9 @@ impl Psr4Map {
         if prefix.is_empty() {
             return;
         }
-        if self
-            .entries
-            .iter()
-            .any(|(existing_prefix, existing_root)| {
-                *existing_prefix == prefix && *existing_root == root
-            })
-        {
+        if self.entries.iter().any(|(existing_prefix, existing_root)| {
+            *existing_prefix == prefix && *existing_root == root
+        }) {
             return;
         }
         self.entries.push((prefix, root));
@@ -404,7 +398,10 @@ impl Psr4Map {
 /// and the leftover leading directories as the root. Returns `None` when the
 /// file stem disagrees with the class name (not PSR-4 layout) or there is no
 /// namespace left to use as a prefix.
-fn php_psr4_entry_from_layout(dotted_identity: &str, relative_path: &str) -> Option<(String, String)> {
+fn php_psr4_entry_from_layout(
+    dotted_identity: &str,
+    relative_path: &str,
+) -> Option<(String, String)> {
     let ns_segments: Vec<&str> = dotted_identity
         .split('.')
         .filter(|segment| !segment.is_empty())
@@ -415,8 +412,14 @@ fn php_psr4_entry_from_layout(dotted_identity: &str, relative_path: &str) -> Opt
     }
     let class_name = *ns_segments.last()?;
     let path = relative_path.replace('\\', "/");
-    let path = path.strip_suffix(".php").or_else(|| path.strip_suffix(".PHP")).unwrap_or(&path);
-    let dir_segments: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+    let path = path
+        .strip_suffix(".php")
+        .or_else(|| path.strip_suffix(".PHP"))
+        .unwrap_or(&path);
+    let dir_segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
     let file_stem = *dir_segments.last()?;
     if file_stem != class_name {
         return None;

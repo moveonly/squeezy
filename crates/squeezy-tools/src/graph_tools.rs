@@ -2803,14 +2803,15 @@ fn read_slice_target(
     if let Some(symbol_id) = args.symbol_id.as_deref() {
         let graph =
             graph.ok_or_else(|| "read_slice symbol_id requires an available graph".to_string())?;
-        let symbol = graph.symbols.get(&SymbolId::new(symbol_id)).ok_or_else(|| {
-            // A stale id (graph re-indexed since it was minted) is recoverable:
-            // tell the caller to re-resolve by name rather than reporting an
-            // opaque "not found".
-            format!(
-                "symbol_id stale; re-resolve via definition_search (stale id: {symbol_id})"
-            )
-        })?;
+        let symbol = graph
+            .symbols
+            .get(&SymbolId::new(symbol_id))
+            .ok_or_else(|| {
+                // A stale id (graph re-indexed since it was minted) is recoverable:
+                // tell the caller to re-resolve by name rather than reporting an
+                // opaque "not found".
+                format!("symbol_id stale; re-resolve via definition_search (stale id: {symbol_id})")
+            })?;
         let span = match args.span_kind.unwrap_or_default() {
             // Read only the declaration header when the extractor pinned a real
             // signature span; fall back to the full node for bodyless symbols
@@ -3331,8 +3332,7 @@ impl ToolRegistry {
         // cap: fold it into `truncated` so the page is flagged, and also surface
         // it as a separate `closure_capped` signal so a caller can tell the
         // subtype *tree* itself was clipped (and may re-scope the walk).
-        let truncated =
-            closure_capped || symbols.len().saturating_sub(offset) > max_results;
+        let truncated = closure_capped || symbols.len().saturating_sub(offset) > max_results;
         let selected = symbols
             .iter()
             .skip(offset)
@@ -4422,8 +4422,10 @@ impl ToolRegistry {
                 let total_changed_ranges = changed_ranges.len();
                 for range in changed_ranges.into_iter().take(max_ranges) {
                     let bytes = text.as_bytes();
-                    let capped_end =
-                        range.end.min(range.start.saturating_add(MAX_READ_LIMIT)).min(bytes.len());
+                    let capped_end = range
+                        .end
+                        .min(range.start.saturating_add(MAX_READ_LIMIT))
+                        .min(bytes.len());
                     // Clamp the start too: a malformed range whose start lands
                     // past `capped_end` would otherwise panic the slice.
                     let content =

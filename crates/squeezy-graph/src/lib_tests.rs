@@ -8500,9 +8500,12 @@ fn graph_lowers_python_inheritance_attributes_to_edges() {
         "Derived should report Base as an ancestor via generic inheritance lowering"
     );
     assert!(
-        graph.edges().iter().any(|edge| edge.kind == EdgeKind::Extends
-            && edge.from == derived.id
-            && edge.to.as_ref() == Some(&base.id)),
+        graph
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Extends
+                && edge.from == derived.id
+                && edge.to.as_ref() == Some(&base.id)),
         "expected an Extends edge Derived -> Base"
     );
 }

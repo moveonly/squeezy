@@ -414,7 +414,9 @@ const GRAPH_LOOKUP_ROUTING: &str = "Pick ONE first lookup: decl_search for lists
 pub(crate) fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: format!("Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or Dart `with` mixers `mixin:<Type>`; prefix-free `attribute=\"<Type>\"` matches all three at once. Pipe-separate to match several (`base:A|base:B`). Pass as `attribute`, not `base:` in `query`. Set transitive=true with an inheritance attribute (base:/iface:/mixin:) to return the full transitive subtype closure, not just direct subtypes (for transitive supertypes/ancestors use inheritance_hierarchy). One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". {GRAPH_LOOKUP_ROUTING} If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness."),
+        description: format!(
+            "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or Dart `with` mixers `mixin:<Type>`; prefix-free `attribute=\"<Type>\"` matches all three at once. Pipe-separate to match several (`base:A|base:B`). Pass as `attribute`, not `base:` in `query`. Set transitive=true with an inheritance attribute (base:/iface:/mixin:) to return the full transitive subtype closure, not just direct subtypes (for transitive supertypes/ancestors use inheritance_hierarchy). One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". {GRAPH_LOOKUP_ROUTING} If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness."
+        ),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -439,7 +441,9 @@ pub(crate) fn decl_search_spec() -> ToolSpec {
 pub(crate) fn definition_search_spec() -> ToolSpec {
     ToolSpec {
         name: "definition_search".to_string(),
-        description: format!("Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?'. Use before flow tools when a name may be ambiguous. {GRAPH_LOOKUP_ROUTING} A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness."),
+        description: format!(
+            "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?'. Use before flow tools when a name may be ambiguous. {GRAPH_LOOKUP_ROUTING} A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness."
+        ),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({

@@ -275,8 +275,7 @@ impl SemanticGraph {
         // Require exactly one in-scope class/interface for the annotated type:
         // a same-named type in another module would otherwise forge a wrong
         // edge, so decline on ambiguity rather than guess.
-        let candidates =
-            self.js_ts_class_candidates_for_name_in_file(&caller.file_id, &type_name);
+        let candidates = self.js_ts_class_candidates_for_name_in_file(&caller.file_id, &type_name);
         let class_id = single_symbol(candidates.into_iter())?;
         if let Some(method) = self.js_ts_method_on_class(&class_id, &call.name) {
             return Some(method);
@@ -403,7 +402,8 @@ fn js_ts_type_name_from_annotation_str(annotation: &str) -> Option<String> {
     if text.is_empty()
         || matches!(
             text,
-            "any" | "bigint"
+            "any"
+                | "bigint"
                 | "boolean"
                 | "false"
                 | "never"

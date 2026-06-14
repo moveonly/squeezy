@@ -126,8 +126,7 @@ impl SemanticGraph {
             // spellings can resolve to the same supertype symbol.
             let mut seen: HashSet<(EdgeKind, SymbolId)> = HashSet::new();
             for (attribute_kind, raw_name) in self.generic_inheritance_attributes(&symbol) {
-                let Some(target_id) =
-                    self.generic_inheritance_target(&symbol.file_id, &raw_name)
+                let Some(target_id) = self.generic_inheritance_target(&symbol.file_id, &raw_name)
                 else {
                     continue;
                 };
@@ -326,7 +325,10 @@ impl SemanticGraph {
                         span: Some(impl_symbol.span),
                         confidence: Confidence::Heuristic,
                         freshness: Freshness::Fresh,
-                        provenance: Provenance::new("tree-sitter-rust", "trait impl implements edge"),
+                        provenance: Provenance::new(
+                            "tree-sitter-rust",
+                            "trait impl implements edge",
+                        ),
                         candidates: Vec::new(),
                     });
                 }
@@ -353,7 +355,11 @@ impl SemanticGraph {
     /// workspace-wide match. `generic_type_candidates_for_name_in_file` already
     /// yields at most one (the unique resolution), so this is a thin adapter
     /// that declines on ambiguity.
-    fn rust_impl_type_symbol(&self, impl_symbol: &GraphSymbol, type_name: &str) -> Option<SymbolId> {
+    fn rust_impl_type_symbol(
+        &self,
+        impl_symbol: &GraphSymbol,
+        type_name: &str,
+    ) -> Option<SymbolId> {
         self.generic_type_candidates_for_name_in_file(&impl_symbol.file_id, type_name)
             .into_iter()
             .next()

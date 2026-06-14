@@ -191,9 +191,7 @@ impl SemanticGraph {
         call: &ParsedCall,
     ) -> Option<SymbolId> {
         let receiver = call.receiver.as_deref()?;
-        if matches!(receiver, "this" | "super")
-            || receiver.contains(' ')
-            || receiver.contains('(')
+        if matches!(receiver, "this" | "super") || receiver.contains(' ') || receiver.contains('(')
         {
             return None;
         }

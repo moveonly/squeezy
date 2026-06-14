@@ -140,9 +140,10 @@ impl SemanticGraph {
         }
         // Gate on the parser's framework marker so we only act on decorators the
         // parser already classified as a web route via its own allow-list.
-        let is_route = handler.attributes.iter().any(|attribute| {
-            attribute == "framework:web-route" || attribute.starts_with("route:")
-        });
+        let is_route = handler
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "framework:web-route" || attribute.starts_with("route:"));
         if !is_route {
             return None;
         }
@@ -177,21 +178,14 @@ impl SemanticGraph {
                 if name.is_empty() {
                     return None;
                 }
-                single_symbol(
-                    self.symbols_by_name_or_scan(name)
-                        .into_iter()
-                        .filter(|id| {
-                            self.symbols
-                                .get(id)
-                                .map(|symbol| {
-                                    matches!(
-                                        symbol.kind,
-                                        SymbolKind::Function | SymbolKind::Class
-                                    )
-                                })
-                                .unwrap_or(false)
-                        }),
-                )
+                single_symbol(self.symbols_by_name_or_scan(name).into_iter().filter(|id| {
+                    self.symbols
+                        .get(id)
+                        .map(|symbol| {
+                            matches!(symbol.kind, SymbolKind::Function | SymbolKind::Class)
+                        })
+                        .unwrap_or(false)
+                }))
             }
         }
     }
@@ -530,7 +524,12 @@ pub(crate) fn is_python_manager_attribute(attribute: &str) -> bool {
 pub(crate) fn python_decorator_target(attribute: &str) -> Option<String> {
     let trimmed = attribute.trim();
     let body = trimmed.strip_prefix('@')?;
-    let callee = body.split('(').next().unwrap_or(body).trim().trim_end_matches('.');
+    let callee = body
+        .split('(')
+        .next()
+        .unwrap_or(body)
+        .trim()
+        .trim_end_matches('.');
     if callee.is_empty() {
         return None;
     }

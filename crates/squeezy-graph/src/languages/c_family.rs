@@ -100,7 +100,8 @@ impl SemanticGraph {
         }
         let receiver_type = self.cpp_receiver_type(caller_id, receiver)?;
         let caller = self.symbols.get(caller_id)?;
-        let candidates = self.cpp_class_candidates_for_name_in_file(&caller.file_id, &receiver_type);
+        let candidates =
+            self.cpp_class_candidates_for_name_in_file(&caller.file_id, &receiver_type);
         let class_id = single_symbol(candidates.into_iter())?;
         self.cpp_method_on_class_or_bases(&class_id, &call.name)
     }
@@ -119,11 +120,7 @@ impl SemanticGraph {
     /// `Type* recv`, `const Type& recv`), then a field named `recv` on the
     /// enclosing class or one of its base classes. The returned name is the
     /// final `::`-segment with pointer/reference/cv decoration stripped.
-    pub(crate) fn cpp_receiver_type(
-        &self,
-        caller_id: &SymbolId,
-        receiver: &str,
-    ) -> Option<String> {
+    pub(crate) fn cpp_receiver_type(&self, caller_id: &SymbolId, receiver: &str) -> Option<String> {
         let caller = self.symbols.get(caller_id)?;
         if let Some(ty) = cpp_param_type_in_signature(&caller.signature, receiver) {
             return Some(ty);
@@ -460,9 +457,7 @@ fn cpp_base_list_names(base_list: &str) -> Vec<String> {
                 !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' || ch == '<' || ch == '>')
             })
             .filter(|token| !token.is_empty())
-            .rfind(|token| {
-                !matches!(*token, "public" | "private" | "protected" | "virtual")
-            });
+            .rfind(|token| !matches!(*token, "public" | "private" | "protected" | "virtual"));
         if let Some(token) = last {
             let bare = token.split('<').next().unwrap_or(token);
             let name = bare.rsplit("::").next().unwrap_or(bare).trim();
