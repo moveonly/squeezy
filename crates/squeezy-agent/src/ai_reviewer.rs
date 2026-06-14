@@ -180,6 +180,19 @@ pub(crate) struct AiReviewerInput<'a> {
     pub(crate) telemetry: TelemetryClient,
 }
 
+/// Lock the reviewer state, recovering the guard if a prior holder panicked.
+/// The reviewer state is advisory (audit log + circuit-breaker counters), so a
+/// poisoned lock must degrade to "carry on" rather than crash the agent — the
+/// permission path already treats the reviewer as best-effort and falls back to
+/// a human prompt when it yields no decision.
+fn lock_reviewer_state(
+    state: &StdMutex<AiReviewerState>,
+) -> std::sync::MutexGuard<'_, AiReviewerState> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerResult {
     let reviewer = &input.config.permissions.ai_reviewer;
     if !reviewer.enabled {
@@ -189,7 +202,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
     }
 
     if let Some(reason) = {
-        let mut state = input.state.lock().expect("ai reviewer state");
+        let mut state = lock_reviewer_state(&input.state);
         let reason = state.bypass_reason(input.turn_id);
         if let Some(reason) = reason.as_deref() {
             state.record_audit(
@@ -207,7 +220,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
     let policy = match load_policy(input.config) {
         Ok(policy) => policy,
         Err(reason) => {
-            input.state.lock().expect("ai reviewer state").record_audit(
+            lock_reviewer_state(&input.state).record_audit(
                 input.turn_id,
                 input.request,
                 ReviewerAuditVerdict::NoDecision,
@@ -217,7 +230,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
         }
     };
     let prompt = {
-        let mut state = input.state.lock().expect("ai reviewer state");
+        let mut state = lock_reviewer_state(&input.state);
         build_review_prompt(
             input.config,
             input.request,
@@ -262,7 +275,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
     {
         Ok(Ok((text, cost))) => (text, cost),
         Ok(Err(reason)) => {
-            input.state.lock().expect("ai reviewer state").record_audit(
+            lock_reviewer_state(&input.state).record_audit(
                 input.turn_id,
                 input.request,
                 ReviewerAuditVerdict::NoDecision,
@@ -272,7 +285,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
         }
         Err(_) => {
             let reason = "ai reviewer timed out".to_string();
-            input.state.lock().expect("ai reviewer state").record_audit(
+            lock_reviewer_state(&input.state).record_audit(
                 input.turn_id,
                 input.request,
                 ReviewerAuditVerdict::NoDecision,
@@ -295,7 +308,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
     };
     let Some(decision) = parse_reviewer_response(&response) else {
         let reason = "ai reviewer returned invalid decision JSON".to_string();
-        input.state.lock().expect("ai reviewer state").record_audit(
+        lock_reviewer_state(&input.state).record_audit(
             input.turn_id,
             input.request,
             ReviewerAuditVerdict::NoDecision,
@@ -308,7 +321,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
             if reviewer_may_auto_allow(&reviewer.allow_capabilities, input.request) {
                 let reason = format!("AI reviewer approved: {}", decision.reason);
                 {
-                    let mut state = input.state.lock().expect("ai reviewer state");
+                    let mut state = lock_reviewer_state(&input.state);
                     state.record_non_denial(input.turn_id);
                     state.record_audit(
                         input.turn_id,
@@ -346,7 +359,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
                     )
                 };
                 {
-                    let mut state = input.state.lock().expect("ai reviewer state");
+                    let mut state = lock_reviewer_state(&input.state);
                     state.record_non_denial(input.turn_id);
                     state.record_audit(
                         input.turn_id,
@@ -361,7 +374,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
         PermissionAction::Ask => {
             let reason = decision.reason;
             {
-                let mut state = input.state.lock().expect("ai reviewer state");
+                let mut state = lock_reviewer_state(&input.state);
                 state.record_non_denial(input.turn_id);
                 state.record_audit(
                     input.turn_id,
@@ -376,7 +389,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
             if reviewer_denial_requests_human_escalation(&decision.reason) {
                 let reason = format!("AI reviewer escalated to human: {}", decision.reason);
                 {
-                    let mut state = input.state.lock().expect("ai reviewer state");
+                    let mut state = lock_reviewer_state(&input.state);
                     state.record_non_denial(input.turn_id);
                     state.record_audit(
                         input.turn_id,
@@ -388,11 +401,11 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
                 return reviewer_result(AiReviewerOutcome::NoDecision { reason });
             }
             let tripped = {
-                let mut state = input.state.lock().expect("ai reviewer state");
+                let mut state = lock_reviewer_state(&input.state);
                 state.record_denial(input.turn_id)
             };
             if let Some(reason) = tripped {
-                input.state.lock().expect("ai reviewer state").record_audit(
+                lock_reviewer_state(&input.state).record_audit(
                     input.turn_id,
                     input.request,
                     ReviewerAuditVerdict::CircuitTripped,
@@ -401,7 +414,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerR
                 return reviewer_result(AiReviewerOutcome::CircuitTripped { reason });
             }
             let reason = format!("AI reviewer denied: {}", decision.reason);
-            input.state.lock().expect("ai reviewer state").record_audit(
+            lock_reviewer_state(&input.state).record_audit(
                 input.turn_id,
                 input.request,
                 ReviewerAuditVerdict::Deny,

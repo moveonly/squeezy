@@ -9322,8 +9322,8 @@ fn plan_mode_question_renders_with_choices_and_freeform_hint() {
         "first choice missing: {output}"
     );
     assert!(
-        output.contains("● Keep the current layout"),
-        "selected marker missing on second choice: {output}"
+        output.contains("● b) Keep the current layout"),
+        "selected marker + positional label missing on second choice: {output}"
     );
     assert!(
         output.contains("freeform"),
@@ -9416,6 +9416,38 @@ fn plan_mode_question_selected_choice_uses_amber_dot_not_yellow_label() {
         .expect("selected label");
     assert_ne!(label.style.fg, Some(crate::render::theme::secondary()));
     assert_ne!(label.style.fg, Some(crate::render::theme::accent()));
+}
+
+#[tokio::test]
+async fn plan_mode_question_without_choices_or_freeform_dismisses_on_enter() {
+    let mut app = test_app(SessionMode::Build);
+    let request = RequestUserInputRequest {
+        question: "a question with nothing to answer".to_string(),
+        choices: Vec::new(),
+        allow_freeform: false,
+    };
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 0,
+        answer: String::new(),
+        answer_cursor: 0,
+    });
+
+    // Degenerate request: Enter used to silently no-op and trap the modal open
+    // with no exit but Esc. It must now resolve the prompt (sending a response so
+    // the agent unblocks) and close the modal with an explanatory status.
+    assert!(crate::input::handle_request_user_input_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    ));
+    assert!(app.pending_request_user_input.is_none());
+    assert!(
+        response_rx.await.is_ok(),
+        "a response must be delivered so the agent does not hang",
+    );
+    assert!(app.status.contains("no choices"), "{}", app.status);
 }
 
 #[test]
@@ -10011,6 +10043,28 @@ async fn approval_menu_uses_arrows_and_enter_for_repo_rule() {
     assert!(app.status.contains("saved repo approval"), "{}", app.status);
 }
 
+#[tokio::test]
+async fn approval_menu_esc_denies_the_run() {
+    let mut app = test_app(SessionMode::Build);
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    app.pending_approval = Some(PendingApproval {
+        request: sample_approval_request(),
+        decision_tx,
+    });
+
+    // The footer advertises "Esc cancel"; Esc must resolve the prompt by denying
+    // this run, not silently no-op and leave the modal (and the tool call) stuck.
+    assert!(handle_approval_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    ));
+    assert_eq!(
+        decision_rx.await.expect("approval decision"),
+        ToolApprovalDecision::DenyOnce
+    );
+    assert!(app.pending_approval.is_none());
+}
+
 #[test]
 fn approval_menu_renders_below_prompt_without_border_box() {
     let mut app = test_app(SessionMode::Build);
@@ -10034,7 +10088,8 @@ fn approval_menu_renders_below_prompt_without_border_box() {
         .expect("approval menu");
 
     assert!(approval > prompt, "{output}");
-    assert!(output.contains("› Approve"), "{output}");
+    // The selected (first) option carries the marker, its `[y]` key tag, and label.
+    assert!(output.contains("› [y] Approve"), "{output}");
     assert!(
         output.contains("Always approve this command in this repo"),
         "{output}"
@@ -10043,8 +10098,8 @@ fn approval_menu_renders_below_prompt_without_border_box() {
     assert!(!output.contains("Deny for this session"), "{output}");
     assert!(!output.contains("Approval required"), "{output}");
     assert!(!output.contains('┌'), "{output}");
-    // The keybind hint is folded into the block, not stranded on the status line.
-    assert!(output.contains("approve once"), "{output}");
+    // The navigation hint is folded into the block, not stranded on the status line.
+    assert!(output.contains("Enter confirm"), "{output}");
 }
 
 fn tall_shell_approval() -> ToolApprovalRequest {
@@ -10104,13 +10159,16 @@ fn approval_keybind_hint_lives_in_block_not_status() {
         100,
         100,
     ));
-    assert!(block.contains("approve once"), "{block}");
-    assert!(block.contains("always allow"), "{block}");
+    // The decision keys live inline as per-option tags; the folded footer row
+    // carries the navigation hint.
+    assert!(block.contains("[y]"), "{block}");
+    assert!(block.contains("[a]"), "{block}");
+    assert!(block.contains("Enter confirm"), "{block}");
 
     // The status hint row no longer carries the approval keybindings.
     let hints = format_status_hints(&app);
-    assert!(!hints.contains("always allow"), "{hints}");
-    assert!(!hints.contains("approve once"), "{hints}");
+    assert!(!hints.contains("Enter confirm"), "{hints}");
+    assert!(!hints.contains("[a]"), "{hints}");
 }
 
 #[test]
@@ -10131,7 +10189,7 @@ fn approval_block_capped_always_keeps_options() {
     // Narrow widths wrap the option labels; the capped block must still never
     // exceed its row budget, or ratatui clips a decision off the bottom.
     for width in [80u16, 50, 30, 24] {
-        let full_rows = visual_line_count(&approval_block_full(&req, 0), width);
+        let full_rows = visual_line_count(&approval_block_full(&req, 0, width), width);
         for max in 4u16..=full_rows + 2 {
             let lines = approval_block_capped(&req, 0, max, width);
             let rows = visual_line_count(&lines, width);
@@ -10152,7 +10210,9 @@ fn approval_block_capped_always_keeps_options() {
         roomy.contains("Always approve this command in this repo"),
         "{roomy}"
     );
-    assert!(roomy.contains("approve once"), "{roomy}");
+    assert!(roomy.contains("Enter confirm"), "{roomy}");
+    // The separator rule fences the options off from the folded hint row.
+    assert!(roomy.contains('─'), "{roomy}");
 }
 
 #[test]
@@ -15267,8 +15327,10 @@ async fn slash_feedback_previews_redacted_message_and_prompts_for_decision() {
 
     let output = render_to_string(&app, 100, 24);
     assert!(output.contains("Send feedback?"), "{output}");
-    assert!(output.contains("Enter/Y Send"), "{output}");
-    assert!(output.contains("Esc/N Discard"), "{output}");
+    assert!(output.contains("Enter/Y send"), "{output}");
+    assert!(output.contains("Esc/N discard"), "{output}");
+    // The hint row no longer wears the `›` cursor that made it read as a choice.
+    assert!(!output.contains("› Enter/Y"), "{output}");
 }
 
 #[tokio::test]
