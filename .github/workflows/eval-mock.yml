@@ -35,7 +35,7 @@ permissions:
 
 concurrency:
   group: eval-mock-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
