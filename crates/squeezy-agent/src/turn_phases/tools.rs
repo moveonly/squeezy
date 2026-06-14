@@ -464,7 +464,7 @@ pub(crate) async fn execute_tool_calls(
 /// a real skip needs to thread through cancellation, event emission,
 /// and broker accounting — but the marker gives the model immediate
 /// feedback so it stops issuing the same grep three times in a row.
-fn mark_intra_batch_duplicates(
+pub(crate) fn mark_intra_batch_duplicates(
     calls: &[ToolCall],
     results: &mut [ToolResult],
     tools: &ToolRegistry,
@@ -497,7 +497,7 @@ fn mark_intra_batch_duplicates(
     }
 }
 
-async fn replay_tool_calls(
+pub(super) async fn replay_tool_calls(
     replay: &ReplayRuntime,
     calls: Vec<ToolCall>,
     turn_id: TurnId,

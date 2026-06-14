@@ -15,7 +15,7 @@ use request::{
     request_response_verbosity,
 };
 use stream::next_llm_stream_event;
-use tools::{cancelled_tool_result, execute_tool_calls};
+use tools::{cancelled_tool_result, execute_tool_calls, replay_tool_calls};
 
 impl TurnRuntime {
     pub(super) async fn run(mut self, input: String) -> squeezy_core::Result<()> {

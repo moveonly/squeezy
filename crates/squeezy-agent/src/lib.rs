@@ -94,6 +94,8 @@ use turn_phases::request::{
 };
 use turn_phases::stream::next_llm_stream_event;
 use turn_phases::tools::execute_tool_calls;
+#[cfg(test)]
+use turn_phases::tools::mark_intra_batch_duplicates;
 
 pub use dispatch::{
     CompactSubcommand, DispatchCommand, DispatchCommandKind, DispatchCommandParseError,
