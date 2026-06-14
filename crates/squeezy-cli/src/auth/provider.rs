@@ -317,24 +317,24 @@ fn tier_has_inline_key(path: &Path, section: &str) -> bool {
 // surface shows the highest-priority source first; the JSON form keeps
 // every signal so scripts can decide for themselves.
 #[derive(Debug, Clone)]
-pub(super) struct StatusRow {
-    pub(super) provider: &'static str,
-    pub(super) section: &'static str,
-    pub(super) inline_tier: Option<TierLabel>,
-    pub(super) inline_path: Option<PathBuf>,
-    pub(super) env_var: &'static str,
-    pub(super) env_set: bool,
-    pub(super) fallback_env_var: Option<&'static str>,
-    pub(super) fallback_env_set: bool,
+pub(crate) struct StatusRow {
+    pub(crate) provider: &'static str,
+    pub(crate) section: &'static str,
+    pub(crate) inline_tier: Option<TierLabel>,
+    pub(crate) inline_path: Option<PathBuf>,
+    pub(crate) env_var: &'static str,
+    pub(crate) env_set: bool,
+    pub(crate) fallback_env_var: Option<&'static str>,
+    pub(crate) fallback_env_set: bool,
     /// Whether the inline key lives in a file-backed TOML tier (as
     /// opposed to an env var). On Windows this is reported as
     /// "file-backed" to distinguish it from a Credential Manager entry
     /// that does not exist yet.
-    pub(super) credentials_file_set: bool,
+    pub(crate) credentials_file_set: bool,
 }
 
 impl StatusRow {
-    pub(super) fn effective_source(&self) -> &'static str {
+    pub(crate) fn effective_source(&self) -> &'static str {
         if self.inline_tier.is_some() {
             "inline"
         } else if self.credentials_file_set {
@@ -352,11 +352,11 @@ impl StatusRow {
     /// environment variable or a credential manager. On Windows this
     /// distinction matters because file-backed keys are not protected by
     /// DPAPI or Windows Credential Manager.
-    pub(super) fn is_file_backed(&self) -> bool {
+    pub(crate) fn is_file_backed(&self) -> bool {
         self.inline_tier.is_some() || self.credentials_file_set
     }
 
-    pub(super) fn to_json(&self) -> serde_json::Value {
+    pub(crate) fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "provider": self.provider,
             "section": self.section,
@@ -373,7 +373,7 @@ impl StatusRow {
     }
 }
 
-fn compute_status_row(
+pub(crate) fn compute_status_row(
     provider: ProviderAuthMeta,
     sources: &SeparatedSources,
     env_lookup: &dyn Fn(&str) -> Option<String>,

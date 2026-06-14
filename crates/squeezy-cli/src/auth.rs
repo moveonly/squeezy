@@ -13,7 +13,7 @@ mod rendering;
 pub(crate) use browser::is_headless_linux;
 use flows::{handle_anthropic_oauth, handle_github_copilot_command, handle_openai_codex_command};
 pub(crate) use provider::{
-    collect_inline_keys, handle_auth_remove_at_path, handle_auth_set_at_path,
+    collect_inline_keys, compute_status_row, handle_auth_remove_at_path, handle_auth_set_at_path,
     handle_auth_status_with_env, provider_section_for,
 };
 use provider::{handle_auth_list, handle_auth_remove, handle_auth_set, handle_auth_status};
