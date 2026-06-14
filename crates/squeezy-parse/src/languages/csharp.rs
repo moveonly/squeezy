@@ -1232,6 +1232,39 @@ pub(crate) fn extract_csharp_symbol_facts(
             push_csharp_type_reference(returns, symbol, ctx, "return type reference");
         }
     }
+    // Generic constraint clauses (`where T : IEntity, new()`). The grammar
+    // never gets read by the generic identifier path, so an interface/enum used
+    // *only* as a constraint was emitted as `Identifier`-kind and rejected by
+    // the binder. Emit a `Type` ref per constraint type so `where T : IEntity`
+    // binds and surfaces in `reference_search`/`impact`. (The `new()` /
+    // `class` / `struct` / `notnull` keyword constraints carry no type.)
+    csharp_emit_constraint_type_references(node, symbol, ctx);
+}
+
+/// Emit a `Type` reference for every type named in a declaration's
+/// `type_parameter_constraints_clause`s (`where T : Base, IFace`). Each clause
+/// holds `type_parameter_constraint` children whose `type` field is the
+/// constraint type; keyword-only constraints (`new()`, `class`, …) are skipped.
+fn csharp_emit_constraint_type_references(
+    node: Node<'_>,
+    symbol: &ParsedSymbol,
+    ctx: &mut ExtractContext<'_>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "type_parameter_constraints_clause" {
+            continue;
+        }
+        let mut constraint_cursor = child.walk();
+        for constraint in child.named_children(&mut constraint_cursor) {
+            if constraint.kind() != "type_parameter_constraint" {
+                continue;
+            }
+            if let Some(type_node) = constraint.child_by_field_name("type") {
+                push_csharp_type_reference(type_node, symbol, ctx, "type constraint reference");
+            }
+        }
+    }
 }
 
 /// Returns the leaf receiver type of a C# extension method, i.e. the `type`
