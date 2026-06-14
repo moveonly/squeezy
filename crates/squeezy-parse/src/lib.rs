@@ -21,9 +21,9 @@ pub(crate) use languages::{
     python::extract_python, ruby::extract_ruby, rust::extract_rust, scala::extract_scala,
     swift::extract_swift,
 };
-pub(crate) use registration::{
-    ParserPool, language_for_kind, parser_for_language_kind, scala_language,
-};
+#[cfg(test)]
+pub(crate) use registration::scala_language;
+pub(crate) use registration::{ParserPool, language_for_kind, parser_for_language_kind};
 
 pub const CRATE_NAME: &str = "squeezy-parse";
 const PARALLEL_PARSE_THRESHOLD: usize = 8;
