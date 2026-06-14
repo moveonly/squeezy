@@ -86,6 +86,10 @@ pub(crate) fn visit_java_node(
             extract_java_method_reference(node, ctx, owner_symbol.clone());
             visit_java_children(node, ctx, parent_symbol, owner_symbol);
         }
+        "explicit_constructor_invocation" => {
+            extract_java_explicit_constructor_invocation(node, ctx, owner_symbol.clone());
+            visit_java_children(node, ctx, parent_symbol, owner_symbol);
+        }
         "identifier" => {}
         "type_identifier" | "scoped_type_identifier" => {
             extract_java_reference(node, ReferenceKind::Type, ctx, owner_symbol.clone())
@@ -442,6 +446,73 @@ pub(crate) fn extract_java_method_invocation(
         confidence: Confidence::CandidateSet,
     });
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+}
+
+/// An explicit constructor invocation is a `super(...)` or `this(...)`
+/// delegation in a constructor body. Both were unhandled, so
+/// constructor-to-superconstructor and constructor-to-overloaded-constructor
+/// delegation produced no call edges and upstream/downstream flow on
+/// constructors missed them. Emit a `Direct` `ParsedCall` named for the
+/// enclosing class (the target type of both `super` and `this` delegation),
+/// carrying the argument arity, so the resolver can bind it to a constructor.
+pub(crate) fn extract_java_explicit_constructor_invocation(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let Some(class_name) = java_enclosing_type_name(node, ctx.source) else {
+        return;
+    };
+    let receiver = node
+        .child_by_field_name("constructor")
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let arity = node
+        .child_by_field_name("arguments")
+        .map(named_child_count)
+        .unwrap_or_default();
+    let target_text = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name: class_name,
+        target_text,
+        receiver,
+        arity,
+        kind: ParsedCallKind::Direct,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-java", "explicit_constructor_invocation"),
+        confidence: Confidence::CandidateSet,
+    });
+    extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+}
+
+/// Walk up to the nearest enclosing type declaration and return its declared
+/// name. Used to name a `super(...)`/`this(...)` delegation after the class
+/// whose constructor it targets.
+fn java_enclosing_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "record_declaration"
+                | "enum_declaration"
+                | "interface_declaration"
+        ) {
+            return parent
+                .child_by_field_name("name")
+                .and_then(|child| node_text(child, source).ok())
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty());
+        }
+        current = parent.parent();
+    }
+    None
 }
 
 /// A method reference (`User::getName`, `Comparator::naturalOrder`,
