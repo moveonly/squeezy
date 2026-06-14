@@ -9109,6 +9109,77 @@ fn delegate_chain_threads_previous_step_summary_into_next_step_prompt() {
     assert_eq!(steps[1].prompt, step_b_template);
     assert!(steps[0].scope.is_none());
     assert!(steps[1].scope.is_none());
+    assert!(
+        steps[0].model.is_none() && steps[1].model.is_none(),
+        "steps without an explicit `model` must parse to None so the dispatcher \
+         falls back to the parent's delegate model"
+    );
+
+    // A per-step `model` override must parse off the chain step AND survive
+    // the round-trip through the delegate sub-call the dispatcher builds:
+    // `handle_delegate_chain_call` copies `step.model` into the step's
+    // `delegate` args, which `parse_subagent_request` reads back into
+    // `SubagentRequest.model_override` that `run_subagent` runs on. If either
+    // layer dropped the field the step would silently fall back to the
+    // parent's delegate model and the advertised override would be a no-op.
+    let step_b_model = "anthropic:claude-haiku";
+    let chain_with_model = ToolCall {
+        call_id: "chain_model".to_string(),
+        name: DELEGATE_CHAIN_TOOL_NAME.to_string(),
+        arguments: json!({
+            "steps": [
+                { "prompt": step_a },
+                { "prompt": step_b_template, "model": step_b_model },
+            ]
+        }),
+    };
+    let model_steps =
+        parse_delegate_chain_steps(&chain_with_model).expect("chain with model valid");
+    assert_eq!(model_steps[0].model, None);
+    assert_eq!(model_steps[1].model.as_deref(), Some(step_b_model));
+
+    let step_call = ToolCall {
+        call_id: "chain_model#step_1".to_string(),
+        name: DELEGATE_TOOL_NAME.to_string(),
+        arguments: json!({
+            "prompt": "rendered",
+            "model": model_steps[1].model.clone().unwrap(),
+        }),
+    };
+    let request =
+        parse_subagent_request(&step_call, SubagentKind::Delegate).expect("delegate args valid");
+    assert_eq!(
+        request.model_override.as_deref(),
+        Some(step_b_model),
+        "the per-step model must reach SubagentRequest.model_override so run_subagent runs the step on it"
+    );
+
+    // A blank `model` collapses to None at both layers so an empty override
+    // never shadows the parent's delegate model.
+    let blank_model_call = ToolCall {
+        call_id: "chain_blank".to_string(),
+        name: DELEGATE_CHAIN_TOOL_NAME.to_string(),
+        arguments: json!({ "steps": [{ "prompt": step_a, "model": "  " }] }),
+    };
+    let blank_steps =
+        parse_delegate_chain_steps(&blank_model_call).expect("blank model still valid");
+    assert_eq!(
+        blank_steps[0].model, None,
+        "a whitespace-only model must collapse to None, not an empty override"
+    );
+
+    // Absent `model` on a plain delegate call → no override on the request.
+    let no_model_call = ToolCall {
+        call_id: "delegate_no_model".to_string(),
+        name: DELEGATE_TOOL_NAME.to_string(),
+        arguments: json!({ "prompt": "rendered" }),
+    };
+    let no_model_request = parse_subagent_request(&no_model_call, SubagentKind::Delegate)
+        .expect("delegate args valid");
+    assert_eq!(
+        no_model_request.model_override, None,
+        "an absent `model` arg must leave model_override None so the per-kind default applies"
+    );
 
     // Missing prompt on a step must surface as an actionable error
     // before any subagent lease is taken.

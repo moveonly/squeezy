@@ -11967,6 +11967,17 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
         }
         Some(_) => return Err("thoroughness must be a string".to_string()),
     };
+    // Optional per-call model override. `delegate_chain` threads each
+    // step's `model` through here so it lands on `SubagentRequest.model_override`,
+    // which `run_subagent` normalizes through `resolve_model_alias_owned` and
+    // runs the subagent on instead of the per-kind default. Blank → None so an
+    // empty string never shadows the kind's default model.
+    let model = match call.arguments.get("model") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(value)) if value.trim().is_empty() => None,
+        Some(Value::String(value)) => Some(value.trim().to_string()),
+        Some(_) => return Err("model must be a string or null".to_string()),
+    };
     if !matches!(kind, SubagentKind::Explore) && thoroughness.is_some() {
         return Err(format!("{} does not accept thoroughness", kind.as_str()));
     }
@@ -12031,8 +12042,10 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
         // Skill subagents reaching this path through `delegate`-style
         // wiring would inherit the kind's default instructions.
         system_override: None,
-        // Model is resolved per-kind for tool-call-driven subagents.
-        model_override: None,
+        // An explicit `model` arg (e.g. a `delegate_chain` step's model)
+        // overrides the per-kind default; absent/blank falls back to
+        // `subagent_model_for_kind` in `run_subagent`.
+        model_override: model,
     })
 }
 
@@ -13019,12 +13032,12 @@ fn subagent_control_result(
 /// One parsed step inside a `delegate_chain` invocation. Mirrors the
 /// shape of the advertised schema in [`delegate_chain_advertised_tool`].
 ///
-/// `model` is currently informational — per-step model overrides are not
-/// wired through `subagent_model_for_kind` yet, so the dispatcher falls
-/// back to the configured delegate model for every step. Keeping the
-/// field on the parsed shape lets us validate the JSON contract up front
-/// and unblocks a future per-step override without another schema
-/// migration.
+/// `model` is the optional per-step override. When set, the dispatcher
+/// threads it into the step's `delegate` sub-call, where it round-trips
+/// through `parse_subagent_request` → `SubagentRequest.model_override` →
+/// `run_subagent` (normalized via `resolve_model_alias_owned`); when
+/// `None` the step falls back to the parent's delegate model from
+/// `subagent_model_for_kind`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DelegateChainStep {
     prompt: String,
@@ -13211,6 +13224,14 @@ async fn handle_delegate_chain_call(
         let mut step_args = json!({ "prompt": substituted });
         if let Some(scope) = &step.scope {
             step_args["scope"] = Value::String(scope.clone());
+        }
+        // Thread the per-step model override into the sub-call so it
+        // round-trips through `parse_subagent_request` →
+        // `SubagentRequest.model_override` → `run_subagent` and the step
+        // actually runs on its requested model; omitted falls back to the
+        // parent's delegate model.
+        if let Some(model) = &step.model {
+            step_args["model"] = Value::String(model.clone());
         }
         let step_call = ToolCall {
             call_id: format!("{}#step_{step_idx}", call.call_id),
