@@ -3988,7 +3988,10 @@ impl ModelProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `PartialOrd`/`Ord` follow declaration order (Low < Medium < High < XHigh) so
+// callers can clamp one effort against another (e.g. cap a cheap rung's effort
+// at a user pin) with `.min()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     Low,

@@ -6178,24 +6178,36 @@ fn request_reasoning_effort_for_tier(
     judge_effort: Option<squeezy_core::ReasoningEffort>,
 ) -> Option<squeezy_core::ReasoningEffort> {
     let routing = &config.routing;
-    let effort = match config.reasoning_effort {
-        // User pin: hard override, every rung.
-        Some(pinned) => pinned,
-        // No pin, but tier-effort disabled or routing off: preserve the global
-        // (None → provider default) behavior.
-        None if !routing.tier_effort || !routing.enabled => return None,
-        // No pin: the judge's per-task effort wins when present (a task-specific
-        // signal — e.g. Opus@xhigh for a tricky bug vs Opus@medium for a routine
-        // edit). Otherwise a per-tier override; otherwise cheaper rungs get their
-        // shallower default while the Strong (parent) rung keeps the provider
-        // default — so enabling tier-effort never silently deepens (and raises
-        // the cost of) un-rerouted turns. Opt into a deeper flagship via
-        // `effort_strong` or judge-effort.
-        None => match judge_effort.or_else(|| routing.effort_for_tier(tier)) {
-            Some(over) => over,
-            None if tier == ModelTier::Strong => return None,
-            None => tier.default_effort(),
-        },
+    // Tier-effort off (or routing off): the user pin applies as-is on every rung
+    // (legacy behavior); no pin → provider default.
+    if !routing.tier_effort || !routing.enabled {
+        let effort = config.reasoning_effort?;
+        return capabilities_for(provider_name, model)
+            .filter(|capabilities| capabilities.reasoning_effort)
+            .map(|_| effort);
+    }
+    let effort = if tier == ModelTier::Strong {
+        // Strong/parent rung: the user pin governs how hard the main model
+        // thinks; failing a pin, a per-task judge effort (Opus@xhigh for a tricky
+        // bug vs Opus@medium for a routine edit) or the `effort_strong` override;
+        // failing all, the provider default (None ends the turn here = no field).
+        config
+            .reasoning_effort
+            .or(judge_effort)
+            .or_else(|| routing.effort_for_tier(ModelTier::Strong))?
+    } else {
+        // Routed DOWN to a cheaper rung: run at the rung's shallow tier effort.
+        // A user pin (or a judge `xhigh`) must NOT deepen a turn squeezy routed
+        // down to economize — spending a 60k-token thinking budget on the cheap
+        // model for a trivial turn would defeat the routing — so the pin can only
+        // ever LOWER a cheap rung's effort, never raise it.
+        let rung = routing
+            .effort_for_tier(tier)
+            .unwrap_or(tier.default_effort());
+        match config.reasoning_effort {
+            Some(pin) => rung.min(pin),
+            None => rung,
+        }
     };
     capabilities_for(provider_name, model)
         .filter(|capabilities| capabilities.reasoning_effort)
