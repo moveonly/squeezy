@@ -1171,11 +1171,11 @@ fn compaction_decision_is_false_below_summarize_threshold() {
         "scenario should satisfy the item floor"
     );
     assert!(
-        decision.estimate.items > decision.effective_keep,
+        decision.estimate.items > config.context_compaction.recent_items.max(1),
         "scenario should have a foldable older slice"
     );
     assert!(
-        decision.tokens_with_overhead < decision.threshold,
+        decision.estimate.estimated_tokens < config.context_compaction.summarize_threshold(),
         "scenario should sit below the summarize threshold"
     );
     assert!(
@@ -1191,7 +1191,7 @@ fn compaction_decision_is_true_above_summarize_threshold() {
     let decision = context_compaction_decision(&conversation, &config, 0);
 
     assert!(
-        decision.tokens_with_overhead >= decision.threshold,
+        decision.estimate.estimated_tokens >= config.context_compaction.summarize_threshold(),
         "scenario should cross the summarize threshold"
     );
     assert!(

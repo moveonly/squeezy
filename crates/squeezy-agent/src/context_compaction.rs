@@ -139,10 +139,6 @@ pub struct ContextCompactionReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContextCompactionDecision {
     pub estimate: ContextEstimate,
-    pub tokens_with_overhead: u64,
-    pub threshold: u64,
-    pub over_high_water: bool,
-    pub effective_keep: usize,
     pub should_compact: bool,
 }
 
@@ -171,10 +167,6 @@ pub(crate) fn context_compaction_decision(
 
     ContextCompactionDecision {
         estimate,
-        tokens_with_overhead,
-        threshold,
-        over_high_water,
-        effective_keep,
         should_compact,
     }
 }
