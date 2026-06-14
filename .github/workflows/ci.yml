@@ -436,7 +436,12 @@ jobs:
 
   eval-mock-scenarios:
     name: Eval mock scenarios (offline)
+    # Post-merge regression gate on main (and manual dispatch), not every PR:
+    # the job cold-builds the harness and runs ~97 scenarios that index the
+    # repo, so it is too heavy to gate every PR on. Mirrors coverage-summary.
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
