@@ -126,6 +126,11 @@ struct ImpactArgs {
     /// Additional file paths that are also part of the changed set.
     #[serde(default)]
     extra_paths: Vec<String>,
+    /// When `true`, return ONLY the files that directly import each changed
+    /// file (one BFS hop, no transitive fan-out). Skips the
+    /// `affected_symbols`/`affected_tests` computation entirely. Defaults to
+    /// `false` (the full transitive impact).
+    direct_only: Option<bool>,
     /// Maximum number of affected symbols to return (default 50).
     max_results: Option<usize>,
 }
@@ -4018,6 +4023,68 @@ impl ToolRegistry {
                 ToolStatus::Success,
                 Value::Object(payload),
                 ToolCostHint::default(),
+                None,
+            );
+        }
+
+        // direct_only: return just the first-hop importer files of every
+        // changed file, with no transitive fan-out and no
+        // affected_symbols/affected_tests computation. Deterministic by sorting
+        // on the relative path; each importer is emitted once across all roots.
+        if args.direct_only.unwrap_or(false) {
+            let mut importers: HashSet<FileId> = HashSet::new();
+            for file_id in &changed {
+                for importer in graph.direct_importers(file_id) {
+                    // Don't list a changed file as an importer of itself.
+                    if !changed.contains(&importer) {
+                        importers.insert(importer);
+                    }
+                }
+            }
+            let mut importer_files: Vec<&squeezy_graph::FileRecord> = importers
+                .iter()
+                .filter_map(|fid| graph.files.get(fid))
+                .collect();
+            importer_files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+            let total = importer_files.len();
+            let truncated = total > max_results;
+            let packets: Vec<Value> = importer_files
+                .iter()
+                .take(max_results)
+                .map(|file| {
+                    json!({
+                        "importer": {
+                            "file_id": file.id.0,
+                            "path": file.relative_path,
+                        }
+                    })
+                })
+                .collect();
+            let returned = packets.len();
+            let mut payload = graph_payload("impact", manager, refresh);
+            payload.insert(
+                "changed_files".to_string(),
+                json!(
+                    changed
+                        .iter()
+                        .filter_map(|fid| graph.files.get(fid))
+                        .map(|f| f.relative_path.clone())
+                        .collect::<Vec<_>>()
+                ),
+            );
+            payload.insert("direct_only".to_string(), json!(true));
+            payload.insert("packets".to_string(), json!(packets));
+            payload.insert("importer_count".to_string(), json!(total));
+            payload.insert("truncated".to_string(), json!(truncated));
+            return make_result(
+                call,
+                ToolStatus::Success,
+                Value::Object(payload),
+                ToolCostHint {
+                    matches_returned: returned as u64,
+                    truncated,
+                    ..ToolCostHint::default()
+                },
                 None,
             );
         }
