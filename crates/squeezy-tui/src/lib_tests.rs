@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ratatui::backend::TestBackend;
 use squeezy_agent::{CostCapStatus, JobKind, JobStatus};
