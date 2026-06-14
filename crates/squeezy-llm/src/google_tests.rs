@@ -2,7 +2,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use super::*;
-use crate::{CacheSpec, LlmInputItem, LlmToolCall, LlmToolSpec};
+use crate::{LlmInputItem, LlmToolCall, LlmToolSpec, test_support::LlmRequestBuilder};
 
 #[test]
 fn stream_url_does_not_contain_api_key() {
@@ -22,32 +22,17 @@ fn stream_url_does_not_contain_api_key() {
 
 #[test]
 fn request_body_uses_generate_content_shape() {
-    let request = LlmRequest {
-        model: "gemini-test".to_string().into(),
-        instructions: "be brief".to_string().into(),
-        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
-        max_output_tokens: Some(32),
-        response_verbosity: None,
-        reasoning_effort: None,
-        previous_response_id: None,
-        cache_key: None,
-        cache: CacheSpec::default(),
-        tools: Arc::from(vec![
-            LlmToolSpec {
-                name: "read_file".to_string(),
-                description: "read".to_string(),
-                parameters: json!({"type": "object"}),
-                strict: true,
-            }
-            .into(),
-        ]),
-        store: false,
-        tool_choice: None,
-        output_schema: None,
-        parallel_tool_calls: None,
-        beta_headers: std::sync::Arc::from(Vec::new()),
-        ..LlmRequest::default()
-    };
+    let request = LlmRequestBuilder::new("gemini-test")
+        .instructions("be brief")
+        .user_text("hello")
+        .max_output_tokens(32)
+        .tool(LlmToolSpec {
+            name: "read_file".to_string(),
+            description: "read".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: true,
+        })
+        .build();
 
     let body = GoogleProvider::request_body(&request);
 
@@ -63,14 +48,13 @@ fn request_body_uses_generate_content_shape() {
 
 #[test]
 fn request_body_lowers_sampling_fields() {
-    let request = LlmRequest {
-        model: "gemini-test".to_string().into(),
-        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
-        temperature: Some(0.3),
-        top_p: Some(0.9),
-        stop: vec!["END".to_string(), "STOP".to_string()],
-        ..LlmRequest::default()
-    };
+    let request = LlmRequestBuilder::new("gemini-test")
+        .user_text("hello")
+        .temperature(0.3)
+        .top_p(0.9)
+        .stop("END")
+        .stop("STOP")
+        .build();
 
     let body = GoogleProvider::request_body(&request);
 
@@ -84,39 +68,22 @@ fn request_body_lowers_sampling_fields() {
 
 #[test]
 fn request_body_preserves_function_tool_order() {
-    let request = LlmRequest {
-        model: "gemini-test".to_string().into(),
-        instructions: "be brief".to_string().into(),
-        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
-        max_output_tokens: None,
-        response_verbosity: None,
-        reasoning_effort: None,
-        previous_response_id: None,
-        cache_key: None,
-        cache: CacheSpec::default(),
-        tools: Arc::from(vec![
-            LlmToolSpec {
-                name: "write_file".to_string(),
-                description: "write".to_string(),
-                parameters: json!({"type": "object"}),
-                strict: true,
-            }
-            .into(),
-            LlmToolSpec {
-                name: "grep".to_string(),
-                description: "search".to_string(),
-                parameters: json!({"type": "object"}),
-                strict: true,
-            }
-            .into(),
-        ]),
-        store: false,
-        tool_choice: None,
-        output_schema: None,
-        parallel_tool_calls: None,
-        beta_headers: std::sync::Arc::from(Vec::new()),
-        ..LlmRequest::default()
-    };
+    let request = LlmRequestBuilder::new("gemini-test")
+        .instructions("be brief")
+        .user_text("hello")
+        .tool(LlmToolSpec {
+            name: "write_file".to_string(),
+            description: "write".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: true,
+        })
+        .tool(LlmToolSpec {
+            name: "grep".to_string(),
+            description: "search".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: true,
+        })
+        .build();
 
     let body = GoogleProvider::request_body(&request);
 
@@ -129,10 +96,9 @@ fn request_body_preserves_function_tool_order() {
 
 #[test]
 fn request_body_preserves_function_response_name() {
-    let request = LlmRequest {
-        model: "gemini-test".to_string().into(),
-        instructions: "be brief".to_string().into(),
-        input: Arc::from(vec![
+    let request = LlmRequestBuilder::new("gemini-test")
+        .instructions("be brief")
+        .input_items(vec![
             LlmInputItem::FunctionCall {
                 call_id: "call-1".to_string(),
                 name: "grep".to_string(),
@@ -144,21 +110,8 @@ fn request_body_preserves_function_response_name() {
                 content_parts: None,
                 is_error: false,
             },
-        ]),
-        max_output_tokens: None,
-        response_verbosity: None,
-        reasoning_effort: None,
-        previous_response_id: None,
-        cache_key: None,
-        cache: CacheSpec::default(),
-        tools: Arc::from(Vec::new()),
-        store: false,
-        tool_choice: None,
-        output_schema: None,
-        parallel_tool_calls: None,
-        beta_headers: std::sync::Arc::from(Vec::new()),
-        ..LlmRequest::default()
-    };
+        ])
+        .build();
 
     let body = GoogleProvider::request_body(&request);
 

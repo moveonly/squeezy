@@ -8,6 +8,7 @@
 //! `src/foo.rs` on case-sensitive Linux filesystems), then by trigram
 //! Jaccard similarity against the path's basename.
 
+use crate::tokens::{TokenCase, path_token_separator, split_tokens, split_tokens_both};
 use std::collections::HashSet;
 
 /// Result of ranking a single path. Sort key is (`-overlap`,
@@ -143,63 +144,20 @@ pub fn rank_paths(paths: &[&str], query: &str) -> Vec<(usize, PathRank)> {
 /// in its separator set so behaviour mirrors what models type for
 /// file-shaped queries.
 fn path_tokens(input: &str) -> Vec<String> {
-    path_split_raw(input, true)
+    split_tokens(input, path_token_separator, TokenCase::Lowercase)
 }
 
 /// Split `input` into tokens on `/`, `\`, `_`, `-`, `.`, and whitespace
 /// without lowercasing.  Used for the exact-case overlap signal so that
 /// `Foo.rs` in a query can match `Foo.rs` in a path but not `foo.rs`.
 fn path_tokens_preserving_case(input: &str) -> Vec<String> {
-    path_split_raw(input, false)
-}
-
-fn path_split_raw(input: &str, lowercase: bool) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    for ch in input.chars() {
-        let is_sep = matches!(ch, '/' | '\\' | '_' | '-' | '.') || ch.is_whitespace();
-        if is_sep {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-            continue;
-        }
-        if lowercase {
-            current.extend(ch.to_lowercase());
-        } else {
-            current.push(ch);
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
+    split_tokens(input, path_token_separator, TokenCase::Preserve)
 }
 
 /// Returns `(lowercase_tokens, case_preserving_tokens)` in a single pass,
 /// avoiding two separate `path_split_raw` traversals per candidate path.
 fn path_split_both(input: &str) -> (Vec<String>, Vec<String>) {
-    let mut lc: Vec<String> = Vec::new();
-    let mut raw: Vec<String> = Vec::new();
-    let mut lc_cur = String::new();
-    let mut raw_cur = String::new();
-    for ch in input.chars() {
-        let is_sep = matches!(ch, '/' | '\\' | '_' | '-' | '.') || ch.is_whitespace();
-        if is_sep {
-            if !lc_cur.is_empty() {
-                lc.push(std::mem::take(&mut lc_cur));
-                raw.push(std::mem::take(&mut raw_cur));
-            }
-        } else {
-            lc_cur.extend(ch.to_lowercase());
-            raw_cur.push(ch);
-        }
-    }
-    if !lc_cur.is_empty() {
-        lc.push(lc_cur);
-        raw.push(raw_cur);
-    }
-    (lc, raw)
+    split_tokens_both(input, path_token_separator)
 }
 
 /// Jaccard similarity over the character-trigram sets of `a` and `b`,

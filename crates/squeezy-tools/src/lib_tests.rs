@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -284,6 +284,62 @@ fn plan_parallel_batches_serializes_unsafe_calls_between_safe_runs() {
     }
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn advertised_first_party_specs_have_registered_executors() {
+    // The spec catalog, permission metadata, and executor classifier are
+    // maintained in different places. Keep a cheap first-party descriptor
+    // guardrail near the registry tests so adding or renaming a tool cannot
+    // silently advertise a spec without updating the in-tree dispatch surface.
+    let roots = [
+        temp_workspace("first_party_specs_default"),
+        temp_workspace("first_party_specs_checkpoints"),
+    ];
+    let registries = [
+        registry_with_shell_sandbox_off(&roots[0]),
+        registry_with_shell_sandbox_off_and_checkpoints(&roots[1]),
+    ];
+
+    for registry in &registries {
+        let mut advertised = BTreeSet::new();
+        let specs = registry.specs();
+        for spec in specs.iter().filter(|spec| !spec.name.starts_with("mcp__")) {
+            assert!(
+                advertised.insert(spec.name.clone()),
+                "duplicate first-party tool spec advertised: {}",
+                spec.name
+            );
+            assert!(
+                first_party_tool_executor(spec.name.as_str()).is_some(),
+                "first-party tool spec `{}` is advertised but missing from the top-level dispatch classifier",
+                spec.name
+            );
+
+            match spec.name.as_str() {
+                "shell" => {
+                    assert_eq!(spec.capability, PermissionCapability::Shell);
+                    assert!(
+                        !spec.parallel_safe,
+                        "shell must stay serialized so shell side effects cannot race"
+                    );
+                }
+                "refresh_compiler_facts" | "verify" => {
+                    assert_eq!(spec.capability, PermissionCapability::Compiler);
+                    assert!(
+                        !spec.parallel_safe,
+                        "{} must stay serialized with compiler/shell execution",
+                        spec.name
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for root in roots {
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[test]

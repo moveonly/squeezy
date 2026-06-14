@@ -35962,6 +35962,17 @@ async fn record_turn_outcome_captures_success_and_edits() {
     );
 }
 
+fn expected_if_prev_succeeded_marker() -> &'static str {
+    if matches!(
+        render::palette::color_level(),
+        render::palette::ColorLevel::NoColor
+    ) {
+        queue_conditions::QueueCondition::IfPrevSucceeded.marker_glyph_ascii()
+    } else {
+        queue_conditions::QueueCondition::IfPrevSucceeded.marker_glyph()
+    }
+}
+
 #[tokio::test]
 async fn overlay_paints_condition_marker_through_real_render() {
     // The open overlay paints a condition tag next to a conditioned prompt and
@@ -35980,7 +35991,7 @@ async fn overlay_paints_condition_marker_through_real_render() {
         "base hint advertises the v verb: {base}"
     );
     assert!(
-        !base.contains("[✓]"),
+        !base.contains(expected_if_prev_succeeded_marker()),
         "no condition glyph when all unconditional: {base}"
     );
     // Condition the front prompt on "if previous succeeded".
@@ -35992,8 +36003,9 @@ async fn overlay_paints_condition_marker_through_real_render() {
     .await
     .expect("condition front prompt");
     let painted = render_to_string(&app, 100, 20);
+    let marker = expected_if_prev_succeeded_marker();
     assert!(
-        painted.contains("[✓]"),
+        painted.contains(marker),
         "the if-succeeded marker is painted: {painted}"
     );
 }
@@ -36054,8 +36066,9 @@ async fn condition_marker_survives_a_narrow_resize() {
         // pre-existing overlay constraint, not a marker bug; the assertion above
         // already proves the narrow render does not panic.
         if width >= 120 {
+            let marker = expected_if_prev_succeeded_marker();
             assert!(
-                rendered.contains("[✓]"),
+                rendered.contains(marker),
                 "marker painted at width {width}: {rendered}"
             );
         }
@@ -52341,4 +52354,39 @@ fn register_command_link_targets_skips_rows_outside_the_window_and_no_wrap() {
         app.click_target_at(0, 0).is_none(),
         "no-wrap mode registers no command-link targets"
     );
+}
+
+#[cfg(test)]
+mod theme_editor_bar_hittest_tests {
+    use super::*;
+
+    /// The clickable track and the painted track must agree in width: the
+    /// rightmost VISIBLE track cell maps to 255, and clicking the reserved
+    /// numeric-value region (the " 255" label cells) clamps to 255 rather than
+    /// being treated as track that reads below max. Regression guard for the
+    /// paint-vs-hit-test width drift.
+    #[test]
+    fn rightmost_visible_track_cell_maps_to_max() {
+        let bar = Rect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 1,
+        };
+        // Painted track: width - label(2) - value(4) = 44 cells, starting at
+        // column track_x = 2, so the last visible cell is column 2 + 44 - 1 = 45.
+        let track_x = THEME_EDITOR_BAR_LABEL_WIDTH;
+        let track_w = bar.width - THEME_EDITOR_BAR_LABEL_WIDTH - THEME_EDITOR_BAR_VALUE_WIDTH;
+        let last_visible = track_x + track_w - 1;
+        assert_eq!(theme_editor_channel_value_at(bar, last_visible), 255);
+        // Clicking the reserved " 255" label region (just past the visible track)
+        // clamps to 255 rather than reading as a lower track value.
+        assert_eq!(
+            theme_editor_channel_value_at(bar, bar.width - 1),
+            255,
+            "value-label region must clamp to 255"
+        );
+        // A click at/left of the track origin reads as 0.
+        assert_eq!(theme_editor_channel_value_at(bar, track_x), 0);
+    }
 }

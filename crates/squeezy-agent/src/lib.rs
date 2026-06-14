@@ -97,8 +97,8 @@ use cancel::{CancelErr, OrCancelExt};
 use context_compaction::build_compaction_summary;
 use context_compaction::{
     PendingToolResult, SeenToolOutputs, compact_conversation, compact_conversation_with_strategy,
-    drop_orphan_function_call_outputs, estimate_context, estimated_tokens,
-    maybe_compact_conversation, next_context_pin_id, pack_tool_results,
+    context_compaction_decision, drop_orphan_function_call_outputs, estimate_context,
+    estimated_tokens, maybe_compact_conversation, next_context_pin_id, pack_tool_results,
     repair_orphan_function_calls,
 };
 use cost_broker::{
@@ -7978,27 +7978,11 @@ impl TurnRuntime {
         // turn — only when compaction will actually run. PostCompact
         // mirrors the report's before/after counts so observers can
         // measure the rewrite. The no-hook path stays allocation-free.
-        let pre_compaction_estimate = estimate_context(&conversation);
-        // Mirror the post-turn gate in `maybe_compact_conversation` so the
-        // PreCompact hook fires exactly when compaction will run: window-aware
-        // ceiling, instruction/tool overhead folded in, and the high-water
-        // `min_items` bypass with its matching `recent_items` cap.
-        let cc = &self.config.context_compaction;
         let overhead_tokens = self.last_request_overhead_tokens.load(Ordering::Relaxed);
-        let pre_compaction_tokens = pre_compaction_estimate
-            .estimated_tokens
-            .saturating_add(overhead_tokens);
-        let over_high_water = pre_compaction_tokens >= cc.min_items_bypass_threshold();
-        let mut effective_keep = cc.recent_items.max(1);
-        if over_high_water {
-            effective_keep = effective_keep.min(pre_compaction_estimate.items / 2).max(1);
-        }
-        let compaction_likely = cc.enabled
-            && (pre_compaction_estimate.items >= cc.min_items || over_high_water)
-            && pre_compaction_estimate.items > effective_keep
-            && pre_compaction_tokens >= cc.summarize_threshold();
-        if compaction_likely {
-            self.dispatch_pre_compact(pre_compaction_estimate.estimated_tokens);
+        let compaction_decision =
+            context_compaction_decision(&conversation, &self.config, overhead_tokens);
+        if compaction_decision.should_compact {
+            self.dispatch_pre_compact(compaction_decision.estimate.estimated_tokens);
         }
         if let Some(report) = maybe_compact_conversation(
             &mut conversation,

@@ -1,32 +1,7 @@
-use std::{env, fs, io, path::PathBuf};
-
-const DOCS: &[(&str, &str)] = &[
-    ("README.md", "docs/external/README.md"),
-    ("AGENT_APPROACH.md", "docs/external/AGENT_APPROACH.md"),
-    ("APPROVAL_POLICY.md", "docs/external/APPROVAL_POLICY.md"),
-    ("CHECKPOINTS.md", "docs/external/CHECKPOINTS.md"),
-    ("CONFIGURATION.md", "docs/external/CONFIGURATION.md"),
-    ("FEEDBACK.md", "docs/external/FEEDBACK.md"),
-    ("INSTALL.md", "docs/external/INSTALL.md"),
-    ("LANGUAGES.md", "docs/external/LANGUAGES.md"),
-    ("MCP_AND_WEB.md", "docs/external/MCP_AND_WEB.md"),
-    ("MEMORY.md", "docs/external/MEMORY.md"),
-    ("PLATFORMS.md", "docs/external/PLATFORMS.md"),
-    ("PROVIDERS.md", "docs/external/PROVIDERS.md"),
-    ("REPO_PROFILE.md", "docs/external/REPO_PROFILE.md"),
-    ("SESSIONS.md", "docs/external/SESSIONS.md"),
-    ("SHELL_SANDBOXING.md", "docs/external/SHELL_SANDBOXING.md"),
-    ("SKILLS.md", "docs/external/SKILLS.md"),
-    ("TELEMETRY.md", "docs/external/TELEMETRY.md"),
-    ("TOOLS.md", "docs/external/TOOLS.md"),
-    ("TROUBLESHOOTING.md", "docs/external/TROUBLESHOOTING.md"),
-    (
-        "tool-call-saving-strategy.md",
-        "docs/external/tool-call-saving-strategy.md",
-    ),
-    ("HOOKS.md", "docs/external/HOOKS.md"),
-    ("PROMPT_TEMPLATES.md", "docs/external/PROMPT_TEMPLATES.md"),
-];
+use std::{
+    env, fs, io,
+    path::{Path, PathBuf},
+};
 
 fn main() -> io::Result<()> {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
@@ -34,8 +9,12 @@ fn main() -> io::Result<()> {
     println!("cargo:rerun-if-changed={}", docs_dir.display());
 
     let mut generated = String::from("const BUNDLED_DOCS: &[BundledDoc] = &[\n");
-    for (file_name, docs_path) in DOCS {
-        let full_path = docs_dir.join(file_name);
+    for full_path in external_doc_paths(&docs_dir)? {
+        let file_name = full_path
+            .file_name()
+            .expect("external docs entry has a filename")
+            .to_string_lossy();
+        let docs_path = format!("docs/external/{file_name}");
         println!("cargo:rerun-if-changed={}", full_path.display());
         let content = fs::read_to_string(&full_path)?;
         generated.push_str("    BundledDoc {\n");
@@ -48,6 +27,18 @@ fn main() -> io::Result<()> {
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("out dir"));
     fs::write(out_dir.join("bundled_docs.rs"), generated)
+}
+
+fn external_doc_paths(docs_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(docs_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+            paths.push(path);
+        }
+    }
+    paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    Ok(paths)
 }
 
 fn raw_string_literal(content: &str) -> String {

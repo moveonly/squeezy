@@ -1013,5 +1013,9 @@ impl LlmProvider for UnavailableProvider {
 }
 
 #[cfg(test)]
+#[path = "test_support.rs"]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;

@@ -2,36 +2,21 @@ use serde_json::json;
 use std::sync::Arc;
 
 use super::*;
-use crate::{CacheSpec, LlmInputItem, LlmToolSpec};
+use crate::{CacheSpec, LlmInputItem, LlmToolSpec, test_support::LlmRequestBuilder};
 
 #[test]
 fn request_body_uses_chat_stream_shape() {
-    let request = LlmRequest {
-        model: "qwen3".to_string().into(),
-        instructions: "be brief".to_string().into(),
-        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
-        max_output_tokens: Some(16),
-        response_verbosity: None,
-        reasoning_effort: None,
-        previous_response_id: None,
-        cache_key: None,
-        cache: CacheSpec::default(),
-        tools: Arc::from(vec![
-            LlmToolSpec {
-                name: "grep".to_string(),
-                description: "search".to_string(),
-                parameters: json!({"type": "object"}),
-                strict: true,
-            }
-            .into(),
-        ]),
-        store: false,
-        tool_choice: None,
-        output_schema: None,
-        parallel_tool_calls: None,
-        beta_headers: std::sync::Arc::from(Vec::new()),
-        ..LlmRequest::default()
-    };
+    let request = LlmRequestBuilder::new("qwen3")
+        .instructions("be brief")
+        .user_text("hello")
+        .max_output_tokens(16)
+        .tool(LlmToolSpec {
+            name: "grep".to_string(),
+            description: "search".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: true,
+        })
+        .build();
 
     let body = OllamaProvider::request_body(&request);
 
@@ -46,24 +31,7 @@ fn request_body_uses_chat_stream_shape() {
 
 #[test]
 fn request_body_emits_keep_alive_when_set() {
-    let request = LlmRequest {
-        model: "qwen3".to_string().into(),
-        instructions: String::new().into(),
-        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
-        max_output_tokens: None,
-        response_verbosity: None,
-        reasoning_effort: None,
-        previous_response_id: None,
-        cache_key: None,
-        cache: CacheSpec::default(),
-        tools: Arc::from(Vec::new()),
-        store: false,
-        tool_choice: None,
-        output_schema: None,
-        parallel_tool_calls: None,
-        beta_headers: std::sync::Arc::from(Vec::new()),
-        ..Default::default()
-    };
+    let request = LlmRequestBuilder::new("qwen3").user_text("hi").build();
 
     let with_value = OllamaProvider::request_body_with(&request, Some("24h"));
     assert_eq!(with_value["keep_alive"], "24h");
@@ -125,24 +93,7 @@ fn from_config_no_key_leaves_api_key_none() {
 
 #[test]
 fn request_body_always_sets_num_ctx_default() {
-    let request = LlmRequest {
-        model: "qwen3".to_string().into(),
-        instructions: String::new().into(),
-        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
-        max_output_tokens: None,
-        response_verbosity: None,
-        reasoning_effort: None,
-        previous_response_id: None,
-        cache_key: None,
-        cache: CacheSpec::default(),
-        tools: Arc::from(Vec::new()),
-        store: false,
-        tool_choice: None,
-        output_schema: None,
-        parallel_tool_calls: None,
-        beta_headers: std::sync::Arc::from(Vec::new()),
-        ..Default::default()
-    };
+    let request = LlmRequestBuilder::new("qwen3").user_text("hello").build();
 
     let body = OllamaProvider::request_body(&request);
 
@@ -155,39 +106,22 @@ fn request_body_always_sets_num_ctx_default() {
 
 #[test]
 fn request_body_preserves_function_tool_order() {
-    let request = LlmRequest {
-        model: "qwen3".to_string().into(),
-        instructions: "be brief".to_string().into(),
-        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
-        max_output_tokens: None,
-        response_verbosity: None,
-        reasoning_effort: None,
-        previous_response_id: None,
-        cache_key: None,
-        cache: CacheSpec::default(),
-        tools: Arc::from(vec![
-            LlmToolSpec {
-                name: "write_file".to_string(),
-                description: "write".to_string(),
-                parameters: json!({"type": "object"}),
-                strict: true,
-            }
-            .into(),
-            LlmToolSpec {
-                name: "grep".to_string(),
-                description: "search".to_string(),
-                parameters: json!({"type": "object"}),
-                strict: true,
-            }
-            .into(),
-        ]),
-        store: false,
-        tool_choice: None,
-        output_schema: None,
-        parallel_tool_calls: None,
-        beta_headers: std::sync::Arc::from(Vec::new()),
-        ..LlmRequest::default()
-    };
+    let request = LlmRequestBuilder::new("qwen3")
+        .instructions("be brief")
+        .user_text("hello")
+        .tool(LlmToolSpec {
+            name: "write_file".to_string(),
+            description: "write".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: true,
+        })
+        .tool(LlmToolSpec {
+            name: "grep".to_string(),
+            description: "search".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: true,
+        })
+        .build();
 
     let body = OllamaProvider::request_body(&request);
 
@@ -240,9 +174,8 @@ fn parser_extracts_text_tool_calls_and_usage() {
 
 #[test]
 fn request_body_lowers_sampling_options_and_tool_call_ids() {
-    let request = LlmRequest {
-        model: "qwen3:8b".to_string().into(),
-        input: Arc::from(vec![
+    let request = LlmRequestBuilder::new("qwen3:8b")
+        .input_items(vec![
             LlmInputItem::FunctionCall {
                 call_id: "native_call_1".to_string(),
                 name: "grep".to_string(),
@@ -254,13 +187,12 @@ fn request_body_lowers_sampling_options_and_tool_call_ids() {
                 content_parts: None,
                 is_error: false,
             },
-        ]),
-        temperature: Some(0.2),
-        top_p: Some(0.75),
-        seed: Some(7),
-        stop: vec!["END".to_string()],
-        ..LlmRequest::default()
-    };
+        ])
+        .temperature(0.2)
+        .top_p(0.75)
+        .seed(7)
+        .stop("END")
+        .build();
 
     let body = OllamaProvider::request_body(&request);
 
@@ -293,72 +225,29 @@ fn parser_preserves_native_tool_call_id_when_present() {
 
 #[test]
 fn request_body_sets_think_true_for_reasoning_effort() {
-    let request = LlmRequest {
-        model: "qwen3:8b".to_string().into(),
-        instructions: String::new().into(),
-        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
-        max_output_tokens: None,
-        response_verbosity: None,
-        reasoning_effort: Some(squeezy_core::ReasoningEffort::Medium),
-        previous_response_id: None,
-        cache_key: None,
-        cache: CacheSpec::default(),
-        tools: Arc::from(Vec::new()),
-        store: false,
-        tool_choice: None,
-        output_schema: None,
-        parallel_tool_calls: None,
-        beta_headers: std::sync::Arc::from(Vec::new()),
-        ..Default::default()
-    };
+    let request = LlmRequestBuilder::new("qwen3:8b")
+        .user_text("hi")
+        .reasoning_effort(squeezy_core::ReasoningEffort::Medium)
+        .build();
     let body = OllamaProvider::request_body(&request);
     assert_eq!(body["think"], true);
 }
 
 #[test]
 fn request_body_sets_think_string_for_gpt_oss() {
-    let request = LlmRequest {
-        model: "gpt-oss:20b".to_string().into(),
-        instructions: String::new().into(),
-        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
-        max_output_tokens: None,
-        response_verbosity: None,
-        reasoning_effort: Some(squeezy_core::ReasoningEffort::High),
-        previous_response_id: None,
-        cache_key: None,
-        cache: CacheSpec::default(),
-        tools: Arc::from(Vec::new()),
-        store: false,
-        tool_choice: None,
-        output_schema: None,
-        parallel_tool_calls: None,
-        beta_headers: std::sync::Arc::from(Vec::new()),
-        ..Default::default()
-    };
+    let request = LlmRequestBuilder::new("gpt-oss:20b")
+        .user_text("hi")
+        .reasoning_effort(squeezy_core::ReasoningEffort::High)
+        .build();
     let body = OllamaProvider::request_body(&request);
     assert_eq!(body["think"], "high");
 }
 
 #[test]
 fn request_body_skips_think_for_non_reasoning_models() {
-    let request = LlmRequest {
-        model: "llama3.3:70b".to_string().into(),
-        instructions: String::new().into(),
-        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
-        max_output_tokens: None,
-        response_verbosity: None,
-        reasoning_effort: None,
-        previous_response_id: None,
-        cache_key: None,
-        cache: CacheSpec::default(),
-        tools: Arc::from(Vec::new()),
-        store: false,
-        tool_choice: None,
-        output_schema: None,
-        parallel_tool_calls: None,
-        beta_headers: std::sync::Arc::from(Vec::new()),
-        ..Default::default()
-    };
+    let request = LlmRequestBuilder::new("llama3.3:70b")
+        .user_text("hi")
+        .build();
     let body = OllamaProvider::request_body(&request);
     assert!(body.get("think").is_none());
 }

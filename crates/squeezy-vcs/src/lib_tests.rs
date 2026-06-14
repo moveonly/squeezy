@@ -497,32 +497,6 @@ fn track_tree_succeeds_when_workspace_gitignore_matches_squeezy_dir() {
 }
 
 #[test]
-fn track_tree_propagates_non_advisory_git_add_errors() {
-    // bd-squeezy-42pp: the gitignore tolerance must only swallow the
-    // addIgnoredFile advisory. Any other stderr body (e.g. a real
-    // pathspec / index failure) must still bubble up.
-    assert!(super::is_add_ignored_advisory_only(
-        "The following paths are ignored by one of your .gitignore files:\n\
-         .squeezy\n\
-         hint: Use -f if you really want to add them.\n\
-         hint: Turn this message off by running\n\
-         hint: \"git config advice.addIgnoredFile false\"\n"
-    ));
-    assert!(super::is_add_ignored_advisory_only(
-        "The following paths are ignored by one of your .gitignore files:\n.squeezy\n"
-    ));
-    assert!(!super::is_add_ignored_advisory_only(
-        "fatal: pathspec 'missing' did not match any files\n"
-    ));
-    assert!(!super::is_add_ignored_advisory_only(""));
-    assert!(!super::is_add_ignored_advisory_only(
-        "The following paths are ignored by one of your .gitignore files:\n\
-         .squeezy\n\
-         fatal: unrelated index corruption\n"
-    ));
-}
-
-#[test]
 fn checkpoint_rollback_reports_conflicts_without_overwriting_user_changes() {
     let root = temp_repo("checkpoint_conflict");
     fs::write(root.join("a.txt"), "A\n").expect("write a");

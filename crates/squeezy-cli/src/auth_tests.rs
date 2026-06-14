@@ -592,3 +592,35 @@ fn is_headless_linux_always_false_on_non_linux() {
         "is_headless_linux must always return false on non-Linux platforms"
     );
 }
+
+#[cfg(test)]
+mod section_round_trip_tests {
+    // Regression: cloudflare_workers_ai / cloudflare_ai_gateway / baseten are
+    // first-class OpenAI-compatible presets (`OpenAiCompatiblePreset::as_str`),
+    // and the core resolver reads `[providers.<section>].api_key` for each. The
+    // CLI must round-trip these ids to their canonical TOML section the same way
+    // `auth_set_resolves_deepinfra_to_canonical_section_name` documents for
+    // deepinfra; before the fix they fell through to "" and surfaced a
+    // misleading "unknown provider" error from set/remove/status.
+    use super::super::{KNOWN_PROVIDERS, provider_section_for};
+
+    #[test]
+    fn provider_section_for_round_trips_registry_presets() {
+        for id in ["cloudflare_workers_ai", "cloudflare_ai_gateway", "baseten"] {
+            let section = provider_section_for(id).expect("known provider");
+            assert_eq!(section, id, "{id} must map to its own TOML section");
+        }
+    }
+
+    #[test]
+    fn baseten_listed_in_known_providers_for_status() {
+        // `auth status baseten` looks up KNOWN_PROVIDERS by the resolved
+        // section, so the row must exist for the per-provider status view.
+        let baseten = KNOWN_PROVIDERS
+            .iter()
+            .find(|p| p.section == "baseten")
+            .expect("baseten known provider row");
+        assert_eq!(baseten.cli, "baseten");
+        assert_eq!(baseten.env, "BASETEN_API_KEY");
+    }
+}

@@ -8,6 +8,7 @@ pub mod bm25_rank;
 pub mod fuzzy;
 pub mod path_rank;
 pub mod symbol_rank;
+mod tokens;
 
 pub use bm25_rank::{BM25Doc, bm25_rerank};
 pub use fuzzy::{camel_snake_split, fuzzy_path_score, fuzzy_score};
