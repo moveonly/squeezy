@@ -4825,6 +4825,41 @@ fn impl_header_implements_trait(header: &str, trait_name: &str) -> bool {
     last_path_segment(trait_part) == trait_name
 }
 
+/// Extract the implementing-type leaf name from a trimmed Rust impl header.
+/// `Trait for Concrete` -> `Concrete`, `Concrete<T>` -> `Concrete`. Returns an
+/// empty string when no usable identifier can be parsed (e.g. a bare `impl`
+/// header that survived trimming oddly). Mirrors the parsing in
+/// [`impl_header_matches_type`].
+fn impl_header_type_name(header: &str) -> String {
+    let own_type = header
+        .split_once(" for ")
+        .map(|(_, target)| target)
+        .unwrap_or(header)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != ':');
+    last_path_segment(own_type)
+}
+
+/// Extract the trait leaf name from a trimmed Rust impl header, or `None` for
+/// an inherent `impl Concrete` block with no trait. `Trait for Concrete` ->
+/// `Some("Trait")`. Mirrors the parsing in [`impl_header_implements_trait`].
+fn impl_header_trait_name(header: &str) -> Option<String> {
+    let (trait_part, _) = header.split_once(" for ")?;
+    let trait_part = trait_part
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != ':');
+    let leaf = last_path_segment(trait_part);
+    if leaf.is_empty() {
+        None
+    } else {
+        Some(leaf)
+    }
+}
+
 fn attribute_text_is_cfg(text: &str) -> bool {
     let trimmed = text.trim_start();
     let body = trimmed

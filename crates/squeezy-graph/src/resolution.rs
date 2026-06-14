@@ -53,6 +53,12 @@ impl SemanticGraph {
         // `build_ancestor_edge_index` so the new edges are indexed for the
         // call-resolution-phase ancestor walk.
         self.add_generic_inheritance_edges();
+        // Rust trait satisfaction only survives as a substring of the impl
+        // block's display name; materialize InherentImpl / TraitImpl / Implements
+        // edges from the impl headers so "what implements trait T" and Rust
+        // inheritance walks work. Also before the ancestor index build so the
+        // type -> trait `Implements` edge is walkable.
+        self.add_rust_impl_edges();
         // The inheritance edges are now final for this rebuild; index them by
         // `from` so the call-resolution-phase ancestor walk does O(out-degree)
         // lookups instead of rescanning the whole edge vector per BFS node.
@@ -251,6 +257,126 @@ impl SemanticGraph {
         single_symbol(typed.iter().map(|symbol| symbol.id.clone()))
             .into_iter()
             .collect()
+    }
+
+    /// Materialize Rust `impl`-block relationships as graph edges.
+    ///
+    /// A Rust `Impl` symbol carries its header in `name` (e.g. `Concrete` for an
+    /// inherent block, `Trait for Concrete` for a trait block). Until now that
+    /// header was the only record of trait satisfaction, so "what implements
+    /// trait T" and Rust inheritance walks saw nothing. For each Rust `Impl`
+    /// symbol we parse the header into the implementing type and (optional)
+    /// trait and emit:
+    ///   * inherent `impl Concrete`: an `InherentImpl` edge `impl -> type`,
+    ///   * trait `impl Trait for Concrete`: a `TraitImpl` edge `impl -> trait`
+    ///     plus an `Implements` edge `type -> trait`.
+    ///
+    /// Only the `Implements` edge participates in ancestor walks; `InherentImpl`
+    /// / `TraitImpl` are structural and stay out of `ANCESTOR_EDGE_KINDS`. Type
+    /// and trait names resolve through a scoped lookup (same-file first, then a
+    /// unique workspace match for the type; trait names go through the existing
+    /// scope-aware `impl_header_trait_resolves_to`); ambiguous or unknown names
+    /// decline so no edge is emitted. Idempotent: every non-`Contains` edge is
+    /// dropped before each rebuild, so this simply re-emits.
+    fn add_rust_impl_edges(&mut self) {
+        let impls = self
+            .symbols
+            .values()
+            .filter(|symbol| symbol.kind == SymbolKind::Impl)
+            .filter(|symbol| {
+                self.files
+                    .get(&symbol.file_id)
+                    .map(|file| file.language == LanguageKind::Rust)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut edges = Vec::new();
+        for impl_symbol in impls {
+            let header = impl_symbol.name.as_str();
+            let type_name = impl_header_type_name(header);
+            if type_name.is_empty() {
+                continue;
+            }
+            let Some(type_id) = self.rust_impl_type_symbol(&impl_symbol, &type_name) else {
+                continue;
+            };
+            match impl_header_trait_name(header) {
+                Some(trait_name) => {
+                    let Some(trait_id) = self.rust_impl_trait_symbol(&impl_symbol, &trait_name)
+                    else {
+                        continue;
+                    };
+                    edges.push(GraphEdge {
+                        from: impl_symbol.id.clone(),
+                        to: Some(trait_id.clone()),
+                        target_text: trait_name.clone(),
+                        kind: EdgeKind::TraitImpl,
+                        span: Some(impl_symbol.span),
+                        confidence: Confidence::Heuristic,
+                        freshness: Freshness::Fresh,
+                        provenance: Provenance::new("tree-sitter-rust", "trait impl edge"),
+                        candidates: Vec::new(),
+                    });
+                    edges.push(GraphEdge {
+                        from: type_id,
+                        to: Some(trait_id),
+                        target_text: trait_name,
+                        kind: EdgeKind::Implements,
+                        span: Some(impl_symbol.span),
+                        confidence: Confidence::Heuristic,
+                        freshness: Freshness::Fresh,
+                        provenance: Provenance::new("tree-sitter-rust", "trait impl implements edge"),
+                        candidates: Vec::new(),
+                    });
+                }
+                None => {
+                    edges.push(GraphEdge {
+                        from: impl_symbol.id.clone(),
+                        to: Some(type_id),
+                        target_text: type_name,
+                        kind: EdgeKind::InherentImpl,
+                        span: Some(impl_symbol.span),
+                        confidence: Confidence::Heuristic,
+                        freshness: Freshness::Fresh,
+                        provenance: Provenance::new("tree-sitter-rust", "inherent impl edge"),
+                        candidates: Vec::new(),
+                    });
+                }
+            }
+        }
+        self.edges.extend(edges);
+    }
+
+    /// Resolve the implementing-type leaf of a Rust `impl` block to a single
+    /// type symbol, scoping same-file declarations first and then a unique
+    /// workspace-wide match. `generic_type_candidates_for_name_in_file` already
+    /// yields at most one (the unique resolution), so this is a thin adapter
+    /// that declines on ambiguity.
+    fn rust_impl_type_symbol(&self, impl_symbol: &GraphSymbol, type_name: &str) -> Option<SymbolId> {
+        self.generic_type_candidates_for_name_in_file(&impl_symbol.file_id, type_name)
+            .into_iter()
+            .next()
+    }
+
+    /// Resolve the trait leaf of a Rust trait-impl header to a single `Trait`
+    /// symbol, reusing the scope-aware `impl_header_trait_resolves_to` matcher
+    /// (same-file or import-visible, module-path checked). Declines on ambiguity.
+    fn rust_impl_trait_symbol(
+        &self,
+        impl_symbol: &GraphSymbol,
+        trait_name: &str,
+    ) -> Option<SymbolId> {
+        single_symbol(
+            self.symbols_by_name(trait_name)
+                .iter()
+                .filter_map(|id| self.symbols.get(id))
+                .filter(|symbol| symbol.kind == SymbolKind::Trait)
+                .filter(|symbol| {
+                    self.impl_header_trait_resolves_to(&impl_symbol.name, symbol, impl_symbol)
+                })
+                .map(|symbol| symbol.id.clone()),
+        )
     }
 
     /// Route/registry decorators (`@MyRouter.get`, bare `@register`) record a
