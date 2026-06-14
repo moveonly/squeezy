@@ -69,6 +69,13 @@ jobs:
       # external setup, e.g. mcp-everything-real) scenarios are skipped and
       # logged. Settings are pinned to an empty file so an ambient user config
       # can't leak in.
+      #
+      # Run serially (default parallelism): each scenario provisions a full
+      # agent harness — repo indexing across rayon threads, tokio workers with
+      # 16 MiB stacks, and (for MCP scenarios) child processes. Running several
+      # at once exhausted the hosted runner (it died mid-run with a "runner
+      # received a shutdown signal"). Serial keeps the footprint small; the run
+      # is still well within the job timeout.
       - name: Run hermetic mock scenarios
         env:
           SQUEEZY_SETTINGS_PATH: ${{ runner.temp }}/empty-settings.toml
@@ -77,7 +84,6 @@ jobs:
           ./target/debug/squeezy-eval check \
             crates/squeezy-eval/fixtures/scenarios \
             --hermetic \
-            --parallelism 4 \
             --out "${{ runner.temp }}/eval-out" \
             --junit "${{ runner.temp }}/eval-mock-junit.xml"
 
