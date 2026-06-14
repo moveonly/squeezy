@@ -9347,6 +9347,7 @@ fn tool_specs_are_sorted_by_name() {
             "refresh_compiler_facts",
             "repo_map",
             "shell",
+            "symbol_at",
             "symbol_context",
             "upstream_flow",
             "verify",
@@ -13161,8 +13162,8 @@ fn prepare_arguments_lookup_advertises_only_hooked_tools() {
         "grep takes a `path`, so it shares the uniform path-alias hook"
     );
     assert!(
-        registry.prepare_arguments_for("repo_map").is_none(),
-        "repo_map has no `path` argument and no bespoke hook"
+        registry.prepare_arguments_for("repo_map").is_some(),
+        "repo_map now takes an optional `path`, so it shares the uniform path-alias hook"
     );
     assert!(
         registry
@@ -13521,7 +13522,12 @@ fn core_tool_prefix_stays_within_byte_baseline() {
     // refresh_incomplete/stale_pending re-issue hint, the inheritance super/sub
     // cross-links, the positive decl/definition routing line, and the new
     // symbol_context `symbol_id` param.
-    const PREFIX_BYTES_BASELINE: usize = 30_000;
+    // 30_000 -> 37_000: deliberate bump for the graph-tools-args work — the new
+    // symbol_at tool spec plus the arg/mode/filter params threaded across the
+    // read tools (language, edge_kind, reference_kind, offset, exclude_tests/
+    // tests_only, unused/max_callers, member, transitive/max_depth, direct_only,
+    // confidence/external, and repo_map path/language). Measured at ~35.3k.
+    const PREFIX_BYTES_BASELINE: usize = 37_000;
 
     // Every first-party spec advertised in the always-core path, paired
     // with the required params the model must still see to call it. Tools
