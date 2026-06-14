@@ -10126,7 +10126,34 @@ impl SubagentKind {
             Self::Skill => None,
         }
     }
+
+    /// Whether this is a general-purpose worker that should be able to EDIT and
+    /// RUN (write/shell), not just read. `Delegate` is the broad worker the main
+    /// model spawns to do scoped work end-to-end, so it gets the parent's full
+    /// toolset (minus subagent-spawn/control tools) and runs in the parent's
+    /// session mode rather than the read-only + forced-Plan sandbox. The
+    /// role-scoped kinds (Explorer/Planner/Reviewer) and DocHelp stay read-only
+    /// — a reviewer or planner shouldn't be mutating the tree.
+    fn is_write_capable(self) -> bool {
+        matches!(self, Self::Delegate)
+    }
 }
+
+/// Subagent-spawning and interactive control tools a write-capable subagent
+/// must NOT receive: handing it `delegate`/`explore`/… would let subagents
+/// recursively spawn subagents, and the interactive control tools have no
+/// meaning inside a scoped subagent. Everything else the parent advertises
+/// (read, search, edit, shell, network, compiler) is fair game.
+const SUBAGENT_EXCLUDED_TOOL_NAMES: &[&str] = &[
+    DELEGATE_TOOL_NAME,
+    EXPLORE_TOOL_NAME,
+    DELEGATE_PLAN_TOOL_NAME,
+    DELEGATE_REVIEW_TOOL_NAME,
+    DELEGATE_CHAIN_TOOL_NAME,
+    REQUEST_USER_INPUT_TOOL_NAME,
+    TASK_STATE_TOOL_NAME,
+    LOAD_TOOL_SCHEMA_TOOL_NAME,
+];
 
 /// Re-applies any pins added concurrently while the turn was running.
 ///
@@ -11199,7 +11226,12 @@ async fn run_subagent(
     activity_id: Option<SubagentId>,
 ) -> SubagentExecution {
     let mut config = parent.config.clone();
-    config.session_mode = SessionMode::Plan;
+    // Read-only kinds run in the Plan sandbox (edits blocked). Write-capable
+    // workers inherit the parent's session mode so they can actually edit/run;
+    // their tool calls still go through the parent's permission policy.
+    if !kind.is_write_capable() {
+        config.session_mode = SessionMode::Plan;
+    }
     config.store_responses = false;
     // Plan/Delegate/Review subagents do real agent work and should be sized
     // like the main agent. Inherit the parent's cap; only fall back to
@@ -11241,7 +11273,7 @@ async fn run_subagent(
             status: ToolStatus::Error,
             summary: String::new(),
             status_label: "failed",
-            error: Some("no read-only tools are available to the subagent".to_string()),
+            error: Some("no tools are available to the subagent".to_string()),
             metrics: TurnMetrics::default(),
             supporting_receipts: Vec::new(),
             model,
@@ -11300,6 +11332,16 @@ async fn run_subagent(
                 let _ = parent_tx.try_send(event);
                 continue;
             }
+            // Permission prompts MUST reach the user: a write-capable subagent's
+            // edit/shell tool call asks for approval by sending this event with a
+            // `decision_tx` oneshot inside it, then awaits the reply. Forward it
+            // to the real UI channel (await, don't drop) so the prompt renders
+            // and the decision routes straight back to the waiting subagent. Read
+            // -only subagents never reach an approval, so this is inert for them.
+            if matches!(event, AgentEvent::ApprovalRequested { .. }) {
+                let _ = parent_tx.send(event).await;
+                continue;
+            }
             // Other interesting events surface to the parent transcript
             // as a compact SubagentActivity line so a watching user can
             // see the subagent's tool churn without seeing its raw
@@ -11324,7 +11366,7 @@ async fn run_subagent(
     let local_jobs = JobRegistry::new();
     let local_task_state = Arc::new(Mutex::new(None));
     let local_loaded_schemas = Arc::new(Mutex::new(Vec::new()));
-    let local_mode = Arc::new(AtomicU8::new(SessionMode::Plan.to_u8()));
+    let local_mode = Arc::new(AtomicU8::new(config.session_mode.to_u8()));
     let local_exploration = Arc::new(Mutex::new(ExplorationTurnState::from_plan(None)));
     let mut seen_outputs = SeenToolOutputs::default();
 
@@ -12826,6 +12868,19 @@ fn subagent_allowed_tools(
     all_tool_specs: &[AdvertisedTool],
     kind: SubagentKind,
 ) -> Vec<AdvertisedTool> {
+    // Write-capable workers get the parent's FULL toolset (read/search/edit/
+    // shell/network/…) minus the subagent-spawn + interactive control tools, so
+    // they can actually do the work end-to-end. Their tool calls still flow
+    // through the same permission/approval path as the main loop (approvals are
+    // forwarded out of the subagent), and writes still require the parent's
+    // permission policy to allow them.
+    if kind.is_write_capable() {
+        return all_tool_specs
+            .iter()
+            .filter(|tool| !SUBAGENT_EXCLUDED_TOOL_NAMES.contains(&tool.spec.name.as_str()))
+            .cloned()
+            .collect();
+    }
     let names: BTreeSet<&str> = match kind {
         SubagentKind::Delegate => DELEGATE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
         SubagentKind::Explore => EXPLORE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
@@ -16813,7 +16868,8 @@ fn delegate_advertised_tool() -> AdvertisedTool {
         capability: PermissionCapability::Read,
         spec: Arc::new(LlmToolSpec {
             name: DELEGATE_TOOL_NAME.to_string(),
-            description: "Delegate open-ended research to an isolated subagent. \
+            description: "Delegate open-ended work — research AND scoped implementation — to an isolated subagent. \
+                          The subagent can read, edit, and run with the same permissions you have (edits/shell still prompt for approval where your policy requires it); it reports back a structured summary. \
                           Reserve it for genuinely multi-pass, context-isolating, or cross-cutting work — \
                           a task spanning several rounds of discovery, or one whose intermediate reading would bloat your context, or one that fans out across unrelated areas. \
                           NOT for greetings, casual replies, or simple questions the parent can answer directly. \
@@ -16827,7 +16883,7 @@ fn delegate_advertised_tool() -> AdvertisedTool {
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Required, non-empty: a concrete research instruction for the subagent."
+                        "description": "Required, non-empty: a concrete instruction for the subagent (research or a scoped change)."
                     },
                     "scope": {
                         "type": ["string", "null"],
