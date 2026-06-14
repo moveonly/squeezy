@@ -25138,6 +25138,12 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') | KeyCode::Char('D') => {
             send_approval_decision(app, pending, approval_deny())
         }
+        KeyCode::Esc => {
+            // The footer advertises "Esc cancel"; honor it by denying this run.
+            // Cancelling fail-safe (deny) rather than leaving the call to hang —
+            // a swallowed Esc used to silently no-op and trap the prompt open.
+            send_approval_decision(app, pending, approval_deny())
+        }
         _ => {
             app.status = format_approval_status_line(&pending.request);
             app.pending_approval = Some(pending);
@@ -25291,9 +25297,13 @@ fn capability_project_label(
         PermissionCapability::Mcp => ("MCP tool", "MCP tool"),
         PermissionCapability::Edit => ("edits to", "edit target"),
         PermissionCapability::Read | PermissionCapability::Search => ("reads of", "read target"),
+        // These capabilities resolve no scope name above and return early via the
+        // generic label, so this arm is not reached today. Fall back to the
+        // generic "command" wording rather than `unreachable!()` so a future
+        // change that hands them a scope degrades gracefully instead of panicking.
         PermissionCapability::Git
         | PermissionCapability::Compiler
-        | PermissionCapability::Destructive => unreachable!(),
+        | PermissionCapability::Destructive => ("command", "command"),
     };
     // On Windows, warn when the shell prefix being persisted is broad
     // (covers all commands run via pwsh, cmd, etc.) because the lower sandbox
@@ -25477,6 +25487,13 @@ fn format_mcp_elicitation_menu_lines(
         } else {
             Style::default().fg(palette::muted_fg())
         };
+        // Per-option key tag (`[y]` accept / `[n]` decline) mirrors the handler
+        // bindings and the approval menu, so every decision menu documents its
+        // keys inline rather than only in the status line.
+        let key = match option.choice {
+            McpElicitationChoice::Accept => 'y',
+            McpElicitationChoice::Decline => 'n',
+        };
         lines.push(Line::from(vec![
             Span::styled(
                 marker,
@@ -25485,6 +25502,10 @@ fn format_mcp_elicitation_menu_lines(
                 } else {
                     crate::render::theme::quiet()
                 }),
+            ),
+            Span::styled(
+                format!("[{key}] "),
+                Style::default().fg(crate::render::theme::quiet()),
             ),
             Span::styled(option.label, label_style),
             Span::styled(
@@ -25584,15 +25605,25 @@ fn format_feedback_prompt_lines(feedback: &PreparedFeedback) -> Vec<Line<'static
                 Style::default().fg(palette::muted_fg()),
             ),
         ]),
-        Line::from(vec![
-            Span::styled(
-                "› Enter/Y Send",
-                Style::default().fg(crate::render::theme::secondary()),
-            ),
-            Span::styled(" · ", Style::default().fg(crate::render::theme::quiet())),
-            Span::styled("Esc/N Discard", Style::default().fg(palette::muted_fg())),
-        ]),
+        // Keybind hint — styled as a footer row (2-space indent, footer tier,
+        // no `›` cursor) so it reads as guidance, not a selectable option. The
+        // prior `› ` marker made this line look like a highlighted choice.
+        Line::from(Span::styled(
+            "  Enter/Y send · Esc/N discard",
+            Style::default().fg(crate::render::theme::footer()),
+        )),
     ]
+}
+
+/// Visual `a) `, `b) `, … label for the Nth multiple-choice option. Past the
+/// alphabet (rare for a question menu) it falls back to a 1-based number so
+/// every row still gets a stable, unambiguous tag.
+fn choice_label_prefix(index: usize) -> String {
+    if index < 26 {
+        format!("{}) ", (b'a' + index as u8) as char)
+    } else {
+        format!("{}) ", index + 1)
+    }
 }
 
 fn format_request_user_input_menu_lines(
@@ -25647,6 +25678,14 @@ fn format_request_user_input_menu_lines(
                     crate::render::theme::quiet()
                 }),
             ),
+            // Positional `a)`/`b)`/`c)` label so each option is referenceable
+            // and the list scans as a multiple-choice question. These are
+            // labels only — selection stays on ↑/↓ + Enter (a typed letter
+            // feeds the free-form answer box, so it must not double as a hotkey).
+            Span::styled(
+                choice_label_prefix(index),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
             Span::styled(compact_text(&choice.label, 180), label_style),
         ];
         if choice.value != choice.label {
@@ -25658,6 +25697,16 @@ fn format_request_user_input_menu_lines(
         lines.push(Line::from(spans));
     }
     if request.allow_freeform {
+        if !request.choices.is_empty() {
+            // Fence the free-form entry off from the lettered choices with a dim
+            // "or" divider so it doesn't read as choice (n+1). Only shown when
+            // there are choices to separate from; a pure free-form question has
+            // nothing above it to confuse with.
+            lines.push(Line::from(Span::styled(
+                "  ─── or type your own answer ───",
+                Style::default().fg(crate::render::theme::quiet()),
+            )));
+        }
         // Dedicated answer-entry box. Lives inside the modal area so the
         // main composer below stays untouched for the user's next prompt.
         // Label + cursor share the `crate::render::theme::magenta()` warm-taupe accent so the
@@ -25707,6 +25756,19 @@ fn format_request_user_input_menu_lines(
     lines
 }
 
+/// The dedicated shortcut key shown as each option's `[k]` tag. These mirror
+/// the keys the approval handler binds (`y` approve once, `a` always allow,
+/// `n` deny) so the menu is self-documenting — every option carries the letter
+/// that activates it, the way the plan-choice menu shows `[e]`/`[r]`/…. Aliases
+/// (`Enter`, `p`, `d`) still work but the canonical letter is the one we print.
+fn approval_choice_key(choice: ApprovalChoice) -> char {
+    match choice {
+        ApprovalChoice::Approve => 'y',
+        ApprovalChoice::ApproveProject => 'a',
+        ApprovalChoice::Deny => 'n',
+    }
+}
+
 fn approval_option_lines(request: &ToolApprovalRequest, selected: usize) -> Vec<Line<'static>> {
     let options = approval_options_for(request);
     let max_index = options.len().saturating_sub(1);
@@ -25734,6 +25796,14 @@ fn approval_option_lines(request: &ToolApprovalRequest, selected: usize) -> Vec<
             };
             Line::from(vec![
                 Span::styled(marker, marker_style),
+                // Per-option key tag: the letter that activates this row, kept
+                // on the quiet tier so it labels without competing with the
+                // choice text. Brackets read as "press this key", distinct from
+                // the open-ended question menu's `a)`/`b)` positional labels.
+                Span::styled(
+                    format!("[{}] ", approval_choice_key(option.choice)),
+                    Style::default().fg(crate::render::theme::quiet()),
+                ),
                 Span::styled(option.label.to_string(), label_style),
                 Span::styled(
                     format!(" · {}", option.hint),
@@ -25753,11 +25823,12 @@ fn format_approval_menu_lines(
     lines
 }
 
-/// The decision keybindings, folded into the bottom of the approval block so
-/// they travel with the options they describe. The status line no longer
-/// carries them.
+/// The navigation hint folded into the bottom of the approval block. The
+/// per-option `[y]`/`[a]`/`[n]` key tags now document the decision keys inline,
+/// so this row only teaches movement and the generic confirm/cancel verbs. The
+/// status line no longer carries any of it.
 fn approval_keybind_hint() -> &'static str {
-    "Up/Down choose · Enter approve once · A always allow · N deny · Esc cancel"
+    "↑/↓ move · Enter confirm · Esc cancel"
 }
 
 fn approval_footer_line() -> Line<'static> {
@@ -25767,11 +25838,38 @@ fn approval_footer_line() -> Line<'static> {
     ))
 }
 
-/// The complete approval block including the folded keybind footer — used to
-/// measure the block's desired height.
-fn approval_block_full(request: &ToolApprovalRequest, selected: usize) -> Vec<Line<'static>> {
+/// A dim horizontal rule that fences the decision options off from the hint
+/// row beneath them, so the keybinding line can never be misread as a fourth
+/// choice. Indented two columns to sit under the option text and styled on the
+/// quiet tier so it reads as chrome, not content.
+fn approval_separator_line(width: usize) -> Line<'static> {
+    let body = width.saturating_sub(2).max(1);
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "─".repeat(body),
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ])
+}
+
+/// The footer region drawn under the options: a separator rule then the
+/// navigation hint. Kept together so the height accounting and the shed-order
+/// in [`approval_block_capped`] treat the rule and hint as one unit.
+fn approval_footer_block(width: usize) -> Vec<Line<'static>> {
+    vec![approval_separator_line(width), approval_footer_line()]
+}
+
+/// The complete approval block including the folded separator + keybind footer
+/// — used to measure the block's desired height. `width` sizes the separator
+/// rule so its row count matches what [`approval_block_capped`] renders.
+fn approval_block_full(
+    request: &ToolApprovalRequest,
+    selected: usize,
+    width: u16,
+) -> Vec<Line<'static>> {
     let mut lines = format_approval_menu_lines(request, selected);
-    lines.push(approval_footer_line());
+    lines.extend(approval_footer_block(width as usize));
     lines
 }
 
@@ -25788,12 +25886,18 @@ fn approval_block_capped(
 ) -> Vec<Line<'static>> {
     let parts = approval::render_preview_parts(request);
     let mut options = approval_option_lines(request, selected);
-    let footer = approval_footer_line();
+    let mut footer = approval_footer_block(width as usize);
+    // Keep the footer rows single-line like the options: the separator is built
+    // to exactly `width`, but the hint can be long, and an unbudgeted wrap would
+    // steal a row from the preview on a narrow terminal.
+    for line in &mut footer {
+        truncate_line_to_width(line, width as usize);
+    }
     let row = |line: &Line<'static>| visual_line_count(std::slice::from_ref(line), width) as usize;
     let rows = |lines: &[Line<'static>]| visual_line_count(lines, width) as usize;
 
     let header_rows = row(&parts.header);
-    let footer_rows = row(&footer);
+    let footer_rows = rows(&footer);
     let blank_rows = 1usize;
 
     // Body in display order (matches `render_preview`): rationale, subject, rule.
@@ -25805,12 +25909,12 @@ fn approval_block_capped(
     let max = max_height as usize;
     let full = header_rows + rows(&body) + blank_rows + rows(&options) + footer_rows;
     if max == 0 || full <= max {
-        let mut out = Vec::with_capacity(body.len() + options.len() + 3);
+        let mut out = Vec::with_capacity(body.len() + options.len() + footer.len() + 2);
         out.push(parts.header);
         out.extend(body);
         out.push(Line::raw(""));
         out.extend(options);
-        out.push(footer);
+        out.extend(footer);
         return out;
     }
 
@@ -25895,7 +25999,7 @@ fn approval_block_capped(
     }
     out.extend(options);
     if keep_footer {
-        out.push(footer);
+        out.extend(footer);
     }
     // Hard ceiling: if the area is so short that even single-row options can't
     // all fit, keep the leading rows rather than letting ratatui clip an
@@ -33747,7 +33851,7 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
     // and live regions and is safe (it rounds up per line, never down).
     if let Some(pending) = app.pending_approval.as_ref() {
         visual_line_count(
-            &approval_block_full(&pending.request, app.approval_selection_index),
+            &approval_block_full(&pending.request, app.approval_selection_index, width),
             width,
         )
     } else if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
@@ -45174,6 +45278,12 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         return String::new();
     } else if app.pending_feedback.is_some() {
         return "Enter/Y send feedback · Esc/N discard".to_string();
+    } else if app.pending_plan_choice.is_some() {
+        // The per-option `[e]/[c]/[r]/[d]` tags document the shortcuts inline;
+        // the status row teaches movement and the dismiss/mode-switch verbs the
+        // panel itself doesn't show.
+        return "Up/Down choose · Enter select · e/c/r/d pick · Esc dismiss · Shift+Tab switch mode"
+            .to_string();
     } else if app.cancel.is_some() {
         let mut hint = format!(
             "Ctrl+C/Esc interrupt · Enter queue · Ctrl+J newline · {} task · {} full transcript · {} copy · /help",

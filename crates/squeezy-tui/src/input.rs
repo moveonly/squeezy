@@ -1500,6 +1500,17 @@ pub(crate) fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> 
                 app.status = format!("answered: {}", choice.label);
                 return true;
             }
+            if choice_count == 0 && !allow_freeform {
+                // Malformed request: no choices to pick and no free-form entry.
+                // Enter used to silently no-op, trapping the modal open with no
+                // way out but Esc. Resolve it as cancelled so the agent unblocks,
+                // and say why rather than swallowing the keypress.
+                let _ = pending
+                    .response_tx
+                    .send(RequestUserInputResponse::cancelled());
+                app.status = "question had no choices to pick — dismissed".to_string();
+                return true;
+            }
             // Nothing to send yet — keep the modal up.
             app.pending_request_user_input = Some(pending);
             true

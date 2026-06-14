@@ -16888,6 +16888,14 @@ pub(crate) fn permission_rule_for_persistence(
         if squeezy_core::target_is_effectively_wildcard(&rule.target) {
             return None;
         }
+        // `shell:*` is the catch-all the shell analyzer assigns to dynamic,
+        // unparseable, or unknown-env commands precisely so each one re-prompts.
+        // Persisting it as an Allow rule would silently auto-approve every future
+        // dynamic command, defeating that guard — refuse it like any other
+        // blanket target. (Deny rules may keep it: a broad deny fails closed.)
+        if rule.target == "shell:*" {
+            return None;
+        }
     }
     Some(rule)
 }
