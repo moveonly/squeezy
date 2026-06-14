@@ -223,6 +223,7 @@ pub(crate) struct CheckpointStore {
 impl CheckpointStore {
     /// A fresh store with nothing saved yet — the first eligible change saves
     /// immediately (no debounce gate to clear on the very first write).
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::default()
     }

@@ -30,8 +30,8 @@ use squeezy_core::{
     Result, SourceSpan, SqueezyError, SymbolId, SymbolKind,
 };
 use squeezy_parse::{
-    BodyHit, BodyHitKind, LanguageParser, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport,
-    ParsedReference, ParsedSymbol, ReferenceKind, edge_kind_for_call,
+    BodyHit, LanguageParser, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport, ParsedReference,
+    ParsedSymbol, ReferenceKind, edge_kind_for_call,
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
 use squeezy_workspace::{

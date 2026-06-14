@@ -1151,10 +1151,6 @@ fn split_config_field_path(path: &str) -> Result<Vec<String>, String> {
     squeezy_core::config_explain::split_config_field_path(path)
 }
 
-fn config_field_path_matches(schema_path: &[&str], requested_path: &[&str]) -> bool {
-    squeezy_core::config_explain::config_field_path_matches(schema_path, requested_path)
-}
-
 fn resolve_explain_field_source(
     sources: &squeezy_core::SeparatedSources,
     field: &squeezy_core::config_schema::FieldMeta,
