@@ -27796,6 +27796,34 @@ fn rail_prefix_and_continuation_track_the_gutter() {
 }
 
 #[test]
+fn consecutive_settings_reload_statuses_coalesce() {
+    let mut app = test_app(SessionMode::Build);
+
+    app.push_status(SETTINGS_RELOADED_STATUS.to_string());
+    app.push_status(SETTINGS_RELOADED_STATUS.to_string());
+    app.push_status(SETTINGS_RELOADED_STATUS.to_string());
+
+    assert_eq!(app.transcript.len(), 1);
+    let text = lines_to_plain_text(&format_transcript_entry(
+        &app.transcript[0],
+        false,
+        app.tool_output_verbosity,
+        MessageOutcome::Normal,
+        "Ctrl+T",
+    ));
+    assert!(text.contains("settings reloaded from disk (x3)"), "{text}");
+
+    app.push_status("plan execution paused (Shift+Tab)".to_string());
+    app.push_status(SETTINGS_RELOADED_STATUS.to_string());
+
+    assert_eq!(
+        app.transcript.len(),
+        3,
+        "a different operational status breaks the reload run"
+    );
+}
+
+#[test]
 fn overlay_collapsed_folds_long_output_expanded_shows_all() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("explore"));

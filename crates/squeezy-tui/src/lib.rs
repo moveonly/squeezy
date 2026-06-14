@@ -2086,7 +2086,7 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     app.apply_config_change(&new_cfg);
     if old_provider == new_provider {
         agent.replace_config(new_cfg);
-        app.push_status("settings reloaded from disk".to_string());
+        app.push_status(SETTINGS_RELOADED_STATUS.to_string());
         return;
     }
     let provider_cfg = new_cfg.provider.clone();
@@ -50075,6 +50075,18 @@ impl TuiApp {
     /// turn-complete markers, compaction notices, and plan-handoff state
     /// that should fade to the periphery rather than read as content.
     pub(crate) fn push_status(&mut self, message: String) {
+        if message == SETTINGS_RELOADED_STATUS
+            && let Some(last) = self.transcript.last_mut()
+            && let Some(count) = consecutive_settings_reload_count(last)
+        {
+            let next = count.saturating_add(1);
+            if let TranscriptEntryKind::Log(log) = &mut last.kind {
+                log.message = format!("{SETTINGS_RELOADED_STATUS} (x{next})");
+                last.bump_revision();
+                self.needs_redraw = true;
+                return;
+            }
+        }
         let id = self.next_id();
         self.push_entry(TranscriptEntry::log_with_kind(
             id,
@@ -50571,6 +50583,7 @@ struct SettleState {
 /// its expanded height to its collapsed preview over this window, then
 /// rests collapsed.
 const SETTLE_DURATION_MS: u64 = 600;
+const SETTINGS_RELOADED_STATUS: &str = "settings reloaded from disk";
 
 /// Representative width used to seed the settle-fold's starting height at
 /// arm time. The exact viewport width isn't available at push time, and
@@ -50893,6 +50906,24 @@ impl LogEntry {
     fn message(&self) -> &str {
         &self.message
     }
+}
+
+fn consecutive_settings_reload_count(entry: &TranscriptEntry) -> Option<u32> {
+    let TranscriptEntryKind::Log(log) = &entry.kind else {
+        return None;
+    };
+    if log.kind != LogKind::Operational {
+        return None;
+    }
+    if log.message == SETTINGS_RELOADED_STATUS {
+        return Some(1);
+    }
+    let suffix = log
+        .message
+        .strip_prefix(SETTINGS_RELOADED_STATUS)?
+        .strip_prefix(" (x")?
+        .strip_suffix(')')?;
+    suffix.parse::<u32>().ok().filter(|count| *count >= 1)
 }
 
 #[derive(Debug, Clone)]
