@@ -1449,7 +1449,7 @@ fn extract_dart_import_export(node: Node<'_>, ctx: &mut ExtractContext<'_>, is_r
     // import_specification (or configurable_uri for exports). The import
     // specification holds the URI, optional `as` alias, and combinator(s)
     // (`show`/`hide`).
-    let (uri_node, alias, combinators, alt_uris) = if node.kind() == "library_import" {
+    let (uri_node, alias, combinators, alt_uris, is_deferred) = if node.kind() == "library_import" {
         let mut cursor = node.walk();
         let spec = node
             .named_children(&mut cursor)
@@ -1460,6 +1460,14 @@ fn extract_dart_import_export(node: Node<'_>, ctx: &mut ExtractContext<'_>, is_r
             .child_by_field_name("alias")
             .and_then(|alias| node_text(alias, ctx.source).ok())
             .map(|text| text.trim().to_string());
+        // `import '...' deferred as p;` carries a `deferred` keyword token
+        // (anonymous in the grammar) before the `as` alias. Scan all children,
+        // not just named ones, so we can tell a lazy-loaded library boundary
+        // apart from an eager prefixed import.
+        let is_deferred = {
+            let mut all = spec.walk();
+            spec.children(&mut all).any(|child| child.kind() == "deferred")
+        };
         let mut combinators = Vec::new();
         let mut alt_uris = Vec::new();
         let mut spec_cursor = spec.walk();
@@ -1480,7 +1488,7 @@ fn extract_dart_import_export(node: Node<'_>, ctx: &mut ExtractContext<'_>, is_r
                 }
             }
         }
-        (uri, alias, combinators, alt_uris)
+        (uri, alias, combinators, alt_uris, is_deferred)
     } else {
         // library_export: configurable_uri is a direct child, combinator(s) too.
         let uri = node.child_by_field_name("uri").or_else(|| {
@@ -1495,7 +1503,7 @@ fn extract_dart_import_export(node: Node<'_>, ctx: &mut ExtractContext<'_>, is_r
                 combinators.push(dart_combinator_clause(child, ctx.source));
             }
         }
-        (uri, None, combinators, Vec::new())
+        (uri, None, combinators, Vec::new(), false)
     };
 
     let Some(uri_node) = uri_node else { return };
@@ -1535,6 +1543,8 @@ fn extract_dart_import_export(node: Node<'_>, ctx: &mut ExtractContext<'_>, is_r
             "tree-sitter-dart",
             if is_reexport {
                 "export directive"
+            } else if is_deferred {
+                "deferred import directive"
             } else {
                 "import directive"
             },
