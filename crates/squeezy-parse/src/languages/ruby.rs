@@ -98,9 +98,16 @@ fn visit_ruby_node(
             // include/extend/prepend produced a Type reference + class
             // attribute, or attr_* synthesized methods. The call itself is
             // not emitted as a `ParsedCall`.
+        } else if extract_ruby_alias_method_call(node, ctx, parent_symbol.as_ref(), host_class.as_ref())
+        {
+            // `alias_method :new, :old` synthesized an aliased Method symbol
+            // plus a reference to the original; the call itself is not emitted.
         } else {
             extract_ruby_call(node, ctx, owner_symbol.clone());
         }
+    } else if kind == "alias" {
+        // `alias new_name old_name` keyword form.
+        extract_ruby_alias_keyword(node, ctx, parent_symbol.as_ref());
     } else if kind == "assignment" {
         extract_ruby_assignment_symbol(
             node,
@@ -839,6 +846,144 @@ fn extract_ruby_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Opt
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
 }
 
+/// `alias new_name old_name` keyword form. Synthesizes a `Method` symbol for
+/// `new_name` carrying a `ruby:alias-of:<old_name>` attribute and emits an
+/// Identifier reference to `old_name` so the alias links back to the original.
+fn extract_ruby_alias_keyword(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) {
+    let new_name = node
+        .child_by_field_name("name")
+        .and_then(|n| ruby_method_name_text(n, ctx.source));
+    let orig_name = node
+        .child_by_field_name("alias")
+        .and_then(|n| ruby_method_name_text(n, ctx.source));
+    let (Some(new_name), Some(orig_name)) = (new_name, orig_name) else {
+        return;
+    };
+    push_ruby_alias_symbol(node, ctx, parent_symbol, &new_name, &orig_name);
+    if let Some(orig_node) = node.child_by_field_name("alias") {
+        push_ruby_alias_origin_reference(orig_node, ctx, parent_symbol, &orig_name);
+    }
+}
+
+/// `alias_method :new, :old` call form. Returns `true` if it was consumed (so
+/// the caller skips emitting an anonymous `ParsedCall`).
+fn extract_ruby_alias_method_call(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+    host_class: Option<&(SymbolId, SymbolKind)>,
+) -> bool {
+    if node.child_by_field_name("receiver").is_some() {
+        return false;
+    }
+    let Some(method_node) = node.child_by_field_name("method") else {
+        return false;
+    };
+    if node_text(method_node, ctx.source).unwrap_or_default().trim() != "alias_method" {
+        return false;
+    }
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = args.walk();
+    let mut args_iter = args.named_children(&mut cursor);
+    let new_arg = args_iter.next();
+    let orig_arg = args_iter.next();
+    let (Some(new_arg), Some(orig_arg)) = (new_arg, orig_arg) else {
+        return false;
+    };
+    let new_name = ruby_symbol_arg_value(new_arg, ctx.source);
+    let orig_name = ruby_symbol_arg_value(orig_arg, ctx.source);
+    let (Some(new_name), Some(orig_name)) = (new_name, orig_name) else {
+        return false;
+    };
+    // `alias_method` is namespaced inside its class body, so prefer the
+    // enclosing class-like host for parenting; fall back to the lexical parent.
+    let owner = host_class.or(parent_symbol);
+    push_ruby_alias_symbol(node, ctx, owner, &new_name, &orig_name);
+    push_ruby_alias_origin_reference(orig_arg, ctx, owner, &orig_name);
+    true
+}
+
+/// Synthesize the aliased `Method`/`Function` symbol. Methods inside a
+/// class/module are `Method`; top-level aliases are `Function`.
+fn push_ruby_alias_symbol(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+    new_name: &str,
+    orig_name: &str,
+) {
+    let symbol_kind = match parent_symbol.map(|(_, k)| *k) {
+        Some(SymbolKind::Class) | Some(SymbolKind::Module) => SymbolKind::Method,
+        _ => SymbolKind::Function,
+    };
+    let span = span_from_node(node);
+    let raw = node_text(node, ctx.source).unwrap_or_default().trim();
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let id = symbol_id(&ctx.file, parent_id.as_ref(), symbol_kind, new_name, span);
+    ctx.symbols.push(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name: new_name.to_string(),
+        kind: symbol_kind,
+        language_identity: None,
+        span,
+        body_span: None,
+        signature_span: None,
+        signature: raw.to_string(),
+        visibility: None,
+        docs: Vec::new(),
+        attributes: vec![
+            "ruby:synthesized".to_string(),
+            format!("ruby:alias-of:{orig_name}"),
+        ],
+        provenance: Provenance::new("tree-sitter-ruby", "alias synthesis"),
+        confidence: Confidence::Partial,
+        freshness: Freshness::Fresh,
+        arity: None,
+    });
+}
+
+/// Emit an Identifier reference to the aliased original method name so the
+/// alias links back to (and a resolver can bind) the original definition.
+fn push_ruby_alias_origin_reference(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+    orig_name: &str,
+) {
+    ctx.references.push(ParsedReference {
+        file_id: ctx.file.id.clone(),
+        owner_id: parent_symbol.map(|(id, _)| id.clone()),
+        text: orig_name.to_string(),
+        kind: ReferenceKind::Identifier,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-ruby", "alias original method"),
+    });
+}
+
+/// Text of a `_method_name` node (identifier/operator/constant/setter) or a
+/// symbol literal (`:foo`), stripped of a leading `:` for symbols.
+fn ruby_method_name_text(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "simple_symbol" | "delimited_symbol" => ruby_symbol_arg_value(node, source),
+        _ => {
+            let raw = node_text(node, source).ok()?.trim();
+            if raw.is_empty() {
+                None
+            } else {
+                Some(raw.to_string())
+            }
+        }
+    }
+}
+
 fn extract_ruby_reference(
     node: Node<'_>,
     kind: ReferenceKind,
@@ -896,8 +1041,18 @@ fn ruby_node_is_declared_name(node: Node<'_>) -> bool {
     {
         return matches!(
             parent.kind(),
-            "class" | "module" | "method" | "singleton_method" | "scope_resolution"
+            "class" | "module" | "method" | "singleton_method" | "scope_resolution" | "alias"
         );
+    }
+    // `alias new old`: both `name` (handled above) and `alias` (the original)
+    // are handled by `extract_ruby_alias_keyword` — it synthesizes the symbol
+    // and emits the origin reference explicitly, so suppress the auto-visit of
+    // the `alias` field to avoid a duplicate reference.
+    if parent.kind() == "alias"
+        && let Some(orig) = parent.child_by_field_name("alias")
+        && orig.id() == node.id()
+    {
+        return true;
     }
     if parent.kind() == "call"
         && let Some(method) = parent.child_by_field_name("method")
