@@ -1757,6 +1757,18 @@ fn packet_matches_result_path(packet: &Value, filter: Option<&str>) -> bool {
     }
 }
 
+/// Pick the effective path scope for RESULT packets on the flow/hierarchy tools.
+/// An explicit `result_path` wins (it lets a caller decouple the root scope from
+/// the result scope); otherwise the plain `path` argument scopes the results too,
+/// satisfying the "path scopes RESULT packets" contract. Empty/whitespace tokens
+/// are treated as absent so a blank string never collapses the result set.
+fn result_path_scope<'a>(path: Option<&'a str>, result_path: Option<&'a str>) -> Option<&'a str> {
+    result_path
+        .or(path)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 /// True when a result packet passes the `exclude_tests`/`tests_only` scope,
 /// keyed on the packet's path (see [`packet_path`]/[`path_is_test`]). Packets
 /// with no determinable path are KEPT under `exclude_tests` and DROPPED under
@@ -2862,6 +2874,27 @@ fn filter_hierarchy_nodes_by_test_scope(
                 .map(symbol_is_test)
                 .unwrap_or(false);
             passes_test_scope(is_test, exclude_tests, tests_only)
+        })
+        .collect()
+}
+
+/// Scope hierarchy nodes to a `result_path` subtree (see [`result_path_scope`]).
+/// A node is kept when its declaring file path matches the filter; nodes with no
+/// resolved symbol (and thus no path) are kept so an unanchored node is never
+/// silently dropped. Returns the input unchanged when the filter is empty.
+fn filter_hierarchy_nodes_by_path(
+    graph: &squeezy_graph::SemanticGraph,
+    nodes: Vec<HierarchyNode>,
+    filter: Option<&str>,
+) -> Vec<HierarchyNode> {
+    let Some(filter) = filter else {
+        return nodes;
+    };
+    nodes
+        .into_iter()
+        .filter(|node| match graph.symbols.get(&node.id) {
+            Some(symbol) => path_matches_filter(symbol.file_id.0.as_str(), filter),
+            None => true,
         })
         .collect()
 }
@@ -4016,6 +4049,13 @@ impl ToolRegistry {
         if let Some(want) = args.edge_kind.as_deref().and_then(parse_edge_kind_filter) {
             packets.retain(|packet| packet_matches_edge_kind(packet, Some(want)));
         }
+        // path/result_path scopes the RESULT packets, not just the root: drop any
+        // caller/edge packet whose file path falls outside the requested subtree.
+        let result_path =
+            result_path_scope(args.path.as_deref(), args.result_path.as_deref());
+        if result_path.is_some() {
+            packets.retain(|packet| packet_matches_result_path(packet, result_path));
+        }
         let truncated = overflowed;
         let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
         let mut payload = graph_payload("upstream_flow", manager, refresh);
@@ -4102,6 +4142,13 @@ impl ToolRegistry {
         // and leaves every packet in place.
         if let Some(want) = args.edge_kind.as_deref().and_then(parse_edge_kind_filter) {
             packets.retain(|packet| packet_matches_edge_kind(packet, Some(want)));
+        }
+        // path/result_path scopes the RESULT packets, not just the root: drop any
+        // callee/edge packet whose file path falls outside the requested subtree.
+        let result_path =
+            result_path_scope(args.path.as_deref(), args.result_path.as_deref());
+        if result_path.is_some() {
+            packets.retain(|packet| packet_matches_result_path(packet, result_path));
         }
         let truncated = overflowed;
         let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
@@ -4246,12 +4293,16 @@ impl ToolRegistry {
             .max_depth
             .unwrap_or(DEFAULT_GRAPH_MAX_DEPTH)
             .clamp(1, MAX_GRAPH_MAX_DEPTH);
+        // Result-packet scope: `result_path` (or the plain `path`) restricts the
+        // emitted nodes to a subtree, not just the root resolution.
+        let result_path = result_path_scope(args.path.as_deref(), args.result_path.as_deref());
         let root = resolve_hierarchy_root(graph, &args);
         if args.symbol_id.is_some() || args.query.is_some() {
             let Some(root) = root else {
                 return unresolved_hierarchy_result(call, manager, refresh, &args);
             };
             let nodes = graph.hierarchy(Some(&root.id), max_depth);
+            let nodes = filter_hierarchy_nodes_by_path(graph, nodes, result_path);
             let total_roots = nodes.len();
             return hierarchy_result(
                 call,
@@ -4272,6 +4323,9 @@ impl ToolRegistry {
             && let Some(file_sym) = resolve_file_symbol(graph, path)
         {
             let nodes = graph.hierarchy(Some(&file_sym.id), max_depth);
+            // The file is already the path scope; an explicit `result_path` can
+            // narrow further within that file's declaration tree.
+            let nodes = filter_hierarchy_nodes_by_path(graph, nodes, args.result_path.as_deref());
             let total_roots = nodes.len();
             return hierarchy_result(
                 call,
@@ -4292,10 +4346,12 @@ impl ToolRegistry {
         let exclude_tests = args.exclude_tests.unwrap_or(false);
         let tests_only = args.tests_only.unwrap_or(false);
         let nodes = filter_hierarchy_nodes_by_test_scope(graph, nodes, exclude_tests, tests_only);
+        let path_scoped = result_path.is_some();
+        let nodes = filter_hierarchy_nodes_by_path(graph, nodes, result_path);
         // `total_roots` came from the pre-filter cap; recompute against the
         // surviving roots so `truncated` reflects what the caller can actually
-        // page through under the test scope.
-        let total_roots = if exclude_tests || tests_only {
+        // page through under the test/path scope.
+        let total_roots = if exclude_tests || tests_only || path_scoped {
             nodes.len()
         } else {
             total_roots
