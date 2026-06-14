@@ -6,10 +6,10 @@ name: Eval mock scenarios
 # tests cannot.
 #
 # This lives in its own workflow so the trigger can be path-filtered per "job":
-#   - push to main  → always (post-merge backstop)
+#   - push to main  → always (post-merge smoke backstop)
 #   - pull_request  → only when harness / eval / scenario code changes, so
 #                     unrelated PRs (docs, other crates) don't pay for it
-#   - workflow_dispatch → on demand for any ref
+#   - workflow_dispatch → full hermetic sweep on demand for any ref
 on:
   workflow_dispatch:
     inputs:
@@ -64,10 +64,10 @@ jobs:
       - name: Build eval harness
         run: cargo build -p squeezy-eval --bins
 
-      # Pull requests run a representative smoke slice because the hosted PR
-      # runner repeatedly cancels this separate eval workflow after ~4m20s
-      # total job time. Pushes to main and manual runs keep the complete
-      # `--hermetic` suite as the post-merge/backstop gate.
+      # Automatic runs use a representative smoke slice because hosted Actions
+      # repeatedly cancels this separate eval workflow after ~4m20s total job
+      # time. Manual runs keep the complete `--hermetic` suite available as an
+      # explicit backstop.
       #
       # Settings are pinned to an empty file so an ambient user config can't
       # leak in. The full check runs serially (default parallelism): each
@@ -79,7 +79,13 @@ jobs:
           SQUEEZY_SETTINGS_PATH: ${{ runner.temp }}/empty-settings.toml
         run: |
           : > "$SQUEEZY_SETTINGS_PATH"
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ./target/debug/squeezy-eval check \
+              crates/squeezy-eval/fixtures/scenarios \
+              --hermetic \
+              --out "${{ runner.temp }}/eval-out" \
+              --junit "${{ runner.temp }}/eval-mock-junit.xml"
+          else
             scenarios=(
               crates/squeezy-eval/fixtures/scenarios/mock-smoke.toml
               crates/squeezy-eval/fixtures/scenarios/audit-smoke-action-step-status.toml
@@ -97,12 +103,6 @@ jobs:
                 --quiet \
                 --out "${{ runner.temp }}/eval-out"
             done
-          else
-            ./target/debug/squeezy-eval check \
-              crates/squeezy-eval/fixtures/scenarios \
-              --hermetic \
-              --out "${{ runner.temp }}/eval-out" \
-              --junit "${{ runner.temp }}/eval-mock-junit.xml"
           fi
 
       - name: Upload JUnit
