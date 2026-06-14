@@ -204,19 +204,25 @@ fn ruby_symbol_from_node(
     let signature = signature_text(node, body, ctx.source);
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let mut attributes = Vec::new();
-    // Minitest: a method whose name starts with `test_` (the framework's
-    // auto-discovery convention), or any method declared in a `*_test.rb` /
-    // `*_spec.rb` / `test/` / `spec/` file. Promote it to `Test` so
+    // Minitest: a method whose name starts with `test_` is a test by the
+    // framework's auto-discovery convention. Promote it to `Test` so
     // `kind=test` queries surface Ruby tests, and tag it with a bare `test`
-    // attribute for attribute search.
+    // attribute for attribute search. Helper `def`s in a spec/test file are NOT
+    // promoted (that would mis-tag fixtures/setup helpers) — RSpec examples and
+    // the Minitest `test "name" do` macro come through the call path instead.
     let mut symbol_kind = symbol_kind;
     if matches!(symbol_kind, SymbolKind::Method | SymbolKind::Function)
-        && (name.starts_with("test_")
-            || ruby_is_test_filename(&ctx.file.relative_path))
+        && name.starts_with("test_")
     {
         symbol_kind = SymbolKind::Test;
         attributes.push("test".to_string());
         attributes.push("ruby:test".to_string());
+    } else if matches!(symbol_kind, SymbolKind::Method | SymbolKind::Function)
+        && ruby_is_test_filename(&ctx.file.relative_path)
+    {
+        // A plain method in a test/spec file: keep its kind but flag it so the
+        // file's symbols are discoverable as test-adjacent.
+        attributes.push("ruby:test-host".to_string());
     }
     let id = symbol_id(&ctx.file, parent_id.as_ref(), symbol_kind, &name, span);
     if symbol_kind == SymbolKind::Class
