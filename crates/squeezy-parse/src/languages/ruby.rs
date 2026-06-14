@@ -102,6 +102,18 @@ fn visit_ruby_node(
         {
             // `alias_method :new, :old` synthesized an aliased Method symbol
             // plus a reference to the original; the call itself is not emitted.
+        } else if let Some(test_symbol) =
+            extract_ruby_rspec_example(node, ctx, parent_symbol.as_ref())
+        {
+            // RSpec `describe`/`context`/`it`/... block: synthesize a `Test`
+            // symbol and descend into the block with the Test as the new parent
+            // so nested examples and body references attach to it.
+            extract_body_hit(node, BodyHitKind::Call, ctx, owner_symbol.clone());
+            let next_parent = Some((test_symbol.id.clone(), test_symbol.kind));
+            let next_owner = Some(test_symbol.id.clone());
+            ctx.symbols.push(test_symbol);
+            visit_ruby_children(node, ctx, next_parent, next_owner, host_class);
+            return;
         } else {
             extract_ruby_call(node, ctx, owner_symbol.clone());
         }
@@ -190,8 +202,22 @@ fn ruby_symbol_from_node(
     let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
-    let id = symbol_id(&ctx.file, parent_id.as_ref(), symbol_kind, &name, span);
     let mut attributes = Vec::new();
+    // Minitest: a method whose name starts with `test_` (the framework's
+    // auto-discovery convention), or any method declared in a `*_test.rb` /
+    // `*_spec.rb` / `test/` / `spec/` file. Promote it to `Test` so
+    // `kind=test` queries surface Ruby tests, and tag it with a bare `test`
+    // attribute for attribute search.
+    let mut symbol_kind = symbol_kind;
+    if matches!(symbol_kind, SymbolKind::Method | SymbolKind::Function)
+        && (name.starts_with("test_")
+            || ruby_is_test_filename(&ctx.file.relative_path))
+    {
+        symbol_kind = SymbolKind::Test;
+        attributes.push("test".to_string());
+        attributes.push("ruby:test".to_string());
+    }
+    let id = symbol_id(&ctx.file, parent_id.as_ref(), symbol_kind, &name, span);
     if symbol_kind == SymbolKind::Class
         && let Some(base) = ruby_superclass_name(node, ctx.source)
     {
@@ -206,7 +232,10 @@ fn ruby_symbol_from_node(
             attributes.push(format!("ruby:singleton-receiver:{}", receiver.trim()));
         }
     }
-    let arity = if matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method) {
+    let arity = if matches!(
+        symbol_kind,
+        SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+    ) {
         node.child_by_field_name("parameters")
             .map(|params| u8::try_from(named_child_count(params)).unwrap_or(u8::MAX))
     } else {
@@ -968,19 +997,117 @@ fn push_ruby_alias_origin_reference(
     });
 }
 
+/// RSpec example/group DSL (`describe`/`context`/`it`/`specify`/`feature`/
+/// `scenario`/`example`) — a receiver-less call carrying a block. Synthesizes a
+/// `Test` symbol named after the description argument so `kind=test` surfaces
+/// RSpec examples. Gated to test/spec files so a project's own `describe`/`it`
+/// method is not misclassified. Returns the symbol when consumed.
+fn extract_ruby_rspec_example(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    if !ruby_is_test_filename(&ctx.file.relative_path) {
+        return None;
+    }
+    if node.child_by_field_name("receiver").is_some() {
+        return None;
+    }
+    // An RSpec example/group is always a block-bearing call.
+    let block = node.child_by_field_name("block")?;
+    let method_node = node.child_by_field_name("method")?;
+    let method_name = node_text(method_node, ctx.source).ok()?.trim().to_string();
+    if !matches!(
+        method_name.as_str(),
+        "describe"
+            | "context"
+            | "it"
+            | "specify"
+            | "feature"
+            | "scenario"
+            | "example"
+            | "xdescribe"
+            | "xcontext"
+            | "xit"
+            | "fdescribe"
+            | "fcontext"
+            | "fit"
+    ) {
+        return None;
+    }
+    // Name from the first argument (description string or `describe SomeClass`).
+    let description = node.child_by_field_name("arguments").and_then(|args| {
+        let mut cursor = args.walk();
+        args.named_children(&mut cursor).next().and_then(|first| {
+            ruby_string_literal_value(first, ctx.source)
+                .or_else(|| node_text(first, ctx.source).ok().map(|t| t.trim().to_string()))
+                .filter(|t| !t.is_empty())
+        })
+    });
+    let name = match description {
+        Some(desc) => format!("{method_name} {desc}"),
+        None => method_name.clone(),
+    };
+    let span = span_from_node(node);
+    let body_span = Some(span_from_node(block));
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let id = symbol_id(&ctx.file, parent_id.as_ref(), SymbolKind::Test, &name, span);
+    // Signature is the call header only (`describe "..."`), not the block body,
+    // which could be arbitrarily large. Slice the source from the call start up
+    // to the block start.
+    let header_end = block.start_byte().min(node.end_byte());
+    let signature = ctx
+        .source
+        .get(node.start_byte()..header_end)
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| name.clone());
+    Some(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name,
+        kind: SymbolKind::Test,
+        language_identity: None,
+        span,
+        body_span,
+        signature_span: None,
+        signature,
+        visibility: None,
+        docs: Vec::new(),
+        attributes: vec![
+            "test".to_string(),
+            "ruby:test".to_string(),
+            "ruby:synthesized".to_string(),
+            format!("ruby:rspec:{method_name}"),
+        ],
+        provenance: Provenance::new("tree-sitter-ruby", "rspec example synthesis"),
+        confidence: Confidence::Heuristic,
+        freshness: Freshness::Fresh,
+        arity: None,
+    })
+}
+
 /// Text of a `_method_name` node (identifier/operator/constant/setter) or a
 /// symbol literal (`:foo`), stripped of a leading `:` for symbols.
 fn ruby_method_name_text(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "simple_symbol" | "delimited_symbol" => ruby_symbol_arg_value(node, source),
-        _ => {
-            let raw = node_text(node, source).ok()?.trim();
-            if raw.is_empty() {
-                None
-            } else {
-                Some(raw.to_string())
-            }
-        }
+    if node.kind() == "simple_symbol"
+        && let Some(value) = ruby_symbol_arg_value(node, source)
+    {
+        return Some(value);
+    }
+    let raw = node_text(node, source).ok()?.trim();
+    if raw.is_empty() {
+        None
+    } else {
+        // `:"foo"` (delimited_symbol) or a bare method name; strip a leading
+        // symbol colon and surrounding quotes so the stored name is the bare
+        // method identifier.
+        Some(
+            raw.trim_start_matches(':')
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_string(),
+        )
     }
 }
 
@@ -1145,6 +1272,19 @@ fn ruby_imported_name_from_path(path: &str) -> Option<String> {
     } else {
         Some(leaf.to_string())
     }
+}
+
+/// True for Ruby test/spec files: a `*_test.rb` / `*_spec.rb` basename, or any
+/// file under a `test/` or `spec/` directory (the Minitest/RSpec conventions).
+fn ruby_is_test_filename(relative_path: &str) -> bool {
+    let lower = relative_path.to_ascii_lowercase();
+    let file_name = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+    if file_name.ends_with("_test.rb") || file_name.ends_with("_spec.rb") {
+        return true;
+    }
+    lower
+        .split(['/', '\\'])
+        .any(|segment| segment == "test" || segment == "spec")
 }
 
 /// One Field per `(host class, ivar/cvar name)` (spec §3); same for
