@@ -6,8 +6,7 @@ configured as core tools, and some are discoverable through lazy schema loading.
 
 ## Navigation And Search
 
-- `repo_map`: compact architecture map, language counts, coverage, unsupported
-  files, and next graph actions.
+- `repo_map`: compact architecture map, language counts, and unsupported files.
 - `decl_search`, `definition_search`: graph-backed declaration lookup and
   disambiguation.
 - `reference_search`: symbol-bound or broad heuristic references.

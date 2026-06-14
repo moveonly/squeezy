@@ -94,6 +94,8 @@ pub(crate) fn symbol_from_node(
         "static_item" => SymbolKind::Static,
         "type_item" | "associated_type" => SymbolKind::TypeAlias,
         "macro_definition" => SymbolKind::Macro,
+        "field_declaration" => SymbolKind::Field,
+        "enum_variant" => SymbolKind::Variant,
         _ => return None,
     };
 
@@ -104,9 +106,19 @@ pub(crate) fn symbol_from_node(
         kind = SymbolKind::Method;
     }
 
-    let attributes = attributes_for_node(node, ctx.source);
+    let mut attributes = attributes_for_node(node, ctx.source);
     if kind == SymbolKind::Function && is_test_function(&attributes) {
         kind = SymbolKind::Test;
+    }
+    // Record the declared type of a struct field as a queryable `type:` attribute,
+    // mirroring the Java/Kotlin field extractors so `decl_search attribute=type:X`
+    // and field hierarchy listings expose it.
+    if kind == SymbolKind::Field
+        && let Some(field_type) = rust_field_type(node, ctx.source)
+    {
+        attributes.push(format!("type:{field_type}"));
+        attributes.sort();
+        attributes.dedup();
     }
 
     let name = symbol_name(node, kind, ctx.source)?;
@@ -233,7 +245,7 @@ pub(crate) fn js_ts_symbol_from_node(
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
 ) -> Option<ParsedSymbol> {
     let mut kind = match node.kind() {
-        "class_declaration" => SymbolKind::Class,
+        "class_declaration" | "abstract_class_declaration" => SymbolKind::Class,
         "enum_declaration" => SymbolKind::Enum,
         "function"
         | "function_declaration"
@@ -247,7 +259,9 @@ pub(crate) fn js_ts_symbol_from_node(
         | "module"
         | "module_declaration"
         | "namespace_declaration" => SymbolKind::Module,
-        "method_definition" | "method_signature" => SymbolKind::Method,
+        "method_definition" | "method_signature" | "abstract_method_signature" => {
+            SymbolKind::Method
+        }
         "public_field_definition" | "field_definition" | "property_signature" => SymbolKind::Field,
         "type_alias_declaration" => SymbolKind::TypeAlias,
         "variable_declarator" => {
@@ -1500,6 +1514,53 @@ pub(crate) fn symbol_name(node: Node<'_>, kind: SymbolKind, source: &str) -> Opt
 pub(crate) fn impl_name(node: Node<'_>, source: &str) -> String {
     let raw = signature_text(node, node.child_by_field_name("body"), source);
     trim_impl_header(&collapse_whitespace(&raw))
+}
+
+/// Extract a queryable type name for a struct `field_declaration` from its
+/// `type` field. Leading `&`/`&mut`/`*` and lifetimes are stripped and any
+/// generic argument list is dropped so `Vec<String>` -> `Vec`, mirroring how the
+/// Java/Kotlin extractors record `type:` for fields.
+pub(crate) fn rust_field_type(node: Node<'_>, source: &str) -> Option<String> {
+    let type_node = node.child_by_field_name("type")?;
+    let raw = node_text(type_node, source).ok()?;
+    let cleaned = rust_type_name_from_text(raw);
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+pub(crate) fn rust_type_name_from_text(text: &str) -> String {
+    let normalized = collapse_whitespace(text);
+    let mut rest = normalized.as_str();
+    loop {
+        let stripped = rest.trim_start_matches(['&', '*']).trim_start();
+        let stripped = stripped
+            .strip_prefix("mut ")
+            .or_else(|| stripped.strip_prefix("const "))
+            .or_else(|| stripped.strip_prefix("dyn "))
+            .or_else(|| stripped.strip_prefix("impl "))
+            .unwrap_or(stripped)
+            .trim_start();
+        // Drop a leading lifetime such as `'a ` so `&'a str` resolves to `str`.
+        let stripped = if stripped.starts_with('\'') {
+            stripped
+                .split_once(char::is_whitespace)
+                .map(|(_, after)| after.trim_start())
+                .unwrap_or("")
+        } else {
+            stripped
+        };
+        if stripped == rest {
+            break;
+        }
+        rest = stripped;
+    }
+    // Keep only the head up to any generic argument list, then take the final
+    // path segment (`std::vec::Vec` -> `Vec`).
+    let head = rest.split('<').next().unwrap_or(rest).trim();
+    last_path_segment(head)
 }
 
 fn collapse_whitespace(text: &str) -> String {

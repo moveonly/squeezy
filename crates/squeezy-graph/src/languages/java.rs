@@ -177,7 +177,7 @@ impl SemanticGraph {
             .java_class_candidates_for_name_in_file(&field.file_id, type_name)
             .first()?
             .clone();
-        self.java_method_on_class(&class_id, &call.name)
+        self.java_method_on_class_or_ancestors(&class_id, &call.name)
     }
 
     pub(crate) fn java_class_for_caller(&self, caller_id: &SymbolId) -> Option<SymbolId> {
@@ -246,6 +246,62 @@ impl SemanticGraph {
                 .filter(|symbol| symbol.kind == SymbolKind::Method && symbol.name == method_name)
                 .map(|symbol| symbol.id.clone()),
         )
+    }
+
+    /// Look up `method_name` on `class_id`, falling back to its superclass /
+    /// interface ancestors so a method inherited from a base type resolves.
+    ///
+    /// Java records inheritance as `base:<name>` attributes (both `extends`
+    /// and `implements` land under `base:`) rather than `Extends`/`Implements`
+    /// graph edges, so `walk_inheritance_ancestors` is empty for Java classes.
+    /// We instead resolve each `base:` name to a class symbol in the class's
+    /// own file scope (package + imports) and recurse. A visited-set bounds the
+    /// walk against cyclic or diamond hierarchies so each ancestor is examined
+    /// once.
+    pub(crate) fn java_method_on_class_or_ancestors(
+        &self,
+        class_id: &SymbolId,
+        method_name: &str,
+    ) -> Option<SymbolId> {
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(class_id.clone());
+        self.java_method_on_class_or_ancestors_visited(class_id, method_name, &mut visited)
+    }
+
+    fn java_method_on_class_or_ancestors_visited(
+        &self,
+        class_id: &SymbolId,
+        method_name: &str,
+        visited: &mut std::collections::HashSet<SymbolId>,
+    ) -> Option<SymbolId> {
+        if let Some(method) = self.java_method_on_class(class_id, method_name) {
+            return Some(method);
+        }
+        let class = self.symbols.get(class_id)?;
+        let class_file_id = class.file_id.clone();
+        let base_names = class
+            .attributes
+            .iter()
+            .filter_map(|attribute| attribute.strip_prefix("base:"))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        for base_name in base_names {
+            for ancestor_id in
+                self.java_class_candidates_for_name_in_file(&class_file_id, &base_name)
+            {
+                if !visited.insert(ancestor_id.clone()) {
+                    continue;
+                }
+                if let Some(method) = self.java_method_on_class_or_ancestors_visited(
+                    &ancestor_id,
+                    method_name,
+                    visited,
+                ) {
+                    return Some(method);
+                }
+            }
+        }
+        None
     }
 }
 

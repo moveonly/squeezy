@@ -456,20 +456,32 @@ impl Writer {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph | TagEnd::Item => self.finish_line(),
+            // Block-level terminators emit a trailing blank separator line so
+            // adjacent blocks read as paragraphs instead of one run-together
+            // wall of text. `Item` stays tight (no blank) so list rows do not
+            // gain a blank between each entry.
+            TagEnd::Paragraph => self.push_blank_line(),
+            TagEnd::Item => self.finish_line(),
             TagEnd::Heading(_) => {
                 self.finish_line();
                 self.pop_style();
+                self.push_blank_line();
             }
             TagEnd::BlockQuote(_) => {
                 self.finish_line();
                 self.quote_depth = self.quote_depth.saturating_sub(1);
                 self.pop_style();
+                self.push_blank_line();
             }
             TagEnd::CodeBlock => self.finish_code_block(),
             TagEnd::List(_) => {
                 self.finish_line();
                 self.list_stack.pop();
+                // Only separate after the outermost list closes; nested
+                // sub-lists stay tight within their parent item.
+                if self.list_stack.is_empty() {
+                    self.push_blank_line();
+                }
             }
             TagEnd::Emphasis
             | TagEnd::Strong
@@ -510,6 +522,7 @@ impl Writer {
                     self.finish_line();
                     let rendered = table.render(self.current_style, self.mode);
                     self.lines.extend(rendered);
+                    self.push_blank_line();
                 }
             }
             TagEnd::Image
@@ -636,6 +649,18 @@ impl Writer {
         }
     }
 
+    /// Commit any pending spans, then push a single blank separator line.
+    /// Skips the blank when the output is still empty (no leading blank) or
+    /// already ends in one (no double blanks between adjacent blocks). Called
+    /// by block-level terminators; `finish()` strips any trailing blank.
+    fn push_blank_line(&mut self) {
+        self.finish_line();
+        let ends_blank = self.lines.last().map(line_is_blank).unwrap_or(true);
+        if !ends_blank {
+            self.lines.push(Line::from(String::new()));
+        }
+    }
+
     fn finish_code_block(&mut self) {
         let Some(block) = self.code_block.take() else {
             return;
@@ -665,10 +690,16 @@ impl Writer {
         )));
         let code_lines = highlight::highlight_code(block.language.as_deref(), source);
         self.lines.extend(code_lines);
+        self.push_blank_line();
     }
 
     fn finish(mut self) -> Vec<Line<'static>> {
         self.finish_line();
+        // Block terminators append a trailing separator; drop it so answers do
+        // not end on a dangling blank row.
+        while self.lines.len() > 1 && self.lines.last().map(line_is_blank).unwrap_or(false) {
+            self.lines.pop();
+        }
         if self.lines.is_empty() {
             self.lines.push(Line::from(""));
         }
@@ -896,16 +927,36 @@ fn pick_earliest<'a>(
 }
 
 fn is_identifier_boundary(text: &str, start: usize, end: usize) -> bool {
+    // A label is only a standalone confidence token when neither neighbour
+    // joins it into a larger word OR a path/URL. Without the path-delimiter
+    // check, `external` inside the citation path `docs/external/PROVIDERS.md`
+    // (flanked by `/`) was recoloured grey — and help answers cite
+    // `docs/external/*` on essentially every response.
+    let joins_token = |byte: &u8| is_identifier_byte(byte) || is_path_delimiter_byte(byte);
     !text
         .as_bytes()
         .get(start.saturating_sub(1))
         .filter(|_| start > 0)
-        .is_some_and(is_identifier_byte)
-        && !text.as_bytes().get(end).is_some_and(is_identifier_byte)
+        .is_some_and(joins_token)
+        && !text.as_bytes().get(end).is_some_and(joins_token)
 }
 
 fn is_identifier_byte(byte: &u8) -> bool {
     byte.is_ascii_alphanumeric() || *byte == b'_'
+}
+
+/// Bytes that splice a confidence-label-looking word into a larger path or URL
+/// (`docs/external/PROVIDERS.md`, `scheme://external`). A label flanked by one
+/// of these is part of that token, not a standalone graph-confidence label, so
+/// it must not be recoloured. Kept to `/` and `:` deliberately: `.` is excluded
+/// so a sentence-ending `… external.` still highlights (matching the em-dash
+/// label form), and `-` is excluded to avoid surprising hyphenated prose.
+fn is_path_delimiter_byte(byte: &u8) -> bool {
+    matches!(byte, b'/' | b':')
+}
+
+fn line_is_blank(line: &Line<'_>) -> bool {
+    line.spans.iter().all(|span| span.content.is_empty())
 }
 
 fn display_link_url(url: &str) -> String {

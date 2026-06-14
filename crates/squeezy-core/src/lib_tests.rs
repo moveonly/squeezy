@@ -6931,6 +6931,21 @@ fn single_model_provider_yields_one_rung_ladder() {
     assert_eq!(ladder.next_up(ModelTier::Strong), None);
 }
 
+// -- Honest cost meter: always-strong baseline -----------------------------
+
+#[test]
+fn session_metrics_sums_routing_strong_baseline() {
+    let mut session = SessionMetrics::default();
+    let turn = TurnMetrics {
+        routed_to_cheap: true,
+        routing_strong_baseline_usd_micros: 1_000,
+        ..TurnMetrics::default()
+    };
+    session.merge_turn(&turn);
+    session.merge_turn(&turn);
+    assert_eq!(session.routing_strong_baseline_usd_micros, 2_000);
+}
+
 // -- Tier × effort routing -------------------------------------------------
 
 #[test]

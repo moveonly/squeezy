@@ -157,6 +157,7 @@ impl ToolRegistry {
         match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
             Ok(result) => {
                 self.invalidate_diff_cache();
+                self.record_restored_files_into_graph(&result.restored_files);
                 // `rollback` returns `skipped && !applied` with no
                 // conflicts when the journal had nothing to select. That
                 // is the clean-tree happy path: no checkpoints exist to undo.
@@ -218,6 +219,7 @@ impl ToolRegistry {
         match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
             Ok(result) => {
                 self.invalidate_diff_cache();
+                self.record_restored_files_into_graph(&result.restored_files);
                 let nothing_to_revert =
                     result.skipped && !result.applied && result.conflicts.is_empty();
                 if nothing_to_revert {
@@ -291,6 +293,7 @@ impl ToolRegistry {
         ) {
             Ok(result) => {
                 self.invalidate_diff_cache();
+                self.record_restored_files_into_graph(&result.restored_files);
                 let message = rollback_message(&result);
                 make_result(
                     call,
@@ -309,6 +312,21 @@ impl ToolRegistry {
             }
             Err(err) => tool_error(call, err),
         }
+    }
+
+    /// Feed checkpoint-restored files (workspace-relative paths) into the
+    /// semantic graph's pending-changed set so a later query reparses them.
+    /// Resolves each against the workspace root; the graph canonicalizes
+    /// during refresh. No-op when nothing was restored.
+    fn record_restored_files_into_graph(&self, restored_files: &[String]) {
+        if restored_files.is_empty() {
+            return;
+        }
+        let abs_paths = restored_files
+            .iter()
+            .map(|rel| self.root.join(rel))
+            .collect::<Vec<_>>();
+        self.record_graph_changed_paths(abs_paths);
     }
 
     pub(crate) async fn execute_checkpoint_check(&self, call: &ToolCall) -> ToolResult {

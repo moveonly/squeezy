@@ -2448,28 +2448,62 @@ fn graph_manager_returns_config_error_for_invalid_policy_glob() {
 }
 
 #[test]
-fn watcher_paths_skip_vcs_and_squeezy_cache_only() {
+fn watcher_paths_skip_vcs_cache_and_policy_pruned_dirs() {
     let root = PathBuf::from("/workspace/project");
+    let policy = CompiledIndexingPolicy::empty();
 
-    assert!(watcher_path_should_enqueue(&root, &root.join("src/lib.rs")));
+    // Ordinary source under the default policy is always enqueued.
     assert!(watcher_path_should_enqueue(
         &root,
-        &root.join("vendor/allowed/lib.rs")
+        &policy,
+        &root.join("src/lib.rs")
     ));
-    assert!(watcher_path_should_enqueue(
-        &root,
-        &root.join("target/generated.rs")
-    ));
+
+    // VCS metadata and Squeezy's own cache are always dropped.
     for path in [
         root.join(".squeezy/cache/graph.redb"),
         root.join(".git/index"),
     ] {
         assert!(
-            !watcher_path_should_enqueue(&root, &path),
+            !watcher_path_should_enqueue(&root, &policy, &path),
             "{} should not enqueue a graph refresh",
             path.display()
         );
     }
+
+    // Default-pruned build/dependency dirs are now dropped (policy-aware
+    // prune), not enqueued, because the crawl would skip them anyway.
+    for path in [
+        root.join("vendor/allowed/lib.rs"),
+        root.join("target/generated.rs"),
+        root.join("node_modules/pkg/index.js"),
+    ] {
+        assert!(
+            !watcher_path_should_enqueue(&root, &policy, &path),
+            "{} should be pruned by default policy",
+            path.display()
+        );
+    }
+
+    // An `include` glob that re-enables a subset of a pruned dir keeps those
+    // paths enqueueable.
+    let include_policy = IndexingPolicy {
+        include: vec!["vendor/allowed/**".to_string()],
+        ..Default::default()
+    }
+    .compile()
+    .expect("policy compiles");
+    assert!(watcher_path_should_enqueue(
+        &root,
+        &include_policy,
+        &root.join("vendor/allowed/lib.rs")
+    ));
+    // A sibling pruned path the include does not cover is still dropped.
+    assert!(!watcher_path_should_enqueue(
+        &root,
+        &include_policy,
+        &root.join("vendor/other/lib.rs")
+    ));
 }
 
 #[test]
@@ -8435,6 +8469,109 @@ internal class TraceJsonReader : JsonReader
 }
 
 #[test]
+fn graph_lowers_python_inheritance_attributes_to_edges() {
+    // Before the generic lowering pass, only C#/PHP materialized inheritance
+    // edges; Python recorded inheritance solely as `base:` attributes, so
+    // inheritance_ancestors / Extends edges were empty for it.
+    let mut parser = LanguageParser::new().unwrap();
+    let record = python_record(
+        "app/models.py",
+        "class Base:\n    pass\n\nclass Derived(Base):\n    pass\n",
+    );
+    let parsed = parser.parse_record(&record).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let base = graph
+        .find_symbol_by_name("Base")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("Base class symbol");
+    let derived = graph
+        .find_symbol_by_name("Derived")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("Derived class symbol");
+
+    assert!(
+        graph
+            .inheritance_ancestors(&derived.id)
+            .iter()
+            .any(|symbol| symbol.id == base.id),
+        "Derived should report Base as an ancestor via generic inheritance lowering"
+    );
+    assert!(
+        graph
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::Extends
+                && edge.from == derived.id
+                && edge.to.as_ref() == Some(&base.id)),
+        "expected an Extends edge Derived -> Base"
+    );
+}
+
+#[test]
+fn graph_materializes_rust_trait_impl_edges() {
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record(
+        "src/lib.rs",
+        r#"
+pub trait Greet {
+    fn hello(&self);
+}
+
+pub struct Person;
+
+impl Greet for Person {
+    fn hello(&self) {}
+}
+
+impl Person {
+    fn new() -> Self {
+        Person
+    }
+}
+"#,
+    );
+    let parsed = parser.parse_record(&record).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let person = graph
+        .find_symbol_by_name("Person")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Struct)
+        .expect("Person struct symbol");
+    let greet = graph
+        .find_symbol_by_name("Greet")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Trait)
+        .expect("Greet trait symbol");
+
+    // The type -> trait Implements edge is what drives the ancestor walk.
+    assert!(
+        graph
+            .inheritance_ancestors(&person.id)
+            .iter()
+            .any(|symbol| symbol.id == greet.id),
+        "Person should report Greet as an ancestor via the materialized Implements edge"
+    );
+    assert!(
+        graph
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::TraitImpl && edge.to.as_ref() == Some(&greet.id)),
+        "expected a TraitImpl edge targeting Greet"
+    );
+    assert!(
+        graph
+            .edges()
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::InherentImpl),
+        "expected an InherentImpl edge for `impl Person`"
+    );
+}
+
+#[test]
 fn graph_records_js_ts_class_heritage_as_base_and_iface_attributes() {
     // The JS/TS extractor records inheritance as queryable `base:`/`iface:`
     // attributes (not only type-reference edges), and the graph build carries
@@ -8799,6 +8936,69 @@ class Two {
 }
 
 class Caller {
+    run(thing) {
+        return thing.bar(1);
+    }
+}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&record, fs::read_to_string(&record.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let run = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Caller.run should be indexed");
+    let one_bar = graph
+        .find_symbol_by_name("bar")
+        .into_iter()
+        .find(|symbol| {
+            symbol
+                .parent_id
+                .as_ref()
+                .and_then(|id| graph.symbols.get(id))
+                .map(|parent| parent.name == "One")
+                .unwrap_or(false)
+        })
+        .expect("One.bar should be indexed");
+
+    let call_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == run.id && edge.kind == EdgeKind::Calls)
+        .expect("expected a Calls edge from Caller.run for thing.bar(1)");
+    // With an explicit non-self receiver and no type/import signal (the param
+    // `thing` is untyped), the arity shortcut must not fire: `thing.bar(1)` is
+    // left unresolved rather than forging a hard edge to the lone arity-1 `bar`.
+    assert_ne!(
+        call_edge.to.as_ref(),
+        Some(&one_bar.id),
+        "thing.bar(1) must not bind to One.bar purely via arity uniqueness (reason={})",
+        call_edge.provenance.reason,
+    );
+}
+
+/// Language-ROI (JS/TS): when the receiver IS typed, the new TS typed-receiver
+/// resolver binds `thing.bar(1)` to the method on the annotated class — the
+/// exact case the arity-guard test above deliberately leaves untyped.
+#[test]
+fn graph_ts_typed_receiver_binds_method_on_annotated_class() {
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ts_record(
+        "src/typed.ts",
+        r#"
+class One {
+    bar(value: number) { return value; }
+}
+
+class Two {
+    bar(left: number, right: number) { return left + right; }
+}
+
+class Caller {
     run(thing: One) {
         return thing.bar(1);
     }
@@ -8833,13 +9033,10 @@ class Caller {
         .iter()
         .find(|edge| edge.from == run.id && edge.kind == EdgeKind::Calls)
         .expect("expected a Calls edge from Caller.run for thing.bar(1)");
-    // With an explicit non-self receiver and no type/import signal, the arity
-    // shortcut must not fire: `thing.bar(1)` is left unresolved rather than
-    // forging a hard edge to the lone arity-1 `bar`.
-    assert_ne!(
+    assert_eq!(
         call_edge.to.as_ref(),
         Some(&one_bar.id),
-        "thing.bar(1) must not bind to One.bar purely via arity uniqueness (reason={})",
+        "thing.bar(1) with `thing: One` must bind to One.bar via the type annotation (reason={})",
         call_edge.provenance.reason,
     );
 }

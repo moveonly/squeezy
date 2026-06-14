@@ -1306,7 +1306,7 @@ impl ToolRegistry {
         // extends A` records `base:B` (not `base:A`), so a one-shot
         // `base:A|...` query would miss C. Seed the closure from each named
         // supertype; the bound below keeps it to `GRAPH_AUGMENT_CAP`.
-        let symbols = graph_transitive_subtype_closure(
+        let (symbols, closure_capped) = graph_transitive_subtype_closure(
             graph,
             None,
             kind,
@@ -1317,7 +1317,7 @@ impl ToolRegistry {
             TRANSITIVE_CLOSURE_CAP,
         );
 
-        let truncated = symbols.len() > GRAPH_AUGMENT_CAP;
+        let truncated = closure_capped || symbols.len() > GRAPH_AUGMENT_CAP;
         let mut matched_attributes = BTreeSet::new();
         let declarations = symbols
             .iter()

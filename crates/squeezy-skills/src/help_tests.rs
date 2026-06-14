@@ -1,8 +1,8 @@
 use std::{collections::BTreeSet, fs, path::Path};
 
 use super::{
-    HelpCitation, HelpStatus, SqueezyHelp, bundled_doc_paths, bundled_docs, extract_doc_intro,
-    matches_squeezy_help_input, relevant_docs_for_input,
+    HelpAnswerSource, HelpCitation, HelpStatus, SqueezyHelp, bundled_doc_paths, bundled_docs,
+    extract_doc_intro, matches_squeezy_help_input, relevant_docs_for_input,
 };
 
 #[test]
@@ -188,6 +188,48 @@ fn squeezy_help_alias_routes_to_providers_topic() {
     let answer = help.answer_for_input("/help model").expect("alias answer");
     assert_eq!(answer.status, HelpStatus::Answered);
     assert_eq!(answer.topic, "providers");
+}
+
+#[test]
+fn squeezy_help_free_text_routes_to_curated_topic() {
+    // `/help <free text>` that does not exactly match a topic id/alias should
+    // still resolve locally via word-boundary scoring instead of falling
+    // through to the slow, provider-backed DocHelp subagent.
+    let help = SqueezyHelp::new("");
+    let answer = help
+        .answer_for_input("/help how to change the model")
+        .expect("free-text /help answer");
+    assert_eq!(
+        answer.status,
+        HelpStatus::Answered,
+        "free-text /help should resolve to a curated topic, not Unsupported"
+    );
+    assert_eq!(answer.topic, "providers");
+    assert_eq!(answer.source, HelpAnswerSource::LocalCurated);
+}
+
+#[test]
+fn squeezy_help_off_topic_query_stays_unsupported() {
+    // A genuinely off-topic `/help` argument has no word-boundary hit, so the
+    // fuzzy fallback must not fabricate a curated answer.
+    let help = SqueezyHelp::new("");
+    let answer = help
+        .answer_for_input("/help zzzzqqq wuxyzzy plover")
+        .expect("unsupported answer");
+    assert_eq!(answer.status, HelpStatus::Unsupported);
+}
+
+#[test]
+fn squeezy_help_unknown_slash_arg_keeps_slash_suggestions() {
+    // A `/help /unknowncmd <word>` must not be hijacked by a stray word that
+    // matches a topic alias (`model`); slash-prefixed args keep the exact-only
+    // path so `unsupported` can surface slash-command suggestions instead.
+    let help = SqueezyHelp::new("");
+    let answer = help
+        .answer_for_input("/help /notacommand model")
+        .expect("unsupported answer");
+    assert_eq!(answer.status, HelpStatus::Unsupported);
+    assert_ne!(answer.topic, "providers");
 }
 
 #[test]

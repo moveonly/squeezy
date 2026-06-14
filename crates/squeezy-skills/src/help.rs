@@ -143,7 +143,26 @@ impl SqueezyHelp {
     }
 
     pub fn answer_topic(&self, topic: &str) -> HelpAnswer {
-        let Some(definition) = find_topic(topic) else {
+        // Exact id/alias match first so `/help model` stays precise and cheap.
+        // For free-text topics, fall back to the same word-boundary scorer used
+        // for natural-language questions so `/help how to change the model`
+        // resolves to the `providers` topic locally instead of escalating to
+        // the slow, provider-backed DocHelp subagent. `best_topic_for_text`
+        // returns `None` on a score-zero (genuinely off-topic) input, so those
+        // still fall through to the suggestion path.
+        //
+        // Slash-prefixed arguments keep the exact-match-only path: an unknown
+        // `/help /command` should surface "did you mean <slash command>?" via
+        // `unsupported`, not get hijacked by a stray word that happens to match
+        // a topic alias.
+        let fuzzy = find_topic(topic).or_else(|| {
+            if topic.trim_start().starts_with('/') {
+                None
+            } else {
+                best_topic_for_text(topic)
+            }
+        });
+        let Some(definition) = fuzzy else {
             return self.unsupported(topic);
         };
         self.answer_definition(definition)

@@ -42,9 +42,11 @@ pub struct WatcherConfig {
 }
 
 /// Default debounce window. Long enough that an editor "save all" or a
-/// branch switch coalesces into one batch; short enough that the next
-/// query sees the change without a perceptible wait.
-pub const DEFAULT_DEBOUNCE_MS: u64 = 10_000;
+/// branch switch coalesces into one batch, but short enough that a change
+/// is reflected within roughly a second: after the last event the watcher
+/// waits this long before firing, so a single edit becomes queryable about
+/// one second after it lands on disk.
+pub const DEFAULT_DEBOUNCE_MS: u64 = 1_000;
 
 impl Default for WatcherConfig {
     fn default() -> Self {

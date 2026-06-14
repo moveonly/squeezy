@@ -75,6 +75,76 @@ fn helper() {}
 }
 
 #[test]
+fn rust_emits_field_and_variant_symbols() {
+    let source = r#"
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+enum Shape {
+    Circle,
+    Rect { w: i32, h: i32 },
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "x" && symbol.kind == SymbolKind::Field),
+        "struct field `x` should be a Field symbol"
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Circle" && symbol.kind == SymbolKind::Variant),
+        "enum variant `Circle` should be a Variant symbol"
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Rect" && symbol.kind == SymbolKind::Variant),
+        "enum variant `Rect` should be a Variant symbol"
+    );
+}
+
+#[test]
+fn typescript_emits_abstract_class_and_members() {
+    let source = r#"
+export abstract class Shape {
+    abstract area(): number;
+    describe(): string {
+        return "shape";
+    }
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ts_record("src/shape.ts", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Shape" && symbol.kind == SymbolKind::Class),
+        "abstract class `Shape` should emit a Class symbol"
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "area" && symbol.kind == SymbolKind::Method),
+        "abstract method `area` should emit a Method symbol"
+    );
+}
+
+#[test]
 fn parse_error_diagnostics_include_language_span_excerpt_and_partial_summary() {
     let source = "fn broken( {\n    let value = ;\n}\n";
     let mut parser = LanguageParser::new().unwrap();

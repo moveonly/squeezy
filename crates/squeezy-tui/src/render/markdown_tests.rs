@@ -304,3 +304,119 @@ fn markdown_renders_three_column_table_with_separators_and_divider() {
         "body row 2 should have ` | ` between three cells: {row2:?}"
     );
 }
+
+fn blank_line_indices(lines: &[Line<'_>]) -> Vec<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line_text(line).is_empty())
+        .map(|(i, _)| i)
+        .collect()
+}
+
+#[test]
+fn markdown_inserts_blank_line_after_heading() {
+    let lines = render_markdown("## Changing the Model\n\nYou can change your model.");
+    let heading_idx = lines
+        .iter()
+        .position(|line| line_text(line).contains("Changing the Model"))
+        .expect("heading line");
+    let para_idx = lines
+        .iter()
+        .position(|line| line_text(line).contains("You can change"))
+        .expect("paragraph line");
+    assert!(
+        para_idx >= heading_idx + 2,
+        "expected a blank separator line between heading and paragraph; lines: {:?}",
+        lines.iter().map(line_text).collect::<Vec<_>>()
+    );
+    assert!(
+        line_text(&lines[heading_idx + 1]).is_empty(),
+        "the line after the heading should be blank"
+    );
+}
+
+#[test]
+fn markdown_inserts_blank_line_around_code_block() {
+    let lines = render_markdown("Intro paragraph.\n\n```bash\nsqueezy --help\n```\n\nOutro.");
+    let code_idx = lines
+        .iter()
+        .position(|line| line_text(line).contains("squeezy --help"))
+        .expect("code line");
+    let outro_idx = lines
+        .iter()
+        .position(|line| line_text(line).contains("Outro"))
+        .expect("outro line");
+    assert!(
+        outro_idx >= code_idx + 2,
+        "expected a blank separator between the code block and following prose; lines: {:?}",
+        lines.iter().map(line_text).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn markdown_does_not_emit_double_blank_or_edge_blanks() {
+    let lines = render_markdown("First paragraph.\n\nSecond paragraph.\n\nThird paragraph.");
+    let blanks = blank_line_indices(&lines);
+    // Two separators for three paragraphs, never adjacent.
+    assert!(
+        blanks.windows(2).all(|w| w[1] != w[0] + 1),
+        "no two blank lines should be adjacent; lines: {:?}",
+        lines.iter().map(line_text).collect::<Vec<_>>()
+    );
+    assert!(
+        !line_text(&lines[0]).is_empty(),
+        "output should not start with a blank line"
+    );
+    assert!(
+        !line_text(lines.last().unwrap()).is_empty(),
+        "output should not end with a blank line"
+    );
+}
+
+#[test]
+fn markdown_keeps_tight_list_items_adjacent() {
+    let lines = render_markdown("- first\n- second\n- third");
+    let first = lines
+        .iter()
+        .position(|line| line_text(line).contains("first"))
+        .expect("first item");
+    let second = lines
+        .iter()
+        .position(|line| line_text(line).contains("second"))
+        .expect("second item");
+    assert_eq!(
+        second,
+        first + 1,
+        "tight list items should not gain a blank line between them; lines: {:?}",
+        lines.iter().map(line_text).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn markdown_does_not_recolor_confidence_label_inside_path() {
+    // Help answers cite `docs/external/*` constantly; `external` is also a
+    // graph-confidence label, but inside a path it must keep the base style.
+    let lines = render_markdown("Bundled doc (logical ID): docs/external/PROVIDERS.md");
+    let recolored = lines.iter().flat_map(|line| line.spans.iter()).any(|span| {
+        span.content.contains("external") && span.style.fg == Some(crate::render::theme::quiet())
+    });
+    assert!(
+        !recolored,
+        "`external` inside a path should not be recolored as a confidence label; lines: {:?}",
+        lines.iter().map(line_text).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn markdown_still_colors_standalone_external_label() {
+    // The path-boundary fix must not stop genuine standalone labels from
+    // highlighting in prose.
+    let lines = render_markdown("The resolution is external in this case.");
+    let span = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "external")
+        .expect("standalone external label span");
+    assert_eq!(span.style.fg, Some(crate::render::theme::quiet()));
+}

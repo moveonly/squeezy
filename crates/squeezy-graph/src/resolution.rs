@@ -8,6 +8,17 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+/// Which inheritance edge an attribute prefix lowers to in
+/// [`SemanticGraph::add_generic_inheritance_edges`]. `Base` maps to
+/// `Extends`/`Implements` depending on the resolved target's kind; `Iface`
+/// always to `Implements`; `Mixin` always to `UsesTrait`.
+#[derive(Clone, Copy)]
+enum GenericInheritanceKind {
+    Base,
+    Iface,
+    Mixin,
+}
+
 impl SemanticGraph {
     pub(crate) fn rebuild_semantic_edges(&mut self) {
         self.rebuild_semantic_edges_with_cached_resolver(false);
@@ -34,6 +45,20 @@ impl SemanticGraph {
         self.js_ts_resolver.update_from_files(&self.files);
         self.add_csharp_type_edges();
         self.add_php_type_edges();
+        // C# and PHP own their inheritance edges above; every other language
+        // only records inheritance as `base:`/`iface:`/`mixin:` attributes on
+        // the type symbol. Lower those attributes into Extends/Implements/
+        // UsesTrait edges so the ancestor walk and edge-driven inheritance
+        // queries work uniformly across all languages. Must run before
+        // `build_ancestor_edge_index` so the new edges are indexed for the
+        // call-resolution-phase ancestor walk.
+        self.add_generic_inheritance_edges();
+        // Rust trait satisfaction only survives as a substring of the impl
+        // block's display name; materialize InherentImpl / TraitImpl / Implements
+        // edges from the impl headers so "what implements trait T" and Rust
+        // inheritance walks work. Also before the ancestor index build so the
+        // type -> trait `Implements` edge is walkable.
+        self.add_rust_impl_edges();
         // The inheritance edges are now final for this rebuild; index them by
         // `from` so the call-resolution-phase ancestor walk does O(out-degree)
         // lookups instead of rescanning the whole edge vector per BFS node.
@@ -64,6 +89,340 @@ impl SemanticGraph {
         let references = std::mem::take(&mut self.references);
         self.add_reference_edges(&references);
         self.references = references;
+
+        self.add_python_route_edges();
+    }
+
+    /// Lower the `base:`/`iface:`/`mixin:` inheritance attributes that every
+    /// non-C#/PHP extractor stamps onto type symbols into concrete
+    /// `Extends`/`Implements`/`UsesTrait` edges.
+    ///
+    /// C# (`add_csharp_type_edges`) and PHP (`add_php_type_edges`) already
+    /// materialize their own inheritance edges, so this pass skips those two
+    /// languages to avoid duplicates. Every other language (Rust, Java, Kotlin,
+    /// Scala, Go, Swift, Dart, JS/TS, Python, Ruby, C/C++) only recorded
+    /// inheritance as attributes, which left `inheritance_hierarchy` and the
+    /// edge-driven ancestor walk empty for them.
+    ///
+    /// Resolution is scope-aware: same-file declarations win, then a single
+    /// unique-by-name type across the workspace. Ambiguous or unresolved names
+    /// produce no edge (we never emit a `to: None` inheritance edge). Edges are
+    /// deduplicated per `(EdgeKind, target)` so Ruby — which stamps a mixin
+    /// under several attribute spellings (`mixin:T`, `mixin:include:T`,
+    /// `mixin:Ns::T`) — yields a single `UsesTrait` edge per included module.
+    ///
+    /// Idempotent across rebuilds: `rebuild_semantic_edges` drops every
+    /// non-`Contains` edge before this runs, so each rebuild simply re-emits.
+    fn add_generic_inheritance_edges(&mut self) {
+        let symbols = self
+            .symbols
+            .values()
+            .filter(|symbol| self.symbol_uses_generic_inheritance(symbol))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut edges = Vec::new();
+        for symbol in symbols {
+            // De-duplicate per (kind, resolved target): several attribute
+            // spellings can resolve to the same supertype symbol.
+            let mut seen: HashSet<(EdgeKind, SymbolId)> = HashSet::new();
+            for (attribute_kind, raw_name) in self.generic_inheritance_attributes(&symbol) {
+                let Some(target_id) = self.generic_inheritance_target(&symbol.file_id, &raw_name)
+                else {
+                    continue;
+                };
+                let kind = match attribute_kind {
+                    GenericInheritanceKind::Base => self
+                        .symbols
+                        .get(&target_id)
+                        .map(|target| {
+                            if target.kind == SymbolKind::Interface {
+                                EdgeKind::Implements
+                            } else {
+                                EdgeKind::Extends
+                            }
+                        })
+                        .unwrap_or(EdgeKind::Extends),
+                    GenericInheritanceKind::Iface => EdgeKind::Implements,
+                    GenericInheritanceKind::Mixin => EdgeKind::UsesTrait,
+                };
+                if !seen.insert((kind, target_id.clone())) {
+                    continue;
+                }
+                edges.push(GraphEdge {
+                    from: symbol.id.clone(),
+                    to: Some(target_id),
+                    target_text: last_path_segment(&raw_name),
+                    kind,
+                    span: Some(symbol.span),
+                    confidence: Confidence::Heuristic,
+                    freshness: Freshness::Fresh,
+                    provenance: Provenance::new("graph", "generic inheritance attribute edge"),
+                    candidates: Vec::new(),
+                });
+            }
+        }
+        self.edges.extend(edges);
+    }
+
+    /// A type-like symbol whose file language is handled by the generic
+    /// inheritance lowering (i.e. everything except the C#/PHP builders).
+    fn symbol_uses_generic_inheritance(&self, symbol: &GraphSymbol) -> bool {
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Class
+                | SymbolKind::Interface
+                | SymbolKind::Struct
+                | SymbolKind::Enum
+                | SymbolKind::Trait
+                | SymbolKind::Union
+        ) {
+            return false;
+        }
+        self.files
+            .get(&symbol.file_id)
+            .map(|file| !matches!(file.language, LanguageKind::CSharp | LanguageKind::Php))
+            .unwrap_or(false)
+    }
+
+    /// The `base:`/`iface:`/`mixin:` inheritance attributes on `symbol`, tagged
+    /// with the edge kind each maps to. Ruby's kind-tagged mixin spellings
+    /// (`mixin:include:T`) survive here but their leaf (`include:T`) declines in
+    /// resolution; the bare `mixin:T` form supplies the resolvable name and the
+    /// per-target de-duplication in the caller collapses the rest.
+    fn generic_inheritance_attributes(
+        &self,
+        symbol: &GraphSymbol,
+    ) -> Vec<(GenericInheritanceKind, String)> {
+        symbol
+            .attributes
+            .iter()
+            .filter_map(|attribute| {
+                if let Some(name) = attribute.strip_prefix("base:") {
+                    Some((GenericInheritanceKind::Base, name.to_string()))
+                } else if let Some(name) = attribute.strip_prefix("iface:") {
+                    Some((GenericInheritanceKind::Iface, name.to_string()))
+                } else {
+                    attribute
+                        .strip_prefix("mixin:")
+                        .map(|name| (GenericInheritanceKind::Mixin, name.to_string()))
+                }
+            })
+            .collect()
+    }
+
+    /// Resolve an inheritance attribute's `<Name>` to a single concrete type
+    /// symbol. Reuses the per-language scoped candidate helper where one exists
+    /// and is callable (C/C++, Java, Python); for the rest a generic
+    /// same-file-then-unique-by-name lookup is used. Returns `None` when the
+    /// name is unknown or ambiguous so the caller emits no edge.
+    fn generic_inheritance_target(&self, file_id: &FileId, name: &str) -> Option<SymbolId> {
+        let language = self.files.get(file_id).map(|file| file.language);
+        let candidates = match language {
+            Some(LanguageKind::Java) => self.java_class_candidates_for_name_in_file(file_id, name),
+            Some(LanguageKind::Python) => {
+                self.python_class_candidates_for_name_in_file(file_id, name)
+            }
+            Some(LanguageKind::C | LanguageKind::Cpp) => {
+                self.cpp_class_candidates_for_name_in_file(file_id, name)
+            }
+            _ => self.generic_type_candidates_for_name_in_file(file_id, name),
+        };
+        single_symbol(candidates.into_iter())
+    }
+
+    /// Generic scope-aware type lookup for languages without a dedicated
+    /// candidate helper reachable here. Same-file type-like declarations win;
+    /// failing that, a single unique-by-name type across the workspace. Anything
+    /// ambiguous yields the empty set so the caller declines.
+    fn generic_type_candidates_for_name_in_file(
+        &self,
+        file_id: &FileId,
+        name: &str,
+    ) -> Vec<SymbolId> {
+        let leaf = last_path_segment(name);
+        let typed = self
+            .symbols_by_name(&leaf)
+            .iter()
+            .filter_map(|id| self.symbols.get(id))
+            .filter(|symbol| is_class_like_kind(symbol.kind) || symbol.kind == SymbolKind::Union)
+            .collect::<Vec<_>>();
+        let same_file = typed
+            .iter()
+            .filter(|symbol| symbol.file_id == *file_id)
+            .map(|symbol| symbol.id.clone());
+        if let Some(id) = single_symbol(same_file) {
+            return vec![id];
+        }
+        single_symbol(typed.iter().map(|symbol| symbol.id.clone()))
+            .into_iter()
+            .collect()
+    }
+
+    /// Materialize Rust `impl`-block relationships as graph edges.
+    ///
+    /// A Rust `Impl` symbol carries its header in `name` (e.g. `Concrete` for an
+    /// inherent block, `Trait for Concrete` for a trait block). Until now that
+    /// header was the only record of trait satisfaction, so "what implements
+    /// trait T" and Rust inheritance walks saw nothing. For each Rust `Impl`
+    /// symbol we parse the header into the implementing type and (optional)
+    /// trait and emit:
+    ///   * inherent `impl Concrete`: an `InherentImpl` edge `impl -> type`,
+    ///   * trait `impl Trait for Concrete`: a `TraitImpl` edge `impl -> trait`
+    ///     plus an `Implements` edge `type -> trait`.
+    ///
+    /// Only the `Implements` edge participates in ancestor walks; `InherentImpl`
+    /// / `TraitImpl` are structural and stay out of `ANCESTOR_EDGE_KINDS`. Type
+    /// and trait names resolve through a scoped lookup (same-file first, then a
+    /// unique workspace match for the type; trait names go through the existing
+    /// scope-aware `impl_header_trait_resolves_to`); ambiguous or unknown names
+    /// decline so no edge is emitted. Idempotent: every non-`Contains` edge is
+    /// dropped before each rebuild, so this simply re-emits.
+    fn add_rust_impl_edges(&mut self) {
+        let impls = self
+            .symbols
+            .values()
+            .filter(|symbol| symbol.kind == SymbolKind::Impl)
+            .filter(|symbol| {
+                self.files
+                    .get(&symbol.file_id)
+                    .map(|file| file.language == LanguageKind::Rust)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut edges = Vec::new();
+        for impl_symbol in impls {
+            let header = impl_symbol.name.as_str();
+            let type_name = impl_header_type_name(header);
+            if type_name.is_empty() {
+                continue;
+            }
+            let Some(type_id) = self.rust_impl_type_symbol(&impl_symbol, &type_name) else {
+                continue;
+            };
+            match impl_header_trait_name(header) {
+                Some(trait_name) => {
+                    let Some(trait_id) = self.rust_impl_trait_symbol(&impl_symbol, &trait_name)
+                    else {
+                        continue;
+                    };
+                    edges.push(GraphEdge {
+                        from: impl_symbol.id.clone(),
+                        to: Some(trait_id.clone()),
+                        target_text: trait_name.clone(),
+                        kind: EdgeKind::TraitImpl,
+                        span: Some(impl_symbol.span),
+                        confidence: Confidence::Heuristic,
+                        freshness: Freshness::Fresh,
+                        provenance: Provenance::new("tree-sitter-rust", "trait impl edge"),
+                        candidates: Vec::new(),
+                    });
+                    edges.push(GraphEdge {
+                        from: type_id,
+                        to: Some(trait_id),
+                        target_text: trait_name,
+                        kind: EdgeKind::Implements,
+                        span: Some(impl_symbol.span),
+                        confidence: Confidence::Heuristic,
+                        freshness: Freshness::Fresh,
+                        provenance: Provenance::new(
+                            "tree-sitter-rust",
+                            "trait impl implements edge",
+                        ),
+                        candidates: Vec::new(),
+                    });
+                }
+                None => {
+                    edges.push(GraphEdge {
+                        from: impl_symbol.id.clone(),
+                        to: Some(type_id),
+                        target_text: type_name,
+                        kind: EdgeKind::InherentImpl,
+                        span: Some(impl_symbol.span),
+                        confidence: Confidence::Heuristic,
+                        freshness: Freshness::Fresh,
+                        provenance: Provenance::new("tree-sitter-rust", "inherent impl edge"),
+                        candidates: Vec::new(),
+                    });
+                }
+            }
+        }
+        self.edges.extend(edges);
+    }
+
+    /// Resolve the implementing-type leaf of a Rust `impl` block to a single
+    /// type symbol, scoping same-file declarations first and then a unique
+    /// workspace-wide match. `generic_type_candidates_for_name_in_file` already
+    /// yields at most one (the unique resolution), so this is a thin adapter
+    /// that declines on ambiguity.
+    fn rust_impl_type_symbol(
+        &self,
+        impl_symbol: &GraphSymbol,
+        type_name: &str,
+    ) -> Option<SymbolId> {
+        self.generic_type_candidates_for_name_in_file(&impl_symbol.file_id, type_name)
+            .into_iter()
+            .next()
+    }
+
+    /// Resolve the trait leaf of a Rust trait-impl header to a single `Trait`
+    /// symbol, reusing the scope-aware `impl_header_trait_resolves_to` matcher
+    /// (same-file or import-visible, module-path checked). Declines on ambiguity.
+    fn rust_impl_trait_symbol(
+        &self,
+        impl_symbol: &GraphSymbol,
+        trait_name: &str,
+    ) -> Option<SymbolId> {
+        single_symbol(
+            self.symbols_by_name(trait_name)
+                .iter()
+                .filter_map(|id| self.symbols.get(id))
+                .filter(|symbol| symbol.kind == SymbolKind::Trait)
+                .filter(|symbol| {
+                    self.impl_header_trait_resolves_to(&impl_symbol.name, symbol, impl_symbol)
+                })
+                .map(|symbol| symbol.id.clone()),
+        )
+    }
+
+    /// Route/registry decorators (`@MyRouter.get`, bare `@register`) record a
+    /// `framework:web-route`/`route:` marker on the decorated handler but no
+    /// call edge, so the registrar that ultimately invokes the handler is
+    /// invisible to call-graph navigation. Emit a registrar -> handler edge for
+    /// the allow-listed, uniquely-resolvable cases; the dominant instance
+    /// registrar form (`router = APIRouter()`) declines (no symbol for the
+    /// module-level variable) and simply yields no edge.
+    fn add_python_route_edges(&mut self) {
+        let handlers: Vec<SymbolId> = self
+            .symbols
+            .values()
+            .filter(|symbol| {
+                matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
+                    && symbol.attributes.iter().any(|attribute| {
+                        attribute == "framework:web-route" || attribute.starts_with("route:")
+                    })
+            })
+            .map(|symbol| symbol.id.clone())
+            .collect();
+        let edges: Vec<GraphEdge> = handlers
+            .iter()
+            .filter_map(|handler_id| {
+                let registrar = self.python_route_decorator_registrar(handler_id)?;
+                let handler = self.symbols.get(handler_id)?;
+                Some(GraphEdge {
+                    from: registrar,
+                    to: Some(handler_id.clone()),
+                    target_text: handler.name.clone(),
+                    kind: EdgeKind::Calls,
+                    span: Some(handler.span),
+                    confidence: Confidence::Heuristic,
+                    freshness: Freshness::Fresh,
+                    provenance: Provenance::new("python", "route decorator registrar"),
+                    candidates: Vec::new(),
+                })
+            })
+            .collect();
+        self.edges.extend(edges);
     }
 
     /// Resolve at most one edge per input item, in parallel.
@@ -267,8 +626,8 @@ impl SemanticGraph {
                 .owner_id
                 .clone()
                 .unwrap_or_else(|| file_symbol_id.clone());
-            let candidates = graph.symbols_by_name_or_scan(last_path_segment_str(&reference.text));
-            let (to, confidence) = match candidates.as_slice() {
+            let candidates = graph.symbols_by_name(last_path_segment_str(&reference.text));
+            let (to, confidence) = match candidates {
                 [only] => (Some(only.clone()), Confidence::Heuristic),
                 _ => return None,
             };
@@ -307,14 +666,15 @@ impl SemanticGraph {
     ) -> (Option<SymbolId>, Confidence, &'static str, Vec<SymbolId>) {
         if call.kind == ParsedCallKind::Macro {
             let candidates = self
-                .symbols_by_name_or_scan(&call.name)
-                .into_iter()
+                .symbols_by_name(&call.name)
+                .iter()
                 .filter(|id| {
                     self.symbols
                         .get(id)
                         .map(|symbol| symbol.kind == SymbolKind::Macro)
                         .unwrap_or(false)
                 })
+                .cloned()
                 .collect::<Vec<_>>();
             return match candidates.as_slice() {
                 [only] => (
@@ -386,6 +746,17 @@ impl SemanticGraph {
             );
         }
 
+        if call.kind == ParsedCallKind::Direct
+            && let Some(callee) = self.php_type_candidate_for_reference(caller_id, call)
+        {
+            return (
+                Some(callee),
+                Confidence::Heuristic,
+                "php psr4 type",
+                Vec::new(),
+            );
+        }
+
         if call.kind == ParsedCallKind::Method
             && let Some(callee) = self.inherited_python_method(caller_id, call)
         {
@@ -449,8 +820,8 @@ impl SemanticGraph {
         }
 
         let candidates = self
-            .symbols_by_name_or_scan(&call.name)
-            .into_iter()
+            .symbols_by_name(&call.name)
+            .iter()
             .filter(|id| {
                 self.symbols
                     .get(id)
@@ -465,6 +836,7 @@ impl SemanticGraph {
                     })
                     .unwrap_or(false)
             })
+            .cloned()
             .collect::<Vec<_>>();
 
         if let Some(id) = self.qualified_direct_call(&candidates, caller_id, call) {
@@ -493,6 +865,14 @@ impl SemanticGraph {
                     Vec::new(),
                 );
             }
+            if let Some(id) = self.csharp_receiver_field_method(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "csharp field receiver",
+                    Vec::new(),
+                );
+            }
             if let Some(id) = self.kotlin_extension_function_call(&candidates, caller_id, call) {
                 return (
                     Some(id),
@@ -506,6 +886,14 @@ impl SemanticGraph {
                     Some(id),
                     Confidence::Heuristic,
                     "kotlin companion member",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.kotlin_receiver_field_method(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "kotlin field receiver",
                     Vec::new(),
                 );
             }
@@ -525,6 +913,14 @@ impl SemanticGraph {
                     Vec::new(),
                 );
             }
+            if let Some(id) = self.python_manager_dispatch_call(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "python manager dispatch",
+                    Vec::new(),
+                );
+            }
             if let Some(id) = self.python_module_qualified_call(&candidates, caller_id, call) {
                 return (
                     Some(id),
@@ -538,6 +934,14 @@ impl SemanticGraph {
                     Some(id),
                     Confidence::ImportResolved,
                     "go package import",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.go_receiver_method_call(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "go receiver method",
                     Vec::new(),
                 );
             }
@@ -578,6 +982,22 @@ impl SemanticGraph {
                     Some(id),
                     Confidence::Heuristic,
                     "dart typed local receiver",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.ts_receiver_typed_method(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "js/ts typed receiver",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.cpp_member_method_call(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "cpp member method",
                     Vec::new(),
                 );
             }

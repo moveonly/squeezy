@@ -145,6 +145,61 @@ impl SemanticGraph {
         ids.dedup();
         ids
     }
+
+    /// Resolve `recv.Method()` where `recv` is a field (or property) of the
+    /// caller's enclosing type, using the field's declared type to locate the
+    /// method. Mirrors `java_receiver_field_method`.
+    pub(crate) fn csharp_receiver_field_method(
+        &self,
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        let caller = self.symbols.get(caller_id)?;
+        let caller_file = self.files.get(&caller.file_id)?;
+        if caller_file.language != LanguageKind::CSharp {
+            return None;
+        }
+        let receiver = call.receiver.as_deref()?;
+        if matches!(receiver, "this" | "base") || receiver.contains(' ') || receiver.contains('(') {
+            return None;
+        }
+        let type_id = self.csharp_type_for_caller(caller_id)?;
+        let field = self
+            .children_by_parent
+            .get(&type_id)?
+            .iter()
+            .find_map(|child_id| {
+                self.symbols
+                    .get(child_id)
+                    .filter(|symbol| symbol.kind == SymbolKind::Field && symbol.name == receiver)
+            })?;
+        let type_name = field
+            .attributes
+            .iter()
+            .find_map(|attribute| attribute.strip_prefix("type:"))?;
+        let target_id = self
+            .csharp_type_candidates_for_name_in_file(&field.file_id, type_name)
+            .first()?
+            .clone();
+        let target = self.symbols.get(&target_id)?;
+        self.method_on_class_or_partials(target, &call.name, None)
+    }
+
+    fn csharp_type_for_caller(&self, caller_id: &SymbolId) -> Option<SymbolId> {
+        let caller = self.symbols.get(caller_id)?;
+        if self.symbol_is_csharp_type(caller) {
+            return Some(caller.id.clone());
+        }
+        let mut current = caller.parent_id.clone();
+        while let Some(id) = current {
+            let symbol = self.symbols.get(&id)?;
+            if self.symbol_is_csharp_type(symbol) {
+                return Some(symbol.id.clone());
+            }
+            current = symbol.parent_id.clone();
+        }
+        None
+    }
 }
 
 pub(crate) fn csharp_import_matches_symbol(import: &ParsedImport, symbol: &GraphSymbol) -> bool {

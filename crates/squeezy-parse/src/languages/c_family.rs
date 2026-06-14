@@ -249,6 +249,7 @@ pub(crate) fn c_family_symbol_from_node(
     let signature = signature_text(node, body, ctx.source);
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let mut attributes = c_family_attributes_for_node(node, kind, &signature);
+    attributes.extend(c_family_base_class_attributes(node, kind, ctx.source));
     attributes.sort();
     attributes.dedup();
     let confidence = c_family_symbol_confidence(node, &attributes);
@@ -286,6 +287,12 @@ pub(crate) fn extract_c_family_symbol_facts(
     {
         let mut cursor = bases.walk();
         for base in bases.named_children(&mut cursor) {
+            // The clause interleaves `access_specifier` (public/private/
+            // protected) nodes with the base types; skip them so we never
+            // record a bogus `public`/`private` type reference.
+            if base.kind() == "access_specifier" {
+                continue;
+            }
             if let Ok(text) = node_text(base, ctx.source) {
                 let name = c_family_last_name(text);
                 if !name.is_empty() {
@@ -937,6 +944,46 @@ pub(crate) fn c_family_is_template_specialization(node: Node<'_>) -> bool {
         return false;
     };
     name.kind() == "template_type"
+}
+
+/// Emit `base:<Leaf>` inheritance attributes for each base class of a C++
+/// `class_specifier` / `struct_specifier`.
+///
+/// tree-sitter-cpp models the base list as a single `base_class_clause` in the
+/// `superclasses` field, whose named children interleave optional
+/// `access_specifier` nodes with the base type nodes (`type_identifier`,
+/// `qualified_identifier`, `template_type`, …); the `virtual` keyword is an
+/// anonymous token. C++ has no syntactic interface/abstract distinction, so per
+/// the generic lowering (which treats `base:` as Extends) every base — public,
+/// protected, private, or virtual — is recorded as `base:`. The leaf type name
+/// is taken (template args and `::` qualifiers stripped) to match how the
+/// resolver looks symbols up. Mirrors the inheritance signal every other
+/// extractor emits so `decl_search attribute=base:<Type>` and
+/// `inheritance_hierarchy` work for C/C++.
+fn c_family_base_class_attributes(node: Node<'_>, kind: SymbolKind, source: &str) -> Vec<String> {
+    if !matches!(kind, SymbolKind::Class | SymbolKind::Struct) {
+        return Vec::new();
+    }
+    let Some(bases) = node.child_by_field_name("superclasses") else {
+        return Vec::new();
+    };
+    let mut attributes = Vec::new();
+    let mut cursor = bases.walk();
+    for base in bases.named_children(&mut cursor) {
+        // The `access_specifier` (public/private/protected) is itself a named
+        // child of the clause; skip it so only real base types are recorded.
+        if base.kind() == "access_specifier" {
+            continue;
+        }
+        let Ok(text) = node_text(base, source) else {
+            continue;
+        };
+        let name = c_family_last_name(text);
+        if !name.is_empty() {
+            attributes.push(format!("base:{name}"));
+        }
+    }
+    attributes
 }
 
 pub(crate) fn c_family_symbol_confidence(node: Node<'_>, attributes: &[String]) -> Confidence {

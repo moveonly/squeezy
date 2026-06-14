@@ -52,9 +52,9 @@ summary is returned.
 
 Squeezy builds a local semantic graph from tree-sitter parsers, workspace facts,
 and language-specific heuristics. Navigation tools return compact evidence
-packets with paths, spans, hashes, confidence, freshness, provenance, and next
-actions. Unsupported languages and excluded files are reported as fallback
-inputs rather than graph-confident answers.
+packets with paths, spans, hashes, and confidence. Unsupported languages and
+excluded files are reported as fallback inputs rather than graph-confident
+answers.
 
 The agent should prefer `repo_map`, declaration/reference/flow tools, and
 `read_slice` before broad raw file reads. Bounded `grep`, `glob`, and

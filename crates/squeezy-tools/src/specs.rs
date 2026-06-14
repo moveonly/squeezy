@@ -389,7 +389,7 @@ pub(crate) fn read_tool_output_spec() -> ToolSpec {
 pub(crate) fn repo_map_spec() -> ToolSpec {
     ToolSpec {
         name: "repo_map".to_string(),
-        description: "Return a compact semantic architecture map from the local graph: hierarchy, language counts, coverage, unsupported files, and next graph actions.".to_string(),
+        description: "Return a compact semantic architecture map from the local graph: hierarchy, language counts, and unsupported files.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -404,10 +404,19 @@ pub(crate) fn repo_map_spec() -> ToolSpec {
     }
 }
 
+/// Shared routing line for the intra-graph lookup tools. Frames the choice
+/// positively — pick the right first tool for the task — instead of leaning on
+/// per-tool "do not also call X" prohibitions, and steers chaining through a
+/// resolved `symbol_id` rather than re-firing the same bare query against a
+/// sibling tool.
+const GRAPH_LOOKUP_ROUTING: &str = "Pick ONE first lookup: decl_search for lists/counts, definition_search for the defining site, symbol_context for relationships; chain only with a resolved symbol_id, not by re-firing the same bare query.";
+
 pub(crate) fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or Dart `with` mixers `mixin:<Type>`; prefix-free `attribute=\"<Type>\"` matches all three at once. Pipe-separate to match several (`base:A|base:B`). Pass as `attribute`, not `base:` in `query`. Set transitive=true with an inheritance attribute (base:/iface:/mixin:) to return the full transitive subtype closure, not just direct subtypes. One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". Do not also call definition_search or symbol_context with the same query in one turn unless this result is ambiguous.".to_string(),
+        description: format!(
+            "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or Dart `with` mixers `mixin:<Type>`; prefix-free `attribute=\"<Type>\"` matches all three at once. Pipe-separate to match several (`base:A|base:B`). Pass as `attribute`, not `base:` in `query`. Set transitive=true with an inheritance attribute (base:/iface:/mixin:) to return the full transitive subtype closure, not just direct subtypes (for transitive supertypes/ancestors use inheritance_hierarchy). One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". {GRAPH_LOOKUP_ROUTING} If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness."
+        ),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -432,7 +441,9 @@ pub(crate) fn decl_search_spec() -> ToolSpec {
 pub(crate) fn definition_search_spec() -> ToolSpec {
     ToolSpec {
         name: "definition_search".to_string(),
-        description: "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?'. Use before flow tools when a name may be ambiguous; do not also call decl_search or symbol_context for the same query unless this result is insufficient.".to_string(),
+        description: format!(
+            "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?'. Use before flow tools when a name may be ambiguous. {GRAPH_LOOKUP_ROUTING} A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness."
+        ),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -454,7 +465,7 @@ pub(crate) fn definition_search_spec() -> ToolSpec {
 pub(crate) fn reference_search_spec() -> ToolSpec {
     ToolSpec {
         name: "reference_search".to_string(),
-        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when a prior graph call returned one. One call returns every callsite — prefer it over N greps for the same symbol name.".to_string(),
+        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when a prior graph call returned one. One call returns every callsite — prefer it over N greps for the same symbol name. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -476,7 +487,7 @@ pub(crate) fn reference_search_spec() -> ToolSpec {
 pub(crate) fn upstream_flow_spec() -> ToolSpec {
     ToolSpec {
         name: "upstream_flow".to_string(),
-        description: "Return compact callers (bounded BFS up to max_depth, each packet tagged with `depth`) and direct inbound references for a resolved symbol. Use for 'who calls X?' or 'who calls X within N hops?'.".to_string(),
+        description: "Return compact callers (bounded BFS up to max_depth, each packet tagged with `depth`) and direct inbound references for a resolved symbol. Use for 'who calls X?' or 'who calls X within N hops?'. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -498,7 +509,7 @@ pub(crate) fn upstream_flow_spec() -> ToolSpec {
 pub(crate) fn downstream_flow_spec() -> ToolSpec {
     ToolSpec {
         name: "downstream_flow".to_string(),
-        description: "Return compact callees (bounded BFS up to max_depth, each packet tagged with `depth`), outgoing reference/import edges, and an explicit call chain when target_symbol_id or target_query is supplied.".to_string(),
+        description: "Return compact callees (bounded BFS up to max_depth, each packet tagged with `depth`), outgoing reference/import edges, and an explicit call chain when target_symbol_id or target_query is supplied. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -522,7 +533,7 @@ pub(crate) fn downstream_flow_spec() -> ToolSpec {
 pub(crate) fn hierarchy_spec() -> ToolSpec {
     ToolSpec {
         name: "hierarchy".to_string(),
-        description: "Return graph containment hierarchy (file → module → class → members) for the workspace, a symbol_id, or a declaration query. This is containment, NOT inheritance — for subclasses/implementers/Dart mixers use `decl_search` with `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or `mixin:<Type>` (Dart `with`); prefix-free `attribute=\"<Type>\"` matches all three. For every method/field/variant of one class, call `hierarchy(symbol_id=<class>)` first to enumerate the member set before reading bodies, replacing member-by-member reads or greps.".to_string(),
+        description: "Return graph containment hierarchy (file → module → class → members) for the workspace, a symbol_id, or a declaration query — the tool for enumerating what a scope contains. For every method/field/variant of one class, call `hierarchy(symbol_id=<class>)` first to enumerate the member set before reading bodies, replacing member-by-member reads or greps. This is containment, NOT inheritance — for subclasses/implementers/Dart mixers use `decl_search` with `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or `mixin:<Type>` (Dart `with`); prefix-free `attribute=\"<Type>\"` matches all three, and for supertypes/ancestors use `inheritance_hierarchy`.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -544,7 +555,7 @@ pub(crate) fn hierarchy_spec() -> ToolSpec {
 pub(crate) fn inheritance_hierarchy_spec() -> ToolSpec {
     ToolSpec {
         name: "inheritance_hierarchy".to_string(),
-        description: "Return inheritance relationships for one class-like symbol. Default returns transitive supertypes through UsesTrait/Extends/Implements edges; set subtypes=true for first-generation direct inheritors. Use for inheritance questions, not containment.".to_string(),
+        description: "Return inheritance relationships for one class-like symbol. Default returns transitive supertypes through UsesTrait/Extends/Implements edges; set subtypes=true for first-generation direct inheritors. Use for inheritance questions, not containment — for the FULL transitive subtype closure use decl_search attribute=\"base:<Type>\" (or iface:/mixin:) with transitive=true.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -564,7 +575,7 @@ pub(crate) fn inheritance_hierarchy_spec() -> ToolSpec {
 pub(crate) fn impact_spec() -> ToolSpec {
     ToolSpec {
         name: "impact".to_string(),
-        description: "Return graph-computed impact for a changed symbol or file path: changed files, reverse-import affected files, affected symbols, tests, and evidence packets. Use before edits or reviews that need a bounded blast-radius view.".to_string(),
+        description: "Return graph-computed impact for a changed symbol or file path: changed files, reverse-import affected files, affected symbols, tests, and evidence packets. Use before edits or reviews that need a bounded blast-radius view. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -585,7 +596,7 @@ pub(crate) fn impact_spec() -> ToolSpec {
 pub(crate) fn read_slice_spec() -> ToolSpec {
     ToolSpec {
         name: "read_slice".to_string(),
-        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Each `content` line is prefixed with its 1-based absolute line number and a tab (cat -n format); the result also carries `start_line`. Set read_mode=diff to return only changed ranges against a baseline. For a symbol_id from a graph packet (definition_search, symbol_context, hierarchy, reference_search), `span_kind=body` returns the body span directly.".to_string(),
+        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Each `content` line is prefixed with its 1-based absolute line number and a tab (cat -n format); the result also carries `start_line`. Set read_mode=diff to return only changed ranges against a baseline. For a symbol_id from a graph packet (definition_search, symbol_context, hierarchy, reference_search), `span_kind=body` returns the body span directly. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -615,7 +626,7 @@ pub(crate) fn read_slice_spec() -> ToolSpec {
 pub(crate) fn symbol_context_spec() -> ToolSpec {
     ToolSpec {
         name: "symbol_context".to_string(),
-        description: "Return compact graph-backed context for symbols matching a declaration query: callers, callees, references, dirty/diff annotations, and evidence packets. Use for relationships, callers, references, or impact. Avoid for simple definition/file lookup that definition_search answers.".to_string(),
+        description: "Return compact graph-backed context for symbols matching a declaration query: callers, callees, references, dirty/diff annotations, and evidence packets. Use for relationships, callers, references, or impact. Avoid for simple definition/file lookup that definition_search answers. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -623,6 +634,7 @@ pub(crate) fn symbol_context_spec() -> ToolSpec {
             "additionalProperties": false,
             "properties": {
                 "query": {"type": "string", "description": "Text to match against indexed symbol signatures."},
+                "symbol_id": {"type": "string", "description": "Exact graph symbol id from a prior packet to anchor context directly instead of re-resolving by name."},
                 "path": {"type": "string", "description": "Optional workspace-relative file path filter."},
                 "diff_only": {"type": "boolean", "description": "When true, return only symbols touched by the current Git diff."},
                 "max_references": {"type": "integer", "minimum": 1, "maximum": 50},
