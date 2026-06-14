@@ -13,12 +13,13 @@
 //! `description`, optional `model`, and an optional CSV/inline-list
 //! `tools` field; the body becomes the subagent's system prompt.
 //!
-//! The catalog is intentionally a read-only query surface today. It
-//! merges built-in kinds with disk-loaded entries so a slash command,
-//! TUI screen, or external tool can answer "what subagents are
-//! available here?" without re-walking the filesystem on every call.
-//! Built-in dispatch in `lib.rs` is unchanged; disk-loaded entries are
-//! additive metadata that future wiring can consume.
+//! The catalog is a read-only query surface. It merges built-in kinds
+//! with disk-loaded entries so a slash command, TUI screen, or external
+//! tool can answer "what subagents are available here?" without
+//! re-walking the filesystem on every call. The `delegate` tool reads it
+//! at dispatch time: an explicit `agent: <name>` selection runs the named
+//! disk-loaded entry's `.md` body as the subagent's system prompt on its
+//! declared model and read-only tools.
 
 use std::{
     borrow::Cow,

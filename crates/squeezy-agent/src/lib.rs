@@ -1435,6 +1435,12 @@ pub struct Agent {
     next_approval_id: Arc<AtomicU64>,
     next_attachment_id: Arc<AtomicU64>,
     subagents: SubagentRegistry,
+    /// Disk-loaded custom subagent definitions discovered at session start
+    /// from `<ws>/.squeezy/agents/*.md` and `~/.squeezy/agents/*.md`. Shared
+    /// with each `TurnRuntime` so the delegate dispatch can resolve an
+    /// explicit `agent:` selection and the tool schema can advertise the
+    /// available agents by name.
+    subagent_catalog: Arc<SubagentCatalog>,
     /// In-memory permission rules added via "Allow user/project rule" during
     /// the current process. Persisted to disk on a best-effort basis; this
     /// vector also makes the rule take effect immediately for subsequent
@@ -2148,6 +2154,10 @@ impl Agent {
             );
         }
         let initial_session_mode = config.session_mode;
+        // Discover disk-loaded custom subagents once at session start so the
+        // delegate dispatch and tool advertisement can read them without
+        // re-walking the filesystem on every turn.
+        let subagent_catalog = Arc::new(SubagentCatalog::discover(&config.workspace_root, None));
         let session_metrics = Arc::new(Mutex::new(conversation_state.metrics.clone()));
         let next_attachment_id = next_attachment_counter(&conversation_state.context_attachments);
         let (event_broadcast, _) = broadcast::channel(64);
@@ -2195,6 +2205,7 @@ impl Agent {
             next_approval_id: Arc::new(AtomicU64::new(1)),
             next_attachment_id: Arc::new(AtomicU64::new(next_attachment_id)),
             subagents: SubagentRegistry::default(),
+            subagent_catalog,
             session_rules: Arc::new(RwLock::new(Vec::new())),
             session_mode: Arc::new(AtomicU8::new(initial_session_mode.to_u8())),
             loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
@@ -3183,7 +3194,8 @@ impl Agent {
         let raw_instructions =
             instructions_with_batch_hint(&raw_instructions, self.config.batch_tool_calls_hint);
         let request_instructions = self.redactor.redact(&raw_instructions).text;
-        let mut all_tool_specs = core_control_tools(&self.config.subagents, mode);
+        let mut all_tool_specs =
+            core_control_tools(&self.config.subagents, mode, &self.subagent_catalog);
         all_tool_specs.extend(self.tools.specs().iter().cloned().map(advertised_tool));
         retain_non_excluded_tools(&mut all_tool_specs, &self.config.tools);
         let session_id_for_plan_mode = self.session_id();
@@ -4772,6 +4784,7 @@ impl Agent {
         let loaded_tool_schemas = self.loaded_tool_schemas.clone();
         let replay = self.replay.clone();
         let subagents = self.subagents.clone();
+        let subagent_catalog = self.subagent_catalog.clone();
         let hooks = self.hooks.clone();
         let background_tasks = self.background_tasks.clone();
         let routing_state = self.routing_state.clone();
@@ -4917,8 +4930,11 @@ impl Agent {
                     .await;
                     return;
                 }
-                let mut all_tool_specs =
-                    core_control_tools(&config.subagents, load_session_mode(&session_mode));
+                let mut all_tool_specs = core_control_tools(
+                    &config.subagents,
+                    load_session_mode(&session_mode),
+                    &subagent_catalog,
+                );
                 all_tool_specs.extend(tools.specs().iter().cloned().map(advertised_tool));
                 retain_non_excluded_tools(&mut all_tool_specs, &config.tools);
                 warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
@@ -4957,6 +4973,7 @@ impl Agent {
                     loaded_tool_schemas,
                     replay,
                     subagents,
+                    subagent_catalog,
                     hooks,
                     display_input: redacted_display_input,
                     transient_input_items,
@@ -5392,6 +5409,7 @@ async fn run_doc_help_web_fallback(
         thoroughness: None,
         system_override: None,
         model_override: None,
+        tool_filter: None,
     };
 
     // Toolless second pass — same ToolExecutionContext construction as
@@ -5399,6 +5417,7 @@ async fn run_doc_help_web_fallback(
     let mut all_tool_specs = core_control_tools(
         &deps.config.subagents,
         load_session_mode(&deps.session_mode),
+        &SubagentCatalog::empty(),
     );
     all_tool_specs.extend(deps.tools.specs().iter().cloned().map(advertised_tool));
     retain_non_excluded_tools(&mut all_tool_specs, &deps.config.tools);
@@ -5425,6 +5444,7 @@ async fn run_doc_help_web_fallback(
         loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
         exploration_state: Arc::new(Mutex::new(ExplorationTurnState::from_plan(None))),
         subagents: deps.subagents.clone(),
+        subagent_catalog: Arc::new(SubagentCatalog::empty()),
         store: None,
         hooks: deps.hooks.clone(),
     };
@@ -5626,10 +5646,12 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
         thoroughness: None,
         system_override: None,
         model_override: None,
+        tool_filter: None,
     };
     let mut all_tool_specs = core_control_tools(
         &deps.config.subagents,
         load_session_mode(&deps.session_mode),
+        &SubagentCatalog::empty(),
     );
     all_tool_specs.extend(deps.tools.specs().iter().cloned().map(advertised_tool));
     retain_non_excluded_tools(&mut all_tool_specs, &deps.config.tools);
@@ -5656,6 +5678,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
         loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
         exploration_state: Arc::new(Mutex::new(ExplorationTurnState::from_plan(None))),
         subagents: deps.subagents.clone(),
+        subagent_catalog: Arc::new(SubagentCatalog::empty()),
         store: None,
         hooks: deps.hooks.clone(),
     };
@@ -6057,6 +6080,7 @@ async fn complete_local_tool_turn(
             loaded_tool_schemas,
             exploration_state,
             subagents,
+            subagent_catalog: Arc::new(SubagentCatalog::empty()),
             store: None,
             hooks,
         },
@@ -6518,6 +6542,10 @@ struct TurnRuntime {
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     replay: Option<Arc<ReplayRuntime>>,
     subagents: SubagentRegistry,
+    /// Disk-loaded custom subagent catalog shared with `Agent`. Read by the
+    /// delegate dispatch to resolve an `agent:` selection and by the tool
+    /// schema builder to advertise available agents.
+    subagent_catalog: Arc<SubagentCatalog>,
     /// Hook registry shared with `Agent`. `None` when no hooks are
     /// installed — the per-round LLM call site checks this before
     /// building a `HookContext`.
@@ -7770,6 +7798,7 @@ impl TurnRuntime {
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
                         exploration_state: exploration_state.clone(),
                         subagents: self.subagents.clone(),
+                        subagent_catalog: self.subagent_catalog.clone(),
                         store: self.store.clone(),
                         hooks: self.hooks.clone(),
                     },
@@ -9708,6 +9737,7 @@ impl TurnRuntime {
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
                         exploration_state: exploration_state.clone(),
                         subagents: self.subagents.clone(),
+                        subagent_catalog: self.subagent_catalog.clone(),
                         store: self.store.clone(),
                         hooks: self.hooks.clone(),
                     },
@@ -10123,6 +10153,7 @@ impl TurnRuntime {
             loaded_tool_schemas: self.loaded_tool_schemas.clone(),
             exploration_state,
             subagents: self.subagents.clone(),
+            subagent_catalog: self.subagent_catalog.clone(),
             store: self.store.clone(),
             hooks: self.hooks.clone(),
         };
@@ -10133,6 +10164,7 @@ impl TurnRuntime {
             system_override: None,
             // Run the exact rung the router chose (weak or mid), not always weak.
             model_override: Some(cheap_model.to_string()),
+            tool_filter: None,
         };
         let execution = run_subagent(&ctx, SubagentKind::Routed, request, None).await;
 
@@ -10866,17 +10898,13 @@ enum SubagentKind {
     DocHelp,
     Plan,
     Review,
-    /// Bounded subagent invoked to run a fork-mode skill body in
-    /// isolation from the parent turn. The skill body is provided via
-    /// `SubagentRequest.system_override` so the subagent's system
-    /// prompt is the skill's own instructions, and the user task is
-    /// passed through the standard `prompt` field. Wired but not yet
-    /// auto-dispatched — fork-mode skills currently appear in a
-    /// `<fork_skills>` system block and rely on the parent agent
-    /// invoking `delegate` to actually run them. The `dead_code`
-    /// allowance covers the period before a `delegate`-style tool
-    /// learns to map onto this kind.
-    #[allow(dead_code)]
+    /// Bounded subagent that runs a supplied system-prompt body in
+    /// isolation from the parent turn. The body is provided via
+    /// `SubagentRequest.system_override` so the subagent's system prompt
+    /// is the supplied instructions verbatim, and the user task is passed
+    /// through the standard `prompt` field. Dispatched when a `delegate`
+    /// call names a disk-loaded custom subagent (see `resolve_custom_agent`)
+    /// or for a fork-mode skill body.
     Skill,
     /// Router-initiated cache-isolation worker: runs a cheap-routed turn's work
     /// end-to-end on the cheap model in its own cache namespace, so the main
@@ -11009,6 +11037,10 @@ struct ToolExecutionContext<'a> {
     conversation_state: Option<Arc<Mutex<ConversationState>>>,
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
     subagents: SubagentRegistry,
+    /// Disk-loaded custom subagent catalog. Read by the delegate dispatch to
+    /// resolve an explicit `agent:` selection into its system prompt, model,
+    /// and declared tools.
+    subagent_catalog: Arc<SubagentCatalog>,
     /// Cross-session receipt store, shared with the parent `Agent`. Lets a
     /// subagent seed its dedup index from receipts the parent already
     /// committed (see `SeenToolOutputs::seeded_read_only`). `None` on paths
@@ -11066,6 +11098,7 @@ impl<'a> ToolExecutionContext<'a> {
             conversation_state: self.conversation_state.clone(),
             task_state: self.task_state.clone(),
             subagents: self.subagents.clone(),
+            subagent_catalog: self.subagent_catalog.clone(),
             store: self.store.clone(),
             all_tool_specs: self.all_tool_specs,
             loaded_tool_schemas: self.loaded_tool_schemas.clone(),
@@ -11491,14 +11524,23 @@ struct SubagentRequest {
     thoroughness: Option<String>,
     /// Optional override that replaces the per-kind default system
     /// prompt produced by [`subagent_instructions`]. Used by
-    /// [`SubagentKind::Skill`] so a fork-mode skill body becomes the
-    /// subagent's system instructions verbatim; other kinds ignore it.
+    /// [`SubagentKind::Skill`] so a custom subagent's `.md` body (or a
+    /// fork-mode skill body) becomes the subagent's system instructions
+    /// verbatim; other kinds ignore it.
     system_override: Option<String>,
     /// Explicit model the subagent must run, overriding `subagent_model_for_kind`.
     /// Set by cache-isolation (`SubagentKind::Routed`) so the routed subagent
     /// runs the exact rung the router chose (weak OR mid), not always the weak
-    /// tier. `None` lets the kind's default model resolution apply.
+    /// tier, and by [`resolve_custom_agent`] so a disk-loaded custom subagent
+    /// runs on its declared model. `None` lets the kind's default model
+    /// resolution apply.
     model_override: Option<String>,
+    /// Optional allow-list of tool names declared by a disk-loaded custom
+    /// subagent. When `Some`, [`subagent_allowed_tools`] intersects the
+    /// kind's default toolset with these names so the custom agent never
+    /// exceeds the parent's read-only delegate surface. `None` keeps the
+    /// kind's full default toolset.
+    tool_filter: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -11638,6 +11680,78 @@ async fn handle_subagent_call(
     outcome.result
 }
 
+/// Resolve an explicit `agent:` selection on a `delegate` call into a
+/// disk-loaded custom subagent.
+///
+/// Returns the dispatch `(kind, request)` to run. When `agent_name` is
+/// `None`, or the host `kind` is anything other than `Delegate`, the pair
+/// is returned unchanged. When a custom agent is selected it is dispatched
+/// through [`SubagentKind::Skill`] with:
+///   * `system_override` = the agent's `.md` body,
+///   * `model_override` = the agent's declared model normalized via
+///     [`resolve_model_alias_owned`], or the incoming per-call
+///     `model_override` when the agent pins none, and
+///   * `tool_filter` = the agent's declared tools (intersected with the
+///     read-only delegate surface downstream in [`subagent_allowed_tools`]).
+///
+/// An unknown name is an error listing the available custom agent names so
+/// the model can correct itself on the next round.
+fn resolve_custom_agent(
+    catalog: &SubagentCatalog,
+    provider_name: &str,
+    kind: SubagentKind,
+    request: SubagentRequest,
+    agent_name: Option<&str>,
+) -> Result<(SubagentKind, SubagentRequest), String> {
+    let Some(agent_name) = agent_name else {
+        return Ok((kind, request));
+    };
+    // `agent:` only applies to the open-ended `delegate` tool; the planner /
+    // reviewer / explore variants have fixed roles and ignore it.
+    if kind != SubagentKind::Delegate {
+        return Ok((kind, request));
+    }
+    let Some(definition) = catalog
+        .user_provided()
+        .find(|entry| entry.name == agent_name)
+    else {
+        let available: Vec<&str> = catalog
+            .user_provided()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        let listing = if available.is_empty() {
+            "no custom agents are defined in .squeezy/agents".to_string()
+        } else {
+            format!("available custom agents: {}", available.join(", "))
+        };
+        return Err(format!("unknown agent `{agent_name}`; {listing}"));
+    };
+    // The agent's own pinned model wins; otherwise keep any per-call override
+    // the caller passed through `model_override`. Clone so `request` stays
+    // whole for the `..request` struct update below (no partial move).
+    let model_override = definition
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| resolve_model_alias_owned(provider_name, value.to_string()))
+        .or_else(|| request.model_override.clone());
+    let tool_filter = if definition.tools.is_empty() {
+        None
+    } else {
+        Some(definition.tools.clone())
+    };
+    Ok((
+        SubagentKind::Skill,
+        SubagentRequest {
+            system_override: Some(definition.system_prompt.clone()),
+            model_override,
+            tool_filter,
+            ..request
+        },
+    ))
+}
+
 /// Run one subagent dispatch end-to-end *without* touching the broker.
 ///
 /// Identical to the prior body of `handle_subagent_call` minus the
@@ -11680,6 +11794,56 @@ async fn run_subagent_dispatch(
     }
     let request = match parse_subagent_request(call, kind) {
         Ok(request) => request,
+        Err(error) => {
+            return SubagentDispatchOutcome {
+                result: subagent_control_result(
+                    call,
+                    kind,
+                    SubagentExecution {
+                        status: ToolStatus::Error,
+                        summary: String::new(),
+                        status_label: "invalid_request",
+                        error: Some(error),
+                        metrics: TurnMetrics::default(),
+                        supporting_receipts: Vec::new(),
+                        model: subagent_model_for_kind(
+                            context.provider.name(),
+                            context.config,
+                            kind,
+                        ),
+                        structured_output: None,
+                        files_touched: Vec::new(),
+                        transcript: Vec::new(),
+                    },
+                ),
+                summary: String::new(),
+                execution_metrics: None,
+                global_failure: true,
+                bucket_failure: true,
+                provider: context.provider.name().to_string(),
+                model: String::new(),
+            };
+        }
+    };
+    // An explicit `agent:` on a `delegate` call selects a disk-loaded custom
+    // subagent. Resolve it against the catalog: its `.md` body becomes the
+    // system prompt, its `model` (when set) the model, and its declared tools
+    // are intersected with the read-only delegate surface. Dispatch then runs
+    // through the Skill kind, which already executes a `system_override` body.
+    let agent_name = call
+        .arguments
+        .get("agent")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (kind, request) = match resolve_custom_agent(
+        &context.subagent_catalog,
+        context.provider.name(),
+        kind,
+        request,
+        agent_name,
+    ) {
+        Ok(resolved) => resolved,
         Err(error) => {
             return SubagentDispatchOutcome {
                 result: subagent_control_result(
@@ -12038,14 +12202,15 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
         prompt,
         scope,
         thoroughness,
-        // Tool-call-driven requests never carry a system override.
-        // Skill subagents reaching this path through `delegate`-style
-        // wiring would inherit the kind's default instructions.
+        // Tool-call-driven requests never carry a system override here;
+        // the delegate dispatch fills it in (along with `tool_filter`) when
+        // an explicit custom `agent:` is resolved against the catalog.
         system_override: None,
         // An explicit `model` arg (e.g. a `delegate_chain` step's model)
         // overrides the per-kind default; absent/blank falls back to
         // `subagent_model_for_kind` in `run_subagent`.
         model_override: model,
+        tool_filter: None,
     })
 }
 
@@ -12102,7 +12267,8 @@ async fn run_subagent(
     };
     config.model = model.clone();
 
-    let allowed_tools = subagent_allowed_tools(parent.all_tool_specs, kind);
+    let allowed_tools =
+        subagent_allowed_tools(parent.all_tool_specs, kind, request.tool_filter.as_deref());
     // DocHelp answers from inlined corpus, so a tool-less call is the intended
     // shape. Other subagent kinds still require at least one read-only tool.
     if allowed_tools.is_empty() && !matches!(kind, SubagentKind::DocHelp) {
@@ -12859,6 +13025,7 @@ async fn run_subagent_rounds(
                         loaded_tool_schemas: local_loaded_schemas.clone(),
                         exploration_state: local_exploration.clone(),
                         subagents: parent.subagents.clone(),
+                        subagent_catalog: parent.subagent_catalog.clone(),
                         store: parent.store.clone(),
                         hooks: parent.hooks.clone(),
                     },
@@ -13767,6 +13934,7 @@ const DOC_HELP_SUBAGENT_TOOL_NAMES: &[&str] = &[];
 fn subagent_allowed_tools(
     all_tool_specs: &[AdvertisedTool],
     kind: SubagentKind,
+    tool_filter: Option<&[String]>,
 ) -> Vec<AdvertisedTool> {
     // Write-capable workers get the parent's FULL toolset (read/search/edit/
     // shell/network/…) minus the subagent-spawn + interactive control tools, so
@@ -13781,7 +13949,7 @@ fn subagent_allowed_tools(
             .cloned()
             .collect();
     }
-    let names: BTreeSet<&str> = match kind {
+    let mut names: BTreeSet<&str> = match kind {
         // Delegate/Routed are write-capable and returned above; these arms are
         // unreachable but keep the match exhaustive.
         SubagentKind::Delegate | SubagentKind::Routed => {
@@ -13804,6 +13972,15 @@ fn subagent_allowed_tools(
             .copied()
             .collect(),
     };
+    // A disk-loaded custom subagent (dispatched through the Skill kind) may
+    // declare its own `tools:` allow-list. Intersect it with the kind's
+    // default set so the custom agent can only narrow, never widen, the
+    // parent's read-only delegate surface — names it declares that aren't in
+    // the default set are silently dropped.
+    if let Some(filter) = tool_filter {
+        let declared: BTreeSet<&str> = filter.iter().map(String::as_str).collect();
+        names.retain(|name| declared.contains(name));
+    }
     all_tool_specs
         .iter()
         .filter(|tool| names.contains(tool.spec.name.as_str()))
@@ -17744,10 +17921,11 @@ pub(crate) fn retain_non_excluded_tools(
 fn core_control_tools(
     subagents: &SubagentConfig,
     session_mode: SessionMode,
+    catalog: &SubagentCatalog,
 ) -> Vec<AdvertisedTool> {
     let mut tools = Vec::new();
     if subagents.enabled {
-        tools.push(delegate_advertised_tool());
+        tools.push(delegate_advertised_tool(catalog));
         if subagents.explore_enabled {
             tools.push(explore_advertised_tool());
         }
@@ -17790,12 +17968,9 @@ fn load_tool_schema_advertised_tool() -> AdvertisedTool {
     }
 }
 
-fn delegate_advertised_tool() -> AdvertisedTool {
-    AdvertisedTool {
-        capability: PermissionCapability::Read,
-        spec: Arc::new(LlmToolSpec {
-            name: DELEGATE_TOOL_NAME.to_string(),
-            description: "Delegate open-ended work — research AND scoped implementation — to an isolated subagent. \
+fn delegate_advertised_tool(catalog: &SubagentCatalog) -> AdvertisedTool {
+    let custom_agents: Vec<&SubagentDefinition> = catalog.user_provided().collect();
+    let mut description = "Delegate open-ended work — research AND scoped implementation — to an isolated subagent. \
                           The subagent can read, edit, and run with the same permissions you have (edits/shell still prompt for approval where your policy requires it); it reports back a structured summary. \
                           Reserve it for genuinely multi-pass, context-isolating, or cross-cutting work — \
                           a task spanning several rounds of discovery, or one whose intermediate reading would bloat your context, or one that fans out across unrelated areas. \
@@ -17803,20 +17978,48 @@ fn delegate_advertised_tool() -> AdvertisedTool {
                           A single-pass enumeration or audit — grep/scan a known set of files or symbols once and report — is NOT multi-pass: do it yourself in-context with grep/read, or via the bounded `explore` tool, rather than firing a whole-task delegate. A cold subagent re-explores from scratch and runs the same model, so on bounded single-pass work it is pure overhead and slower. \
                           Do NOT delegate enumeration or extraction over a list of files or symbols you ALREADY have (e.g. from a graph/hierarchy result) — read or slice those yourself; the subagent re-reads the same files, so delegating known-target extraction is pure overhead. Delegate only when the set of files to inspect is itself unknown, large, and must be discovered across multiple passes. \
                           `prompt` is required; the parent receives only a structured summary, supporting receipts, and separate spend metrics."
-                .to_string(),
+        .to_string();
+    let mut properties = json!({
+        "prompt": {
+            "type": "string",
+            "description": "Required, non-empty: a concrete instruction for the subagent (research or a scoped change)."
+        },
+        "scope": {
+            "type": ["string", "null"],
+            "description": "Optional bounded scope such as paths, modules, symbols, or exclusions."
+        }
+    });
+    // Advertise any disk-loaded custom subagents so the model can route to one
+    // by name via the `agent` parameter. Each runs its `.md` body as its system
+    // prompt and is restricted to its declared read-only tools.
+    if !custom_agents.is_empty() {
+        let listing = custom_agents
+            .iter()
+            .map(|agent| format!("`{}` — {}", agent.name, agent.description))
+            .collect::<Vec<_>>()
+            .join("; ");
+        description.push_str(&format!(
+            " Set `agent` to one of the available custom subagents to run it with its own system prompt and model: {listing}."
+        ));
+        let agent_names: Vec<&str> = custom_agents
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect();
+        properties["agent"] = json!({
+            "type": "string",
+            "enum": agent_names,
+            "description": "Optional: name of a custom subagent (from .squeezy/agents) to run for this task. Omit to use the default general-purpose subagent."
+        });
+    }
+    AdvertisedTool {
+        capability: PermissionCapability::Read,
+        spec: Arc::new(LlmToolSpec {
+            name: DELEGATE_TOOL_NAME.to_string(),
+            description,
             parameters: json!({
                 "type": "object",
                 "additionalProperties": false,
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "Required, non-empty: a concrete instruction for the subagent (research or a scoped change)."
-                    },
-                    "scope": {
-                        "type": ["string", "null"],
-                        "description": "Optional bounded scope such as paths, modules, symbols, or exclusions."
-                    }
-                },
+                "properties": properties,
                 "required": ["prompt"]
             }),
             strict: false,
@@ -18022,7 +18225,13 @@ fn advertised_tool_specs(
 
 fn synthetic_tool_by_name(name: &str) -> Option<AdvertisedTool> {
     match name {
-        DELEGATE_TOOL_NAME => Some(delegate_advertised_tool()),
+        // The custom-agent listing lives on the enriched `delegate` spec built
+        // by `core_control_tools`; `push_tool_spec_by_name` resolves that copy
+        // from the advertised `tools` slice directly, so this arm only fires as
+        // the bare fallback when `delegate` isn't otherwise advertised. Building
+        // from an empty catalog here is deliberately leaf: `delegate_advertised_tool`
+        // only reads the catalog, so it cannot re-enter the spec builder.
+        DELEGATE_TOOL_NAME => Some(delegate_advertised_tool(&SubagentCatalog::empty())),
         EXPLORE_TOOL_NAME => Some(explore_advertised_tool()),
         DELEGATE_PLAN_TOOL_NAME => Some(delegate_plan_advertised_tool()),
         DELEGATE_REVIEW_TOOL_NAME => Some(delegate_review_advertised_tool()),
@@ -18203,6 +18412,20 @@ fn push_tool_spec_by_name(
     seen: &mut BTreeSet<String>,
 ) {
     if !seen.insert(name.to_string()) {
+        return;
+    }
+    // The `delegate` spec carried in `tools` is enriched with the discovered
+    // custom-agent listing by `core_control_tools`. Prefer that already-built
+    // copy over the bare synthetic rebuild so the lazy-schema path advertises
+    // the same `agent` selection the eager path does. Resolving it from `tools`
+    // (rather than calling back into a spec builder) keeps this path a strict
+    // leaf: it never re-enters `request_tool_specs` / `push_tool_spec_by_name`.
+    if name == DELEGATE_TOOL_NAME
+        && let Some(tool) = tools.iter().find(|tool| tool.spec.name == name)
+    {
+        if !mode_refuses_capability(mode, tool.capability, plan_edit_allowed) {
+            specs.push(Arc::clone(&tool.spec));
+        }
         return;
     }
     if let Some(tool) = synthetic_tool_by_name(name) {
