@@ -257,6 +257,9 @@ pub(crate) fn kotlin_symbol_from_node(
         "companion_object" => Some(kotlin_companion_object_symbol(node, ctx, parent_symbol)),
         "function_declaration" => kotlin_function_declaration_symbol(node, ctx, parent_symbol),
         "secondary_constructor" => kotlin_secondary_constructor_symbol(node, ctx, parent_symbol),
+        "anonymous_initializer" => {
+            kotlin_anonymous_initializer_symbol(node, ctx, parent_symbol)
+        }
         "type_alias" => kotlin_type_alias_symbol(node, ctx, parent_symbol),
         "enum_entry" => kotlin_enum_entry_symbol(node, ctx, parent_symbol),
         _ => None,
@@ -653,6 +656,55 @@ fn kotlin_secondary_constructor_symbol(
         confidence: Confidence::ExactSyntax,
         freshness: Freshness::Fresh,
         arity,
+    })
+}
+
+/// kotlin spec: model an `init { ... }` block as a dedicated callable so
+/// construction-time calls are scopable rather than attributed to the class
+/// symbol. The `anonymous_initializer` node's single child is the `block`,
+/// which becomes the symbol's `body_span` — that triggers the owner switch in
+/// `visit_kotlin_node`, so calls inside the block attribute to this symbol
+/// instead of leaking onto the enclosing class.
+fn kotlin_anonymous_initializer_symbol(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    let parent = parent_symbol?;
+    // Only meaningful inside a class-like body.
+    if !matches!(
+        parent.1,
+        SymbolKind::Class | SymbolKind::Trait | SymbolKind::Enum | SymbolKind::Struct,
+    ) {
+        return None;
+    }
+    let span = span_from_node(node);
+    let name = "<init>".to_string();
+    let body = kotlin_first_child_of_kind(node, "block");
+    let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
+    let signature = signature_text(node, body, ctx.source);
+    let id = symbol_id(&ctx.file, Some(&parent.0), SymbolKind::Method, &name, span);
+    let attributes = vec!["kotlin:init".to_string()];
+
+    Some(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id: Some(parent.0.clone()),
+        name,
+        kind: SymbolKind::Method,
+        language_identity: None,
+        span,
+        body_span,
+        signature_span,
+        signature,
+        visibility: None,
+        docs: kotlin_docs_for_node(node, ctx.source),
+        attributes,
+        provenance: Provenance::new("tree-sitter-kotlin", "anonymous initializer"),
+        confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+        arity: None,
     })
 }
 
