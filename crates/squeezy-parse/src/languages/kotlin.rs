@@ -280,11 +280,7 @@ fn kotlin_class_declaration_symbol(
     let signature = signature_text(node, body, ctx.source);
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
     let mut attributes = kotlin_attributes_for_node(node, ctx.source);
-    attributes.extend(
-        kotlin_type_inheritance_names(node, ctx.source)
-            .into_iter()
-            .map(|base| format!("base:{base}")),
-    );
+    attributes.extend(kotlin_inheritance_attributes(node, ctx.source));
     if kotlin_class_modifier_present(node, "data") {
         attributes.push("kotlin:data".to_string());
     }
@@ -342,11 +338,7 @@ fn kotlin_object_declaration_symbol(
     );
     let mut attributes = kotlin_attributes_for_node(node, ctx.source);
     attributes.push("kotlin:object".to_string());
-    attributes.extend(
-        kotlin_type_inheritance_names(node, ctx.source)
-            .into_iter()
-            .map(|base| format!("base:{base}")),
-    );
+    attributes.extend(kotlin_inheritance_attributes(node, ctx.source));
     attributes.sort();
     attributes.dedup();
 
@@ -397,11 +389,7 @@ fn kotlin_object_literal_symbol(
         "kotlin:anonymous-object".to_string(),
         "kotlin:object".to_string(),
     ];
-    attributes.extend(
-        kotlin_type_inheritance_names(node, ctx.source)
-            .into_iter()
-            .map(|base| format!("base:{base}")),
-    );
+    attributes.extend(kotlin_inheritance_attributes(node, ctx.source));
     attributes.sort();
     attributes.dedup();
 
@@ -1720,23 +1708,50 @@ fn kotlin_docs_for_node(node: Node<'_>, source: &str) -> Vec<String> {
     docs
 }
 
-fn kotlin_type_inheritance_names(node: Node<'_>, source: &str) -> Vec<String> {
-    let mut names = Vec::new();
+/// Returns the supertype attribute strings for a class/object declaration,
+/// classifying each delegation specifier into `base:` (the superclass) or
+/// `iface:` (interfaces / delegated interfaces).
+///
+/// Kotlin's grammar makes this decidable without name resolution: a
+/// `delegation_specifier` that wraps a `constructor_invocation` (`: Base()`)
+/// invokes the superclass constructor and is therefore the single superclass;
+/// a bare `type` / `user_type` (`: Iface`) or an `explicit_delegation`
+/// (`: Iface by impl`) is an interface. There can be at most one superclass,
+/// so the first constructor-invocation specifier wins `base:` and any later
+/// constructor invocation (syntactically invalid Kotlin) falls back to
+/// `iface:` rather than being dropped.
+fn kotlin_inheritance_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut attributes = Vec::new();
+    let mut saw_base = false;
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.kind() == "delegation_specifiers" {
-            let mut inner = child.walk();
-            for spec in child.named_children(&mut inner) {
-                if spec.kind() != "delegation_specifier" {
-                    continue;
-                }
-                collect_kotlin_type_names(spec, source, &mut names);
+        if child.kind() != "delegation_specifiers" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for spec in child.named_children(&mut inner) {
+            if spec.kind() != "delegation_specifier" {
+                continue;
+            }
+            let mut names = Vec::new();
+            collect_kotlin_type_names(spec, source, &mut names);
+            let Some(name) = names.into_iter().next() else {
+                continue;
+            };
+            // The superclass is the one specifier that calls a constructor.
+            let is_superclass =
+                !saw_base && kotlin_first_child_of_kind(spec, "constructor_invocation").is_some();
+            if is_superclass {
+                saw_base = true;
+                attributes.push(format!("base:{name}"));
+            } else {
+                attributes.push(format!("iface:{name}"));
             }
         }
     }
-    names.sort();
-    names.dedup();
-    names
+    attributes.sort();
+    attributes.dedup();
+    attributes
 }
 
 fn collect_kotlin_type_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {
