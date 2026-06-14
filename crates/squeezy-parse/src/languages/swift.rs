@@ -337,11 +337,17 @@ fn swift_symbol_from_node(
         kind,
         SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Trait
     ) {
-        attributes.extend(
-            swift_inheritance_names(node, ctx.source)
-                .into_iter()
-                .map(|base| format!("base:{base}")),
-        );
+        // Swift's grammar lists every supertype and protocol conformance under
+        // an identical `inheritance_specifier`, so we split them by language
+        // rule: only a `class` may declare a superclass, and Swift requires it
+        // to be the first listed type. Everything that follows (and every
+        // supertype of a struct/enum/protocol/actor) is a protocol conformance.
+        // The superclass becomes `base:` (lowered to `Extends`); conformances
+        // become `iface:` (lowered to `Implements`) by the shared generic
+        // inheritance-edge pass in `squeezy-graph`.
+        let (bases, ifaces) = swift_categorized_inheritance(node, &decl_kind_text, ctx.source);
+        attributes.extend(bases.into_iter().map(|base| format!("base:{base}")));
+        attributes.extend(ifaces.into_iter().map(|iface| format!("iface:{iface}")));
     }
     if matches!(
         kind,
@@ -596,6 +602,33 @@ fn swift_inheritance_names(node: Node<'_>, source: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// Split a type declaration's `inheritance_specifier` list into superclasses
+/// (`base:`) and protocol conformances (`iface:`).
+///
+/// Swift permits a superclass only on a `class`, and the language requires it
+/// to be the first entry in the inheritance clause. Every other entry — and
+/// every entry on a `struct`/`enum`/`protocol`/`actor` — is a protocol
+/// conformance. We can't tell a class-named first entry from a protocol-named
+/// one without type-checking, so we follow the syntactic position rule: for a
+/// `class`, the first name is the superclass and the rest are conformances.
+fn swift_categorized_inheritance(
+    node: Node<'_>,
+    decl_kind: &str,
+    source: &str,
+) -> (Vec<String>, Vec<String>) {
+    let names = swift_inheritance_names(node, source);
+    // Only a `class` can carry a superclass; `actor` (which also maps to
+    // SymbolKind::Class) and value/protocol types conform to protocols only.
+    if decl_kind == "class" {
+        let mut iter = names.into_iter();
+        let bases: Vec<String> = iter.by_ref().take(1).collect();
+        let ifaces: Vec<String> = iter.collect();
+        (bases, ifaces)
+    } else {
+        (Vec::new(), names)
+    }
 }
 
 fn swift_callable_generic_constraints(node: Node<'_>, source: &str) -> Vec<String> {
