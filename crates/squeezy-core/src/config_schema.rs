@@ -140,32 +140,6 @@ pub enum FieldKind {
     /// verbatim; there is no editor and saves never touch it. Used to surface
     /// context like the active provider in the Routing section.
     Info,
-    /// Singleton kind used only by the `Providers` section to indicate the
-    /// six per-provider sub-tabs along the right pane.
-    ProviderSubTabs,
-    /// Multi-row editor: each row is itself a `FieldMeta` schema. `Keyed`
-    /// rows are addressed by name (`[mcp.servers.<name>]`); `Ordered` rows
-    /// are positional (`[[permissions.rules]]`).
-    TableArray {
-        kind: TableArrayKind,
-    },
-}
-
-#[derive(Clone, Copy)]
-pub enum TableArrayKind {
-    Keyed { item_fields: &'static [FieldMeta] },
-    Ordered { item_fields: &'static [FieldMeta] },
-}
-
-impl std::fmt::Debug for TableArrayKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Keyed { item_fields } => write!(f, "Keyed {{ {} fields }}", item_fields.len()),
-            Self::Ordered { item_fields } => {
-                write!(f, "Ordered {{ {} fields }}", item_fields.len())
-            }
-        }
-    }
 }
 
 impl std::fmt::Debug for FieldKind {
@@ -214,8 +188,6 @@ impl std::fmt::Debug for FieldKind {
                 .field("dir_only", dir_only)
                 .finish(),
             Self::Secret { env_var } => f.debug_struct("Secret").field("env_var", env_var).finish(),
-            Self::ProviderSubTabs => write!(f, "ProviderSubTabs"),
-            Self::TableArray { kind } => f.debug_struct("TableArray").field("kind", kind).finish(),
         }
     }
 }
@@ -239,7 +211,7 @@ pub enum FieldValue {
     /// the dedicated secret-entry flow which writes inline `api_key` to
     /// the active scope's TOML.
     Secret,
-    /// Selected sub-tab index (read-only convenience for `ProviderSubTabs`).
+    /// Selected sub-tab index (read-only convenience for a sub-tabbed row).
     SubTabs(usize),
     /// Keyed table array (e.g. `[mcp.servers.<name>]`).
     TableArrayKeyed(BTreeMap<String, BTreeMap<String, FieldValue>>),
@@ -307,22 +279,17 @@ pub enum SectionId {
     Verbosity,
     Limits,
     Telemetry,
-    Providers,
     Routing,
     Session,
     Modes,
     Context,
     Subagents,
-    Skills,
     Graph,
     Cache,
-    Tools,
     Feedback,
     Redaction,
     Web,
     McpServers,
-    ShellSandbox,
-    PermissionRules,
     /// Synthetic section that hosts tier-wide reset actions ("delete the
     /// user file", "delete the repo file", "delete the local file"). Has
     /// no `FieldMeta` entries — the TUI renders an action list and runs
@@ -339,22 +306,17 @@ impl SectionId {
             Self::Verbosity => "verbosity",
             Self::Limits => "limits",
             Self::Telemetry => "telemetry",
-            Self::Providers => "providers",
             Self::Routing => "routing",
             Self::Session => "session",
             Self::Modes => "modes",
             Self::Context => "context",
             Self::Subagents => "subagents",
-            Self::Skills => "skills",
             Self::Graph => "graph",
             Self::Cache => "cache",
-            Self::Tools => "tools",
             Self::Feedback => "feedback",
             Self::Redaction => "redaction",
             Self::Web => "web",
             Self::McpServers => "mcp-servers",
-            Self::ShellSandbox => "shell-sandbox",
-            Self::PermissionRules => "permission-rules",
             Self::Reset => "reset",
         }
     }

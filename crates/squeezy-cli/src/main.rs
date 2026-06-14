@@ -1821,16 +1821,6 @@ fn field_kind_to_json(kind: &squeezy_core::config_schema::FieldKind) -> serde_js
             "type": "secret", "env_var": env_var
         }),
         FieldKind::Info => serde_json::json!({"type": "info"}),
-        FieldKind::ProviderSubTabs => serde_json::json!({"type": "provider_sub_tabs"}),
-        FieldKind::TableArray { kind } => {
-            use squeezy_core::config_schema::TableArrayKind;
-            match kind {
-                TableArrayKind::Keyed { .. } => serde_json::json!({"type": "table_array_keyed"}),
-                TableArrayKind::Ordered { .. } => {
-                    serde_json::json!({"type": "table_array_ordered"})
-                }
-            }
-        }
     }
 }
 
