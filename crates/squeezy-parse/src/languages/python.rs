@@ -159,6 +159,11 @@ pub(crate) fn visit_python_children(
 pub(crate) fn python_refine_symbol(node: Node<'_>, symbol: &mut ParsedSymbol, file: &FileRecord) {
     if symbol.kind == SymbolKind::Class {
         python_refine_class(symbol, file);
+        // An enum subclass is never also a test class; only promote plain
+        // classes that carry the test-class attributes.
+        if symbol.kind == SymbolKind::Class {
+            python_promote_test_symbol(symbol, file);
+        }
         return;
     }
     if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
@@ -184,6 +189,34 @@ pub(crate) fn python_refine_symbol(node: Node<'_>, symbol: &mut ParsedSymbol, fi
     }
     symbol.attributes.sort();
     symbol.attributes.dedup();
+    python_promote_test_symbol(symbol, file);
+}
+
+/// Promote a test-tagged symbol to `SymbolKind::Test` so `decl_search(kind=test)`
+/// finds it. The framework attributes (`python:test`/`pytest:test`/...) are
+/// added by the shared `python_test_attributes` and are kept. Reclassifying
+/// changes the kind embedded in the id, so the id is regenerated.
+fn python_promote_test_symbol(symbol: &mut ParsedSymbol, file: &FileRecord) {
+    if symbol.kind == SymbolKind::Test {
+        return;
+    }
+    let is_test = symbol.attributes.iter().any(|attribute| {
+        matches!(
+            attribute.as_str(),
+            "python:test" | "pytest:test" | "python:test-class" | "pytest:test-class"
+        )
+    });
+    if !is_test {
+        return;
+    }
+    symbol.kind = SymbolKind::Test;
+    symbol.id = symbol_id(
+        file,
+        symbol.parent_id.as_ref(),
+        SymbolKind::Test,
+        &symbol.name,
+        symbol.span,
+    );
 }
 
 /// True when `node`'s subtree contains a `yield` expression that belongs to the
