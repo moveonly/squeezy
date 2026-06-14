@@ -2515,9 +2515,9 @@ fn should_coalesce_transcript_overlay_drag(
 }
 
 fn transcript_overlay_drag_mode_active(app: &TuiApp) -> bool {
-    app.transcript_overlay
-        .as_ref()
-        .is_some_and(|state| state.mode.mouse_capture())
+    // The overlay always captures the mouse while open (scrollbar drag + text
+    // selection), so any left-drag over it is app-handled and coalescible.
+    app.transcript_overlay.is_some()
 }
 
 /// Stamp the interaction kind that should be attributed to the *next* painted
@@ -4652,6 +4652,64 @@ fn main_pos_for_cell(
         })
         .unwrap_or(0);
     selection::Pos::new(row_idx, col)
+}
+
+/// Map an absolute `(column, row)` mouse cell onto a surface-local
+/// `selection::Pos` for the Ctrl+T overlay text area. The overlay scroll model is
+/// a top-anchored offset (`resolved_transcript_overlay_scroll`), unlike the main
+/// view's tail-anchored window, so the row math differs from
+/// [`main_pos_for_cell`]. `clamp` extends an out-of-bounds pointer onto the
+/// nearest edge cell (used while dragging) rather than returning `None`. `rows`
+/// is the painted overlay row list (see [`selection_surface_rows`]).
+fn overlay_point_from_mouse(
+    app: &TuiApp,
+    rows: &[Line<'static>],
+    column: u16,
+    row: u16,
+    clamp: bool,
+) -> Option<selection::Pos> {
+    let (width, height) = app.off_frame_terminal_size();
+    let full_area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let (area, _) = transcript_overlay_content_and_status_areas(full_area);
+    let inner = transcript_overlay_inner(area);
+    let (text_area, _) = transcript_overlay_text_and_scrollbar_areas(inner)?;
+    if text_area.width == 0 || text_area.height == 0 {
+        return None;
+    }
+    let (col, r) = if clamp {
+        (
+            column.clamp(text_area.x, text_area.x + text_area.width - 1),
+            row.clamp(text_area.y, text_area.y + text_area.height - 1),
+        )
+    } else if column < text_area.x
+        || column >= text_area.x.saturating_add(text_area.width)
+        || row < text_area.y
+        || row >= text_area.y.saturating_add(text_area.height)
+    {
+        return None;
+    } else {
+        (column, row)
+    };
+    let scroll = resolved_transcript_overlay_scroll(app);
+    let local_row = usize::from(r.saturating_sub(text_area.y));
+    let last = rows.len().saturating_sub(1);
+    let row_idx = (scroll + local_row).min(last);
+    let display_col = usize::from(col.saturating_sub(text_area.x));
+    let char_col = rows
+        .get(row_idx)
+        .map(|line| {
+            selection::char_offset_for_display_col(
+                &transcript_surface::plain_text_of_line(line),
+                display_col,
+            )
+        })
+        .unwrap_or(0);
+    Some(selection::Pos::new(row_idx, char_col))
 }
 
 /// The surface a fresh incremental search opens on: the overlay when it is open,
@@ -7915,10 +7973,6 @@ fn handle_transcript_overlay_mouse(
         }
         MouseEventKind::Down(crossterm::event::MouseButton::Left)
         | MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-            // Drag-latch (deep-review #124): while an overlay-scrollbar drag is
-            // armed, resolve a `Drag` by ROW only (against the cached gutter
-            // column) so the grab survives the pointer drifting off the 1-cell
-            // gutter; a PRESS in the gutter arms it. Released on button-up.
             let is_press = matches!(
                 mouse.kind,
                 MouseEventKind::Down(crossterm::event::MouseButton::Left)
@@ -7927,29 +7981,102 @@ fn handle_transcript_overlay_mouse(
                 mouse.kind,
                 MouseEventKind::Drag(crossterm::event::MouseButton::Left)
             );
-            let effective_column =
-                if is_drag && app.scrollbar_drag == Some(ScrollbarDragSurface::Overlay) {
-                    app.transcript_overlay_scrollbar_cache
-                        .get()
-                        .map(|c| c.scrollbar_area.x)
-                        .unwrap_or(mouse.column)
-                } else {
-                    mouse.column
-                };
-            if app
-                .transcript_overlay
+            // Drag-latch (deep-review #124): while an overlay-scrollbar drag is
+            // armed, resolve a `Drag` by ROW only (against the cached gutter
+            // column) so the grab survives the pointer drifting off the 1-cell
+            // gutter; a PRESS in the gutter arms it. Released on button-up.
+            let latched = is_drag && app.scrollbar_drag == Some(ScrollbarDragSurface::Overlay);
+            let has_overlay_selection = app
+                .selection
                 .as_ref()
-                .is_some_and(|state| state.mode.mouse_capture())
-                && let Some((scroll, max_scroll)) =
-                    transcript_overlay_scroll_from_mouse(app, effective_column, mouse.row)
+                .is_some_and(|sel| sel.surface == selection::SelectionSurface::Overlay);
+            if latched {
+                // Keep driving the scrollbar; never fall through to text selection
+                // while the gutter grab is held (a drift off the gutter rows is a
+                // no-op until release).
+                let gutter_column = app
+                    .transcript_overlay_scrollbar_cache
+                    .get()
+                    .map(|c| c.scrollbar_area.x)
+                    .unwrap_or(mouse.column);
+                if let Some((scroll, max_scroll)) =
+                    transcript_overlay_scroll_from_mouse(app, gutter_column, mouse.row)
+                {
+                    set_transcript_overlay_scroll_from_cached_geometry(app, scroll, max_scroll)
+                } else {
+                    false
+                }
+            } else if is_drag && has_overlay_selection {
+                // Extend an in-flight text selection — checked BEFORE the gutter
+                // so a drag that crosses the gutter column keeps selecting rather
+                // than hijacking to scroll. Clamp to the viewport edge (the
+                // overlay does not auto-scroll under the pointer).
+                let rows = selection_surface_rows(app, selection::SelectionSurface::Overlay);
+                if let Some(pos) =
+                    overlay_point_from_mouse(app, &rows, mouse.column, mouse.row, true)
+                {
+                    set_selection_cursor(app, pos);
+                    true
+                } else {
+                    false
+                }
+            } else if let Some((scroll, max_scroll)) =
+                transcript_overlay_scroll_from_mouse(app, mouse.column, mouse.row)
             {
+                // On the scrollbar gutter: a press arms the drag and cancels any
+                // in-flight text selection.
                 if is_press {
                     app.scrollbar_drag = Some(ScrollbarDragSurface::Overlay);
+                    app.selection = None;
                 }
                 set_transcript_overlay_scroll_from_cached_geometry(app, scroll, max_scroll)
+            } else if is_press {
+                // Press over the overlay text arms an app-level selection — the
+                // mouse twin of the main view's drag-to-select — unless a
+                // registered click target owns the cell.
+                if app.click_target_at(mouse.column, mouse.row).is_some() {
+                    false
+                } else {
+                    let rows = selection_surface_rows(app, selection::SelectionSurface::Overlay);
+                    if let Some(pos) =
+                        overlay_point_from_mouse(app, &rows, mouse.column, mouse.row, false)
+                    {
+                        app.selection = Some(selection::Selection::at(
+                            selection::SelectionSurface::Overlay,
+                            pos,
+                            selection::SelectionMode::Cell,
+                            overlay_text_width(app),
+                        ));
+                        true
+                    } else {
+                        false
+                    }
+                }
             } else {
                 false
             }
+        }
+        MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+            let mut changed = false;
+            if app.scrollbar_drag == Some(ScrollbarDragSurface::Overlay) {
+                app.scrollbar_drag = None;
+            }
+            if let Some(sel) = app.selection.as_ref()
+                && sel.surface == selection::SelectionSurface::Overlay
+            {
+                if sel.is_empty() {
+                    // A bare click leaves no highlight, matching the main view.
+                    app.selection = None;
+                } else {
+                    // Overlay selection exists only to copy (no quote/snippet
+                    // verbs here), so a real drag-release copies it — restoring the
+                    // copy reach the removed native-selection mode provided. The
+                    // highlight is kept so the user sees what was copied.
+                    copy_any_active_selection(app);
+                }
+                changed = true;
+            }
+            changed
         }
         _ => false,
     };
@@ -24201,6 +24328,16 @@ fn close_transcript_overlay(app: &mut TuiApp) {
     app.transcript_overlay_scrollbar_cache.set(None);
     app.transcript_overlay_text_width.set(None);
     app.transcript_overlay = None;
+    // Drop any overlay-surface text selection so it can't outlive the overlay
+    // (a stale `Overlay` selection would have no rows to copy/highlight once the
+    // overlay is gone).
+    if app
+        .selection
+        .as_ref()
+        .is_some_and(|sel| sel.surface == selection::SelectionSurface::Overlay)
+    {
+        app.selection = None;
+    }
     // The detail pane only lives alongside the overlay; closing the overlay
     // closes the pane too so it can never linger as orphaned state.
     app.diff_detail_pane = None;
@@ -24369,14 +24506,6 @@ fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             set_transcript_overlay_scroll(app, end);
             true
         }
-        KeyCode::Char('m') | KeyCode::Char('M')
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META) =>
-        {
-            toggle_transcript_overlay_mouse_capture(app);
-            true
-        }
         KeyCode::Char('f') | KeyCode::Char('F')
             if !key
                 .modifiers
@@ -24458,35 +24587,6 @@ fn cycle_transcript_overlay_filter(app: &mut TuiApp, backward: bool) {
     let label = state.filter.label(&tool_names);
     set_transcript_overlay_scroll(app, TRANSCRIPT_OVERLAY_SCROLL_BOTTOM);
     app.status = format!("filter: {label}");
-}
-
-fn toggle_transcript_overlay_mouse_capture(app: &mut TuiApp) {
-    if let Some(state) = app.transcript_overlay.as_mut() {
-        state.mode = match state.mode {
-            TranscriptOverlayMode::NativeSelection => TranscriptOverlayMode::ScrollbarDrag,
-            TranscriptOverlayMode::ScrollbarDrag => TranscriptOverlayMode::NativeSelection,
-        };
-        let capture = state.mode.mouse_capture();
-        app.status = if capture {
-            format!(
-                "transcript scrollbar drag on ({}-drag selects text)",
-                app.native_select_label
-            )
-        } else {
-            "transcript native selection mode".to_string()
-        };
-        // Mouse Hover Intent (§12.1.3): turning capture off (native-selection
-        // mode) means the terminal stops forwarding reliable motion, so suppress
-        // (and hide) any hover reveal and reset the recognizer's hover arm. The
-        // reveal degrades to keyboard focus, exactly the spec's fallback. The
-        // set+clear records the honest reason for the transition without latching.
-        if !capture {
-            app.hover_intent
-                .set_suppression(Some(hover_intent::SuppressReason::CaptureOff));
-            app.hover_intent.set_suppression(None);
-            app.gestures.reset();
-        }
-    }
 }
 
 /// Consume a multi-select verb (§11G.7) while the reorder overlay is open.
@@ -36182,18 +36282,6 @@ fn render_semantic_filter_badge(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
 
 const TRANSCRIPT_OVERLAY_SCROLL_BOTTOM: usize = usize::MAX;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TranscriptOverlayMode {
-    NativeSelection,
-    ScrollbarDrag,
-}
-
-impl TranscriptOverlayMode {
-    fn mouse_capture(self) -> bool {
-        matches!(self, Self::ScrollbarDrag)
-    }
-}
-
 /// How much of each entry the overlay shows. `Collapsed` mirrors the main
 /// inline view — tool cards folded, reasoning trimmed — so a subagent opens
 /// formatted like the main conversation; `Expanded` unfolds every body for the
@@ -36259,7 +36347,6 @@ impl OverlayFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TranscriptOverlayState {
     pub(crate) scroll: usize,
-    pub(crate) mode: TranscriptOverlayMode,
     pub(crate) detail: OverlayDetail,
     pub(crate) filter: OverlayFilter,
 }
@@ -36268,7 +36355,6 @@ impl Default for TranscriptOverlayState {
     fn default() -> Self {
         Self {
             scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
-            mode: TranscriptOverlayMode::NativeSelection,
             detail: OverlayDetail::Expanded,
             filter: OverlayFilter::All,
         }
@@ -46373,15 +46459,9 @@ fn key_hint(app: &TuiApp, action: keymap::Action) -> String {
 }
 
 fn format_status_hint_base(app: &TuiApp) -> String {
-    if let Some(overlay) = app.transcript_overlay.as_ref() {
-        return if overlay.mode.mouse_capture() {
-            format!(
-                "PgUp/PgDn/Wheel scroll · M native selection · drag right gutter scroll · {}-drag select · Esc close",
-                app.native_select_label
-            )
-        } else {
-            "PgUp/PgDn/Wheel scroll · M scrollbar drag · native select/copy · Esc close".to_string()
-        };
+    if app.transcript_overlay.is_some() {
+        return "PgUp/PgDn/Wheel scroll · drag right gutter to scroll · drag text to select+copy · Esc close"
+            .to_string();
     }
     if app.subagent_pane.focused {
         return "Up/Down switch · Enter open · Del clear done · type/Esc back to prompt"

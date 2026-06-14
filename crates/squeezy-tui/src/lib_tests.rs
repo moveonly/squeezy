@@ -2418,7 +2418,6 @@ async fn wheel_scroll_targets_transcript_overlay_when_open() {
     }
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
-        mode: TranscriptOverlayMode::NativeSelection,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
@@ -24548,10 +24547,6 @@ async fn ctrl_t_opens_and_closes_transcript_overlay() {
         overlay.scroll, TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
         "Ctrl+T should open anchored to the bottom/live end"
     );
-    assert!(
-        !overlay.mode.mouse_capture(),
-        "Ctrl+T should preserve native text selection by default"
-    );
 
     handle_key(
         &mut app,
@@ -24590,99 +24585,17 @@ async fn esc_closes_transcript_overlay_without_interrupting_active_turn() {
     assert!(!cancel.is_cancelled(), "Esc should close overlay first");
 }
 
-#[tokio::test]
-async fn transcript_overlay_m_toggles_scrollbar_drag_mode() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
-    )
-    .await
-    .expect("open overlay");
-    let native_hint = format_status_hints(&app);
-    assert!(
-        native_hint.contains("native select/copy"),
-        "overlay should start in native selection mode: {native_hint}"
-    );
-    assert!(
-        native_hint.contains("M scrollbar drag"),
-        "overlay should expose the scrollbar-drag toggle: {native_hint}"
-    );
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
-    )
-    .await
-    .expect("toggle overlay mouse mode");
-    let overlay = app.transcript_overlay.expect("overlay");
-    assert!(
-        overlay.mode.mouse_capture(),
-        "M should enable app-handled right scrollbar dragging"
-    );
-    let drag_hint = format_status_hints(&app);
-    assert!(
-        drag_hint.contains("drag right gutter scroll"),
-        "drag mode should describe the active scrollbar behavior: {drag_hint}"
-    );
-    assert!(
-        drag_hint.contains(&format!("{}-drag select", app.native_select_label)),
-        "drag mode should name THIS terminal's native-selection bypass key: {drag_hint}"
-    );
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
-    )
-    .await
-    .expect("toggle overlay mouse mode off");
-    assert!(
-        !app.transcript_overlay
-            .expect("overlay")
-            .mode
-            .mouse_capture(),
-        "second M should restore native selection mode"
-    );
-}
-
-#[tokio::test]
-async fn transcript_overlay_ctrl_m_does_not_toggle_scrollbar_drag_mode() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.transcript_overlay = Some(TranscriptOverlayState::default());
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
-    )
-    .await
-    .expect("ctrl-m while overlay is open");
-
-    assert!(
-        !app.transcript_overlay
-            .expect("overlay")
-            .mode
-            .mouse_capture(),
-        "Ctrl+M must not arm terminal mouse-drag reporting"
-    );
-}
-
 #[test]
-fn transcript_overlay_drag_release_keeps_scrollbar_drag_mode() {
+fn transcript_overlay_bare_mouse_release_does_not_redraw() {
     let mut app = test_app(SessionMode::Build);
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
-        mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
 
+    // A release with no armed scrollbar drag and no active text selection is a
+    // no-op (no copy, no redraw) — the overlay stays open.
     let changed = handle_mouse(
         &mut app,
         crossterm::event::MouseEvent {
@@ -24695,15 +24608,9 @@ fn transcript_overlay_drag_release_keeps_scrollbar_drag_mode() {
 
     assert!(
         !changed,
-        "mouse release alone should not redraw the overlay"
+        "a bare mouse release should not redraw the overlay"
     );
-    assert!(
-        app.transcript_overlay
-            .expect("overlay")
-            .mode
-            .mouse_capture(),
-        "explicit scrollbar drag mode must remain armed until the user toggles it off"
-    );
+    assert!(app.transcript_overlay.is_some(), "overlay stays open");
 }
 
 #[test]
@@ -24711,7 +24618,6 @@ fn input_batch_coalesces_transcript_scrollbar_drag_flood_before_key() {
     let mut app = test_app(SessionMode::Build);
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
-        mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
@@ -24765,7 +24671,6 @@ fn input_batch_prioritizes_key_before_transcript_drag_flood() {
     let mut app = test_app(SessionMode::Build);
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
-        mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
@@ -24855,7 +24760,6 @@ fn input_poll_limit_expands_in_transcript_scrollbar_drag_mode() {
 
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
-        mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
@@ -24868,44 +24772,10 @@ fn input_poll_limit_expands_in_transcript_scrollbar_drag_mode() {
 }
 
 #[test]
-fn input_batch_does_not_coalesce_drags_outside_scrollbar_drag_mode() {
-    let mut app = test_app(SessionMode::Build);
-    app.transcript_overlay = Some(TranscriptOverlayState {
-        scroll: 0,
-        mode: TranscriptOverlayMode::NativeSelection,
-        detail: OverlayDetail::Expanded,
-        filter: OverlayFilter::All,
-    });
-    let events = vec![
-        Event::Mouse(crossterm::event::MouseEvent {
-            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            column: 79,
-            row: 3,
-            modifiers: KeyModifiers::NONE,
-        }),
-        Event::Mouse(crossterm::event::MouseEvent {
-            kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            column: 79,
-            row: 8,
-            modifiers: KeyModifiers::NONE,
-        }),
-    ];
-
-    let coalesced = coalesce_input_events_for_dispatch(&app, events);
-
-    assert_eq!(
-        coalesced.len(),
-        2,
-        "native-selection mode should not rewrite mouse event batches"
-    );
-}
-
-#[test]
 fn transcript_overlay_drag_uses_cached_scrollbar_geometry() {
     let mut app = test_app(SessionMode::Build);
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
-        mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
@@ -24946,6 +24816,54 @@ fn transcript_overlay_drag_uses_cached_scrollbar_geometry() {
 }
 
 #[test]
+fn transcript_overlay_gutter_press_cancels_text_selection() {
+    let mut app = test_app(SessionMode::Build);
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
+    });
+    app.transcript_overlay_scrollbar_cache
+        .set(Some(TranscriptOverlayScrollbarCache {
+            scrollbar_area: Rect {
+                x: 79,
+                y: 1,
+                width: 1,
+                height: 10,
+            },
+            geometry: TranscriptScrollbarGeometry {
+                thumb_top: 0,
+                thumb_height: 2,
+                max_scroll: 100,
+            },
+        }));
+    // Pretend a text drag-selection is already in flight on the overlay.
+    app.selection = Some(crate::selection::Selection::at(
+        crate::selection::SelectionSurface::Overlay,
+        crate::selection::Pos::new(0, 0),
+        crate::selection::SelectionMode::Cell,
+        80,
+    ));
+
+    // A press on the scrollbar gutter arms the scrollbar drag AND drops the
+    // in-flight text selection — the two never fight for the pointer.
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 79,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(app.scrollbar_drag, Some(ScrollbarDragSurface::Overlay));
+    assert!(
+        app.selection.is_none(),
+        "a gutter press must cancel an in-flight overlay text selection"
+    );
+}
+
+#[test]
 fn scrollbar_drag_feature_is_reachable_because_motion_reporting_is_enabled() {
     // deep-review #8: the transcript-overlay scrollbar-drag feature is only
     // reachable if the terminal forwards `MouseEventKind::Drag(Left)` events,
@@ -24978,7 +24896,6 @@ fn scrollbar_drag_feature_is_reachable_because_motion_reporting_is_enabled() {
     let mut app = test_app(SessionMode::Build);
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
-        mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
@@ -25022,7 +24939,6 @@ async fn transcript_overlay_end_boundary_keeps_escape_and_ctrl_c_responsive() {
     let mut app = test_app(SessionMode::Build);
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
-        mode: TranscriptOverlayMode::NativeSelection,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
@@ -25056,7 +24972,6 @@ async fn transcript_overlay_end_boundary_keeps_escape_and_ctrl_c_responsive() {
 
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
-        mode: TranscriptOverlayMode::NativeSelection,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
@@ -25085,7 +25000,6 @@ async fn transcript_overlay_owns_page_keys_before_global_keymap() {
     app.transcript_scroll = scroll::ScrollState::scrolled_up(12);
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: 0,
-        mode: TranscriptOverlayMode::NativeSelection,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
@@ -25161,7 +25075,6 @@ async fn transcript_overlay_home_end_keys_drive_unified_resolve_in_render() {
     }
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
-        mode: TranscriptOverlayMode::NativeSelection,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
@@ -25247,7 +25160,6 @@ async fn transcript_overlay_resize_reclamps_through_unified_resolve() {
     app.transcript_overlay = Some(TranscriptOverlayState {
         // Follow-tail intent: render must resolve to each frame's own bottom.
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
-        mode: TranscriptOverlayMode::NativeSelection,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
@@ -25306,7 +25218,6 @@ async fn turn_completion_preserves_transcript_overlay_scrollbar_drag_mode() {
     app.turn_rx = Some(rx);
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
-        mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
@@ -25329,10 +25240,9 @@ async fn turn_completion_preserves_transcript_overlay_scrollbar_drag_mode() {
     drain_agent_events(&mut app).await;
 
     assert!(app.turn_rx.is_none(), "turn should finish");
-    let overlay = app.transcript_overlay.expect("overlay should remain open");
     assert!(
-        overlay.mode.mouse_capture(),
-        "turn completion must preserve explicit scrollbar drag mode"
+        app.transcript_overlay.is_some(),
+        "turn completion must keep the overlay open"
     );
 }
 
@@ -25344,7 +25254,6 @@ async fn esc_still_closes_overlay_after_turn_completes_from_scrollbar_drag_mode(
     app.turn_rx = Some(rx);
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
-        mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
@@ -25387,7 +25296,6 @@ async fn ctrl_c_still_reaches_exit_confirm_after_turn_completes_from_scrollbar_d
     app.turn_rx = Some(rx);
     app.transcript_overlay = Some(TranscriptOverlayState {
         scroll: TRANSCRIPT_OVERLAY_SCROLL_BOTTOM,
-        mode: TranscriptOverlayMode::ScrollbarDrag,
         detail: OverlayDetail::Expanded,
         filter: OverlayFilter::All,
     });
@@ -25803,12 +25711,12 @@ fn transcript_overlay_keeps_status_footer_visible() {
         "overlay should keep the transcript hint row visible: {output}"
     );
     assert!(
-        output.contains("M scrollbar drag"),
-        "overlay should expose the scrollbar-drag toggle: {output}"
+        output.contains("drag right gutter to scroll"),
+        "overlay should advertise scrollbar-drag scrolling: {output}"
     );
     assert!(
-        output.contains("native select/copy"),
-        "overlay should default to native text selection: {output}"
+        output.contains("drag text to select+copy"),
+        "overlay should advertise drag-to-select+copy: {output}"
     );
 }
 
