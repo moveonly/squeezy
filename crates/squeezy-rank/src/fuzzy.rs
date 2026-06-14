@@ -3,6 +3,8 @@
 //! Scoring is case-insensitive, Unicode-correct, with a `-100` prefix
 //! bonus that pulls exact-prefix matches above subsequence hits.
 
+use crate::tokens::split_compound_identifier;
+
 /// Score a haystack against a needle using a case-insensitive subsequence
 /// match. Returns `None` if the needle's lowercase characters do not all
 /// appear, in order, somewhere in the haystack. Lower is better.
@@ -109,54 +111,7 @@ fn normalize_path_separators(input: &str) -> String {
 /// letters followed by lower-case (e.g. `XMLParser`) split into `XML` +
 /// `Parser`. Returns lowercase tokens.
 pub fn camel_snake_split(name: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let chars: Vec<char> = name.chars().collect();
-
-    for (i, &ch) in chars.iter().enumerate() {
-        let is_sep = matches!(ch, '_' | '-' | '/' | '.' | ' ' | ':');
-        if is_sep {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-            continue;
-        }
-
-        let prev = if i > 0 {
-            chars.get(i - 1).copied()
-        } else {
-            None
-        };
-        let next = chars.get(i + 1).copied();
-
-        let camel_boundary = match (prev, ch) {
-            (Some(p), c) if p.is_ascii_lowercase() && c.is_ascii_uppercase() => true,
-            (Some(p), c)
-                if p.is_ascii_uppercase()
-                    && c.is_ascii_uppercase()
-                    && matches!(next, Some(n) if n.is_ascii_lowercase()) =>
-            {
-                true
-            }
-            (Some(p), c) if p.is_ascii_alphabetic() && c.is_ascii_digit() => true,
-            (Some(p), c) if p.is_ascii_digit() && c.is_ascii_alphabetic() => true,
-            _ => false,
-        };
-
-        if camel_boundary && !current.is_empty() {
-            tokens.push(std::mem::take(&mut current));
-        }
-        current.push(ch);
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
-    tokens
-        .into_iter()
-        .map(|tok| tok.to_lowercase())
-        .filter(|tok| !tok.is_empty())
-        .collect()
+    split_compound_identifier(name)
 }
 
 #[cfg(test)]

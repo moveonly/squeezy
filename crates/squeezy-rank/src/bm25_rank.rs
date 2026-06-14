@@ -5,6 +5,7 @@
 //! tokens. Pure in-tree implementation — no upstream `bm25` crate so
 //! we avoid the unmaintained `fxhash` advisory it pulls in.
 
+use crate::tokens::{TokenCase, bm25_token_separator, for_each_token, split_tokens};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -131,71 +132,12 @@ fn collect_doc_stats<'query>(
 /// `:`, parens, brackets, quotes, etc.), lowercasing each token. CamelCase
 /// is not split — the token-bag tier in [`super::symbol_rank`] handles that.
 fn tokenize(input: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut visit = |token: &str| tokens.push(token.to_owned());
-    tokenize_part(input, &mut current, &mut visit);
-    flush_token(&mut current, &mut visit);
-    tokens
+    split_tokens(input, bm25_token_separator, TokenCase::Lowercase)
 }
 
 fn for_each_doc_token(doc: BM25Doc<'_>, mut visit: impl FnMut(&str)) {
-    let mut current = String::new();
     for part in [doc.signature, doc.docs, doc.attributes] {
-        tokenize_part(part, &mut current, &mut visit);
-        flush_token(&mut current, &mut visit);
-    }
-}
-
-fn tokenize_part(input: &str, current: &mut String, visit: &mut impl FnMut(&str)) {
-    for ch in input.chars() {
-        let is_sep = ch.is_whitespace()
-            || matches!(
-                ch,
-                '_' | '-'
-                    | '/'
-                    | '.'
-                    | ':'
-                    | '('
-                    | ')'
-                    | '<'
-                    | '>'
-                    | '&'
-                    | ','
-                    | ';'
-                    | '\''
-                    | '"'
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-                    | '!'
-                    | '?'
-                    | '*'
-                    | '='
-                    | '|'
-                    | '@'
-                    | '#'
-                    | '$'
-                    | '%'
-                    | '^'
-                    | '~'
-                    | '`'
-                    | '+'
-                    | '\\'
-            );
-        if is_sep {
-            flush_token(current, visit);
-            continue;
-        }
-        current.extend(ch.to_lowercase());
-    }
-}
-
-fn flush_token(current: &mut String, visit: &mut impl FnMut(&str)) {
-    if !current.is_empty() {
-        visit(current);
-        current.clear();
+        for_each_token(part, bm25_token_separator, TokenCase::Lowercase, &mut visit);
     }
 }
 
