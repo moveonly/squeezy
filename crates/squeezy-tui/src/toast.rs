@@ -76,7 +76,6 @@ impl ToastVariant {
 /// lifetime per push without complicating the queue.
 #[derive(Debug, Clone)]
 pub(crate) struct Toast {
-    pub id: u64,
     pub message: String,
     pub variant: ToastVariant,
     pub dismissed_at: Instant,
@@ -98,8 +97,6 @@ impl Toast {
 /// [`visible`]: ToastQueue::visible
 pub(crate) struct ToastQueue {
     items: VecDeque<Toast>,
-    #[allow(dead_code)] // assigned on push; read by future dismissal/coalesce paths
-    next_id: u64,
 }
 
 impl Default for ToastQueue {
@@ -112,14 +109,13 @@ impl ToastQueue {
     pub(crate) fn new() -> Self {
         Self {
             items: VecDeque::new(),
-            next_id: 1,
         }
     }
 
-    /// Push a toast with [`DEFAULT_TOAST_TTL`] and return its id.
+    /// Push a toast with [`DEFAULT_TOAST_TTL`].
     #[allow(dead_code)] // primary entry point for consumers wired in follow-up tickets
-    pub(crate) fn push(&mut self, message: impl Into<String>, variant: ToastVariant) -> u64 {
-        self.push_with_ttl(message, variant, DEFAULT_TOAST_TTL)
+    pub(crate) fn push(&mut self, message: impl Into<String>, variant: ToastVariant) {
+        self.push_with_ttl(message, variant, DEFAULT_TOAST_TTL);
     }
 
     /// Push a toast with an explicit ttl. When the queue is already at
@@ -131,11 +127,8 @@ impl ToastQueue {
         message: impl Into<String>,
         variant: ToastVariant,
         ttl: Duration,
-    ) -> u64 {
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1).max(1);
+    ) {
         let toast = Toast {
-            id,
             message: message.into(),
             variant,
             dismissed_at: Instant::now() + ttl,
@@ -144,7 +137,6 @@ impl ToastQueue {
             self.items.pop_front();
         }
         self.items.push_back(toast);
-        id
     }
 
     /// Drop expired toasts. Idempotent; safe to call on every animation
@@ -154,17 +146,6 @@ impl ToastQueue {
         let before = self.items.len();
         self.items.retain(|t| !t.expired());
         before != self.items.len()
-    }
-
-    /// Drop a single toast by id. Silent no-op when the id is unknown.
-    #[allow(dead_code)] // wired for future user-driven dismissal keys
-    pub(crate) fn dismiss(&mut self, id: u64) -> bool {
-        if let Some(pos) = self.items.iter().position(|t| t.id == id) {
-            self.items.remove(pos);
-            true
-        } else {
-            false
-        }
     }
 
     /// Drop every toast. Returns how many were removed.
