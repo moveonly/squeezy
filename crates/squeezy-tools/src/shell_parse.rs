@@ -31,6 +31,10 @@ pub(crate) struct ParsedShellCommand {
 /// making the policy boundary explicit and parser-backed.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct CommandUnit {
+    /// Original source text for this command node. This preserves quote
+    /// grouping for wrapper analysis (`sh -c "..."`) while still exposing
+    /// dequoted typed fields for structured consumers.
+    pub(crate) source: String,
     /// First `command_name` child, with surrounding quotes stripped. Empty
     /// when the command begins with a substitution (e.g. `$(echo rm) -rf`).
     pub(crate) name: String,
@@ -151,6 +155,9 @@ fn collect_command_units(
 
 fn build_command_unit(node: Node<'_>, bytes: &[u8]) -> CommandUnit {
     let mut unit = CommandUnit::default();
+    if let Ok(text) = node.utf8_text(bytes) {
+        unit.source = collapse_whitespace(text);
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
@@ -296,6 +303,9 @@ fn command_units_to_segments(units: &[CommandUnit]) -> Vec<String> {
 }
 
 fn command_unit_to_segment(unit: &CommandUnit) -> Option<String> {
+    if !unit.source.trim().is_empty() {
+        return Some(unit.source.clone());
+    }
     let mut tokens = Vec::new();
     for (name, value) in &unit.env {
         tokens.push(format!("{name}={value}"));

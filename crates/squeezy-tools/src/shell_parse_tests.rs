@@ -15,6 +15,7 @@ fn extract_commands_returns_units() {
     let units = extract_command_units("FOO=bar rm -rf \"/tmp/x y\" 2>/dev/null");
     assert_eq!(units.len(), 1, "expected single command unit");
     let unit = &units[0];
+    assert_eq!(unit.source, "FOO=bar rm -rf \"/tmp/x y\"");
     assert_eq!(unit.name, "rm");
     assert_eq!(unit.args, vec!["-rf".to_string(), "/tmp/x y".to_string()]);
     assert_eq!(unit.env, vec![("FOO".to_string(), "bar".to_string())]);
@@ -222,11 +223,22 @@ fn plan_mode_rejects_base64_file_output() {
 #[test]
 fn command_unit_default_is_empty() {
     let unit = CommandUnit::default();
+    assert!(unit.source.is_empty());
     assert!(unit.name.is_empty());
     assert!(unit.args.is_empty());
     assert!(unit.env.is_empty());
     assert!(unit.redirects.is_empty());
     assert!(!unit.has_substitution);
+}
+
+#[test]
+fn wrapper_unwrap_preserves_quoted_sh_c_script_for_force_push() {
+    let analysis = analyze_shell_command("sh -c \"git push --force origin main\"");
+    assert_eq!(analysis.capability, PermissionCapability::Destructive);
+    assert!(
+        analysis.destructive,
+        "quoted sh -c script must stay grouped so --force is classified"
+    );
 }
 
 fn test_home() -> String {

@@ -2,8 +2,9 @@
 
 Source audit: `docs/internal/TECH_DEBT_REFACTORING_AUDIT.md` (2026-06-14)
 
-Status reflects coverage in `origin/main..HEAD` on branch
-`tech-debt-audit-refactor` as of `1e5434ca`.
+Status is maintained by implementation waves against the current working
+branch. Evidence should cite committed files or explicit blockers rather than
+stale branch/head snapshots.
 
 Legend: `Done` means the current branch directly completes the item. `Partial`
 means the branch adds a guardrail, helper, or first slice but leaves the audit
@@ -47,7 +48,7 @@ action incomplete. `Open` means no current-branch coverage found.
 | Partial | Tools/shell/MCP | Decompose `shell.rs` into policy, runner, fallback, ask-server, and output-capture components. | Extracted nested ask IPC into `shell_ask_server.rs` and bounded pipe/raw-sidecar capture into `shell_capture.rs`; blocker: runner, fallback, and policy denial still share spawn/timeout/sandbox-health state in `shell.rs`, so finishing this row needs a larger state-boundary split. | TBD |
 | Partial | Tools/shell/MCP | Split sandbox planning by platform. | Added `shell_sandbox/backend.rs` with linux/macos/windows/unsupported backend metadata modules consumed by approval metadata; blocker: `prepare_shell_sandbox_plan` still owns cross-platform command argument construction, probing, and fallback state in `shell_sandbox.rs`. | TBD |
 | Partial | Tools/shell/MCP | Split `crates/squeezy-mcp/src/lib.rs` into registry, transport, palette, schema compaction, elicitation, and resources. | Added `transport.rs`, `elicitation.rs`, and `resources.rs` alongside existing `schema_compaction.rs`; blocker: `McpClientRegistry` orchestration and palette normalization/cache persistence still live in `lib.rs`. | `2cc94eb8`, TBD |
-| Done | Tools/shell/MCP | Extract packet, read-slice, diff-range, filter, and executor helpers from `graph_tools.rs`. | Added `graph_tools_packets.rs`, `graph_tools_read_slice.rs`, `graph_tools_diff_ranges.rs`, `graph_tools_filters.rs`, and `graph_tools_executor.rs`; graph entrypoint, path filters, read-slice args/context, and diff range math now live outside `graph_tools.rs`. | TBD |
+| Partial | Tools/shell/MCP | Extract packet, read-slice, diff-range, filter, and executor helpers from `graph_tools.rs`. | Added `graph_tools_packets.rs`, `graph_tools_read_slice.rs`, `graph_tools_diff_ranges.rs`, `graph_tools_filters.rs`, and `graph_tools_executor.rs`; blocker: full evidence packet constructors and most graph tool handler bodies still live in `graph_tools.rs`, so only the first helper slice is complete. | TBD |
 | Open | LLM/eval/harness | Split provider option lowering out of provider bodies. | No provider option lowerers added. | TBD |
 | Open | LLM/eval/harness | Extract a shared SSE stream driver for Responses-style providers. | No shared stream driver added. | TBD |
 | Open | LLM/eval/harness | Split `retry.rs` into policy, request retry, stream retry, and classifiers. | No retry module split in current branch. | TBD |

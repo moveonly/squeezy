@@ -30,7 +30,7 @@ pub(crate) fn path_matches_filter(path: &str, filter: &str) -> bool {
     squeezy_rank::fuzzy::fuzzy_path_score(path, filter).is_some()
 }
 
-fn normalize_path_filter(filter: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn normalize_path_filter(filter: &str) -> std::borrow::Cow<'_, str> {
     let s = if filter.contains('\\') {
         std::borrow::Cow::Owned(filter.replace('\\', "/"))
     } else {
@@ -43,7 +43,7 @@ fn normalize_path_filter(filter: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-fn path_matches_exact_or_suffix(path: &str, filter: &str) -> bool {
+pub(crate) fn path_matches_exact_or_suffix(path: &str, filter: &str) -> bool {
     let filter = normalize_path_filter(filter);
     let filter = filter.as_ref();
     if path == filter {

@@ -26,6 +26,8 @@ use crate::graph_tools_diff_ranges::{
     line_number_for_byte,
 };
 use crate::graph_tools_filters::path_matches_filter;
+#[cfg(test)]
+use crate::graph_tools_filters::{normalize_path_filter, path_matches_exact_or_suffix};
 use crate::graph_tools_packets::{DiffNextActionKind, read_diff_next_action};
 use crate::graph_tools_read_slice::{
     DiffReadBaseline, LastReceiptDiffOutcome, ReadSliceArgs, ReadSliceDiffCtx, ReadSliceReadMode,
