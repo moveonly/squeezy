@@ -1629,6 +1629,21 @@ impl SeenToolOutputs {
         outputs
     }
 
+    /// Seed the dedup index from `store`'s committed receipts but keep no
+    /// handle for write-back. A repeated read/grep still collapses to a
+    /// receipt stub against receipts already committed by the parent (or an
+    /// earlier session), and `remember_results` still indexes this caller's
+    /// own earlier rounds in memory — but no new receipt is persisted.
+    /// Subagents use this: they run read-only and fan out up to
+    /// `subagents.max_concurrent` at once, so routing their receipt writes
+    /// into the single-writer store would serialize concurrent siblings on a
+    /// shared lock to persist exploratory reads no other reader is keyed to.
+    pub(crate) fn seeded_read_only(store: Option<Arc<SqueezyStore>>) -> Self {
+        let mut outputs = Self::from_store(store);
+        outputs.store = None;
+        outputs
+    }
+
     pub(crate) fn prepare_results(&self, results: Vec<ToolResult>) -> Vec<PendingToolResult> {
         let mut prepared = Vec::with_capacity(results.len());
         let mut seen = self

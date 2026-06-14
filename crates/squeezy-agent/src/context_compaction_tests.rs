@@ -1,6 +1,7 @@
 use serde_json::json;
 use squeezy_core::{AppConfig, ContextCompactionState};
 use squeezy_llm::LlmInputItem;
+use squeezy_store::SqueezyStore;
 use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus, sha256_hex};
 
 use super::{
@@ -1234,4 +1235,88 @@ fn forced_few_but_huge_folds_even_below_high_water() {
     .expect("forced compaction must fold a few-but-huge conversation");
     assert!(report.record.after.bytes < report.record.before.bytes);
     assert!(conversation.len() < before.items);
+}
+
+fn unique_store_root(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("squeezy-{tag}-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp store root");
+    dir
+}
+
+fn is_receipt_stub(result: &ToolResult) -> bool {
+    result
+        .content
+        .get("receipt_stub")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+/// A subagent seeds its dedup index read-only from the parent's store: a
+/// re-read of a file the parent already committed collapses to a receipt stub
+/// (preload hit), its own repeat reads collapse across rounds (in-memory
+/// `remember_results`), but none of its reads are written back to the shared
+/// single-writer store.
+#[test]
+fn subagent_seeded_read_only_preloads_parent_receipts_without_writing_back() {
+    let root = unique_store_root("seeded-ro");
+    let store = std::sync::Arc::new(SqueezyStore::open(&root, None).expect("open store"));
+
+    // Parent commits a read receipt the way the top-level loop does:
+    // store-backed `from_store` + prepare + remember.
+    let parent_read = tool_result(
+        "parent-read",
+        "read_file",
+        ToolStatus::Success,
+        json!({ "path": "src/auth.rs", "content": "fn verify_token() {}" }),
+    );
+    let mut parent_seen = SeenToolOutputs::from_store(Some(store.clone()));
+    let prepared = parent_seen.prepare_results(vec![parent_read.clone()]);
+    parent_seen.remember_results(&prepared);
+    let committed = store.tool_receipts().expect("receipts").len();
+    assert_eq!(committed, 1, "parent should commit exactly one receipt");
+
+    // Subagent seeds read-only from the same store. An identical read is a
+    // preload hit and collapses to a stub instead of re-billing the bytes.
+    let mut sub_seen = SeenToolOutputs::seeded_read_only(Some(store.clone()));
+    let preload_hit = sub_seen.prepare_results(vec![parent_read]);
+    assert!(
+        is_receipt_stub(&preload_hit[0].result),
+        "re-read of a parent-committed file must collapse to a receipt stub, got {:?}",
+        preload_hit[0].result.content,
+    );
+
+    // A brand-new subagent read is remembered in memory but must NOT be
+    // persisted to the shared store (no concurrent-writer contention).
+    let new_read = || {
+        tool_result(
+            "sub-read",
+            "read_file",
+            ToolStatus::Success,
+            json!({ "path": "src/router.rs", "content": "fn route() {}" }),
+        )
+    };
+    let first = sub_seen.prepare_results(vec![new_read()]);
+    assert!(
+        !is_receipt_stub(&first[0].result),
+        "first read of a new file is not a stub",
+    );
+    sub_seen.remember_results(&first);
+    assert_eq!(
+        store.tool_receipts().expect("receipts").len(),
+        committed,
+        "seeded_read_only must not write subagent reads back to the shared store",
+    );
+
+    // ...but the subagent still dedups that read across its own later rounds.
+    let second = sub_seen.prepare_results(vec![new_read()]);
+    assert!(
+        is_receipt_stub(&second[0].result),
+        "repeat read within the subagent must collapse via in-memory remember, got {:?}",
+        second[0].result.content,
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }

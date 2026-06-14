@@ -5323,6 +5323,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
         loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
         exploration_state: Arc::new(Mutex::new(ExplorationTurnState::from_plan(None))),
         subagents: deps.subagents.clone(),
+        store: None,
         hooks: deps.hooks.clone(),
     };
     let execution = run_subagent(&parent, SubagentKind::DocHelp, request, None).await;
@@ -5635,6 +5636,7 @@ async fn complete_local_tool_turn(
             loaded_tool_schemas,
             exploration_state,
             subagents,
+            store: None,
             hooks,
         },
         &mut broker,
@@ -7314,6 +7316,7 @@ impl TurnRuntime {
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
                         exploration_state: exploration_state.clone(),
                         subagents: self.subagents.clone(),
+                        store: self.store.clone(),
                         hooks: self.hooks.clone(),
                     },
                     &mut broker,
@@ -9216,6 +9219,7 @@ impl TurnRuntime {
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
                         exploration_state: exploration_state.clone(),
                         subagents: self.subagents.clone(),
+                        store: self.store.clone(),
                         hooks: self.hooks.clone(),
                     },
                     &mut broker,
@@ -10301,6 +10305,12 @@ struct ToolExecutionContext<'a> {
     conversation_state: Option<Arc<Mutex<ConversationState>>>,
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
     subagents: SubagentRegistry,
+    /// Cross-session receipt store, shared with the parent `Agent`. Lets a
+    /// subagent seed its dedup index from receipts the parent already
+    /// committed (see `SeenToolOutputs::seeded_read_only`). `None` on paths
+    /// without a persistent store (in-memory tests, the doc-help and
+    /// local-tool one-shot turns).
+    store: Option<Arc<SqueezyStore>>,
     all_tool_specs: &'a [AdvertisedTool],
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     exploration_state: Arc<Mutex<ExplorationTurnState>>,
@@ -10352,6 +10362,7 @@ impl<'a> ToolExecutionContext<'a> {
             conversation_state: self.conversation_state.clone(),
             task_state: self.task_state.clone(),
             subagents: self.subagents.clone(),
+            store: self.store.clone(),
             all_tool_specs: self.all_tool_specs,
             loaded_tool_schemas: self.loaded_tool_schemas.clone(),
             exploration_state: self.exploration_state.clone(),
@@ -11439,7 +11450,7 @@ async fn run_subagent(
     let local_loaded_schemas = Arc::new(Mutex::new(Vec::new()));
     let local_mode = Arc::new(AtomicU8::new(SessionMode::Plan.to_u8()));
     let local_exploration = Arc::new(Mutex::new(ExplorationTurnState::from_plan(None)));
-    let mut seen_outputs = SeenToolOutputs::default();
+    let mut seen_outputs = SeenToolOutputs::seeded_read_only(parent.store.clone());
 
     let mut execution = run_subagent_loop(
         parent,
@@ -12067,6 +12078,7 @@ async fn run_subagent_rounds(
                         loaded_tool_schemas: local_loaded_schemas.clone(),
                         exploration_state: local_exploration.clone(),
                         subagents: parent.subagents.clone(),
+                        store: parent.store.clone(),
                         hooks: parent.hooks.clone(),
                     },
                     broker,
@@ -12094,6 +12106,12 @@ async fn run_subagent_rounds(
                 ));
             }
         }
+        // Index this round's outputs so a later round collapses a repeat
+        // read/grep into a receipt stub instead of re-billing the bytes,
+        // and so dedup also fires against the parent receipts preloaded at
+        // construction. Read-only seed (`seeded_read_only`), so this only
+        // updates the in-memory index — it never writes to the store.
+        seen_outputs.remember_results(&results);
         conversation.extend(
             tool_calls
                 .iter()
