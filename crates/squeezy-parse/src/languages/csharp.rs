@@ -824,13 +824,22 @@ pub(crate) fn extract_csharp_using_directive(
     if path.is_empty() {
         return;
     }
+    // Classify the binding shape so the parse-coverage histogram reflects it:
+    //   `using static N.C;`     -> Static  (members of C in scope)
+    //   `using Alias = N.Type;` -> Named   (a single aliased name in scope)
+    //   `using N;`              -> Namespace (every name under N in scope)
     let kind = if is_static {
         ImportKind::Static
+    } else if alias.is_some() {
+        ImportKind::Named
     } else {
         ImportKind::Namespace
     };
     let imported_name = if is_static {
         None
+    } else if let Some(alias) = alias.as_deref() {
+        // For an alias, the bound leaf is the alias identifier itself.
+        Some(alias.to_string())
     } else {
         Some(last_path_segment(&path))
     };
