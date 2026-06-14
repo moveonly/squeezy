@@ -2292,7 +2292,9 @@ fn routing_pane_renders_default_filter_and_pinned_banner() {
         std::env::remove_var("SQUEEZY_ROUTING_EXPENSIVE_MODELS");
     }
     let mut state = temp_config_state(Some(SId::Routing));
-    let rendered = render_screen_to_text(&state, 120, 24);
+    // Tall viewport so the whole Routing section (toggles + tier-effort knobs +
+    // per-provider model/filter fields) renders without scrolling.
+    let rendered = render_screen_to_text(&state, 120, 48);
     assert!(
         rendered.contains("(?!"),
         "default reroute filter should show a negative-lookahead regex, got:\n{rendered}"
@@ -2310,7 +2312,7 @@ fn routing_pane_renders_default_filter_and_pinned_banner() {
         .entry(slug)
         .or_default()
         .expensive_models = Some(String::new());
-    let rendered2 = render_screen_to_text(&state, 120, 24);
+    let rendered2 = render_screen_to_text(&state, 120, 48);
     assert!(
         rendered2.contains("any"),
         "explicit empty filter should render as 'any', got:\n{rendered2}"

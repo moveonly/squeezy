@@ -784,6 +784,19 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
+                label: "judge_effort",
+                toml_path: &["routing", "judge_effort"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_routing_judge_effort,
+                set: set_routing_judge_effort,
+                default_display: "false",
+                default: || FieldValue::Bool(crate::DEFAULT_ROUTING_JUDGE_EFFORT),
+                help: "Let the LLM judge estimate per-task reasoning effort (overriding the tier→effort map for that turn), so two turns on the same rung can run at different depths. Off by default; needs llm_judge. A user /effort pin still wins.",
+                env_override: Some("SQUEEZY_ROUTING_JUDGE_EFFORT"),
+                secret: false,
+            },
+            FieldMeta {
                 label: "cheap_model",
                 toml_path: &["providers", "*", "cheap_model"],
                 kind: FieldKind::String { multiline: false },
@@ -3437,6 +3450,19 @@ fn set_routing_tier_effort(cfg: &mut AppConfig, value: FieldValue) -> Result<(),
     match value {
         FieldValue::Bool(v) => {
             cfg.routing.tier_effort = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_routing_judge_effort(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.routing.judge_effort)
+}
+fn set_routing_judge_effort(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.routing.judge_effort = v;
             Ok(())
         }
         _ => Err("expects bool"),

@@ -657,6 +657,10 @@ pub const DEFAULT_ROUTING_LLM_JUDGE: bool = true;
 /// Default for `[routing].tier_effort`: route reasoning effort by tier (cheap
 /// rungs shallow, the flagship deep) when the user hasn't pinned an effort.
 pub const DEFAULT_ROUTING_TIER_EFFORT: bool = true;
+/// Default for `[routing].judge_effort`: off — the judge estimates only the tier
+/// by default; per-task effort estimation is opt-in (cheap judges calibrate
+/// effort less reliably than they pick a tier).
+pub const DEFAULT_ROUTING_JUDGE_EFFORT: bool = false;
 /// Char-budget below which a turn is treated as a short follow-up ("ok",
 /// "continue", "yes") and inherits the previous turn's routing decision
 /// instead of paying for a judge call — a follow-up to a big parent turn
@@ -2180,6 +2184,10 @@ impl AppConfig {
                 )),
             }
         }
+        output.push_str(&format!(
+            "judge_effort = {}  # judge also estimates per-task effort, overriding the tier map (needs llm_judge)\n",
+            self.routing.judge_effort
+        ));
         // judge_model / judge_prompt / expensive_models below show the value
         // resolved for the ACTIVE provider; set them per provider under
         // [providers.<name>] (a global [routing] value applies as a fallback).
@@ -5353,6 +5361,15 @@ pub struct RoutingConfig {
     pub effort_weak: Option<ReasoningEffort>,
     pub effort_medium: Option<ReasoningEffort>,
     pub effort_strong: Option<ReasoningEffort>,
+    /// When `true`, the LLM routing judge additionally estimates a per-TASK
+    /// reasoning effort (not just the tier), which overrides the static
+    /// tier→effort map for that turn — so two turns on the same rung can run at
+    /// different depths (e.g. Opus@xhigh for a tricky bug vs Opus@medium for a
+    /// routine edit). Falls back to the tier map on turns the judge doesn't run,
+    /// and is dropped on escalation (the judge's estimate proved wrong). Default
+    /// off: a cheap judge calibrating effort is less reliable than picking a
+    /// tier, so opt in. A user `/effort` pin still wins. Requires `llm_judge`.
+    pub judge_effort: bool,
 }
 
 impl RoutingConfig {
@@ -5467,6 +5484,14 @@ impl RoutingConfig {
                 .as_deref()
                 .and_then(ReasoningEffort::parse)
                 .or(settings.effort_strong),
+            judge_effort: get_var("SQUEEZY_ROUTING_JUDGE_EFFORT")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(
+                    settings
+                        .judge_effort
+                        .unwrap_or(DEFAULT_ROUTING_JUDGE_EFFORT),
+                ),
         }
     }
 
@@ -5506,6 +5531,7 @@ pub struct RoutingSettings {
     pub effort_weak: Option<ReasoningEffort>,
     pub effort_medium: Option<ReasoningEffort>,
     pub effort_strong: Option<ReasoningEffort>,
+    pub judge_effort: Option<bool>,
 }
 
 impl RoutingSettings {
@@ -5533,6 +5559,7 @@ impl RoutingSettings {
                 "effort_weak",
                 "effort_medium",
                 "effort_strong",
+                "judge_effort",
             ],
             source,
             path,
@@ -5633,6 +5660,7 @@ impl RoutingSettings {
                 source,
                 &field(path, "effort_strong"),
             )?,
+            judge_effort: bool_value(table, "judge_effort", source, &field(path, "judge_effort"))?,
         })
     }
 
@@ -5672,6 +5700,7 @@ impl RoutingSettings {
         replace_if_some(&mut self.effort_weak, next.effort_weak);
         replace_if_some(&mut self.effort_medium, next.effort_medium);
         replace_if_some(&mut self.effort_strong, next.effort_strong);
+        replace_if_some(&mut self.judge_effort, next.judge_effort);
     }
 }
 

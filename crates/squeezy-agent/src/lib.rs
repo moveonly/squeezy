@@ -6152,8 +6152,10 @@ fn request_reasoning_effort(
 ///
 /// Precedence: an explicit user pin (`config.reasoning_effort`) always wins and
 /// behaves exactly as [`request_reasoning_effort`]. Otherwise, when tier-effort
-/// is enabled and routing is on, the rung's effort
-/// ([`RoutingConfig::effort_for_tier`] → [`ModelTier::default_effort`]) is used.
+/// is enabled and routing is on: a per-task `judge_effort` (from the routing
+/// judge, when `[routing].judge_effort` is on) overrides the static map, so two
+/// turns on the same rung can run at different depths; failing that, the rung's
+/// effort ([`RoutingConfig::effort_for_tier`] → [`ModelTier::default_effort`]).
 /// With tier-effort off, or routing disabled, we fall back to the global path so
 /// behavior is unchanged. The capability gate runs against the LIVE routed
 /// `model` (not `config.model`), so a non-reasoning rung correctly drops the
@@ -6163,6 +6165,7 @@ fn request_reasoning_effort_for_tier(
     provider_name: &str,
     model: &str,
     tier: ModelTier,
+    judge_effort: Option<squeezy_core::ReasoningEffort>,
 ) -> Option<squeezy_core::ReasoningEffort> {
     let routing = &config.routing;
     let effort = match config.reasoning_effort {
@@ -6171,12 +6174,14 @@ fn request_reasoning_effort_for_tier(
         // No pin, but tier-effort disabled or routing off: preserve the global
         // (None → provider default) behavior.
         None if !routing.tier_effort || !routing.enabled => return None,
-        // No pin: a per-tier override wins for any rung. With no override,
-        // cheaper rungs get their shallower default effort, but the Strong
-        // (parent) rung keeps the provider/model default — so enabling
-        // tier-effort never silently deepens (and raises the cost of)
-        // un-rerouted turns. Opt into a deeper flagship via `effort_strong`.
-        None => match routing.effort_for_tier(tier) {
+        // No pin: the judge's per-task effort wins when present (a task-specific
+        // signal — e.g. Opus@xhigh for a tricky bug vs Opus@medium for a routine
+        // edit). Otherwise a per-tier override; otherwise cheaper rungs get their
+        // shallower default while the Strong (parent) rung keeps the provider
+        // default — so enabling tier-effort never silently deepens (and raises
+        // the cost of) un-rerouted turns. Opt into a deeper flagship via
+        // `effort_strong` or judge-effort.
+        None => match judge_effort.or_else(|| routing.effort_for_tier(tier)) {
             Some(over) => over,
             None if tier == ModelTier::Strong => return None,
             None => tier.default_effort(),
@@ -6449,11 +6454,15 @@ impl TurnRuntime {
             .set_routing_sticky_remaining_turns(sticky_remaining);
         self.telemetry
             .spawn(TelemetryEvent::routing_escalated(reason_token));
+        // An escalated rung uses its own tier-default effort: the judge's
+        // per-task estimate was for the cheaper rung that just proved
+        // insufficient, so it no longer applies.
         let effort = request_reasoning_effort_for_tier(
             &self.config,
             self.provider.name(),
             &to_model,
             to_tier,
+            None,
         );
         let _ = self
             .tx
@@ -7479,6 +7488,13 @@ impl TurnRuntime {
         let decision = classify_result.decision;
         let judge_cost = classify_result.judge_cost;
         let judge_model = classify_result.judge_model;
+        // The judge's per-task effort (when `[routing].judge_effort` is on)
+        // overrides the static tier→effort map — but only while the turn is on
+        // the rung the judge actually assigned. Once an escalation (or a
+        // context bump) moves to a different rung, the judge's estimate no
+        // longer applies and the rung's own default effort takes over.
+        let judge_assigned_tier = decision.tier();
+        let judge_effort = classify_result.judge_effort;
         // Fold the judge call's spend into the broker so its tokens
         // count against `max_session_cost_usd_micros` and surface in
         // the turn's provider cost — that's the bill the provider
@@ -7614,6 +7630,11 @@ impl TurnRuntime {
                     self.provider.name(),
                     &current_model,
                     current_tier,
+                    if current_tier == judge_assigned_tier {
+                        judge_effort
+                    } else {
+                        None
+                    },
                 );
                 let _ = self
                     .tx
@@ -7952,6 +7973,11 @@ impl TurnRuntime {
                     self.provider.name(),
                     &current_model,
                     current_tier,
+                    if current_tier == judge_assigned_tier {
+                        judge_effort
+                    } else {
+                        None
+                    },
                 ),
                 previous_response_id: previous_response_id.clone(),
                 cache_key: None,

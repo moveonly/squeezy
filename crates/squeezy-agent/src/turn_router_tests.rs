@@ -43,6 +43,7 @@ fn default_routing_config() -> RoutingConfig {
         effort_weak: None,
         effort_medium: None,
         effort_strong: None,
+        judge_effort: squeezy_core::DEFAULT_ROUTING_JUDGE_EFFORT,
     }
 }
 
@@ -402,19 +403,25 @@ fn sticky_window_expires_after_n_turns() {
 
 // -- Judge reply parsing ---------------------------------------------------
 
+/// The tier a judge reply parses to (dropping any effort), for tests that only
+/// care about routing.
+fn parsed_tier(raw: &str) -> Option<ModelTier> {
+    super::parse_judge_reply(raw).map(|verdict| verdict.tier)
+}
+
 #[test]
 fn parse_judge_reply_handles_bare_json() {
     // Legacy "cheap" maps to the weak tier; the new vocabulary parses directly.
     assert_eq!(
-        super::parse_judge_reply(r#"{"route":"cheap","reason":"single command"}"#),
+        parsed_tier(r#"{"route":"cheap","reason":"single command"}"#),
         Some(ModelTier::Weak)
     );
     assert_eq!(
-        super::parse_judge_reply(r#"{"route":"weak","reason":"single command"}"#),
+        parsed_tier(r#"{"route":"weak","reason":"single command"}"#),
         Some(ModelTier::Weak)
     );
     assert_eq!(
-        super::parse_judge_reply(r#"{"route":"medium","reason":"localized edit"}"#),
+        parsed_tier(r#"{"route":"medium","reason":"localized edit"}"#),
         Some(ModelTier::Medium)
     );
 }
@@ -422,9 +429,21 @@ fn parse_judge_reply_handles_bare_json() {
 #[test]
 fn parse_judge_reply_handles_code_fence() {
     let raw = "```json\n{\"route\":\"parent\",\"reason\":\"needs reasoning\"}\n```";
-    assert_eq!(super::parse_judge_reply(raw), Some(ModelTier::Strong));
+    assert_eq!(parsed_tier(raw), Some(ModelTier::Strong));
     let strong = "```json\n{\"route\":\"strong\",\"reason\":\"needs reasoning\"}\n```";
-    assert_eq!(super::parse_judge_reply(strong), Some(ModelTier::Strong));
+    assert_eq!(parsed_tier(strong), Some(ModelTier::Strong));
+}
+
+#[test]
+fn parse_judge_reply_extracts_per_task_effort_when_present() {
+    let verdict =
+        super::parse_judge_reply(r#"{"route":"strong","effort":"xhigh","reason":"tricky"}"#)
+            .expect("parses");
+    assert_eq!(verdict.tier, ModelTier::Strong);
+    assert_eq!(verdict.effort, Some(squeezy_core::ReasoningEffort::XHigh));
+    // Absent or unparseable effort just leaves it unset.
+    let no_effort = super::parse_judge_reply(r#"{"route":"weak","reason":"x"}"#).expect("parses");
+    assert_eq!(no_effort.effort, None);
 }
 
 #[test]
@@ -446,7 +465,7 @@ fn parse_judge_reply_rejects_garbage() {
 /// be marked strict so supporting providers enforce it server-side.
 #[test]
 fn judge_output_schema_mirrors_judge_reply() {
-    let schema = super::judge_output_schema();
+    let schema = super::judge_output_schema(false);
     assert!(schema.strict, "judge schema must be strict");
 
     let props = &schema.schema["properties"];
@@ -480,17 +499,31 @@ fn judge_output_schema_mirrors_judge_reply() {
         let doc = serde_json::json!({ "route": route, "reason": "x" });
         let reply: super::JudgeReply = serde_json::from_value(doc.clone()).expect("deserializes");
         assert_eq!(reply.route, route);
-        assert_eq!(super::parse_judge_reply(&doc.to_string()), expect);
+        assert_eq!(parsed_tier(&doc.to_string()), expect);
     }
     // The loose parser still accepts the legacy binary vocabulary so older judge
     // prompts (and the scripted integration provider) keep routing correctly.
     assert_eq!(
-        super::parse_judge_reply(r#"{"route":"cheap","reason":"x"}"#),
+        parsed_tier(r#"{"route":"cheap","reason":"x"}"#),
         Some(ModelTier::Weak)
     );
     assert_eq!(
-        super::parse_judge_reply(r#"{"route":"parent","reason":"x"}"#),
+        parsed_tier(r#"{"route":"parent","reason":"x"}"#),
         Some(ModelTier::Strong)
+    );
+
+    // With judge-effort on, the schema additionally requires an effort enum.
+    let effort_schema = super::judge_output_schema(true);
+    let effort_values: Vec<&str> = effort_schema.schema["properties"]["effort"]["enum"]
+        .as_array()
+        .expect("effort carries an enum")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(effort_values, vec!["low", "medium", "high", "xhigh"]);
+    assert_eq!(
+        effort_schema.schema["required"],
+        serde_json::json!(["route", "effort", "reason"])
     );
 }
 
@@ -563,14 +596,15 @@ async fn run_judge_attaches_schema_only_on_supporting_provider() {
         &model,
         "judge instructions",
         "rename foo to bar in src/lib.rs",
+        false,
         tokio_util::sync::CancellationToken::new(),
     )
     .await;
-    assert_eq!(verdict, Some(ModelTier::Weak));
+    assert_eq!(verdict.map(|v| v.tier), Some(ModelTier::Weak));
     let req = recorder.last_request();
     assert_eq!(
         req.output_schema,
-        Some(super::judge_output_schema()),
+        Some(super::judge_output_schema(false)),
         "openai must carry the judge schema"
     );
 
@@ -582,6 +616,7 @@ async fn run_judge_attaches_schema_only_on_supporting_provider() {
         &model,
         "judge instructions",
         "rename foo to bar in src/lib.rs",
+        false,
         tokio_util::sync::CancellationToken::new(),
     )
     .await;
