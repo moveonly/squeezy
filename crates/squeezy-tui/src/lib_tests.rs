@@ -11534,6 +11534,25 @@ async fn draw_app_routes_main_view_through_render() {
     );
 }
 
+#[tokio::test]
+async fn draw_app_treats_terminal_backpressure_as_skipped_frame() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("hello from the model"));
+
+    let before = app.render_metrics.get();
+    let mut guard = TerminalGuard::for_backpressure_test(120, 40);
+    let status = guard
+        .draw_app(&mut app)
+        .expect("terminal backpressure must not be fatal");
+
+    assert_eq!(status, DrawStatus::Backpressured);
+    assert_eq!(
+        app.render_metrics.get().frame,
+        before.frame,
+        "a skipped frame must not be recorded as committed"
+    );
+}
+
 /// `\x1b[?2026h` / `\x1b[?2026l` — DEC 2026 synchronized-output begin/end. The
 /// fullscreen renderer brackets each painted frame with these when synchronized
 /// output is enabled so a capable terminal commits the frame's cells atomically.

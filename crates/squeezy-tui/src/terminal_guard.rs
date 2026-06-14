@@ -8,6 +8,8 @@
 
 use std::env;
 use std::io::{self, IsTerminal, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -77,6 +79,10 @@ pub(crate) struct TerminalGuard {
     /// writer bumps it on every write; `draw_app` resets it at frame begin and
     /// reads the delta at frame end into [`metrics::RenderMetrics::bytes_emitted`].
     byte_counter: metrics::ByteCounter,
+    /// Original stdout file-status flags before the TUI made fd 1 nonblocking.
+    /// Restored on every guard drop so the parent shell inherits its normal fd.
+    #[cfg(unix)]
+    stdout_flags: Option<i32>,
 }
 
 impl TerminalGuard {
@@ -88,6 +94,53 @@ impl TerminalGuard {
             .as_mut()
             .expect("primary terminal lost — unreachable after `enter`")
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrawStatus {
+    Committed,
+    Backpressured,
+}
+
+#[cfg(unix)]
+fn make_stdout_nonblocking() -> Option<i32> {
+    let fd = io::stdout().as_raw_fd();
+    // SAFETY: fcntl only inspects/modifies the file-status flags for fd 1.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || flags & libc::O_NONBLOCK != 0 {
+        return None;
+    }
+    // SAFETY: same fd, preserving all existing flags and adding O_NONBLOCK.
+    let set = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if set < 0 { None } else { Some(flags) }
+}
+
+#[cfg(unix)]
+fn restore_stdout_flags(flags: Option<i32>) {
+    let Some(flags) = flags else {
+        signal_teardown::set_stdout_restore_flags(None);
+        return;
+    };
+    let fd = io::stdout().as_raw_fd();
+    // SAFETY: best-effort restoration of the file-status flags captured at enter.
+    let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    signal_teardown::set_stdout_restore_flags(None);
+}
+
+fn terminal_io_error(err: io::Error) -> SqueezyError {
+    if err.kind() == io::ErrorKind::WouldBlock {
+        SqueezyError::Terminal(format!("terminal output backpressure: {err}"))
+    } else {
+        SqueezyError::Terminal(err.to_string())
+    }
+}
+
+fn is_terminal_backpressure(err: &SqueezyError) -> bool {
+    matches!(
+        err,
+        SqueezyError::Terminal(message)
+            if message.starts_with("terminal output backpressure:")
+    )
 }
 
 impl TerminalGuard {
@@ -104,6 +157,10 @@ impl TerminalGuard {
         }
         let synchronized_output = resolve_synchronized_output(synchronized_output);
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        #[cfg(unix)]
+        let stdout_flags = make_stdout_nonblocking();
+        #[cfg(unix)]
+        signal_teardown::set_stdout_restore_flags(stdout_flags);
         // Wrap stdout in the env-gated debug-tap writer so every
         // subsequent ANSI sequence — startup setup, draw bytes, and
         // teardown — is mirrored to the log when
@@ -127,8 +184,11 @@ impl TerminalGuard {
         // entry, bracketed paste / focus, mouse capture) through the shared free
         // helper so a test can drive the exact same bytes into a `Capture`
         // writer with no real TTY.
-        emit_terminal_enter_setup(&mut writer, mouse_capture)
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        if let Err(err) = emit_terminal_enter_setup(&mut writer, mouse_capture) {
+            #[cfg(unix)]
+            restore_stdout_flags(stdout_flags);
+            return Err(terminal_io_error(err));
+        }
         // Crash safety (Phase 9): install the panic hook now that the terminal is
         // in raw mode / the alternate screen, and publish the alt-screen state so
         // the hook (and the Unix signal handlers) leave it exactly once. Both are
@@ -156,6 +216,8 @@ impl TerminalGuard {
             synchronized_output,
             size_source: Box::new(crate::size_source::RealSize),
             byte_counter,
+            #[cfg(unix)]
+            stdout_flags,
         })
     }
 
@@ -196,6 +258,8 @@ impl TerminalGuard {
             synchronized_output: false,
             size_source: Box::new(crate::size_source::FixedSize(w, h)),
             byte_counter,
+            #[cfg(unix)]
+            stdout_flags: None,
         };
         (guard, sink)
     }
@@ -229,8 +293,33 @@ impl TerminalGuard {
             synchronized_output: false,
             size_source: Box::new(crate::size_source::FixedSize(w, h)),
             byte_counter,
+            #[cfg(unix)]
+            stdout_flags: None,
         };
         (guard, sink)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_backpressure_test(w: u16, h: u16) -> Self {
+        let byte_counter: metrics::ByteCounter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut writer = TerminalWriter::would_block();
+        writer.set_byte_counter(Arc::clone(&byte_counter));
+        let backend = CrosstermBackend::new(writer);
+        let viewport = Viewport::Fixed(Rect::new(0, 0, w.max(1), h.max(1)));
+        let terminal = Terminal::with_options(backend, TerminalOptions { viewport })
+            .expect("backpressure terminal builds with a fixed viewport");
+        signal_teardown::set_alt_screen_active(true);
+        Self {
+            terminal: Some(terminal),
+            alt_screen_active: true,
+            mouse_capture: true,
+            exit_hint: None,
+            synchronized_output: false,
+            size_source: Box::new(crate::size_source::FixedSize(w, h)),
+            byte_counter,
+            #[cfg(unix)]
+            stdout_flags: None,
+        }
     }
 
     /// Test-only: force the resolved DEC 2026 synchronized-output flag on (the
@@ -654,12 +743,12 @@ impl TerminalGuard {
                 frame.render_widget(paragraph, target);
             })
             .map(|_| ())
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+            .map_err(terminal_io_error)?;
         let _ = self.term().backend_mut().flush();
         Ok(())
     }
 
-    pub(crate) fn draw_app(&mut self, app: &mut TuiApp) -> Result<()> {
+    pub(crate) fn draw_app(&mut self, app: &mut TuiApp) -> Result<DrawStatus> {
         self.apply_terminal_title(app)?;
         if app.pending_resize {
             // Ratatui autoresizes the fullscreen terminal cleanly on the next
@@ -801,6 +890,13 @@ impl TerminalGuard {
         compensate_main_scroll_for_append(app);
 
         let paint = self.paint_one_frame(app);
+        if let Err(err) = &paint
+            && is_terminal_backpressure(err)
+        {
+            app.dogfood_metrics.record_skipped_frame();
+            return Ok(DrawStatus::Backpressured);
+        }
+        let paint = paint.map(|()| DrawStatus::Committed);
 
         // ---- Frame-budget instrumentation: end ----
         // Stamp the snapshot ONLY on a painted frame (this method runs only when
@@ -890,17 +986,15 @@ impl TerminalGuard {
     /// purges scrollback (that is the terminal guard's teardown responsibility).
     /// Best-effort: callers treat a returned error as "retry next iteration"
     /// rather than a fatal loop error.
-    pub(crate) fn force_full_redraw(&mut self, app: &mut TuiApp) -> Result<()> {
+    pub(crate) fn force_full_redraw(&mut self, app: &mut TuiApp) -> Result<DrawStatus> {
         // (1) Drop ratatui's diff baseline so the next draw is a full repaint.
-        self.term()
-            .clear()
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        self.term().clear().map_err(terminal_io_error)?;
         // (2) Scrub the visible screen and home the cursor at the backend layer.
         {
             let backend = self.term().backend_mut();
             queue!(backend, Clear(ClearType::All), MoveTo(0, 0))
                 .and_then(|_| backend.flush())
-                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+                .map_err(terminal_io_error)?;
         }
         // (3) Commit a fresh frame through the normal instrumented paint, then
         //     flush so the recovery bytes are not held back behind the gate.
@@ -947,13 +1041,13 @@ impl TerminalGuard {
             backend
                 .write_all(BEGIN_SYNCHRONIZED_UPDATE.as_bytes())
                 .and_then(|_| backend.flush())
-                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+                .map_err(terminal_io_error)?;
         }
         let drawn = self
             .term()
             .draw(|frame| render(frame, app))
             .map(|_| ())
-            .map_err(|err| SqueezyError::Terminal(err.to_string()));
+            .map_err(terminal_io_error);
         if synchronized {
             // Close the synchronized update even if the draw failed, so a
             // capable terminal is never left buffering. Best-effort flush.
@@ -988,7 +1082,7 @@ impl TerminalGuard {
             None => write!(backend, "\x1b]0;\x07"),
         }
         .and_then(|_| backend.flush())
-        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        .map_err(terminal_io_error)?;
         app.last_terminal_title = desired;
         Ok(())
     }
@@ -1017,6 +1111,8 @@ fn sanitize_osc_text(title: &str) -> String {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        let stdout_flags = self.stdout_flags.take();
         // Emergency-only teardown: restore the terminal modes and (if still
         // active) leave the alternate screen, but write NO user-facing content
         // and run NO render/mirror. The clean exit + transcript mirror is owned
@@ -1025,6 +1121,8 @@ impl Drop for TerminalGuard {
         // both paths run.
         let _ = disable_raw_mode();
         let Some(terminal) = self.terminal.as_mut() else {
+            #[cfg(unix)]
+            restore_stdout_flags(stdout_flags);
             return;
         };
         {
@@ -1070,6 +1168,8 @@ impl Drop for TerminalGuard {
         // keeping the second-TUI / non-TUI contract intact. Idempotent via the
         // `HOOKS_INSTALLED` swap, so it is a no-op if a clean exit already restored.
         signal_teardown::restore_previous_panic_hook();
+        #[cfg(unix)]
+        restore_stdout_flags(stdout_flags);
     }
 }
 
