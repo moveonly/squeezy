@@ -64,28 +64,46 @@ jobs:
       - name: Build eval harness
         run: cargo build -p squeezy-eval --bins
 
-      # `--hermetic` runs only `provider = "mock"` scenarios with
-      # `hermetic = true`; non-mock (need a key) and `hermetic = false` (need
-      # external setup, e.g. mcp-everything-real) scenarios are skipped and
-      # logged. Settings are pinned to an empty file so an ambient user config
-      # can't leak in.
+      # Pull requests run a representative smoke slice because the hosted PR
+      # runner repeatedly cancels this separate eval workflow after ~4m20s
+      # total job time. Pushes to main and manual runs keep the complete
+      # `--hermetic` suite as the post-merge/backstop gate.
       #
-      # Run serially (default parallelism): each scenario provisions a full
-      # agent harness — repo indexing across rayon threads, tokio workers with
-      # 16 MiB stacks, and (for MCP scenarios) child processes. Running several
-      # at once exhausted the hosted runner (it died mid-run with a "runner
-      # received a shutdown signal"). Serial keeps the footprint small; the run
-      # is still well within the job timeout.
+      # Settings are pinned to an empty file so an ambient user config can't
+      # leak in. The full check runs serially (default parallelism): each
+      # scenario provisions a full agent harness — repo indexing across rayon
+      # threads, tokio workers with 16 MiB stacks, and (for MCP scenarios) child
+      # processes. Running several at once exhausted the hosted runner.
       - name: Run hermetic mock scenarios
         env:
           SQUEEZY_SETTINGS_PATH: ${{ runner.temp }}/empty-settings.toml
         run: |
           : > "$SQUEEZY_SETTINGS_PATH"
-          ./target/debug/squeezy-eval check \
-            crates/squeezy-eval/fixtures/scenarios \
-            --hermetic \
-            --out "${{ runner.temp }}/eval-out" \
-            --junit "${{ runner.temp }}/eval-mock-junit.xml"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            scenarios=(
+              crates/squeezy-eval/fixtures/scenarios/mock-smoke.toml
+              crates/squeezy-eval/fixtures/scenarios/audit-smoke-action-step-status.toml
+              crates/squeezy-eval/fixtures/scenarios/audit-smoke-modal-active.toml
+              crates/squeezy-eval/fixtures/scenarios/audit-config-options-reset.toml
+              crates/squeezy-eval/fixtures/scenarios/mcp-fake-discovery.toml
+              crates/squeezy-eval/fixtures/scenarios/mcp-fake-error-roundtrip.toml
+              crates/squeezy-eval/fixtures/scenarios/skills-fixture-load.toml
+              crates/squeezy-eval/fixtures/scenarios/ux-surface-matrix.toml
+            )
+            for scenario in "${scenarios[@]}"; do
+              echo "eval smoke: $scenario"
+              ./target/debug/squeezy-eval run "$scenario" \
+                --no-triage \
+                --quiet \
+                --out "${{ runner.temp }}/eval-out"
+            done
+          else
+            ./target/debug/squeezy-eval check \
+              crates/squeezy-eval/fixtures/scenarios \
+              --hermetic \
+              --out "${{ runner.temp }}/eval-out" \
+              --junit "${{ runner.temp }}/eval-mock-junit.xml"
+          fi
 
       - name: Upload JUnit
         if: ${{ always() }}
