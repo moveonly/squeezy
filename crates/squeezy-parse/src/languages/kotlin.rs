@@ -376,6 +376,7 @@ fn kotlin_class_declaration_symbol(
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
     let mut attributes = kotlin_attributes_for_node(node, ctx.source);
     attributes.extend(kotlin_inheritance_attributes(node, ctx.source));
+    attributes.extend(kotlin_generic_bound_attributes(node, ctx.source));
     if kotlin_class_modifier_present(node, "data") {
         attributes.push("kotlin:data".to_string());
     }
@@ -595,6 +596,7 @@ fn kotlin_function_declaration_symbol(
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
 
     let mut attributes = kotlin_attributes_for_node(node, ctx.source);
+    attributes.extend(kotlin_generic_bound_attributes(node, ctx.source));
     if kotlin_function_modifier_present(node, "suspend") {
         attributes.push("kotlin:suspend".to_string());
     }
@@ -2122,6 +2124,65 @@ fn kotlin_inheritance_attributes(node: Node<'_>, source: &str) -> Vec<String> {
                 attributes.push(format!("base:{name}"));
             } else {
                 attributes.push(format!("iface:{name}"));
+            }
+        }
+    }
+    attributes.sort();
+    attributes.dedup();
+    attributes
+}
+
+/// kotlin spec §7: collect generic upper-bound attributes for a declaration.
+/// Both inline bounds (`<T : Bound>` on `type_parameters -> type_parameter`)
+/// and `where` clauses (`type_constraints -> type_constraint`) are emitted as
+/// `bound:<param>:<bound>` so `decl_search` can find constraint-bounded
+/// generics. A dedicated `bound:` namespace is used (rather than overloading
+/// `base:`) to keep type-parameter constraints distinguishable from real
+/// supertypes. Aligning Swift (currently `base:`) and JS/TS onto this same
+/// namespace is a cross-language follow-up that touches their extractors.
+fn kotlin_generic_bound_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut attributes = Vec::new();
+    // Inline bounds: `type_parameters -> type_parameter[identifier, : type]`.
+    if let Some(params) = kotlin_first_child_of_kind(node, "type_parameters") {
+        let mut cursor = params.walk();
+        for param in params.named_children(&mut cursor) {
+            if param.kind() != "type_parameter" {
+                continue;
+            }
+            let Some(name) = kotlin_first_child_of_kind(param, "identifier")
+                .and_then(|n| node_text(n, source).ok())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+            else {
+                continue;
+            };
+            if let Some(bound) = kotlin_first_child_of_kind(param, "type")
+                .and_then(|t| node_text(t, source).ok())
+                .and_then(kotlin_type_name_from_text)
+            {
+                attributes.push(format!("bound:{name}:{bound}"));
+            }
+        }
+    }
+    // `where` clauses: `type_constraints -> type_constraint[identifier, type]`.
+    if let Some(constraints) = kotlin_first_child_of_kind(node, "type_constraints") {
+        let mut cursor = constraints.walk();
+        for constraint in constraints.named_children(&mut cursor) {
+            if constraint.kind() != "type_constraint" {
+                continue;
+            }
+            let Some(name) = kotlin_first_child_of_kind(constraint, "identifier")
+                .and_then(|n| node_text(n, source).ok())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+            else {
+                continue;
+            };
+            if let Some(bound) = kotlin_first_child_of_kind(constraint, "type")
+                .and_then(|t| node_text(t, source).ok())
+                .and_then(kotlin_type_name_from_text)
+            {
+                attributes.push(format!("bound:{name}:{bound}"));
             }
         }
     }
