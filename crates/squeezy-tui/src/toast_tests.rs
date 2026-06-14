@@ -11,11 +11,10 @@ fn empty_queue_is_empty() {
 #[test]
 fn push_adds_one_visible_entry() {
     let mut q = ToastQueue::new();
-    let id = q.push("indexed", ToastVariant::Success);
+    q.push("indexed", ToastVariant::Success);
     assert_eq!(q.len(), 1);
     let visible = q.visible();
     assert_eq!(visible.len(), 1);
-    assert_eq!(visible[0].id, id);
     assert_eq!(visible[0].message, "indexed");
     assert_eq!(visible[0].variant, ToastVariant::Success);
 }
@@ -44,17 +43,6 @@ fn push_evicts_oldest_at_capacity() {
     assert_eq!(visible[0].message, "d");
     assert_eq!(visible[1].message, "c");
     assert_eq!(visible[2].message, "b");
-}
-
-#[test]
-fn dismiss_removes_by_id() {
-    let mut q = ToastQueue::new();
-    let a = q.push("a", ToastVariant::Info);
-    let b = q.push("b", ToastVariant::Info);
-    assert!(q.dismiss(a));
-    assert_eq!(q.len(), 1);
-    assert_eq!(q.visible()[0].id, b);
-    assert!(!q.dismiss(a), "second dismiss of the same id is a no-op");
 }
 
 #[test]
@@ -93,8 +81,12 @@ fn toast_dismisses_after_five_seconds() {
     assert!(changed, "tick reports a change when an entry expires");
     assert!(q.is_empty(), "expired entries are removed after tick");
 
-    let id = q.push("default-ttl", ToastVariant::Info);
-    let toast = q.visible().into_iter().find(|t| t.id == id).unwrap();
+    q.push("default-ttl", ToastVariant::Info);
+    let toast = q
+        .visible()
+        .into_iter()
+        .find(|t| t.message == "default-ttl")
+        .unwrap();
     let remaining = toast.dismissed_at.saturating_duration_since(Instant::now());
     assert!(
         remaining <= DEFAULT_TOAST_TTL

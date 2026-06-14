@@ -450,7 +450,7 @@ fn keyboard_reachability_gate_flags_a_shadowed_keymap_path() {
     // path's target is shadowed in the keymap (some other action wins its key in
     // the reverse lookup), the gate must report a violation naming it. Here we
     // rebind `open_search` onto QueueUndo's default `u`, so `u` no longer
-    // resolves to QueueUndo (the JumpToLatest/QueueUndo path target) and the gate
+    // resolves to QueueUndo (the QueueUndo keymap-path target) and the gate
     // catches it. Without the resolution check this scenario is silently passed.
     let mut overrides = std::collections::BTreeMap::new();
     overrides.insert("open_search".to_string(), "u".to_string());

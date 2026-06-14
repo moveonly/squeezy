@@ -125,8 +125,8 @@ fn hit_test_distinguishes_cards_sharing_an_action_kind_via_key() {
 fn rowspan_target_round_trips() {
     let mut reg = Registry::new();
     let key = TargetKey::RowSpan(RowId(4), RowSpan::new(2, 9));
-    reg.register(rect(2, 0, 7, 1), key, Action::JumpToLatest);
-    assert_eq!(reg.hit_test(5, 0), Some((key, Action::JumpToLatest)));
+    reg.register(rect(2, 0, 7, 1), key, Action::QueueUndo);
+    assert_eq!(reg.hit_test(5, 0), Some((key, Action::QueueUndo)));
 }
 
 // ===========================================================================

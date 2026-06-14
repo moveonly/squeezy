@@ -46,10 +46,6 @@ pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
 pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-sonnet-4-6";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/api";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
-/// Synthetic model id for the in-process faux provider. The faux
-/// provider does not consult model registries during a request — this
-/// is purely a label that flows through cost/logging surfaces.
-pub const DEFAULT_FAUX_MODEL: &str = "faux-1";
 pub const DEFAULT_CHECKPOINT_RETENTION_DAYS: u64 = 7;
 pub const DEFAULT_CHECKPOINT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub const DEFAULT_CHECKPOINT_CLEANUP_INTERVAL_SECS: u64 = 60 * 60;
@@ -972,6 +968,18 @@ pub struct AppConfig {
     pub context_compaction: ContextCompactionConfig,
     pub subagents: SubagentConfig,
     pub store_responses: bool,
+    /// Opt into Anthropic's 1M-token context window (`context-1m-2025-08-07`
+    /// beta). Only takes effect on the Anthropic / Bedrock providers; the
+    /// agent attaches the beta id to the main-agent and subagent requests.
+    /// `false` (the default) leaves the standard 200K window in place.
+    /// Configured via `[model].context_1m` or `SQUEEZY_CONTEXT_1M`.
+    pub context_1m: bool,
+    /// Opt into Anthropic's interleaved/extended thinking
+    /// (`interleaved-thinking-2025-05-14` beta), which lets the model reason
+    /// between tool calls within a turn. Anthropic / Bedrock only. `false`
+    /// (the default) leaves thinking unchanged. Configured via
+    /// `[model].extended_thinking` or `SQUEEZY_EXTENDED_THINKING`.
+    pub extended_thinking: bool,
     pub exploration_graph: bool,
     pub max_parallel_tools: usize,
     pub tool_spill_threshold_bytes: usize,
@@ -1063,7 +1071,6 @@ pub fn provider_slug(provider: &ProviderConfig) -> &'static str {
         ProviderConfig::OpenAiCodex(_) => "openai_codex",
         ProviderConfig::GitHubCopilot(_) => "github_copilot",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
-        ProviderConfig::Faux(_) => "faux",
     }
 }
 
@@ -1357,12 +1364,6 @@ impl AppConfig {
                     ),
                 })
             }
-            "faux" | "mock" => ProviderConfig::Faux(FauxConfig {
-                script: get_var("SQUEEZY_FAUX_SCRIPT")
-                    .or_else(|| provider_setting(&providers, "faux", "script")),
-                name: None,
-                transport: provider_transport_settings(&providers, &["faux"]),
-            }),
             other if OpenAiCompatiblePreset::parse(other).is_some() => {
                 let preset =
                     OpenAiCompatiblePreset::parse(other).expect("guarded by match condition");
@@ -1407,8 +1408,6 @@ impl AppConfig {
                 provider_setting(&providers, config.preset.as_str(), "default_model")
                     .unwrap_or_else(|| config.preset.default_model().to_string())
             }
-            ProviderConfig::Faux(_) => provider_setting(&providers, "faux", "default_model")
-                .unwrap_or_else(|| DEFAULT_FAUX_MODEL.to_string()),
         };
         let profile = get_var("SQUEEZY_PROFILE")
             .or(model_settings.profile)
@@ -1431,7 +1430,6 @@ impl AppConfig {
             ProviderConfig::OpenAiCodex(_) => "openai_codex",
             ProviderConfig::GitHubCopilot(_) => "github_copilot",
             ProviderConfig::OpenAiCompatible(_) => "",
-            ProviderConfig::Faux(_) => "faux",
         };
         // Legacy GLOBAL reroute-model override (env → `[model].small_fast_model`).
         // The per-provider override (`[providers.<slug>].cheap_model`) and the
@@ -1541,6 +1539,17 @@ impl AppConfig {
                 provider,
                 ProviderConfig::OpenAi(_) | ProviderConfig::AzureOpenAi(_)
             );
+        // Anthropic beta opt-ins. Parsed unconditionally here; the agent
+        // attaches the beta ids to requests only when the active provider is
+        // Anthropic or Bedrock, so a stray flag on another provider is inert.
+        let context_1m = get_var("SQUEEZY_CONTEXT_1M")
+            .as_deref()
+            .map(parse_enabled_bool)
+            .unwrap_or(model_settings.context_1m.unwrap_or(false));
+        let extended_thinking = get_var("SQUEEZY_EXTENDED_THINKING")
+            .as_deref()
+            .map(parse_enabled_bool)
+            .unwrap_or(model_settings.extended_thinking.unwrap_or(false));
         let agent_settings = settings.agent.unwrap_or_default();
         // Exploration graph prefetch defaults to on, and the documented env-var
         // override is `SQUEEZY_EXPLORATION_GRAPH=off|false|...`. Treating
@@ -1754,6 +1763,8 @@ impl AppConfig {
             context_compaction,
             subagents,
             store_responses,
+            context_1m,
+            extended_thinking,
             exploration_graph,
             max_parallel_tools,
             tool_spill_threshold_bytes,
@@ -1966,7 +1977,12 @@ impl AppConfig {
             "stream_idle_timeout_ms = {}\n",
             self.stream_idle_timeout.as_millis()
         ));
-        output.push_str(&format!("store_responses = {}\n\n", self.store_responses));
+        output.push_str(&format!("store_responses = {}\n", self.store_responses));
+        output.push_str(&format!("context_1m = {}\n", self.context_1m));
+        output.push_str(&format!(
+            "extended_thinking = {}\n\n",
+            self.extended_thinking
+        ));
 
         output.push_str("[agent]\n");
         output.push_str(&format!(
@@ -2430,12 +2446,8 @@ impl AppConfig {
 
         output.push_str("[hardening]\n");
         output.push_str(&format!(
-            "disable_core_dumps = {}\n",
+            "disable_core_dumps = {}\n\n",
             self.hardening.disable_core_dumps
-        ));
-        output.push_str(&format!(
-            "deny_debug_attach = {}\n\n",
-            self.hardening.deny_debug_attach
         ));
 
         output.push_str("[telemetry]\n");
@@ -2814,7 +2826,6 @@ fn provider_kind(provider: &ProviderConfig) -> &'static str {
         ProviderConfig::OpenAiCodex(_) => "openai_codex",
         ProviderConfig::GitHubCopilot(_) => "github_copilot",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
-        ProviderConfig::Faux(_) => "faux",
     }
 }
 
@@ -2971,14 +2982,6 @@ fn model_option_support(provider: &ProviderConfig, model: &str) -> ModelOptionSu
             }
         }
         ProviderConfig::OpenAiCompatible(_) => chat_completions,
-        ProviderConfig::Faux(_) => ModelOptionSupport {
-            temperature: false,
-            top_p: false,
-            seed: false,
-            stop: false,
-            frequency_penalty: false,
-            presence_penalty: false,
-        },
     }
 }
 
@@ -3127,13 +3130,6 @@ pub enum ProviderConfig {
     /// token persisted under `~/.squeezy/auth/github-copilot.json`;
     /// the request host is derived from the Copilot token at runtime.
     GitHubCopilot(GitHubCopilotConfig),
-    /// Deterministic in-process faux provider for tests and the eval
-    /// harness. The wire protocol is local: each `stream_response` call
-    /// pops the next scripted response from an internal queue and replays
-    /// it as a synthetic event stream. No outbound HTTP. See
-    /// `squeezy-llm`'s `FauxProvider` for the runtime behaviour and
-    /// script format.
-    Faux(FauxConfig),
 }
 
 /// OpenAI Chat-Completions–style providers (one struct, many presets).
@@ -3861,47 +3857,6 @@ impl Default for OllamaConfig {
     }
 }
 
-/// Configuration for the in-process faux provider used by tests and the
-/// eval harness. The provider is wired through [`ProviderConfig::Faux`]
-/// so eval / integration tests can target it with a `[providers.faux]`
-/// TOML section instead of plumbing a bespoke mock through every entry
-/// point.
-///
-/// Example settings:
-///
-/// ```toml
-/// [model]
-/// provider = "faux"
-///
-/// [providers.faux]
-/// # Optional path to a TOML script file. When omitted the provider
-/// # starts empty and callers must push responses programmatically.
-/// script = "tests/fixtures/faux-script.toml"
-/// # Optional override for the provider name reported by
-/// # `LlmProvider::name` (defaults to "faux").
-/// default_model = "faux-1"
-/// ```
-///
-/// `script` is read by `squeezy-llm`'s `FauxProvider::from_config`; see
-/// that crate for the script schema (a list of `[[turn]]` entries with
-/// `text` / `thinking` / `tool_calls` / `error` / token-usage fields).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct FauxConfig {
-    /// Path to a TOML file describing the scripted responses. Resolved
-    /// relative to the process working directory when the provider is
-    /// constructed.
-    #[serde(default)]
-    pub script: Option<String>,
-    /// Optional override for the provider name returned by
-    /// `LlmProvider::name`. Falls back to `"faux"` when unset.
-    #[serde(default)]
-    pub name: Option<String>,
-    /// Retry / timeout knobs are accepted for surface symmetry with the
-    /// real providers but ignored by the in-process faux implementation.
-    #[serde(default)]
-    pub transport: ProviderTransportConfig,
-}
-
 /// Selects which HTTP route the Ollama provider uses to stream completions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -4314,17 +4269,11 @@ impl SettingsFile {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct HardeningSettings {
     pub disable_core_dumps: Option<bool>,
-    pub deny_debug_attach: Option<bool>,
 }
 
 impl HardeningSettings {
     fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
-        reject_unknown_keys(
-            table,
-            &["disable_core_dumps", "deny_debug_attach"],
-            source,
-            path,
-        )?;
+        reject_unknown_keys(table, &["disable_core_dumps"], source, path)?;
         Ok(Self {
             disable_core_dumps: bool_value(
                 table,
@@ -4332,32 +4281,23 @@ impl HardeningSettings {
                 source,
                 &field(path, "disable_core_dumps"),
             )?,
-            deny_debug_attach: bool_value(
-                table,
-                "deny_debug_attach",
-                source,
-                &field(path, "deny_debug_attach"),
-            )?,
         })
     }
 
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.disable_core_dumps, next.disable_core_dumps);
-        replace_if_some(&mut self.deny_debug_attach, next.deny_debug_attach);
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HardeningConfig {
     pub disable_core_dumps: bool,
-    pub deny_debug_attach: bool,
 }
 
 impl Default for HardeningConfig {
     fn default() -> Self {
         Self {
             disable_core_dumps: true,
-            deny_debug_attach: true,
         }
     }
 }
@@ -4366,9 +4306,39 @@ impl HardeningConfig {
     fn from_settings(settings: HardeningSettings) -> Self {
         Self {
             disable_core_dumps: settings.disable_core_dumps.unwrap_or(true),
-            deny_debug_attach: settings.deny_debug_attach.unwrap_or(true),
         }
     }
+}
+
+/// Resolve the effective `[hardening]` config before any heavy startup work.
+///
+/// `pre_main_hardening` runs at the very top of each binary's entry point, far
+/// earlier than the full config load, so this reads and parses *only* the
+/// `[hardening]` table from the resolved settings file (honoring
+/// `SQUEEZY_SETTINGS_PATH`, then the default path). Any failure — missing file,
+/// unparseable TOML, a malformed `[hardening]` section, or no section at all —
+/// falls back to the safe defaults (both toggles on) rather than weakening the
+/// process, matching the behavior of the full loader.
+pub fn early_hardening_config() -> HardeningConfig {
+    let path = default_settings_path();
+    let Ok(text) = fs::read_to_string(&path) else {
+        return HardeningConfig::default();
+    };
+    let Ok(table) = toml::from_str::<toml::value::Table>(&text) else {
+        return HardeningConfig::default();
+    };
+    let source = format!("hardening:{}", path.display());
+    let settings = match optional_table(&table, "hardening", &source) {
+        Ok(Some(hardening)) => {
+            HardeningSettings::from_table(hardening, &source, "hardening").unwrap_or_default()
+        }
+        _ => HardeningSettings::default(),
+    };
+    // `from_table` may have recorded unknown keys in the thread-local registry;
+    // drain them so they don't leak into the later full config load on this
+    // thread.
+    let _ = take_unknown_fields();
+    HardeningConfig::from_settings(settings)
 }
 
 // M-63: redaction lives on the serde `Serialize` path only (see
@@ -4443,9 +4413,6 @@ pub struct ProviderSettings {
     /// every other provider. Can also be supplied via the `OLLAMA_KEEP_ALIVE`
     /// env var (env var takes precedence over TOML).
     pub keep_alive: Option<String>,
-    /// Faux-only: path to a TOML script file consumed by the in-process
-    /// faux provider. Other providers ignore this field.
-    pub script: Option<String>,
     /// Azure-only: opt in to the Entra ID / managed-identity bearer auth
     /// path. When `Some(true)` the provider emits `Authorization: Bearer`
     /// sourced from `AZURE_OPENAI_BEARER_TOKEN` instead of the default
@@ -4531,7 +4498,6 @@ impl ProviderSettings {
                 "deployment_name_map",
                 "route_style",
                 "keep_alive",
-                "script",
                 "use_entra_id",
                 "organization",
                 "project",
@@ -4785,7 +4751,6 @@ impl ProviderSettings {
             deployment_name_map,
             route_style: string_value(table, "route_style", source, &field(path, "route_style"))?,
             keep_alive: string_value(table, "keep_alive", source, &field(path, "keep_alive"))?,
-            script: string_value(table, "script", source, &field(path, "script"))?,
             use_entra_id: bool_value(table, "use_entra_id", source, &field(path, "use_entra_id"))?,
             organization: string_value(
                 table,
@@ -4858,7 +4823,6 @@ impl ProviderSettings {
         replace_if_some(&mut self.headers, next.headers);
         replace_if_some(&mut self.route_style, next.route_style);
         replace_if_some(&mut self.keep_alive, next.keep_alive);
-        replace_if_some(&mut self.script, next.script);
         replace_if_some(&mut self.use_entra_id, next.use_entra_id);
         replace_if_some(&mut self.organization, next.organization);
         replace_if_some(&mut self.project, next.project);
@@ -4994,6 +4958,14 @@ pub struct ModelSettings {
     pub presence_penalty: Option<f32>,
     pub stream_idle_timeout_ms: Option<u64>,
     pub store_responses: Option<bool>,
+    /// Opt into Anthropic's 1M-token context window beta. Anthropic /
+    /// Bedrock only; ignored on other providers. `None`/`false` keeps the
+    /// standard window.
+    pub context_1m: Option<bool>,
+    /// Opt into Anthropic's interleaved/extended-thinking beta. Anthropic /
+    /// Bedrock only; ignored on other providers. `None`/`false` leaves
+    /// thinking unchanged.
+    pub extended_thinking: Option<bool>,
     pub selection_version: Option<u32>,
     /// Forwarded to the provider as `tool_choice` whenever tools are
     /// advertised on the request. `None` omits the field (provider
@@ -5043,6 +5015,8 @@ impl ModelSettings {
                 "presence_penalty",
                 "stream_idle_timeout_ms",
                 "store_responses",
+                "context_1m",
+                "extended_thinking",
                 "selection_version",
                 "tool_choice",
                 "parallel_tool_calls",
@@ -5122,6 +5096,13 @@ impl ModelSettings {
                 source,
                 &field(path, "store_responses"),
             )?,
+            context_1m: bool_value(table, "context_1m", source, &field(path, "context_1m"))?,
+            extended_thinking: bool_value(
+                table,
+                "extended_thinking",
+                source,
+                &field(path, "extended_thinking"),
+            )?,
             selection_version: u32_value(
                 table,
                 "selection_version",
@@ -5167,6 +5148,8 @@ impl ModelSettings {
             next.stream_idle_timeout_ms,
         );
         replace_if_some(&mut self.store_responses, next.store_responses);
+        replace_if_some(&mut self.context_1m, next.context_1m);
+        replace_if_some(&mut self.extended_thinking, next.extended_thinking);
         replace_if_some(&mut self.selection_version, next.selection_version);
         replace_if_some(&mut self.tool_choice, next.tool_choice);
         replace_if_some(&mut self.parallel_tool_calls, next.parallel_tool_calls);
@@ -11326,7 +11309,6 @@ pub fn user_settings_template() -> &'static str {
 
 [hardening]
 # disable_core_dumps = true
-# deny_debug_attach = true
 
 [telemetry]
 # enabled = true
@@ -11522,7 +11504,6 @@ pub fn project_settings_template() -> &'static str {
 
 [hardening]
 # disable_core_dumps = true
-# deny_debug_attach = true
 
 # `[graph]` controls workspace indexing. `[mcp.servers.*]` configures
 # external MCP tools that are discovered before each agent turn.
@@ -12081,7 +12062,6 @@ fn provider_setting(
         "keep_alive" => settings.keep_alive.as_ref(),
         "cloudflare_account_id" => settings.cloudflare_account_id.as_ref(),
         "cloudflare_gateway_id" => settings.cloudflare_gateway_id.as_ref(),
-        "script" => settings.script.as_ref(),
         "organization" => settings.organization.as_ref(),
         "project" => settings.project.as_ref(),
         "service_tier" => settings.service_tier.as_ref(),
@@ -12190,9 +12170,6 @@ fn validate_provider_base_urls(provider: &ProviderConfig) -> Result<()> {
             Some(url) => check_base_url_scheme(url, "bedrock"),
             None => Ok(()),
         },
-        // The faux provider runs entirely in-process; no base URL to
-        // validate.
-        ProviderConfig::Faux(_) => Ok(()),
     }
 }
 
@@ -12590,7 +12567,6 @@ fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] 
             OpenAiCompatiblePreset::CloudflareAiGateway => &["cloudflare_ai_gateway"],
             OpenAiCompatiblePreset::Custom => &["openai_compatible"],
         },
-        ProviderConfig::Faux(_) => &["faux"],
     }
 }
 
@@ -14367,6 +14343,14 @@ pub enum ContextAttachmentKind {
     /// matching `LlmInputItem::Image` per turn when the active model
     /// advertises vision capability.
     Image,
+    /// Binary document payload (PDF/DOCX/XLSX/DOC/XLS) routed by file
+    /// extension. The raw bytes are retained on
+    /// [`ContextAttachment::image_data_base64`] (shared byte slot) so the
+    /// agent can emit a matching `LlmInputItem::Document` per turn when the
+    /// active provider advertises a document lowering. Text-like documents
+    /// (CSV/Markdown/HTML/plain text) keep their existing text-attachment
+    /// routing, which embeds the readable content directly.
+    Document,
 }
 
 impl ContextAttachmentKind {
@@ -14379,13 +14363,14 @@ impl ContextAttachmentKind {
             Self::UnsupportedBinary => "unsupported_binary",
             Self::UnsupportedImage => "unsupported_image",
             Self::Image => "image",
+            Self::Document => "document",
         }
     }
 
     pub fn is_supported_text(self) -> bool {
         !matches!(
             self,
-            Self::UnsupportedBinary | Self::UnsupportedImage | Self::Image
+            Self::UnsupportedBinary | Self::UnsupportedImage | Self::Image | Self::Document
         )
     }
 
@@ -14395,6 +14380,14 @@ impl ContextAttachmentKind {
     /// instead of being squashed into the user text reference block.
     pub fn is_routable_image(self) -> bool {
         matches!(self, Self::Image)
+    }
+
+    /// `true` for the [`Self::Document`] kind. Used at request-build time
+    /// to fan a single attachment out into a `LlmInputItem::Document` so
+    /// the bytes reach the provider's document content block verbatim
+    /// instead of being dropped as an unsupported binary.
+    pub fn is_routable_document(self) -> bool {
+        matches!(self, Self::Document)
     }
 }
 
@@ -14474,6 +14467,14 @@ pub fn detect_context_attachment_kind(
     if looks_like_image(label, bytes) {
         return ContextAttachmentKind::UnsupportedImage;
     }
+    // Binary document formats (PDF/DOCX/XLSX/…) are detected by extension
+    // and routed to the provider's document content block. Text-like
+    // documents (CSV/Markdown/HTML/plain text) deliberately fall through
+    // to the text-attachment classification below, which embeds their
+    // readable content directly rather than shipping opaque bytes.
+    if detect_binary_document_media_type(label).is_some() {
+        return ContextAttachmentKind::Document;
+    }
     let Some(text) = text else {
         return ContextAttachmentKind::UnsupportedBinary;
     };
@@ -14519,6 +14520,25 @@ pub fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
         return Some("image/webp");
     }
     None
+}
+
+/// Map a binary document file extension to its canonical MIME type. Only
+/// the formats that are unreadable as text — and would otherwise be
+/// dropped as `UnsupportedBinary` — are routed to the document pipeline:
+/// PDF, Word (`.doc`/`.docx`), and Excel (`.xls`/`.xlsx`). The returned
+/// MIME strings match the document-block media-type maps in the
+/// `squeezy-llm` providers. Returns `None` for unknown or text-like
+/// extensions so the caller can fall back to text classification.
+pub fn detect_binary_document_media_type(label: Option<&str>) -> Option<&'static str> {
+    let lower = label?.to_ascii_lowercase();
+    match lower.rsplit('.').next()? {
+        "pdf" => Some("application/pdf"),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "doc" => Some("application/msword"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "xls" => Some("application/vnd.ms-excel"),
+        _ => None,
+    }
 }
 
 pub fn context_attachment_preview(text: &str, max_bytes: usize) -> (String, bool) {

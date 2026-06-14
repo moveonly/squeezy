@@ -822,9 +822,8 @@ pub async fn run_with_startup_profile_in_terminal_and_telemetry(
 }
 
 pub fn startup_resume_question_available(config: &AppConfig) -> bool {
-    // Only a yes/no answer is needed here, so use the summary-only loader:
-    // skip the per-candidate event-log reads that `load_candidates` does for
-    // branch detection (the picker itself still does them when it renders).
+    // Only a yes/no answer is needed here, and the candidate list is built
+    // from session metadata alone, so no event-log reads are required.
     let candidates = resume_picker::load_candidate_summaries(config);
     resume_picker::has_scoped_candidates(&candidates, &config.workspace_root)
 }
@@ -891,6 +890,12 @@ async fn run_inner_with_terminal(
     signal_teardown::install_signal_handlers();
     let direct_resume_requested = resume_session_id.is_some();
     let picker_route_enabled = !startup.skip_resume_picker && !direct_resume_requested;
+    // An explicit `SQUEEZY_HIGH_CONTRAST` opt-in wins for the palette before
+    // anything else reads the theme, so the env var delivers the same
+    // high-contrast presentation as `/theme high-contrast` instead of only a
+    // telemetry signal. Folded into `config` so the agent snapshot and the
+    // TuiApp below observe the override too.
+    apply_high_contrast_env_override(&mut config, high_contrast_requested());
     // Apply the persisted theme preference before the first render so the
     // initial paint already reflects the user's choice — without this the
     // first frame uses the auto-detected tone and pops to the override on
@@ -1473,7 +1478,7 @@ fn maybe_pick_resume_session(
     if startup.skip_resume_picker {
         return Ok(ResumeStartup::Fresh);
     }
-    let candidates = resume_picker::load_candidates(config);
+    let candidates = resume_picker::load_candidate_summaries(config);
     if candidates.is_empty() {
         return Ok(ResumeStartup::Fresh);
     }
@@ -1489,13 +1494,7 @@ fn maybe_pick_resume_session(
     .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
     match choice {
         resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
-        // The picker only emits linear entries (branch-tip rows are collapsed
-        // until branch-aware resume is implemented), so `branch_tip` is always
-        // `None` here. The field is preserved in the enum for future use.
-        resume_picker::ResumeChoice::Resume {
-            session_id,
-            branch_tip: _,
-        } => Ok(ResumeStartup::Use(session_id)),
+        resume_picker::ResumeChoice::Resume { session_id } => Ok(ResumeStartup::Use(session_id)),
         resume_picker::ResumeChoice::CrossProject {
             session_id,
             target_cwd,
@@ -10024,6 +10023,25 @@ fn insert_file_prompt_attachment(app: &mut TuiApp, path: &str) -> Result<String>
             insert_prompt_image_token(app, format!("[Image {label}]"), media_type, bytes);
         return Ok(format!("inserted {placeholder}"));
     }
+    if kind == ContextAttachmentKind::Document {
+        if bytes.len() > MAX_PROMPT_DOCUMENT_BYTES {
+            return Err(SqueezyError::Agent(format!(
+                "document {label} is {} bytes; exceeds the {MAX_PROMPT_DOCUMENT_BYTES} byte attachment limit. Split or compress it before attaching",
+                bytes.len(),
+            )));
+        }
+        let media_type = squeezy_core::detect_binary_document_media_type(Some(&label))
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let placeholder = insert_prompt_document_token(
+            app,
+            format!("[Document {label}]"),
+            media_type,
+            label,
+            bytes,
+        );
+        return Ok(format!("inserted {placeholder}"));
+    }
     if !kind.is_supported_text() {
         return Err(SqueezyError::Agent(format!(
             "unsupported file kind={}",
@@ -10181,6 +10199,26 @@ fn insert_prompt_image_token(
         placeholder: placeholder.clone(),
         payload: PromptAttachmentPayload::Image {
             media_type,
+            bytes: Arc::from(bytes.into_boxed_slice()),
+        },
+    });
+    placeholder
+}
+
+fn insert_prompt_document_token(
+    app: &mut TuiApp,
+    base_placeholder: String,
+    media_type: String,
+    name: String,
+    bytes: Vec<u8>,
+) -> String {
+    let placeholder = unique_prompt_placeholder(app, &base_placeholder);
+    insert_input_text(app, &placeholder);
+    app.prompt_attachments.push(PromptAttachment {
+        placeholder: placeholder.clone(),
+        payload: PromptAttachmentPayload::Document {
+            media_type,
+            name,
             bytes: Arc::from(bytes.into_boxed_slice()),
         },
     });
@@ -10963,6 +11001,10 @@ fn dispatch_keymap_action_inner(
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
                 return false;
             }
+            // The suspend/spawn/terminal-restore plumbing is Unix-only. Off Unix
+            // the chord is consumed silently (so `Alt+e` never leaks `e` into the
+            // composer) and does nothing — there is no editor handoff to offer.
+            #[cfg(unix)]
             open_composer_in_editor(app);
             true
         }
@@ -16522,43 +16564,36 @@ fn toggle_pin_selected_clipboard_entry(app: &mut TuiApp) {
 
 /// `Alt+e`: open the composer text in the user's `$VISUAL`/`$EDITOR` (§12.6.5
 /// External Editor Handoff). Resolves the editor from the environment; when none
-/// is configured (or this is a non-Unix build, where the suspend/spawn plumbing
-/// is not wired) this degrades to a safe status hint and changes nothing.
+/// is configured this degrades to a safe status hint and changes nothing.
 /// Otherwise it stamps a [`editor_handoff::EditorHandoffRequest`] for the run
 /// loop to execute on its next turn — the loop owns the terminal guard, so it
 /// (not this side-effect-light arm) does the alt-screen suspend / spawn /
 /// restore. Editing during a live turn is fine: the composer text is independent
 /// of the running turn.
+///
+/// Unix-only: the suspend/spawn/terminal-restore plumbing differs sharply off
+/// Unix (see the spec's platform notes), so there is no handoff to offer there.
+#[cfg(unix)]
 fn open_composer_in_editor(app: &mut TuiApp) {
-    // Off Unix the suspend/spawn/terminal-restore differs sharply (see the spec's
-    // platform notes), so the spawn is Unix-only; the non-Unix build keeps the
-    // keybinding reachable but degrades to the same hint as "no editor set".
-    #[cfg(not(unix))]
-    {
-        app.status = "external editor handoff is only available on Unix builds".to_string();
-    }
-    #[cfg(unix)]
-    {
-        let Some(command) = editor_handoff::resolve_editor(|key| std::env::var_os(key)) else {
-            app.status =
-                "no editor configured — set $VISUAL or $EDITOR to edit in your editor".to_string();
-            return;
-        };
-        app.pending_editor_handoff = Some(editor_handoff::EditorHandoffRequest {
-            target: editor_handoff::EditorTarget::Composer,
-            initial_text: app.input.clone(),
-            command,
-        });
-        // The loop runs the handoff before its next draw; surface the editor we
-        // are about to hand off to so the brief alt-screen leave is explained.
-        app.status = format!(
-            "opening composer in {} …",
-            app.pending_editor_handoff
-                .as_ref()
-                .map(|r| r.command.display())
-                .unwrap_or_default(),
-        );
-    }
+    let Some(command) = editor_handoff::resolve_editor(|key| std::env::var_os(key)) else {
+        app.status =
+            "no editor configured — set $VISUAL or $EDITOR to edit in your editor".to_string();
+        return;
+    };
+    app.pending_editor_handoff = Some(editor_handoff::EditorHandoffRequest {
+        target: editor_handoff::EditorTarget::Composer,
+        initial_text: app.input.clone(),
+        command,
+    });
+    // The loop runs the handoff before its next draw; surface the editor we
+    // are about to hand off to so the brief alt-screen leave is explained.
+    app.status = format!(
+        "opening composer in {} …",
+        app.pending_editor_handoff
+            .as_ref()
+            .map(|r| r.command.display())
+            .unwrap_or_default(),
+    );
 }
 
 /// Apply a completed editor handoff to the app: a real change opens the
@@ -19441,10 +19476,6 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
                 queue_cycle_condition_by_id(app, id);
             }
         }
-        // Scrollbar-jump and jump-to-latest are not yet registered as targets
-        // by the render paths; their handlers land with the affordances that
-        // register them. Until then these arms are inert (no panic).
-        interaction::Action::ScrollbarJump | interaction::Action::JumpToLatest => {}
         // Minimap turn-rail cell click: jump so the entry behind the cell sits
         // at the top of the viewport. Reuses the keyboard jump path
         // (`jump_to_entry_id`), so mouse/keyboard parity holds by construction.
@@ -25407,6 +25438,17 @@ fn prepare_prompt_turn_input(app: &mut TuiApp, input: String) -> PreparedPromptT
             }
             PromptAttachmentPayload::Image { media_type, bytes } => {
                 transient_input_items.push(LlmInputItem::Image { media_type, bytes });
+            }
+            PromptAttachmentPayload::Document {
+                media_type,
+                name,
+                bytes,
+            } => {
+                transient_input_items.push(LlmInputItem::Document {
+                    media_type,
+                    name,
+                    bytes,
+                });
             }
         }
     }
@@ -46919,6 +46961,12 @@ struct Osc52Clipboard;
 /// quietly discarded the escape.
 pub(crate) const OSC52_MAX_PAYLOAD_BYTES: usize = 8 * 1024;
 
+/// Cap on document attachment bytes accepted via `/attach`. Matches the
+/// strictest provider document-block limit (Bedrock Converse, ~4.5 MiB)
+/// so an oversized PDF fails at attach time with an actionable message
+/// instead of being rejected later at the provider wire.
+pub(crate) const MAX_PROMPT_DOCUMENT_BYTES: usize = 4_718_592;
+
 impl Clipboard for Osc52Clipboard {
     fn copy_text(&mut self, text: &str) -> std::result::Result<(), String> {
         let sequence = build_osc52_sequence(text)?;
@@ -47344,6 +47392,11 @@ enum PromptAttachmentPayload {
     },
     Image {
         media_type: String,
+        bytes: Arc<[u8]>,
+    },
+    Document {
+        media_type: String,
+        name: String,
         bytes: Arc<[u8]>,
     },
 }
@@ -49522,6 +49575,8 @@ impl TuiApp {
         self.transcript_default = config.tui.transcript_default;
         self.show_reasoning_usage = config.tui.show_reasoning_usage;
         self.coalesce_tool_runs = config.tui.coalesce_tool_runs;
+        self.desktop_notifier
+            .set_method(config.tui.desktop_notifications);
         self.copy_on_select = config.tui.copy_on_select;
         self.permissions = PermissionStatus::from_policy(&config.permissions);
         self.telemetry = TelemetryStatus::from_config(&config.telemetry);
@@ -51162,6 +51217,21 @@ fn high_contrast_requested() -> bool {
         .ok()
         .and_then(|name| squeezy_core::normalize_tui_theme_name(&name))
         .is_some_and(|slug| slug == "high-contrast")
+}
+
+/// Force the built-in `high-contrast` palette onto `config` when the
+/// environment opted into a high-contrast presentation. An explicit
+/// accessibility request wins over the persisted theme preference, so the
+/// resolved palette matches what `/theme high-contrast` selects. Returns
+/// whether the override was applied; the boolean keeps the call site testable
+/// without inspecting global theme state. No-op when the config already names
+/// the high-contrast slug so an unrelated theme is never clobbered needlessly.
+fn apply_high_contrast_env_override(config: &mut AppConfig, requested: bool) -> bool {
+    if !requested || config.tui.theme == "high-contrast" {
+        return false;
+    }
+    config.tui.theme = "high-contrast".to_string();
+    true
 }
 
 /// Emit the terminal startup setup sequence into `writer`: the keyboard

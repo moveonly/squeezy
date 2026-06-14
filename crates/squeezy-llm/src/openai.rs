@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
-    LlmEvent, LlmHostedTool, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest, LlmStream,
-    LlmToolCall, ReasoningKind, ReasoningPayload,
+    LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+    ReasoningKind, ReasoningPayload,
     credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
     openai_prompt_cache::clamp_prompt_cache_key,
     retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
@@ -404,8 +404,8 @@ impl OpenAiProvider {
                 body["include"] = json!(["reasoning.encrypted_content"]);
             }
         }
-        if !request.tools.is_empty() || !request.hosted_tools.is_empty() {
-            let mut tools = Vec::with_capacity(request.tools.len() + request.hosted_tools.len());
+        if !request.tools.is_empty() {
+            let mut tools = Vec::with_capacity(request.tools.len());
             for tool in request.tools.iter() {
                 tools.push(json!({
                     "type": "function",
@@ -414,9 +414,6 @@ impl OpenAiProvider {
                     "parameters": tool.parameters,
                     "strict": tool.strict,
                 }));
-            }
-            for tool in &request.hosted_tools {
-                tools.push(openai_hosted_tool(tool, provider_name));
             }
             body["tools"] = Value::Array(tools);
         }
@@ -467,32 +464,6 @@ impl OpenAiProvider {
             ("session_id", clamped.clone()),
             ("x-client-request-id", clamped),
         ]
-    }
-}
-
-fn openai_hosted_tool(tool: &LlmHostedTool, provider_name: &str) -> Value {
-    match tool {
-        LlmHostedTool::WebSearch { filters } if provider_name == "xai" => {
-            let mut value = json!({ "type": "web_search" });
-            if let Some(filters) = filters {
-                value["filters"] = filters.clone();
-            }
-            value
-        }
-        LlmHostedTool::WebSearch { filters } => {
-            let mut value = json!({ "type": "web_search_preview" });
-            if let Some(filters) = filters {
-                value["filters"] = filters.clone();
-            }
-            value
-        }
-        LlmHostedTool::FileSearch { vector_store_ids } => json!({
-            "type": "file_search",
-            "vector_store_ids": vector_store_ids,
-        }),
-        LlmHostedTool::ComputerUse => json!({
-            "type": "computer_use_preview",
-        }),
     }
 }
 
@@ -640,9 +611,6 @@ impl LlmProvider for OpenAiProvider {
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
         if let Err(err) = request.ensure_vision_support(self.name) {
-            return Box::pin(futures_util::stream::once(async move { Err(err) }));
-        }
-        if let Err(err) = request.reject_unsupported_documents(self.name) {
             return Box::pin(futures_util::stream::once(async move { Err(err) }));
         }
         let client = self.client.clone();
@@ -1427,17 +1395,66 @@ fn openai_input_item(item: &LlmInputItem) -> Option<Value> {
         }
         // Reasoning items from other providers are dropped when replaying to OpenAI.
         LlmInputItem::Reasoning(_) => return None,
-        // OpenAI Responses accepts document inputs via the `input_file`
-        // content block. Per-provider lowering lands in Phase 4; for
-        // now we skip with a debug log so the request still ships.
-        LlmInputItem::Document { name, .. } => {
-            tracing::debug!(
-                target: "squeezy_llm::openai",
-                name = name.as_str(),
-                "openai document content block not yet implemented; skipping",
-            );
-            return None;
-        }
+        LlmInputItem::Document {
+            media_type,
+            name,
+            bytes,
+        } => openai_document_item(media_type, name, bytes),
+    })
+}
+
+/// Lower an `LlmInputItem::Document` into an OpenAI Responses user item.
+///
+/// The Responses API ingests PDFs through the `input_file` content block
+/// (a `data:` URL carrying the base64 payload). Text-representable
+/// formats (CSV, Markdown, HTML, plain text) degrade to an `input_text`
+/// block when their bytes are valid UTF-8. Office binaries and other
+/// payloads the API cannot read degrade to a descriptive `input_text`
+/// block naming the attachment rather than being dropped silently.
+fn openai_document_item(media_type: &str, name: &str, bytes: &Arc<[u8]>) -> Value {
+    let lower = media_type.to_ascii_lowercase();
+    if matches!(lower.as_str(), "application/pdf" | "application/x-pdf") {
+        return json!({
+            "role": "user",
+            "content": [{
+                "type": "input_file",
+                "filename": name,
+                "file_data": format!(
+                    "data:application/pdf;base64,{}",
+                    BASE64_STANDARD.encode(bytes.as_ref())
+                ),
+            }],
+        });
+    }
+    let text_like = matches!(
+        lower.as_str(),
+        "text/plain"
+            | "text/csv"
+            | "application/csv"
+            | "text/markdown"
+            | "text/x-markdown"
+            | "text/html"
+            | "application/xhtml+xml"
+    );
+    let text = if text_like {
+        std::str::from_utf8(bytes.as_ref())
+            .map(|body| format!("Attached document `{name}` ({media_type}):\n{body}"))
+            .ok()
+    } else {
+        None
+    };
+    let text = text.unwrap_or_else(|| {
+        format!(
+            "[attached document `{name}` ({media_type}) could not be inlined for this model; \
+             ask for its text to be extracted before retrying]"
+        )
+    });
+    json!({
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": text,
+        }],
     })
 }
 

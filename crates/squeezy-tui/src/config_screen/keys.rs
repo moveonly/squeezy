@@ -383,17 +383,6 @@ pub(crate) fn handle_key(
                     "Use `squeezy auth set <provider>` to write the secret.",
                     NotifySeverity::Info,
                 );
-            } else if matches!(
-                field.kind,
-                FieldKind::TableArray { .. } | FieldKind::ProviderSubTabs
-            ) {
-                notifications.push(
-                    format!(
-                        "{} is not yet editable in the screen — edit the TOML directly for now.",
-                        field.label
-                    ),
-                    NotifySeverity::Info,
-                );
             } else if matches!(field.kind, FieldKind::String { multiline: true }) {
                 // Long paragraph fields (the judge prompt) open a full-screen
                 // multi-line editor — the inline single-line caret overflows

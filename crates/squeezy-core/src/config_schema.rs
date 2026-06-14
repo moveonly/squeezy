@@ -31,9 +31,9 @@ use crate::{
     DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL, DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
     DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
     DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, DEFAULT_TUI_SPINNER_NAME,
-    DEFAULT_TUI_THEME_NAME, DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode,
-    PermissionPolicyMode, ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode,
-    SessionResumePicker, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault,
+    DEFAULT_TUI_THEME_NAME, DEFAULT_WEBSEARCH_PROVIDER, NotificationMethod, OpenAiCompatiblePreset,
+    PermissionMode, PermissionPolicyMode, ProviderConfig, ReasoningEffort, ResponseVerbosity,
+    SessionMode, SessionResumePicker, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault,
     TuiSynchronizedOutput, normalize_tui_spinner_name, normalize_tui_theme_name,
 };
 
@@ -140,32 +140,6 @@ pub enum FieldKind {
     /// verbatim; there is no editor and saves never touch it. Used to surface
     /// context like the active provider in the Routing section.
     Info,
-    /// Singleton kind used only by the `Providers` section to indicate the
-    /// six per-provider sub-tabs along the right pane.
-    ProviderSubTabs,
-    /// Multi-row editor: each row is itself a `FieldMeta` schema. `Keyed`
-    /// rows are addressed by name (`[mcp.servers.<name>]`); `Ordered` rows
-    /// are positional (`[[permissions.rules]]`).
-    TableArray {
-        kind: TableArrayKind,
-    },
-}
-
-#[derive(Clone, Copy)]
-pub enum TableArrayKind {
-    Keyed { item_fields: &'static [FieldMeta] },
-    Ordered { item_fields: &'static [FieldMeta] },
-}
-
-impl std::fmt::Debug for TableArrayKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Keyed { item_fields } => write!(f, "Keyed {{ {} fields }}", item_fields.len()),
-            Self::Ordered { item_fields } => {
-                write!(f, "Ordered {{ {} fields }}", item_fields.len())
-            }
-        }
-    }
 }
 
 impl std::fmt::Debug for FieldKind {
@@ -214,8 +188,6 @@ impl std::fmt::Debug for FieldKind {
                 .field("dir_only", dir_only)
                 .finish(),
             Self::Secret { env_var } => f.debug_struct("Secret").field("env_var", env_var).finish(),
-            Self::ProviderSubTabs => write!(f, "ProviderSubTabs"),
-            Self::TableArray { kind } => f.debug_struct("TableArray").field("kind", kind).finish(),
         }
     }
 }
@@ -239,7 +211,7 @@ pub enum FieldValue {
     /// the dedicated secret-entry flow which writes inline `api_key` to
     /// the active scope's TOML.
     Secret,
-    /// Selected sub-tab index (read-only convenience for `ProviderSubTabs`).
+    /// Selected sub-tab index (read-only convenience for a sub-tabbed row).
     SubTabs(usize),
     /// Keyed table array (e.g. `[mcp.servers.<name>]`).
     TableArrayKeyed(BTreeMap<String, BTreeMap<String, FieldValue>>),
@@ -307,22 +279,18 @@ pub enum SectionId {
     Verbosity,
     Limits,
     Telemetry,
-    Providers,
     Routing,
     Session,
     Modes,
     Context,
     Subagents,
-    Skills,
     Graph,
     Cache,
-    Tools,
     Feedback,
     Redaction,
     Web,
+    Tools,
     McpServers,
-    ShellSandbox,
-    PermissionRules,
     /// Synthetic section that hosts tier-wide reset actions ("delete the
     /// user file", "delete the repo file", "delete the local file"). Has
     /// no `FieldMeta` entries — the TUI renders an action list and runs
@@ -339,22 +307,18 @@ impl SectionId {
             Self::Verbosity => "verbosity",
             Self::Limits => "limits",
             Self::Telemetry => "telemetry",
-            Self::Providers => "providers",
             Self::Routing => "routing",
             Self::Session => "session",
             Self::Modes => "modes",
             Self::Context => "context",
             Self::Subagents => "subagents",
-            Self::Skills => "skills",
             Self::Graph => "graph",
             Self::Cache => "cache",
-            Self::Tools => "tools",
             Self::Feedback => "feedback",
             Self::Redaction => "redaction",
             Self::Web => "web",
+            Self::Tools => "tools",
             Self::McpServers => "mcp-servers",
-            Self::ShellSandbox => "shell-sandbox",
-            Self::PermissionRules => "permission-rules",
             Self::Reset => "reset",
         }
     }
@@ -431,6 +395,7 @@ pub const STATUS_VERBOSITY_OPTIONS: &[&str] = &["compact", "verbose"];
 pub const RESPONSE_VERBOSITY_OPTIONS: &[&str] = &["concise", "normal", "verbose"];
 pub const TOOL_OUTPUT_VERBOSITY_OPTIONS: &[&str] = &["compact", "normal", "verbose"];
 pub const TRANSCRIPT_DEFAULT_OPTIONS: &[&str] = &["compact", "expanded"];
+pub const DESKTOP_NOTIFICATIONS_OPTIONS: &[&str] = &["off", "bel", "osc9", "auto"];
 pub const SYNCHRONIZED_OUTPUT_OPTIONS: &[&str] = &["auto", "always", "never"];
 pub const PERMISSION_POLICY_MODE_OPTIONS: &[&str] =
     &["default", "auto_review", "full_access", "custom"];
@@ -652,6 +617,32 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default: || FieldValue::Bool(false),
                 help: "(OpenAI/Azure only) Persist responses on the provider side for retrieval.",
                 env_override: Some("SQUEEZY_STORE_RESPONSES"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "context_1m",
+                toml_path: &["model", "context_1m"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_context_1m,
+                set: set_context_1m,
+                default_display: "false",
+                default: || FieldValue::Bool(false),
+                help: "(Anthropic/Bedrock only) Opt into the 1M-token context window (context-1m beta). Raises the cap from 200K but bills long prompts at a premium per-token rate — leave off unless you need it.",
+                env_override: Some("SQUEEZY_CONTEXT_1M"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "extended_thinking",
+                toml_path: &["model", "extended_thinking"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_extended_thinking,
+                set: set_extended_thinking,
+                default_display: "false",
+                default: || FieldValue::Bool(false),
+                help: "(Anthropic/Bedrock only) Opt into interleaved/extended thinking (interleaved-thinking beta), letting the model reason between tool calls. Spends extra thinking tokens and adds latency.",
+                env_override: Some("SQUEEZY_EXTENDED_THINKING"),
                 secret: false,
             },
             FieldMeta {
@@ -1194,6 +1185,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default_display: "compact",
                 default: || FieldValue::Enum("compact"),
                 help: "Whether new transcript entries start collapsed or expanded.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "desktop_notifications",
+                toml_path: &["tui", "desktop_notifications"],
+                kind: FieldKind::Enum {
+                    options: DESKTOP_NOTIFICATIONS_OPTIONS,
+                },
+                tier: ApplyTier::Immediate,
+                get: get_desktop_notifications,
+                set: set_desktop_notifications,
+                default_display: "off",
+                default: || FieldValue::Enum("off"),
+                help: "Bell/desktop notification when a turn finishes or needs approval.",
                 env_override: None,
                 secret: false,
             },
@@ -2102,6 +2108,19 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
+                label: "help_strict_local",
+                toml_path: &["subagents", "help_strict_local"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_subagent_help_strict_local,
+                set: set_subagent_help_strict_local,
+                default_display: "false",
+                default: || FieldValue::Bool(false),
+                help: "Answer /help fully locally — never call the DocHelp model subagent.",
+                env_override: Some("SQUEEZY_HELP_STRICT_LOCAL"),
+                secret: false,
+            },
+            FieldMeta {
                 label: "max_concurrent",
                 toml_path: &["subagents", "max_concurrent"],
                 kind: FieldKind::Integer {
@@ -2547,6 +2566,24 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
         ],
     },
     ConfigSectionMeta {
+        id: SectionId::Tools,
+        label: "Tools",
+        description: "Local tool behavior such as the checkpoint/undo safety net",
+        fields: &[FieldMeta {
+            label: "checkpoints_enabled",
+            toml_path: &["tools", "checkpoints_enabled"],
+            kind: FieldKind::Bool,
+            tier: ApplyTier::Restart,
+            get: get_checkpoints_enabled,
+            set: set_checkpoints_enabled,
+            default_display: "false",
+            default: || FieldValue::Bool(false),
+            help: "Enable local git-snapshot checkpoints with /undo and /revert (off by default).",
+            env_override: Some("SQUEEZY_CHECKPOINTS_ENABLED"),
+            secret: false,
+        }],
+    },
+    ConfigSectionMeta {
         id: SectionId::McpServers,
         label: "MCP Servers",
         // Render path: the `/mcp` page renders one row per configured
@@ -2585,9 +2622,8 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
         DEFAULT_GITHUB_COPILOT_MODEL, DEFAULT_GOOGLE_BASE_URL, DEFAULT_GOOGLE_MODEL,
         DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_BASE_URL,
         DEFAULT_OPENAI_CODEX_BASE_URL, DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_CODEX_ORIGINATOR,
-        DEFAULT_OPENAI_MODEL, FauxConfig, GitHubCopilotConfig, GoogleConfig, OllamaConfig,
-        OpenAiCodexConfig, OpenAiCompatibleConfig, OpenAiCompatiblePreset, OpenAiConfig,
-        ProviderTransportConfig,
+        DEFAULT_OPENAI_MODEL, GitHubCopilotConfig, GoogleConfig, OllamaConfig, OpenAiCodexConfig,
+        OpenAiCompatibleConfig, OpenAiCompatiblePreset, OpenAiConfig, ProviderTransportConfig,
     };
     let transport = ProviderTransportConfig::default();
     let (provider, default_model) = match s {
@@ -2666,14 +2702,6 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
             }),
             DEFAULT_OLLAMA_MODEL,
         ),
-        "faux" | "mock" => (
-            ProviderConfig::Faux(FauxConfig {
-                script: None,
-                name: None,
-                transport,
-            }),
-            crate::DEFAULT_FAUX_MODEL,
-        ),
         other => {
             let preset = OpenAiCompatiblePreset::parse(other).ok_or("unknown provider")?;
             let default_model = preset.default_model();
@@ -2711,7 +2739,6 @@ fn provider_to_str(p: &ProviderConfig) -> &'static str {
         ProviderConfig::OpenAiCodex(_) => "openai_codex",
         ProviderConfig::GitHubCopilot(_) => "github_copilot",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
-        ProviderConfig::Faux(_) => "faux",
     }
 }
 
@@ -2725,7 +2752,6 @@ pub fn default_model_for(provider: &str) -> &'static str {
         "ollama" => DEFAULT_OLLAMA_MODEL,
         "openai_codex" | "openai-codex" | "chatgpt" => DEFAULT_OPENAI_CODEX_MODEL,
         "github_copilot" | "github-copilot" | "copilot" => DEFAULT_GITHUB_COPILOT_MODEL,
-        "faux" | "mock" => crate::DEFAULT_FAUX_MODEL,
         other => match OpenAiCompatiblePreset::parse(other) {
             Some(preset) => preset.default_model(),
             None => DEFAULT_OPENAI_MODEL,
@@ -2922,6 +2948,32 @@ fn set_store_responses(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'s
             Ok(())
         }
         _ => Err("store_responses expects bool"),
+    }
+}
+
+fn get_context_1m(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.context_1m)
+}
+fn set_context_1m(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.context_1m = v;
+            Ok(())
+        }
+        _ => Err("context_1m expects bool"),
+    }
+}
+
+fn get_extended_thinking(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.extended_thinking)
+}
+fn set_extended_thinking(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.extended_thinking = v;
+            Ok(())
+        }
+        _ => Err("extended_thinking expects bool"),
     }
 }
 
@@ -3242,6 +3294,19 @@ fn set_transcript_default(cfg: &mut AppConfig, value: FieldValue) -> Result<(), 
         "expanded" => TranscriptDefault::Expanded,
         _ => return Err("invalid transcript_default"),
     };
+    Ok(())
+}
+
+fn get_desktop_notifications(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.tui.desktop_notifications.as_str())
+}
+fn set_desktop_notifications(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::Enum(s) => s,
+        _ => return Err("expects enum"),
+    };
+    cfg.tui.desktop_notifications =
+        NotificationMethod::parse(s).ok_or("invalid desktop_notifications")?;
     Ok(())
 }
 
@@ -4235,6 +4300,21 @@ fn set_exploration_graph(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &
     }
 }
 
+// ─── Tools ────────────────────────────────────────────────────────────────────
+
+fn get_checkpoints_enabled(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.checkpoints_enabled)
+}
+fn set_checkpoints_enabled(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.checkpoints_enabled = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
 // ─── Session Logs ─────────────────────────────────────────────────────────────
 
 fn get_session_log_dir(cfg: &AppConfig) -> FieldValue {
@@ -4353,6 +4433,22 @@ fn set_subagent_explore_enabled(
     match value {
         FieldValue::Bool(v) => {
             cfg.subagents.explore_enabled = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_subagent_help_strict_local(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.subagents.help_strict_local)
+}
+fn set_subagent_help_strict_local(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.subagents.help_strict_local = v;
             Ok(())
         }
         _ => Err("expects bool"),

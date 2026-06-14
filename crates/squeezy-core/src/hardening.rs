@@ -13,11 +13,6 @@ pub fn pre_main_hardening(config: HardeningConfig) {
 
 #[cfg(target_os = "macos")]
 fn macos_hardening(config: HardeningConfig) {
-    if config.deny_debug_attach {
-        unsafe {
-            let _ = libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0);
-        }
-    }
     if config.disable_core_dumps {
         disable_core_dumps();
     }

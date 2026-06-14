@@ -18,9 +18,9 @@ use squeezy_core::{
     ShellSandboxMode, SkillsConfig, SubagentConfig, TaskStateStatus,
 };
 use squeezy_llm::{
-    INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
-    StopReason,
+    CONTEXT_1M_BETA, INTERLEAVED_THINKING_BETA, INVALID_TOOL_ARGUMENTS_ERROR_KEY,
+    INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem,
+    LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec, StopReason,
 };
 use squeezy_tools::{ToolCall, ToolCostHint, ToolReceipt, ToolStatus, sha256_hex};
 use tracing_subscriber::fmt::MakeWriter;
@@ -1659,6 +1659,53 @@ fn provider_capability_gate_controls_native_reasoning_and_verbosity_fields() {
     );
     assert_eq!(request_response_verbosity(&config, "anthropic"), None);
     assert_eq!(request_reasoning_effort(&config, "anthropic"), None);
+}
+
+#[test]
+fn anthropic_beta_flags_attach_only_on_anthropic_providers() {
+    fn betas(headers: &std::sync::Arc<[std::sync::Arc<str>]>) -> Vec<&str> {
+        headers.iter().map(|beta| beta.as_ref()).collect()
+    }
+
+    // Both opt-ins on.
+    let config = AppConfig {
+        context_1m: true,
+        extended_thinking: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        betas(&request_beta_headers(&config, "anthropic")),
+        vec![CONTEXT_1M_BETA, INTERLEAVED_THINKING_BETA],
+        "1P Anthropic carries both beta ids",
+    );
+    assert_eq!(
+        betas(&request_beta_headers(&config, "bedrock")),
+        vec![CONTEXT_1M_BETA, INTERLEAVED_THINKING_BETA],
+        "Bedrock (Anthropic via AWS) carries both beta ids",
+    );
+    assert!(
+        request_beta_headers(&config, "openai").is_empty(),
+        "non-Anthropic providers never receive Anthropic betas",
+    );
+    assert!(
+        request_beta_headers(&config, "google").is_empty(),
+        "non-Anthropic providers never receive Anthropic betas",
+    );
+
+    // Only the 1M-context opt-in.
+    let context_only = AppConfig {
+        context_1m: true,
+        extended_thinking: false,
+        ..Default::default()
+    };
+    assert_eq!(
+        betas(&request_beta_headers(&context_only, "anthropic")),
+        vec![CONTEXT_1M_BETA],
+    );
+
+    // Default config emits nothing even on an Anthropic provider.
+    let off = AppConfig::default();
+    assert!(request_beta_headers(&off, "anthropic").is_empty());
 }
 
 #[test]
@@ -5447,7 +5494,11 @@ fn advertised_tool_specs_are_mode_aware() {
 
 #[test]
 fn control_tools_are_advertised_in_build_and_plan_modes() {
-    let tools = core_control_tools(&SubagentConfig::default(), SessionMode::Build);
+    let tools = core_control_tools(
+        &SubagentConfig::default(),
+        SessionMode::Build,
+        &SubagentCatalog::empty(),
+    );
 
     let expected = vec![
         DELEGATE_TOOL_NAME,
@@ -5472,20 +5523,25 @@ fn core_control_tools_filter_subagents_when_disabled() {
         enabled: false,
         ..SubagentConfig::default()
     };
-    let names: Vec<_> = core_control_tools(&subagents, SessionMode::Build)
-        .into_iter()
-        .map(|tool| tool.spec.name.clone())
-        .collect();
+    let names: Vec<_> =
+        core_control_tools(&subagents, SessionMode::Build, &SubagentCatalog::empty())
+            .into_iter()
+            .map(|tool| tool.spec.name.clone())
+            .collect();
     assert!(names.is_empty());
 
     let explore_only_off = SubagentConfig {
         explore_enabled: false,
         ..SubagentConfig::default()
     };
-    let names: Vec<_> = core_control_tools(&explore_only_off, SessionMode::Build)
-        .into_iter()
-        .map(|tool| tool.spec.name.clone())
-        .collect();
+    let names: Vec<_> = core_control_tools(
+        &explore_only_off,
+        SessionMode::Build,
+        &SubagentCatalog::empty(),
+    )
+    .into_iter()
+    .map(|tool| tool.spec.name.clone())
+    .collect();
     assert_eq!(
         names,
         vec![
@@ -5553,7 +5609,11 @@ fn warn_unknown_tool_schema_names_emits_warning_for_typo_and_skips_known() {
 
 #[test]
 fn lazy_request_tool_specs_keep_core_first_and_mcp_discoverable_by_default() {
-    let mut tools = core_control_tools(&SubagentConfig::default(), SessionMode::Build);
+    let mut tools = core_control_tools(
+        &SubagentConfig::default(),
+        SessionMode::Build,
+        &SubagentCatalog::empty(),
+    );
     tools.extend([
         test_advertised_tool("grep", PermissionCapability::Search),
         test_advertised_tool("webfetch", PermissionCapability::Network),
@@ -5604,7 +5664,7 @@ fn request_tool_specs_skips_disabled_subagent_control_tools() {
         enabled: false,
         ..SubagentConfig::default()
     };
-    let mut tools = core_control_tools(&subagents, SessionMode::Build);
+    let mut tools = core_control_tools(&subagents, SessionMode::Build, &SubagentCatalog::empty());
     tools.push(test_advertised_tool("grep", PermissionCapability::Search));
     let config = ToolSchemaConfig::default();
 
@@ -5624,7 +5684,8 @@ fn request_tool_specs_skips_disabled_subagent_control_tools() {
         explore_enabled: false,
         ..SubagentConfig::default()
     };
-    let mut tools = core_control_tools(&explore_only, SessionMode::Build);
+    let mut tools =
+        core_control_tools(&explore_only, SessionMode::Build, &SubagentCatalog::empty());
     tools.push(test_advertised_tool("grep", PermissionCapability::Search));
     let specs = request_tool_specs(&tools, SessionMode::Build, &config, &[], false);
     let names = advertised_tool_names(&specs);
@@ -5714,6 +5775,7 @@ async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy(
             None,
         ))),
         subagents: SubagentRegistry::default(),
+        subagent_catalog: Arc::new(SubagentCatalog::empty()),
         store: None,
         hooks: None,
     };
@@ -6116,11 +6178,20 @@ impl io::Write for SharedLogWrite {
 }
 
 fn temp_workspace(name: &str) -> PathBuf {
+    // Path uniqueness has to hold across PROCESSES (nextest runs tests in
+    // parallel processes), not just threads. A nanosecond clock can read the
+    // same value in two processes under a coarse timer, so the wall-clock
+    // nonce alone is not collision-proof — qualify it with the pid and a
+    // per-process monotonic counter so no two `temp_workspace` calls anywhere
+    // can ever land on the same directory.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("squeezy_{name}_{nonce}"));
+    let pid = std::process::id();
+    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("squeezy_{name}_{pid}_{counter}_{nonce}"));
     fs::create_dir_all(&root).expect("create temp workspace");
     root
 }
@@ -7248,7 +7319,7 @@ fn core_control_tools_includes_new_delegate_planner_reviewer() {
         explore_enabled: true,
         ..SubagentConfig::default()
     };
-    let names: Vec<_> = core_control_tools(&config, SessionMode::Build)
+    let names: Vec<_> = core_control_tools(&config, SessionMode::Build, &SubagentCatalog::empty())
         .into_iter()
         .map(|tool| tool.spec.name.clone())
         .collect();
@@ -7265,7 +7336,7 @@ fn core_control_tools_drops_all_when_subagents_disabled() {
         enabled: false,
         ..SubagentConfig::default()
     };
-    assert!(core_control_tools(&config, SessionMode::Build).is_empty());
+    assert!(core_control_tools(&config, SessionMode::Build, &SubagentCatalog::empty()).is_empty());
 }
 
 #[test]
@@ -7398,7 +7469,7 @@ fn explore_subagent_cannot_call_write_file() {
     // the parent advertises `write_file`, `apply_patch`, and `shell`, the
     // explore subagent must never see them.
     let parent_tools = parent_tools_with_mutators();
-    let allowed = subagent_allowed_tools(&parent_tools, SubagentKind::Explore);
+    let allowed = subagent_allowed_tools(&parent_tools, SubagentKind::Explore, None);
     let allowed_names: BTreeSet<&str> =
         allowed.iter().map(|tool| tool.spec.name.as_str()).collect();
 
@@ -7438,7 +7509,7 @@ fn typed_subagents_filter_to_read_search_capability() {
         SubagentKind::Plan,
         SubagentKind::Review,
     ] {
-        let allowed = subagent_allowed_tools(&parent_tools, kind);
+        let allowed = subagent_allowed_tools(&parent_tools, kind, None);
         for tool in &allowed {
             assert!(
                 matches!(
@@ -7461,7 +7532,7 @@ fn reviewer_subagent_cannot_call_apply_patch_or_shell() {
     // run shell commands, even if the parent advertisement contains those
     // tools.
     let parent_tools = parent_tools_with_mutators();
-    let allowed = subagent_allowed_tools(&parent_tools, SubagentKind::Review);
+    let allowed = subagent_allowed_tools(&parent_tools, SubagentKind::Review, None);
     let allowed_names: BTreeSet<&str> =
         allowed.iter().map(|tool| tool.spec.name.as_str()).collect();
 
@@ -8774,6 +8845,7 @@ fn skill_subagent_uses_system_override_as_instructions() {
         thoroughness: None,
         system_override: Some("# Skill body\nFollow these steps exactly.".to_string()),
         model_override: None,
+        tool_filter: None,
     };
     let instructions = super::subagent_instructions(SubagentKind::Skill, &request);
     assert!(
@@ -8790,12 +8862,151 @@ fn skill_subagent_falls_back_when_system_override_missing() {
         thoroughness: None,
         system_override: None,
         model_override: None,
+        tool_filter: None,
     };
     let instructions = super::subagent_instructions(SubagentKind::Skill, &request);
     assert!(
         instructions.to_lowercase().contains("fork-mode skill"),
         "missing fallback prompt for skill subagent without override: {instructions}"
     );
+}
+
+/// Build a `SubagentCatalog` from a temp workspace carrying a single custom
+/// agent `.md`. The user agents dir is pointed at an empty temp dir so the
+/// real `~/.squeezy/agents` is never read.
+fn catalog_with_custom_agent(name: &str, body: &str, frontmatter_extra: &str) -> SubagentCatalog {
+    let root = temp_workspace(&format!("custom_agent_{name}"));
+    let agents_dir = root.join(".squeezy/agents");
+    fs::create_dir_all(&agents_dir).expect("create agents dir");
+    let contents = format!(
+        "---\nname: {name}\ndescription: A custom {name} agent.\n{frontmatter_extra}---\n{body}\n"
+    );
+    fs::write(agents_dir.join(format!("{name}.md")), contents).expect("write agent md");
+    let empty_user = root.join("empty-user");
+    fs::create_dir_all(&empty_user).expect("create empty user dir");
+    SubagentCatalog::discover(&root, Some(&empty_user))
+}
+
+#[test]
+fn delegate_with_custom_agent_dispatches_skill_with_body_and_model() {
+    let catalog = catalog_with_custom_agent(
+        "auditor",
+        "# Auditor\nFind security issues only.",
+        "model: haiku\ntools: [read_file, grep]\n",
+    );
+    let request = super::SubagentRequest {
+        prompt: "audit the auth module".to_string(),
+        scope: None,
+        thoroughness: None,
+        system_override: None,
+        model_override: None,
+        tool_filter: None,
+    };
+    let (kind, resolved) = super::resolve_custom_agent(
+        &catalog,
+        "anthropic",
+        SubagentKind::Delegate,
+        request,
+        Some("auditor"),
+    )
+    .expect("known custom agent resolves");
+
+    assert_eq!(kind, SubagentKind::Skill);
+    assert_eq!(
+        resolved.system_override.as_deref(),
+        Some("# Auditor\nFind security issues only.")
+    );
+    // The agent's declared `haiku` model is normalized through the alias table
+    // and lands on `model_override` (the per-call model field `run_subagent`
+    // reads). Assert against the alias table resolved the same way here, so the
+    // test confirms the value was threaded through correctly without depending
+    // on whether the table maps `haiku` to a concrete id or passes it through.
+    let model = resolved
+        .model_override
+        .as_deref()
+        .expect("custom agent model carried");
+    let expected = super::resolve_model_alias_owned("anthropic", "haiku".to_string());
+    assert_eq!(
+        model,
+        expected.as_str(),
+        "custom agent model must be threaded through the alias resolver: {model}"
+    );
+    assert_eq!(
+        resolved.tool_filter.as_deref(),
+        Some(["read_file".to_string(), "grep".to_string()].as_slice())
+    );
+
+    // The resolved request runs the agent body verbatim as system prompt.
+    let instructions = super::subagent_instructions(SubagentKind::Skill, &resolved);
+    assert!(
+        instructions.contains("Find security issues only."),
+        "custom agent body must become the system prompt: {instructions}"
+    );
+}
+
+#[test]
+fn delegate_with_unknown_agent_errors_with_available_names() {
+    let catalog = catalog_with_custom_agent("auditor", "Body.", "");
+    let request = super::SubagentRequest {
+        prompt: "do work".to_string(),
+        scope: None,
+        thoroughness: None,
+        system_override: None,
+        model_override: None,
+        tool_filter: None,
+    };
+    let error = super::resolve_custom_agent(
+        &catalog,
+        "anthropic",
+        SubagentKind::Delegate,
+        request,
+        Some("nope"),
+    )
+    .expect_err("unknown agent must error");
+    assert!(
+        error.contains("nope") && error.contains("auditor"),
+        "error should name the bad request and list available agents: {error}"
+    );
+}
+
+#[test]
+fn custom_agent_tool_filter_narrows_to_read_only_delegate_surface() {
+    let tools = [
+        ("read_file", PermissionCapability::Read),
+        ("grep", PermissionCapability::Search),
+        ("write_file", PermissionCapability::Edit),
+        ("shell", PermissionCapability::Shell),
+    ]
+    .map(|(name, cap)| test_advertised_tool(name, cap));
+
+    // The agent declares read_file plus a write tool it must never receive: the
+    // intersection with the read-only Skill surface drops shell/write entirely.
+    let filter = vec!["read_file".to_string(), "shell".to_string()];
+    let allowed =
+        super::subagent_allowed_tools(&tools, super::SubagentKind::Skill, Some(filter.as_slice()));
+    let names: Vec<&str> = allowed.iter().map(|t| t.spec.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["read_file"],
+        "tool_filter must intersect with the read-only delegate set, not widen it: {names:?}"
+    );
+}
+
+#[test]
+fn delegate_tool_advertises_discovered_custom_agents() {
+    let catalog = catalog_with_custom_agent("auditor", "Body.", "");
+    let tool = super::delegate_advertised_tool(&catalog);
+    assert!(
+        tool.spec.description.contains("auditor"),
+        "delegate description must advertise the custom agent: {}",
+        tool.spec.description
+    );
+    let agent_enum = &tool.spec.parameters["properties"]["agent"]["enum"];
+    assert_eq!(agent_enum, &json!(["auditor"]));
+
+    // With no custom agents, the schema stays unchanged (no `agent` property).
+    let bare = super::delegate_advertised_tool(&SubagentCatalog::empty());
+    assert!(bare.spec.parameters["properties"]["agent"].is_null());
 }
 
 #[test]
@@ -8806,6 +9017,7 @@ fn plan_subagent_instructions_advertise_json_tail_contract() {
         thoroughness: None,
         system_override: None,
         model_override: None,
+        tool_filter: None,
     };
     let plan = super::subagent_instructions(SubagentKind::Plan, &request);
     assert!(
@@ -9062,6 +9274,77 @@ fn delegate_chain_threads_previous_step_summary_into_next_step_prompt() {
     assert_eq!(steps[1].prompt, step_b_template);
     assert!(steps[0].scope.is_none());
     assert!(steps[1].scope.is_none());
+    assert!(
+        steps[0].model.is_none() && steps[1].model.is_none(),
+        "steps without an explicit `model` must parse to None so the dispatcher \
+         falls back to the parent's delegate model"
+    );
+
+    // A per-step `model` override must parse off the chain step AND survive
+    // the round-trip through the delegate sub-call the dispatcher builds:
+    // `handle_delegate_chain_call` copies `step.model` into the step's
+    // `delegate` args, which `parse_subagent_request` reads back into
+    // `SubagentRequest.model_override` that `run_subagent` runs on. If either
+    // layer dropped the field the step would silently fall back to the
+    // parent's delegate model and the advertised override would be a no-op.
+    let step_b_model = "anthropic:claude-haiku";
+    let chain_with_model = ToolCall {
+        call_id: "chain_model".to_string(),
+        name: DELEGATE_CHAIN_TOOL_NAME.to_string(),
+        arguments: json!({
+            "steps": [
+                { "prompt": step_a },
+                { "prompt": step_b_template, "model": step_b_model },
+            ]
+        }),
+    };
+    let model_steps =
+        parse_delegate_chain_steps(&chain_with_model).expect("chain with model valid");
+    assert_eq!(model_steps[0].model, None);
+    assert_eq!(model_steps[1].model.as_deref(), Some(step_b_model));
+
+    let step_call = ToolCall {
+        call_id: "chain_model#step_1".to_string(),
+        name: DELEGATE_TOOL_NAME.to_string(),
+        arguments: json!({
+            "prompt": "rendered",
+            "model": model_steps[1].model.clone().unwrap(),
+        }),
+    };
+    let request =
+        parse_subagent_request(&step_call, SubagentKind::Delegate).expect("delegate args valid");
+    assert_eq!(
+        request.model_override.as_deref(),
+        Some(step_b_model),
+        "the per-step model must reach SubagentRequest.model_override so run_subagent runs the step on it"
+    );
+
+    // A blank `model` collapses to None at both layers so an empty override
+    // never shadows the parent's delegate model.
+    let blank_model_call = ToolCall {
+        call_id: "chain_blank".to_string(),
+        name: DELEGATE_CHAIN_TOOL_NAME.to_string(),
+        arguments: json!({ "steps": [{ "prompt": step_a, "model": "  " }] }),
+    };
+    let blank_steps =
+        parse_delegate_chain_steps(&blank_model_call).expect("blank model still valid");
+    assert_eq!(
+        blank_steps[0].model, None,
+        "a whitespace-only model must collapse to None, not an empty override"
+    );
+
+    // Absent `model` on a plain delegate call → no override on the request.
+    let no_model_call = ToolCall {
+        call_id: "delegate_no_model".to_string(),
+        name: DELEGATE_TOOL_NAME.to_string(),
+        arguments: json!({ "prompt": "rendered" }),
+    };
+    let no_model_request = parse_subagent_request(&no_model_call, SubagentKind::Delegate)
+        .expect("delegate args valid");
+    assert_eq!(
+        no_model_request.model_override, None,
+        "an absent `model` arg must leave model_override None so the per-kind default applies"
+    );
 
     // Missing prompt on a step must surface as an actionable error
     // before any subagent lease is taken.
@@ -11809,67 +12092,6 @@ async fn late_cancelled_steered_turn_does_not_drop_replacement_context() {
     );
 }
 
-// F08-session-lifecycle-events-cancelable: `Agent::switch_session`
-// consults the typed `AgentHookBus` before swapping the active
-// session, and a `Decision::Deny` from any registered handler aborts
-// the swap before `resume_current` runs. The two tests below pin both
-// halves of that contract — allow proceeds to `resume_current`, which
-// then fails with the synthetic id; deny short-circuits with the hook
-// message and leaves the in-process session id untouched.
-
-struct AllowSwitchHook;
-
-impl squeezy_hooks::AgentHook for AllowSwitchHook {
-    fn before_session_switch<'a>(
-        &'a self,
-        _target_id: &'a str,
-    ) -> squeezy_hooks::HookFuture<'a, squeezy_hooks::Decision> {
-        Box::pin(async { squeezy_hooks::Decision::Allow })
-    }
-}
-
-struct DenySwitchHook {
-    reason: &'static str,
-}
-
-impl squeezy_hooks::AgentHook for DenySwitchHook {
-    fn before_session_switch<'a>(
-        &'a self,
-        _target_id: &'a str,
-    ) -> squeezy_hooks::HookFuture<'a, squeezy_hooks::Decision> {
-        let message = self.reason.to_string();
-        Box::pin(async move { squeezy_hooks::Decision::Deny { message } })
-    }
-}
-
-#[tokio::test]
-async fn switch_session_allow_hook_proceeds_to_resume_current() {
-    let provider = Arc::new(MockProvider::new(Vec::new()));
-    let mut agent = Agent::new(AppConfig::default(), provider);
-    let mut bus = squeezy_hooks::AgentHookBus::new();
-    bus.register(Box::new(AllowSwitchHook));
-    agent.set_agent_hook_bus(Some(Arc::new(bus)));
-
-    // The synthetic id has no on-disk session, so `resume_current`
-    // will reject the swap once it actually runs. The exact disk-level
-    // failure mode varies by environment (io::ErrorKind::NotFound, an
-    // explicit "is not resumable" message, etc.), so the assertion
-    // anchors on the *negative* shape that uniquely identifies the
-    // hook deny path. If allow ever leaks the deny message we'd see
-    // "denied by hook" instead of a resume-current error.
-    let result = agent.switch_session("nonexistent-session-id-allow").await;
-    let err = result.expect_err("nonexistent synthetic session must fail to resume");
-    let msg = err.to_string();
-    assert!(
-        !msg.contains("denied by hook"),
-        "allow hook must never short-circuit to a deny error: {msg}",
-    );
-    assert!(
-        !msg.is_empty(),
-        "resume_current must surface its disk-level failure, got empty error",
-    );
-}
-
 // Verifies that a long-running subagent body emits `AgentEvent::ToolProgress`
 // heartbeats on the parent's event channel even before the subagent fires
 // its first inner tool call.
@@ -12054,36 +12276,6 @@ async fn explore_subagent_emits_tool_progress_heartbeats_during_slow_first_round
          SubagentCompleted so the eval driver's 60s event_timeout \
          does not abandon a subagent whose first model round is \
          silent; got {explore_progress_count}",
-    );
-}
-
-#[tokio::test]
-async fn switch_session_deny_hook_aborts_before_resume_current() {
-    let provider = Arc::new(MockProvider::new(Vec::new()));
-    let mut agent = Agent::new(AppConfig::default(), provider);
-    let initial_session_id = agent.session_id();
-
-    let mut bus = squeezy_hooks::AgentHookBus::new();
-    bus.register(Box::new(DenySwitchHook {
-        reason: "unsaved work",
-    }));
-    agent.set_agent_hook_bus(Some(Arc::new(bus)));
-
-    let result = agent.switch_session("any-target-session-id").await;
-    let err = result.expect_err("denying hook must abort the switch");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("denied by hook") && msg.contains("unsaved work"),
-        "expected deny error from hook, got {msg}",
-    );
-    assert!(
-        !msg.contains("not resumable"),
-        "deny must short-circuit before resume_current touches disk: {msg}",
-    );
-    assert_eq!(
-        agent.session_id(),
-        initial_session_id,
-        "deny must leave the in-process session id untouched",
     );
 }
 
@@ -13216,7 +13408,7 @@ fn delegate_subagent_is_write_capable_minus_spawn_tools() {
     ]
     .map(|(name, cap)| test_advertised_tool(name, cap));
 
-    let allowed = super::subagent_allowed_tools(&tools, super::SubagentKind::Delegate);
+    let allowed = super::subagent_allowed_tools(&tools, super::SubagentKind::Delegate, None);
     let names: Vec<&str> = allowed.iter().map(|t| t.spec.name.as_str()).collect();
     assert!(
         names.contains(&"write_file") && names.contains(&"shell"),
@@ -13251,7 +13443,7 @@ fn read_only_subagent_kinds_still_exclude_write_tools() {
     .map(|(name, cap)| test_advertised_tool(name, cap));
 
     // Explore is role-scoped read-only: write/shell never reach it.
-    let allowed = super::subagent_allowed_tools(&tools, super::SubagentKind::Explore);
+    let allowed = super::subagent_allowed_tools(&tools, super::SubagentKind::Explore, None);
     let names: Vec<&str> = allowed.iter().map(|t| t.spec.name.as_str()).collect();
     assert!(
         !names.contains(&"write_file") && !names.contains(&"shell"),

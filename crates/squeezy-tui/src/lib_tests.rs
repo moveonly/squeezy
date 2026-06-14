@@ -2167,16 +2167,16 @@ async fn topmost_overlapping_click_target_wins() {
             width: 10,
             height: 1,
         },
-        interaction::TargetKey::Chrome(interaction::ChromeKey::JumpToLatest),
-        interaction::Action::JumpToLatest,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::ClipboardClear),
+        interaction::Action::ClipboardClear,
     );
     // The later-registered (topmost) target wins where the two overlap.
     let hit = app.click_target_at(7, 4);
     assert_eq!(
         hit,
         Some((
-            interaction::TargetKey::Chrome(interaction::ChromeKey::JumpToLatest),
-            interaction::Action::JumpToLatest,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::ClipboardClear),
+            interaction::Action::ClipboardClear,
         )),
     );
     // Sanity: a coord only inside the FIRST rect still hits the first.
@@ -7794,6 +7794,36 @@ async fn slash_attach_routes_canonical_images_to_prompt_token() {
     };
     assert_eq!(media_type, "image/png");
     assert_eq!(bytes.as_ref(), image_bytes.as_slice());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn slash_attach_routes_pdf_documents_to_prompt_token() {
+    let root = temp_workspace("tui_attach_pdf");
+    let pdf_bytes = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n".to_vec();
+    fs::write(root.join("report.pdf"), &pdf_bytes).expect("write pdf");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/attach report.pdf").await);
+    assert!(app.attachments.is_empty());
+    assert_eq!(app.input, "[Document report.pdf]");
+    let input = app.input.clone();
+    let prepared = prepare_prompt_turn_input(&mut app, input);
+    assert_eq!(prepared.transient_input_items.len(), 1);
+    let LlmInputItem::Document {
+        media_type,
+        name,
+        bytes,
+    } = &prepared.transient_input_items[0]
+    else {
+        panic!("expected document item");
+    };
+    assert_eq!(media_type, "application/pdf");
+    assert_eq!(name, "report.pdf");
+    assert_eq!(bytes.as_ref(), pdf_bytes.as_slice());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -22214,6 +22244,36 @@ async fn slash_theme_high_contrast_selects_builtin_theme() {
     let ran = handle_slash_command(&mut app, &mut agent, "/theme system").await;
     assert!(ran);
     assert_eq!(crate::render::theme::current_theme_name(), "default");
+}
+
+/// A high-contrast env opt-in forces the `high-contrast` palette onto the
+/// config, overriding the persisted theme, so startup renders with actual
+/// high contrast rather than only emitting a telemetry signal.
+#[test]
+fn high_contrast_env_override_wins_over_persisted_theme() {
+    let mut cfg = squeezy_core::AppConfig::default();
+    cfg.tui.theme = "bright".to_string();
+
+    assert!(crate::apply_high_contrast_env_override(&mut cfg, true));
+    assert_eq!(cfg.tui.theme, "high-contrast");
+}
+
+/// Without a request the persisted theme is left untouched, and a config that
+/// already names the high-contrast slug reports no change.
+#[test]
+fn high_contrast_env_override_is_a_noop_when_not_requested_or_already_set() {
+    let mut unrequested = squeezy_core::AppConfig::default();
+    unrequested.tui.theme = "bright".to_string();
+    assert!(!crate::apply_high_contrast_env_override(
+        &mut unrequested,
+        false
+    ));
+    assert_eq!(unrequested.tui.theme, "bright");
+
+    let mut already = squeezy_core::AppConfig::default();
+    already.tui.theme = "high-contrast".to_string();
+    assert!(!crate::apply_high_contrast_env_override(&mut already, true));
+    assert_eq!(already.tui.theme, "high-contrast");
 }
 
 /// Regression for `squeezy-ramu`: when the eval harness pins a settings

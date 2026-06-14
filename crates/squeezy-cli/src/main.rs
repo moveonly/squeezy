@@ -786,7 +786,7 @@ fn run_blocking() -> squeezy_core::Result<()> {
 async fn run() -> squeezy_core::Result<()> {
     squeezy_core::startup_trace::init();
     squeezy_core::startup_trace::mark("main_start");
-    squeezy_core::pre_main_hardening(squeezy_core::HardeningConfig::default());
+    squeezy_core::pre_main_hardening(squeezy_core::early_hardening_config());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -1821,16 +1821,6 @@ fn field_kind_to_json(kind: &squeezy_core::config_schema::FieldKind) -> serde_js
             "type": "secret", "env_var": env_var
         }),
         FieldKind::Info => serde_json::json!({"type": "info"}),
-        FieldKind::ProviderSubTabs => serde_json::json!({"type": "provider_sub_tabs"}),
-        FieldKind::TableArray { kind } => {
-            use squeezy_core::config_schema::TableArrayKind;
-            match kind {
-                TableArrayKind::Keyed { .. } => serde_json::json!({"type": "table_array_keyed"}),
-                TableArrayKind::Ordered { .. } => {
-                    serde_json::json!({"type": "table_array_ordered"})
-                }
-            }
-        }
     }
 }
 

@@ -12,12 +12,23 @@
 //! per-model gating policy belong in a follow-up.
 use std::sync::Arc;
 
+/// Anthropic beta id for the 1M-token context window on Claude Sonnet 4
+/// (and successors). Carried in the `anthropic-beta` header on the 1P
+/// transport and in `additional_model_request_fields.anthropic_beta` on
+/// Bedrock.
+pub const CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
+
+/// Anthropic beta id for interleaved/extended thinking — lets the model
+/// reason between tool calls within a single turn. Body-eligible on
+/// Bedrock; otherwise header-only.
+pub const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+
 /// Beta opt-ins that must be carried in the request body (not the HTTP
 /// header) when the request goes through Bedrock. Other betas have no
 /// safe Bedrock transport today and are dropped.
 pub(crate) const BEDROCK_EXTRA_PARAMS_BETAS: &[&str] = &[
-    "interleaved-thinking-2025-05-14",
-    "context-1m-2025-08-07",
+    INTERLEAVED_THINKING_BETA,
+    CONTEXT_1M_BETA,
     "tool-search-tool-2025-10-19",
 ];
 
