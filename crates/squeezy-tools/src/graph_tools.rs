@@ -100,6 +100,9 @@ struct DefinitionSearchArgs {
     path: Option<String>,
     language: Option<String>,
     max_results: Option<usize>,
+    /// Skip the first N candidates after sorting, before `max_results`. Lets a
+    /// caller page through a large candidate set.
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +191,8 @@ struct ImpactArgs {
     tests_only: Option<bool>,
     /// Maximum number of affected symbols to return (default 50).
     max_results: Option<usize>,
+    /// Skip the first N affected symbols after sorting, before `max_results`.
+    offset: Option<usize>,
 }
 
 /// Arguments for the `symbol_at` graph tool: resolve a source position
@@ -241,6 +246,8 @@ struct InheritanceHierarchyArgs {
     max_depth: Option<usize>,
     /// Maximum results (default 50).
     max_results: Option<usize>,
+    /// Skip the first N related symbols after sorting, before `max_results`.
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3008,10 +3015,16 @@ fn hierarchy_result(
     total_roots: usize,
     max_depth: usize,
     max_results: Option<usize>,
+    offset: usize,
     root: Option<GraphSymbol>,
 ) -> ToolResult {
     let max_results = graph_limit(max_results);
-    let selected = nodes.iter().take(max_results).collect::<Vec<_>>();
+    // Page the forest roots: skip `offset`, then keep `max_results`.
+    let selected = nodes
+        .iter()
+        .skip(offset)
+        .take(max_results)
+        .collect::<Vec<_>>();
     // Count the total serialized nodes (roots + all recursively-emitted
     // children), not just the number of roots. A single wide root can blow past
     // `max_results` in the serialized `hierarchy`/`packets` while
@@ -3020,7 +3033,8 @@ fn hierarchy_result(
         .iter()
         .map(|node| hierarchy_node_count(node))
         .sum::<usize>();
-    let truncated = total_roots > max_results || serialized_nodes > max_results;
+    let truncated =
+        total_roots.saturating_sub(offset) > max_results || serialized_nodes > max_results;
     let hierarchy = selected
         .iter()
         .map(|node| hierarchy_node_json(graph, node))
@@ -3031,6 +3045,7 @@ fn hierarchy_result(
         .collect::<Vec<_>>();
     let mut payload = graph_payload("hierarchy", manager, refresh);
     payload.insert("max_depth".to_string(), json!(max_depth));
+    payload.insert("offset".to_string(), json!(offset));
     payload.insert(
         "root".to_string(),
         json!(root.as_ref().map(|symbol| symbol_json(graph, symbol))),
@@ -4007,9 +4022,16 @@ impl ToolRegistry {
                 args.language.as_deref(),
             )
         });
-        let truncated = symbols.len() > max_results;
         let candidate_count = symbols.len();
-        let selected = symbols.into_iter().take(max_results).collect::<Vec<_>>();
+        // Page after sorting: skip `offset`, then keep `max_results`. `truncated`
+        // reflects whether anything remains past the returned window.
+        let offset = args.offset.unwrap_or(0);
+        let truncated = candidate_count.saturating_sub(offset) > max_results;
+        let selected = symbols
+            .into_iter()
+            .skip(offset)
+            .take(max_results)
+            .collect::<Vec<_>>();
         let packets = selected
             .iter()
             .map(|symbol| {
@@ -4032,6 +4054,7 @@ impl ToolRegistry {
                 packet_count,
             ),
         );
+        payload.insert("offset".to_string(), json!(offset));
         payload.insert("truncated".to_string(), json!(truncated));
         payload.insert("total_candidates".to_string(), json!(candidate_count));
         make_result(
@@ -4187,11 +4210,18 @@ impl ToolRegistry {
         if result_path.is_some() {
             packets.retain(|packet| packet_matches_result_path(packet, result_path));
         }
-        let truncated = overflowed;
+        // Pagination over the filtered packets: skip `offset`, keep `max_results`.
+        // The page can be truncated either because the BFS overflowed upstream or
+        // because filtered packets remain past the returned window.
+        let offset = args.offset.unwrap_or(0);
+        let filtered_total = packets.len();
+        let truncated = overflowed || filtered_total.saturating_sub(offset) > max_results;
+        let packets: Vec<Value> = packets.into_iter().skip(offset).take(max_results).collect();
         let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
         let mut payload = graph_payload("upstream_flow", manager, refresh);
         payload.insert("symbol".to_string(), symbol_json(graph, &symbol));
         payload.insert("max_depth".to_string(), json!(max_depth));
+        payload.insert("offset".to_string(), json!(offset));
         let packet_count = packets.len();
         payload.insert("packets".to_string(), json!(packets));
         payload.insert("truncated".to_string(), json!(truncated));
@@ -4281,11 +4311,18 @@ impl ToolRegistry {
         if result_path.is_some() {
             packets.retain(|packet| packet_matches_result_path(packet, result_path));
         }
-        let truncated = overflowed;
+        // Pagination over the filtered packets: skip `offset`, keep `max_results`.
+        // The page can be truncated either because the BFS overflowed downstream
+        // or because filtered packets remain past the returned window.
+        let offset = args.offset.unwrap_or(0);
+        let filtered_total = packets.len();
+        let truncated = overflowed || filtered_total.saturating_sub(offset) > max_results;
+        let packets: Vec<Value> = packets.into_iter().skip(offset).take(max_results).collect();
         let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
         let mut payload = graph_payload("downstream_flow", manager, refresh);
         payload.insert("symbol".to_string(), symbol_json(graph, &symbol));
         payload.insert("max_depth".to_string(), json!(max_depth));
+        payload.insert("offset".to_string(), json!(offset));
         let packet_count = packets.len();
         payload.insert("packets".to_string(), json!(packets));
         payload.insert("truncated".to_string(), json!(truncated));
@@ -4349,8 +4386,14 @@ impl ToolRegistry {
         .filter(|symbol| language_matches(graph, symbol, language_filter))
         .filter(|symbol| passes_test_scope(symbol_is_test(symbol), exclude_tests, tests_only))
         .collect::<Vec<_>>();
+        // Page after filtering/sorting: skip `offset`, keep `max_results`.
+        let offset = args.offset.unwrap_or(0);
         let mut pre_take_len = candidates.len();
-        let mut symbols = candidates.into_iter().take(max_results).collect::<Vec<_>>();
+        let mut symbols = candidates
+            .into_iter()
+            .skip(offset)
+            .take(max_results)
+            .collect::<Vec<_>>();
         if symbols.is_empty() && diff_only {
             let fallback = graph
                 .dirty_symbols()
@@ -4365,9 +4408,13 @@ impl ToolRegistry {
                 })
                 .collect::<Vec<_>>();
             pre_take_len = fallback.len();
-            symbols = fallback.into_iter().take(max_results).collect();
+            symbols = fallback
+                .into_iter()
+                .skip(offset)
+                .take(max_results)
+                .collect();
         }
-        let truncated = pre_take_len > max_results;
+        let truncated = pre_take_len.saturating_sub(offset) > max_results;
         // One cache shared across every result packet: a file referenced by
         // several of the returned symbols is read from disk once, not per symbol.
         let mut sources = SourceCache::default();
@@ -4385,6 +4432,7 @@ impl ToolRegistry {
             json!(diff_mode_str(args.mode.unwrap_or_default())),
         );
         payload.insert("diff_only".to_string(), json!(diff_only));
+        payload.insert("offset".to_string(), json!(offset));
         let packet_count = packets.len();
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
@@ -4424,6 +4472,7 @@ impl ToolRegistry {
             .max_depth
             .unwrap_or(DEFAULT_GRAPH_MAX_DEPTH)
             .clamp(1, MAX_GRAPH_MAX_DEPTH);
+        let offset = args.offset.unwrap_or(0);
         // Result-packet scope: `result_path` (or the plain `path`) restricts the
         // emitted nodes to a subtree, not just the root resolution.
         let result_path = result_path_scope(args.path.as_deref(), args.result_path.as_deref());
@@ -4444,6 +4493,7 @@ impl ToolRegistry {
                 total_roots,
                 max_depth,
                 args.max_results,
+                offset,
                 Some(root),
             );
         }
@@ -4467,13 +4517,16 @@ impl ToolRegistry {
                 total_roots,
                 max_depth,
                 args.max_results,
+                offset,
                 Some(file_sym),
             );
         }
         // Rootless map: cap the forest roots before expansion instead of
-        // building the whole forest and discarding all but `max_results`.
+        // building the whole forest and discarding all but `max_results`. The cap
+        // must include `offset` so the requested page is still reachable.
         let max_results = graph_limit(args.max_results);
-        let (nodes, total_roots) = graph.hierarchy_capped(None, max_depth, max_results);
+        let cap = offset.saturating_add(max_results);
+        let (nodes, total_roots) = graph.hierarchy_capped(None, max_depth, cap);
         let exclude_tests = args.exclude_tests.unwrap_or(false);
         let tests_only = args.tests_only.unwrap_or(false);
         let nodes = filter_hierarchy_nodes_by_test_scope(graph, nodes, exclude_tests, tests_only);
@@ -4496,6 +4549,7 @@ impl ToolRegistry {
             total_roots,
             max_depth,
             args.max_results,
+            offset,
             None,
         )
     }
@@ -4599,8 +4653,11 @@ impl ToolRegistry {
             .filter(|sym| language_matches(graph, sym, language_filter))
             .collect();
 
-        let truncated = related.len() > max_results;
-        let selected: Vec<&GraphSymbol> = related.iter().take(max_results).collect();
+        // Page after filtering: skip `offset`, keep `max_results`.
+        let offset = args.offset.unwrap_or(0);
+        let truncated = related.len().saturating_sub(offset) > max_results;
+        let selected: Vec<&GraphSymbol> =
+            related.iter().skip(offset).take(max_results).collect();
 
         let packets: Vec<Value> = selected
             .iter()
@@ -4622,6 +4679,7 @@ impl ToolRegistry {
         let mut payload = graph_payload("inheritance_hierarchy", manager, refresh);
         payload.insert("root".to_string(), symbol_json(graph, &root_sym));
         payload.insert("direction".to_string(), json!(direction));
+        payload.insert("offset".to_string(), json!(offset));
         payload.insert(
             "symbols".to_string(),
             json!(
@@ -4732,9 +4790,12 @@ impl ToolRegistry {
                 .collect();
             importer_files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
             let total = importer_files.len();
-            let truncated = total > max_results;
+            // Page after sorting: skip `offset`, keep `max_results`.
+            let offset = args.offset.unwrap_or(0);
+            let truncated = total.saturating_sub(offset) > max_results;
             let packets: Vec<Value> = importer_files
                 .iter()
+                .skip(offset)
                 .take(max_results)
                 .map(|file| {
                     json!({
@@ -4758,6 +4819,7 @@ impl ToolRegistry {
                 ),
             );
             payload.insert("direct_only".to_string(), json!(true));
+            payload.insert("offset".to_string(), json!(offset));
             payload.insert("packets".to_string(), json!(packets));
             payload.insert("importer_count".to_string(), json!(total));
             payload.insert("truncated".to_string(), json!(truncated));
@@ -4785,15 +4847,31 @@ impl ToolRegistry {
         let exclude_tests = args.exclude_tests.unwrap_or(false);
         let tests_only = args.tests_only.unwrap_or(false);
         let language_filter = args.language.as_deref();
-        let affected_symbols: Vec<&squeezy_graph::GraphSymbol> = impact
+        let mut affected_symbols: Vec<&squeezy_graph::GraphSymbol> = impact
             .affected_symbols
             .iter()
             .filter(|sym| passes_test_scope(symbol_is_test(sym), exclude_tests, tests_only))
             .filter(|sym| language_matches(graph, sym, language_filter))
             .collect();
-        let truncated = affected_symbols.len() > max_results;
-        let selected_symbols: Vec<&squeezy_graph::GraphSymbol> =
-            affected_symbols.into_iter().take(max_results).collect();
+        // `compute_impact` collects from a HashMap, so iteration order is not
+        // stable. Sort deterministically (path, span, id) before paging so the
+        // `offset` window is reproducible across calls.
+        affected_symbols.sort_by(|a, b| {
+            a.file_id
+                .0
+                .cmp(&b.file_id.0)
+                .then(a.span.start.line.cmp(&b.span.start.line))
+                .then(a.span.start.column.cmp(&b.span.start.column))
+                .then(a.id.0.cmp(&b.id.0))
+        });
+        // Page after sorting: skip `offset`, keep `max_results`.
+        let offset = args.offset.unwrap_or(0);
+        let truncated = affected_symbols.len().saturating_sub(offset) > max_results;
+        let selected_symbols: Vec<&squeezy_graph::GraphSymbol> = affected_symbols
+            .into_iter()
+            .skip(offset)
+            .take(max_results)
+            .collect();
 
         let packets: Vec<Value> = selected_symbols
             .iter()
@@ -4833,6 +4911,7 @@ impl ToolRegistry {
             "affected_file_count".to_string(),
             json!(impact.affected_files.len()),
         );
+        payload.insert("offset".to_string(), json!(offset));
         payload.insert("packets".to_string(), json!(packets));
         payload.insert("test_symbols".to_string(), json!(test_symbols_json));
         payload.insert("truncated".to_string(), json!(truncated));
