@@ -7,7 +7,6 @@ use std::{
 
 use squeezy_core::SkillsConfig;
 
-use super::*;
 use crate::SkillCatalog;
 
 fn write_skill(dir: &Path, name: &str, description: &str, triggers: &[&str]) {

@@ -150,7 +150,7 @@ impl SqueezyHelp {
         for group in TopicGroup::ORDER {
             let topic_list = TOPICS
                 .iter()
-                .filter(|topic| topic.group == group)
+                .filter(|topic| topic.group == *group)
                 .map(|topic| format!("`{}`", topic.id))
                 .collect::<Vec<_>>()
                 .join(" · ");

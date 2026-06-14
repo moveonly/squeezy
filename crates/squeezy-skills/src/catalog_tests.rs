@@ -1343,6 +1343,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+static LOG_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
 /// Routes each event to the calling thread's [`CAPTURE_BUFFER`], or drops it
 /// when none is installed. Cloned per `make_writer`, so it is cheap.
 #[derive(Clone, Default)]

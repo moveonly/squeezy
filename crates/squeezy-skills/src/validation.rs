@@ -9,7 +9,6 @@ use crate::{
     COMPAT_PROJECT_SKILLS_DIR, PROJECT_SKILLS_DIR, SKILL_FILE, SkillCatalog,
     catalog::ancestor_project_roots,
     frontmatter::{is_valid_skill_name, parse_skill_file},
-    implicit,
 };
 
 pub fn parse_skill_triggers(content: &str) -> Vec<String> {
