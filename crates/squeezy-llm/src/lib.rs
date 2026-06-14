@@ -69,6 +69,7 @@ pub use tokens::{
 };
 
 pub use anthropic::AnthropicProvider;
+pub use anthropic_betas::{CONTEXT_1M_BETA, INTERLEAVED_THINKING_BETA};
 pub use bedrock::BedrockProvider;
 pub use cache_policy::{CacheRetention, CacheSpec};
 pub use compatible::OpenAiCompatibleProvider;

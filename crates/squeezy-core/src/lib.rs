@@ -968,6 +968,18 @@ pub struct AppConfig {
     pub context_compaction: ContextCompactionConfig,
     pub subagents: SubagentConfig,
     pub store_responses: bool,
+    /// Opt into Anthropic's 1M-token context window (`context-1m-2025-08-07`
+    /// beta). Only takes effect on the Anthropic / Bedrock providers; the
+    /// agent attaches the beta id to the main-agent and subagent requests.
+    /// `false` (the default) leaves the standard 200K window in place.
+    /// Configured via `[model].context_1m` or `SQUEEZY_CONTEXT_1M`.
+    pub context_1m: bool,
+    /// Opt into Anthropic's interleaved/extended thinking
+    /// (`interleaved-thinking-2025-05-14` beta), which lets the model reason
+    /// between tool calls within a turn. Anthropic / Bedrock only. `false`
+    /// (the default) leaves thinking unchanged. Configured via
+    /// `[model].extended_thinking` or `SQUEEZY_EXTENDED_THINKING`.
+    pub extended_thinking: bool,
     pub exploration_graph: bool,
     pub max_parallel_tools: usize,
     pub tool_spill_threshold_bytes: usize,
@@ -1527,6 +1539,17 @@ impl AppConfig {
                 provider,
                 ProviderConfig::OpenAi(_) | ProviderConfig::AzureOpenAi(_)
             );
+        // Anthropic beta opt-ins. Parsed unconditionally here; the agent
+        // attaches the beta ids to requests only when the active provider is
+        // Anthropic or Bedrock, so a stray flag on another provider is inert.
+        let context_1m = get_var("SQUEEZY_CONTEXT_1M")
+            .as_deref()
+            .map(parse_enabled_bool)
+            .unwrap_or(model_settings.context_1m.unwrap_or(false));
+        let extended_thinking = get_var("SQUEEZY_EXTENDED_THINKING")
+            .as_deref()
+            .map(parse_enabled_bool)
+            .unwrap_or(model_settings.extended_thinking.unwrap_or(false));
         let agent_settings = settings.agent.unwrap_or_default();
         // Exploration graph prefetch defaults to on, and the documented env-var
         // override is `SQUEEZY_EXPLORATION_GRAPH=off|false|...`. Treating
@@ -1740,6 +1763,8 @@ impl AppConfig {
             context_compaction,
             subagents,
             store_responses,
+            context_1m,
+            extended_thinking,
             exploration_graph,
             max_parallel_tools,
             tool_spill_threshold_bytes,
@@ -1952,7 +1977,12 @@ impl AppConfig {
             "stream_idle_timeout_ms = {}\n",
             self.stream_idle_timeout.as_millis()
         ));
-        output.push_str(&format!("store_responses = {}\n\n", self.store_responses));
+        output.push_str(&format!("store_responses = {}\n", self.store_responses));
+        output.push_str(&format!("context_1m = {}\n", self.context_1m));
+        output.push_str(&format!(
+            "extended_thinking = {}\n\n",
+            self.extended_thinking
+        ));
 
         output.push_str("[agent]\n");
         output.push_str(&format!(
@@ -4928,6 +4958,14 @@ pub struct ModelSettings {
     pub presence_penalty: Option<f32>,
     pub stream_idle_timeout_ms: Option<u64>,
     pub store_responses: Option<bool>,
+    /// Opt into Anthropic's 1M-token context window beta. Anthropic /
+    /// Bedrock only; ignored on other providers. `None`/`false` keeps the
+    /// standard window.
+    pub context_1m: Option<bool>,
+    /// Opt into Anthropic's interleaved/extended-thinking beta. Anthropic /
+    /// Bedrock only; ignored on other providers. `None`/`false` leaves
+    /// thinking unchanged.
+    pub extended_thinking: Option<bool>,
     pub selection_version: Option<u32>,
     /// Forwarded to the provider as `tool_choice` whenever tools are
     /// advertised on the request. `None` omits the field (provider
@@ -4977,6 +5015,8 @@ impl ModelSettings {
                 "presence_penalty",
                 "stream_idle_timeout_ms",
                 "store_responses",
+                "context_1m",
+                "extended_thinking",
                 "selection_version",
                 "tool_choice",
                 "parallel_tool_calls",
@@ -5056,6 +5096,13 @@ impl ModelSettings {
                 source,
                 &field(path, "store_responses"),
             )?,
+            context_1m: bool_value(table, "context_1m", source, &field(path, "context_1m"))?,
+            extended_thinking: bool_value(
+                table,
+                "extended_thinking",
+                source,
+                &field(path, "extended_thinking"),
+            )?,
             selection_version: u32_value(
                 table,
                 "selection_version",
@@ -5101,6 +5148,8 @@ impl ModelSettings {
             next.stream_idle_timeout_ms,
         );
         replace_if_some(&mut self.store_responses, next.store_responses);
+        replace_if_some(&mut self.context_1m, next.context_1m);
+        replace_if_some(&mut self.extended_thinking, next.extended_thinking);
         replace_if_some(&mut self.selection_version, next.selection_version);
         replace_if_some(&mut self.tool_choice, next.tool_choice);
         replace_if_some(&mut self.parallel_tool_calls, next.parallel_tool_calls);

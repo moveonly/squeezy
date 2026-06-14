@@ -18,9 +18,9 @@ use squeezy_core::{
     ShellSandboxMode, SkillsConfig, SubagentConfig, TaskStateStatus,
 };
 use squeezy_llm::{
-    INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
-    StopReason,
+    CONTEXT_1M_BETA, INTERLEAVED_THINKING_BETA, INVALID_TOOL_ARGUMENTS_ERROR_KEY,
+    INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem,
+    LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec, StopReason,
 };
 use squeezy_tools::{ToolCall, ToolCostHint, ToolReceipt, ToolStatus, sha256_hex};
 use tracing_subscriber::fmt::MakeWriter;
@@ -1659,6 +1659,53 @@ fn provider_capability_gate_controls_native_reasoning_and_verbosity_fields() {
     );
     assert_eq!(request_response_verbosity(&config, "anthropic"), None);
     assert_eq!(request_reasoning_effort(&config, "anthropic"), None);
+}
+
+#[test]
+fn anthropic_beta_flags_attach_only_on_anthropic_providers() {
+    fn betas(headers: &std::sync::Arc<[std::sync::Arc<str>]>) -> Vec<&str> {
+        headers.iter().map(|beta| beta.as_ref()).collect()
+    }
+
+    // Both opt-ins on.
+    let config = AppConfig {
+        context_1m: true,
+        extended_thinking: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        betas(&request_beta_headers(&config, "anthropic")),
+        vec![CONTEXT_1M_BETA, INTERLEAVED_THINKING_BETA],
+        "1P Anthropic carries both beta ids",
+    );
+    assert_eq!(
+        betas(&request_beta_headers(&config, "bedrock")),
+        vec![CONTEXT_1M_BETA, INTERLEAVED_THINKING_BETA],
+        "Bedrock (Anthropic via AWS) carries both beta ids",
+    );
+    assert!(
+        request_beta_headers(&config, "openai").is_empty(),
+        "non-Anthropic providers never receive Anthropic betas",
+    );
+    assert!(
+        request_beta_headers(&config, "google").is_empty(),
+        "non-Anthropic providers never receive Anthropic betas",
+    );
+
+    // Only the 1M-context opt-in.
+    let context_only = AppConfig {
+        context_1m: true,
+        extended_thinking: false,
+        ..Default::default()
+    };
+    assert_eq!(
+        betas(&request_beta_headers(&context_only, "anthropic")),
+        vec![CONTEXT_1M_BETA],
+    );
+
+    // Default config emits nothing even on an Anthropic provider.
+    let off = AppConfig::default();
+    assert!(request_beta_headers(&off, "anthropic").is_empty());
 }
 
 #[test]

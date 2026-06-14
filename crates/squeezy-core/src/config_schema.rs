@@ -620,6 +620,32 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
+                label: "context_1m",
+                toml_path: &["model", "context_1m"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_context_1m,
+                set: set_context_1m,
+                default_display: "false",
+                default: || FieldValue::Bool(false),
+                help: "(Anthropic/Bedrock only) Opt into the 1M-token context window (context-1m beta). Raises the cap from 200K but bills long prompts at a premium per-token rate — leave off unless you need it.",
+                env_override: Some("SQUEEZY_CONTEXT_1M"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "extended_thinking",
+                toml_path: &["model", "extended_thinking"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_extended_thinking,
+                set: set_extended_thinking,
+                default_display: "false",
+                default: || FieldValue::Bool(false),
+                help: "(Anthropic/Bedrock only) Opt into interleaved/extended thinking (interleaved-thinking beta), letting the model reason between tool calls. Spends extra thinking tokens and adds latency.",
+                env_override: Some("SQUEEZY_EXTENDED_THINKING"),
+                secret: false,
+            },
+            FieldMeta {
                 label: "ollama_keep_alive",
                 toml_path: &["providers", "ollama", "keep_alive"],
                 kind: FieldKind::String { multiline: false },
@@ -2909,6 +2935,32 @@ fn set_store_responses(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'s
             Ok(())
         }
         _ => Err("store_responses expects bool"),
+    }
+}
+
+fn get_context_1m(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.context_1m)
+}
+fn set_context_1m(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.context_1m = v;
+            Ok(())
+        }
+        _ => Err("context_1m expects bool"),
+    }
+}
+
+fn get_extended_thinking(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.extended_thinking)
+}
+fn set_extended_thinking(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.extended_thinking = v;
+            Ok(())
+        }
+        _ => Err("extended_thinking expects bool"),
     }
 }
 

@@ -31,12 +31,12 @@ use squeezy_core::{
 };
 use squeezy_hooks::{HookPayload, HookRegistry, HookResult};
 use squeezy_llm::{
-    CacheRetention, CacheSpec, CitationSource, ContextLimitInput, INVALID_TOOL_ARGUMENTS_ERROR_KEY,
-    INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem,
-    LlmOutputSchema, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
-    ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate, StopReason, capabilities_for,
-    estimate_cost, estimate_request_context_full, fetch_ollama_context_window,
-    provider_honors_output_schema,
+    CONTEXT_1M_BETA, CacheRetention, CacheSpec, CitationSource, ContextLimitInput,
+    INTERLEAVED_THINKING_BETA, INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY,
+    INVALID_TOOL_ARGUMENTS_RAW_KEY, LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider,
+    LlmRequest, LlmStream, LlmToolCall, LlmToolSpec, ReasoningPayload, ReasoningSnapshot,
+    RequestTokenEstimate, StopReason, capabilities_for, estimate_cost,
+    estimate_request_context_full, fetch_ollama_context_window, provider_honors_output_schema,
 };
 use squeezy_skills::{
     DocSection, HelpAnswer, HelpCitation, HelpStatus, SkillActivationKind, SqueezyHelp,
@@ -3232,7 +3232,7 @@ impl Agent {
             // Mirror the wire request so context/token accounting reflects
             // the same `parallel_tool_calls` choice the real request sends.
             parallel_tool_calls: self.config.parallel_tool_calls,
-            beta_headers: std::sync::Arc::from(Vec::new()),
+            beta_headers: request_beta_headers(&self.config, self.provider.name()),
         }
     }
 
@@ -6516,6 +6516,26 @@ fn request_reasoning_effort(
         .map(|_| effort)
 }
 
+/// Anthropic beta opt-ins to attach to a request, derived from the
+/// `[model].context_1m` / `extended_thinking` flags. Returns an empty list
+/// unless the active provider speaks the Anthropic Messages API (1P
+/// `anthropic` or `bedrock`), so the betas never reach a provider that would
+/// reject them. The transport layer joins them into the `anthropic-beta`
+/// header (1P) or `additional_model_request_fields.anthropic_beta` (Bedrock).
+fn request_beta_headers(config: &AppConfig, provider_name: &str) -> Arc<[Arc<str>]> {
+    if !matches!(provider_name, "anthropic" | "bedrock") {
+        return Arc::from(Vec::new());
+    }
+    let mut betas: Vec<Arc<str>> = Vec::new();
+    if config.context_1m {
+        betas.push(Arc::from(CONTEXT_1M_BETA));
+    }
+    if config.extended_thinking {
+        betas.push(Arc::from(INTERLEAVED_THINKING_BETA));
+    }
+    Arc::from(betas)
+}
+
 /// Reasoning effort for the live routed rung. Effort is a cost lever orthogonal
 /// to model choice, so a routed turn runs each rung at the effort it warrants
 /// (weak→low … strong→high) instead of one global effort for every rung.
@@ -8412,7 +8432,7 @@ impl TurnRuntime {
                 // parallel on OpenAI Responses / Chat-Completions — in
                 // place, so behavior is unchanged unless opted in.
                 parallel_tool_calls: self.config.parallel_tool_calls,
-                beta_headers: std::sync::Arc::from(Vec::new()),
+                beta_headers: request_beta_headers(&self.config, self.provider.name()),
                 ..LlmRequest::default()
             };
             let request_model = Arc::clone(&request.model);
@@ -12472,7 +12492,7 @@ async fn run_subagent_rounds(
             // operator-controlled batching opt-in. `None` keeps the
             // provider default.
             parallel_tool_calls: config.parallel_tool_calls,
-            beta_headers: std::sync::Arc::from(Vec::new()),
+            beta_headers: request_beta_headers(config, parent.provider.name()),
             ..LlmRequest::default()
         };
         let mut stream = parent

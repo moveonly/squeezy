@@ -816,6 +816,39 @@ disable_core_dumps = false
 }
 
 #[test]
+fn anthropic_beta_opt_ins_parse_default_off_and_round_trip() {
+    // Default: both off.
+    let default_config = AppConfig::from_env_vars(None, |_| None);
+    assert!(!default_config.context_1m);
+    assert!(!default_config.extended_thinking);
+
+    // TOML `[model]` flags flow through.
+    let settings = SettingsFile::from_toml_str(
+        "[model]\ncontext_1m = true\nextended_thinking = true\n",
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert!(config.context_1m);
+    assert!(config.extended_thinking);
+
+    // The redacted inspect dump is round-trippable.
+    let inspect = config.inspect_redacted();
+    assert!(inspect.contains("context_1m = true"));
+    assert!(inspect.contains("extended_thinking = true"));
+    SettingsFile::from_toml_str(&inspect, "round-trip").expect("inspect parses");
+
+    // Env overrides win over an unset TOML value.
+    let env_config = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_CONTEXT_1M" => Some("true".to_string()),
+        "SQUEEZY_EXTENDED_THINKING" => Some("on".to_string()),
+        _ => None,
+    });
+    assert!(env_config.context_1m);
+    assert!(env_config.extended_thinking);
+}
+
+#[test]
 fn config_reads_supported_env_overrides() {
     let config = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_MODEL" => Some("custom-model".to_string()),
