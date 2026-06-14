@@ -4766,17 +4766,25 @@ fn selection_surface_geometry(app: &TuiApp) -> (usize, usize) {
 /// Begin a fresh cell selection anchored at `pos` on `surface`, with drag
 /// tracking armed.
 fn start_selection(app: &mut TuiApp, surface: selection::SelectionSurface, pos: selection::Pos) {
-    let width = app
-        .main_text_area_cache
-        .get()
-        .map(|c| c.text_area.width)
-        .unwrap_or_else(|| main_text_width(app));
+    let width = selection_width_for_surface(app, surface);
     app.selection = Some(selection::Selection::at(
         surface,
         pos,
         selection::SelectionMode::Cell,
         width,
     ));
+}
+
+fn selection_width_for_surface(app: &TuiApp, surface: selection::SelectionSurface) -> u16 {
+    match surface {
+        selection::SelectionSurface::Main => app
+            .main_text_area_cache
+            .get()
+            .map(|c| c.text_area.width)
+            .unwrap_or_else(|| main_text_width(app))
+            .max(1),
+        selection::SelectionSurface::Overlay => overlay_text_width(app),
+    }
 }
 
 /// Move the active selection's cursor to `pos` (keeping the anchor fixed). A
@@ -4879,12 +4887,14 @@ fn scroll_selection_cursor_into_view(app: &mut TuiApp, cursor_row: usize, last: 
     }
 }
 
-/// Handle a left mouse press on the MAIN text area: shift-click extends the
-/// existing selection, a 2nd press at the same cell selects the word, a 3rd the
-/// row, and a plain press starts a new cell selection. Returns `true` (consumed).
-fn handle_main_selection_press(
+/// Handle a left mouse press on a transcript text surface: shift-click extends
+/// the existing selection, a 2nd press at the same cell selects the word, a 3rd
+/// the row, and a plain press starts a new cell selection. Returns `true`
+/// (consumed).
+fn handle_surface_selection_press(
     app: &mut TuiApp,
     rows: &[Line<'static>],
+    surface: selection::SelectionSurface,
     pos: selection::Pos,
     column: u16,
     row: u16,
@@ -4912,10 +4922,7 @@ fn handle_main_selection_press(
     // Shift+click extends the current selection's cursor (when one exists on
     // this surface).
     if modifiers.contains(KeyModifiers::SHIFT)
-        && app
-            .selection
-            .as_ref()
-            .is_some_and(|s| s.surface == selection::SelectionSurface::Main)
+        && app.selection.as_ref().is_some_and(|s| s.surface == surface)
     {
         set_selection_cursor(app, pos);
         return true;
@@ -4926,7 +4933,9 @@ fn handle_main_selection_press(
     // committed range toggles that range off; otherwise the live range (if any)
     // is committed into the set and a fresh disjoint range is started at the
     // click. The keyboard path (`Alt+d`) stays the primary, reliable affordance.
-    if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+    if surface == selection::SelectionSurface::Main
+        && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
         if app
             .selection_set
             .remove_at(selection::SelectionSurface::Main, pos)
@@ -4941,23 +4950,42 @@ fn handle_main_selection_press(
         // Commit the current live range (if non-empty) before starting a new one
         // so the disjoint set grows by the previous gesture's range.
         add_live_selection_to_set(app);
-        start_selection(app, selection::SelectionSurface::Main, pos);
+        start_selection(app, surface, pos);
         return true;
     }
 
     match multiplicity {
-        2 => select_word_at(app, rows, selection::SelectionSurface::Main, pos),
-        3 => select_row_at(app, rows, selection::SelectionSurface::Main, pos),
-        _ => start_selection(app, selection::SelectionSurface::Main, pos),
+        2 => select_word_at(app, rows, surface, pos),
+        3 => select_row_at(app, rows, surface, pos),
+        _ => start_selection(app, surface, pos),
     }
     true
+}
+
+fn handle_main_selection_press(
+    app: &mut TuiApp,
+    rows: &[Line<'static>],
+    pos: selection::Pos,
+    column: u16,
+    row: u16,
+    modifiers: KeyModifiers,
+) -> bool {
+    handle_surface_selection_press(
+        app,
+        rows,
+        selection::SelectionSurface::Main,
+        pos,
+        column,
+        row,
+        modifiers,
+    )
 }
 
 /// Double-click: select the word under `pos` over that row's plain text, snapping
 /// the anchor/cursor to word bounds (`SelectionMode::Word`).
 ///
-/// `rows` is the gesture's already-built main-surface row list (the press path
-/// is always on the main surface), reused here instead of rebuilding it.
+/// `rows` is the gesture's already-built surface row list, reused here instead
+/// of rebuilding it.
 fn select_word_at(
     app: &mut TuiApp,
     rows: &[Line<'static>],
@@ -4970,11 +4998,7 @@ fn select_word_at(
     };
     let plain = transcript_surface::plain_text_of_line(line);
     let bounds = selection::word_bounds(&plain, pos.col);
-    let width = app
-        .main_text_area_cache
-        .get()
-        .map(|c| c.text_area.width)
-        .unwrap_or_else(|| main_text_width(app));
+    let width = selection_width_for_surface(app, surface);
     let mut sel = selection::Selection::at(
         surface,
         selection::Pos::new(pos.row, bounds.start),
@@ -4987,8 +5011,8 @@ fn select_word_at(
 
 /// Triple-click: select the whole visual row under `pos` (`SelectionMode::Row`).
 ///
-/// `rows` is the gesture's already-built main-surface row list, reused here
-/// instead of rebuilding it.
+/// `rows` is the gesture's already-built surface row list, reused here instead
+/// of rebuilding it.
 fn select_row_at(
     app: &mut TuiApp,
     rows: &[Line<'static>],
@@ -4999,11 +5023,7 @@ fn select_row_at(
         .get(pos.row)
         .map(|l| transcript_surface::plain_text_of_line(l).chars().count())
         .unwrap_or(0);
-    let width = app
-        .main_text_area_cache
-        .get()
-        .map(|c| c.text_area.width)
-        .unwrap_or_else(|| main_text_width(app));
+    let width = selection_width_for_surface(app, surface);
     let mut sel = selection::Selection::at(
         surface,
         selection::Pos::new(pos.row, 0),
@@ -8080,13 +8100,15 @@ fn handle_transcript_overlay_mouse(
                     if let Some(pos) =
                         overlay_point_from_mouse(app, &rows, mouse.column, mouse.row, false)
                     {
-                        app.selection = Some(selection::Selection::at(
+                        handle_surface_selection_press(
+                            app,
+                            &rows,
                             selection::SelectionSurface::Overlay,
                             pos,
-                            selection::SelectionMode::Cell,
-                            overlay_text_width(app),
-                        ));
-                        true
+                            mouse.column,
+                            mouse.row,
+                            mouse.modifiers,
+                        )
                     } else {
                         false
                     }
@@ -35094,6 +35116,30 @@ fn selection_highlight_style() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
 }
 
+fn rows_with_text_selection_highlights(
+    mut rows: Vec<Line<'static>>,
+    app: &TuiApp,
+    surface: selection::SelectionSurface,
+) -> Vec<Line<'static>> {
+    if surface == selection::SelectionSurface::Main {
+        for sel in app.selection_set.members() {
+            if sel.surface == selection::SelectionSurface::Main {
+                rows = selection::rows_with_selection_highlight(
+                    &rows,
+                    sel,
+                    selection_highlight_style(),
+                );
+            }
+        }
+    }
+    if let Some(sel) = app.selection.as_ref()
+        && sel.surface == surface
+    {
+        rows = selection::rows_with_selection_highlight(&rows, sel, selection_highlight_style());
+    }
+    rows
+}
+
 /// Style for every search match: a muted accent background so all hits are
 /// visible at once without overwhelming the current one. Uses an explicit
 /// theme color rather than reverse-video so it composes on top of a selection
@@ -35993,19 +36039,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
     // non-contiguous selections show at once. Each pass clones the rows and only
     // patches its own span, so the highlights compose (a row touched by two
     // disjoint ranges keeps both). Applied to main-view ranges only.
-    let mut lines = lines;
-    for sel in app.selection_set.members() {
-        if sel.surface == selection::SelectionSurface::Main {
-            lines =
-                selection::rows_with_selection_highlight(&lines, sel, selection_highlight_style());
-        }
-    }
-    let lines = match app.selection.as_ref() {
-        Some(sel) if sel.surface == selection::SelectionSurface::Main => {
-            selection::rows_with_selection_highlight(&lines, sel, selection_highlight_style())
-        }
-        _ => lines,
-    };
+    let lines = rows_with_text_selection_highlights(lines, app, selection::SelectionSurface::Main);
     // Bake the search-match highlight AFTER the selection so the active match
     // stays visible inside a selection. Surface-local: only matches on the main
     // surface are applied here.
@@ -36756,14 +36790,11 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         let row_count = rows.len();
         let scroll =
             resolved_transcript_overlay_scroll_for_state(state, row_count, text_area.height);
-        // Selection is main-view only — the overlay paints no selection
-        // highlight. Search, however, can follow the active surface onto the
-        // overlay and is honoured here.
         let overlay_search = app
             .search
             .as_ref()
             .filter(|s| s.surface == selection::SelectionSurface::Overlay);
-        render_transcript_overlay_rows(frame, text_area, rows, scroll, overlay_search);
+        render_transcript_overlay_rows(frame, text_area, rows, scroll, app, overlay_search);
         if scrollbar_area.width > 0
             && let Some(geometry) =
                 transcript_overlay_scrollbar_geometry(row_count, scrollbar_area.height, scroll)
@@ -37369,26 +37400,30 @@ fn render_transcript_overlay_rows(
     area: Rect,
     rows: &[Line<'static>],
     scroll: usize,
+    app: &TuiApp,
     search: Option<&search::SearchState>,
 ) {
     frame.render_widget(ratatui::widgets::Clear, area);
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // Bake the search-match highlight onto the full pre-scroll row list, THEN
-    // skip/take the visible window. Selection is main-view only, so the overlay
-    // paints no selection highlight here.
+    // Bake the text-selection and search-match highlights onto the full
+    // pre-scroll row list, THEN skip/take the visible window. Selection and copy
+    // use the same absolute row/char basis, so the highlighted cells match the
+    // copied text.
+    let selected = rows_with_text_selection_highlights(
+        rows.to_vec(),
+        app,
+        selection::SelectionSurface::Overlay,
+    );
     let searched;
     let source: &[Line<'static>] = match search {
         Some(state) => {
-            searched = rows_with_search_highlight(
-                rows.to_vec(),
-                state,
-                selection::SelectionSurface::Overlay,
-            );
+            searched =
+                rows_with_search_highlight(selected, state, selection::SelectionSurface::Overlay);
             &searched
         }
-        None => rows,
+        None => &selected,
     };
     let visible_rows = source
         .iter()
