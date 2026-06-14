@@ -4,6 +4,17 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+/// Worker-thread stack size for the eval runtime. Mirrors squeezy-cli's
+/// `WORKER_THREAD_STACK_SIZE`. The agent code this harness drives can recurse
+/// deeply on a tokio worker — e.g. the `grep` tool walks the workspace with
+/// `ignore::Walk`, which compiles the repo's `.gitignore` globs into a single
+/// regex (globset → regex-automata's recursive NFA compiler). On a large
+/// `local = "."` workspace that compile overflows tokio's default 2 MiB worker
+/// stack and SIGABRTs. The real CLI bumps its workers to 16 MiB for exactly
+/// this reason; the eval runtime must match or scenarios crash here despite the
+/// product being fine in production.
+const WORKER_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "squeezy-eval",
@@ -124,6 +135,7 @@ fn main() -> ExitCode {
     // sweep watchdog to SIGKILL them mid-flush.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_stack_size(WORKER_THREAD_STACK_SIZE)
         .build()
         .expect("build tokio runtime");
     let result = runtime.block_on(async {
