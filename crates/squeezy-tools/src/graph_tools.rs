@@ -2712,6 +2712,31 @@ fn resolve_hierarchy_root(
     .next()
 }
 
+/// Resolve a `path` filter to its workspace File symbol (kind `File`). Used by
+/// the file-outline path of `hierarchy`: rooting the tree at the File symbol
+/// yields that file's declaration tree instead of the whole-workspace forest.
+///
+/// Prefers a case-insensitive exact lookup (O(1), Windows-friendly) and falls
+/// back to the directory-aware `path_matches_filter` scan so a partial but
+/// unambiguous spelling still resolves. The File symbol is registered under the
+/// stable `file:{file_id}` id, so the lookup needs no private graph accessor.
+fn resolve_file_symbol(
+    graph: &squeezy_graph::SemanticGraph,
+    path: &str,
+) -> Option<GraphSymbol> {
+    if path.trim().is_empty() {
+        return None;
+    }
+    let file = graph.find_file_case_insensitive(path).or_else(|| {
+        graph
+            .files
+            .values()
+            .find(|file| path_matches_filter(&file.relative_path, path))
+    })?;
+    let file_symbol_id = SymbolId::new(format!("file:{}", file.id.0));
+    graph.symbols.get(&file_symbol_id).cloned()
+}
+
 fn unresolved_hierarchy_result(
     call: &ToolCall,
     manager: &GraphManager,
@@ -3781,6 +3806,26 @@ impl ToolRegistry {
                 max_depth,
                 args.max_results,
                 Some(root),
+            );
+        }
+        // File outline: a `path` with no symbol_id/query roots the hierarchy at
+        // the file's File symbol so the result is that file's declaration tree
+        // (functions/classes/etc.), not the whole-workspace rootless forest.
+        if let Some(path) = args.path.as_deref()
+            && let Some(file_sym) = resolve_file_symbol(graph, path)
+        {
+            let nodes = graph.hierarchy(Some(&file_sym.id), max_depth);
+            let total_roots = nodes.len();
+            return hierarchy_result(
+                call,
+                manager,
+                refresh,
+                graph,
+                nodes,
+                total_roots,
+                max_depth,
+                args.max_results,
+                Some(file_sym),
             );
         }
         // Rootless map: cap the forest roots before expansion instead of
