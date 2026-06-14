@@ -10906,6 +10906,10 @@ fn dispatch_keymap_action_inner(
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
                 return false;
             }
+            // The suspend/spawn/terminal-restore plumbing is Unix-only. Off Unix
+            // the chord is consumed silently (so `Alt+e` never leaks `e` into the
+            // composer) and does nothing — there is no editor handoff to offer.
+            #[cfg(unix)]
             open_composer_in_editor(app);
             true
         }
@@ -16436,43 +16440,36 @@ fn toggle_pin_selected_clipboard_entry(app: &mut TuiApp) {
 
 /// `Alt+e`: open the composer text in the user's `$VISUAL`/`$EDITOR` (§12.6.5
 /// External Editor Handoff). Resolves the editor from the environment; when none
-/// is configured (or this is a non-Unix build, where the suspend/spawn plumbing
-/// is not wired) this degrades to a safe status hint and changes nothing.
+/// is configured this degrades to a safe status hint and changes nothing.
 /// Otherwise it stamps a [`editor_handoff::EditorHandoffRequest`] for the run
 /// loop to execute on its next turn — the loop owns the terminal guard, so it
 /// (not this side-effect-light arm) does the alt-screen suspend / spawn /
 /// restore. Editing during a live turn is fine: the composer text is independent
 /// of the running turn.
+///
+/// Unix-only: the suspend/spawn/terminal-restore plumbing differs sharply off
+/// Unix (see the spec's platform notes), so there is no handoff to offer there.
+#[cfg(unix)]
 fn open_composer_in_editor(app: &mut TuiApp) {
-    // Off Unix the suspend/spawn/terminal-restore differs sharply (see the spec's
-    // platform notes), so the spawn is Unix-only; the non-Unix build keeps the
-    // keybinding reachable but degrades to the same hint as "no editor set".
-    #[cfg(not(unix))]
-    {
-        app.status = "external editor handoff is only available on Unix builds".to_string();
-    }
-    #[cfg(unix)]
-    {
-        let Some(command) = editor_handoff::resolve_editor(|key| std::env::var_os(key)) else {
-            app.status =
-                "no editor configured — set $VISUAL or $EDITOR to edit in your editor".to_string();
-            return;
-        };
-        app.pending_editor_handoff = Some(editor_handoff::EditorHandoffRequest {
-            target: editor_handoff::EditorTarget::Composer,
-            initial_text: app.input.clone(),
-            command,
-        });
-        // The loop runs the handoff before its next draw; surface the editor we
-        // are about to hand off to so the brief alt-screen leave is explained.
-        app.status = format!(
-            "opening composer in {} …",
-            app.pending_editor_handoff
-                .as_ref()
-                .map(|r| r.command.display())
-                .unwrap_or_default(),
-        );
-    }
+    let Some(command) = editor_handoff::resolve_editor(|key| std::env::var_os(key)) else {
+        app.status =
+            "no editor configured — set $VISUAL or $EDITOR to edit in your editor".to_string();
+        return;
+    };
+    app.pending_editor_handoff = Some(editor_handoff::EditorHandoffRequest {
+        target: editor_handoff::EditorTarget::Composer,
+        initial_text: app.input.clone(),
+        command,
+    });
+    // The loop runs the handoff before its next draw; surface the editor we
+    // are about to hand off to so the brief alt-screen leave is explained.
+    app.status = format!(
+        "opening composer in {} …",
+        app.pending_editor_handoff
+            .as_ref()
+            .map(|r| r.command.display())
+            .unwrap_or_default(),
+    );
 }
 
 /// Apply a completed editor handoff to the app: a real change opens the

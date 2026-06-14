@@ -226,8 +226,9 @@ pub(crate) enum Action {
     /// §12.6.5 External Editor Handoff). Suspends the alt-screen, hands a temp
     /// file to the editor, and re-imports the saved buffer through an
     /// accept/reopen/discard confirmation. A safe no-op (status hint) when no
-    /// editor is configured, and degrades to the same hint off Unix where the
-    /// spawn/terminal-restore plumbing is not wired. Records nothing at idle.
+    /// editor is configured. Unix-only: the spawn/terminal-restore plumbing is
+    /// not wired off Unix, where the chord is consumed silently. Records nothing
+    /// at idle.
     OpenComposerInEditor,
     /// Cycle the main-view Semantic Filter (§12.5.2) forward through its
     /// categories — all → user turns → assistant → tool calls → errors → (per
