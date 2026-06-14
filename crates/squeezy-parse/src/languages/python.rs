@@ -1,5 +1,5 @@
 use crate::languages::js_ts::{
-    python_assignment_target, python_from_imports, python_plain_imports,
+    is_python_identifier, python_assignment_target, python_from_imports, python_plain_imports,
     python_simple_assignment_name, python_string_list_values,
 };
 use crate::languages::rust::*;
@@ -228,9 +228,17 @@ pub(crate) fn extract_python_field_symbol(
     ctx: &mut ExtractContext<'_>,
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
 ) {
-    let Some((parent_id, SymbolKind::Class)) = parent_symbol else {
+    // Class/Enum bodies emit member symbols (Field, or Variant for enum
+    // members); module scope (no parent) emits binding symbols (Static/Const,
+    // or TypeAlias for `X: TypeAlias = ...`). Assignments nested inside a
+    // function/method (parent kind Function/Method) are locals and are skipped.
+    let parent_kind = parent_symbol.map(|(_, kind)| *kind);
+    let is_member = matches!(parent_kind, Some(SymbolKind::Class | SymbolKind::Enum));
+    let is_module_level = parent_symbol.is_none();
+    if !is_member && !is_module_level {
         return;
-    };
+    }
+
     let raw = node_text(node, ctx.source).unwrap_or_default();
     let Some((left, right)) = split_python_assignment_like(raw) else {
         return;
@@ -239,31 +247,81 @@ pub(crate) fn extract_python_field_symbol(
         return;
     };
     let span = span_from_node(node);
-    let mut attributes = vec!["python:field".to_string()];
-    if let Some(annotation) = left
-        .split_once(':')
-        .and_then(|(_, annotation)| python_field_type_name(annotation))
-    {
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+
+    // Member kind: enum members with a plain `NAME = value` body become
+    // Variant; everything else in a class body stays Field. Module-level
+    // bindings become TypeAlias (`X: TypeAlias = ...`), Static (ALL_CAPS or a
+    // `Final` annotation, i.e. a constant), or Const otherwise.
+    let annotation_text = left.split_once(':').map(|(_, ann)| ann.trim());
+    let is_type_alias = annotation_text
+        .map(|ann| python_field_type_name(ann).as_deref() == Some("TypeAlias"))
+        .unwrap_or(false);
+    let kind = if is_member {
+        if matches!(parent_kind, Some(SymbolKind::Enum)) && python_is_simple_enum_member(left, right)
+        {
+            SymbolKind::Variant
+        } else {
+            SymbolKind::Field
+        }
+    } else if is_type_alias {
+        SymbolKind::TypeAlias
+    } else if python_binding_is_constant(&name, annotation_text) {
+        SymbolKind::Static
+    } else {
+        SymbolKind::Const
+    };
+
+    let mut attributes = match kind {
+        SymbolKind::Field => vec!["python:field".to_string()],
+        SymbolKind::Variant => vec!["python:enum-member".to_string()],
+        SymbolKind::TypeAlias => vec!["python:type-alias".to_string()],
+        _ => vec!["python:binding".to_string()],
+    };
+    // For a TypeAlias the RHS is the aliased type; record it as a Type
+    // reference. For other bindings the LHS annotation (if any) is the type.
+    if kind == SymbolKind::TypeAlias {
+        if let Some(target) = python_field_type_name(right) {
+            attributes.push(format!("type:{target}"));
+            ctx.references.push(ParsedReference {
+                file_id: ctx.file.id.clone(),
+                owner_id: parent_id.clone(),
+                text: target,
+                kind: ReferenceKind::Type,
+                span,
+                provenance: Provenance::new("tree-sitter-python", "type alias reference"),
+            });
+        }
+    } else if let Some(annotation) = annotation_text.and_then(python_field_type_name) {
         attributes.push(format!("type:{annotation}"));
         ctx.references.push(ParsedReference {
             file_id: ctx.file.id.clone(),
-            owner_id: Some(parent_id.clone()),
+            owner_id: parent_id.clone(),
             text: annotation,
             kind: ReferenceKind::Type,
             span,
             provenance: Provenance::new("tree-sitter-python", "field annotation reference"),
         });
     }
-    attributes.extend(python_field_attributes(right));
+    if matches!(kind, SymbolKind::Field | SymbolKind::Variant) {
+        attributes.extend(python_field_attributes(right));
+    }
     attributes.sort();
     attributes.dedup();
 
+    let provenance_label = match kind {
+        SymbolKind::Variant => "enum variant",
+        SymbolKind::TypeAlias => "type alias assignment",
+        SymbolKind::Static | SymbolKind::Const => "module binding assignment",
+        _ => "class field assignment",
+    };
+
     ctx.symbols.push(ParsedSymbol {
-        id: symbol_id(&ctx.file, Some(parent_id), SymbolKind::Field, &name, span),
+        id: symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span),
         file_id: ctx.file.id.clone(),
-        parent_id: Some(parent_id.clone()),
+        parent_id,
         name,
-        kind: SymbolKind::Field,
+        kind,
         language_identity: None,
         span,
         body_span: None,
@@ -272,11 +330,42 @@ pub(crate) fn extract_python_field_symbol(
         visibility: None,
         docs: Vec::new(),
         attributes,
-        provenance: Provenance::new("tree-sitter-python", "class field assignment"),
+        provenance: Provenance::new("tree-sitter-python", provenance_label),
         confidence: Confidence::Heuristic,
         freshness: Freshness::Fresh,
         arity: None,
     });
+}
+
+/// True when a module-level binding is constant-shaped: an ALL_CAPS name (the
+/// PEP 8 constant convention) or a `Final` / `Final[...]` annotation.
+pub(crate) fn python_binding_is_constant(name: &str, annotation: Option<&str>) -> bool {
+    let is_all_caps = name.chars().any(|ch| ch.is_ascii_alphabetic())
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_');
+    let is_final = annotation
+        .map(|ann| {
+            let leaf = python_field_type_name(ann);
+            leaf.as_deref() == Some("Final") || ann.trim_start().starts_with("Final")
+        })
+        .unwrap_or(false);
+    is_all_caps || is_final
+}
+
+/// True for a plain `NAME = value` enum member (e.g. `RED = 1`, `RED = auto()`)
+/// as opposed to a method or a non-member assignment such as `_ignore_ = ...`.
+pub(crate) fn python_is_simple_enum_member(left: &str, right: &str) -> bool {
+    // Members are simple unannotated names; dunder/sunder housekeeping
+    // attributes (`__slots__`, `_ignore_`) are not value members.
+    if left.contains(':') {
+        return false;
+    }
+    let name = left.trim();
+    if name.starts_with('_') || !is_python_identifier(name) {
+        return false;
+    }
+    !right.trim().is_empty()
 }
 
 pub(crate) fn python_field_type_name(annotation: &str) -> Option<String> {
