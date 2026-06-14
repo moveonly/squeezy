@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex as StdMutex, RwLock,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -79,6 +79,7 @@ mod cost_broker;
 pub mod dispatch;
 mod exploration_compiler;
 pub mod export_html;
+mod memory_extraction;
 mod micro_compaction;
 mod permission_persist;
 mod plan_mode;
@@ -1434,6 +1435,16 @@ pub struct Agent {
     next_turn_id: Arc<AtomicU64>,
     next_approval_id: Arc<AtomicU64>,
     next_attachment_id: Arc<AtomicU64>,
+    /// High-water mark into `conversation_state.transcript` for the automatic
+    /// memory-extraction pass: items before it have already been considered.
+    /// In-memory only (resets on restart → one harmless re-consideration of the
+    /// resumed transcript).
+    last_extracted_memory_len: Arc<AtomicUsize>,
+    /// One-line summaries of what the automatic extraction pass saved/removed,
+    /// queued here because the pass finishes *after* the turn's event channel
+    /// closes. The TUI drains this on its poll loop and renders each as a quiet
+    /// transcript line (same pattern as background-job notifications).
+    memory_notices: Arc<StdMutex<Vec<String>>>,
     subagents: SubagentRegistry,
     /// In-memory permission rules added via "Allow user/project rule" during
     /// the current process. Persisted to disk on a best-effort basis; this
@@ -2119,23 +2130,35 @@ impl Agent {
                 config.instructions, repo_doc
             );
         }
-        if let Some(user_memory) =
-            ingest_user_memory(config.context_compaction.user_memory_max_bytes)
-        {
+        if config.context_compaction.user_memory_max_bytes > 0 {
+            // Surface the memory guidance whenever memory is enabled — even with
+            // an empty index — so a first-time user is bootstrapped into the
+            // save/recall loop instead of the feature lying dormant until they
+            // hand-author `~/.squeezy/MEMORY.md`. The index body is appended when
+            // present. Replay zeroes `user_memory_max_bytes`, so this whole block
+            // is omitted there and the cached prefix stays byte-stable.
+            let cap = config.context_compaction.user_memory_max_bytes;
+            let global_index = ingest_user_memory(cap);
+            let project_index = ingest_project_memory(&config.workspace_root, cap);
             log_session_event(
                 session_log.as_ref(),
                 &redactor,
                 "user_memory_ingested",
                 None,
                 Some(format!(
-                    "{} bytes ingested from ~/.squeezy/MEMORY.md",
-                    user_memory.len()
+                    "memory enabled; global index {} bytes, project index {} bytes",
+                    global_index.as_deref().map(str::len).unwrap_or(0),
+                    project_index.as_deref().map(str::len).unwrap_or(0),
                 )),
-                json!({ "bytes": user_memory.len() }),
+                json!({
+                    "global_index_bytes": global_index.as_deref().map(str::len).unwrap_or(0),
+                    "project_index_bytes": project_index.as_deref().map(str::len).unwrap_or(0),
+                }),
             );
             config.instructions = format!(
-                "{}\n\nUser-level memory (~/.squeezy/MEMORY.md):\n{}",
-                config.instructions, user_memory
+                "{}\n\n{}",
+                config.instructions,
+                memory_prompt_block(global_index.as_deref(), project_index.as_deref())
             );
         }
         let ambiguous_skills = tools.ambiguous_skill_names();
@@ -2182,6 +2205,10 @@ impl Agent {
         } else {
             None
         };
+        // Seed the memory-extraction high-water mark at the resumed transcript
+        // length so a resumed session does not re-extract (and re-save) facts
+        // already considered in the prior session — only new turns are scanned.
+        let initial_extracted_memory_len = conversation_state.transcript.len();
         let agent = Self {
             telemetry,
             session_started_at: Instant::now(),
@@ -2198,6 +2225,8 @@ impl Agent {
             ai_reviewer_state: Arc::new(StdMutex::new(ai_reviewer::AiReviewerState::default())),
             next_turn_id: Arc::new(AtomicU64::new(1)),
             next_approval_id: Arc::new(AtomicU64::new(1)),
+            last_extracted_memory_len: Arc::new(AtomicUsize::new(initial_extracted_memory_len)),
+            memory_notices: Arc::new(StdMutex::new(Vec::new())),
             next_attachment_id: Arc::new(AtomicU64::new(next_attachment_id)),
             subagents: SubagentRegistry::default(),
             session_rules: Arc::new(RwLock::new(Vec::new())),
@@ -2853,6 +2882,18 @@ impl Agent {
 
     pub fn job_notifications(&self) -> Vec<JobNotification> {
         self.jobs.notifications()
+    }
+
+    /// Take and clear any one-line summaries queued by the automatic memory
+    /// extraction pass since the last call. The TUI drains this each poll and
+    /// renders each as a quiet transcript line.
+    pub fn drain_memory_notices(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .memory_notices
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        )
     }
 
     pub fn job_snapshot(&self, id: JobId) -> Option<JobSnapshot> {
@@ -4773,6 +4814,15 @@ impl Agent {
         let last_request_overhead_tokens = self.last_request_overhead_tokens.clone();
         let configured_model_context_window = self.configured_model_context_window;
 
+        let memory_extraction = build_memory_extraction_context(
+            &config,
+            &provider,
+            &conversation_state,
+            &self.last_extracted_memory_len,
+            &self.memory_notices,
+            session_log.is_some(),
+        );
+
         let turn_done = Arc::new(Notify::new());
         let turn_finished = CancellationToken::new();
         let panic_tx = tx.clone();
@@ -4793,6 +4843,7 @@ impl Agent {
                 telemetry: panic_telemetry,
                 active_turn: active_turn.clone(),
                 turn_finished: turn_finished.clone(),
+                memory_extraction,
             },
             async move {
                 let redacted_input = redactor.redact(&input);
@@ -5074,6 +5125,10 @@ struct ObservedTurnContext {
     telemetry: TelemetryClient,
     active_turn: Arc<StdMutex<Option<ActiveTurn>>>,
     turn_finished: CancellationToken,
+    /// When `Some`, run the automatic memory-extraction pass after this
+    /// top-level turn settles. `None` for subagents (they never reach here),
+    /// replay, or when extraction is disabled / not viable.
+    memory_extraction: Option<MemoryExtractionContext>,
 }
 
 fn spawn_observed_turn<F>(context: ObservedTurnContext, future: F) -> tokio::task::JoinHandle<()>
@@ -5089,9 +5144,11 @@ where
         telemetry,
         active_turn,
         turn_finished,
+        memory_extraction,
     } = context;
     tokio::spawn(async move {
         let outcome = AssertUnwindSafe(future).catch_unwind().await;
+        let panicked = outcome.is_err();
         if outcome.is_err() {
             let error = SqueezyError::Agent("agent turn panicked".to_string());
             log_session_event(
@@ -5123,7 +5180,211 @@ where
         clear_active_turn_if_current(&active_turn, turn_id);
         turn_finished.cancel();
         done.notify_waiters();
+        // Automatic memory extraction runs detached, after the user has already
+        // seen the turn complete — never on a panicked turn. Only top-level
+        // turns reach `spawn_observed_turn`, so subagents are excluded for free.
+        if !panicked && let Some(extraction) = memory_extraction {
+            tokio::spawn(run_memory_extraction_task(
+                extraction,
+                session_log,
+                redactor,
+                turn_id,
+            ));
+        }
     })
+}
+
+/// Everything the detached memory-extraction task needs. Assembled in
+/// `start_turn` only when extraction is enabled and viable.
+struct MemoryExtractionContext {
+    provider: Arc<dyn LlmProvider>,
+    model: Arc<str>,
+    workspace_root: std::path::PathBuf,
+    conversation_state: Arc<Mutex<ConversationState>>,
+    last_extracted_len: Arc<AtomicUsize>,
+    notices: Arc<StdMutex<Vec<String>>>,
+}
+
+/// Build the extraction context iff automatic memory extraction is enabled and
+/// viable: memory on (`user_memory_max_bytes > 0`, which replay also zeroes),
+/// the auto-extract toggle set, a real recorded session (so unit tests with
+/// mock providers never trigger an extraction LLM call), and a resolvable cheap
+/// model.
+/// The viability gate for automatic memory extraction, factored out so it can
+/// be unit-tested directly. All four conditions must hold; the `session_log` +
+/// cheap-model requirements are what keep unit tests (mock providers, no
+/// session) from ever firing a real extraction LLM call.
+fn memory_auto_extract_viable(
+    config: &AppConfig,
+    provider_name: &str,
+    session_log_present: bool,
+) -> bool {
+    let cc = &config.context_compaction;
+    cc.user_memory_max_bytes > 0
+        && cc.memory_auto_extract
+        && session_log_present
+        && cheap_model_for(provider_name, config).is_some()
+}
+
+fn build_memory_extraction_context(
+    config: &AppConfig,
+    provider: &Arc<dyn LlmProvider>,
+    conversation_state: &Arc<Mutex<ConversationState>>,
+    last_extracted_len: &Arc<AtomicUsize>,
+    notices: &Arc<StdMutex<Vec<String>>>,
+    session_log_present: bool,
+) -> Option<MemoryExtractionContext> {
+    if !memory_auto_extract_viable(config, provider.name(), session_log_present) {
+        return None;
+    }
+    let model = cheap_model_for(provider.name(), config)?;
+    Some(MemoryExtractionContext {
+        provider: provider.clone(),
+        model: Arc::from(model),
+        workspace_root: config.workspace_root.clone(),
+        conversation_state: conversation_state.clone(),
+        last_extracted_len: last_extracted_len.clone(),
+        notices: notices.clone(),
+    })
+}
+
+/// Did the most recent turn already curate memory via the `memory` tool? Scans
+/// the conversation tail back to the last user message for a `memory`
+/// save/delete call. Mirrors Claude Code's skip-if-direct-write gate: when the
+/// model just wrote memory itself, the extraction pass is redundant.
+fn turn_wrote_memory_inline(conversation: &[LlmInputItem]) -> bool {
+    for item in conversation.iter().rev() {
+        match item {
+            // Reached the start of the current turn without finding a write.
+            LlmInputItem::UserText(_) => return false,
+            LlmInputItem::FunctionCall {
+                name, arguments, ..
+            } if name == "memory" => {
+                let op = arguments
+                    .get("op")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                if op.eq_ignore_ascii_case("save") || op.eq_ignore_ascii_case("delete") {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Render new transcript items as plain `User:` / `Assistant:` lines for the
+/// extraction prompt, skipping system/empty items.
+fn render_transcript_slice(items: &[TranscriptItem]) -> String {
+    let mut out = String::new();
+    for item in items {
+        let role = match item.role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            Role::System => continue,
+        };
+        let content = item.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        out.push_str(role);
+        out.push_str(": ");
+        out.push_str(content);
+        out.push_str("\n\n");
+    }
+    out
+}
+
+/// The detached extraction pass: read the new transcript slice, run the cheap
+/// LLM call, persist what it proposes, surface and log what changed.
+async fn run_memory_extraction_task(
+    ctx: MemoryExtractionContext,
+    session_log: Option<SessionHandle>,
+    redactor: Arc<Redactor>,
+    turn_id: TurnId,
+) {
+    // Read the new slice under the lock (fast); release before the LLM call.
+    let (slice_text, claimed_len) = {
+        let state = ctx.conversation_state.lock().await;
+        let total = state.transcript.len();
+        // Skip-if-direct-write (mirrors Claude Code): if the model already
+        // curated memory via the `memory` tool this turn, the extraction pass is
+        // redundant — advance past the slice and bail rather than spend a call.
+        if turn_wrote_memory_inline(&state.conversation) {
+            ctx.last_extracted_len.store(total, Ordering::Relaxed);
+            return;
+        }
+        let start = ctx.last_extracted_len.load(Ordering::Relaxed).min(total);
+        let new_items = &state.transcript[start..];
+        let new_user_chars: usize = new_items
+            .iter()
+            .filter(|item| item.role == Role::User)
+            .map(|item| item.content.chars().count())
+            .sum();
+        if new_user_chars < memory_extraction::EXTRACTION_MIN_NEW_PROSE_CHARS {
+            return;
+        }
+        (render_transcript_slice(new_items), total)
+    };
+    if slice_text.trim().is_empty() {
+        return;
+    }
+
+    // The extractor sees the whole store (generously capped) so its dedup and
+    // contradiction checks aren't fooled by a truncated index.
+    let memory = squeezy_store::memory::Memory::new(Some(&ctx.workspace_root));
+    let global_index = memory
+        .global_index()
+        .ok()
+        .flatten()
+        .and_then(|body| truncate_memory_index(body, memory_extraction::EXTRACTION_MAX_INDEX_BYTES))
+        .unwrap_or_default();
+    let project_index = memory
+        .project_index()
+        .ok()
+        .flatten()
+        .and_then(|body| truncate_memory_index(body, memory_extraction::EXTRACTION_MAX_INDEX_BYTES))
+        .unwrap_or_default();
+
+    // `None` means the LLM call failed — leave the high-water mark unadvanced so
+    // the slice is retried next turn rather than silently dropped.
+    let Some(result) = memory_extraction::run_extraction(
+        &ctx.provider,
+        ctx.model.clone(),
+        &ctx.workspace_root,
+        &slice_text,
+        &global_index,
+        &project_index,
+    )
+    .await
+    else {
+        return;
+    };
+    // The slice was handled (even if nothing was saved): advance past it.
+    ctx.last_extracted_len.store(claimed_len, Ordering::Relaxed);
+
+    if let Some(summary) = result.summary() {
+        log_session_event(
+            session_log.as_ref(),
+            &redactor,
+            "memory_extracted",
+            Some(turn_id),
+            Some(format!("auto-memory: {summary}")),
+            json!({
+                "saved": result.saved.len(),
+                "deleted": result.deleted.len(),
+                "skipped": result.skipped,
+            }),
+        );
+        // Queue a quiet, user-visible line so auto-saved memory is never silent
+        // — the TUI drains this on its poll loop (the turn's event channel has
+        // already closed by the time this detached pass finishes).
+        ctx.notices
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(format!("✎ memory: {summary}"));
+    }
 }
 
 fn spawn_turn_cancel_monitor(
@@ -6738,22 +6999,90 @@ fn ingest_agents_md(cwd: &std::path::Path, max_bytes: usize) -> Option<String> {
     }
 }
 
-/// Read `~/.squeezy/MEMORY.md` (preferred) or `~/.squeezy/memory.md` and
-/// return its contents truncated to `max_bytes`. Returns `None` when
-/// ingestion is disabled, `HOME` is unset, or neither file is present /
-/// readable. Errors are silent on purpose: this is a best-effort enrichment,
-/// never load-bearing. Uppercase first mirrors the project's `AGENTS.md`
-/// casing so users converging on the canonical name see it picked up.
-fn ingest_user_memory(max_bytes: usize) -> Option<String> {
-    if max_bytes == 0 {
-        return None;
+/// Standing guidance for the file-based memory feature, stitched into the
+/// system prompt at session start whenever memory is enabled. It teaches the
+/// model the memory taxonomy, the save/recall discipline, and — critically —
+/// what *not* to persist, so the `memory` tool produces a durable, high-signal
+/// store instead of an activity log. Kept static so it stays in the cached
+/// prompt prefix; the per-user index is appended separately by
+/// [`memory_prompt_block`].
+const MEMORY_PROMPT_GUIDANCE: &str = "\
+You have a persistent, file-based memory that survives across sessions, split by scope between a \
+global store (`~/.squeezy/`, shared across all your projects) and a per-project store \
+(`<repo>/.squeezy/`, local to this repository). Curate it with the `memory` tool (`save`, `delete`, \
+`list`, `read`) so future sessions start with what you have already learned. The indexes below are \
+loaded every session; topic files are read on demand. Build it up over time so future conversations \
+know who the user is, how they want to work with you, what to avoid or repeat, and the context behind \
+their requests. If the user asks you to remember something, save it immediately as whichever type \
+fits; if they ask you to forget something, delete it.
+
+Types of memory:
+- user — the user's role, expertise, and working preferences.
+- feedback — guidance on how to approach work: corrections (\"no, not that\") and confirmations \
+(\"yes, keep doing that\" — quieter, watch for them). Lead with the rule, then a **Why:** line and a \
+**How to apply:** line. Guidance that applies only to *this repo* (a testing policy, a build \
+invariant) is a `project` memory; reserve `feedback` for how to collaborate with the user in general.
+- project — ongoing work, goals, or decisions not derivable from code or git history. Convert \
+relative dates to absolute when saving. Add **Why:** / **How to apply:** lines.
+- reference — where to find information in an external system (issue tracker, dashboard, channel).
+
+Scope is automatic, decided by the type — you never choose a location. `user` and `feedback` are \
+saved globally (they apply to you across every project); `project` and `reference` are saved to \
+*this repository* only. Pick the right type and it routes itself.
+
+How to save: one fact per file, one paragraph, named by a short slug (e.g. `prefers-bun-over-npm`). \
+Don't write duplicates — `list` first and, if a memory already covers the topic, overwrite it by \
+reusing its slug rather than adding a near-copy. If a new fact contradicts or supersedes an existing \
+memory (the user changed their mind, a decision was reversed), overwrite that slug or `delete` it — \
+never leave two memories that disagree. Delete memories that turn out to be wrong or outdated.
+
+What NOT to save: never secrets, API keys, credentials, tokens, or personal data. Also skip code \
+patterns, conventions, architecture, file paths, or project structure (re-derivable by reading the \
+project); git history or who-changed-what (`git log` / `git blame` are authoritative); debugging fix \
+recipes (the fix lives in the code); anything already in AGENTS.md; and ephemeral state that only \
+matters this conversation. If asked to save one of these, ask what was *surprising* or *non-obvious* \
+about it and save that instead.
+
+When to access: when a memory seems relevant, or the user references prior-conversation work. You \
+MUST consult memory when the user explicitly asks you to check, recall, or remember. If the user \
+says to ignore memory, do not apply or cite it.
+
+Before acting on memory: a memory naming a file, function, or flag is a claim that it existed when \
+written — it may have been renamed or removed. Verify (read the file, grep the symbol) before \
+recommending it. \"The memory says X exists\" is not \"X exists now.\"
+
+Memory vs. other persistence: `notes_remember` / `notes_recall` remain available for structured, \
+queryable observations within a project; reserve `memory` for the durable cross-session picture of \
+the user and project. Use plans and tasks for work that only matters in the current conversation.";
+
+/// Compose the `## Memory` system-prompt block: the standing
+/// [`MEMORY_PROMPT_GUIDANCE`] plus the global and project indexes, each in its
+/// own labeled subsection so the model always knows which scope a fact lives
+/// in. Absent or empty indexes still render (with an "empty" note) so the model
+/// knows it can start saving; this is the bootstrap path for a first-time user.
+fn memory_prompt_block(global_index: Option<&str>, project_index: Option<&str>) -> String {
+    format!(
+        "## Memory\n\n{MEMORY_PROMPT_GUIDANCE}\n\n\
+         ### Global memory (~/.squeezy/MEMORY.md)\n{}\n\n\
+         ### This project's memory (<repo>/.squeezy/MEMORY.md)\n{}",
+        memory_index_or_empty(global_index),
+        memory_index_or_empty(project_index),
+    )
+}
+
+fn memory_index_or_empty(index: Option<&str>) -> String {
+    match index {
+        Some(body) if !body.trim().is_empty() => body.trim().to_string(),
+        _ => "(empty so far — as you save memories with the `memory` tool, their one-line \
+              pointers will appear here)"
+            .to_string(),
     }
-    let home = env::var_os("HOME")?;
-    let dir = std::path::PathBuf::from(home).join(".squeezy");
-    let body = fs::read_to_string(dir.join("MEMORY.md"))
-        .or_else(|_| fs::read_to_string(dir.join("memory.md")))
-        .ok()?;
-    if body.is_empty() {
+}
+
+/// Truncate an index body to `max_bytes` at a UTF-8 boundary, appending
+/// `\n[truncated]` when capped. `None` for an empty/disabled body.
+fn truncate_memory_index(body: String, max_bytes: usize) -> Option<String> {
+    if max_bytes == 0 || body.is_empty() {
         return None;
     }
     if body.len() <= max_bytes {
@@ -6767,6 +7096,34 @@ fn ingest_user_memory(max_bytes: usize) -> Option<String> {
     truncated.push_str(&body[..end]);
     truncated.push_str("\n[truncated]");
     Some(truncated)
+}
+
+/// Read the global memory index `~/.squeezy/MEMORY.md` (preferred) or the
+/// legacy lowercase `~/.squeezy/memory.md`, truncated to `max_bytes`. `None`
+/// when disabled, `HOME` is unset, or neither file is present. Errors are
+/// silent on purpose: best-effort enrichment, never load-bearing.
+fn ingest_user_memory(max_bytes: usize) -> Option<String> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let home = env::var_os("HOME")?;
+    let dir = std::path::PathBuf::from(home).join(".squeezy");
+    let body = fs::read_to_string(dir.join("MEMORY.md"))
+        .or_else(|_| fs::read_to_string(dir.join("memory.md")))
+        .ok()?;
+    truncate_memory_index(body, max_bytes)
+}
+
+/// Read the project memory index `<workspace>/.squeezy/MEMORY.md`, truncated to
+/// `max_bytes`. `None` when disabled or the file is absent. Best-effort.
+fn ingest_project_memory(workspace_root: &std::path::Path, max_bytes: usize) -> Option<String> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let body = squeezy_store::memory::Memory::new(Some(workspace_root))
+        .project_index()
+        .ok()??;
+    truncate_memory_index(body, max_bytes)
 }
 
 fn instructions_with_pinned_context(instructions: &str, pinned: &[ContextPin]) -> String {

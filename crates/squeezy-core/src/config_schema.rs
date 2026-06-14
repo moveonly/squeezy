@@ -1877,8 +1877,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_context_user_memory_max_bytes,
                 default_display: "16384 bytes",
                 default: || FieldValue::Integer(DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES as i64),
-                help: "Cap on ~/.squeezy/MEMORY.md stitched into base instructions (0 disables).",
+                help: "Master switch + byte cap for file-based memory: stitches the ~/.squeezy/MEMORY.md index and memory guidance into the system prompt and lets the model curate memory via the `memory` tool (0 disables the whole feature).",
                 env_override: Some("SQUEEZY_CONTEXT_USER_MEMORY_MAX_BYTES"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "memory_auto_extract",
+                toml_path: &["context", "memory_auto_extract"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_context_memory_auto_extract,
+                set: set_context_memory_auto_extract,
+                default_display: "true",
+                default: || FieldValue::Bool(true),
+                help: "Run a cheap auxiliary pass after each turn to distil durable facts into memory automatically (requires memory on). Off keeps the file memory + `memory` tool but skips the extra extraction LLM call.",
+                env_override: Some("SQUEEZY_CONTEXT_MEMORY_AUTO_EXTRACT"),
                 secret: false,
             },
         ],
@@ -3957,6 +3970,17 @@ fn set_context_user_memory_max_bytes(
     value: FieldValue,
 ) -> Result<(), &'static str> {
     cfg.context_compaction.user_memory_max_bytes = ctx_integer(value, 0)? as usize;
+    Ok(())
+}
+
+fn get_context_memory_auto_extract(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.context_compaction.memory_auto_extract)
+}
+fn set_context_memory_auto_extract(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    cfg.context_compaction.memory_auto_extract = ctx_bool(value)?;
     Ok(())
 }
 

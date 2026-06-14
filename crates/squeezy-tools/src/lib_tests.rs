@@ -9335,6 +9335,7 @@ fn tool_specs_are_sorted_by_name() {
             "inheritance_hierarchy",
             "list_skills",
             "load_skill",
+            "memory",
             "notebook_edit",
             "notes_recall",
             "notes_remember",
@@ -12909,6 +12910,101 @@ async fn notes_remember_then_recall_round_trip() {
     );
 }
 
+#[test]
+fn memory_tool_save_list_read_delete_round_trip() {
+    // The memory tool resolves `~/.squeezy` from HOME, so serialise with the
+    // other env-mutating tests. A sync test driving the async dispatches via
+    // `block_on` keeps the std `ENV_MUTEX` guard off any await point.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let root = temp_workspace("memory_tool_root");
+    let home = temp_workspace("memory_tool_home");
+    let previous_home = env::var_os("HOME");
+    unsafe {
+        env::set_var("HOME", &home);
+    }
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let call = |id: &str, args: Value| {
+        runtime.block_on(registry.execute(
+            ToolCall {
+                call_id: id.to_string(),
+                name: "memory".to_string(),
+                arguments: args,
+            },
+            CancellationToken::new(),
+        ))
+    };
+
+    let save = call(
+        "m1",
+        json!({
+            "op": "save",
+            "name": "prefers-bun",
+            "type": "feedback",
+            "description": "use bun not npm",
+            "body": "Use bun for package scripts.\n\n**Why:** npm is slow here.\n**How to apply:** install and run steps."
+        }),
+    );
+    let list = call("m2", json!({ "op": "list" }));
+    let read = call("m3", json!({ "op": "read", "name": "prefers-bun" }));
+    let delete = call("m4", json!({ "op": "delete", "name": "prefers-bun" }));
+    let read_after = call("m5", json!({ "op": "read", "name": "prefers-bun" }));
+    let bad_op = call("m6", json!({ "op": "frobnicate" }));
+    let missing_field = call("m7", json!({ "op": "save", "name": "x" }));
+
+    // Restore HOME before asserting so a failure cannot leak env state.
+    unsafe {
+        match previous_home {
+            Some(value) => env::set_var("HOME", value),
+            None => env::remove_var("HOME"),
+        }
+    }
+
+    assert_eq!(save.status, ToolStatus::Success, "{save:?}");
+    assert_eq!(save.content["saved"], json!("prefers-bun"));
+    assert_eq!(save.content["type"], json!("feedback"));
+
+    assert_eq!(list.status, ToolStatus::Success);
+    let memories = list.content["memories"].as_array().expect("memories array");
+    assert!(
+        memories
+            .iter()
+            .any(|item| item["name"] == json!("prefers-bun") && item["type"] == json!("feedback")),
+        "list surfaces the saved memory: {list:?}"
+    );
+
+    assert_eq!(read.status, ToolStatus::Success);
+    assert_eq!(read.content["found"], json!(true));
+    assert!(
+        read.content["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Use bun for package scripts."),
+        "{read:?}"
+    );
+
+    assert_eq!(delete.status, ToolStatus::Success);
+    assert_eq!(delete.content["deleted"], json!(true));
+    assert_eq!(read_after.content["found"], json!(false));
+
+    assert_eq!(
+        bad_op.status,
+        ToolStatus::Error,
+        "unknown op is a clean error"
+    );
+    assert_eq!(
+        missing_field.status,
+        ToolStatus::Error,
+        "save without required fields is a clean error"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn notes_remember_rejects_unknown_kind() {
     let root = temp_workspace("notes_invalid_kind");
@@ -13651,6 +13747,12 @@ fn first_party_args_schemas_cover_all_accepted_fields() {
         (
             read_tool_output_spec,
             &["handle", "path", "offset", "limit"],
+        ),
+        (
+            memory_spec,
+            // `type` is the serde-renamed field for `MemoryArgs::memory_type`;
+            // the schema must advertise the wire name, not the Rust field name.
+            &["op", "name", "type", "description", "body", "title", "hook"],
         ),
     ];
 

@@ -5852,7 +5852,7 @@ keep_alive = "24h"
 }
 
 #[test]
-fn memory_scope_doc_records_deferred_tool_decision() {
+fn memory_scope_doc_records_file_memory_and_observations() {
     let scope_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -5863,11 +5863,11 @@ fn memory_scope_doc_records_deferred_tool_decision() {
         .unwrap_or_else(|err| panic!("read {}: {err}", scope_path.display()));
     assert!(
         body.contains("user_memory_max_bytes"),
-        "scope doc must anchor to the existing config field"
+        "scope doc must anchor to the gating config field"
     );
     assert!(
-        body.contains("A separate `memory_append` tool name"),
-        "scope doc must record memory_append as out of scope"
+        body.contains("`memory` tool"),
+        "scope doc must document the model-curated `memory` tool surface"
     );
     assert!(
         body.contains("notes_remember"),

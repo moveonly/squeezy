@@ -582,6 +582,22 @@ const TOPICS: &[TopicDefinition] = &[
         config: &["session"],
     },
     TopicDefinition {
+        id: "memory",
+        title: "cross-session memory: what it remembers, where it lives, how to manage it",
+        aliases: &[
+            "remember",
+            "remembered",
+            "forget",
+            "memories",
+            "auto-memory",
+            "automemory",
+            "/memory",
+        ],
+        summary: "Squeezy keeps durable cross-session memory (on by default): facts about you (global, ~/.squeezy/memory/) and each project (local, <repo>/.squeezy/memory/), captured automatically from the conversation and recalled at session start. Manage it with `/memory`, by saying remember/forget, or by editing the Markdown files. Gated by context.user_memory_max_bytes; automatic capture by context.memory_auto_extract.",
+        docs: &["docs/external/MEMORY.md"],
+        config: &["context"],
+    },
+    TopicDefinition {
         id: "feedback",
         title: "feedback, reports, redaction, and privacy",
         aliases: &[
@@ -1292,6 +1308,15 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         available_during_turn: true,
         capability_note: None,
         related: &["cost", "sessions"],
+    },
+    SlashCommandHelp {
+        name: "/memory",
+        what: "Show what squeezy has remembered across sessions — durable facts about you (global) and this project (local), saved automatically as you work or on request.",
+        syntax: "/memory",
+        examples: &["/memory  — list saved memories and where to edit them"],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["context"],
     },
     SlashCommandHelp {
         name: "/clear",

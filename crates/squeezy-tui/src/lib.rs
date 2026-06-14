@@ -1170,6 +1170,13 @@ async fn run_inner_with_terminal(
         drain_repo_pr(&mut app);
         drain_job_events(&mut app);
         drain_agent_events(&mut app).await;
+        // Surface anything the background memory-extraction pass saved since the
+        // last tick as quiet transcript lines. The pass finishes after the
+        // turn's event channel closes, so it queues notices the agent hands back
+        // here rather than emitting an `AgentEvent`.
+        for notice in agent.drain_memory_notices() {
+            app.push_transcript_item(TranscriptItem::system(notice));
+        }
         if app.auto_drain_queue {
             app.auto_drain_queue = false;
             drain_prompt_queue_if_idle(&mut app, &mut agent).await;
@@ -21200,6 +21207,19 @@ async fn handle_slash_command_on_surface(
         handle_export_command(app, agent, rest);
         return true;
     }
+    // `/memory` is a TUI-local, read-only view of the file-memory store.
+    if raw_head == "/memory" {
+        record_slash_command_telemetry(
+            agent,
+            "/memory",
+            surface,
+            SlashOutcome::Accepted,
+            SlashAliasKind::Canonical,
+            slash_arg_shape_from_rest(input),
+        );
+        handle_memory_command(app, agent);
+        return true;
+    }
 
     // `/bundle` (§12.6.6) is likewise a TUI-local command: it reuses the same
     // in-memory transcript row model + Markdown export formatter to build a
@@ -23734,6 +23754,47 @@ fn deliver_copy_via_chain(app: &mut TuiApp, text: &str, label: &str, primary_err
 /// (`<workspace>/.squeezy/exports/<session_id>/transcript-<ts>.<ext>`).
 ///
 /// All file-backed destinations share the same atomic-write pipeline; the
+/// `/memory`: a read-only view of the file-memory store (global + this
+/// project), so the user can see what squeezy has remembered — auto-extracted
+/// or saved on request — and knows where to edit it.
+fn handle_memory_command(app: &mut TuiApp, agent: &Agent) {
+    let workspace_root = agent.config().workspace_root.clone();
+    let memory = squeezy_store::memory::Memory::new(Some(&workspace_root));
+    let item = match memory.list() {
+        Ok(entries) if !entries.is_empty() => {
+            use squeezy_store::memory::Scope;
+            let mut out = String::from("Memory — what squeezy remembers:\n");
+            // `list()` returns entries sorted by scope then name; print a header
+            // when the scope changes so global vs project reads at a glance.
+            let mut current: Option<Scope> = None;
+            for entry in &entries {
+                if current != Some(entry.scope) {
+                    out.push_str(match entry.scope {
+                        Scope::Global => "\nGlobal (you, across all projects):\n",
+                        Scope::Project => "\nThis project:\n",
+                    });
+                    current = Some(entry.scope);
+                }
+                let ty = entry.memory_type.as_deref().unwrap_or("?");
+                let desc = entry.description.as_deref().unwrap_or("");
+                out.push_str(&format!("  • {} ({ty}) — {desc}\n", entry.name));
+            }
+            out.push_str(
+                "\nAsk me to update or forget any of these, or edit them in \
+                 ~/.squeezy/memory/ (global) and <repo>/.squeezy/memory/ (this project).",
+            );
+            TranscriptItem::system(out)
+        }
+        Ok(_) => TranscriptItem::system(
+            "Memory is empty so far. As you work, squeezy automatically saves durable facts \
+             about you and this project; you can also just say \"remember …\"."
+                .to_string(),
+        ),
+        Err(err) => TranscriptItem::system(format!("memory: {err}")),
+    };
+    app.push_transcript_item(item);
+}
+
 /// clipboard destination reuses [`deliver_copy`] (provider chain + clipboard
 /// history). The payload is rendered exactly once, then routed.
 fn handle_export_command(app: &mut TuiApp, agent: &Agent, rest: &str) {

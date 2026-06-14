@@ -272,11 +272,12 @@ impl SessionStore {
         write_json_bytes(&path, &new_bytes)
     }
 
-    /// Path to the user-global memory file. Uses `HOME/.squeezy` when
+    /// Path to the legacy line-oriented memory file
+    /// (`~/.squeezy/memory.md`, lowercase). Uses `HOME/.squeezy` when
     /// available and falls back to native Windows profile/app-data roots when
-    /// `HOME` is unset. The file itself is the single static memory store described in
-    /// `docs/internal/MEMORY_SCOPE.md`; this primitive does not introduce a
-    /// new directory or partition scheme.
+    /// `HOME` is unset. This is distinct from the model-curated file memory in
+    /// [`crate::memory`] (topic files under `~/.squeezy/memory/` indexed by the
+    /// uppercase `MEMORY.md`); see `docs/internal/MEMORY_SCOPE.md`.
     pub fn memory_path() -> Option<PathBuf> {
         Some(fs_util::user_squeezy_dir()?.join("memory.md"))
     }
@@ -288,10 +289,9 @@ impl SessionStore {
     /// line and the byte-cap ingestion path stays predictable. Returns
     /// the number of bytes appended (line body plus the trailing newline).
     ///
-    /// This is the canonical cross-session memory write primitive; higher
-    /// layers (e.g. the deferred `memory_append` tool from
-    /// `MEMORY_SCOPE.md`) wrap this rather than re-implement the path or
-    /// the newline discipline.
+    /// This is the canonical write primitive for the legacy line-oriented
+    /// `memory.md`; the richer model-curated surface lives in
+    /// [`crate::memory`] and maintains its own topic files and index.
     pub fn remember(line: &str) -> Result<usize> {
         let trimmed = line.trim();
         if trimmed.is_empty() {

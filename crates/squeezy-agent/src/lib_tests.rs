@@ -6311,6 +6311,251 @@ fn ingest_user_memory_reads_uppercase() {
     assert!(body.contains("uppercase-only body"));
 }
 
+#[test]
+fn memory_prompt_block_renders_guidance_with_and_without_index() {
+    let block = super::memory_prompt_block(
+        Some("- [Prefers terse](memory/prefers-terse.md) — global one\n"),
+        Some("- [Auth rewrite](memory/auth-rewrite.md) — project one\n"),
+    );
+    assert!(block.starts_with("## Memory"), "{block}");
+    assert!(block.contains("Types of memory"));
+    assert!(block.contains("What NOT to save"));
+    assert!(block.contains("`memory` tool"));
+    assert!(
+        block.contains("Scope is automatic"),
+        "scope routing explained"
+    );
+    assert!(block.contains("### Global memory"));
+    assert!(block.contains("### This project's memory"));
+    assert!(
+        block.contains("- [Prefers terse](memory/prefers-terse.md) — global one"),
+        "global index appended: {block}"
+    );
+    assert!(
+        block.contains("- [Auth rewrite](memory/auth-rewrite.md) — project one"),
+        "project index appended: {block}"
+    );
+
+    // Both empty -> both bootstrap notes; blank counts as empty.
+    let empty = super::memory_prompt_block(None, Some("   \n  "));
+    assert!(empty.contains("## Memory"));
+    assert_eq!(
+        empty.matches("empty so far").count(),
+        2,
+        "absent + blank indexes both render the bootstrap note: {empty}"
+    );
+}
+
+#[tokio::test]
+async fn agent_build_stitches_memory_block_into_instructions() {
+    // HOME is intentionally left untouched: the `## Memory` header renders
+    // whether or not a `~/.squeezy/MEMORY.md` exists, so this test needs no
+    // env mutation and cannot race the other HOME-mutating agent tests. Index
+    // body rendering is covered by `memory_prompt_block_*` and the store tests.
+    let root = temp_workspace("agent_build_memory");
+    fs::create_dir_all(root.join(".git")).expect("create .git marker");
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+
+    let enabled = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+    let enabled_instructions = enabled.config().instructions.clone();
+
+    let mut disabled_config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    disabled_config.context_compaction.user_memory_max_bytes = 0;
+    let disabled = Agent::new(disabled_config, provider);
+    let disabled_instructions = disabled.config().instructions.clone();
+
+    assert!(
+        enabled_instructions.contains("## Memory"),
+        "memory block stitched into base instructions (default config): {enabled_instructions}"
+    );
+    assert!(
+        enabled_instructions.contains("the `memory` tool"),
+        "memory guidance present"
+    );
+    assert!(
+        !disabled_instructions.contains("## Memory"),
+        "user_memory_max_bytes = 0 omits the memory block"
+    );
+}
+
+#[test]
+fn render_transcript_slice_keeps_user_assistant_skips_system_and_empty() {
+    let items = vec![
+        TranscriptItem::user("I prefer bun"),
+        TranscriptItem::system("internal note"),
+        TranscriptItem::assistant("noted"),
+        TranscriptItem::user("   "),
+    ];
+    let rendered = super::render_transcript_slice(&items);
+    assert!(rendered.contains("User: I prefer bun"));
+    assert!(rendered.contains("Assistant: noted"));
+    assert!(!rendered.contains("internal note"), "system items excluded");
+    assert_eq!(
+        rendered.matches("User:").count(),
+        1,
+        "blank user item is skipped"
+    );
+}
+
+#[test]
+fn turn_wrote_memory_inline_detects_recent_save_or_delete_only() {
+    use squeezy_llm::LlmInputItem;
+    let memory_call = |op: &str| LlmInputItem::FunctionCall {
+        call_id: "c".to_string(),
+        name: "memory".to_string(),
+        arguments: json!({ "op": op }),
+    };
+
+    // A save / delete in the current turn -> skip extraction.
+    assert!(super::turn_wrote_memory_inline(&[
+        LlmInputItem::UserText("remember bun".to_string()),
+        LlmInputItem::AssistantText("ok".to_string()),
+        memory_call("save"),
+    ]));
+    assert!(super::turn_wrote_memory_inline(&[
+        LlmInputItem::UserText("forget x".to_string()),
+        memory_call("delete"),
+    ]));
+
+    // Read-only memory ops don't count as a write.
+    assert!(!super::turn_wrote_memory_inline(&[
+        LlmInputItem::UserText("what do you know".to_string()),
+        memory_call("list"),
+    ]));
+
+    // A save in a PRIOR turn (a newer user message follows) doesn't suppress.
+    assert!(!super::turn_wrote_memory_inline(&[
+        LlmInputItem::UserText("remember bun".to_string()),
+        memory_call("save"),
+        LlmInputItem::UserText("now do something else".to_string()),
+        LlmInputItem::AssistantText("sure".to_string()),
+    ]));
+
+    // A non-memory tool call, and an empty conversation, don't suppress.
+    assert!(!super::turn_wrote_memory_inline(&[
+        LlmInputItem::UserText("u".to_string()),
+        LlmInputItem::FunctionCall {
+            call_id: "c".to_string(),
+            name: "grep".to_string(),
+            arguments: json!({}),
+        },
+    ]));
+    assert!(!super::turn_wrote_memory_inline(&[]));
+}
+
+#[tokio::test]
+async fn run_memory_extraction_task_saves_and_surfaces_end_to_end() {
+    // End-to-end of the detached extraction task with a mock provider:
+    // substantive transcript -> cheap LLM call -> parse -> save -> surface.
+    // Uses a `project`-type memory so it writes to the temp workspace, not HOME.
+    let workspace = temp_workspace("extract_e2e");
+    let extraction_json = "[{\"op\":\"save\",\"name\":\"prefers-bun\",\"type\":\"project\",\
+         \"description\":\"use bun\",\"body\":\"Use bun for scripts.\"}]";
+    let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::TextDelta(extraction_json.to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("r".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+
+    let long_user = format!(
+        "Remember my tooling preference: {}",
+        "always use bun, not npm, for installing and running scripts in this repo. ".repeat(5)
+    );
+    assert!(long_user.chars().count() >= super::memory_extraction::EXTRACTION_MIN_NEW_PROSE_CHARS);
+    let conversation_state = Arc::new(tokio::sync::Mutex::new(super::ConversationState {
+        transcript: vec![
+            TranscriptItem::user(long_user),
+            TranscriptItem::assistant("Got it.".to_string()),
+        ],
+        ..Default::default()
+    }));
+
+    let notices = Arc::new(StdMutex::new(Vec::new()));
+    let last_extracted = Arc::new(AtomicUsize::new(0));
+    let ctx = super::MemoryExtractionContext {
+        provider,
+        model: Arc::from("mock-cheap"),
+        workspace_root: workspace.clone(),
+        conversation_state,
+        last_extracted_len: last_extracted.clone(),
+        notices: notices.clone(),
+    };
+
+    super::run_memory_extraction_task(ctx, None, Arc::new(Redactor::default()), TurnId::new(1))
+        .await;
+
+    let saved = squeezy_store::memory::Memory::new(Some(&workspace))
+        .list()
+        .expect("list");
+    assert!(
+        saved.iter().any(|entry| entry.name == "prefers-bun"),
+        "extracted project memory persisted to the workspace: {saved:?}"
+    );
+    let queued = notices.lock().expect("notices");
+    assert_eq!(queued.len(), 1, "one surfaced notice");
+    assert!(
+        queued[0].contains("prefers-bun"),
+        "notice mentions the save: {queued:?}"
+    );
+    assert_eq!(
+        last_extracted.load(Ordering::Relaxed),
+        2,
+        "high-water advanced past the consumed slice"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn memory_auto_extract_viable_gates_off_mock_and_disabled() {
+    let mut config = AppConfig::default();
+    // Default: memory on, auto-extract on. A mock provider resolves no cheap
+    // model, so extraction is never viable even with a session present — this
+    // is what keeps the agent unit tests from firing a real extraction call.
+    assert!(
+        !super::memory_auto_extract_viable(&config, "mock", true),
+        "mock provider has no cheap model -> not viable"
+    );
+    // A real provider with a recorded session and memory on -> viable.
+    assert!(
+        super::memory_auto_extract_viable(&config, "anthropic", true),
+        "real provider + session -> viable"
+    );
+    // No session log -> never viable (excludes Agent::new unit tests).
+    assert!(
+        !super::memory_auto_extract_viable(&config, "anthropic", false),
+        "no session -> not viable"
+    );
+    // Memory master switch off.
+    config.context_compaction.user_memory_max_bytes = 0;
+    assert!(!super::memory_auto_extract_viable(
+        &config,
+        "anthropic",
+        true
+    ));
+    // Auto-extract toggle off (memory otherwise on).
+    config.context_compaction.user_memory_max_bytes = 16_384;
+    config.context_compaction.memory_auto_extract = false;
+    assert!(!super::memory_auto_extract_viable(
+        &config,
+        "anthropic",
+        true
+    ));
+}
+
 #[tokio::test]
 async fn agent_build_stitches_agents_md_into_instructions() {
     let root = temp_workspace("agent_build_agents_md");
