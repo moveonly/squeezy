@@ -2148,8 +2148,6 @@ fn forward_config_feedback(app: &mut TuiApp, mut feedback: config_screen::Config
 /// outcome including "no session at this slot" so the user sees feedback.
 async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: usize) -> bool {
     if app.turn_rx.is_some()
-        || app.pending_plan_choice.is_some()
-        || app.pending_feedback.is_some()
         || modal::any_active_surface_matching(app, |surface| {
             surface.blocks_session_quick_switch
         })
@@ -2263,7 +2261,7 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             // reset the dedup store so the first write isn't mis-gated by the
             // prior session's fingerprint.
             app.session_id = agent.session_id();
-            app.session_checkpoint = session_checkpoint::CheckpointStore::new();
+            app.session_checkpoint = session_checkpoint::CheckpointUiState::new();
             app.status = format!("resumed session {session_id}");
         }
         Err(error) => {
@@ -3186,9 +3184,9 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // open: a left-click on the `[restore]` affordance restores the saved
     // checkpoint (the mouse twin of `r`). Every other click is swallowed so a
     // stray press can't fall through to the surface beneath. Hit-tested in ABSOLUTE
-    // screen coordinates against the target `render_session_checkpoint_surface`
+    // screen coordinates against the target `session_checkpoint::render_surface`
     // registered this frame.
-    if app.session_checkpoint_overlay.is_some() {
+    if app.session_checkpoint.overlay.is_some() {
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
                 interaction::TargetKey::Chrome(interaction::ChromeKey::CheckpointRestore),
@@ -6573,8 +6571,8 @@ fn restore_session_checkpoint_on_launch(app: &mut TuiApp) {
 /// the toggle paints immediately, but leaves the idle redraw cadence untouched
 /// once settled.
 fn toggle_session_checkpoint_overlay(app: &mut TuiApp) {
-    if app.session_checkpoint_overlay.is_some() {
-        app.session_checkpoint_overlay = None;
+    if app.session_checkpoint.overlay.is_some() {
+        app.session_checkpoint.overlay = None;
         app.status = "checkpoint status closed".to_string();
         app.needs_redraw = true;
         return;
@@ -6583,7 +6581,7 @@ fn toggle_session_checkpoint_overlay(app: &mut TuiApp) {
         .session_id
         .as_ref()
         .and_then(|id| session_checkpoint::load(id));
-    app.session_checkpoint_overlay = Some(saved.unwrap_or_default());
+    app.session_checkpoint.overlay = Some(saved.unwrap_or_default());
     app.status = session_checkpoint_status(app);
     app.needs_redraw = true;
 }
@@ -6595,7 +6593,8 @@ fn toggle_session_checkpoint_overlay(app: &mut TuiApp) {
 /// recorded a save), so the user can tell auto-save is live.
 fn session_checkpoint_status(app: &TuiApp) -> String {
     let has_on_disk = app
-        .session_checkpoint_overlay
+        .session_checkpoint
+        .overlay
         .as_ref()
         .is_some_and(|c| !c.session_id.is_empty());
     let lead = if app.session_checkpoint.has_saved() {
@@ -6644,8 +6643,8 @@ fn forget_session_checkpoint(app: &mut TuiApp) {
         }
     }
     // Refresh the overlay snapshot to the now-empty state so the panel reflects it.
-    if app.session_checkpoint_overlay.is_some() {
-        app.session_checkpoint_overlay = Some(session_checkpoint::UiStateCheckpoint::default());
+    if app.session_checkpoint.overlay.is_some() {
+        app.session_checkpoint.overlay = Some(session_checkpoint::UiStateCheckpoint::default());
     }
     app.needs_redraw = true;
 }
@@ -6656,7 +6655,7 @@ fn forget_session_checkpoint(app: &mut TuiApp) {
 /// modal: its own toggle chord and Esc close; `r` restores the saved checkpoint
 /// onto the running session; `x`/Delete forgets it.
 fn handle_session_checkpoint_key(app: &mut TuiApp, key: KeyEvent) -> bool {
-    if app.session_checkpoint_overlay.is_none() {
+    if app.session_checkpoint.overlay.is_none() {
         return false;
     }
     // The overlay's own toggle chord closes it (the same key opens and closes).
@@ -8904,7 +8903,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // any selection-clear, search, chord, or keymap dispatch, so a stray key never
     // leaks into the composer underneath. Sits beside the other front-of-loop
     // overlays for the same reason.
-    if app.session_checkpoint_overlay.is_some() && handle_session_checkpoint_key(app, key) {
+    if app.session_checkpoint.overlay.is_some() && handle_session_checkpoint_key(app, key) {
         return Ok(false);
     }
 
@@ -9683,7 +9682,7 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
     // The Session Auto-Save Checkpoints overlay (§12.9.5) is modal and has no text
     // field, so it swallows paste entirely rather than letting it leak into the
     // composer beneath.
-    if app.session_checkpoint_overlay.is_some() {
+    if app.session_checkpoint.overlay.is_some() {
         return Ok(());
     }
     // The remaining §12.7 fullscreen overlays — the Keybinding Editor (§12.7.1),
@@ -15253,7 +15252,7 @@ fn first_run_hint_suppressed(app: &TuiApp) -> bool {
         || app.theme_editor.is_some()
         || app.workspace_profile.is_some()
         // The Session Auto-Save Checkpoints overlay (§12.9.5) owns the surface too.
-        || app.session_checkpoint_overlay.is_some()
+        || app.session_checkpoint.overlay.is_some()
         // The remaining §12.7 fullscreen overlays own the surface too, so the hint
         // would paint behind them — suppress for all six consistently.
         || app.keybinding_editor.is_some()
@@ -27403,8 +27402,8 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     // fullscreen modal over the main surface while open, registering its
     // `[restore]` click target every frame. Checked before the config screen so
     // its target registers and it owns the surface while open.
-    if let Some(checkpoint) = &app.session_checkpoint_overlay {
-        render_session_checkpoint_surface(frame, area, app, checkpoint);
+    if let Some(checkpoint) = &app.session_checkpoint.overlay {
+        session_checkpoint::render_surface(frame, area, app, checkpoint);
         return;
     }
     // The Per-Terminal Profiles overlay (§12.7.3) paints as a fullscreen modal over
@@ -29855,179 +29854,6 @@ fn render_workspace_profile_surface(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "\u{2191}\u{2193} field \u{00b7} s save live \u{00b7} r restore saved \u{00b7} x reset \u{00b7} Esc close",
-                Style::default()
-                    .fg(crate::render::theme::secondary())
-                    .add_modifier(Modifier::BOLD),
-            ))),
-            footer_rect,
-        );
-    }
-}
-
-/// Paint the Session Auto-Save Checkpoints status overlay (§12.9.5) as a centered
-/// modal: a header naming the session whose checkpoint this is, a read-only list
-/// of the logical fields the checkpoint would restore (scroll anchor, focused
-/// entry, search, minimap pane), a `[restore]` affordance, and a footer with the
-/// verb legend. The `[restore]` line registers a
-/// [`interaction::ChromeKey::CheckpointRestore`] click target so a click restores
-/// it (the mouse twin of `r`). Reads only the captured checkpoint snapshot, so
-/// painting is constant-time and does no transcript walk.
-fn render_session_checkpoint_surface(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &TuiApp,
-    checkpoint: &session_checkpoint::UiStateCheckpoint,
-) {
-    let title = Line::from(vec![
-        Span::styled(
-            " Session checkpoint ",
-            Style::default()
-                .fg(crate::render::theme::accent())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "\u{2014} auto-saved UI state ",
-            Style::default().fg(crate::render::theme::quiet()),
-        ),
-    ]);
-    let inner = modal::surface(frame, area, 64, 14, title, app.glyph_mode);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    let has_saved = !checkpoint.session_id.is_empty();
-
-    // Header: whether a checkpoint exists for this session, and for which session.
-    let header = if has_saved {
-        Line::from(vec![
-            Span::styled(
-                "saved for session ",
-                Style::default().fg(crate::render::theme::quiet()),
-            ),
-            Span::styled(
-                checkpoint.session_id.clone(),
-                Style::default().fg(crate::render::theme::secondary()),
-            ),
-        ])
-    } else {
-        Line::from(Span::styled(
-            "no checkpoint saved yet \u{2014} one is auto-saved as you work",
-            Style::default().fg(crate::render::theme::quiet()),
-        ))
-    };
-    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
-
-    // The logical fields the checkpoint would restore, as read-only rows.
-    let scroll_value = if checkpoint.following_tail {
-        "following tail".to_string()
-    } else {
-        format!("{} line(s) up", checkpoint.scroll_from_bottom)
-    };
-    let selected_value = match checkpoint.selected_entry {
-        Some(index) => format!("entry #{index}"),
-        None => "\u{2014}".to_string(),
-    };
-    let search_value = checkpoint
-        .search_query
-        .clone()
-        .unwrap_or_else(|| "\u{2014}".to_string());
-    let minimap_value = if checkpoint.show_minimap {
-        "shown"
-    } else {
-        "hidden"
-    };
-    let rows: [(&str, String); 4] = [
-        ("Scroll", scroll_value),
-        ("Focused entry", selected_value),
-        ("Search", search_value),
-        ("Minimap pane", minimap_value.to_string()),
-    ];
-    let rows_top = inner.y.saturating_add(2);
-    let value_col = inner.x.saturating_add(18).min(inner.x + inner.width);
-    let rows_bottom = inner.y.saturating_add(inner.height).saturating_sub(2);
-    for (offset, (label, value)) in rows.iter().enumerate() {
-        let row_y = rows_top + offset as u16;
-        if row_y >= rows_bottom {
-            break;
-        }
-        let label_rect = Rect {
-            x: inner.x,
-            y: row_y,
-            width: inner.width,
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                *label,
-                Style::default().fg(crate::render::theme::foreground()),
-            ))),
-            label_rect,
-        );
-        if value_col < inner.x.saturating_add(inner.width) {
-            let value_rect = Rect {
-                x: value_col,
-                y: row_y,
-                width: inner
-                    .x
-                    .saturating_add(inner.width)
-                    .saturating_sub(value_col),
-                height: 1,
-            };
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    value.clone(),
-                    Style::default().fg(crate::render::theme::secondary()),
-                ))),
-                value_rect,
-            );
-        }
-    }
-
-    // The `[restore]` affordance row (the mouse twin of `r`), painted just above
-    // the footer when there is a checkpoint to restore.
-    let restore_y = inner.y.saturating_add(inner.height).saturating_sub(2);
-    if has_saved && restore_y >= rows_top {
-        let restore_rect = Rect {
-            x: inner.x,
-            y: restore_y,
-            width: inner.width,
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "[restore]",
-                Style::default()
-                    .fg(crate::render::theme::accent())
-                    .add_modifier(Modifier::BOLD),
-            ))),
-            restore_rect,
-        );
-        // Register the click target over the `[restore]` glyph (9 cells wide).
-        let target_rect = Rect {
-            x: inner.x,
-            y: restore_y,
-            width: 9u16.min(inner.width),
-            height: 1,
-        };
-        app.register_click(
-            target_rect,
-            interaction::TargetKey::Chrome(interaction::ChromeKey::CheckpointRestore),
-            interaction::Action::CheckpointRestore,
-        );
-    }
-
-    // Footer: the in-overlay verb legend on the last inner row.
-    let footer_y = inner.y.saturating_add(inner.height).saturating_sub(1);
-    if footer_y >= rows_top {
-        let footer_rect = Rect {
-            x: inner.x,
-            y: footer_y,
-            width: inner.width,
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "r restore \u{00b7} x forget \u{00b7} Esc close",
                 Style::default()
                     .fg(crate::render::theme::secondary())
                     .add_modifier(Modifier::BOLD),
@@ -48131,20 +47957,13 @@ pub(crate) struct TuiApp {
     /// profile itself is persisted under the Squeezy projects state dir, keyed by
     /// the resolved workspace root, never inside the repo.
     pub(crate) workspace_profile: Option<workspace_profile::WorkspaceProfileState>,
-    /// Session Auto-Save Checkpoints For UI State (§12.9.5): the debounce gate +
-    /// last-saved fingerprint for the background auto-save. Reads/records the live
-    /// UI state (scroll anchor, focused entry, search, minimap pane) keyed by the
-    /// session id; the on-disk write is debounced so a burst of interaction never
-    /// becomes a write storm. Costs nothing at idle — the auto-save tick only runs
-    /// on iterations the UI already changed on.
-    pub(crate) session_checkpoint: session_checkpoint::CheckpointStore,
-    /// Session Auto-Save Checkpoints (§12.9.5): the read-only checkpoint status
-    /// overlay, or `None` when closed (the resting state, which paints nothing
-    /// extra and schedules no redraw). `Some` carries the last-saved checkpoint
-    /// snapshot to display; the overlay's `r` verb (or its `[restore]` click)
-    /// restores it onto the running session. Opened by the `OpenSessionCheckpoint`
-    /// keymap action.
-    pub(crate) session_checkpoint_overlay: Option<session_checkpoint::UiStateCheckpoint>,
+    /// Session Auto-Save Checkpoints For UI State (§12.9.5): grouped checkpoint
+    /// TUI state containing the debounced background store plus the optional
+    /// read-only status overlay snapshot. The store reads/records the live UI
+    /// state (scroll anchor, focused entry, search, minimap pane) keyed by the
+    /// session id; the overlay's `r` verb (or `[restore]` click) restores it onto
+    /// the running session.
+    pub(crate) session_checkpoint: session_checkpoint::CheckpointUiState,
     /// Per-Terminal Profiles (§12.7.3): the interactive terminal-profile editor
     /// overlay, or `None` when closed (the resting state, which paints nothing
     /// extra and schedules no redraw). `Some` = the fullscreen overlay owns
@@ -49419,8 +49238,7 @@ impl TuiApp {
             keybinding_editor: None,
             theme_editor: None,
             workspace_profile: None,
-            session_checkpoint: session_checkpoint::CheckpointStore::new(),
-            session_checkpoint_overlay: None,
+            session_checkpoint: session_checkpoint::CheckpointUiState::new(),
             terminal_profile_editor: None,
             terminal_profile_override: None,
             gesture_settings_editor: None,

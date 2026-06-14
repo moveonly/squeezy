@@ -78,6 +78,8 @@ pub(crate) enum SurfaceKind {
     PendingApproval,
     PendingMcpElicitation,
     PendingUserInput,
+    PendingPlanChoice,
+    PendingFeedback,
 }
 
 /// Modal-surface contract used by input, macro replay, quick-switch, and render
@@ -141,6 +143,8 @@ pub(crate) const RENDER_ORDER: &[SurfaceKind] = &[
     SurfaceKind::PendingApproval,
     SurfaceKind::PendingMcpElicitation,
     SurfaceKind::PendingUserInput,
+    SurfaceKind::PendingPlanChoice,
+    SurfaceKind::PendingFeedback,
 ];
 
 pub(crate) fn active_surface_descriptors(
@@ -190,7 +194,7 @@ impl SurfaceKind {
             SurfaceKind::StatusLineSetup => app.status_line_setup.is_some(),
             SurfaceKind::ThemeEditor => app.theme_editor.is_some(),
             SurfaceKind::WorkspaceProfile => app.workspace_profile.is_some(),
-            SurfaceKind::SessionCheckpoint => app.session_checkpoint_overlay.is_some(),
+            SurfaceKind::SessionCheckpoint => app.session_checkpoint.overlay.is_some(),
             SurfaceKind::TerminalProfile => app.terminal_profile_editor.is_some(),
             SurfaceKind::GestureSettings => app.gesture_settings_editor.is_some(),
             SurfaceKind::GlyphMode => app.glyph_mode_editor.is_some(),
@@ -203,6 +207,8 @@ impl SurfaceKind {
             SurfaceKind::PendingApproval => app.pending_approval.is_some(),
             SurfaceKind::PendingMcpElicitation => app.pending_mcp_elicitation.is_some(),
             SurfaceKind::PendingUserInput => app.pending_request_user_input.is_some(),
+            SurfaceKind::PendingPlanChoice => app.pending_plan_choice.is_some(),
+            SurfaceKind::PendingFeedback => app.pending_feedback.is_some(),
         }
     }
 
@@ -456,7 +462,7 @@ impl SurfaceKind {
                 self,
                 "session checkpoint",
                 "handle_session_checkpoint_key",
-                "render_session_checkpoint_surface",
+                "session_checkpoint::render_surface",
                 true,
                 true,
                 true,
@@ -564,6 +570,24 @@ impl SurfaceKind {
                 self,
                 "user input request",
                 "handle_request_user_input_key",
+                "render_approval",
+                false,
+                true,
+                true,
+            ),
+            PendingPlanChoice => descriptor(
+                self,
+                "plan choice",
+                "handle_pending_plan_choice_key",
+                "render_approval",
+                false,
+                true,
+                true,
+            ),
+            PendingFeedback => descriptor(
+                self,
+                "feedback",
+                "handle_pending_feedback_key",
                 "render_approval",
                 false,
                 true,

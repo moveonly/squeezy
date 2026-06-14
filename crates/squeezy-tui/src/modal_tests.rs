@@ -52,6 +52,16 @@ fn descriptor_flags_preserve_known_modal_contracts() {
     assert!(!compare.blocks_session_quick_switch);
     assert!(compare.consumes_macro_replay);
     assert!(!compare.allows_screen_selection);
+
+    let plan_choice = SurfaceKind::PendingPlanChoice.descriptor();
+    assert_eq!(plan_choice.label, "plan choice");
+    assert!(plan_choice.blocks_session_quick_switch);
+    assert!(plan_choice.consumes_macro_replay);
+
+    let feedback = SurfaceKind::PendingFeedback.descriptor();
+    assert_eq!(feedback.label, "feedback");
+    assert!(feedback.blocks_session_quick_switch);
+    assert!(feedback.consumes_macro_replay);
 }
 
 #[test]

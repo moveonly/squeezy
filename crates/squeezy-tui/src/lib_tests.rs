@@ -30979,7 +30979,7 @@ async fn session_checkpoint_overlay_opens_and_paints_state_through_real_render()
         .await
         .unwrap();
     assert!(
-        app.session_checkpoint_overlay.is_some(),
+        app.session_checkpoint.overlay.is_some(),
         "Ctrl+Alt+[ opens the overlay"
     );
 
@@ -31272,7 +31272,7 @@ async fn overlay_forget_removes_the_saved_checkpoint() {
     // "no checkpoint saved yet" and drops the `[restore]` affordance + its click
     // target (so a click can't restore a checkpoint that no longer exists).
     assert!(
-        app.session_checkpoint_overlay.is_some(),
+        app.session_checkpoint.overlay.is_some(),
         "forget leaves the overlay open"
     );
     let after = render_to_string(&app, 100, 30);
@@ -31314,7 +31314,7 @@ async fn overlay_status_distinguishes_on_disk_from_live_auto_save() {
         false,
     );
     crate::session_checkpoint::save(&saved).expect("save");
-    app.session_checkpoint_overlay = Some(saved);
+    app.session_checkpoint.overlay = Some(saved);
     assert!(
         !app.session_checkpoint.has_saved(),
         "precondition: the in-memory store has not recorded a save this run",
@@ -31348,13 +31348,13 @@ async fn overlay_keyboard_esc_closes_and_chord_toggles() {
     handle_key(&mut app, &mut agent, session_checkpoint_key())
         .await
         .unwrap();
-    assert!(app.session_checkpoint_overlay.is_some(), "chord opens it");
+    assert!(app.session_checkpoint.overlay.is_some(), "chord opens it");
     // The same chord closes it.
     handle_key(&mut app, &mut agent, session_checkpoint_key())
         .await
         .unwrap();
     assert!(
-        app.session_checkpoint_overlay.is_none(),
+        app.session_checkpoint.overlay.is_none(),
         "the same chord closes it"
     );
     // Reopen and close with Esc.
@@ -31369,7 +31369,7 @@ async fn overlay_keyboard_esc_closes_and_chord_toggles() {
     .await
     .unwrap();
     assert!(
-        app.session_checkpoint_overlay.is_none(),
+        app.session_checkpoint.overlay.is_none(),
         "Esc closes the overlay"
     );
 }
