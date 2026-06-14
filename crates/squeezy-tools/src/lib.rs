@@ -147,6 +147,17 @@ use shell_parse::{shell_coverage_warnings, shell_segments};
 #[cfg(test)]
 use shell_program::ShellProgram;
 pub use shell_program::effective_shell_label;
+use specs::mcp_tool_spec;
+#[cfg(test)]
+use specs::{
+    apply_patch_spec, decl_search_spec, definition_search_spec, diff_context_spec,
+    downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, impact_spec,
+    inheritance_hierarchy_spec, list_skills_spec, load_skill_spec, memory_spec, notebook_edit_spec,
+    notes_recall_spec, notes_remember_spec, observations_spec, plan_patch_spec, read_file_spec,
+    read_slice_spec, read_tool_output_spec, reference_search_spec, refresh_compiler_facts_spec,
+    repo_map_spec, shell_spec, symbol_context_spec, upstream_flow_spec, verify_spec, webfetch_spec,
+    websearch_spec, write_file_spec,
+};
 pub use squeezy_graph::LanguageReport;
 
 #[cfg(all(test, target_os = "macos"))]
@@ -237,6 +248,12 @@ const VERIFY_SHELL_TIMEOUT_MS: u64 = 600_000;
 pub(crate) const DEFAULT_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
 pub(crate) const MAX_SHELL_OUTPUT_BYTE_CAP: usize = 128_000;
 const DIFF_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
+
+#[cfg(test)]
+fn first_party_tool_executor(name: &str) -> Option<FirstPartyToolExecutor> {
+    catalog::descriptor(name).map(|descriptor| descriptor.executor)
+}
+
 /// Upper bound a graph tool waits for the deferred
 /// background graph-open task to finish before it
 /// falls back to `graph_unavailable_result`. The condvar fires the instant

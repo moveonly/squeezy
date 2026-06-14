@@ -59,6 +59,8 @@ use resources::{
     RESOURCE_READ_CACHE_TTL, insert_resource_read,
 };
 use schema_compaction::{compact_tool_schema, schema_object};
+#[cfg(test)]
+use transport::DEFAULT_MCP_TIMEOUT_MS;
 use transport::{discovery_timeout_ms, tool_call_timeout_ms};
 
 const MCP_TOOL_CACHE_SCHEMA_VERSION: u64 = 1;

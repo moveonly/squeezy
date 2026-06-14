@@ -4,7 +4,7 @@ use std::{
     ffi::OsString,
     path::Path,
     process::Stdio,
-    sync::{Arc, OnceLock, atomic::Ordering},
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,12 +17,12 @@ use std::os::fd::FromRawFd;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use squeezy_core::{
-    PermissionCapability, PermissionRisk, Redactor, ShellSandboxConfig, ShellSandboxMode,
+    PermissionCapability, PermissionRisk, ShellSandboxConfig, ShellSandboxMode,
     sensitive_pattern_base,
 };
 use tokio::{
     process::Command,
-    sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit},
+    sync::{OwnedMutexGuard, OwnedSemaphorePermit},
     time,
 };
 use tokio_util::sync::CancellationToken;
@@ -43,7 +43,7 @@ use crate::shell_sandbox::{
     shell_sandbox_best_effort_fallback_reason, shell_sandbox_runtime_unavailable,
     shell_sandbox_status_metadata,
 };
-use crate::shell_spillover::{RawSidecar, ShellSpilloverInfo};
+use crate::shell_spillover::ShellSpilloverInfo;
 #[cfg(windows)]
 use crate::win_job::ShellJob;
 #[cfg(windows)]

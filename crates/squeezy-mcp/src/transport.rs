@@ -1,6 +1,6 @@
 use squeezy_core::McpServerConfig;
 
-const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
+pub(crate) const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
 
 pub(crate) fn discovery_timeout_ms(server: &McpServerConfig) -> u64 {
     server
