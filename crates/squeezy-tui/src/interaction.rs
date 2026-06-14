@@ -39,10 +39,9 @@ use crate::transcript_surface::{EntryId, RowId};
 ///
 /// `Entry`, `Chrome(QueueStrip)`, and `QueueItem` (delete/reorder) are
 /// registered today (card headers/carets, the queue strip, and the per-item
-/// overlay affordances). `RowSpan` (sub-row code-block copy) and the
-/// `JumpToLatest`/`ScrollbarGutter` chrome keys are the substrate vocabulary
-/// their affordances register in later phases; the hit-test handles them
-/// uniformly already and the tests exercise them.
+/// overlay affordances). `RowSpan` (sub-row code-block copy) is the substrate
+/// vocabulary its affordance registers in later phases; the hit-test handles it
+/// uniformly already and the tests exercise it.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TargetKey {
@@ -99,17 +98,12 @@ impl RowSpan {
 }
 
 /// Chrome affordances with no entry/row identity of their own. `QueueStrip` is
-/// registered today; `JumpToLatest`/`ScrollbarGutter` register with their
-/// affordances in later phases.
+/// registered today.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ChromeKey {
     /// The prompt-queue indicator strip in the footer.
     QueueStrip,
-    /// The jump-to-latest affordance.
-    JumpToLatest,
-    /// The main-view scrollbar gutter.
-    ScrollbarGutter,
     /// The "Accept" action in the inline large-paste question (§11G.6).
     PasteConfirm,
     /// The "Discard" action in the inline large-paste question (§11G.6).
@@ -414,10 +408,6 @@ pub(crate) enum Action {
     /// always-available equivalent is the keyboard `v`, since crossterm only
     /// reports mouse modifiers when key-modifier capture is on).
     QueueCycleCondition(u64),
-    /// Jump the transcript to the latest (tail) row.
-    JumpToLatest,
-    /// Jump the scrollbar thumb to the clicked gutter row.
-    ScrollbarJump,
     /// Jump the transcript so the entry behind a minimap turn-rail cell sits at
     /// the top of the viewport. Keyed by the cell's [`EntryId`] so a resize
     /// re-registers the same target at a fresh rail cell.
@@ -774,8 +764,6 @@ impl Action {
         Action::QueueEdit(0),
         Action::QueueRunNext(0),
         Action::QueueCycleCondition(0),
-        Action::JumpToLatest,
-        Action::ScrollbarJump,
         Action::MinimapJump(EntryId(0)),
         Action::ConfirmPaste,
         Action::CancelPaste,

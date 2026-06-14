@@ -2105,16 +2105,16 @@ async fn topmost_overlapping_click_target_wins() {
             width: 10,
             height: 1,
         },
-        interaction::TargetKey::Chrome(interaction::ChromeKey::JumpToLatest),
-        interaction::Action::JumpToLatest,
+        interaction::TargetKey::Chrome(interaction::ChromeKey::ClipboardClear),
+        interaction::Action::ClipboardClear,
     );
     // The later-registered (topmost) target wins where the two overlap.
     let hit = app.click_target_at(7, 4);
     assert_eq!(
         hit,
         Some((
-            interaction::TargetKey::Chrome(interaction::ChromeKey::JumpToLatest),
-            interaction::Action::JumpToLatest,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::ClipboardClear),
+            interaction::Action::ClipboardClear,
         )),
     );
     // Sanity: a coord only inside the FIRST rect still hits the first.

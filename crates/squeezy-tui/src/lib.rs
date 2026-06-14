@@ -19347,10 +19347,6 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
                 queue_cycle_condition_by_id(app, id);
             }
         }
-        // Scrollbar-jump and jump-to-latest are not yet registered as targets
-        // by the render paths; their handlers land with the affordances that
-        // register them. Until then these arms are inert (no panic).
-        interaction::Action::ScrollbarJump | interaction::Action::JumpToLatest => {}
         // Minimap turn-rail cell click: jump so the entry behind the cell sits
         // at the top of the viewport. Reuses the keyboard jump path
         // (`jump_to_entry_id`), so mouse/keyboard parity holds by construction.
