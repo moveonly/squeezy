@@ -227,6 +227,11 @@ struct InheritanceHierarchyArgs {
     /// instead of the type-to-type ancestor/subtype walk. Ignored (falls back to
     /// the type walk) when the root is not a member.
     member: Option<bool>,
+    /// Restrict the resolved root (when resolved by query) and the related
+    /// symbols to a single language. See `language_matches`.
+    language: Option<String>,
+    /// Transitive subtype walk depth when `subtypes=true` (see O6).
+    max_depth: Option<usize>,
     /// Maximum results (default 50).
     max_results: Option<usize>,
 }
@@ -1924,13 +1929,25 @@ fn language_matches(
     symbol: &GraphSymbol,
     language: Option<&str>,
 ) -> bool {
-    let Some(language) = language else {
+    file_language_matches(graph, &symbol.file_id, language)
+}
+
+/// Language predicate keyed directly on a `FileId`. Shared by `language_matches`
+/// (symbol-based) and by tools whose results are keyed on a file rather than a
+/// symbol (reference hits, importer files). Returns `true` when no language
+/// filter is set; `false` when the file is unknown to the graph.
+fn file_language_matches(
+    graph: &squeezy_graph::SemanticGraph,
+    file_id: &FileId,
+    language: Option<&str>,
+) -> bool {
+    let Some(language) = language.map(str::trim).filter(|value| !value.is_empty()) else {
         return true;
     };
-    let Some(file) = graph.files.get(&symbol.file_id) else {
+    let Some(file) = graph.files.get(file_id) else {
         return false;
     };
-    let language = language.trim().to_ascii_lowercase();
+    let language = language.to_ascii_lowercase();
     file.language.display_name().to_ascii_lowercase() == language
         || format!("{:?}", file.language).to_ascii_lowercase() == language
         || file
@@ -2920,7 +2937,7 @@ fn resolve_single_symbol(
         Some(query),
         args.kind.as_deref(),
         args.path.as_deref(),
-        None,
+        args.language.as_deref(),
         None,
         None,
     )
@@ -3016,7 +3033,7 @@ fn resolve_hierarchy_root(
         Some(query),
         args.kind.as_deref(),
         args.path.as_deref(),
-        None,
+        args.language.as_deref(),
         None,
         None,
     )
@@ -3569,10 +3586,36 @@ impl ToolRegistry {
         let graph = manager.graph();
         let max_depth = args.max_depth.unwrap_or(2).clamp(1, MAX_GRAPH_MAX_DEPTH);
         let max_files = args.max_files.unwrap_or(50).clamp(1, 200);
+        let path_filter = args.path.as_deref().filter(|p| !p.trim().is_empty());
+        let language_filter = args.language.as_deref().filter(|l| !l.trim().is_empty());
         // Cap the roots before expansion instead of building the entire forest
         // and discarding all but `max_files`; `total_roots` is the pre-cap count
         // used for the truncation signal.
-        let (nodes, total_roots) = graph.hierarchy_capped(None, max_depth, max_files);
+        //
+        // When a path/language scope is requested the cap can't run before the
+        // filter (it would cap on unscoped roots and under-return), so build the
+        // full forest, filter the roots by the declaring file's path/language,
+        // then cap. Unscoped repo_map keeps the cheap pre-capped fast path.
+        let (nodes, total_roots) = if path_filter.is_some() || language_filter.is_some() {
+            let all = graph.hierarchy(None, max_depth);
+            let filtered: Vec<HierarchyNode> = all
+                .into_iter()
+                .filter(|node| {
+                    let Some(symbol) = graph.symbols.get(&node.id) else {
+                        return false;
+                    };
+                    path_filter
+                        .map(|p| path_matches_filter(symbol.file_id.0.as_str(), p))
+                        .unwrap_or(true)
+                        && file_language_matches(graph, &symbol.file_id, language_filter)
+                })
+                .collect();
+            let total = filtered.len();
+            let capped = filtered.into_iter().take(max_files).collect::<Vec<_>>();
+            (capped, total)
+        } else {
+            graph.hierarchy_capped(None, max_depth, max_files)
+        };
         let selected = nodes.iter().collect::<Vec<_>>();
         // Count total serialized nodes (roots + recursively-emitted children),
         // not just the number of roots, so a single wide root that exceeds
@@ -3881,6 +3924,9 @@ impl ToolRegistry {
                     tests_only,
                 )
             })
+            .filter(|hit| {
+                file_language_matches(graph, &hit.reference.file_id, args.language.as_deref())
+            })
             .collect::<Vec<_>>();
         let truncated = filtered.len().saturating_sub(offset) > max_results;
         let selected = filtered
@@ -4080,6 +4126,7 @@ impl ToolRegistry {
         let max_references = args.max_references.unwrap_or(12).min(50);
         let max_results = graph_limit(args.max_results);
         let path_filter = args.path.as_deref();
+        let language_filter = args.language.as_deref();
         let diff_only = args.diff_only.unwrap_or(false);
         let exclude_tests = args.exclude_tests.unwrap_or(false);
         let tests_only = args.tests_only.unwrap_or(false);
@@ -4100,7 +4147,7 @@ impl ToolRegistry {
                 Some(&args.query),
                 None,
                 path_filter,
-                None,
+                language_filter,
                 None,
                 None,
             ),
@@ -4109,6 +4156,7 @@ impl ToolRegistry {
         .filter(|symbol| {
             !diff_only || symbol.dirty.is_some() || dirty_paths.contains(&symbol.file_id.0)
         })
+        .filter(|symbol| language_matches(graph, symbol, language_filter))
         .filter(|symbol| passes_test_scope(symbol_is_test(symbol), exclude_tests, tests_only))
         .collect::<Vec<_>>();
         let mut pre_take_len = candidates.len();
@@ -4118,6 +4166,7 @@ impl ToolRegistry {
                 .dirty_symbols()
                 .into_iter()
                 .filter(|symbol| symbol_matches_path_filter(symbol, path_filter))
+                .filter(|symbol| language_matches(graph, symbol, language_filter))
                 .filter(|symbol| {
                     passes_test_scope(symbol_is_test(symbol), exclude_tests, tests_only)
                 })
@@ -4271,7 +4320,7 @@ impl ToolRegistry {
         {
             Some(sym.clone())
         } else if let Some(q) = args.query.as_deref() {
-            graph_symbol_search(graph, Some(q), None, None, None, None, None)
+            graph_symbol_search(graph, Some(q), None, None, args.language.as_deref(), None, None)
                 .into_iter()
                 .next()
         } else {
@@ -4332,6 +4381,11 @@ impl ToolRegistry {
         } else {
             graph.inheritance_ancestors(&root_sym.id)
         };
+        let language_filter = args.language.as_deref();
+        let related: Vec<GraphSymbol> = related
+            .into_iter()
+            .filter(|sym| language_matches(graph, sym, language_filter))
+            .collect();
 
         let truncated = related.len() > max_results;
         let selected: Vec<&GraphSymbol> = related.iter().take(max_results).collect();
@@ -4511,14 +4565,15 @@ impl ToolRegistry {
         let removed: HashSet<FileId> = HashSet::new();
         let impact = graph.compute_impact(&changed, &propagating, &removed);
 
-        // Scope the affected set by test-ness when requested. The language
-        // filter is applied in the O2 commit.
+        // Scope the affected set by test-ness and language when requested.
         let exclude_tests = args.exclude_tests.unwrap_or(false);
         let tests_only = args.tests_only.unwrap_or(false);
+        let language_filter = args.language.as_deref();
         let affected_symbols: Vec<&squeezy_graph::GraphSymbol> = impact
             .affected_symbols
             .iter()
             .filter(|sym| passes_test_scope(symbol_is_test(sym), exclude_tests, tests_only))
+            .filter(|sym| language_matches(graph, sym, language_filter))
             .collect();
         let truncated = affected_symbols.len() > max_results;
         let selected_symbols: Vec<&squeezy_graph::GraphSymbol> =
