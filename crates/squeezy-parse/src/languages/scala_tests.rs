@@ -100,3 +100,21 @@ fn separates_superclass_from_with_mixins() {
         admin.attributes
     );
 }
+
+#[test]
+fn records_derives_clause_typeclasses() {
+    // A Scala 3 `derives` clause records each derived typeclass structurally so
+    // "which types derive X" is a queryable attribute, not a bare Type mention.
+    let parsed = parse_scala("case class Point(x: Int, y: Int) derives Eq, Show");
+    let point = scala_symbol(&parsed, "Point");
+    assert!(
+        point.attributes.iter().any(|a| a == "derives:Eq"),
+        "expected derives:Eq, got {:?}",
+        point.attributes
+    );
+    assert!(
+        point.attributes.iter().any(|a| a == "derives:Show"),
+        "expected derives:Show, got {:?}",
+        point.attributes
+    );
+}

@@ -258,6 +258,7 @@ fn scala_symbol_from_node(
         SymbolKind::Class | SymbolKind::Struct | SymbolKind::Trait | SymbolKind::Enum
     ) {
         attributes.extend(scala_inheritance_attributes(node, ctx.source));
+        attributes.extend(scala_derives_attributes(node, ctx.source));
     }
     if is_case_class {
         attributes.push("scala:case-class".to_string());
@@ -704,6 +705,29 @@ fn scala_collect_ordered_type_names(node: Node<'_>, source: &str, names: &mut Ve
         return;
     }
     collect_scala_type_names(node, source, names);
+}
+
+/// Read the Scala 3 `derives` clause, recording each derived typeclass as a
+/// `derives:<Typeclass>` attribute so "which types derive X" is a structured
+/// query rather than an undifferentiated `Type` mention.
+fn scala_derives_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(derive) = node.child_by_field_name("derive") else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut cursor = derive.walk();
+    for child in derive.children_by_field_name("type", &mut cursor) {
+        collect_scala_type_names(child, source, &mut names);
+    }
+    let mut attributes = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for name in names {
+        let attribute = format!("derives:{name}");
+        if seen.insert(attribute.clone()) {
+            attributes.push(attribute);
+        }
+    }
+    attributes
 }
 
 fn collect_scala_type_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {
