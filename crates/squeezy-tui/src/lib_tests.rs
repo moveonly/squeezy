@@ -17899,6 +17899,33 @@ fn render_transcript_populates_main_scrollbar_cache_on_overflow() {
 }
 
 #[test]
+fn main_scrollbar_is_hidden_before_scroll_or_hover() {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..120 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    let width = 40u16;
+    let height = 12u16;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_transcript(frame, Rect::new(0, 0, width, height), &app, false))
+        .expect("draw");
+    assert!(
+        app.main_scrollbar_cache.get().is_some(),
+        "overflow still caches the scrollbar hit-test geometry"
+    );
+    let buffer = terminal.backend().buffer();
+    let symbols = (0..height)
+        .map(|y| buffer[(width - 1, y)].symbol().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        symbols.iter().all(|symbol| symbol == " "),
+        "startup scrollbar gutter stays visually empty: {symbols:?}"
+    );
+}
+
+#[test]
 fn render_transcript_clears_scrollbar_cache_when_content_fits() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("only one short turn".to_string()));
@@ -23717,7 +23744,11 @@ fn main_scrollbar_uses_terminal_gray_colors() {
         match symbol.as_str() {
             "\u{2588}" => {
                 saw_thumb = true;
-                assert_eq!(fg, Color::Gray, "main scrollbar thumb is neutral gray");
+                assert_eq!(
+                    fg,
+                    Color::Rgb(90, 90, 90),
+                    "main scrollbar thumb is soft dark gray"
+                );
                 assert!(
                     modifier.contains(Modifier::BOLD),
                     "main scrollbar thumb stays visually distinct"
@@ -23727,8 +23758,8 @@ fn main_scrollbar_uses_terminal_gray_colors() {
                 saw_track = true;
                 assert_eq!(
                     fg,
-                    Color::DarkGray,
-                    "main scrollbar track is subdued terminal gray"
+                    Color::Rgb(45, 45, 45),
+                    "main scrollbar track is faint dark gray"
                 );
             }
             other => panic!("unexpected main scrollbar symbol {other:?}"),
@@ -23736,6 +23767,62 @@ fn main_scrollbar_uses_terminal_gray_colors() {
     }
     assert!(saw_thumb, "main scrollbar thumb painted");
     assert!(saw_track, "main scrollbar track painted");
+}
+
+#[test]
+fn main_scrollbar_reappears_on_hover_and_hides_after_timeout() {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..120 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    let width = 40u16;
+    let height = 12u16;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_transcript(frame, Rect::new(0, 0, width, height), &app, false))
+        .expect("initial draw");
+
+    assert!(handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: width - 1,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        },
+    ));
+    terminal
+        .draw(|frame| render_transcript(frame, Rect::new(0, 0, width, height), &app, false))
+        .expect("hover draw");
+    let hovered = terminal.backend().buffer();
+    assert!(
+        (0..height).any(|y| hovered[(width - 1, y)].symbol() == "█"),
+        "hover over the gutter reveals the main scrollbar"
+    );
+
+    assert!(handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 0,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        },
+    ));
+    app.scrollbar_reveal_until = Some(std::time::Instant::now() - Duration::from_millis(1));
+    assert!(
+        app.finalize_elapsed_scrollbar_chrome(),
+        "expired reveal requests one repaint to hide the scrollbar"
+    );
+    terminal
+        .draw(|frame| render_transcript(frame, Rect::new(0, 0, width, height), &app, false))
+        .expect("hide draw");
+    let hidden = terminal.backend().buffer();
+    assert!(
+        (0..height).all(|y| hidden[(width - 1, y)].symbol() == " "),
+        "main scrollbar disappears again after hover leaves and reveal expires"
+    );
 }
 
 /// Open the scratchpad on a wide terminal for a given glyph mode and return the
@@ -25941,7 +26028,7 @@ fn transcript_overlay_repaint_clears_stale_characters() {
 }
 
 #[test]
-fn transcript_overlay_renders_right_scrollbar_for_overflow() {
+fn transcript_overlay_scrollbar_hides_until_scroll() {
     let mut app = test_app(SessionMode::Build);
     for index in 0..40 {
         app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
@@ -25951,12 +26038,22 @@ fn transcript_overlay_renders_right_scrollbar_for_overflow() {
     let output = render_to_string(&app, 80, 12);
 
     assert!(
-        output.contains('█'),
-        "overflowing transcript overlay should render a scrollbar thumb: {output}"
+        !output.contains('█'),
+        "overflowing transcript overlay hides the scrollbar thumb before scroll/hover: {output}"
     );
     assert!(
-        output.contains('░'),
-        "overflowing transcript overlay should render a scrollbar track: {output}"
+        !output.contains('░'),
+        "overflowing transcript overlay hides the scrollbar track before scroll/hover: {output}"
+    );
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
     );
 
     let width = 80u16;
@@ -25975,8 +26072,8 @@ fn transcript_overlay_renders_right_scrollbar_for_overflow() {
                     saw_thumb = true;
                     assert_eq!(
                         cell.fg,
-                        Color::Gray,
-                        "overlay scrollbar thumb is neutral gray"
+                        Color::Rgb(90, 90, 90),
+                        "overlay scrollbar thumb is soft dark gray"
                     );
                     assert!(
                         cell.modifier.contains(Modifier::BOLD),
@@ -25987,8 +26084,8 @@ fn transcript_overlay_renders_right_scrollbar_for_overflow() {
                     saw_track = true;
                     assert_eq!(
                         cell.fg,
-                        Color::DarkGray,
-                        "overlay scrollbar track is subdued terminal gray"
+                        Color::Rgb(45, 45, 45),
+                        "overlay scrollbar track is faint dark gray"
                     );
                 }
                 _ => {}
@@ -25997,6 +26094,51 @@ fn transcript_overlay_renders_right_scrollbar_for_overflow() {
     }
     assert!(saw_thumb, "overlay scrollbar thumb painted");
     assert!(saw_track, "overlay scrollbar track painted");
+}
+
+#[test]
+fn transcript_overlay_scrollbar_reappears_on_hover() {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..40 {
+        app.push_transcript_item(TranscriptItem::user(format!("turn {index}")));
+    }
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let width = 80u16;
+    let height = 12u16;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render(frame, &app))
+        .expect("initial draw");
+    let gutter = app
+        .transcript_overlay_scrollbar_cache
+        .get()
+        .expect("overflowing overlay caches scrollbar geometry")
+        .scrollbar_area;
+
+    let consumed = handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: gutter.x,
+            row: gutter.y + gutter.height / 2,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(!consumed, "overlay hover move does not scroll content");
+    assert!(
+        app.needs_redraw,
+        "overlay hover move requests repaint for scrollbar reveal"
+    );
+    terminal
+        .draw(|frame| render(frame, &app))
+        .expect("hover draw");
+    let buffer = terminal.backend().buffer();
+    assert!(
+        (0..height).any(|y| buffer[(gutter.x, y)].symbol() == "█"),
+        "hover over the overlay gutter reveals the scrollbar"
+    );
 }
 
 #[test]

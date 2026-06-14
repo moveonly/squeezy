@@ -1216,6 +1216,9 @@ async fn run_inner_with_terminal(
         if app.finalize_elapsed_main_scroll_anim() {
             app.needs_redraw = true;
         }
+        if app.finalize_elapsed_scrollbar_chrome() {
+            app.needs_redraw = true;
+        }
         if app.toasts.tick() {
             app.needs_redraw = true;
         }
@@ -2776,6 +2779,8 @@ async fn handle_input_event(
 }
 
 fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
+    update_scrollbar_hover_from_mouse(app, mouse);
+
     // Mouse Hover Intent (§12.1.3): a button-held drag (queue reorder, scrollbar
     // drag, or a text-selection drag) is not a dwell — it suppresses (and hides)
     // any in-flight hover reveal. Recorded before the per-overlay routing below so
@@ -3789,6 +3794,7 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             && let Some(from_bottom) =
                 main_scrollbar_from_bottom_from_mouse(app, effective_column, mouse.row)
         {
+            reveal_scrollbar_chrome(app);
             // A press that lands in the gutter arms the drag-latch for the hold.
             if is_press {
                 app.scrollbar_drag = Some(ScrollbarDragSurface::Main);
@@ -4470,6 +4476,7 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     let wheel_step_lines = app.effective_gesture_settings().scroll_lines as usize;
     match mouse.kind {
         MouseEventKind::ScrollUp => {
+            reveal_scrollbar_chrome(app);
             // A wheel scroll is the pointer sweeping content, not dwelling on a
             // target: §12.1.3 says it must suppress (and hide) any hover reveal.
             hover_suppress_scroll(app);
@@ -4478,6 +4485,7 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             active_transcript_scroll(app) != before
         }
         MouseEventKind::ScrollDown => {
+            reveal_scrollbar_chrome(app);
             hover_suppress_scroll(app);
             let before = active_transcript_scroll(app);
             scroll_transcript_down(app, wheel_step_lines);
@@ -4517,6 +4525,63 @@ pub(crate) enum ScrollbarDragSurface {
     Main,
     /// The Ctrl+T transcript-overlay scrollbar gutter.
     Overlay,
+}
+
+const SCROLLBAR_CHROME_REVEAL_MS: u64 = 2700;
+
+fn reveal_scrollbar_chrome(app: &mut TuiApp) {
+    app.scrollbar_reveal_until =
+        Some(std::time::Instant::now() + Duration::from_millis(SCROLLBAR_CHROME_REVEAL_MS));
+    app.needs_redraw = true;
+}
+
+fn scrollbar_chrome_visible(app: &TuiApp, surface: ScrollbarDragSurface) -> bool {
+    app.scrollbar_hover == Some(surface)
+        || app.scrollbar_drag == Some(surface)
+        || app
+            .scrollbar_reveal_until
+            .is_some_and(|until| std::time::Instant::now() < until)
+}
+
+fn update_scrollbar_hover_from_mouse(
+    app: &mut TuiApp,
+    mouse: crossterm::event::MouseEvent,
+) -> bool {
+    if !matches!(mouse.kind, MouseEventKind::Moved) {
+        return false;
+    }
+    let next = scrollbar_surface_under_mouse(app, mouse.column, mouse.row);
+    if app.scrollbar_hover == next {
+        return false;
+    }
+    app.scrollbar_hover = next;
+    app.needs_redraw = true;
+    true
+}
+
+fn scrollbar_surface_under_mouse(
+    app: &TuiApp,
+    column: u16,
+    row: u16,
+) -> Option<ScrollbarDragSurface> {
+    if app.transcript_overlay.is_some() {
+        let area = app.transcript_overlay_scrollbar_cache.get()?.scrollbar_area;
+        return rect_contains(area, column, row).then_some(ScrollbarDragSurface::Overlay);
+    }
+    if app.config_screen.is_some() {
+        return None;
+    }
+    let area = app.main_scrollbar_cache.get()?.scrollbar_area;
+    rect_contains(area, column, row).then_some(ScrollbarDragSurface::Main)
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
 }
 
 /// MAIN transcript scrollbar, using the per-frame `main_scrollbar_cache`.
@@ -8072,9 +8137,11 @@ fn handle_transcript_overlay_mouse(
     }
     let changed = match mouse.kind {
         MouseEventKind::ScrollUp => {
+            reveal_scrollbar_chrome(app);
             adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_sub(3))
         }
         MouseEventKind::ScrollDown => {
+            reveal_scrollbar_chrome(app);
             adjust_transcript_overlay_scroll(app, |scroll| scroll.saturating_add(3))
         }
         MouseEventKind::Down(crossterm::event::MouseButton::Left)
@@ -8108,6 +8175,7 @@ fn handle_transcript_overlay_mouse(
                 if let Some((scroll, max_scroll)) =
                     transcript_overlay_scroll_from_mouse(app, gutter_column, mouse.row)
                 {
+                    reveal_scrollbar_chrome(app);
                     set_transcript_overlay_scroll_from_cached_geometry(app, scroll, max_scroll)
                 } else {
                     false
@@ -8129,6 +8197,7 @@ fn handle_transcript_overlay_mouse(
             } else if let Some((scroll, max_scroll)) =
                 transcript_overlay_scroll_from_mouse(app, mouse.column, mouse.row)
             {
+                reveal_scrollbar_chrome(app);
                 // On the scrollbar gutter: a press arms the drag and cancels any
                 // in-flight text selection.
                 if is_press {
@@ -8206,6 +8275,7 @@ fn set_transcript_overlay_scroll_known_clamped(app: &mut TuiApp, scroll: usize) 
             return false;
         }
         state.scroll = scroll;
+        reveal_scrollbar_chrome(app);
         true
     } else {
         false
@@ -8227,6 +8297,7 @@ fn set_transcript_overlay_scroll_from_cached_geometry(
             return false;
         }
         state.scroll = scroll;
+        reveal_scrollbar_chrome(app);
         true
     } else {
         false
@@ -20893,6 +20964,7 @@ fn reanchor_focus_on_resize(app: &mut TuiApp) {
 }
 
 fn scroll_transcript_up(app: &mut TuiApp, lines: usize) {
+    reveal_scrollbar_chrome(app);
     // Direct nudges snap: cancel any in-flight ease so the view doesn't fight
     // the user's wheel/page input. `cancel_main_scroll_anim` makes the painted
     // position jump straight to the (about-to-change) logical state.
@@ -20905,6 +20977,7 @@ fn scroll_transcript_up(app: &mut TuiApp, lines: usize) {
 }
 
 fn scroll_transcript_down(app: &mut TuiApp, lines: usize) {
+    reveal_scrollbar_chrome(app);
     cancel_main_scroll_anim(app);
     clear_screen_selection(app);
     let (line_count, viewport_h) = active_transcript_geometry(app);
@@ -20937,6 +21010,7 @@ fn commit_main_from_bottom_animated_at(
     target_from_bottom: usize,
     now: std::time::Instant,
 ) {
+    reveal_scrollbar_chrome(app);
     let (line_count, viewport_h) = active_transcript_geometry(app);
     // Sample the start from the DISPLAYED position, not the logical/committed
     // offset: while a prior ease is in flight the logical offset already equals
@@ -20958,6 +21032,7 @@ fn commit_main_from_bottom_animated_at(
 /// `scroll_to_top` so the stored `from_bottom` is the real top offset (not the
 /// `usize::MAX` sentinel), keeping it meaningful for a later `clamp`.
 fn jump_main_to_top_animated(app: &mut TuiApp) {
+    reveal_scrollbar_chrome(app);
     let (line_count, viewport_h) = active_transcript_geometry(app);
     // Sample the start from the DISPLAYED (mid-ease) position so re-triggering a
     // jump while a prior ease is in flight eases from where the paint actually is,
@@ -36189,19 +36264,21 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
         if scrollbar_area.width > 0
             && let Some(geometry) = scroll::scrollbar_geometry(total_rows, viewport_h, from_bottom)
         {
-            render_main_scrollbar(
-                frame,
-                scrollbar_area,
-                scroll::to_u16_clamped(geometry.thumb_offset),
-                scroll::to_u16_clamped(geometry.thumb_len),
-                app.glyph_mode,
-            );
             app.main_scrollbar_cache.set(Some(MainScrollbarCache {
                 scrollbar_area,
                 total_rows,
                 viewport_h: text_area.height,
                 max_from_bottom: total_rows.saturating_sub(viewport_h),
             }));
+            if scrollbar_chrome_visible(app, ScrollbarDragSurface::Main) {
+                render_main_scrollbar(
+                    frame,
+                    scrollbar_area,
+                    scroll::to_u16_clamped(geometry.thumb_offset),
+                    scroll::to_u16_clamped(geometry.thumb_len),
+                    app.glyph_mode,
+                );
+            }
         } else {
             app.main_scrollbar_cache.set(None);
         }
@@ -36523,12 +36600,12 @@ fn transcript_main_text_and_scrollbar_areas(area: Rect) -> (Rect, Option<Rect>) 
 /// chrome, not semantic emphasis, so keep them independent of the active theme.
 fn transcript_scrollbar_thumb_style() -> Style {
     Style::default()
-        .fg(Color::Gray)
+        .fg(Color::Rgb(90, 90, 90))
         .add_modifier(Modifier::BOLD)
 }
 
 fn transcript_scrollbar_track_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().fg(Color::Rgb(45, 45, 45))
 }
 
 /// Draw the main-view scrollbar thumb on a quiet track.
@@ -36925,7 +37002,9 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                     scrollbar_area,
                     geometry,
                 }));
-            render_transcript_overlay_scrollbar(frame, scrollbar_area, geometry);
+            if scrollbar_chrome_visible(app, ScrollbarDragSurface::Overlay) {
+                render_transcript_overlay_scrollbar(frame, scrollbar_area, geometry);
+            }
         } else {
             app.transcript_overlay_scrollbar_cache.set(None);
         }
@@ -47810,6 +47889,14 @@ pub(crate) struct TuiApp {
     /// click/drag can map to a `from_bottom` without re-deriving the layout.
     /// Set at the end of `render_transcript`; `None` when content fits.
     pub(crate) main_scrollbar_cache: std::cell::Cell<Option<MainScrollbarCache>>,
+    /// Which transcript scrollbar gutter the pointer is currently hovering.
+    /// `None` at startup and whenever the pointer leaves the gutter, so
+    /// scrollbars paint only during explicit scroll/drag or direct hover.
+    pub(crate) scrollbar_hover: Option<ScrollbarDragSurface>,
+    /// One-shot reveal deadline after scroll/click/drag. The renderer consults
+    /// it for paint only; the event loop clears it once elapsed and requests one
+    /// repaint to erase the transient chrome.
+    pub(crate) scrollbar_reveal_until: Option<std::time::Instant>,
     /// Per-frame snapshot of the MAIN transcript text rectangle + wrapped-row
     /// geometry so a mouse press/drag maps a cell onto a surface-local
     /// `selection::Pos`. Set in `render_transcript`; `None` before the first
@@ -49416,6 +49503,8 @@ impl TuiApp {
                 PendingDisplayContentCache::default(),
             ),
             main_scrollbar_cache: std::cell::Cell::new(None),
+            scrollbar_hover: None,
+            scrollbar_reveal_until: None,
             main_text_area_cache: std::cell::Cell::new(None),
             last_frame_size: std::cell::Cell::new(None),
             selection: None,
@@ -49973,6 +50062,17 @@ impl TuiApp {
             // A smooth-scroll ease is wall-clock driven too; keep repainting
             // while one is running so the painted position advances to target.
             || self.main_scroll_anim.is_some()
+    }
+
+    pub(crate) fn finalize_elapsed_scrollbar_chrome(&mut self) -> bool {
+        let Some(until) = self.scrollbar_reveal_until else {
+            return false;
+        };
+        if std::time::Instant::now() < until {
+            return false;
+        }
+        self.scrollbar_reveal_until = None;
+        self.scrollbar_hover.is_none() && self.scrollbar_drag.is_none()
     }
 
     /// Flip the hidden render-budget HUD on/off and request a repaint so the
