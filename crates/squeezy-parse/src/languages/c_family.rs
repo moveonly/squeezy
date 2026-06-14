@@ -155,6 +155,8 @@ pub(crate) fn visit_c_family_node(
         extract_c_include(node, ctx, owner_symbol.cloned());
     } else if matches!(kind, "using_declaration" | "using_directive") {
         extract_c_using(node, ctx, owner_symbol.cloned());
+    } else if kind == "friend_declaration" {
+        extract_c_family_friend(node, ctx, parent_symbol.map(|(id, _)| id.clone()));
     }
 
     if let Some(symbol) = c_family_symbol_from_node(node, ctx, parent_symbol) {
@@ -264,6 +266,11 @@ pub(crate) fn c_family_symbol_from_node(
     }
     if kind == SymbolKind::Field {
         attributes.extend(c_family_bitfield_attributes(node, ctx.source));
+    }
+    if matches!(kind, SymbolKind::Function | SymbolKind::Method)
+        && c_family_has_c_linkage(node, ctx.source)
+    {
+        attributes.push("c++:c-linkage".to_string());
     }
     attributes.sort();
     attributes.dedup();
@@ -488,6 +495,47 @@ pub(crate) fn extract_c_using(
         imported_name,
         is_global: false,
     });
+}
+
+/// Record a C++ `friend` grant on the enclosing class.
+///
+/// tree-sitter-cpp models `friend class Bar;` / `friend Bar;` as a
+/// `friend_declaration` whose named child is a `type_identifier`,
+/// `qualified_identifier`, or `template_type`; friend *functions*
+/// (`friend void f();`) wrap a `declaration` / `function_definition` that the
+/// regular visitor still descends into. We emit a `Type` reference for the
+/// granted name tagged with a `friend grant` provenance so the access grant is
+/// distinguishable from an ordinary type mention. The reference is owned by the
+/// granting class so "who does Foo befriend" is answerable.
+pub(crate) fn extract_c_family_friend(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if !matches!(
+            child.kind(),
+            "type_identifier" | "qualified_identifier" | "template_type"
+        ) {
+            continue;
+        }
+        let Ok(text) = node_text(child, ctx.source) else {
+            continue;
+        };
+        let name = c_family_last_name(text);
+        if name.is_empty() {
+            continue;
+        }
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: owner_id.clone(),
+            text: name,
+            kind: ReferenceKind::Type,
+            span: span_from_node(child),
+            provenance: Provenance::new(c_family_parser_name(ctx.file.language), "friend grant"),
+        });
+    }
 }
 
 pub(crate) fn extract_c_family_call(
@@ -831,6 +879,25 @@ pub(crate) fn c_family_special_member_role(
         Some(class) if class == name => Some("c++:constructor"),
         _ => None,
     }
+}
+
+/// True when `node` sits inside an `extern "C"` block / declaration. C++ models
+/// this as a `linkage_specification` whose `value` field is the string literal
+/// `"C"`; `extern "C++"` and other linkages are left untagged. Walking
+/// ancestors covers both `extern "C" void f();` and the braced
+/// `extern "C" { … }` form.
+pub(crate) fn c_family_has_c_linkage(node: Node<'_>, source: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "linkage_specification"
+            && let Some(value) = parent.child_by_field_name("value")
+            && let Ok(text) = node_text(value, source)
+        {
+            return text.trim().trim_matches('"').trim() == "C";
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 /// The leaf name of the nearest enclosing `class`/`struct`/`union` specifier,
