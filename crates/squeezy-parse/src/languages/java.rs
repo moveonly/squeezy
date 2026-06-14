@@ -119,6 +119,7 @@ pub(crate) fn java_symbol_from_node(
         "class_declaration" => SymbolKind::Class,
         "interface_declaration" | "annotation_type_declaration" => SymbolKind::Trait,
         "enum_declaration" => SymbolKind::Enum,
+        "enum_constant" => SymbolKind::Variant,
         "record_declaration" => SymbolKind::Struct,
         "annotation_type_element_declaration" => SymbolKind::Method,
         "method_declaration" => SymbolKind::Method,
