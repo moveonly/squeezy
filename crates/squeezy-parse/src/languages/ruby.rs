@@ -714,7 +714,127 @@ fn extract_ruby_mixin_or_attr(
         return true;
     }
 
+    if extract_ruby_rails_macro(node, ctx, parent_id, method_name) {
+        let _ = owner_id;
+        return true;
+    }
+
     false
+}
+
+/// Rails / ActiveSupport class-body macros that implicitly define accessor
+/// methods. Synthesizes `Partial` Method symbols (one reader, optionally a
+/// writer/predicate) for each declared name and records association targets as
+/// an `assoc:<macro>:<name>` attribute on the host class. Returns `true` when
+/// the call was a recognised macro (so the caller skips the anonymous call).
+fn extract_ruby_rails_macro(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_id: &SymbolId,
+    method_name: &str,
+) -> bool {
+    // (emit_reader, emit_writer, emit_predicate, is_association)
+    let (emit_reader, emit_writer, emit_predicate, is_assoc) = match method_name {
+        // ActiveRecord associations: implicit reader + writer accessor.
+        "has_many" | "has_one" | "belongs_to" | "has_and_belongs_to_many" => {
+            (true, true, false, true)
+        }
+        // ActiveSupport attribute macros: reader + writer (+ predicate for
+        // `class_attribute`).
+        "class_attribute" => (true, true, true, false),
+        "cattr_accessor" | "mattr_accessor" => (true, true, false, false),
+        "cattr_reader" | "mattr_reader" => (true, false, false, false),
+        "cattr_writer" | "mattr_writer" => (false, true, false, false),
+        // `delegate :a, :b, to: :x` exposes reader methods for each name; the
+        // trailing `to:`/options hash is skipped below.
+        "delegate" => (true, false, false, false),
+        _ => return false,
+    };
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let span = span_from_node(node);
+    let raw = node_text(node, ctx.source).unwrap_or_default().trim();
+    let mut cursor = args.walk();
+    let mut emitted_any = false;
+    for child in args.named_children(&mut cursor) {
+        // Options hashes (`to: :user`, `class_name: "Post"`, `dependent:
+        // :destroy`) and inline `pair`s are not accessor names — stop/skip.
+        if matches!(child.kind(), "pair" | "hash" | "keyword_argument") {
+            continue;
+        }
+        let Some(name) = ruby_symbol_arg_value(child, ctx.source) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        emitted_any = true;
+        if is_assoc {
+            if let Some(host) = ctx.symbols.iter_mut().find(|s| s.id == *parent_id) {
+                host.attributes
+                    .push(format!("assoc:{method_name}:{name}"));
+            }
+        }
+        if emit_reader {
+            push_synthetic_macro_accessor(ctx, parent_id, &name, method_name, span, raw);
+        }
+        if emit_writer {
+            push_synthetic_macro_accessor(
+                ctx,
+                parent_id,
+                &format!("{name}="),
+                method_name,
+                span,
+                raw,
+            );
+        }
+        if emit_predicate {
+            push_synthetic_macro_accessor(
+                ctx,
+                parent_id,
+                &format!("{name}?"),
+                method_name,
+                span,
+                raw,
+            );
+        }
+    }
+    emitted_any
+}
+
+fn push_synthetic_macro_accessor(
+    ctx: &mut ExtractContext<'_>,
+    parent_id: &SymbolId,
+    name: &str,
+    macro_name: &str,
+    span: SourceSpan,
+    raw: &str,
+) {
+    let writer = name.ends_with('=');
+    let id = symbol_id(&ctx.file, Some(parent_id), SymbolKind::Method, name, span);
+    ctx.symbols.push(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id: Some(parent_id.clone()),
+        name: name.to_string(),
+        kind: SymbolKind::Method,
+        language_identity: None,
+        span,
+        body_span: None,
+        signature_span: None,
+        signature: raw.to_string(),
+        visibility: None,
+        docs: Vec::new(),
+        attributes: vec![
+            "ruby:synthesized".to_string(),
+            format!("ruby:macro:{macro_name}"),
+        ],
+        provenance: Provenance::new("tree-sitter-ruby", "rails macro accessor synthesis"),
+        confidence: Confidence::Partial,
+        freshness: Freshness::Fresh,
+        arity: Some(if writer { 1 } else { 0 }),
+    });
 }
 
 fn push_synthetic_attr(
