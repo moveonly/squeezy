@@ -313,6 +313,19 @@ fn csharp_symbol_from_node(
     {
         attributes.push("csharp:test-host".to_string());
     }
+    // C# extension method: a `static` method whose first parameter carries the
+    // `this` modifier. Tag it `csharp:extension` and capture the receiver type
+    // so a future `csharp_extension_method_call` resolver branch can route
+    // `value.Method()` to this static definition (parallels Kotlin/Swift/
+    // Scala/Dart). The receiver leaf is also recorded as a `type:` attribute,
+    // mirroring how the Swift resolver discovers the extended type.
+    if matches!(node.kind(), "method_declaration")
+        && modifiers.iter().any(|modifier| modifier == "static")
+        && let Some(receiver) = csharp_extension_receiver_type(node, ctx.source)
+    {
+        attributes.push("csharp:extension".to_string());
+        attributes.push(format!("csharp:extension-receiver:{receiver}"));
+    }
     if let Some(namespace) = scope.current_namespace() {
         attributes.push(format!("csharp:namespace:{namespace}"));
     }
@@ -1212,6 +1225,27 @@ pub(crate) fn extract_csharp_symbol_facts(
             push_csharp_type_reference(returns, symbol, ctx, "return type reference");
         }
     }
+}
+
+/// Returns the leaf receiver type of a C# extension method, i.e. the `type`
+/// of the first parameter when that parameter carries the `this` modifier.
+/// tree-sitter-c-sharp aliases the `this`/`ref`/`in`/`out` parameter prefixes
+/// to named `modifier` nodes, so we scan the first parameter's children.
+pub(crate) fn csharp_extension_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
+    let parameters = node.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    let first = parameters
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "parameter")?;
+    let has_this = csharp_modifiers(first, source)
+        .iter()
+        .any(|modifier| modifier == "this");
+    if !has_this {
+        return None;
+    }
+    let type_node = first.child_by_field_name("type")?;
+    let text = node_text(type_node, source).ok()?;
+    csharp_type_name_from_annotation(text)
 }
 
 pub(crate) fn push_csharp_type_reference(
