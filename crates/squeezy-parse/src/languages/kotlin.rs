@@ -32,6 +32,7 @@
 
 use std::collections::HashSet;
 
+use crate::languages::common::visit_named_children_with_state;
 use crate::languages::rust::*;
 use crate::*;
 
@@ -251,10 +252,10 @@ pub(crate) fn visit_kotlin_children(
     parent_symbol: Option<(SymbolId, SymbolKind)>,
     owner_symbol: Option<SymbolId>,
 ) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        visit_kotlin_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
-    }
+    visit_named_children_with_state(node, (parent_symbol, owner_symbol), |child, state| {
+        let (parent_symbol, owner_symbol) = state;
+        visit_kotlin_node(child, ctx, parent_symbol, owner_symbol);
+    });
 }
 
 /// kotlin spec §5: walk an `annotation` node's argument expressions so calls

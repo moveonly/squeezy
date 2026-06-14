@@ -12,6 +12,7 @@
 //! - SwiftPM `Package.swift` parsing for module facts
 //! - `#externalMacro`/`#freestanding` macro resolution
 
+use crate::languages::common::visit_named_children_with_state;
 use crate::languages::rust::*;
 use crate::*;
 
@@ -247,16 +248,14 @@ fn visit_swift_children(
     owner_symbol: Option<SymbolId>,
     extension_owner: ExtensionOwner<'_>,
 ) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        visit_swift_node(
-            child,
-            ctx,
-            parent_symbol.clone(),
-            owner_symbol.clone(),
-            extension_owner,
-        );
-    }
+    visit_named_children_with_state(
+        node,
+        (parent_symbol, owner_symbol, extension_owner),
+        |child, state| {
+            let (parent_symbol, owner_symbol, extension_owner) = state;
+            visit_swift_node(child, ctx, parent_symbol, owner_symbol, extension_owner);
+        },
+    );
 }
 
 fn swift_symbol_from_node(

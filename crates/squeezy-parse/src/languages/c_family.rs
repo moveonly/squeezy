@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::languages::common::visit_named_children_with_state;
 use crate::languages::rust::*;
 use crate::*;
 
@@ -198,10 +199,10 @@ pub(crate) fn visit_c_family_children(
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
     owner_symbol: Option<&SymbolId>,
 ) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
+    visit_named_children_with_state(node, (parent_symbol, owner_symbol), |child, state| {
+        let (parent_symbol, owner_symbol) = state;
         visit_c_family_node(child, ctx, parent_symbol, owner_symbol);
-    }
+    });
 }
 
 pub(crate) fn c_family_symbol_from_node(

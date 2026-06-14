@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::languages::common::visit_named_children_with_state;
 use crate::languages::rust::*;
 use crate::*;
 
@@ -190,16 +191,10 @@ fn visit_csharp_children(
     owner_symbol: Option<SymbolId>,
     scope: &mut CsharpScope,
 ) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        visit_csharp_node(
-            child,
-            ctx,
-            parent_symbol.clone(),
-            owner_symbol.clone(),
-            scope,
-        );
-    }
+    visit_named_children_with_state(node, (parent_symbol, owner_symbol), |child, state| {
+        let (parent_symbol, owner_symbol) = state;
+        visit_csharp_node(child, ctx, parent_symbol, owner_symbol, scope);
+    });
 }
 
 pub(crate) fn csharp_namespace_symbol(

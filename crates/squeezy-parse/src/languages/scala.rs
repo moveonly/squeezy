@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::languages::common::visit_named_children_with_state;
 use crate::languages::rust::{java_visibility_text, signature_text, symbol_id};
 use crate::*;
 
@@ -183,16 +184,14 @@ fn visit_scala_children(
     owner_symbol: Option<SymbolId>,
     inside_inline: bool,
 ) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        visit_scala_node(
-            child,
-            ctx,
-            parent_symbol.clone(),
-            owner_symbol.clone(),
-            inside_inline,
-        );
-    }
+    visit_named_children_with_state(
+        node,
+        (parent_symbol, owner_symbol, inside_inline),
+        |child, state| {
+            let (parent_symbol, owner_symbol, inside_inline) = state;
+            visit_scala_node(child, ctx, parent_symbol, owner_symbol, inside_inline);
+        },
+    );
 }
 
 fn scala_symbol_from_node(
