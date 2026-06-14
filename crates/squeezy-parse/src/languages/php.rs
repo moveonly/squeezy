@@ -219,6 +219,23 @@ fn visit_php_node(
             }
             extract_php_object_creation(node, ctx, owner_symbol.clone());
         }
+        "class_constant_access_expression" => {
+            // `Foo::Bar` / `self::CONST` / enum-case match arms. Emit a Type
+            // reference for the class qualifier and a Field reference for the
+            // accessed constant / enum case, then stop so the inner `name`
+            // nodes do not also surface as bare identifiers.
+            extract_php_class_constant_access(node, ctx, owner_symbol.clone(), scope);
+            return;
+        }
+        "binary_expression"
+            if php_binary_operator(node, ctx.source).as_deref() == Some("instanceof") =>
+        {
+            // `$x instanceof Foo` — the RHS class is a Type test. Emit a Type
+            // reference for it and descend only into the LHS so the class name
+            // is not also recorded as a bare identifier.
+            extract_php_instanceof(node, ctx, owner_symbol.clone(), scope);
+            return;
+        }
         "qualified_name" if !is_php_declaration_name(node) => {
             extract_php_reference(node, ReferenceKind::Path, ctx, owner_symbol.clone());
         }
@@ -1412,6 +1429,74 @@ fn extract_php_reference(
         kind: body_kind,
         span: span_from_node(node),
     });
+}
+
+fn php_binary_operator(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("operator")
+        .and_then(|op| node_text(op, source).ok())
+        .map(|text| text.trim().to_string())
+}
+
+fn extract_php_class_constant_access(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+    scope: &mut PhpScope,
+) {
+    // The grammar emits `<qualifier> :: <name>` with no field names; the first
+    // named child is the class qualifier and the last is the constant / enum
+    // case `name`.
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+    let Some(qualifier) = children.first().copied() else {
+        return;
+    };
+    match qualifier.kind() {
+        "name" | "qualified_name" | "relative_name" => {
+            // A static class qualifier (`Foo::`, but not `self::`/`static::`/
+            // `parent::`, which `extract_php_reference` filters as keywords) is
+            // a Type reference.
+            extract_php_reference(qualifier, ReferenceKind::Type, ctx, owner_id.clone());
+        }
+        _ => {
+            // Dynamic qualifier such as `$class::CONST` — descend so the
+            // variable/expression is still recorded.
+            visit_php_node(qualifier, ctx, None, owner_id.clone(), scope);
+        }
+    }
+    // The accessed constant / enum case (last child) is a Field reference so
+    // enum-case match arms link to the variant rather than degrading to a bare
+    // identifier.
+    if let Some(constant) = children.last().copied()
+        && constant.id() != qualifier.id()
+        && constant.kind() == "name"
+    {
+        extract_php_reference(constant, ReferenceKind::Field, ctx, owner_id);
+    }
+}
+
+fn extract_php_instanceof(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+    scope: &mut PhpScope,
+) {
+    // Descend the left operand normally (it is the tested value).
+    if let Some(left) = node.child_by_field_name("left") {
+        visit_php_node(left, ctx, None, owner_id.clone(), scope);
+    }
+    let Some(right) = node.child_by_field_name("right") else {
+        return;
+    };
+    match right.kind() {
+        "name" | "qualified_name" | "relative_name" => {
+            extract_php_reference(right, ReferenceKind::Type, ctx, owner_id);
+        }
+        _ => {
+            // `$x instanceof $class` — dynamic, descend so the variable lands.
+            visit_php_node(right, ctx, None, owner_id, scope);
+        }
+    }
 }
 
 fn extract_php_property_symbols(
