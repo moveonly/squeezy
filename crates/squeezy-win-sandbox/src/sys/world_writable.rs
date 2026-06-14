@@ -177,9 +177,15 @@ unsafe fn dacl_has_world_write_allow(p_dacl: *mut ACL, psid_world: PSID) -> bool
         if unsafe { GetAce(p_dacl as *const ACL, i, &mut p_ace) } == 0 {
             continue;
         }
+        if p_ace.is_null() {
+            continue;
+        }
 
         let hdr = unsafe { &*(p_ace as *const ACE_HEADER) };
         if hdr.AceType != ACCESS_ALLOWED_ACE_TYPE {
+            continue;
+        }
+        if usize::from(hdr.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>() {
             continue;
         }
         // Inherit-only ACEs do not apply to the object itself.

@@ -14,5 +14,8 @@
     "@types/bun": "^1",
     "typescript": "^5.9.3",
     "wrangler": "^4.94.0"
+  },
+  "overrides": {
+    "esbuild": "0.28.1"
   }
 }
