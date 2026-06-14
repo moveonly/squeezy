@@ -741,7 +741,7 @@ pub(crate) fn extract_python_call(
     ctx.calls.push(ParsedCall {
         file_id: ctx.file.id.clone(),
         caller_id: owner_id.clone(),
-        name,
+        name: name.clone(),
         target_text: target_text.clone(),
         receiver,
         arity,
@@ -754,7 +754,61 @@ pub(crate) fn extract_python_call(
         provenance: Provenance::new("tree-sitter-python", "call"),
         confidence: Confidence::Heuristic,
     });
+    extract_python_dynamic_import(node, &name, ctx, owner_id.clone());
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+}
+
+/// Recognise statically-resolvable dynamic imports — `importlib.import_module("m")`
+/// and `__import__("m")` with a literal first argument — and synthesise a
+/// `ParsedImport` for the named module so it shows up as an import fact.
+/// Non-literal arguments (variables, f-strings) are intentionally ignored.
+pub(crate) fn extract_python_dynamic_import(
+    node: Node<'_>,
+    callee_leaf: &str,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    if !matches!(callee_leaf, "import_module" | "__import__") {
+        return;
+    }
+    let Some(arguments) = node.child_by_field_name("arguments").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "argument_list")
+    }) else {
+        return;
+    };
+    // Only the first positional argument names the module; require it to be a
+    // string literal so the import is statically resolvable.
+    let mut cursor = arguments.walk();
+    let Some(first_arg) = arguments.named_children(&mut cursor).next() else {
+        return;
+    };
+    if first_arg.kind() != "string" {
+        return;
+    }
+    let Some(module) = node_text(first_arg, ctx.source)
+        .ok()
+        .and_then(first_python_string_literal)
+        .filter(|module| !module.is_empty())
+    else {
+        return;
+    };
+
+    ctx.imports.push(ParsedImport {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        path: module.clone(),
+        alias: None,
+        is_glob: false,
+        is_reexport: false,
+        is_static: false,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-python", "dynamic import call"),
+        kind: ImportKind::Namespace,
+        imported_name: Some(last_path_segment(&module)),
+        is_global: false,
+    });
 }
 
 pub(crate) fn extract_python_reference(
