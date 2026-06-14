@@ -2,7 +2,7 @@
 name = "squeezy-semantic-cases"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.93.1"
+rust-version = "1.96.0"
 publish = false
 
 [lib]

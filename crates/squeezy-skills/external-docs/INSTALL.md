@@ -69,7 +69,7 @@ squeezy doctor
 ```
 
 Use this path when you already have a recent Rust toolchain installed. Squeezy
-requires Rust 1.93.1 or newer.
+requires Rust 1.96.0 or newer.
 
 For local source checkouts, keep install artifacts in a persistent target
 directory so repeat installs can reuse them:

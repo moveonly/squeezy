@@ -11,7 +11,7 @@ user-visible behavior changes.
 
 ## Setup
 
-Install Rust `1.93.1` or newer. The repository pins `1.93.1` in `rust-toolchain.toml` and each crate inherits `rust-version = "1.93.1"` from the workspace.
+Install Rust `1.96.0` or newer. The repository pins `1.96.0` in `rust-toolchain.toml` and each crate inherits `rust-version = "1.96.0"` from the workspace.
 
 Install pre-commit hooks:
 
