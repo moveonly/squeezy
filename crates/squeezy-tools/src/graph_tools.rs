@@ -62,6 +62,17 @@ struct DeclSearchArgs {
     visibility: Option<String>,
     attribute: Option<String>,
     transitive: Option<bool>,
+    /// Dead-code mode: when `true`, retain only scanned declarations that have
+    /// zero inbound `Calls`/`References`/`TestOf` edges (no resolved use). The
+    /// usual query/kind/path/language/visibility/attribute filters still scope
+    /// the candidate set first. Public/exported candidates are flagged rather
+    /// than dropped, and candidates whose only edges resolve at a low
+    /// confidence are caveated, never silently reported as dead.
+    unused: Option<bool>,
+    /// In `unused` mode, the inbound-edge count above which a declaration is
+    /// considered "used" and excluded. Defaults to 0 (strictly zero inbound
+    /// edges). Lets a caller surface near-dead declarations (e.g. used once).
+    max_callers: Option<usize>,
     max_results: Option<usize>,
     offset: Option<usize>,
 }
@@ -1546,6 +1557,56 @@ fn decl_counts_by_kind(symbols: &[GraphSymbol]) -> Value {
         *counts.entry(symbol_kind_label(symbol.kind)).or_default() += 1;
     }
     json!(counts)
+}
+
+/// Edge kinds that count as a "use" of a declaration for dead-code analysis:
+/// a resolved call site, a textual/identifier reference, or a test exercising
+/// it. Inbound `Contains`/`Imports`/inheritance edges are structural, not uses,
+/// so they are excluded.
+fn is_usage_edge(kind: EdgeKind) -> bool {
+    matches!(
+        kind,
+        EdgeKind::Calls | EdgeKind::References | EdgeKind::TestOf
+    )
+}
+
+/// Count inbound usage edges (`Calls`/`References`/`TestOf`) pointing at this
+/// symbol via the graph's `edges_by_to` index.
+fn inbound_usage_count(graph: &squeezy_graph::SemanticGraph, symbol: &GraphSymbol) -> usize {
+    graph
+        .inbound_edges(&symbol.id)
+        .filter(|edge| is_usage_edge(edge.kind))
+        .count()
+}
+
+/// True when the symbol's visibility marks it as part of a public/exported
+/// surface. Such a declaration may have callers outside the scanned graph
+/// (downstream crates, reflection, FFI), so dead-code mode FLAGS it rather than
+/// asserting it is dead. Treats anything that is not explicitly
+/// `private`/`protected`/`internal`/`fileprivate` as exported, matching the
+/// graph's own permissive export heuristic.
+fn visibility_is_exported(symbol: &GraphSymbol) -> bool {
+    match symbol.visibility.as_deref() {
+        None => false,
+        Some(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "private" | "protected" | "internal" | "fileprivate" | "module" | "package"
+        ),
+    }
+}
+
+/// Confidence levels at which "zero inbound usage edges" is NOT trustworthy
+/// evidence of dead code: a macro-opaque/conditional/external/candidate-set
+/// declaration may well be used through an edge the resolver could not pin
+/// down. Such candidates are caveated, never reported as confidently dead.
+fn confidence_is_unresolved(confidence: Confidence) -> bool {
+    matches!(
+        confidence,
+        Confidence::MacroOpaque
+            | Confidence::ConditionalUnknown
+            | Confidence::External
+            | Confidence::CandidateSet
+    )
 }
 
 pub(crate) fn resolve_definition_candidates(
@@ -3358,6 +3419,21 @@ impl ToolRegistry {
                 false,
             ),
         };
+        // Dead-code mode: drop any scanned declaration that has more than
+        // `max_callers` (default 0) inbound usage edges. Unscanned stubs
+        // (external/parse-failed) are dropped outright — they are not real
+        // declarations in this workspace and would be false positives.
+        let unused = args.unused.unwrap_or(false);
+        let max_callers = args.max_callers.unwrap_or(0);
+        let symbols: Vec<GraphSymbol> = if unused {
+            symbols
+                .into_iter()
+                .filter(|symbol| symbol.scanned)
+                .filter(|symbol| inbound_usage_count(graph, symbol) <= max_callers)
+                .collect()
+        } else {
+            symbols
+        };
         // The closure cap is a distinct truncation source from the result-window
         // cap: fold it into `truncated` so the page is flagged, and also surface
         // it as a separate `closure_capped` signal so a caller can tell the
@@ -3373,7 +3449,42 @@ impl ToolRegistry {
             .iter()
             .map(|symbol| {
                 let rank_label = args.query.as_deref().map(|q| symbol_rank_label(symbol, q));
-                symbol_packet(graph, symbol, "decl_search", rank_label)
+                let mut packet = symbol_packet(graph, symbol, "decl_search", rank_label);
+                // In dead-code mode, annotate each surviving candidate so the
+                // model never treats a flagged/caveated result as confidently
+                // dead: `exported` (may have callers outside this graph) and
+                // `caveat` (only low-confidence edges, so absence of resolved
+                // uses is not proof). A clean candidate gets `confidently dead`.
+                if unused
+                    && let Some(object) = packet.as_object_mut()
+                {
+                    let exported = visibility_is_exported(symbol);
+                    let caveat = confidence_is_unresolved(symbol.confidence);
+                    let mut flags = serde_json::Map::new();
+                    flags.insert("exported".to_string(), json!(exported));
+                    if caveat {
+                        flags.insert(
+                            "caveat".to_string(),
+                            json!("no resolved references found; this declaration's edges resolved at low confidence (macro/conditional/external/candidate), so absence of uses is not proof of dead code"),
+                        );
+                    }
+                    if exported {
+                        flags.insert(
+                            "note".to_string(),
+                            json!("public/exported: may have callers outside the scanned workspace"),
+                        );
+                    }
+                    flags.insert(
+                        "verdict".to_string(),
+                        json!(if exported || caveat {
+                            "possibly_dead"
+                        } else {
+                            "likely_dead"
+                        }),
+                    );
+                    object.insert("dead_code".to_string(), Value::Object(flags));
+                }
+                packet
             })
             .collect::<Vec<_>>();
         let confidence_distribution =
@@ -3404,6 +3515,10 @@ impl ToolRegistry {
         payload.insert("counts_by_kind".to_string(), decl_counts_by_kind(&symbols));
         payload.insert("truncated".to_string(), json!(truncated));
         payload.insert("closure_capped".to_string(), json!(closure_capped));
+        if unused {
+            payload.insert("unused".to_string(), json!(true));
+            payload.insert("max_callers".to_string(), json!(max_callers));
+        }
         make_result(
             call,
             ToolStatus::Success,
