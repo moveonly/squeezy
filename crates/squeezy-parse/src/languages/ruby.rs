@@ -24,6 +24,7 @@ pub(crate) fn extract_ruby(file: FileRecord, source: &str, tree: &Tree) -> Parse
     record_parse_error_diagnostics(root, &mut ctx);
 
     visit_ruby_node(root, &mut ctx, None, None, None);
+    apply_ruby_visibility(root, &mut ctx);
     dedup_ruby_facts(&mut ctx);
 
     ParsedFile {
@@ -1405,6 +1406,188 @@ fn ruby_is_test_filename(relative_path: &str) -> bool {
     lower
         .split(['/', '\\'])
         .any(|segment| segment == "test" || segment == "spec")
+}
+
+/// Apply Ruby visibility (`private`/`protected`/`public`) to method symbols.
+///
+/// Ruby visibility is set two ways inside a class/module body:
+///   1. Toggle form — a bare `private` (or `protected`/`public`) flips the
+///      default visibility for every subsequent direct method definition in the
+///      body. `module_function` (bare) flips the default to a module-function
+///      mode that is also private on the instance side; we record it as
+///      `private`.
+///   2. Targeted form — `private :foo, :bar` / `private def baz; end` /
+///      `private_class_method :qux` set visibility on the named method(s) only.
+///
+/// Computed as a post-pass over the parse tree so it can observe body order
+/// without threading mutable state through the cloning recursive descent. The
+/// resulting `start_byte -> visibility` map patches `ParsedSymbol.visibility`.
+fn apply_ruby_visibility(root: Node<'_>, ctx: &mut ExtractContext<'_>) {
+    let mut visibility_by_start: std::collections::HashMap<u32, &'static str> =
+        std::collections::HashMap::new();
+    collect_ruby_visibility(root, ctx.source, &mut visibility_by_start);
+    if visibility_by_start.is_empty() {
+        return;
+    }
+    for symbol in &mut ctx.symbols {
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Method | SymbolKind::Function | SymbolKind::Test
+        ) {
+            continue;
+        }
+        if let Some(vis) = visibility_by_start.get(&symbol.span.start_byte) {
+            symbol.visibility = Some((*vis).to_string());
+        }
+    }
+}
+
+/// Recursively walk class/module/singleton_class bodies, tracking the running
+/// default visibility, and fill `out` with `method-def start_byte -> visibility`.
+fn collect_ruby_visibility(
+    node: Node<'_>,
+    source: &str,
+    out: &mut std::collections::HashMap<u32, &'static str>,
+) {
+    let kind = node.kind();
+    if matches!(kind, "class" | "module" | "singleton_class") {
+        // The body of a class/module is a `body_statement`; a `singleton_class`
+        // (`class << self`) likewise hosts a `body_statement`. Iterate its
+        // direct statements in document order.
+        let body = node
+            .child_by_field_name("body")
+            .or_else(|| ruby_first_child_of_kind(node, "body_statement"));
+        if let Some(body) = body {
+            let mut current = "public";
+            let mut cursor = body.walk();
+            for stmt in body.named_children(&mut cursor) {
+                ruby_apply_visibility_statement(stmt, source, &mut current, out);
+            }
+        }
+    }
+    // Descend so nested classes/modules get their own visibility scope.
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_ruby_visibility(child, source, out);
+    }
+}
+
+/// Handle one direct statement of a class/module body for visibility tracking.
+fn ruby_apply_visibility_statement(
+    stmt: Node<'_>,
+    source: &str,
+    current: &mut &'static str,
+    out: &mut std::collections::HashMap<u32, &'static str>,
+) {
+    match stmt.kind() {
+        // A direct instance-method definition takes the running default. The
+        // toggle does not govern `singleton_method` (`def self.foo`) — those are
+        // class methods whose visibility is set only by `private_class_method`/
+        // `public_class_method`, handled in the targeted-call arm.
+        "method" => {
+            out.insert(span_from_node(stmt).start_byte, *current);
+        }
+        // Bare `private` / `protected` / `public` (parsed as an identifier
+        // statement) toggles the default for subsequent definitions.
+        "identifier" => {
+            if let Some(v) = ruby_visibility_keyword(node_text(stmt, source).unwrap_or_default().trim())
+            {
+                *current = v;
+            }
+        }
+        "call" => {
+            // A `private`/`protected`/`public`/`module_function`/
+            // `*_class_method` call. With no args it is a toggle; with args it
+            // is the targeted form.
+            if stmt.child_by_field_name("receiver").is_some() {
+                return;
+            }
+            let Some(method_node) = stmt.child_by_field_name("method") else {
+                return;
+            };
+            let method_name = node_text(method_node, source).unwrap_or_default();
+            let method_name = method_name.trim();
+            let Some(vis) = ruby_visibility_call(method_name) else {
+                return;
+            };
+            match stmt.child_by_field_name("arguments") {
+                None => {
+                    // `private` toggle (only the symmetric instance-visibility
+                    // keywords flip the running default; `*_class_method` with
+                    // no args is a no-op toggle we ignore).
+                    if matches!(method_name, "private" | "protected" | "public" | "module_function")
+                    {
+                        *current = vis;
+                    }
+                }
+                Some(args) => {
+                    let mut cursor = args.walk();
+                    for arg in args.named_children(&mut cursor) {
+                        // `private def foo; end` — the arg is a method def.
+                        if matches!(arg.kind(), "method" | "singleton_method") {
+                            out.insert(span_from_node(arg).start_byte, vis);
+                            continue;
+                        }
+                        // `private :foo` — resolve the symbol name to the
+                        // sibling method definition and tag it.
+                        if let Some(name) = ruby_symbol_arg_value(arg, source)
+                            && let Some(parent) = stmt.parent()
+                        {
+                            ruby_tag_sibling_method(parent, source, &name, vis, out);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Map a bare visibility keyword to its canonical visibility string.
+fn ruby_visibility_keyword(text: &str) -> Option<&'static str> {
+    match text {
+        "private" => Some("private"),
+        "protected" => Some("protected"),
+        "public" => Some("public"),
+        // `module_function` (bare) makes subsequent defs private on instances.
+        "module_function" => Some("private"),
+        _ => None,
+    }
+}
+
+/// Map a visibility-setting call name to the visibility it applies.
+fn ruby_visibility_call(name: &str) -> Option<&'static str> {
+    match name {
+        "private" | "private_class_method" | "module_function" => Some("private"),
+        "protected" => Some("protected"),
+        "public" | "public_class_method" => Some("public"),
+        _ => None,
+    }
+}
+
+/// Find the direct-child method named `name` within `body_owner` (a class/
+/// module body or its `body_statement`) and record its visibility.
+fn ruby_tag_sibling_method(
+    body_owner: Node<'_>,
+    source: &str,
+    name: &str,
+    vis: &'static str,
+    out: &mut std::collections::HashMap<u32, &'static str>,
+) {
+    let mut cursor = body_owner.walk();
+    for child in body_owner.named_children(&mut cursor) {
+        if matches!(child.kind(), "method" | "singleton_method")
+            && ruby_symbol_name(child, source).as_deref() == Some(name)
+        {
+            out.insert(span_from_node(child).start_byte, vis);
+        }
+    }
+}
+
+/// First named child of `node` with the given kind.
+fn ruby_first_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find(|c| c.kind() == kind)
 }
 
 /// One Field per `(host class, ivar/cvar name)` (spec §3); same for
