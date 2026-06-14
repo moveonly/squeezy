@@ -353,9 +353,15 @@ thing".
                 cheap_model_for(provider, config).unwrap_or(parent_model.clone())
             })
         }
-        (SubagentKind::DocHelp, _) => {
-            cheap_model_for(provider, config).unwrap_or(parent_model.clone())
-        }
+        // `/help` is user-facing; DocHelp defaults to the parent model.
+        // `subagents.doc_help_model` overrides: "cheap" drops to the cheap
+        // tier, an explicit id resolves through the alias table, and
+        // None/"auto" keep the parent model.
+        (SubagentKind::DocHelp, _) => match config.subagents.doc_help_model.as_deref() {
+            Some("cheap") => cheap_model_for(provider, config).unwrap_or(parent_model),
+            Some(id) if id != "auto" => resolve_model_alias_owned(provider, id.to_string()),
+            _ => parent_model,
+        },
         (_, RoleModelPolicy::Parent) => parent_model,
         (_, RoleModelPolicy::Cheap) => cheap_model_for(provider, config).unwrap_or(parent_model),
     }
@@ -365,9 +371,12 @@ Reviewer (`Cheap`, `roles.rs:125`) and Explorer (`Cheap`,
 `roles.rs:103`) drop to the provider's cheap tier when one is
 configured or curated. Planner stays on the parent model (`Parent`, `roles.rs:114`)
 because planning quality suffers under cheap-tier. `Delegate` has no
-role overlay and keeps the parent model; `DocHelp` uses the provider's cheap
-tier when available and falls back to the parent model, with a separate output
-budget floor so the user-visible answer can still be complete. There is no
+role overlay and keeps the parent model; `DocHelp` is user-facing (it backs
+`/help`), so it defaults to the configured main/parent model for parent-grade
+answers, with a separate output budget floor so the user-visible answer can
+still be complete. Operators who want to trade quality for cost can set
+`subagents.doc_help_model` (or `SQUEEZY_DOC_HELP_MODEL`) to `"cheap"` for the
+provider's small-fast tier, or to an explicit model id. There is no
 "global cheap-model fast path" — cheap-tier fires only for the kinds
 whose role catalog or subagent kind asks for it, and only when a cheap model
 resolves (`cheap_model_for`, `lib.rs:8578-8589`). A child's

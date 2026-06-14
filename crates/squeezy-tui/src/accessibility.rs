@@ -994,6 +994,12 @@ pub(crate) fn keyboard_equivalent(action: interaction::Action) -> Option<Keyboar
         A::SmartSplitAdjustField(_) => {
             KeyboardPath::Always("smart split \u{2191}\u{2193}/\u{2190}\u{2192} keys")
         }
+        // Actionable help command link (ITEM 3) — a click on a `squeezy:cmd:` span
+        // prefills the composer with that command. The keyboard twin is simply
+        // typing the command into the composer (it is shown verbatim in the
+        // answer), which reaches the same place; the click is a discoverability
+        // shortcut, not a unique capability. Reachable without a mouse.
+        A::PrefillCommand(_) => KeyboardPath::Always("type the command in the composer"),
     })
 }
 

@@ -6569,6 +6569,8 @@ pub struct SubagentSettings {
     pub max_runtime_secs: Option<u64>,
     pub include_transcript: Option<bool>,
     pub help_strict_local: Option<bool>,
+    pub doc_help_model: Option<String>,
+    pub help_web_fallback: Option<bool>,
 }
 
 impl SubagentSettings {
@@ -6588,6 +6590,8 @@ impl SubagentSettings {
                 "max_runtime_secs",
                 "include_transcript",
                 "help_strict_local",
+                "doc_help_model",
+                "help_web_fallback",
             ],
             source,
             path,
@@ -6660,6 +6664,18 @@ impl SubagentSettings {
                 source,
                 &field(path, "help_strict_local"),
             )?,
+            doc_help_model: string_value(
+                table,
+                "doc_help_model",
+                source,
+                &field(path, "doc_help_model"),
+            )?,
+            help_web_fallback: bool_value(
+                table,
+                "help_web_fallback",
+                source,
+                &field(path, "help_web_fallback"),
+            )?,
         })
     }
 
@@ -6685,6 +6701,8 @@ impl SubagentSettings {
         replace_if_some(&mut self.max_runtime_secs, next.max_runtime_secs);
         replace_if_some(&mut self.include_transcript, next.include_transcript);
         replace_if_some(&mut self.help_strict_local, next.help_strict_local);
+        replace_if_some(&mut self.doc_help_model, next.doc_help_model);
+        replace_if_some(&mut self.help_web_fallback, next.help_web_fallback);
     }
 }
 
@@ -6716,6 +6734,20 @@ pub struct SubagentConfig {
     /// `subagents.enabled = true`).
     #[serde(default)]
     pub help_strict_local: bool,
+    /// Model the user-facing `/help` DocHelp subagent runs on. `None` or the
+    /// literal `"auto"` use the session's configured main/parent model
+    /// (`AppConfig::model`); `"cheap"` uses the provider's small-fast/cheap
+    /// tier; any other value is treated as an explicit model id (resolved
+    /// through the provider's alias table). Defaults to `None` so `/help`
+    /// answers at parent-model quality unless the operator opts down.
+    #[serde(default)]
+    pub doc_help_model: Option<String>,
+    /// Default-off opt-in that lets `/help` escalate to a version-pinned
+    /// GitHub docs fetch when the curated local docs miss. Adds a network
+    /// fetch plus an extra model pass, so it stays disabled unless explicitly
+    /// enabled. Defaults to `false`.
+    #[serde(default)]
+    pub help_web_fallback: bool,
 }
 
 impl SubagentConfig {
@@ -6788,6 +6820,13 @@ impl SubagentConfig {
                 .as_deref()
                 .map(parse_enabled_bool)
                 .unwrap_or(settings.help_strict_local.unwrap_or(false)),
+            doc_help_model: get_var("SQUEEZY_DOC_HELP_MODEL")
+                .or(settings.doc_help_model)
+                .filter(|value| !value.trim().is_empty()),
+            help_web_fallback: get_var("SQUEEZY_HELP_WEB_FALLBACK")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.help_web_fallback.unwrap_or(false)),
         }
     }
 }
@@ -6807,6 +6846,8 @@ impl Default for SubagentConfig {
             max_runtime_secs: None,
             include_transcript: false,
             help_strict_local: false,
+            doc_help_model: None,
+            help_web_fallback: false,
         }
     }
 }

@@ -1420,6 +1420,27 @@ impl TelemetryEvent {
         }
     }
 
+    /// `help_answer_rated{topic, source, rating, version}` — the user's
+    /// thumbs-up / thumbs-down on the most recent `/help` answer. Anonymous by
+    /// construction: only the curated topic id, the answer source, the rating
+    /// direction, and the squeezy crate version are recorded — never the prompt
+    /// or the answer body. The version is taken from the telemetry crate's
+    /// `CARGO_PKG_VERSION` (the same value stamped on every outgoing batch).
+    pub fn help_answer_rated(report: HelpAnswerRatedReport<'_>) -> Self {
+        Self {
+            event: TelemetryEventName::HelpAnswerRated,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                help_topic: Some(help_topic_token(report.topic)),
+                help_source: Some(report.source.token().to_string()),
+                help_rating: Some(report.rating.token().to_string()),
+                squeezy_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
+
     pub fn failure_seen(kind: ErrorKind) -> Self {
         Self {
             event: TelemetryEventName::FailureSeen,
@@ -1816,6 +1837,13 @@ pub enum TelemetryEventName {
     SlashCommandUsed,
     #[serde(rename = "squeezy_config_change_committed")]
     ConfigChangeCommitted,
+    /// `help_answer_rated{topic, source, rating}` — emitted when the user gives
+    /// the most recent `/help` answer a thumbs-up / thumbs-down. Anonymous:
+    /// carries only the curated topic id, the answer source, the rating
+    /// direction, and the squeezy version — never the prompt or answer text.
+    /// Aggregated counts tell maintainers which help topics underperform.
+    #[serde(rename = "squeezy_help_answer_rated")]
+    HelpAnswerRated,
     #[serde(rename = "squeezy_failure_seen")]
     FailureSeen,
     /// `approval.best_effort.fallback{tool=shell}` — emitted every time
@@ -2068,6 +2096,23 @@ pub struct TelemetryProperties {
     pub config_prev_bucket: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_new_bucket: Option<String>,
+    /// Curated help-topic id rated by the user (e.g. `"providers"`, `"tui"`,
+    /// `"/theme"`). Set only on `HelpAnswerRated`. A stable, non-secret token —
+    /// never the user's prompt or the answer body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub help_topic: Option<String>,
+    /// How the rated help answer was produced (`local_curated` /
+    /// `doc_help_model`). Set only on `HelpAnswerRated`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub help_source: Option<String>,
+    /// The rating direction (`up` / `down`). Set only on `HelpAnswerRated`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub help_rating: Option<String>,
+    /// The squeezy binary version that produced the rated help answer, so
+    /// maintainers can scope weak-answer signals to the release they shipped.
+    /// Set only on `HelpAnswerRated`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub squeezy_version: Option<String>,
     /// Tagged on shell-sandbox events (e.g.
     /// `ShellSandboxBestEffortFallback`) so dashboards can break down by
     /// the OS backend that was attempted (`macos-sandbox-exec`,
@@ -2139,6 +2184,11 @@ pub struct TelemetryProperties {
     pub provider_error_counts: Option<BTreeMap<String, u64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason_counts: Option<BTreeMap<String, u64>>,
+    /// Per-`topic:rating` help-answer vote counts folded into the session
+    /// summary (e.g. `{"providers:down": 1}`). Keys are anonymous topic ids +
+    /// the up/down direction — never prompt or answer text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub help_rating_counts: Option<BTreeMap<String, u64>>,
     // --- new scalar/boolean fields ---
     /// `stop_reason` for this turn (safe token from StopReasonKind).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2294,6 +2344,8 @@ fn build_summary_from_events(
         capped_count_map(accumulator.provider_error_counts);
     let (stop_reason_counts, stop_reason_dropped) =
         capped_count_map(accumulator.stop_reason_counts);
+    let (help_rating_counts, help_rating_dropped) =
+        capped_count_map(accumulator.help_rating_counts);
     let dropped_buckets = tool_dropped
         + slash_dropped
         + failure_dropped
@@ -2308,7 +2360,8 @@ fn build_summary_from_events(
         + permission_dropped
         + retry_dropped
         + provider_error_dropped
-        + stop_reason_dropped;
+        + stop_reason_dropped
+        + help_rating_dropped;
     let truncated = dropped_buckets > 0;
     let tool_calls = accumulator.tool_calls.max(accumulator.turn_tool_calls);
     let files_scanned = accumulator
@@ -2386,6 +2439,7 @@ fn build_summary_from_events(
             retry_counts: non_empty_map(retry_counts),
             provider_error_counts: non_empty_map(provider_error_counts),
             stop_reason_counts: non_empty_map(stop_reason_counts),
+            help_rating_counts: non_empty_map(help_rating_counts),
             subagent_cap_rejections: if accumulator.subagent_cap_rejections > 0 {
                 Some(accumulator.subagent_cap_rejections)
             } else {
@@ -2493,6 +2547,7 @@ struct SummaryAccumulator {
     retry_counts: BTreeMap<String, u64>,
     provider_error_counts: BTreeMap<String, u64>,
     stop_reason_counts: BTreeMap<String, u64>,
+    help_rating_counts: BTreeMap<String, u64>,
     // new scalar accumulators
     subagent_cap_rejections: u64,
     cache_write_tokens: u64,
@@ -2638,6 +2693,15 @@ impl SummaryAccumulator {
                 self.config_change_count = self.config_change_count.saturating_add(1);
                 if let Some(field) = props.config_field.as_ref() {
                     increment_count(&mut self.config_counts, field.clone());
+                }
+            }
+            TelemetryEventName::HelpAnswerRated => {
+                // Aggregate per `topic:rating` so the session summary shows how
+                // many up/down votes each curated topic got, never any text.
+                if let (Some(topic), Some(rating)) =
+                    (props.help_topic.as_ref(), props.help_rating.as_ref())
+                {
+                    increment_count(&mut self.help_rating_counts, format!("{topic}:{rating}"));
                 }
             }
             TelemetryEventName::FailureSeen => {
@@ -2960,6 +3024,58 @@ pub struct ConfigChangeReport<'a> {
     pub change_kind: ConfigChangeKind,
     pub prev_bucket: &'a str,
     pub new_bucket: &'a str,
+}
+
+/// A user thumbs-up / thumbs-down rating of the most recent `/help` answer.
+///
+/// Anonymous by construction: it names the curated topic id, how the answer was
+/// produced (`HelpAnswerSourceKind`), and the rating direction — never any
+/// prompt or answer text. Aggregated over the fleet it tells maintainers which
+/// help topics consistently disappoint so the curated summaries can be improved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HelpRatingKind {
+    Up,
+    Down,
+}
+
+impl HelpRatingKind {
+    fn token(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+        }
+    }
+}
+
+/// How the rated help answer was produced. A telemetry-local mirror of
+/// `squeezy_skills::HelpAnswerSource` so the telemetry crate stays free of a
+/// dependency on the skills crate. The wire tokens (`local_curated` /
+/// `doc_help_model`) match the skills enum's `snake_case` serialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HelpAnswerSourceKind {
+    LocalCurated,
+    DocHelpModel,
+}
+
+impl HelpAnswerSourceKind {
+    fn token(self) -> &'static str {
+        match self {
+            Self::LocalCurated => "local_curated",
+            Self::DocHelpModel => "doc_help_model",
+        }
+    }
+}
+
+/// Dimensions for a [`TelemetryEvent::help_answer_rated`] event. `topic` is the
+/// curated help topic id (e.g. `"providers"`, `"tui"`, `"/theme"`) — a stable,
+/// non-secret identifier, never the user's prompt or the answer body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelpAnswerRatedReport<'a> {
+    pub topic: &'a str,
+    pub source: HelpAnswerSourceKind,
+    pub rating: HelpRatingKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3355,6 +3471,33 @@ fn slash_command_token(value: &str) -> String {
     let trimmed = value.trim().trim_start_matches('/');
     for ch in trimmed.chars().flat_map(char::to_lowercase) {
         if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            token.push(ch);
+        } else {
+            return "unknown".to_string();
+        }
+        if token.len() >= 80 {
+            break;
+        }
+    }
+    if token.is_empty() {
+        "unknown".to_string()
+    } else {
+        token
+    }
+}
+
+/// Sanitize a curated help-topic id into a safe telemetry token. Curated topic
+/// ids are already simple (`providers`, `tui`, `/theme`), but a defensive pass
+/// keeps the field anonymous even if a future caller passes raw user text: only
+/// `[a-z0-9-_/]` survive, anything else collapses the token to `"unknown"`, and
+/// the result is length-capped. Mirrors [`slash_command_token`], but keeps a
+/// leading `/` so slash-command help topics (`/theme`) stay distinguishable
+/// from plain topics (`theme`).
+fn help_topic_token(value: &str) -> String {
+    let mut token = String::new();
+    let trimmed = value.trim();
+    for ch in trimmed.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/') {
             token.push(ch);
         } else {
             return "unknown".to_string();
