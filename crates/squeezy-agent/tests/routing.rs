@@ -574,6 +574,74 @@ async fn cheap_provider_error_retries_once_on_parent() {
 }
 
 #[tokio::test]
+async fn cache_isolation_subagent_runs_the_cheap_turn_in_a_subagent() {
+    // With cache_isolation=Subagent, a cheap-routed turn's work runs in a scoped
+    // subagent on the cheap model (its own cache namespace) while the main loop
+    // stays pinned to the parent — so the only provider request is the
+    // subagent's, on the cheap model, and the turn completes from its summary.
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply(
+        "done in subagent",
+    )]));
+    let mut config = config_with_routing();
+    config.routing.cache_isolation = squeezy_core::CacheIsolation::Subagent;
+    let agent = Agent::new(config, provider.clone());
+    let events = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the work runs once, in the subagent — the main loop never dispatches the parent"
+    );
+    assert_eq!(
+        &*requests[0].model, CHEAP_MODEL,
+        "the routed subagent runs the cheap model"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnRouted { to, reason, .. }
+                if reason == "routed_subagent" && to == CHEAP_MODEL
+        )),
+        "isolation must emit a routed_subagent event"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Completed { .. })),
+        "the turn completes from the subagent's summary"
+    );
+}
+
+#[tokio::test]
+async fn cache_isolation_switch_keeps_the_cheap_turn_in_loop() {
+    // cache_isolation=Switch is the classic path: the cheap turn runs on the
+    // main loop (no subagent), exactly as before.
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("done in loop")]));
+    let mut config = config_with_routing();
+    config.routing.cache_isolation = squeezy_core::CacheIsolation::Switch;
+    let agent = Agent::new(config, provider.clone());
+    let events = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(&*requests[0].model, CHEAP_MODEL, "in-loop cheap dispatch");
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnRouted { reason, .. } if reason == "routed_subagent"
+        )),
+        "switch mode must not isolate into a subagent"
+    );
+}
+
+#[tokio::test]
 async fn tier_effort_runs_weak_rung_at_low_effort() {
     // With tier_effort on (default) and no user pin, a weak-routed turn runs at
     // low reasoning effort — effort tracks the rung, not one global value.

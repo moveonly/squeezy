@@ -422,6 +422,7 @@ pub const PROVIDER_OPTIONS: &[&str] = &[
 pub const COMPACTION_STRATEGY_OPTIONS: &[&str] =
     &["extractive", "model_assisted", "layered_fallback"];
 pub const PROFILE_OPTIONS: &[&str] = &["cheap", "balanced", "strong"];
+pub const CACHE_ISOLATION_OPTIONS: &[&str] = &["switch", "subagent", "auto"];
 pub const REASONING_EFFORT_OPTIONS: &[&str] = &["low", "medium", "high", "xhigh"];
 pub const SESSION_MODE_OPTIONS: &[&str] = &["build", "plan"];
 pub const SESSION_RESUME_PICKER_OPTIONS: &[&str] = &["ask", "never"];
@@ -723,6 +724,40 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default: || FieldValue::Bool(crate::DEFAULT_ROUTING_LLM_JUDGE),
                 help: "For non-obvious turns, ask the judge model whether to route cheap. Global.",
                 env_override: Some("SQUEEZY_ROUTING_LLM_JUDGE"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "cache_isolation",
+                toml_path: &["routing", "cache_isolation"],
+                kind: FieldKind::Enum {
+                    options: CACHE_ISOLATION_OPTIONS,
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_routing_cache_isolation,
+                set: set_routing_cache_isolation,
+                default_display: "auto",
+                default: || FieldValue::Enum(crate::DEFAULT_ROUTING_CACHE_ISOLATION.as_str()),
+                help: "How a cheap-routed turn avoids cold-writing the parent's prompt cache. switch = swap the main loop's model (classic); subagent = run the cheap work in a scoped subagent so the main loop stays on the parent (cache warm); auto = subagent only when the prefix is large enough to pay for it.",
+                env_override: Some("SQUEEZY_ROUTING_CACHE_ISOLATION"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "auto_prefix_token_threshold",
+                toml_path: &["routing", "auto_prefix_token_threshold"],
+                kind: FieldKind::Integer {
+                    min: 0,
+                    max: 2_000_000,
+                    suffix: Some("tok"),
+                },
+                tier: ApplyTier::NextPrompt,
+                get: get_routing_auto_prefix_token_threshold,
+                set: set_routing_auto_prefix_token_threshold,
+                default_display: "8000 tok",
+                default: || {
+                    FieldValue::Integer(crate::DEFAULT_ROUTING_AUTO_PREFIX_TOKEN_THRESHOLD as i64)
+                },
+                help: "Prefix size (estimated tokens) above which `cache_isolation = auto` isolates a cheap turn into a subagent.",
+                env_override: Some("SQUEEZY_ROUTING_AUTO_PREFIX_TOKEN_THRESHOLD"),
                 secret: false,
             },
             FieldMeta {
@@ -3427,6 +3462,35 @@ fn set_routing_heuristic(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &
             Ok(())
         }
         _ => Err("expects bool"),
+    }
+}
+
+fn get_routing_cache_isolation(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.routing.cache_isolation.as_str())
+}
+fn set_routing_cache_isolation(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::Enum(s) | FieldValue::OptionalEnum(Some(s)) => s,
+        _ => return Err("expects enum"),
+    };
+    cfg.routing.cache_isolation =
+        crate::CacheIsolation::parse(s).ok_or("invalid cache_isolation")?;
+    Ok(())
+}
+fn get_routing_auto_prefix_token_threshold(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.routing.auto_prefix_token_threshold as i64)
+}
+fn set_routing_auto_prefix_token_threshold(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Integer(v) if v >= 0 => {
+            cfg.routing.auto_prefix_token_threshold = v as u64;
+            Ok(())
+        }
+        FieldValue::Integer(_) => Err("must be >= 0"),
+        _ => Err("expects integer"),
     }
 }
 

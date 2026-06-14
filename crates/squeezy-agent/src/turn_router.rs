@@ -27,7 +27,8 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use squeezy_core::{
-    AppConfig, CostSnapshot, ModelTier, ReasoningEffort, RoutingConfig, SessionMode, TierLadder,
+    AppConfig, CacheIsolation, CostSnapshot, ModelTier, ReasoningEffort, RoutingConfig,
+    SessionMode, TierLadder,
 };
 use squeezy_llm::{
     CacheRetention, CacheSpec, LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest,
@@ -590,6 +591,28 @@ impl ClassifyResult {
             judge_cost: CostSnapshot::default(),
             judge_model: None,
             judge_effort: None,
+        }
+    }
+}
+
+/// Whether a cheap-routed turn should run as a scoped cache-isolation subagent
+/// (keeping the main loop on the parent model so its prompt cache stays warm)
+/// instead of switching the main loop's model. `Switch` never isolates;
+/// `Subagent` always does; `Auto` isolates only when prompt caching is supported
+/// AND the assembled prefix already exceeds the configured token threshold — the
+/// regime where a switch-and-escalate cold cache rewrite would dominate the
+/// cheap savings. Below the threshold (or with no caching) the in-loop switch is
+/// cheaper, so `Auto` matches today's behavior.
+pub(crate) fn should_isolate(
+    cfg: &RoutingConfig,
+    prefix_tokens: u64,
+    caching_supported: bool,
+) -> bool {
+    match cfg.cache_isolation {
+        CacheIsolation::Switch => false,
+        CacheIsolation::Subagent => true,
+        CacheIsolation::Auto => {
+            caching_supported && prefix_tokens > cfg.auto_prefix_token_threshold
         }
     }
 }

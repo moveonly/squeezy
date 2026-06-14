@@ -710,8 +710,9 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
     {
         let m = &snapshot.metrics;
         out.push_str(&format!(
-            "  routing routed_turns={} escalated={} judge=${:.6}\n",
+            "  routing routed_turns={} isolated={} escalated={} judge=${:.6}\n",
             m.routed_to_cheap_turns,
+            m.routed_to_subagent_turns,
             m.escalated_to_parent_turns,
             m.routing_judge_usd_micros as f64 / 1_000_000.0,
         ));

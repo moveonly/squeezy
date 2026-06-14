@@ -678,6 +678,54 @@ pub const DEFAULT_ROUTING_HEURISTIC_MAX_CHARS: u32 = 2_000;
 /// mentioning Linux sandbox/container/kernel keywords to the parent model
 /// even when the heuristic or judge would choose cheap.
 pub const DEFAULT_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT: bool = true;
+/// Default for `[routing].cache_isolation`: `Auto` — isolate a cheap turn into a
+/// scoped subagent (so the main loop never switches model and its prompt cache
+/// stays warm) ONLY when the conversation prefix is large enough that a
+/// switch-and-escalate cold cache rewrite would erase the cheap savings;
+/// otherwise behave exactly like the classic in-loop switch.
+pub const DEFAULT_ROUTING_CACHE_ISOLATION: CacheIsolation = CacheIsolation::Auto;
+/// Default prefix size (estimated tokens) above which `Auto` cache-isolation
+/// kicks in. Below this the cold rewrite is cheap, so switching in-loop wins.
+pub const DEFAULT_ROUTING_AUTO_PREFIX_TOKEN_THRESHOLD: u64 = 8_000;
+
+/// How the router isolates a cheap-routed turn from the parent model's prompt
+/// cache. Prompt caches are per-`(model, prefix)`: switching the main loop to a
+/// cheap model and later escalating back forces a cold re-write of the grown
+/// prefix on the parent — which, on a large prefix, can cost more than the cheap
+/// savings. `Subagent` runs the cheap work in a scoped subagent (its own cache
+/// namespace) while the main loop stays pinned to the parent; `Switch` is the
+/// classic in-loop model swap; `Auto` picks `Subagent` only when the prefix is
+/// large enough (and caching is supported) to make isolation pay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheIsolation {
+    /// Classic behavior: swap the main loop's model to the cheap tier.
+    Switch,
+    /// Always run the cheap turn as a scoped subagent (main loop stays parent).
+    Subagent,
+    /// Isolate via subagent only when the prefix is large enough to pay for it.
+    #[default]
+    Auto,
+}
+
+impl CacheIsolation {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "switch" => Some(Self::Switch),
+            "subagent" => Some(Self::Subagent),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Switch => "switch",
+            Self::Subagent => "subagent",
+            Self::Auto => "auto",
+        }
+    }
+}
 /// Char-budget gate for the LLM judge. Prompts longer than this skip the
 /// judge call and route to `Parent` directly — long prompts almost
 /// always carry the kind of nuance the cheap tier struggles with, and a
@@ -2224,8 +2272,16 @@ impl AppConfig {
             ));
         }
         output.push_str(&format!(
-            "linux_sandbox_sensitive_parent = {}  # route Linux sandbox/container prompts to parent\n\n",
+            "linux_sandbox_sensitive_parent = {}  # route Linux sandbox/container prompts to parent\n",
             self.routing.linux_sandbox_sensitive_parent
+        ));
+        output.push_str(&format!(
+            "cache_isolation = {}  # switch | subagent | auto: run a cheap turn as a scoped subagent so the parent's prompt cache stays warm\n",
+            toml_string(self.routing.cache_isolation.as_str())
+        ));
+        output.push_str(&format!(
+            "auto_prefix_token_threshold = {}  # auto-isolate only when the prefix exceeds this many tokens\n\n",
+            self.routing.auto_prefix_token_threshold
         ));
 
         output.push_str("[permissions]\n");
@@ -5349,6 +5405,11 @@ pub struct RoutingConfig {
     /// OS. The name reflects where the keywords originate, not where the
     /// guard activates.
     pub linux_sandbox_sensitive_parent: bool,
+    /// How a cheap-routed turn is isolated from the parent model's prompt cache.
+    /// See [`CacheIsolation`]; default [`CacheIsolation::Auto`].
+    pub cache_isolation: CacheIsolation,
+    /// Estimated-prefix-token threshold above which `Auto` isolation engages.
+    pub auto_prefix_token_threshold: u64,
     /// When `true` (default), a routed turn runs at the reasoning effort its
     /// rung warrants (`ModelTier::default_effort`, overridable per tier below)
     /// instead of one global effort for every rung. Reasoning effort is a cost
@@ -5468,6 +5529,16 @@ impl RoutingConfig {
                     .linux_sandbox_sensitive_parent
                     .unwrap_or(DEFAULT_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT),
             ),
+            cache_isolation: get_var("SQUEEZY_ROUTING_CACHE_ISOLATION")
+                .as_deref()
+                .and_then(CacheIsolation::parse)
+                .or(settings.cache_isolation)
+                .unwrap_or(DEFAULT_ROUTING_CACHE_ISOLATION),
+            auto_prefix_token_threshold: get_var("SQUEEZY_ROUTING_AUTO_PREFIX_TOKEN_THRESHOLD")
+                .as_deref()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .or(settings.auto_prefix_token_threshold)
+                .unwrap_or(DEFAULT_ROUTING_AUTO_PREFIX_TOKEN_THRESHOLD),
             tier_effort: get_var("SQUEEZY_ROUTING_TIER_EFFORT")
                 .as_deref()
                 .map(parse_enabled_bool)
@@ -5527,6 +5598,8 @@ pub struct RoutingSettings {
     pub judge_model: Option<String>,
     pub extra_heuristic_verbs: Option<Vec<String>>,
     pub linux_sandbox_sensitive_parent: Option<bool>,
+    pub cache_isolation: Option<CacheIsolation>,
+    pub auto_prefix_token_threshold: Option<u64>,
     pub tier_effort: Option<bool>,
     pub effort_weak: Option<ReasoningEffort>,
     pub effort_medium: Option<ReasoningEffort>,
@@ -5555,6 +5628,8 @@ impl RoutingSettings {
                 "judge_model",
                 "extra_heuristic_verbs",
                 "linux_sandbox_sensitive_parent",
+                "cache_isolation",
+                "auto_prefix_token_threshold",
                 "tier_effort",
                 "effort_weak",
                 "effort_medium",
@@ -5641,6 +5716,26 @@ impl RoutingSettings {
                 source,
                 &field(path, "linux_sandbox_sensitive_parent"),
             )?,
+            cache_isolation: match string_value(
+                table,
+                "cache_isolation",
+                source,
+                &field(path, "cache_isolation"),
+            )? {
+                Some(value) => Some(CacheIsolation::parse(&value).ok_or_else(|| {
+                    SqueezyError::Config(format!(
+                        "{source}: {}: invalid cache_isolation {value:?}; expected switch, subagent, or auto",
+                        field(path, "cache_isolation")
+                    ))
+                })?),
+                None => None,
+            },
+            auto_prefix_token_threshold: u64_value(
+                table,
+                "auto_prefix_token_threshold",
+                source,
+                &field(path, "auto_prefix_token_threshold"),
+            )?,
             tier_effort: bool_value(table, "tier_effort", source, &field(path, "tier_effort"))?,
             effort_weak: reasoning_effort_value(
                 table,
@@ -5695,6 +5790,11 @@ impl RoutingSettings {
         replace_if_some(
             &mut self.linux_sandbox_sensitive_parent,
             next.linux_sandbox_sensitive_parent,
+        );
+        replace_if_some(&mut self.cache_isolation, next.cache_isolation);
+        replace_if_some(
+            &mut self.auto_prefix_token_threshold,
+            next.auto_prefix_token_threshold,
         );
         replace_if_some(&mut self.tier_effort, next.tier_effort);
         replace_if_some(&mut self.effort_weak, next.effort_weak);
@@ -14818,6 +14918,10 @@ pub struct SessionMetrics {
     /// parent model.
     #[serde(default)]
     pub routed_to_cheap_turns: u64,
+    /// Number of turns whose cheap work ran in a scoped subagent (cache
+    /// isolation) rather than switching the main loop's model.
+    #[serde(default)]
+    pub routed_to_subagent_turns: u64,
     /// Number of cheap-routed turns that escalated back to the parent
     /// model mid-turn.
     #[serde(default)]
@@ -14875,6 +14979,9 @@ impl SessionMetrics {
             .saturating_add(turn.routing_judge_usd_micros);
         if turn.routed_to_cheap {
             self.routed_to_cheap_turns = self.routed_to_cheap_turns.saturating_add(1);
+        }
+        if turn.routed_to_subagent {
+            self.routed_to_subagent_turns = self.routed_to_subagent_turns.saturating_add(1);
         }
         if turn.escalated_to_parent {
             self.escalated_to_parent_turns = self.escalated_to_parent_turns.saturating_add(1);
@@ -14941,6 +15048,10 @@ pub struct TurnMetrics {
     /// tier rather than the user's configured parent model.
     #[serde(default)]
     pub routed_to_cheap: bool,
+    /// True when the turn's cheap work ran in a scoped subagent (cache
+    /// isolation) while the main loop stayed pinned to the parent model.
+    #[serde(default)]
+    pub routed_to_subagent: bool,
     /// True when a cheap-routed turn ran into an escalation signal and
     /// switched back to the parent model mid-turn.
     #[serde(default)]

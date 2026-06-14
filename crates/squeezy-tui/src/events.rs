@@ -643,6 +643,10 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         format!("↑ escalated `{from}` → `{to}` ({signal}{effort_note})")
                     } else if reason == "reroute_skipped_context" {
                         format!("↳ kept on `{to}` (context too large to reroute)")
+                    } else if reason == "routed_subagent" {
+                        // The cheap work ran in a scoped subagent so the parent's
+                        // prompt cache stayed warm (cache isolation).
+                        format!("⇄ isolated `{to}` subagent (cache-safe)")
                     } else {
                         format!("↓ rerouted `{from}` → `{to}` ({reason}{effort_note})")
                     };

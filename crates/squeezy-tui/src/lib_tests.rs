@@ -6434,7 +6434,7 @@ fn format_context_command_renders_routing_savings_meter() {
 
     let output = strip_ansi_escape_sequences(&commands::format_context_command(&snapshot));
     assert!(
-        output.contains("routing routed_turns=3 escalated=1"),
+        output.contains("routing routed_turns=3 isolated=0 escalated=1"),
         "{output}"
     );
     assert!(
