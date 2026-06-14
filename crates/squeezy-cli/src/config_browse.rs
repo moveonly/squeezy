@@ -20,7 +20,7 @@ use squeezy_core::{AppConfig, Result, SqueezyError};
 use squeezy_skills::{PromptTemplate, PromptTemplateCatalog, SkillCatalog, SkillSummary};
 use squeezy_store::{SessionMetadata, SessionQuery, SessionStore};
 
-use crate::ConfigBrowseArgs;
+use crate::config::ConfigBrowseArgs;
 use crate::providers::{ProviderEntry, registry_entries};
 
 /// Maximum number of sessions surfaced inline in the browse output.

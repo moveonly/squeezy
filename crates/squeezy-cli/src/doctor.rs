@@ -10,7 +10,8 @@ use clap::{Args, ValueEnum};
 use serde_json::json;
 use squeezy_core::{
     AppConfig, McpServerConfig, McpTransport, OllamaConfig, ProviderConfig, ProviderSettings,
-    Result, SettingsFile, SqueezyError, default_prompt_history_path, default_settings_path,
+    Result, SettingsFile, SqueezyError, canonical_provider_name, default_prompt_history_path,
+    default_settings_path,
 };
 use squeezy_llm::{
     KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
@@ -449,11 +450,10 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         }
     }
 
-    if should_include_check(args, "terminal") {
-        checks.push(terminal_capability_check());
-    }
-    if should_include_check(args, "parser_health") {
-        checks.push(parser_health_check());
+    for check in LOCAL_DOCTOR_CHECKS {
+        if should_include_check(args, check.name) {
+            checks.push((check.run)());
+        }
     }
     if should_include_check(args, "sandbox") {
         checks.push(sandbox_check(config.as_ref()));
@@ -580,6 +580,22 @@ fn needs_config(args: &DoctorArgs) -> bool {
         )
     })
 }
+
+struct DoctorCheckSpec {
+    name: &'static str,
+    run: fn() -> Check,
+}
+
+const LOCAL_DOCTOR_CHECKS: &[DoctorCheckSpec] = &[
+    DoctorCheckSpec {
+        name: "terminal",
+        run: terminal_capability_check,
+    },
+    DoctorCheckSpec {
+        name: "parser_health",
+        run: parser_health_check,
+    },
+];
 
 fn exit_code_for_checks(checks: &[Check]) -> i32 {
     let (_, failures) = check_counts(checks);
@@ -1610,7 +1626,9 @@ fn providers_check(settings: &SettingsFile) -> Check {
 }
 
 fn provider_settings_state(name: &str, settings: &ProviderSettings) -> &'static str {
-    if matches!(name, "bedrock" | "ollama") {
+    if canonical_provider_name(name)
+        .is_some_and(|canonical| matches!(canonical, "bedrock" | "ollama"))
+    {
         return "keyless";
     }
     if settings

@@ -7,7 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
 use squeezy_core::{
-    OpenAiCompatiblePreset, SeparatedSources, SqueezyError, load_separated_settings_sources,
+    ProviderAuthMeta, SeparatedSources, SqueezyError, load_separated_settings_sources,
+    provider_auth_for_section, provider_auth_metadata, provider_section_for_cli,
     settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits},
 };
 use squeezy_llm::{
@@ -20,169 +21,9 @@ use squeezy_llm::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// Every `[providers.<section>]` name that can carry an inline `api_key`,
-/// paired with the CLI alias used in error messages. Order is the
-/// canonical listing for `auth list` / `auth status` without a provider.
-const KNOWN_PROVIDERS: &[KnownProvider] = &[
-    KnownProvider {
-        section: "openai",
-        cli: "openai",
-        env: "SQUEEZY_OPENAI_KEY",
-        fallback_env: Some("OPENAI_API_KEY"),
-    },
-    KnownProvider {
-        section: "anthropic",
-        cli: "anthropic",
-        env: "SQUEEZY_ANTHROPIC_KEY",
-        fallback_env: Some("ANTHROPIC_API_KEY"),
-    },
-    KnownProvider {
-        section: "google",
-        cli: "google",
-        env: "SQUEEZY_GOOGLE_KEY",
-        fallback_env: Some("GOOGLE_API_KEY"),
-    },
-    KnownProvider {
-        section: "azure_openai",
-        cli: "azure",
-        env: "SQUEEZY_AZURE_OPENAI_KEY",
-        fallback_env: Some("AZURE_OPENAI_API_KEY"),
-    },
-    KnownProvider {
-        section: "openrouter",
-        cli: "openrouter",
-        env: "SQUEEZY_OPENROUTER_KEY",
-        fallback_env: Some("OPENROUTER_API_KEY"),
-    },
-    KnownProvider {
-        section: "vercel",
-        cli: "vercel",
-        env: "SQUEEZY_VERCEL_KEY",
-        fallback_env: Some("AI_GATEWAY_API_KEY"),
-    },
-    KnownProvider {
-        section: "portkey",
-        cli: "portkey",
-        env: "SQUEEZY_PORTKEY_KEY",
-        fallback_env: Some("PORTKEY_API_KEY"),
-    },
-    KnownProvider {
-        section: "groq",
-        cli: "groq",
-        env: "SQUEEZY_GROQ_KEY",
-        fallback_env: Some("GROQ_API_KEY"),
-    },
-    KnownProvider {
-        section: "xai",
-        cli: "xai",
-        env: "SQUEEZY_XAI_KEY",
-        fallback_env: Some("XAI_API_KEY"),
-    },
-    KnownProvider {
-        section: "deepseek",
-        cli: "deepseek",
-        env: "SQUEEZY_DEEPSEEK_KEY",
-        fallback_env: Some("DEEPSEEK_API_KEY"),
-    },
-    KnownProvider {
-        section: "vertex",
-        cli: "vertex",
-        env: "SQUEEZY_VERTEX_KEY",
-        fallback_env: Some("VERTEX_ACCESS_TOKEN"),
-    },
-    KnownProvider {
-        section: "mistral",
-        cli: "mistral",
-        env: "SQUEEZY_MISTRAL_KEY",
-        fallback_env: Some("MISTRAL_API_KEY"),
-    },
-    KnownProvider {
-        section: "together",
-        cli: "together",
-        env: "SQUEEZY_TOGETHER_KEY",
-        fallback_env: Some("TOGETHER_API_KEY"),
-    },
-    KnownProvider {
-        section: "fireworks",
-        cli: "fireworks",
-        env: "SQUEEZY_FIREWORKS_KEY",
-        fallback_env: Some("FIREWORKS_API_KEY"),
-    },
-    KnownProvider {
-        section: "cerebras",
-        cli: "cerebras",
-        env: "SQUEEZY_CEREBRAS_KEY",
-        fallback_env: Some("CEREBRAS_API_KEY"),
-    },
-    // Match the core runtime resolver, which treats `DEEPINFRA_API_KEY` as the
-    // canonical primary (`default_api_key_env`) and `DEEPINFRA_TOKEN` as the
-    // alias consulted only when the primary is empty
-    // (`preset_api_key_env_aliases`). Keeping the CLI status table in the same
-    // order avoids `squeezy auth status` reporting a different effective
-    // credential than the one a request actually authenticates with.
-    KnownProvider {
-        section: "deepinfra",
-        cli: "deepinfra",
-        env: "DEEPINFRA_API_KEY",
-        fallback_env: Some("DEEPINFRA_TOKEN"),
-    },
-    // Baseten's autoload env (`default_api_key_env`) is `BASETEN_API_KEY` with
-    // no documented alias (`preset_api_key_env_aliases` is empty), so mirror
-    // the runtime primary directly and leave the fallback slot unset.
-    KnownProvider {
-        section: "baseten",
-        cli: "baseten",
-        env: "BASETEN_API_KEY",
-        fallback_env: None,
-    },
-    // Local self-hosted OpenAI-compatible servers. They typically run without
-    // authentication on a loopback port; the inline-key slot exists so users
-    // can stand up a reverse proxy that requires a bearer token.
-    KnownProvider {
-        section: "lmstudio",
-        cli: "lmstudio",
-        env: "SQUEEZY_LMSTUDIO_KEY",
-        fallback_env: Some("LMSTUDIO_API_KEY"),
-    },
-    KnownProvider {
-        section: "vllm",
-        cli: "vllm",
-        env: "SQUEEZY_VLLM_KEY",
-        fallback_env: Some("VLLM_API_KEY"),
-    },
-    KnownProvider {
-        section: "llamacpp",
-        cli: "llamacpp",
-        env: "SQUEEZY_LLAMACPP_KEY",
-        fallback_env: Some("LLAMACPP_API_KEY"),
-    },
-    KnownProvider {
-        section: "cloudflare_workers_ai",
-        cli: "cloudflare_workers_ai",
-        env: "SQUEEZY_CLOUDFLARE_WORKERS_AI_KEY",
-        fallback_env: Some("CLOUDFLARE_API_KEY"),
-    },
-    KnownProvider {
-        section: "cloudflare_ai_gateway",
-        cli: "cloudflare_ai_gateway",
-        env: "SQUEEZY_CLOUDFLARE_AI_GATEWAY_KEY",
-        fallback_env: Some("CLOUDFLARE_API_KEY"),
-    },
-    KnownProvider {
-        section: "openai_compatible",
-        cli: "openai_compatible",
-        env: "SQUEEZY_OPENAI_COMPATIBLE_KEY",
-        fallback_env: None,
-    },
-];
-
-#[derive(Debug, Clone, Copy)]
-struct KnownProvider {
-    section: &'static str,
-    cli: &'static str,
-    env: &'static str,
-    fallback_env: Option<&'static str>,
-}
+#[cfg(test)]
+static KNOWN_PROVIDERS: std::sync::LazyLock<Vec<ProviderAuthMeta>> =
+    std::sync::LazyLock::new(provider_auth_metadata);
 
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
@@ -871,35 +712,7 @@ fn read_api_key_from_stdin() -> squeezy_core::Result<String> {
 /// section name. Bedrock and Ollama have no single inline key — we surface
 /// that as an actionable error instead of writing nothing.
 pub(crate) fn provider_section_for(provider: &str) -> squeezy_core::Result<&'static str> {
-    match provider {
-        "openai" => Ok("openai"),
-        "anthropic" | "claude" => Ok("anthropic"),
-        "google" | "gemini" => Ok("google"),
-        "azure" | "azure-openai" | "azure_openai" => Ok("azure_openai"),
-        "bedrock" => Err(SqueezyError::Config(
-            "bedrock uses the AWS default credential chain; configure credentials with aws configure"
-                .to_string(),
-        )),
-        "ollama" | "local" => Err(SqueezyError::Config(
-            "ollama runs locally and does not require an API key".to_string(),
-        )),
-        // OpenAI-compatible presets reuse the same name as both the CLI
-        // provider id and the TOML section, so pass them through.
-        other => Ok(static_section_name(other)),
-    }
-}
-
-fn static_section_name(provider: &str) -> &'static str {
-    // Drive the section name straight from the registry so the CLI list can
-    // never drift from the providers the core resolver actually consumes:
-    // `OpenAiCompatiblePreset::as_str()` is the canonical `[providers.<section>]`
-    // name (e.g. "cloudflare_workers_ai", "cloudflare_ai_gateway", "baseten"),
-    // and `parse` also accepts the same aliases as the runtime. Fail closed to
-    // an empty string for genuinely unknown ids so the callers' empty-section
-    // guards keep rejecting them.
-    OpenAiCompatiblePreset::parse(provider)
-        .map(|preset| preset.as_str())
-        .unwrap_or("")
+    provider_section_for_cli(provider)
 }
 
 pub(crate) fn handle_auth_set(
@@ -1048,21 +861,16 @@ pub(crate) fn handle_auth_status_with_env(
                     provider
                 )));
             }
-            let known = KNOWN_PROVIDERS
-                .iter()
-                .find(|p| p.section == section)
-                .copied()
-                .ok_or_else(|| {
-                    SqueezyError::Config(format!(
-                        "no status view for provider {}; unknown section {}",
-                        provider, section
-                    ))
-                })?;
+            let known = provider_auth_for_section(section).ok_or_else(|| {
+                SqueezyError::Config(format!(
+                    "no status view for provider {}; unknown section {}",
+                    provider, section
+                ))
+            })?;
             vec![compute_status_row(known, sources, env_lookup)]
         }
-        None => KNOWN_PROVIDERS
-            .iter()
-            .copied()
+        None => provider_auth_metadata()
+            .into_iter()
             .map(|p| compute_status_row(p, sources, env_lookup))
             .collect(),
     };
@@ -1307,7 +1115,7 @@ impl StatusRow {
 }
 
 fn compute_status_row(
-    provider: KnownProvider,
+    provider: ProviderAuthMeta,
     sources: &SeparatedSources,
     env_lookup: &dyn Fn(&str) -> Option<String>,
 ) -> StatusRow {
