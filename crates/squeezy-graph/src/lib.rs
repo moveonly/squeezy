@@ -807,6 +807,37 @@ impl SemanticGraph {
         &self.kotlin_project_facts
     }
 
+    /// Collect the Java / .NET / Kotlin project facts that apply to `file_id`
+    /// as `(label, detail)` string pairs for agent display.
+    ///
+    /// A fact applies to the file when the build manifest that produced it
+    /// (`source_file`, e.g. `pom.xml` / `*.csproj` / `build.gradle.kts`) lives
+    /// in a directory that is an ancestor of — or the same directory as — the
+    /// file. That is the standard "nearest project root" containment: a
+    /// `module-a/pom.xml` fact applies to `module-a/src/Foo.java` but not to a
+    /// sibling `module-b/...`. The label is `"{provider}:{kind}"` (e.g.
+    /// `maven:dependency`) and the detail is the fact's value. Returns an empty
+    /// `Vec` when no project fact covers the file.
+    pub fn language_facts_for_file(&self, file_id: &FileId) -> Vec<(String, String)> {
+        let mut facts = Vec::new();
+        for fact in &self.java_project_facts {
+            if file_in_project_of(&fact.source_file, file_id) {
+                facts.push((format!("{}:{}", fact.provider, fact.kind), fact.value.clone()));
+            }
+        }
+        for fact in &self.dotnet_project_facts {
+            if file_in_project_of(&fact.source_file, file_id) {
+                facts.push((format!("{}:{}", fact.provider, fact.kind), fact.value.clone()));
+            }
+        }
+        for fact in &self.kotlin_project_facts {
+            if file_in_project_of(&fact.source_file, file_id) {
+                facts.push((format!("{}:{}", fact.provider, fact.kind), fact.value.clone()));
+            }
+        }
+        facts
+    }
+
     pub fn cargo_facts(&self) -> Option<&CargoCompilerFacts> {
         self.cargo_facts.as_ref()
     }
@@ -4134,6 +4165,26 @@ fn span_line_height(span: &SourceSpan) -> u32 {
 /// malformed span where `end_byte < start_byte`.
 fn span_byte_width(span: &SourceSpan) -> u32 {
     span.end_byte.saturating_sub(span.start_byte)
+}
+
+/// True when `file` lives in (or below) the project directory rooted at the
+/// build manifest `manifest`. Both ids are slash-normalized relative paths, so
+/// the manifest's directory is its path with the final `/<basename>` stripped;
+/// the file belongs to the project when that directory is `""` (repo-root
+/// manifest, applies to everything) or a `dir/`-bounded prefix of the file's
+/// path. The `dir/` boundary stops `module-a` from matching `module-ab/...`.
+fn file_in_project_of(manifest: &FileId, file: &FileId) -> bool {
+    let manifest_dir = match manifest.0.rsplit_once('/') {
+        Some((dir, _)) => dir,
+        None => "",
+    };
+    if manifest_dir.is_empty() {
+        return true;
+    }
+    let file_path = file.0.as_str();
+    file_path
+        .strip_prefix(manifest_dir)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// True when a symbol carries an override-style or abstract modifier. The
