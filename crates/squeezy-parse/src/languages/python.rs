@@ -145,12 +145,15 @@ pub(crate) fn extract_python_import(
     owner_id: Option<SymbolId>,
 ) {
     let raw = node_text(node, ctx.source).unwrap_or_default().trim();
-    let imports = if let Some(rest) = raw.strip_prefix("from ") {
-        python_from_imports(rest, &ctx.file.relative_path)
+    // `import os` / `import os.path` binds the whole module namespace, whereas
+    // `from m import foo` binds a named member. Track which form produced each
+    // tuple so the binding shape can be classified as Namespace vs Named.
+    let (imports, is_plain_module_import) = if let Some(rest) = raw.strip_prefix("from ") {
+        (python_from_imports(rest, &ctx.file.relative_path), false)
     } else if let Some(rest) = raw.strip_prefix("import ") {
-        python_plain_imports(rest)
+        (python_plain_imports(rest), true)
     } else {
-        Vec::new()
+        (Vec::new(), false)
     };
 
     for (path, alias, is_glob) in imports {
@@ -158,6 +161,14 @@ pub(crate) fn extract_python_import(
             None
         } else {
             Some(last_path_segment(&path))
+        };
+        let kind = if is_glob {
+            ImportKind::Wildcard
+        } else if is_plain_module_import {
+            // `import os` / `import os.path [as p]` binds the module namespace.
+            ImportKind::Namespace
+        } else {
+            ImportKind::Named
         };
         ctx.imports.push(ParsedImport {
             file_id: ctx.file.id.clone(),
@@ -169,11 +180,7 @@ pub(crate) fn extract_python_import(
             is_static: false,
             span: span_from_node(node),
             provenance: Provenance::new("tree-sitter-python", "import declaration"),
-            kind: if is_glob {
-                ImportKind::Wildcard
-            } else {
-                ImportKind::Named
-            },
+            kind,
             imported_name,
             is_global: false,
         });
