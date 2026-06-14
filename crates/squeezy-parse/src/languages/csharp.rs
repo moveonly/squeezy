@@ -1205,6 +1205,13 @@ pub(crate) fn extract_csharp_symbol_facts(
                 );
             }
         }
+        // Positional records (`record Customer(string Name, int Age)`) and C# 12
+        // primary-constructor classes/structs declare their parameters directly
+        // on the type. The grammar models them as a `parameter_list` child of
+        // the type declaration. Each one becomes an init-only property of the
+        // type, so mint a `Field` member per parameter (plus its `Type` ref) —
+        // otherwise the type shows field-less and `Customer.Name` has no decl.
+        csharp_emit_primary_constructor_fields(node, symbol, ctx);
     }
     if matches!(
         node.kind(),
@@ -1246,6 +1253,101 @@ pub(crate) fn csharp_extension_receiver_type(node: Node<'_>, source: &str) -> Op
     let type_node = first.child_by_field_name("type")?;
     let text = node_text(type_node, source).ok()?;
     csharp_type_name_from_annotation(text)
+}
+
+/// Mint a `Field` member for each positional-record / primary-constructor
+/// parameter of a type declaration. These parameters become public init-only
+/// properties of the type, so they are surfaced as members (DocComment-ID
+/// prefix `P:`) parented to the type, each with a `Type` reference.
+fn csharp_emit_primary_constructor_fields(
+    node: Node<'_>,
+    type_symbol: &ParsedSymbol,
+    ctx: &mut ExtractContext<'_>,
+) {
+    let mut cursor = node.walk();
+    let Some(parameter_list) = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == "parameter_list")
+    else {
+        return;
+    };
+    // Property DocComment-ID owner derived from the type's own `T:` identity.
+    let owner_identity = type_symbol
+        .language_identity
+        .as_deref()
+        .and_then(|identity| identity.strip_prefix("T:"))
+        .map(str::to_string);
+    let mut param_cursor = parameter_list.walk();
+    for parameter in parameter_list.named_children(&mut param_cursor) {
+        if parameter.kind() != "parameter" {
+            continue;
+        }
+        let Some(name_node) = parameter.child_by_field_name("name") else {
+            continue;
+        };
+        let Some(name) = node_text(name_node, ctx.source)
+            .ok()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let type_node = parameter.child_by_field_name("type");
+        let type_text = type_node
+            .and_then(|n| node_text(n, ctx.source).ok())
+            .map(|text| text.trim().to_string());
+        let span = span_from_node(parameter);
+        let mut attributes = vec![
+            "csharp:field".to_string(),
+            "csharp:primary-constructor-param".to_string(),
+        ];
+        if let Some(text) = type_text.as_ref() {
+            attributes.push(format!("type:{}", last_path_segment(text)));
+        }
+        attributes.sort();
+        attributes.dedup();
+        let language_identity = owner_identity
+            .as_ref()
+            .map(|owner| format!("P:{owner}.{name}"));
+        ctx.symbols.push(ParsedSymbol {
+            id: symbol_id(
+                &ctx.file,
+                Some(&type_symbol.id),
+                SymbolKind::Field,
+                &name,
+                span,
+            ),
+            file_id: ctx.file.id.clone(),
+            parent_id: Some(type_symbol.id.clone()),
+            name: name.clone(),
+            kind: SymbolKind::Field,
+            language_identity,
+            span,
+            body_span: None,
+            signature_span: None,
+            signature: node_text(parameter, ctx.source)
+                .ok()
+                .map(|text| text.trim().to_string()),
+            visibility: Some("public".to_string()),
+            docs: Vec::new(),
+            attributes,
+            provenance: Provenance::new(
+                "tree-sitter-c-sharp",
+                "primary constructor parameter",
+            ),
+            confidence: Confidence::ExactSyntax,
+            freshness: Freshness::Fresh,
+            arity: None,
+        });
+        if let Some(type_node) = type_node {
+            push_csharp_type_reference(
+                type_node,
+                type_symbol,
+                ctx,
+                "primary constructor parameter type reference",
+            );
+        }
+    }
 }
 
 pub(crate) fn push_csharp_type_reference(
