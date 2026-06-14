@@ -217,11 +217,15 @@ struct InheritanceHierarchyArgs {
     query: Option<String>,
     /// When `false` (default), return all transitive supertypes of the root
     /// via a BFS over `UsesTrait`/`Extends`/`Implements` edges (ancestors).
-    /// When `true`, return only the **first-generation** direct subtypes
-    /// (symbols that carry an edge pointing *to* the root). A transitive
-    /// subtype walk is not available in a single tool call; issue multiple
-    /// calls using the returned symbols as new roots.
+    /// When `true`, return the direct subtypes of the root (symbols that carry
+    /// an edge pointing *to* the root). Combine with `transitive=true` to return
+    /// the full subtype closure instead of just the first generation.
     subtypes: Option<bool>,
+    /// When `true` (with `subtypes=true`), return the transitive subtype closure
+    /// via a bounded BFS over the inheritance edges instead of only the direct
+    /// subtypes. Ignored when `subtypes` is unset (ancestors are already a
+    /// transitive walk) or when in member mode. See `max_depth`.
+    transitive: Option<bool>,
     /// When `true` and the resolved root is a member (Method/Field), return the
     /// overrides/implementations of that member across transitive subtypes
     /// instead of the type-to-type ancestor/subtype walk. Ignored (falls back to
@@ -230,7 +234,10 @@ struct InheritanceHierarchyArgs {
     /// Restrict the resolved root (when resolved by query) and the related
     /// symbols to a single language. See `language_matches`.
     language: Option<String>,
-    /// Transitive subtype walk depth when `subtypes=true` (see O6).
+    /// Transitive subtype walk depth when `subtypes=true` and `transitive=true`.
+    /// Clamped to the graph's traversal bounds; defaults to the standard
+    /// depth-bounded-walk default. Ignored unless the transitive subtype closure
+    /// is requested.
     max_depth: Option<usize>,
     /// Maximum results (default 50).
     max_results: Option<usize>,
@@ -4480,10 +4487,23 @@ impl ToolRegistry {
         let member_requested = args.member.unwrap_or(false);
         let member_mode =
             member_requested && matches!(root_sym.kind, SymbolKind::Method | SymbolKind::Field);
+        // Transitive subtype closure: only meaningful in subtype mode (ancestors
+        // are already a full transitive walk; member mode resolves overrides
+        // directly). `max_depth` is clamped to the graph's traversal bounds; the
+        // default matches the other depth-bounded graph walks.
+        let transitive_subtypes = subtypes && !member_mode && args.transitive.unwrap_or(false);
+        let subtype_depth = args
+            .max_depth
+            .unwrap_or(DEFAULT_GRAPH_MAX_DEPTH)
+            .clamp(1, MAX_GRAPH_MAX_DEPTH);
         let related: Vec<GraphSymbol> = if member_mode {
             graph.member_implementations(&root_sym.id)
         } else if subtypes {
-            graph.inheritance_direct_subtypes(&root_sym.id)
+            if transitive_subtypes {
+                graph.inheritance_subtypes_transitive(&root_sym.id, subtype_depth)
+            } else {
+                graph.inheritance_direct_subtypes(&root_sym.id)
+            }
         } else {
             graph.inheritance_ancestors(&root_sym.id)
         };
@@ -4504,7 +4524,11 @@ impl ToolRegistry {
         let direction = if member_mode {
             "member_implementations"
         } else if subtypes {
-            "subtypes"
+            if transitive_subtypes {
+                "subtypes_transitive"
+            } else {
+                "subtypes"
+            }
         } else {
             "supertypes"
         };
