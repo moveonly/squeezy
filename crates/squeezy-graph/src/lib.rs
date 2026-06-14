@@ -51,6 +51,10 @@ use crate::languages::{
 
 pub const CRATE_NAME: &str = "squeezy-graph";
 const BODY_HIT_TRIGRAM_INDEX_MAX_HITS: usize = 100_000;
+/// Depth cap for the transitive subtype walk that backs
+/// [`SemanticGraph::member_implementations`]. Generous enough to cover any
+/// realistic inheritance chain while still bounding pathological/cyclic graphs.
+const MEMBER_IMPL_MAX_SUBTYPE_DEPTH: usize = 64;
 // v2: graph partitions and resolver-cache rows are now stored DEFLATE-compressed
 // (squeezy-store `encode_graph`/`decode_graph`) instead of plain JSON. Bumping
 // this invalidates any v1 plain-JSON cache via the metadata gate so it is wiped
@@ -1462,6 +1466,73 @@ impl SemanticGraph {
             frontier = next;
         }
         out
+    }
+
+    /// Find the implementations / overrides of a type member across the type's
+    /// transitive subtypes.
+    ///
+    /// `member` is the `SymbolId` of a method/property declared on some type
+    /// (its owning type is read from the member's `parent_id`). For every
+    /// transitive subtype of that owning type, this collects the subtype's
+    /// direct child members that share the member's name. When *both* the base
+    /// member and a candidate carry an arity, the arities must match (an
+    /// overload with a different parameter count is not an override); when
+    /// either side lacks arity information the name match alone qualifies, since
+    /// not every parser records arity.
+    ///
+    /// Members that explicitly carry an override/abstract attribute (e.g.
+    /// `kotlin:override`, `csharp:abstract`) are ranked first so the strongest
+    /// signals lead, but same-name members on subtypes are still returned even
+    /// when the language never tags overrides (Java without `@Override`, Python,
+    /// JS/TS) — the attribute is a sort hint, not a hard filter. The base
+    /// `member` itself is never included. Results are de-duplicated by
+    /// `SymbolId`.
+    pub fn member_implementations(&self, member: &SymbolId) -> Vec<GraphSymbol> {
+        let Some(base) = self.symbols.get(member) else {
+            return Vec::new();
+        };
+        let Some(owner) = base.parent_id.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut seen = HashSet::from([member.clone()]);
+        let mut tagged = Vec::new();
+        let mut untagged = Vec::new();
+        for subtype in
+            self.inheritance_subtypes_transitive(owner, MEMBER_IMPL_MAX_SUBTYPE_DEPTH)
+        {
+            for child_id in self
+                .children_by_parent
+                .get(&subtype.id)
+                .into_iter()
+                .flatten()
+            {
+                let Some(child) = self.symbols.get(child_id) else {
+                    continue;
+                };
+                if child.name != base.name {
+                    continue;
+                }
+                // Reject a different-arity overload only when both sides know
+                // their arity; a `None` on either side means the parser could
+                // not count parameters, so we fall back to the name match.
+                if let (Some(base_arity), Some(child_arity)) = (base.arity, child.arity)
+                    && base_arity != child_arity
+                {
+                    continue;
+                }
+                if !seen.insert(child.id.clone()) {
+                    continue;
+                }
+                if is_override_or_abstract(child) {
+                    tagged.push(child.clone());
+                } else {
+                    untagged.push(child.clone());
+                }
+            }
+        }
+        tagged.extend(untagged);
+        tagged
     }
 
     /// Compute the impact set for a set of changed file IDs. Returns all files
@@ -4063,6 +4134,20 @@ fn span_line_height(span: &SourceSpan) -> u32 {
 /// malformed span where `end_byte < start_byte`.
 fn span_byte_width(span: &SourceSpan) -> u32 {
     span.end_byte.saturating_sub(span.start_byte)
+}
+
+/// True when a symbol carries an override-style or abstract modifier. The
+/// parsers tag these as language-namespaced attributes (`kotlin:override`,
+/// `scala:abstract`, `csharp:abstract`, `java:override`, …), so this matches on
+/// the `:override` / `:abstract` suffix rather than enumerating every language.
+/// The bare forms are accepted too in case an attribute is emitted unprefixed.
+fn is_override_or_abstract(symbol: &GraphSymbol) -> bool {
+    symbol.attributes.iter().any(|attribute| {
+        attribute.ends_with(":override")
+            || attribute.ends_with(":abstract")
+            || attribute == "override"
+            || attribute == "abstract"
+    })
 }
 
 fn spans_intersect(left: SourceSpan, right: SourceSpan) -> bool {
