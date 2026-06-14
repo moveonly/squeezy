@@ -432,7 +432,7 @@ pub(crate) fn decl_search_spec() -> ToolSpec {
 pub(crate) fn definition_search_spec() -> ToolSpec {
     ToolSpec {
         name: "definition_search".to_string(),
-        description: "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?'. Use before flow tools when a name may be ambiguous; do not also call decl_search or symbol_context for the same query unless this result is insufficient.".to_string(),
+        description: "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?'. Use before flow tools when a name may be ambiguous; do not also call decl_search or symbol_context for the same query unless this result is insufficient. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -454,7 +454,7 @@ pub(crate) fn definition_search_spec() -> ToolSpec {
 pub(crate) fn reference_search_spec() -> ToolSpec {
     ToolSpec {
         name: "reference_search".to_string(),
-        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when a prior graph call returned one. One call returns every callsite — prefer it over N greps for the same symbol name.".to_string(),
+        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when a prior graph call returned one. One call returns every callsite — prefer it over N greps for the same symbol name. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -476,7 +476,7 @@ pub(crate) fn reference_search_spec() -> ToolSpec {
 pub(crate) fn upstream_flow_spec() -> ToolSpec {
     ToolSpec {
         name: "upstream_flow".to_string(),
-        description: "Return compact callers (bounded BFS up to max_depth, each packet tagged with `depth`) and direct inbound references for a resolved symbol. Use for 'who calls X?' or 'who calls X within N hops?'.".to_string(),
+        description: "Return compact callers (bounded BFS up to max_depth, each packet tagged with `depth`) and direct inbound references for a resolved symbol. Use for 'who calls X?' or 'who calls X within N hops?'. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -498,7 +498,7 @@ pub(crate) fn upstream_flow_spec() -> ToolSpec {
 pub(crate) fn downstream_flow_spec() -> ToolSpec {
     ToolSpec {
         name: "downstream_flow".to_string(),
-        description: "Return compact callees (bounded BFS up to max_depth, each packet tagged with `depth`), outgoing reference/import edges, and an explicit call chain when target_symbol_id or target_query is supplied.".to_string(),
+        description: "Return compact callees (bounded BFS up to max_depth, each packet tagged with `depth`), outgoing reference/import edges, and an explicit call chain when target_symbol_id or target_query is supplied. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -585,7 +585,7 @@ pub(crate) fn impact_spec() -> ToolSpec {
 pub(crate) fn read_slice_spec() -> ToolSpec {
     ToolSpec {
         name: "read_slice".to_string(),
-        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Each `content` line is prefixed with its 1-based absolute line number and a tab (cat -n format); the result also carries `start_line`. Set read_mode=diff to return only changed ranges against a baseline. For a symbol_id from a graph packet (definition_search, symbol_context, hierarchy, reference_search), `span_kind=body` returns the body span directly.".to_string(),
+        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Each `content` line is prefixed with its 1-based absolute line number and a tab (cat -n format); the result also carries `start_line`. Set read_mode=diff to return only changed ranges against a baseline. For a symbol_id from a graph packet (definition_search, symbol_context, hierarchy, reference_search), `span_kind=body` returns the body span directly. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
