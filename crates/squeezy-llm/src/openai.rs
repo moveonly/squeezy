@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
-    LlmEvent, LlmHostedTool, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest, LlmStream,
-    LlmToolCall, ReasoningKind, ReasoningPayload,
+    LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+    ReasoningKind, ReasoningPayload,
     credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
     openai_prompt_cache::clamp_prompt_cache_key,
     retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
@@ -404,8 +404,8 @@ impl OpenAiProvider {
                 body["include"] = json!(["reasoning.encrypted_content"]);
             }
         }
-        if !request.tools.is_empty() || !request.hosted_tools.is_empty() {
-            let mut tools = Vec::with_capacity(request.tools.len() + request.hosted_tools.len());
+        if !request.tools.is_empty() {
+            let mut tools = Vec::with_capacity(request.tools.len());
             for tool in request.tools.iter() {
                 tools.push(json!({
                     "type": "function",
@@ -414,9 +414,6 @@ impl OpenAiProvider {
                     "parameters": tool.parameters,
                     "strict": tool.strict,
                 }));
-            }
-            for tool in &request.hosted_tools {
-                tools.push(openai_hosted_tool(tool, provider_name));
             }
             body["tools"] = Value::Array(tools);
         }
@@ -467,32 +464,6 @@ impl OpenAiProvider {
             ("session_id", clamped.clone()),
             ("x-client-request-id", clamped),
         ]
-    }
-}
-
-fn openai_hosted_tool(tool: &LlmHostedTool, provider_name: &str) -> Value {
-    match tool {
-        LlmHostedTool::WebSearch { filters } if provider_name == "xai" => {
-            let mut value = json!({ "type": "web_search" });
-            if let Some(filters) = filters {
-                value["filters"] = filters.clone();
-            }
-            value
-        }
-        LlmHostedTool::WebSearch { filters } => {
-            let mut value = json!({ "type": "web_search_preview" });
-            if let Some(filters) = filters {
-                value["filters"] = filters.clone();
-            }
-            value
-        }
-        LlmHostedTool::FileSearch { vector_store_ids } => json!({
-            "type": "file_search",
-            "vector_store_ids": vector_store_ids,
-        }),
-        LlmHostedTool::ComputerUse => json!({
-            "type": "computer_use_preview",
-        }),
     }
 }
 

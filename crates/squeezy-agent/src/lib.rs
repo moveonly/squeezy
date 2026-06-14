@@ -3233,7 +3233,6 @@ impl Agent {
             // the same `parallel_tool_calls` choice the real request sends.
             parallel_tool_calls: self.config.parallel_tool_calls,
             beta_headers: std::sync::Arc::from(Vec::new()),
-            ..LlmRequest::default()
         }
     }
 
