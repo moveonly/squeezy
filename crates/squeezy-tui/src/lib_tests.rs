@@ -49668,9 +49668,11 @@ fn entry_preview_meta_names_the_turns_model() {
 
     let mut metrics = squeezy_core::TurnMetrics::default();
     metrics.provider.estimated_usd_micros = Some(12_340);
-    let mut main_cost = squeezy_core::CostSnapshot::default();
-    main_cost.estimated_usd_micros = Some(12_340);
-    main_cost.output_tokens = Some(340);
+    let main_cost = squeezy_core::CostSnapshot {
+        estimated_usd_micros: Some(12_340),
+        output_tokens: Some(340),
+        ..Default::default()
+    };
     metrics.model_ledger.record(
         "anthropic",
         "claude-opus-4-8",
@@ -49694,12 +49696,16 @@ fn entry_preview_meta_names_the_turns_model() {
 #[test]
 fn turn_primary_model_picks_the_dominant_main_bucket() {
     let mut metrics = squeezy_core::TurnMetrics::default();
-    let mut cheap = squeezy_core::CostSnapshot::default();
-    cheap.estimated_usd_micros = Some(100);
-    cheap.output_tokens = Some(50);
-    let mut pricey = squeezy_core::CostSnapshot::default();
-    pricey.estimated_usd_micros = Some(9_000);
-    pricey.output_tokens = Some(800);
+    let cheap = squeezy_core::CostSnapshot {
+        estimated_usd_micros: Some(100),
+        output_tokens: Some(50),
+        ..Default::default()
+    };
+    let pricey = squeezy_core::CostSnapshot {
+        estimated_usd_micros: Some(9_000),
+        output_tokens: Some(800),
+        ..Default::default()
+    };
     metrics.model_ledger.record(
         "anthropic",
         "claude-haiku-4-5",
@@ -49719,8 +49725,10 @@ fn turn_primary_model_picks_the_dominant_main_bucket() {
     );
 
     let mut subagent_only = squeezy_core::TurnMetrics::default();
-    let mut sub = squeezy_core::CostSnapshot::default();
-    sub.estimated_usd_micros = Some(50_000);
+    let sub = squeezy_core::CostSnapshot {
+        estimated_usd_micros: Some(50_000),
+        ..Default::default()
+    };
     subagent_only.model_ledger.record(
         "anthropic",
         "explore-model",
