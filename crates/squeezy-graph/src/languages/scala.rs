@@ -256,13 +256,58 @@ impl SemanticGraph {
     }
 }
 
+/// Map a literal-shaped extension-call receiver to the Scala built-in type
+/// the extractor records as `language_identity` for that extension. Mirrors
+/// `kotlin_literal_receiver_type`: the receiver text arrives raw from
+/// tree-sitter (e.g. `"hello"`, `s"…"`, `42`, `1.5`, `true`, `'x'`). Returns
+/// `None` when the receiver is not a recognizable literal so the caller can
+/// fall back to the typed-binding inference path rather than guessing.
 fn scala_call_receiver_type(call: &ParsedCall) -> Option<String> {
     let raw = call.receiver.as_deref()?.trim();
-    if raw.is_empty() {
+    scala_literal_receiver_type(raw).map(str::to_string)
+}
+
+fn scala_literal_receiver_type(receiver: &str) -> Option<&'static str> {
+    let trimmed = receiver.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    if raw.starts_with('"') || raw.starts_with("s\"") || raw.starts_with("f\"") {
-        return Some("String".to_string());
+    // String literals: plain `"…"`, triple-quoted, and interpolators
+    // (`s"…"`, `f"…"`, `raw"…"`). Anything that ends as a string literal is a
+    // `String`. Interpolator prefixes are alphanumeric identifiers followed
+    // by a `"`.
+    if trimmed.starts_with('"') {
+        return Some("String");
+    }
+    if let Some(quote) = trimmed.find('"')
+        && trimmed[..quote].chars().all(|c| c.is_ascii_alphanumeric())
+        && !trimmed[..quote].is_empty()
+    {
+        return Some("String");
+    }
+    // Character literal: `'x'`.
+    if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+        return Some("Char");
+    }
+    // Boolean literals.
+    if trimmed == "true" || trimmed == "false" {
+        return Some("Boolean");
+    }
+    // Numeric literals. A trailing type suffix wins; otherwise a `.` makes it
+    // a `Double`, else `Int`.
+    let first = trimmed.chars().next()?;
+    if first.is_ascii_digit() || (first == '-' && trimmed.len() > 1) {
+        let last = trimmed.chars().last()?;
+        if last == 'L' || last == 'l' {
+            return Some("Long");
+        }
+        if last == 'f' || last == 'F' {
+            return Some("Float");
+        }
+        if last == 'd' || last == 'D' || trimmed.contains('.') {
+            return Some("Double");
+        }
+        return Some("Int");
     }
     None
 }
