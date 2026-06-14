@@ -111,6 +111,11 @@ fn visit_ruby_node(
         );
     } else if kind == "identifier" {
         extract_ruby_reference(node, ReferenceKind::Identifier, ctx, owner_symbol.clone());
+    } else if kind == "global_variable" {
+        // `$var` read (the LHS of an assignment is handled by the assignment
+        // arm and suppressed here via `ruby_node_is_declared_name`). Emit an
+        // Identifier reference + body hit so `$config` reads are searchable.
+        extract_ruby_reference(node, ReferenceKind::Identifier, ctx, owner_symbol.clone());
     } else if kind == "constant" {
         let ref_kind = if ruby_constant_in_type_position(node) {
             ReferenceKind::Type
@@ -346,6 +351,33 @@ fn extract_ruby_assignment_symbol(
                 attributes: Vec::new(),
                 provenance: Provenance::new("tree-sitter-ruby", "constant assignment"),
                 confidence: symbol_confidence,
+                freshness: Freshness::Fresh,
+                arity: None,
+            });
+        }
+        "global_variable" => {
+            // `$config = ...` is a process-global. Model it as a file-scoped
+            // `Static` (the closest analogue to a module-level constant binding
+            // that is mutable and not namespaced) so `$config` is queryable as a
+            // declaration. Globals have no lexical owner, so the symbol is
+            // parented at the file regardless of the enclosing class/method.
+            let id = symbol_id(&ctx.file, None, SymbolKind::Static, left_text, span);
+            ctx.symbols.push(ParsedSymbol {
+                id,
+                file_id: ctx.file.id.clone(),
+                parent_id: None,
+                name: left_text.to_string(),
+                kind: SymbolKind::Static,
+                language_identity: None,
+                span,
+                body_span: None,
+                signature_span: None,
+                signature: raw.to_string(),
+                visibility: None,
+                docs: Vec::new(),
+                attributes: vec!["ruby:global".to_string()],
+                provenance: Provenance::new("tree-sitter-ruby", "global variable assignment"),
+                confidence: Confidence::Heuristic,
                 freshness: Freshness::Fresh,
                 arity: None,
             });
@@ -919,11 +951,19 @@ fn ruby_imported_name_from_path(path: &str) -> Option<String> {
 }
 
 /// One Field per `(host class, ivar/cvar name)` (spec §3); same for
-/// duplicate include/extend/prepend mixin attributes. Calls and references
-/// are not deduped — every call site is its own data point.
+/// duplicate include/extend/prepend mixin attributes and one Static per
+/// global-variable name (`$config = ...` may be re-assigned many times).
+/// Calls and references are not deduped — every call site is its own data
+/// point.
 fn dedup_ruby_facts(ctx: &mut ExtractContext<'_>) {
     let mut seen_fields = std::collections::HashSet::new();
+    let mut seen_globals = std::collections::HashSet::new();
     ctx.symbols.retain(|symbol| {
+        if symbol.kind == SymbolKind::Static
+            && symbol.attributes.iter().any(|attr| attr == "ruby:global")
+        {
+            return seen_globals.insert(symbol.name.clone());
+        }
         if symbol.kind != SymbolKind::Field {
             return true;
         }
