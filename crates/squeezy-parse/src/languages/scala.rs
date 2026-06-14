@@ -259,6 +259,7 @@ fn scala_symbol_from_node(
     ) {
         attributes.extend(scala_inheritance_attributes(node, ctx.source));
         attributes.extend(scala_derives_attributes(node, ctx.source));
+        attributes.extend(scala_self_type_attributes(node, ctx.source));
     }
     if is_case_class {
         attributes.push("scala:case-class".to_string());
@@ -725,6 +726,42 @@ fn scala_derives_attributes(node: Node<'_>, source: &str) -> Vec<String> {
         let attribute = format!("derives:{name}");
         if seen.insert(attribute.clone()) {
             attributes.push(attribute);
+        }
+    }
+    attributes
+}
+
+/// Record cake-pattern self-type constraints (`self: T with U =>`) as
+/// `scala:self-type:<T>` attributes on the enclosing trait/class so required
+/// mixins are enumerable. The `self_type` node lives directly inside the
+/// `template_body`; its leading self-identifier is skipped and only the ascribed
+/// types are recorded.
+fn scala_self_type_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut attributes = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut cursor = node.walk();
+    for body in node.children_by_field_name("body", &mut cursor) {
+        let mut body_cursor = body.walk();
+        for child in body.named_children(&mut body_cursor) {
+            if child.kind() != "self_type" {
+                continue;
+            }
+            let mut names = Vec::new();
+            let mut self_cursor = child.walk();
+            for component in child.named_children(&mut self_cursor) {
+                // Skip the leading self-identifier (`self`); only the ascribed
+                // types after the `:` are required mixins.
+                if matches!(component.kind(), "identifier" | "operator_identifier") {
+                    continue;
+                }
+                collect_scala_type_names(component, source, &mut names);
+            }
+            for name in names {
+                let attribute = format!("scala:self-type:{name}");
+                if seen.insert(attribute.clone()) {
+                    attributes.push(attribute);
+                }
+            }
         }
     }
     attributes

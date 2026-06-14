@@ -118,3 +118,28 @@ fn records_derives_clause_typeclasses() {
         point.attributes
     );
 }
+
+#[test]
+fn records_self_type_required_mixins() {
+    // The cake-pattern self-type `self: T with U =>` records each required type
+    // as a `scala:self-type:` constraint so cake dependencies are enumerable.
+    let parsed =
+        parse_scala("trait Service {\n  self: Repository with Logger =>\n  def run(): Unit\n}");
+    let service = scala_symbol(&parsed, "Service");
+    assert!(
+        service
+            .attributes
+            .iter()
+            .any(|a| a == "scala:self-type:Repository"),
+        "expected scala:self-type:Repository, got {:?}",
+        service.attributes
+    );
+    assert!(
+        service
+            .attributes
+            .iter()
+            .any(|a| a == "scala:self-type:Logger"),
+        "expected scala:self-type:Logger, got {:?}",
+        service.attributes
+    );
+}
