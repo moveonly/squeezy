@@ -8601,6 +8601,18 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         app.terminal_title_state = TerminalTitleState::Cleared;
     }
 
+    // App-level interrupt keys must resolve a pending approval before the
+    // approval menu consumes raw keys. The menu handler's direct Esc behavior is
+    // still a one-shot deny; fullscreen Esc/Ctrl+C cancel the parked turn.
+    if app.pending_approval.is_some()
+        && (key.code == KeyCode::Esc
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')))
+        && request_turn_interrupt(app)
+    {
+        app.exit_confirm_armed = false;
+        return Ok(false);
+    }
+
     // Approval/MCP/user-input prompts are injected by the agent/tool loop and
     // must take priority over an already-open paste decision: a paste prompt is
     // only a composer safety gate, while these prompts unblock the active turn.
