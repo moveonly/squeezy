@@ -1217,6 +1217,56 @@ impl SemanticGraph {
         symbols
     }
 
+    /// Return the narrowest declaration in `file_id` whose line span
+    /// `[span.start.line, span.end.line]` (inclusive) contains `line`.
+    ///
+    /// "Narrowest" is measured by line height first, then by byte width as a
+    /// tie-break, so a method nested inside a class is preferred over the
+    /// enclosing class when both contain the probed line. The whole-file
+    /// pseudo-symbol ([`SymbolKind::File`]) is never returned — callers asking
+    /// "which declaration is at this line?" want a real declaration, and the
+    /// file symbol would otherwise win whenever a line falls between two
+    /// top-level decls. Returns a clone, or `None` when no declaration spans
+    /// the line.
+    pub fn symbol_at_line(&self, file_id: &FileId, line: u32) -> Option<GraphSymbol> {
+        self.symbols
+            .values()
+            .filter(|symbol| {
+                symbol.kind != SymbolKind::File
+                    && &symbol.file_id == file_id
+                    && symbol.span.start.line <= line
+                    && line <= symbol.span.end.line
+            })
+            .min_by(|left, right| {
+                span_line_height(&left.span)
+                    .cmp(&span_line_height(&right.span))
+                    .then_with(|| span_byte_width(&left.span).cmp(&span_byte_width(&right.span)))
+            })
+            .cloned()
+    }
+
+    /// Return the narrowest declaration in `file_id` whose byte span contains
+    /// `byte`. The byte-precise counterpart of [`Self::symbol_at_line`]:
+    /// "narrowest" is measured by byte width (line height is the tie-break),
+    /// and the whole-file pseudo-symbol is never returned. Returns a clone, or
+    /// `None` when no declaration spans the byte.
+    pub fn symbol_at_byte(&self, file_id: &FileId, byte: u32) -> Option<GraphSymbol> {
+        self.symbols
+            .values()
+            .filter(|symbol| {
+                symbol.kind != SymbolKind::File
+                    && &symbol.file_id == file_id
+                    && symbol.span.start_byte <= byte
+                    && byte <= symbol.span.end_byte
+            })
+            .min_by(|left, right| {
+                span_byte_width(&left.span)
+                    .cmp(&span_byte_width(&right.span))
+                    .then_with(|| span_line_height(&left.span).cmp(&span_line_height(&right.span)))
+            })
+            .cloned()
+    }
+
     /// Iterate the graph edges whose source is `from`, in index order, using
     /// the `edges_by_from` index instead of scanning the full edge vector.
     /// Callers that only need a subset (a particular [`EdgeKind`], say) can
@@ -3935,6 +3985,20 @@ fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> Lan
 
 fn line_ranges_intersect(start: u32, end: u32, dirty: DirtyRange) -> bool {
     start <= dirty.end_line && dirty.start_line <= end
+}
+
+/// Inclusive line height of a span (`end.line - start.line`), used to rank
+/// enclosing declarations from narrowest to widest. `saturating_sub` keeps a
+/// malformed span where `end < start` from underflowing.
+fn span_line_height(span: &SourceSpan) -> u32 {
+    span.end.line.saturating_sub(span.start.line)
+}
+
+/// Byte width of a span (`end_byte - start_byte`), the byte-precise tie-break
+/// for ranking enclosing declarations. `saturating_sub` guards against a
+/// malformed span where `end_byte < start_byte`.
+fn span_byte_width(span: &SourceSpan) -> u32 {
+    span.end_byte.saturating_sub(span.start_byte)
 }
 
 fn spans_intersect(left: SourceSpan, right: SourceSpan) -> bool {
