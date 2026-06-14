@@ -1177,6 +1177,21 @@ pub(crate) fn extract_csharp_symbol_facts(
                 provenance: Provenance::new("tree-sitter-c-sharp", "base type reference"),
             });
         }
+        // `csharp_collect_base_types` only returns the leaf of each base
+        // (`IReadOnlyList`), so a type used solely as a generic argument of a
+        // base (`: IEnumerable<MyEnum>`) would never bind. Walk the raw
+        // `base_list` subtree to emit a `Type` ref per nested argument.
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "base_list" {
+                csharp_push_generic_argument_refs(
+                    child,
+                    symbol,
+                    ctx,
+                    "base type argument reference",
+                );
+            }
+        }
     }
     if matches!(
         node.kind(),
@@ -1205,21 +1220,59 @@ pub(crate) fn push_csharp_type_reference(
     ctx: &mut ExtractContext<'_>,
     reason: &'static str,
 ) {
-    let Ok(text) = node_text(type_node, ctx.source) else {
-        return;
-    };
-    let cleaned = csharp_type_name_from_annotation(text);
-    let Some(cleaned) = cleaned else {
-        return;
-    };
-    ctx.references.push(ParsedReference {
-        file_id: ctx.file.id.clone(),
-        owner_id: Some(symbol.id.clone()),
-        text: cleaned,
-        kind: ReferenceKind::Type,
-        span: symbol.span,
-        provenance: Provenance::new("tree-sitter-c-sharp", reason),
-    });
+    if let Ok(text) = node_text(type_node, ctx.source)
+        && let Some(cleaned) = csharp_type_name_from_annotation(text)
+    {
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: Some(symbol.id.clone()),
+            text: cleaned,
+            kind: ReferenceKind::Type,
+            span: symbol.span,
+            provenance: Provenance::new("tree-sitter-c-sharp", reason),
+        });
+    }
+    // `csharp_type_name_from_annotation` truncates at the first `<`, so the
+    // outer ref only names the open generic (e.g. `List`). Recurse into every
+    // nested `type_argument_list` and emit a `Type` ref per argument so a type
+    // used *only* as a generic argument (`List<MyEnum>`) still binds — the
+    // binder rejects `Identifier`-kind refs for interfaces/enums/aliases.
+    csharp_push_generic_argument_refs(type_node, symbol, ctx, reason);
+}
+
+/// Walk the subtree of a type node, pushing a `Type` reference for each named
+/// argument found inside any `type_argument_list` (handles nesting such as
+/// `Dictionary<string, List<Foo>>`).
+fn csharp_push_generic_argument_refs(
+    node: Node<'_>,
+    symbol: &ParsedSymbol,
+    ctx: &mut ExtractContext<'_>,
+    reason: &'static str,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "type_argument_list" {
+            let mut arg_cursor = child.walk();
+            for argument in child.named_children(&mut arg_cursor) {
+                if let Ok(text) = node_text(argument, ctx.source)
+                    && let Some(cleaned) = csharp_type_name_from_annotation(text)
+                {
+                    ctx.references.push(ParsedReference {
+                        file_id: ctx.file.id.clone(),
+                        owner_id: Some(symbol.id.clone()),
+                        text: cleaned,
+                        kind: ReferenceKind::Type,
+                        span: symbol.span,
+                        provenance: Provenance::new("tree-sitter-c-sharp", reason),
+                    });
+                }
+                // Descend so deeper argument lists are captured too.
+                csharp_push_generic_argument_refs(argument, symbol, ctx, reason);
+            }
+        } else {
+            csharp_push_generic_argument_refs(child, symbol, ctx, reason);
+        }
+    }
 }
 
 pub(crate) fn csharp_type_name_from_annotation(annotation: &str) -> Option<String> {
