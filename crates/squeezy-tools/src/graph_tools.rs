@@ -2388,6 +2388,26 @@ fn reference_packet(hit: &ReferenceHit) -> Value {
     packet
 }
 
+/// Canonical lower-case label for a reference's syntactic kind, derived from the
+/// `Debug` rendering of `ReferenceKind` (the same source `reference_json` uses
+/// for the wire `kind`). Kept string-based so it needs no non-test dependency on
+/// `squeezy-parse`'s `ReferenceKind` enum.
+fn reference_kind_label(hit: &ReferenceHit) -> String {
+    format!("{:?}", hit.reference.kind).to_ascii_lowercase()
+}
+
+/// True when a reference hit matches the requested `reference_kind` filter
+/// (`identifier`|`type`|`path`|`field`|`attribute`, case-insensitive). An empty
+/// or whitespace-only filter is treated as "no filter" and keeps every hit; an
+/// unrecognized token simply matches nothing (the caller asked for a kind that
+/// can't occur), which is the conservative, non-surprising behavior.
+fn reference_kind_matches(hit: &ReferenceHit, filter: Option<&str>) -> bool {
+    let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    reference_kind_label(hit) == filter.to_ascii_lowercase()
+}
+
 fn reference_matches_path(hit: &ReferenceHit, filter: &str) -> bool {
     // Use the same directory-aware filter `decl_search` uses so a `path=`
     // scope like `src/foo` matches references in `src/foo/bar.rs` (directory
@@ -4070,6 +4090,7 @@ impl ToolRegistry {
             .filter(|hit| {
                 file_language_matches(graph, &hit.reference.file_id, args.language.as_deref())
             })
+            .filter(|hit| reference_kind_matches(hit, args.reference_kind.as_deref()))
             .collect::<Vec<_>>();
         let truncated = filtered.len().saturating_sub(offset) > max_results;
         let selected = filtered
