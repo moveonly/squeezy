@@ -286,62 +286,12 @@ fn plan_parallel_batches_serializes_unsafe_calls_between_safe_runs() {
     let _ = fs::remove_dir_all(root);
 }
 
-fn first_party_executor_tool_names() -> BTreeSet<&'static str> {
-    [
-        "apply_patch",
-        "checkpoint_check",
-        "checkpoint_doctor",
-        "checkpoint_list",
-        "checkpoint_restore_file",
-        "checkpoint_revert",
-        "checkpoint_show",
-        "checkpoint_undo",
-        "decl_search",
-        "definition_search",
-        "diff_context",
-        "downstream_flow",
-        "glob",
-        "grep",
-        "hierarchy",
-        "impact",
-        "inheritance_hierarchy",
-        "list_skills",
-        "load_skill",
-        "mcp_list_resource_templates",
-        "mcp_list_resources",
-        "mcp_read_resource",
-        "memory",
-        "notebook_edit",
-        "notes_recall",
-        "notes_remember",
-        "observations",
-        "plan_patch",
-        "read_file",
-        "read_slice",
-        "read_tool_output",
-        "reference_search",
-        "refresh_compiler_facts",
-        "repo_map",
-        "shell",
-        "symbol_at",
-        "symbol_context",
-        "upstream_flow",
-        "verify",
-        "webfetch",
-        "websearch",
-        "write_file",
-    ]
-    .into_iter()
-    .collect()
-}
-
 #[test]
 fn advertised_first_party_specs_have_registered_executors() {
-    // The spec catalog, permission metadata, and executor match are maintained
-    // in different places. Keep a cheap first-party descriptor guardrail near
-    // the registry tests so adding or renaming a tool cannot silently advertise
-    // a spec without updating the in-tree executor surface.
-    let executor_names = first_party_executor_tool_names();
+    // The spec catalog, permission metadata, and executor classifier are
+    // maintained in different places. Keep a cheap first-party descriptor
+    // guardrail near the registry tests so adding or renaming a tool cannot
+    // silently advertise a spec without updating the in-tree dispatch surface.
     let roots = [
         temp_workspace("first_party_specs_default"),
         temp_workspace("first_party_specs_checkpoints"),
@@ -361,8 +311,8 @@ fn advertised_first_party_specs_have_registered_executors() {
                 spec.name
             );
             assert!(
-                executor_names.contains(spec.name.as_str()),
-                "first-party tool spec `{}` is advertised but missing from the registered executor-name guardrail",
+                first_party_tool_executor(spec.name.as_str()).is_some(),
+                "first-party tool spec `{}` is advertised but missing from the top-level dispatch classifier",
                 spec.name
             );
 

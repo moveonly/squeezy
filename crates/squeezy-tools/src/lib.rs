@@ -568,6 +568,81 @@ pub struct ToolExecutionOptions {
     pub shell_ask_approver: Option<ShellAskApprover>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FirstPartyToolExecutor {
+    ApplyPatch,
+    CheckpointDoctor,
+    CheckpointList,
+    CheckpointShow,
+    CheckpointUndo,
+    CheckpointRevert,
+    CheckpointRestoreFile,
+    CheckpointCheck,
+    Graph,
+    DiffContext,
+    PlanPatch,
+    Glob,
+    Grep,
+    ReadFile,
+    ReadToolOutput,
+    RefreshCompilerFacts,
+    Verify,
+    NotebookEdit,
+    WriteFile,
+    Shell,
+    Webfetch,
+    Websearch,
+    McpListResources,
+    McpListResourceTemplates,
+    McpReadResource,
+    ListSkills,
+    LoadSkill,
+    NotesRemember,
+    NotesRecall,
+    Observations,
+    Memory,
+}
+
+fn first_party_tool_executor(name: &str) -> Option<FirstPartyToolExecutor> {
+    if ToolRegistry::is_graph_tool_name(name) {
+        return Some(FirstPartyToolExecutor::Graph);
+    }
+
+    match name {
+        "apply_patch" => Some(FirstPartyToolExecutor::ApplyPatch),
+        "checkpoint_doctor" => Some(FirstPartyToolExecutor::CheckpointDoctor),
+        "checkpoint_list" => Some(FirstPartyToolExecutor::CheckpointList),
+        "checkpoint_show" => Some(FirstPartyToolExecutor::CheckpointShow),
+        "checkpoint_undo" => Some(FirstPartyToolExecutor::CheckpointUndo),
+        "checkpoint_revert" => Some(FirstPartyToolExecutor::CheckpointRevert),
+        "checkpoint_restore_file" => Some(FirstPartyToolExecutor::CheckpointRestoreFile),
+        "checkpoint_check" => Some(FirstPartyToolExecutor::CheckpointCheck),
+        "diff_context" => Some(FirstPartyToolExecutor::DiffContext),
+        "plan_patch" => Some(FirstPartyToolExecutor::PlanPatch),
+        "glob" => Some(FirstPartyToolExecutor::Glob),
+        "grep" => Some(FirstPartyToolExecutor::Grep),
+        "read_file" => Some(FirstPartyToolExecutor::ReadFile),
+        "read_tool_output" => Some(FirstPartyToolExecutor::ReadToolOutput),
+        "refresh_compiler_facts" => Some(FirstPartyToolExecutor::RefreshCompilerFacts),
+        "verify" => Some(FirstPartyToolExecutor::Verify),
+        "notebook_edit" => Some(FirstPartyToolExecutor::NotebookEdit),
+        "write_file" => Some(FirstPartyToolExecutor::WriteFile),
+        "shell" => Some(FirstPartyToolExecutor::Shell),
+        "webfetch" => Some(FirstPartyToolExecutor::Webfetch),
+        "websearch" => Some(FirstPartyToolExecutor::Websearch),
+        "mcp_list_resources" => Some(FirstPartyToolExecutor::McpListResources),
+        "mcp_list_resource_templates" => Some(FirstPartyToolExecutor::McpListResourceTemplates),
+        "mcp_read_resource" => Some(FirstPartyToolExecutor::McpReadResource),
+        "list_skills" => Some(FirstPartyToolExecutor::ListSkills),
+        "load_skill" => Some(FirstPartyToolExecutor::LoadSkill),
+        "notes_remember" => Some(FirstPartyToolExecutor::NotesRemember),
+        "notes_recall" => Some(FirstPartyToolExecutor::NotesRecall),
+        "observations" => Some(FirstPartyToolExecutor::Observations),
+        "memory" => Some(FirstPartyToolExecutor::Memory),
+        _ => None,
+    }
+}
+
 /// Per-tool soft-validation hook. Runs against the raw `arguments` JSON
 /// **before** typed-struct deserialization (and before the live
 /// `#[serde(deny_unknown_fields)]` schema rejects unknown keys), so a spec
@@ -3467,50 +3542,84 @@ impl ToolRegistry {
         let result = if self.mcp_tool(&call.name).is_some() {
             self.execute_mcp_tool(&call, cancel).await
         } else {
-            match call.name.as_str() {
-                "apply_patch" => self.execute_apply_patch(&call, &group_id).await,
-                "checkpoint_doctor" => self.execute_checkpoint_doctor(&call).await,
-                "checkpoint_list" => self.execute_checkpoint_list(&call).await,
-                "checkpoint_show" => self.execute_checkpoint_show(&call).await,
-                "checkpoint_undo" => self.execute_checkpoint_undo(&call).await,
-                "checkpoint_revert" => self.execute_checkpoint_revert(&call).await,
-                "checkpoint_restore_file" => self.execute_checkpoint_restore_file(&call).await,
-                "checkpoint_check" => self.execute_checkpoint_check(&call).await,
-                "repo_map" | "decl_search" | "definition_search" | "reference_search"
-                | "upstream_flow" | "downstream_flow" | "hierarchy" | "read_slice"
-                | "symbol_context" => self.execute_graph_tool(&call).await,
-                "diff_context" => self.execute_diff_context(&call).await,
-                "plan_patch" => self.execute_plan_patch(&call).await,
-                "glob" => self.execute_glob(&call, cancel).await,
-                "grep" => self.execute_grep(&call, cancel).await,
-                "read_file" => self.execute_read_file(&call).await,
-                "read_tool_output" => self.execute_read_tool_output(&call).await,
-                "refresh_compiler_facts" => {
+            match first_party_tool_executor(&call.name) {
+                Some(FirstPartyToolExecutor::ApplyPatch) => {
+                    self.execute_apply_patch(&call, &group_id).await
+                }
+                Some(FirstPartyToolExecutor::CheckpointDoctor) => {
+                    self.execute_checkpoint_doctor(&call).await
+                }
+                Some(FirstPartyToolExecutor::CheckpointList) => {
+                    self.execute_checkpoint_list(&call).await
+                }
+                Some(FirstPartyToolExecutor::CheckpointShow) => {
+                    self.execute_checkpoint_show(&call).await
+                }
+                Some(FirstPartyToolExecutor::CheckpointUndo) => {
+                    self.execute_checkpoint_undo(&call).await
+                }
+                Some(FirstPartyToolExecutor::CheckpointRevert) => {
+                    self.execute_checkpoint_revert(&call).await
+                }
+                Some(FirstPartyToolExecutor::CheckpointRestoreFile) => {
+                    self.execute_checkpoint_restore_file(&call).await
+                }
+                Some(FirstPartyToolExecutor::CheckpointCheck) => {
+                    self.execute_checkpoint_check(&call).await
+                }
+                Some(FirstPartyToolExecutor::Graph) => self.execute_graph_tool(&call).await,
+                Some(FirstPartyToolExecutor::DiffContext) => self.execute_diff_context(&call).await,
+                Some(FirstPartyToolExecutor::PlanPatch) => self.execute_plan_patch(&call).await,
+                Some(FirstPartyToolExecutor::Glob) => self.execute_glob(&call, cancel).await,
+                Some(FirstPartyToolExecutor::Grep) => self.execute_grep(&call, cancel).await,
+                Some(FirstPartyToolExecutor::ReadFile) => self.execute_read_file(&call).await,
+                Some(FirstPartyToolExecutor::ReadToolOutput) => {
+                    self.execute_read_tool_output(&call).await
+                }
+                Some(FirstPartyToolExecutor::RefreshCompilerFacts) => {
                     self.execute_refresh_compiler_facts(&call, cancel, &group_id)
                         .await
                 }
-                "verify" => self.execute_verify(&call, cancel, &group_id).await,
-                "notebook_edit" => self.execute_notebook_edit(&call, &group_id).await,
-                "write_file" => self.execute_write_file(&call, &group_id).await,
-                "shell" => {
+                Some(FirstPartyToolExecutor::Verify) => {
+                    self.execute_verify(&call, cancel, &group_id).await
+                }
+                Some(FirstPartyToolExecutor::NotebookEdit) => {
+                    self.execute_notebook_edit(&call, &group_id).await
+                }
+                Some(FirstPartyToolExecutor::WriteFile) => {
+                    self.execute_write_file(&call, &group_id).await
+                }
+                Some(FirstPartyToolExecutor::Shell) => {
                     self.execute_shell(&call, cancel, &group_id, options.shell_ask_approver.clone())
                         .await
                 }
-                "webfetch" => self.execute_webfetch(&call, cancel).await,
-                "websearch" => self.execute_websearch(&call, cancel).await,
-                "mcp_list_resources" => self.execute_mcp_list_resources(&call, cancel).await,
-                "mcp_list_resource_templates" => {
+                Some(FirstPartyToolExecutor::Webfetch) => {
+                    self.execute_webfetch(&call, cancel).await
+                }
+                Some(FirstPartyToolExecutor::Websearch) => {
+                    self.execute_websearch(&call, cancel).await
+                }
+                Some(FirstPartyToolExecutor::McpListResources) => {
+                    self.execute_mcp_list_resources(&call, cancel).await
+                }
+                Some(FirstPartyToolExecutor::McpListResourceTemplates) => {
                     self.execute_mcp_list_resource_templates(&call, cancel)
                         .await
                 }
-                "mcp_read_resource" => self.execute_mcp_read_resource(&call, cancel).await,
-                "list_skills" => self.execute_list_skills(&call).await,
-                "load_skill" => self.execute_load_skill(&call).await,
-                "notes_remember" => self.execute_notes_remember(&call).await,
-                "notes_recall" => self.execute_notes_recall(&call).await,
-                "observations" => self.execute_observations(&call).await,
-                "memory" => self.execute_memory(&call).await,
-                _ => make_result(
+                Some(FirstPartyToolExecutor::McpReadResource) => {
+                    self.execute_mcp_read_resource(&call, cancel).await
+                }
+                Some(FirstPartyToolExecutor::ListSkills) => self.execute_list_skills(&call).await,
+                Some(FirstPartyToolExecutor::LoadSkill) => self.execute_load_skill(&call).await,
+                Some(FirstPartyToolExecutor::NotesRemember) => {
+                    self.execute_notes_remember(&call).await
+                }
+                Some(FirstPartyToolExecutor::NotesRecall) => self.execute_notes_recall(&call).await,
+                Some(FirstPartyToolExecutor::Observations) => {
+                    self.execute_observations(&call).await
+                }
+                Some(FirstPartyToolExecutor::Memory) => self.execute_memory(&call).await,
+                None => make_result(
                     &call,
                     ToolStatus::Error,
                     json!({ "error": format!("unknown tool: {}", call.name) }),

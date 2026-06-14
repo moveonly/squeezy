@@ -3729,6 +3729,24 @@ fn span_json(span: squeezy_core::SourceSpan) -> Value {
 }
 
 impl ToolRegistry {
+    pub(crate) fn is_graph_tool_name(name: &str) -> bool {
+        matches!(
+            name,
+            "repo_map"
+                | "decl_search"
+                | "definition_search"
+                | "reference_search"
+                | "upstream_flow"
+                | "downstream_flow"
+                | "symbol_context"
+                | "hierarchy"
+                | "inheritance_hierarchy"
+                | "impact"
+                | "symbol_at"
+                | "read_slice"
+        )
+    }
+
     pub(crate) async fn execute_graph_tool(&self, call: &ToolCall) -> ToolResult {
         let registry = self.clone();
         let call = call.clone();
