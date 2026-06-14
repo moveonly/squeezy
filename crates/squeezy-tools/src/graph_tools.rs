@@ -1181,10 +1181,58 @@ fn parse_symbol_kind_filter(value: &str) -> Option<SymbolKindFilter> {
     parse_symbol_kind(value).map(SymbolKindFilter::Single)
 }
 
+/// Split a possibly pipe-separated `kind` argument into its individual,
+/// trimmed, non-empty tokens (e.g. `"struct|enum|trait"` → three tokens).
+/// Returns `None` when no kind was supplied or every token is blank, so callers
+/// fall back to their existing single-kind / no-kind path. A single-valued kind
+/// yields a one-element vec, preserving the original behavior.
+fn split_kind_tokens(kind: Option<&str>) -> Option<Vec<&str>> {
+    let kind = kind?;
+    let tokens: Vec<&str> = kind
+        .split('|')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens)
+    }
+}
+
 fn single_symbol_kind(filter: Option<SymbolKindFilter>) -> Option<SymbolKind> {
     match filter {
         Some(SymbolKindFilter::Single(kind)) => Some(kind),
         _ => None,
+    }
+}
+
+/// Run a single-kind symbol search once per pipe-separated `kind` token and
+/// union the results, deduplicating by symbol id while preserving first-seen
+/// order. A `None`/single-token kind runs `search` exactly once (with the
+/// original argument), so the no-kind and single-kind paths are unchanged. This
+/// is how the multi-valued `kind` ("struct|enum|trait") matcher reuses the
+/// existing single-kind search instead of teaching the matcher about lists.
+fn multi_kind_symbol_union(
+    kind: Option<&str>,
+    mut search: impl FnMut(Option<&str>) -> Vec<GraphSymbol>,
+) -> Vec<GraphSymbol> {
+    match split_kind_tokens(kind) {
+        Some(tokens) if tokens.len() > 1 => {
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for token in tokens {
+                for symbol in search(Some(token)) {
+                    if seen.insert(symbol.id.clone()) {
+                        out.push(symbol);
+                    }
+                }
+            }
+            out
+        }
+        // No kind, a single token, or an all-blank kind: one pass with the
+        // original argument so trigram seeding and ranking are untouched.
+        _ => search(kind),
     }
 }
 
@@ -3766,27 +3814,40 @@ impl ToolRegistry {
                 .filter(|attr| attribute_has_inheritance_prefix(attr))
                 .map(seed_type_names)
         });
+        // `kind` is multi-valued: "struct|enum|trait" matches any of the listed
+        // kinds. Each pass reuses the existing single-kind search and the union
+        // dedups by id; a single-token / absent kind runs exactly one pass.
         let (symbols, closure_capped) = match transitive_seed {
-            Some(Some(seed_names)) if !seed_names.is_empty() => graph_transitive_subtype_closure(
-                graph,
-                args.query.as_deref(),
-                args.kind.as_deref(),
-                args.path.as_deref(),
-                args.language.as_deref(),
-                args.visibility.as_deref(),
-                &seed_names,
-                TRANSITIVE_CLOSURE_CAP,
-            ),
+            Some(Some(seed_names)) if !seed_names.is_empty() => {
+                let mut capped = false;
+                let symbols = multi_kind_symbol_union(args.kind.as_deref(), |kind| {
+                    let (symbols, pass_capped) = graph_transitive_subtype_closure(
+                        graph,
+                        args.query.as_deref(),
+                        kind,
+                        args.path.as_deref(),
+                        args.language.as_deref(),
+                        args.visibility.as_deref(),
+                        &seed_names,
+                        TRANSITIVE_CLOSURE_CAP,
+                    );
+                    capped |= pass_capped;
+                    symbols
+                });
+                (symbols, capped)
+            }
             _ => (
-                graph_symbol_search(
-                    graph,
-                    args.query.as_deref(),
-                    args.kind.as_deref(),
-                    args.path.as_deref(),
-                    args.language.as_deref(),
-                    args.visibility.as_deref(),
-                    args.attribute.as_deref(),
-                ),
+                multi_kind_symbol_union(args.kind.as_deref(), |kind| {
+                    graph_symbol_search(
+                        graph,
+                        args.query.as_deref(),
+                        kind,
+                        args.path.as_deref(),
+                        args.language.as_deref(),
+                        args.visibility.as_deref(),
+                        args.attribute.as_deref(),
+                    )
+                }),
                 false,
             ),
         };
@@ -3914,14 +3975,18 @@ impl ToolRegistry {
     ) -> ToolResult {
         let graph = manager.graph();
         let max_results = graph_limit(args.max_results);
-        let symbols = resolve_definition_candidates(
-            graph,
-            args.symbol_id.as_deref(),
-            args.query.as_deref(),
-            args.kind.as_deref(),
-            args.path.as_deref(),
-            args.language.as_deref(),
-        );
+        // `kind` is multi-valued ("struct|enum|trait"): resolve candidates once
+        // per kind token and union by id, reusing the single-kind resolver.
+        let symbols = multi_kind_symbol_union(args.kind.as_deref(), |kind| {
+            resolve_definition_candidates(
+                graph,
+                args.symbol_id.as_deref(),
+                args.query.as_deref(),
+                kind,
+                args.path.as_deref(),
+                args.language.as_deref(),
+            )
+        });
         let truncated = symbols.len() > max_results;
         let candidate_count = symbols.len();
         let selected = symbols.into_iter().take(max_results).collect::<Vec<_>>();
