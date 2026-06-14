@@ -305,7 +305,7 @@ fn php_symbol_from_node(
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
     scope: &PhpScope,
 ) -> Option<ParsedSymbol> {
-    let kind = match node.kind() {
+    let mut kind = match node.kind() {
         "class_declaration" => SymbolKind::Class,
         "interface_declaration" => SymbolKind::Interface,
         "trait_declaration" => SymbolKind::Trait,
@@ -336,6 +336,22 @@ fn php_symbol_from_node(
     }
     if matches!(kind, SymbolKind::Method) && name == "__destruct" {
         attributes.push("php:dtor".to_string());
+    }
+    // PHPUnit promotes a method to a `Test` symbol when it carries a `#[Test]`/
+    // `#[DataProvider]` attribute, is named `test*`, or lives in a `*Test.php`
+    // file / `TestCase`-derived class. Mirrors the C# `Fact`/`Test` promotion.
+    if matches!(kind, SymbolKind::Method)
+        && !is_php_magic_method(&name)
+        && php_is_test_method(
+            node,
+            &name,
+            &attributes_raw,
+            ctx.source,
+            &ctx.file.relative_path,
+        )
+    {
+        kind = SymbolKind::Test;
+        attributes.push("php:test".to_string());
     }
     if let Some(namespace) = scope.current_namespace() {
         attributes.push(format!("php:namespace:{namespace}"));
@@ -1638,6 +1654,65 @@ fn is_php_magic_method(name: &str) -> bool {
             | "__set_state"
             | "__debugInfo"
     )
+}
+
+fn php_is_test_method(
+    node: Node<'_>,
+    name: &str,
+    attributes_raw: &[String],
+    source: &str,
+    relative_path: &str,
+) -> bool {
+    // PHPUnit attribute markers (`#[Test]`, `#[DataProvider]`, `#[TestWith]`,
+    // `#[TestDox]`) are an unambiguous signal.
+    if attributes_raw.iter().any(|attribute| {
+        matches!(
+            php_attribute_head(attribute).as_str(),
+            "Test" | "DataProvider" | "TestWith" | "TestDox" | "Group" | "CoversClass"
+        )
+    }) {
+        return true;
+    }
+    // The classic `test*`-prefix convention, but only inside a test context
+    // (a `*Test.php` file or a `TestCase`-derived class) so a stray
+    // `testimony()` helper in production code is not misclassified.
+    php_method_name_is_test_prefixed(name)
+        && (php_is_test_filename(relative_path) || php_method_in_testcase_class(node, source))
+}
+
+fn php_method_name_is_test_prefixed(name: &str) -> bool {
+    // `test` followed by an uppercase letter or underscore — matches
+    // `testFoo`/`test_foo` but not `testimony`.
+    let Some(rest) = name.strip_prefix("test") else {
+        return false;
+    };
+    rest.chars()
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_uppercase())
+}
+
+fn php_is_test_filename(relative_path: &str) -> bool {
+    let file_name = relative_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(relative_path);
+    let stem = file_name.strip_suffix(".php").unwrap_or(file_name);
+    stem.ends_with("Test") || stem.ends_with("TestCase")
+}
+
+fn php_method_in_testcase_class(node: Node<'_>, source: &str) -> bool {
+    // Walk up to the enclosing class and check its base list for a
+    // `TestCase` ancestor (PHPUnit's base class, optionally namespaced).
+    let mut walker = node;
+    while let Some(parent) = walker.parent() {
+        if matches!(parent.kind(), "class_declaration" | "anonymous_class") {
+            return php_collect_base_types(parent, source)
+                .iter()
+                .any(|base| base == "TestCase");
+        }
+        walker = parent;
+    }
+    false
 }
 
 fn is_php_implicit_dispatch_target(name: &str) -> bool {
