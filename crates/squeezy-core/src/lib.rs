@@ -10924,6 +10924,59 @@ pub fn per_repo_settings_path(root: impl AsRef<Path>) -> PathBuf {
         .join("settings.toml")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigInitScope {
+    User,
+    Project,
+    Local,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigInitTarget {
+    pub path: PathBuf,
+    pub template: &'static str,
+}
+
+/// Resolves the settings file and starter template for `squeezy config init`.
+///
+/// The project and local scopes intentionally mirror runtime settings
+/// discovery: project init overwrites the nearest ancestor `squeezy.toml` when
+/// one exists, and local init hashes the project root rather than a nested CWD.
+pub fn config_init_target(scope: ConfigInitScope, cwd: impl AsRef<Path>) -> ConfigInitTarget {
+    match scope {
+        ConfigInitScope::User => ConfigInitTarget {
+            path: default_settings_path(),
+            template: user_settings_template(),
+        },
+        ConfigInitScope::Project => ConfigInitTarget {
+            path: project_settings_init_target(cwd),
+            template: project_settings_template(),
+        },
+        ConfigInitScope::Local => ConfigInitTarget {
+            path: per_repo_settings_path(settings_repo_root(cwd)),
+            template: local_settings_template(),
+        },
+    }
+}
+
+fn project_settings_init_target(cwd: impl AsRef<Path>) -> PathBuf {
+    let cwd = cwd.as_ref();
+    find_project_settings_path(cwd).unwrap_or_else(|| cwd.join(PROJECT_SETTINGS_FILE))
+}
+
+fn settings_repo_root(cwd: impl AsRef<Path>) -> PathBuf {
+    let cwd = cwd.as_ref();
+    let project_path = find_project_settings_path(cwd);
+    repo_root_for_project_settings(cwd, project_path.as_deref())
+}
+
+fn repo_root_for_project_settings(cwd: &Path, project_path: Option<&Path>) -> PathBuf {
+    project_path
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cwd.to_path_buf())
+}
+
 fn sanitize_repo_settings_name(name: &str) -> String {
     name.chars()
         .map(|ch| {
@@ -11624,11 +11677,7 @@ fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>, Vec<Con
     let user_path = default_settings_path();
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_path = find_project_settings_path(&cwd);
-    let repo_root = project_path
-        .as_deref()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or(cwd);
+    let repo_root = repo_root_for_project_settings(&cwd, project_path.as_deref());
     let repo_path = per_repo_settings_path(repo_root);
     let (settings, sources, mut warnings) = load_settings_from_paths(
         Some(user_path.as_path()),
@@ -11784,11 +11833,7 @@ pub fn load_separated_settings_sources() -> Result<SeparatedSources> {
     let user_path = default_settings_path();
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_path = find_project_settings_path(&cwd);
-    let repo_root = project_path
-        .as_deref()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| cwd.clone());
+    let repo_root = repo_root_for_project_settings(&cwd, project_path.as_deref());
     let repo_path = per_repo_settings_path(&repo_root);
 
     let user = load_tier_source(&user_path)?;
@@ -11942,11 +11987,7 @@ pub fn resolved_config_paths() -> ConfigPaths {
 
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let project_settings = find_project_settings_path(&cwd);
-    let repo_root = project_settings
-        .as_deref()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| cwd.clone());
+    let repo_root = repo_root_for_project_settings(&cwd, project_settings.as_deref());
     let repo_settings = per_repo_settings_path(&repo_root);
 
     let session_log_dir_env = env::var("SQUEEZY_SESSION_DIR")

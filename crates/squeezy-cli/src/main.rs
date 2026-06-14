@@ -19,11 +19,10 @@ use squeezy_agent::{
 };
 use squeezy_core::settings_writer::write_settings_atomic;
 use squeezy_core::{
-    AppConfig, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpServerConfig,
-    McpTransport, ModelProfile, OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode,
-    ReasoningEffort, SessionMode, SettingsFile, SqueezyError, default_settings_path,
-    find_project_settings_path, local_settings_template, per_repo_settings_path,
-    project_settings_template, user_settings_template,
+    AppConfig, ConfigInitScope, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION,
+    McpServerConfig, McpTransport, ModelProfile, OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE,
+    PermissionMode, ReasoningEffort, SessionMode, SettingsFile, SqueezyError, config_init_target,
+    default_settings_path, find_project_settings_path, per_repo_settings_path,
 };
 use squeezy_llm::{
     LlmProvider, ModelInfo, PROVIDERS, UnavailableProvider, capabilities_for,
@@ -1236,27 +1235,17 @@ fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_
             force,
             with_bundled_skills,
         }) => {
-            let (path, template) = if scope.user {
-                (default_settings_path(), user_settings_template())
+            let init_scope = if scope.user {
+                ConfigInitScope::User
             } else if scope.local {
-                // Mirror the logic in load_default_settings_sources: walk up to
-                // find squeezy.toml and use its parent as the canonical repo root.
-                // Using raw CWD would hash a different path than the runtime uses
-                // when the user is in a subdirectory of the repo.
-                let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                let repo_root = find_project_settings_path(&cwd)
-                    .as_deref()
-                    .and_then(|p| p.parent())
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or(cwd);
-                (
-                    per_repo_settings_path(&repo_root),
-                    local_settings_template(),
-                )
+                ConfigInitScope::Local
             } else {
-                let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                (project_init_target(cwd), project_settings_template())
+                ConfigInitScope::Project
             };
+            let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let target = config_init_target(init_scope, cwd);
+            let path = target.path;
+            let template = target.template;
             // Validate flag compatibility before any filesystem writes so a
             // bad combination never overwrites an existing file.
             if *with_bundled_skills && !scope.user {
@@ -5500,18 +5489,6 @@ fn telemetry_notice_path() -> PathBuf {
                 .map(|home| home.join(".squeezy/telemetry_notice"))
         })
         .unwrap_or_else(|| PathBuf::from(".squeezy/telemetry_notice"))
-}
-
-/// Resolves where `config init --project` writes its template.
-///
-/// Mirrors project-settings discovery so the write target and the
-/// overwrite guard refer to the file that loading would actually pick up:
-/// an existing ancestor `squeezy.toml` when one exists, otherwise
-/// `cwd/squeezy.toml`. This prevents writing a closer file from a
-/// subdirectory that would silently shadow the repo's real project config.
-fn project_init_target(cwd: impl AsRef<Path>) -> PathBuf {
-    let cwd = cwd.as_ref();
-    find_project_settings_path(cwd).unwrap_or_else(|| cwd.join(PROJECT_SETTINGS_FILE))
 }
 
 #[cfg(test)]

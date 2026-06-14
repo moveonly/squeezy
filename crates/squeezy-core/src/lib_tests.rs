@@ -6607,6 +6607,68 @@ fn repo_settings_id_is_deterministic_and_well_formed() {
     assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
+#[test]
+fn config_init_target_user_uses_default_settings_template() {
+    let target = config_init_target(ConfigInitScope::User, PathBuf::from("ignored"));
+
+    assert_eq!(target.path, default_settings_path());
+    assert_eq!(target.template, user_settings_template());
+}
+
+#[test]
+fn config_init_target_project_prefers_existing_ancestor() {
+    let root = std::env::temp_dir().join(format!(
+        "squeezy-config-init-project-{}-{}",
+        std::process::id(),
+        CONFIG_TEST_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let nested = root.join("workspace").join("src").join("bin");
+    fs::create_dir_all(&nested).expect("mkdir nested");
+    let project_path = root.join("workspace").join(PROJECT_SETTINGS_FILE);
+    fs::write(&project_path, "# project\n").expect("write project settings");
+
+    let target = config_init_target(ConfigInitScope::Project, &nested);
+
+    assert_eq!(target.path, project_path);
+    assert_eq!(target.template, project_settings_template());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn config_init_target_local_hashes_project_root_from_nested_cwd() {
+    let root = std::env::temp_dir().join(format!(
+        "squeezy-config-init-local-{}-{}",
+        std::process::id(),
+        CONFIG_TEST_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let repo = root.join("repo");
+    let nested = repo.join("crates").join("tool");
+    fs::create_dir_all(&nested).expect("mkdir nested");
+    fs::write(repo.join(PROJECT_SETTINGS_FILE), "# project\n").expect("write project settings");
+
+    let target = config_init_target(ConfigInitScope::Local, &nested);
+
+    assert_eq!(target.path, per_repo_settings_path(&repo));
+    assert_eq!(target.template, local_settings_template());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn config_init_target_local_uses_cwd_when_no_project_settings_exist() {
+    let root = std::env::temp_dir().join(format!(
+        "squeezy-config-init-local-no-project-{}-{}",
+        std::process::id(),
+        CONFIG_TEST_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&root).expect("mkdir root");
+
+    let target = config_init_target(ConfigInitScope::Local, &root);
+
+    assert_eq!(target.path, per_repo_settings_path(&root));
+    assert_eq!(target.template, local_settings_template());
+    let _ = fs::remove_dir_all(root);
+}
+
 #[cfg(windows)]
 #[test]
 fn repo_settings_id_windows_drive_letter_case_stable() {

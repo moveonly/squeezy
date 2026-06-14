@@ -1814,7 +1814,7 @@ fn project_init_target_resolves_ancestor_then_falls_back_to_cwd() {
     let sub = root.join("crates").join("foo");
     fs::create_dir_all(&sub).expect("mkdir sub");
     assert_eq!(
-        project_init_target(&sub),
+        config_init_target(ConfigInitScope::Project, &sub).path,
         sub.join(PROJECT_SETTINGS_FILE),
         "without an ancestor file, init writes into the current directory",
     );
@@ -1824,7 +1824,7 @@ fn project_init_target_resolves_ancestor_then_falls_back_to_cwd() {
     let root_settings = canonical_root.join(PROJECT_SETTINGS_FILE);
     fs::write(&root_settings, "[session]\nmode = \"plan\"\n").expect("write root settings");
     assert_eq!(
-        project_init_target(&sub),
+        config_init_target(ConfigInitScope::Project, &sub).path,
         root_settings,
         "with an ancestor file, init must target it rather than the subdirectory",
     );
