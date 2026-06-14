@@ -1108,8 +1108,30 @@ fn cargo_diagnostic_hit_json(hit: &CargoDiagnosticHit) -> Value {
 }
 
 fn graph_language_counts_json(graph: &squeezy_graph::SemanticGraph) -> Value {
+    graph_language_counts_scoped_json(graph, None, None)
+}
+
+/// Per-language file counts, optionally restricted to a `path` subtree and/or a
+/// single `language`. Used by `repo_map` so its coverage map reflects the same
+/// scope as its hierarchy when the caller narrows by path/language. Empty
+/// filters fall through to the whole-graph count.
+fn graph_language_counts_scoped_json(
+    graph: &squeezy_graph::SemanticGraph,
+    path: Option<&str>,
+    language: Option<&str>,
+) -> Value {
+    let path = path.map(str::trim).filter(|value| !value.is_empty());
+    let language = language.map(str::trim).filter(|value| !value.is_empty());
     let mut counts = BTreeMap::<&'static str, usize>::new();
     for file in graph.files.values() {
+        if let Some(path) = path
+            && !path_matches_filter(file.relative_path.as_str(), path)
+        {
+            continue;
+        }
+        if !file_language_matches(graph, &file.id, language) {
+            continue;
+        }
         *counts.entry(file.language.display_name()).or_default() += 1;
     }
     json!(counts)
@@ -3670,7 +3692,23 @@ impl ToolRegistry {
         let mut payload = graph_payload("repo_map", manager, refresh);
         payload.insert("max_depth".to_string(), json!(max_depth));
         payload.insert("stats".to_string(), graph_stats_json(graph));
-        payload.insert("languages".to_string(), graph_language_counts_json(graph));
+        // Coverage counts honor the same path/language scope as the hierarchy so
+        // a scoped `repo_map` reports the languages present in that subtree, not
+        // the whole workspace. The `stats` block stays whole-graph (its cargo /
+        // index aggregates are not file-scopable) and is tagged accordingly.
+        if path_filter.is_some() || language_filter.is_some() {
+            payload.insert(
+                "languages".to_string(),
+                graph_language_counts_scoped_json(graph, path_filter, language_filter),
+            );
+            payload.insert("scoped".to_string(), json!(true));
+            payload.insert(
+                "stats_scope".to_string(),
+                json!("whole_graph; languages restricted to path/language scope"),
+            );
+        } else {
+            payload.insert("languages".to_string(), graph_language_counts_json(graph));
+        }
         payload.insert("hierarchy".to_string(), json!(hierarchy));
         payload.insert("packets".to_string(), json!(packets));
         payload.insert("unsupported_files".to_string(), json!(unsupported));
