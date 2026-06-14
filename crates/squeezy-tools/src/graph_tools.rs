@@ -161,6 +161,11 @@ struct InheritanceHierarchyArgs {
     /// subtype walk is not available in a single tool call; issue multiple
     /// calls using the returned symbols as new roots.
     subtypes: Option<bool>,
+    /// When `true` and the resolved root is a member (Method/Field), return the
+    /// overrides/implementations of that member across transitive subtypes
+    /// instead of the type-to-type ancestor/subtype walk. Ignored (falls back to
+    /// the type walk) when the root is not a member.
+    member: Option<bool>,
     /// Maximum results (default 50).
     max_results: Option<usize>,
 }
@@ -4031,7 +4036,16 @@ impl ToolRegistry {
             );
         };
 
-        let related: Vec<GraphSymbol> = if subtypes {
+        // Member mode: when the root is a Method/Field and `member=true`, return
+        // the overrides/implementations of that member across subtypes instead
+        // of the type-to-type walk. A non-member root falls back to the type
+        // walk so the flag never dead-ends a mistargeted call.
+        let member_requested = args.member.unwrap_or(false);
+        let member_mode =
+            member_requested && matches!(root_sym.kind, SymbolKind::Method | SymbolKind::Field);
+        let related: Vec<GraphSymbol> = if member_mode {
+            graph.member_implementations(&root_sym.id)
+        } else if subtypes {
             graph.inheritance_direct_subtypes(&root_sym.id)
         } else {
             graph.inheritance_ancestors(&root_sym.id)
@@ -4045,13 +4059,17 @@ impl ToolRegistry {
             .map(|sym| symbol_packet(graph, sym, "inheritance_hierarchy", None))
             .collect();
 
+        let direction = if member_mode {
+            "member_implementations"
+        } else if subtypes {
+            "subtypes"
+        } else {
+            "supertypes"
+        };
         let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
         let mut payload = graph_payload("inheritance_hierarchy", manager, refresh);
         payload.insert("root".to_string(), symbol_json(graph, &root_sym));
-        payload.insert(
-            "direction".to_string(),
-            json!(if subtypes { "subtypes" } else { "supertypes" }),
-        );
+        payload.insert("direction".to_string(), json!(direction));
         payload.insert(
             "symbols".to_string(),
             json!(
