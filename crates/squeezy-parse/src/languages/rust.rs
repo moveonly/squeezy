@@ -139,6 +139,17 @@ pub(crate) fn symbol_from_node(
                 .map(|base| format!("base:{base}")),
         );
     }
+    // Record the impl's self-type and (optional) trait as queryable tokens so an
+    // inheritance-edge builder can emit Implements/Extends/InherentImpl/TraitImpl
+    // without re-parsing the impl header string on every query.
+    if kind == SymbolKind::Impl {
+        if let Some(self_type) = rust_impl_self_type(node, ctx.source) {
+            attributes.push(format!("impl-for:{self_type}"));
+        }
+        if let Some(trait_name) = rust_impl_trait(node, ctx.source) {
+            attributes.push(format!("impl-trait:{trait_name}"));
+        }
+    }
     attributes.sort();
     attributes.dedup();
 
@@ -1833,6 +1844,24 @@ fn rust_attribute_inner_paths(attribute: &str) -> Vec<String> {
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty())
         .collect()
+}
+
+/// The self-type of an `impl_item` (`impl Foo`, `impl Trait for Foo`), reduced
+/// to its final path segment with generics/refs stripped.
+pub(crate) fn rust_impl_self_type(node: Node<'_>, source: &str) -> Option<String> {
+    let type_node = node.child_by_field_name("type")?;
+    let raw = node_text(type_node, source).ok()?;
+    let name = rust_type_name_from_text(raw);
+    (!name.is_empty()).then_some(name)
+}
+
+/// The implemented trait of an `impl Trait for Type` block, reduced to its
+/// final path segment. `None` for inherent impls (`impl Foo { .. }`).
+pub(crate) fn rust_impl_trait(node: Node<'_>, source: &str) -> Option<String> {
+    let trait_node = node.child_by_field_name("trait")?;
+    let raw = node_text(trait_node, source).ok()?;
+    let name = rust_type_name_from_text(raw);
+    (!name.is_empty()).then_some(name)
 }
 
 /// Collect the supertrait names from a `trait_item`'s `bounds` field
