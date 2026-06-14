@@ -8,6 +8,17 @@ use std::sync::Mutex;
 // runner does not let them race.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+fn temp_workspace(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "squeezy-doctor-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ))
+}
+
 /// Point `SQUEEZY_CREDENTIALS_FILE` at a guaranteed-absent path so the
 /// credentials.json tier returns None and the developer's real
 /// `~/.squeezy/credentials.json` cannot shadow the env tier under test.
@@ -760,14 +771,7 @@ fn providers_check_treats_bedrock_and_ollama_as_keyless() {
 
 #[test]
 fn state_store_check_opens_redb_in_tempdir() {
-    let workspace = std::env::temp_dir().join(format!(
-        "squeezy-doctor-state-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let workspace = temp_workspace("state");
     let _ = fs::remove_dir_all(&workspace);
     fs::create_dir_all(&workspace).expect("create workspace");
     let mut config = AppConfig::from_env();
@@ -780,15 +784,35 @@ fn state_store_check_opens_redb_in_tempdir() {
 }
 
 #[test]
+fn state_store_check_warns_when_redb_is_already_open() {
+    let workspace = temp_workspace("state-locked");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let open_store = squeezy_store::SqueezyStore::open(&workspace, None).expect("open state store");
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+
+    let check = state_store_check(&config);
+
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("locked by another Squeezy process"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(
+        check.detail.contains("rerun after it exits"),
+        "detail: {}",
+        check.detail
+    );
+    drop(open_store);
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
 fn graph_store_check_reports_absent_without_creating_redb() {
-    let workspace = std::env::temp_dir().join(format!(
-        "squeezy-doctor-graph-absent-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let workspace = temp_workspace("graph-absent");
     let _ = fs::remove_dir_all(&workspace);
     fs::create_dir_all(&workspace).expect("create workspace");
     let mut config = AppConfig::from_env();
@@ -812,6 +836,10 @@ fn storage_error_hint_classifies_common_failures() {
         "likely lock contention"
     );
     assert_eq!(
+        storage_error_hint("Database already open. Cannot acquire lock."),
+        "likely lock contention"
+    );
+    assert_eq!(
         storage_error_hint("permission denied"),
         "likely permission problem"
     );
@@ -831,14 +859,7 @@ fn storage_error_hint_classifies_common_failures() {
 
 #[test]
 fn graph_store_check_opens_existing_redb_in_tempdir() {
-    let workspace = std::env::temp_dir().join(format!(
-        "squeezy-doctor-graph-existing-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let workspace = temp_workspace("graph-existing");
     let _ = fs::remove_dir_all(&workspace);
     fs::create_dir_all(&workspace).expect("create workspace");
     let store = squeezy_store::GraphStore::open(&workspace, None).expect("seed graph store");
@@ -850,6 +871,33 @@ fn graph_store_check_opens_existing_redb_in_tempdir() {
     let _ = fs::remove_dir_all(&workspace);
     assert_eq!(check.status, Status::Ok, "detail: {}", check.detail);
     assert!(check.detail.contains("readable"));
+}
+
+#[test]
+fn graph_store_check_warns_when_redb_is_already_open() {
+    let workspace = temp_workspace("graph-locked");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let open_store = squeezy_store::GraphStore::open(&workspace, None).expect("open graph store");
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+
+    let check = graph_store_check(&config);
+
+    assert_eq!(check.status, Status::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("locked by another Squeezy process"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(
+        check.detail.contains("rerun after it exits"),
+        "detail: {}",
+        check.detail
+    );
+    drop(open_store);
+    let _ = fs::remove_dir_all(&workspace);
 }
 
 #[test]
@@ -985,14 +1033,7 @@ fn cache_check_prune_preserves_storage_warning() {
 
 #[test]
 fn cache_check_storage_reports_paths_and_backup_age() {
-    let workspace = std::env::temp_dir().join(format!(
-        "squeezy-doctor-cache-storage-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let workspace = temp_workspace("cache-storage");
     let cache_dir = workspace.join(".squeezy").join("cache");
     fs::create_dir_all(&cache_dir).expect("create cache dir");
     let backup = cache_dir.join("schema-2-test.redb.bak");
@@ -1028,6 +1069,58 @@ fn cache_check_storage_reports_paths_and_backup_age() {
         "detail: {}",
         check.detail
     );
+}
+
+#[test]
+fn cache_check_storage_reports_locked_redb_without_raw_error() {
+    let workspace = temp_workspace("cache-locked");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let state_store =
+        squeezy_store::SqueezyStore::open(&workspace, None).expect("open state store");
+    let graph_store = squeezy_store::GraphStore::open(&workspace, None).expect("open graph store");
+    let mut config = AppConfig::from_env();
+    config.workspace_root = workspace.clone();
+    config.cache.root = None;
+
+    let check = cache_check(&config, false, true);
+
+    assert!(
+        check
+            .detail
+            .contains("state_stats=locked_by_another_squeezy_process"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(
+        check
+            .detail
+            .contains("graph_stats=locked_by_another_squeezy_process"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(
+        check
+            .detail
+            .contains("state.redb=locked_by_another_squeezy_process"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(
+        check
+            .detail
+            .contains("graph.redb=locked_by_another_squeezy_process"),
+        "detail: {}",
+        check.detail
+    );
+    assert!(
+        !check.detail.contains("Database already open"),
+        "detail: {}",
+        check.detail
+    );
+    drop(graph_store);
+    drop(state_store);
+    let _ = fs::remove_dir_all(&workspace);
 }
 
 #[cfg(unix)]
