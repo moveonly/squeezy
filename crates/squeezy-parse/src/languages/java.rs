@@ -46,6 +46,11 @@ pub(crate) fn visit_java_node(
         _ => {}
     }
 
+    if node.kind() == "module_declaration" {
+        extract_java_module(node, ctx);
+        return;
+    }
+
     if node.kind() == "field_declaration" {
         let symbols = java_field_symbols_from_node(node, ctx, parent_symbol.as_ref());
         if !symbols.is_empty() {
@@ -342,6 +347,84 @@ pub(crate) fn java_record_component_symbols(
         });
     }
     symbols
+}
+
+/// A Java 9 (JPMS) module declaration in `module-info.java`. Emit a `Module`
+/// symbol for the module itself and translate its directives into facts:
+/// `requires <module>` becomes a (named) `Imports` fact and
+/// `exports <package>` becomes a `Reexports` fact, so module-info contributes
+/// both a symbol and JPMS dependency edges. `opens`/`provides`/`uses` are left
+/// unmodelled for now.
+pub(crate) fn extract_java_module(node: Node<'_>, ctx: &mut ExtractContext<'_>) {
+    let Some(name) = node
+        .child_by_field_name("name")
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+    else {
+        return;
+    };
+    let span = span_from_node(node);
+    let body = node.child_by_field_name("body");
+    let id = symbol_id(&ctx.file, None, SymbolKind::Module, &name, span);
+    ctx.symbols.push(ParsedSymbol {
+        id: id.clone(),
+        file_id: ctx.file.id.clone(),
+        parent_id: None,
+        name,
+        kind: SymbolKind::Module,
+        language_identity: None,
+        span,
+        body_span: body.map(span_from_node),
+        signature_span: signature_span_from_nodes(node, body),
+        signature: signature_text(node, body, ctx.source),
+        visibility: None,
+        docs: java_docs_for_node(node, ctx.source),
+        attributes: vec!["java:module".to_string()],
+        provenance: Provenance::new("tree-sitter-java", "module declaration"),
+        confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+        arity: None,
+    });
+
+    let Some(body) = body else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for directive in body.named_children(&mut cursor) {
+        let (field, is_reexport, kind, provenance) = match directive.kind() {
+            "requires_module_directive" => {
+                ("module", false, ImportKind::Named, "module requires directive")
+            }
+            "exports_module_directive" => {
+                ("package", true, ImportKind::Unspecified, "module exports directive")
+            }
+            _ => continue,
+        };
+        let Some(path) = directive
+            .child_by_field_name(field)
+            .and_then(|child| node_text(child, ctx.source).ok())
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let imported_name = Some(last_path_segment(&path));
+        ctx.imports.push(ParsedImport {
+            file_id: ctx.file.id.clone(),
+            owner_id: Some(id.clone()),
+            path,
+            alias: None,
+            is_glob: false,
+            is_reexport,
+            is_static: false,
+            span: span_from_node(directive),
+            provenance: Provenance::new("tree-sitter-java", provenance),
+            kind,
+            imported_name,
+            is_global: false,
+        });
+    }
 }
 
 pub(crate) fn extract_java_package(node: Node<'_>, ctx: &mut ExtractContext<'_>) {
