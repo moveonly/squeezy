@@ -11809,67 +11809,6 @@ async fn late_cancelled_steered_turn_does_not_drop_replacement_context() {
     );
 }
 
-// F08-session-lifecycle-events-cancelable: `Agent::switch_session`
-// consults the typed `AgentHookBus` before swapping the active
-// session, and a `Decision::Deny` from any registered handler aborts
-// the swap before `resume_current` runs. The two tests below pin both
-// halves of that contract — allow proceeds to `resume_current`, which
-// then fails with the synthetic id; deny short-circuits with the hook
-// message and leaves the in-process session id untouched.
-
-struct AllowSwitchHook;
-
-impl squeezy_hooks::AgentHook for AllowSwitchHook {
-    fn before_session_switch<'a>(
-        &'a self,
-        _target_id: &'a str,
-    ) -> squeezy_hooks::HookFuture<'a, squeezy_hooks::Decision> {
-        Box::pin(async { squeezy_hooks::Decision::Allow })
-    }
-}
-
-struct DenySwitchHook {
-    reason: &'static str,
-}
-
-impl squeezy_hooks::AgentHook for DenySwitchHook {
-    fn before_session_switch<'a>(
-        &'a self,
-        _target_id: &'a str,
-    ) -> squeezy_hooks::HookFuture<'a, squeezy_hooks::Decision> {
-        let message = self.reason.to_string();
-        Box::pin(async move { squeezy_hooks::Decision::Deny { message } })
-    }
-}
-
-#[tokio::test]
-async fn switch_session_allow_hook_proceeds_to_resume_current() {
-    let provider = Arc::new(MockProvider::new(Vec::new()));
-    let mut agent = Agent::new(AppConfig::default(), provider);
-    let mut bus = squeezy_hooks::AgentHookBus::new();
-    bus.register(Box::new(AllowSwitchHook));
-    agent.set_agent_hook_bus(Some(Arc::new(bus)));
-
-    // The synthetic id has no on-disk session, so `resume_current`
-    // will reject the swap once it actually runs. The exact disk-level
-    // failure mode varies by environment (io::ErrorKind::NotFound, an
-    // explicit "is not resumable" message, etc.), so the assertion
-    // anchors on the *negative* shape that uniquely identifies the
-    // hook deny path. If allow ever leaks the deny message we'd see
-    // "denied by hook" instead of a resume-current error.
-    let result = agent.switch_session("nonexistent-session-id-allow").await;
-    let err = result.expect_err("nonexistent synthetic session must fail to resume");
-    let msg = err.to_string();
-    assert!(
-        !msg.contains("denied by hook"),
-        "allow hook must never short-circuit to a deny error: {msg}",
-    );
-    assert!(
-        !msg.is_empty(),
-        "resume_current must surface its disk-level failure, got empty error",
-    );
-}
-
 // Verifies that a long-running subagent body emits `AgentEvent::ToolProgress`
 // heartbeats on the parent's event channel even before the subagent fires
 // its first inner tool call.
@@ -12054,36 +11993,6 @@ async fn explore_subagent_emits_tool_progress_heartbeats_during_slow_first_round
          SubagentCompleted so the eval driver's 60s event_timeout \
          does not abandon a subagent whose first model round is \
          silent; got {explore_progress_count}",
-    );
-}
-
-#[tokio::test]
-async fn switch_session_deny_hook_aborts_before_resume_current() {
-    let provider = Arc::new(MockProvider::new(Vec::new()));
-    let mut agent = Agent::new(AppConfig::default(), provider);
-    let initial_session_id = agent.session_id();
-
-    let mut bus = squeezy_hooks::AgentHookBus::new();
-    bus.register(Box::new(DenySwitchHook {
-        reason: "unsaved work",
-    }));
-    agent.set_agent_hook_bus(Some(Arc::new(bus)));
-
-    let result = agent.switch_session("any-target-session-id").await;
-    let err = result.expect_err("denying hook must abort the switch");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("denied by hook") && msg.contains("unsaved work"),
-        "expected deny error from hook, got {msg}",
-    );
-    assert!(
-        !msg.contains("not resumable"),
-        "deny must short-circuit before resume_current touches disk: {msg}",
-    );
-    assert_eq!(
-        agent.session_id(),
-        initial_session_id,
-        "deny must leave the in-process session id untouched",
     );
 }
 

@@ -31,7 +31,7 @@ The internal hook enum includes these lifecycle events:
 ## Mutation Capabilities
 
 Two events support typed internal mutations. These mutations are applied by
-in-process handlers registered against the `AgentHookBus`, not by skill hook
+in-process handlers registered against the `HookRegistry`, not by skill hook
 scripts — skill hook script stdout is always ignored.
 
 **`PreTurn`** — an internal handler can return `extra_instructions` in its
