@@ -1369,7 +1369,8 @@ fn csharp_emit_primary_constructor_fields(
             signature_span: None,
             signature: node_text(parameter, ctx.source)
                 .ok()
-                .map(|text| text.trim().to_string()),
+                .map(|text| text.trim().to_string())
+                .unwrap_or_default(),
             visibility: Some("public".to_string()),
             docs: Vec::new(),
             attributes,

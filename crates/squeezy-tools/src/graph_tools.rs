@@ -4990,7 +4990,7 @@ impl ToolRegistry {
                     }
                 }
             }
-            let mut importer_files: Vec<&squeezy_graph::FileRecord> = importers
+            let mut importer_files: Vec<&squeezy_workspace::FileRecord> = importers
                 .iter()
                 .filter_map(|fid| graph.files.get(fid))
                 .collect();
