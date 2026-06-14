@@ -2,11 +2,13 @@ id = "wave2-01-startup-banner-and-card-anthropic"
 title = "Wave-2 / domain 01 — startup banner + card on Anthropic claude-haiku-4-5"
 description = """
 Wave-2 row 01 (startup-banner-and-card) cross-provider companion to
-the OpenAI scenario. Probes the first-frame banner against Anthropic
-Haiku 4.5 to detect cross-model rendering regressions in
-`startup_card_lines` (`crates/squeezy-tui/src/lib.rs:5504`). All three
-provider scenarios use the same `tui_frame_contains` shape so a
-divergence is itself the finding.
+the OpenAI scenario. Probes the first-frame banner strip against
+Anthropic Haiku 4.5 to detect cross-model rendering regressions in
+`startup_phase_strip`/`startup_card_lines`. The provider/model and
+language summary now render on the live status line
+(`render_status_detail_line`), not the card. All three provider
+scenarios use the same `tui_frame_contains` shape so a divergence is
+itself the finding.
 
 Requires `ANTHROPIC_API_KEY` exported in the shell. Run with:
 
@@ -38,13 +40,16 @@ kind = "prompt"
 text = "Say 'ok' and stop."
 wait_for = "turn_completed"
 
+# Banner identity: the "Squeezy v<version>" header in the phase strip.
 [[steps]]
 kind = "action"
 action = "assert"
 [steps.check]
 kind = "tui_frame_contains"
-text = ">_ Squeezy v"
+text = "Squeezy v"
 
+# Provider + model: the status line's ProviderAndModel item echoes the
+# configured pair exactly.
 [[steps]]
 kind = "action"
 action = "assert"
@@ -52,19 +57,14 @@ action = "assert"
 kind = "tui_frame_contains"
 text = "anthropic:claude-haiku-4-5-20251001"
 
+# Language summary accuracy: the status line carries the resolved
+# language summary value (this repo is Rust), not a "languages" label.
 [[steps]]
 kind = "action"
 action = "assert"
 [steps.check]
 kind = "tui_frame_contains"
-text = "languages"
-
-[[steps]]
-kind = "action"
-action = "assert"
-[steps.check]
-kind = "tui_frame_contains"
-text = "directory"
+text = "Rust"
 
 [expect]
 max_wall_clock_seconds = 90
