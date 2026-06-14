@@ -4298,7 +4298,12 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                     return true;
                 }
             }
-            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+            MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                if app
+                    .selection
+                    .as_ref()
+                    .is_some_and(|s| s.surface == selection::SelectionSurface::Main) =>
+            {
                 // Release ends a drag; a bare click (collapsed cell selection)
                 // leaves no selection so a single click doesn't paint a 1-cell
                 // highlight. A non-empty selection copies on release when
@@ -4307,13 +4312,12 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                 // add-to-set / save-snippet verbs still have a live range;
                 // the explicit copy chords (Ctrl+C, ⌘C, Ctrl+Shift+C) remain
                 // the clear-on-copy paths.
-                if finish_surface_selection_release(
+                finish_surface_selection_release(
                     app,
                     selection::SelectionSurface::Main,
                     app.copy_on_select,
-                ) {
-                    return true;
-                }
+                );
+                return true;
             }
             _ => {}
         }
