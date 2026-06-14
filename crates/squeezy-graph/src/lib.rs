@@ -420,6 +420,13 @@ pub struct SemanticGraph {
     body_hit_text_lower: Vec<String>,
     body_hit_trigram_index: HashMap<[u8; 3], Vec<usize>>,
     body_hit_trigram_indexed: bool,
+    /// Fingerprint of the `body_hits` text used to build the current
+    /// `body_hit_text_lower` / `body_hit_trigram_index`. `rebuild_indexes`
+    /// recomputes this from `body_hits` and, when it matches, skips the
+    /// per-hit `to_lowercase()` re-allocation and the trigram rebuild — the
+    /// dominant index-rebuild cost on body-hit-heavy repos when a refresh did
+    /// not actually change any body hit. `None` forces a rebuild.
+    body_hits_fingerprint: Option<u64>,
     references_by_text: HashMap<String, Vec<usize>>,
     children_by_parent: HashMap<SymbolId, Vec<SymbolId>>,
     edges_by_from: HashMap<SymbolId, Vec<usize>>,
@@ -551,6 +558,7 @@ impl SemanticGraph {
             body_hit_text_lower: Vec::new(),
             body_hit_trigram_index: HashMap::new(),
             body_hit_trigram_indexed: true,
+            body_hits_fingerprint: None,
             references_by_text: HashMap::new(),
             children_by_parent: HashMap::new(),
             edges_by_from: HashMap::new(),
@@ -1875,8 +1883,6 @@ impl SemanticGraph {
         self.symbols_by_name.clear();
         self.symbol_signature_lower.clear();
         self.signature_trigram_index.clear();
-        self.body_hit_text_lower.clear();
-        self.body_hit_trigram_index.clear();
         self.references_by_text.clear();
         self.children_by_parent.clear();
         self.edges_by_from.clear();
@@ -1885,6 +1891,19 @@ impl SemanticGraph {
         self.files_by_normalized_id.clear();
         self.case_collisions.clear();
         self.rebuild_import_indexes();
+
+        // Decide up front whether the body-hit lowercase shadow + trigram index
+        // can be reused. They are a pure function of the ordered `body_hits`
+        // text, so an unchanged fingerprint (and a still-aligned shadow vector)
+        // means the existing index is exact and the costly per-hit lowercasing
+        // can be skipped entirely. Only clear them when we will actually rebuild.
+        let body_fingerprint = body_hits_fingerprint(&self.body_hits);
+        let body_hits_unchanged = self.body_hits_fingerprint == Some(body_fingerprint)
+            && self.body_hit_text_lower.len() == self.body_hits.len();
+        if !body_hits_unchanged {
+            self.body_hit_text_lower.clear();
+            self.body_hit_trigram_index.clear();
+        }
 
         // Build a lowercase path → FileId index for O(1) case-insensitive
         // lookups and detect case collisions that indicate Windows casing drift.
@@ -1903,7 +1922,6 @@ impl SemanticGraph {
 
         self.symbols_by_name.reserve(self.symbols.len());
         self.symbol_signature_lower.reserve(self.symbols.len());
-        self.body_hit_text_lower.reserve(self.body_hits.len());
         self.references_by_text.reserve(self.references.len());
         self.children_by_parent.reserve(self.symbols.len());
         self.edges_by_from.reserve(self.edges.len());
@@ -1935,22 +1953,29 @@ impl SemanticGraph {
         // Body hits can dominate huge Java/Go repositories. Build the trigram
         // index only when total hit volume is small enough; otherwise
         // body_search falls back to a direct scan so cold graph builds stay
-        // cheap on million-hit corpora.
-        self.body_hit_text_lower = self
-            .body_hits
-            .iter()
-            .map(|hit| hit.text.to_lowercase())
-            .collect();
-        self.body_hit_trigram_indexed = self.body_hits.len() <= BODY_HIT_TRIGRAM_INDEX_MAX_HITS;
-        if self.body_hit_trigram_indexed {
-            for (index, lower) in self.body_hit_text_lower.iter().enumerate() {
-                for trigram in unique_trigrams(lower) {
-                    self.body_hit_trigram_index
-                        .entry(trigram)
-                        .or_default()
-                        .push(index);
+        // cheap on million-hit corpora. Skip the whole section when the body
+        // hits are byte-identical to the last rebuild (the common no-op /
+        // metadata-only refresh): the existing shadow vector and trigram index
+        // are already exact.
+        if !body_hits_unchanged {
+            self.body_hit_text_lower = self
+                .body_hits
+                .iter()
+                .map(|hit| hit.text.to_lowercase())
+                .collect();
+            self.body_hit_trigram_indexed =
+                self.body_hits.len() <= BODY_HIT_TRIGRAM_INDEX_MAX_HITS;
+            if self.body_hit_trigram_indexed {
+                for (index, lower) in self.body_hit_text_lower.iter().enumerate() {
+                    for trigram in unique_trigrams(lower) {
+                        self.body_hit_trigram_index
+                            .entry(trigram)
+                            .or_default()
+                            .push(index);
+                    }
                 }
             }
+            self.body_hits_fingerprint = Some(body_fingerprint);
         }
 
         for (index, reference) in self.references.iter().enumerate() {
@@ -2386,6 +2411,21 @@ fn unique_trigrams(text: &str) -> BTreeSet<[u8; 3]> {
         .windows(3)
         .map(|window| [window[0], window[1], window[2]])
         .collect()
+}
+
+/// Fingerprint the ordered `body_hits` text so `rebuild_indexes` can detect a
+/// no-op refresh and reuse the existing lowercase shadow + trigram index. The
+/// fingerprint covers only what those indexes derive from: the hit count and
+/// each hit's text in order. Used only for within-process equality, so the
+/// non-deterministic `DefaultHasher` seed is fine.
+fn body_hits_fingerprint(body_hits: &[BodyHit]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body_hits.len().hash(&mut hasher);
+    for hit in body_hits {
+        hit.text.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[derive(Debug, Clone)]
