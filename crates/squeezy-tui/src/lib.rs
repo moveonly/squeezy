@@ -237,7 +237,7 @@ use input::{
 
 use notification::DesktopNotifier;
 use render::palette::{self, blend_color};
-pub(crate) use terminal_guard::TerminalGuard;
+pub(crate) use terminal_guard::{DrawStatus, TerminalGuard};
 use toast::ToastQueue;
 
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1_000;
@@ -1312,7 +1312,10 @@ async fn run_inner_with_terminal(
             );
             // Best-effort recovery: a failure here just leaves the stall for the
             // next iteration to retry, so never propagate it as a loop error.
-            let recovered = terminal.force_full_redraw(&mut app).is_ok();
+            let recovered = matches!(
+                terminal.force_full_redraw(&mut app),
+                Ok(DrawStatus::Committed)
+            );
             app.render_health.note_recovery(now);
             if recovered {
                 // The forced redraw committed a fresh frame, so catch the drawn
@@ -1333,21 +1336,24 @@ async fn run_inner_with_terminal(
                     toast::ToastVariant::Warning,
                 );
             }
-            // The forced redraw committed the frame, so the normal gate below
-            // should not immediately repaint on top of it.
-            app.needs_redraw = false;
+            // Only a committed recovery frame caught the display up. If the
+            // terminal is still backpressured, keep the dirty bit set so a later
+            // writable tick repaints the missed state.
+            app.needs_redraw = !recovered;
             frame_limiter.mark_emitted(now);
         }
         if wants_draw && frame_limiter.allow(now) {
-            terminal.draw_app(&mut app)?;
-            app.needs_redraw = false;
+            let draw_status = terminal.draw_app(&mut app)?;
+            app.needs_redraw = draw_status == DrawStatus::Backpressured;
             frame_limiter.mark_emitted(now);
             // The last-known-good layout store held the screen usable through a
             // degenerate frame this session. Surface that once — a single quiet
             // toast on the first substitution, then silence — so a user hitting a
             // sub-usable size or a resize storm gets one glance-able signal that
             // stability is being actively held, without nagging on every frame.
-            if app.layout_fallback.take_first_fallback_notice() {
+            if draw_status == DrawStatus::Committed
+                && app.layout_fallback.take_first_fallback_notice()
+            {
                 app.toasts.push(
                     "Recovered the layout — restored the last good frame.",
                     toast::ToastVariant::Info,
@@ -1357,9 +1363,11 @@ async fn run_inner_with_terminal(
             // up to the state revision and the stall clock resets. The frame
             // ordinal is the cheap per-frame signature — already stamped by
             // `draw_app` — so the watchdog never recomputes a buffer hash.
-            app.render_health
-                .record_frame_committed(now, app.render_metrics.get().frame);
-            if !interactive_marked {
+            if draw_status == DrawStatus::Committed {
+                app.render_health
+                    .record_frame_committed(now, app.render_metrics.get().frame);
+            }
+            if draw_status == DrawStatus::Committed && !interactive_marked {
                 interactive_marked = true;
                 squeezy_core::startup_trace::mark("interactive_ready");
                 agent.record_startup_ready_telemetry(

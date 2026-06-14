@@ -66,6 +66,11 @@ pub(crate) enum WriterKind {
         sink: Arc<Mutex<Vec<u8>>>,
         on_write: ProbeCallback,
     },
+    /// Test-only sink that simulates a terminal whose pty cannot accept more
+    /// bytes right now. This pins the production contract that render
+    /// backpressure is a skipped frame, not a wedged UI loop.
+    #[cfg(test)]
+    WouldBlock,
 }
 
 /// Sink used as the crossterm backend writer for the TUI. Owns the
@@ -132,6 +137,14 @@ impl TerminalWriter {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn would_block() -> Self {
+        Self {
+            kind: WriterKind::WouldBlock,
+            counter: None,
+        }
+    }
+
     /// Install the shared per-frame [`ByteCounter`] so every subsequent write
     /// increments it. Called once by the `TerminalGuard` after construction;
     /// the guard keeps the other end of the `Arc` to sample bytes-per-frame.
@@ -174,6 +187,13 @@ impl Write for TerminalWriter {
                 on_write(buf);
                 buf.len()
             }
+            #[cfg(test)]
+            WriterKind::WouldBlock => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "terminal output backpressure",
+                ));
+            }
         };
         // Count exactly the bytes the sink accepted (so a short stdout write is
         // reflected). Relaxed: this is a per-frame statistic, never a
@@ -197,6 +217,11 @@ impl Write for TerminalWriter {
             WriterKind::Capture { .. } => Ok(()),
             #[cfg(test)]
             WriterKind::CaptureProbe { .. } => Ok(()),
+            #[cfg(test)]
+            WriterKind::WouldBlock => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "terminal output backpressure",
+            )),
         }
     }
 }
