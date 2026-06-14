@@ -187,6 +187,10 @@ pub(crate) fn visit_kotlin_node(
             extract_kotlin_call_expression(node, ctx, owner_symbol.clone());
             visit_kotlin_children(node, ctx, parent_symbol, owner_symbol);
         }
+        "infix_expression" => {
+            extract_kotlin_infix_expression(node, ctx, owner_symbol.clone());
+            visit_kotlin_children(node, ctx, parent_symbol, owner_symbol);
+        }
         "constructor_invocation" => {
             extract_kotlin_constructor_invocation(node, ctx, owner_symbol.clone());
             visit_kotlin_children(node, ctx, parent_symbol, owner_symbol);
@@ -1100,6 +1104,59 @@ pub(crate) fn extract_kotlin_call_expression(
         kind: call_kind,
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-kotlin", "call_expression"),
+        confidence: Confidence::CandidateSet,
+    });
+    extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+}
+
+/// Kotlin infix calls (`a to b`, `x shl 1`, `1 until n`, custom `infix fun`s)
+/// parse as `infix_expression` with three positional named children:
+/// `<left expression> <operator identifier> <right expression>`. The node has
+/// no field names, so we select children by position. We emit a single
+/// `ParsedCall` (kind `Method`, name = operator identifier, receiver = the
+/// left operand text) mirroring `scala.rs`'s `infix_expression` handling.
+pub(crate) fn extract_kotlin_infix_expression(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let left = node.named_child(0);
+    let operator = node.named_child(1);
+    let Some(operator) = operator else {
+        return;
+    };
+    // The operator must be a bare `identifier`; `is`/`in`/`!is`/`!in` and the
+    // range/elvis operators are not infix-function identifiers and either
+    // surface under different node kinds or are anonymous tokens.
+    if operator.kind() != "identifier" {
+        return;
+    }
+    let name = node_text(operator, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if name.is_empty() || is_kotlin_keyword(&name) {
+        return;
+    }
+    let receiver = left
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let raw = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name,
+        target_text: raw,
+        receiver,
+        // An infix call passes exactly one argument (the right operand).
+        arity: 1,
+        kind: ParsedCallKind::Method,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-kotlin", "infix_expression"),
         confidence: Confidence::CandidateSet,
     });
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
