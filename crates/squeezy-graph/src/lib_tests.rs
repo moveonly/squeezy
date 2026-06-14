@@ -8833,6 +8833,69 @@ class Two {
 }
 
 class Caller {
+    run(thing) {
+        return thing.bar(1);
+    }
+}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&record, fs::read_to_string(&record.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let run = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Caller.run should be indexed");
+    let one_bar = graph
+        .find_symbol_by_name("bar")
+        .into_iter()
+        .find(|symbol| {
+            symbol
+                .parent_id
+                .as_ref()
+                .and_then(|id| graph.symbols.get(id))
+                .map(|parent| parent.name == "One")
+                .unwrap_or(false)
+        })
+        .expect("One.bar should be indexed");
+
+    let call_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == run.id && edge.kind == EdgeKind::Calls)
+        .expect("expected a Calls edge from Caller.run for thing.bar(1)");
+    // With an explicit non-self receiver and no type/import signal (the param
+    // `thing` is untyped), the arity shortcut must not fire: `thing.bar(1)` is
+    // left unresolved rather than forging a hard edge to the lone arity-1 `bar`.
+    assert_ne!(
+        call_edge.to.as_ref(),
+        Some(&one_bar.id),
+        "thing.bar(1) must not bind to One.bar purely via arity uniqueness (reason={})",
+        call_edge.provenance.reason,
+    );
+}
+
+/// Language-ROI (JS/TS): when the receiver IS typed, the new TS typed-receiver
+/// resolver binds `thing.bar(1)` to the method on the annotated class — the
+/// exact case the arity-guard test above deliberately leaves untyped.
+#[test]
+fn graph_ts_typed_receiver_binds_method_on_annotated_class() {
+    let mut parser = LanguageParser::new().unwrap();
+    let record = ts_record(
+        "src/typed.ts",
+        r#"
+class One {
+    bar(value: number) { return value; }
+}
+
+class Two {
+    bar(left: number, right: number) { return left + right; }
+}
+
+class Caller {
     run(thing: One) {
         return thing.bar(1);
     }
@@ -8867,13 +8930,10 @@ class Caller {
         .iter()
         .find(|edge| edge.from == run.id && edge.kind == EdgeKind::Calls)
         .expect("expected a Calls edge from Caller.run for thing.bar(1)");
-    // With an explicit non-self receiver and no type/import signal, the arity
-    // shortcut must not fire: `thing.bar(1)` is left unresolved rather than
-    // forging a hard edge to the lone arity-1 `bar`.
-    assert_ne!(
+    assert_eq!(
         call_edge.to.as_ref(),
         Some(&one_bar.id),
-        "thing.bar(1) must not bind to One.bar purely via arity uniqueness (reason={})",
+        "thing.bar(1) with `thing: One` must bind to One.bar via the type annotation (reason={})",
         call_edge.provenance.reason,
     );
 }
