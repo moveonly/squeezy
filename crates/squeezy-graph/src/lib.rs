@@ -1280,6 +1280,18 @@ impl SemanticGraph {
             .filter_map(|index| self.edges.get(*index))
     }
 
+    /// Public read over the reverse-import index: the files that directly
+    /// import `file_id` (one hop, no transitive propagation). Returns an empty
+    /// `Vec` when nothing imports the file. This is the single-file dual of the
+    /// impact computation in [`Self::compute_impact`]; callers that want the
+    /// transitive downstream set should feed the result back through that.
+    pub fn direct_importers(&self, file_id: &FileId) -> Vec<FileId> {
+        self.importers_by_file
+            .get(file_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn callees(&self, caller: &SymbolId) -> Vec<CallEdgeHit> {
         self.edges_by_from
             .get(caller)
