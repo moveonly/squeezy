@@ -445,6 +445,13 @@ fn swift_property_symbols_from_node(
     if let Some(field_type) = swift_property_type(node, ctx.source) {
         attributes.push(format!("type:{field_type}"));
     }
+    // `lazy` parses as a `property_behavior_modifier`. The grammar may place it
+    // inside the `modifiers` node (handled by `swift_attributes_for_node`) or
+    // directly under the `property_declaration`; cover the direct-child case so
+    // `lazy var` reliably carries `swift:lazy`, consistent with weak/unowned.
+    if swift_has_named_child_kind(node, "property_behavior_modifier") {
+        attributes.push("swift:lazy".to_string());
+    }
     if node.child_by_field_name("computed_value").is_some()
         || node.kind() == "protocol_property_declaration"
     {
@@ -865,6 +872,13 @@ fn swift_modifiers_node(node: Node<'_>) -> Option<Node<'_>> {
         .find(|child| child.kind() == "modifiers")
 }
 
+/// True when `node` has a direct named child of the given kind.
+fn swift_has_named_child_kind(node: Node<'_>, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == kind)
+}
+
 fn swift_async_modifier(node: Node<'_>, source: &str) -> bool {
     swift_has_keyword_child(node, source, "async")
 }
@@ -921,6 +935,7 @@ fn swift_attributes_for_node(node: Node<'_>, source: &str) -> Vec<String> {
             | "mutation_modifier"
             | "ownership_modifier"
             | "property_modifier"
+            | "property_behavior_modifier"
             | "member_modifier"
             | "function_modifier" => {
                 if let Ok(text) = node_text(child, source) {
