@@ -41,13 +41,23 @@ pub(crate) struct SymbolContextArgs {
     path: Option<String>,
     diff_only: Option<bool>,
     mode: Option<DiffMode>,
+    /// Restrict resolved symbols to a single language. See `language_matches`.
+    language: Option<String>,
+    /// Filter result packets to symbols in test code only / excluding tests.
+    exclude_tests: Option<bool>,
+    tests_only: Option<bool>,
     max_references: Option<usize>,
     max_results: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepoMapArgs {
+    /// Restrict the map to roots whose declaring file is under this path scope.
+    path: Option<String>,
+    /// Restrict the map to roots in a single language.
+    language: Option<String>,
     max_depth: Option<usize>,
     max_files: Option<usize>,
 }
@@ -73,6 +83,10 @@ struct DeclSearchArgs {
     /// considered "used" and excluded. Defaults to 0 (strictly zero inbound
     /// edges). Lets a caller surface near-dead declarations (e.g. used once).
     max_callers: Option<usize>,
+    /// Drop test-code declarations from the result (see `path_is_test`).
+    exclude_tests: Option<bool>,
+    /// Keep ONLY test-code declarations. Wins over `exclude_tests` when both set.
+    tests_only: Option<bool>,
     max_results: Option<usize>,
     offset: Option<usize>,
 }
@@ -95,6 +109,14 @@ struct ReferenceSearchArgs {
     text: Option<String>,
     symbol_id: Option<String>,
     path: Option<String>,
+    /// Restrict reference hits to a single language (matched against the
+    /// declaring file of each hit). See `language_matches`.
+    language: Option<String>,
+    /// Restrict to a reference kind (e.g. `call`, `import`); see
+    /// `reference_kind_matches`.
+    reference_kind: Option<String>,
+    exclude_tests: Option<bool>,
+    tests_only: Option<bool>,
     max_results: Option<usize>,
     offset: Option<usize>,
 }
@@ -106,10 +128,20 @@ struct FlowArgs {
     query: Option<String>,
     kind: Option<String>,
     path: Option<String>,
+    /// Restrict the resolved root (when resolved by query) to a single language.
+    language: Option<String>,
+    /// Restrict result packets to a single edge kind
+    /// (`Calls`|`References`|`Imports`|`Reexports`); see `edge_kind_matches`.
+    edge_kind: Option<String>,
+    /// Filter the RESULT packets (not just the root) to this path scope.
+    result_path: Option<String>,
+    exclude_tests: Option<bool>,
+    tests_only: Option<bool>,
     target_symbol_id: Option<String>,
     target_query: Option<String>,
     max_depth: Option<usize>,
     max_results: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,8 +151,15 @@ struct HierarchyArgs {
     query: Option<String>,
     kind: Option<String>,
     path: Option<String>,
+    /// Restrict the resolved root (when resolved by query) to a single language.
+    language: Option<String>,
+    /// Filter the RESULT nodes (not just the root) to this path scope.
+    result_path: Option<String>,
+    exclude_tests: Option<bool>,
+    tests_only: Option<bool>,
     max_depth: Option<usize>,
     max_results: Option<usize>,
+    offset: Option<usize>,
 }
 
 /// Arguments for the `impact` graph tool. Accepts a symbol, a file path, or
@@ -142,6 +181,11 @@ struct ImpactArgs {
     /// `affected_symbols`/`affected_tests` computation entirely. Defaults to
     /// `false` (the full transitive impact).
     direct_only: Option<bool>,
+    /// Restrict the affected-symbol packets to a single language.
+    language: Option<String>,
+    /// Drop / keep-only test-code symbols among the affected set.
+    exclude_tests: Option<bool>,
+    tests_only: Option<bool>,
     /// Maximum number of affected symbols to return (default 50).
     max_results: Option<usize>,
 }
@@ -1581,6 +1625,147 @@ fn decl_counts_by_kind(symbols: &[GraphSymbol]) -> Value {
     json!(counts)
 }
 
+/// True when a path looks like test code. Recognises the common per-language
+/// conventions: a `test`/`tests`/`__tests__`/`spec`/`testing` directory
+/// segment, or a file name ending in a test/spec suffix
+/// (`_test`/`_tests`/`.test`/`.spec`/`Test`/`Tests`/`Spec`). Used by the
+/// `exclude_tests`/`tests_only` scoping shared across the read tools.
+fn path_is_test(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let dir_marker = lower.split('/').any(|segment| {
+        matches!(
+            segment,
+            "test" | "tests" | "__tests__" | "spec" | "specs" | "testing"
+        )
+    });
+    if dir_marker {
+        return true;
+    }
+    let file = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    // Strip a trailing extension so `foo_test.rs` / `foo.test.ts` both match.
+    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
+    stem.ends_with("_test")
+        || stem.ends_with("_tests")
+        || stem.ends_with(".test")
+        || stem.ends_with(".spec")
+        || stem.ends_with("test")
+        || stem.ends_with("tests")
+        || stem.ends_with("spec")
+}
+
+/// True when a symbol is part of test code: either its kind is `Test` or its
+/// declaring file path looks like test code (see [`path_is_test`]).
+fn symbol_is_test(symbol: &GraphSymbol) -> bool {
+    symbol.kind == SymbolKind::Test || path_is_test(symbol.file_id.0.as_str())
+}
+
+/// Apply an `exclude_tests`/`tests_only` pair to a test-ness verdict. When both
+/// are set, `tests_only` wins (the more specific request). Returns whether the
+/// item should be KEPT.
+fn passes_test_scope(is_test: bool, exclude_tests: bool, tests_only: bool) -> bool {
+    if tests_only {
+        is_test
+    } else if exclude_tests {
+        !is_test
+    } else {
+        true
+    }
+}
+
+/// Parse an `edge_kind` filter token to an [`EdgeKind`]. Accepts the
+/// case-insensitive names the flow/symbol_context tools advertise:
+/// `calls`/`references`/`imports`/`reexports`. Returns `None` for anything
+/// else so an unknown token is treated as "no filter" by the caller.
+fn parse_edge_kind_filter(value: &str) -> Option<EdgeKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "calls" | "call" => Some(EdgeKind::Calls),
+        "references" | "reference" | "ref" => Some(EdgeKind::References),
+        "imports" | "import" => Some(EdgeKind::Imports),
+        "reexports" | "reexport" | "re-export" => Some(EdgeKind::Reexports),
+        _ => None,
+    }
+}
+
+/// True when a result packet's `edge.kind` matches the requested edge kind.
+/// Packets that carry no `edge` body (pure symbol/reference packets) are kept
+/// only when no edge-kind filter is active — an edge-kind filter is meaningful
+/// only for edge-bearing packets, so a `reference`/`symbol` packet is dropped
+/// when the caller asked for a specific edge kind.
+fn packet_matches_edge_kind(packet: &Value, want: Option<EdgeKind>) -> bool {
+    let Some(want) = want else {
+        return true;
+    };
+    let want_label = format!("{want:?}");
+    packet
+        .get("edge")
+        .and_then(|edge| edge.get("kind"))
+        .and_then(Value::as_str)
+        .map(|kind| kind == want_label)
+        .unwrap_or(false)
+}
+
+/// Best-effort extraction of the workspace-relative path a result packet points
+/// at, for the `result_path` filter on the flow/hierarchy/symbol_context tools.
+/// Looks at the packet bodies these tools emit: `symbol.path`, `reference.path`,
+/// the first `spans[].path`, and (for edge packets) the `edge.from` symbol's
+/// file via the `spans` entry. Returns `None` when no path can be determined.
+fn packet_path(packet: &Value) -> Option<&str> {
+    if let Some(path) = packet
+        .get("symbol")
+        .and_then(|symbol| symbol.get("path"))
+        .and_then(Value::as_str)
+    {
+        return Some(path);
+    }
+    if let Some(path) = packet
+        .get("reference")
+        .and_then(|reference| reference.get("path"))
+        .and_then(Value::as_str)
+    {
+        return Some(path);
+    }
+    if let Some(path) = packet
+        .get("caller")
+        .and_then(|caller| caller.get("path"))
+        .and_then(Value::as_str)
+    {
+        return Some(path);
+    }
+    packet
+        .get("spans")
+        .and_then(Value::as_array)
+        .and_then(|spans| spans.first())
+        .and_then(|span| span.get("path"))
+        .and_then(Value::as_str)
+}
+
+/// True when a result packet passes the optional `result_path` scope. Packets
+/// whose path can't be determined are KEPT (the filter is a positive scope, not
+/// a hard gate that would silently drop edges the extractor couldn't anchor).
+fn packet_matches_result_path(packet: &Value, filter: Option<&str>) -> bool {
+    let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    match packet_path(packet) {
+        Some(path) => path_matches_filter(path, filter),
+        None => true,
+    }
+}
+
+/// True when a result packet passes the `exclude_tests`/`tests_only` scope,
+/// keyed on the packet's path (see [`packet_path`]/[`path_is_test`]). Packets
+/// with no determinable path are KEPT under `exclude_tests` and DROPPED under
+/// `tests_only` (a path-less packet can't be confirmed as a test).
+fn packet_matches_test_scope(packet: &Value, exclude_tests: bool, tests_only: bool) -> bool {
+    if !exclude_tests && !tests_only {
+        return true;
+    }
+    match packet_path(packet) {
+        Some(path) => passes_test_scope(path_is_test(path), exclude_tests, tests_only),
+        None => !tests_only,
+    }
+}
+
 /// Edge kinds that count as a "use" of a declaration for dead-code analysis:
 /// a resolved call site, a textual/identifier reference, or a test exercising
 /// it. Inbound `Contains`/`Imports`/inheritance edges are structural, not uses,
@@ -2638,6 +2823,32 @@ fn hierarchy_node_count(node: &HierarchyNode) -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Filter a list of root [`HierarchyNode`]s by the test-scope of their
+/// declaring file. Used by `hierarchy`'s `exclude_tests`/`tests_only`. Only the
+/// root nodes are filtered (a non-test root may legitimately contain test
+/// children and vice versa); children are kept intact under a surviving root.
+fn filter_hierarchy_nodes_by_test_scope(
+    graph: &squeezy_graph::SemanticGraph,
+    nodes: Vec<HierarchyNode>,
+    exclude_tests: bool,
+    tests_only: bool,
+) -> Vec<HierarchyNode> {
+    if !exclude_tests && !tests_only {
+        return nodes;
+    }
+    nodes
+        .into_iter()
+        .filter(|node| {
+            let is_test = graph
+                .symbols
+                .get(&node.id)
+                .map(symbol_is_test)
+                .unwrap_or(false);
+            passes_test_scope(is_test, exclude_tests, tests_only)
+        })
+        .collect()
+}
+
 fn hierarchy_result(
     call: &ToolCall,
     manager: &GraphManager,
@@ -3464,15 +3675,16 @@ impl ToolRegistry {
         // declarations in this workspace and would be false positives.
         let unused = args.unused.unwrap_or(false);
         let max_callers = args.max_callers.unwrap_or(0);
-        let symbols: Vec<GraphSymbol> = if unused {
-            symbols
-                .into_iter()
-                .filter(|symbol| symbol.scanned)
-                .filter(|symbol| inbound_usage_count(graph, symbol) <= max_callers)
-                .collect()
-        } else {
-            symbols
-        };
+        let exclude_tests = args.exclude_tests.unwrap_or(false);
+        let tests_only = args.tests_only.unwrap_or(false);
+        let symbols: Vec<GraphSymbol> = symbols
+            .into_iter()
+            .filter(|symbol| {
+                passes_test_scope(symbol_is_test(symbol), exclude_tests, tests_only)
+            })
+            .filter(|symbol| !unused || symbol.scanned)
+            .filter(|symbol| !unused || inbound_usage_count(graph, symbol) <= max_callers)
+            .collect();
         // The closure cap is a distinct truncation source from the result-window
         // cap: fold it into `truncated` so the page is flagged, and also surface
         // it as a separate `closure_capped` signal so a caller can tell the
@@ -3652,6 +3864,8 @@ impl ToolRegistry {
                 None,
             );
         };
+        let exclude_tests = args.exclude_tests.unwrap_or(false);
+        let tests_only = args.tests_only.unwrap_or(false);
         let filtered = hits
             .into_iter()
             .filter(|hit| {
@@ -3659,6 +3873,13 @@ impl ToolRegistry {
                     .as_deref()
                     .map(|path| reference_matches_path(hit, path))
                     .unwrap_or(true)
+            })
+            .filter(|hit| {
+                passes_test_scope(
+                    path_is_test(hit.reference.file_id.0.as_str()),
+                    exclude_tests,
+                    tests_only,
+                )
             })
             .collect::<Vec<_>>();
         let truncated = filtered.len().saturating_sub(offset) > max_results;
@@ -3738,6 +3959,11 @@ impl ToolRegistry {
                 packets.push(reference_packet(&hit));
             }
         }
+        let exclude_tests = args.exclude_tests.unwrap_or(false);
+        let tests_only = args.tests_only.unwrap_or(false);
+        if exclude_tests || tests_only {
+            packets.retain(|packet| packet_matches_test_scope(packet, exclude_tests, tests_only));
+        }
         let truncated = overflowed;
         let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
         let mut payload = graph_payload("upstream_flow", manager, refresh);
@@ -3814,6 +4040,11 @@ impl ToolRegistry {
                 packets.push(edge_packet(graph, edge, "downstream_flow"));
             }
         }
+        let exclude_tests = args.exclude_tests.unwrap_or(false);
+        let tests_only = args.tests_only.unwrap_or(false);
+        if exclude_tests || tests_only {
+            packets.retain(|packet| packet_matches_test_scope(packet, exclude_tests, tests_only));
+        }
         let truncated = overflowed;
         let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
         let mut payload = graph_payload("downstream_flow", manager, refresh);
@@ -3850,6 +4081,8 @@ impl ToolRegistry {
         let max_results = graph_limit(args.max_results);
         let path_filter = args.path.as_deref();
         let diff_only = args.diff_only.unwrap_or(false);
+        let exclude_tests = args.exclude_tests.unwrap_or(false);
+        let tests_only = args.tests_only.unwrap_or(false);
         // A live symbol_id from a sibling tool resolves the target directly;
         // a stale id (graph re-indexed since it was minted) falls through to
         // the name query so the call still lands on the right symbol.
@@ -3876,6 +4109,7 @@ impl ToolRegistry {
         .filter(|symbol| {
             !diff_only || symbol.dirty.is_some() || dirty_paths.contains(&symbol.file_id.0)
         })
+        .filter(|symbol| passes_test_scope(symbol_is_test(symbol), exclude_tests, tests_only))
         .collect::<Vec<_>>();
         let mut pre_take_len = candidates.len();
         let mut symbols = candidates.into_iter().take(max_results).collect::<Vec<_>>();
@@ -3884,6 +4118,9 @@ impl ToolRegistry {
                 .dirty_symbols()
                 .into_iter()
                 .filter(|symbol| symbol_matches_path_filter(symbol, path_filter))
+                .filter(|symbol| {
+                    passes_test_scope(symbol_is_test(symbol), exclude_tests, tests_only)
+                })
                 .filter(|symbol| {
                     symbol.name.contains(&args.query) || symbol.signature.contains(&args.query)
                 })
@@ -3991,6 +4228,17 @@ impl ToolRegistry {
         // building the whole forest and discarding all but `max_results`.
         let max_results = graph_limit(args.max_results);
         let (nodes, total_roots) = graph.hierarchy_capped(None, max_depth, max_results);
+        let exclude_tests = args.exclude_tests.unwrap_or(false);
+        let tests_only = args.tests_only.unwrap_or(false);
+        let nodes = filter_hierarchy_nodes_by_test_scope(graph, nodes, exclude_tests, tests_only);
+        // `total_roots` came from the pre-filter cap; recompute against the
+        // surviving roots so `truncated` reflects what the caller can actually
+        // page through under the test scope.
+        let total_roots = if exclude_tests || tests_only {
+            nodes.len()
+        } else {
+            total_roots
+        };
         hierarchy_result(
             call,
             manager,
@@ -4263,9 +4511,18 @@ impl ToolRegistry {
         let removed: HashSet<FileId> = HashSet::new();
         let impact = graph.compute_impact(&changed, &propagating, &removed);
 
-        let truncated = impact.affected_symbols.len() > max_results;
+        // Scope the affected set by test-ness when requested. The language
+        // filter is applied in the O2 commit.
+        let exclude_tests = args.exclude_tests.unwrap_or(false);
+        let tests_only = args.tests_only.unwrap_or(false);
+        let affected_symbols: Vec<&squeezy_graph::GraphSymbol> = impact
+            .affected_symbols
+            .iter()
+            .filter(|sym| passes_test_scope(symbol_is_test(sym), exclude_tests, tests_only))
+            .collect();
+        let truncated = affected_symbols.len() > max_results;
         let selected_symbols: Vec<&squeezy_graph::GraphSymbol> =
-            impact.affected_symbols.iter().take(max_results).collect();
+            affected_symbols.into_iter().take(max_results).collect();
 
         let packets: Vec<Value> = selected_symbols
             .iter()
