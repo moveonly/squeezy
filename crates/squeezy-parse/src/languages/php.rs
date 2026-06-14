@@ -1029,7 +1029,10 @@ fn extract_php_function_call(
             arity: 0,
             kind: ParsedCallKind::Direct,
             span: span_from_node(node),
-            provenance: Provenance::new(PROVENANCE, "function_call_expression first-class callable"),
+            provenance: Provenance::new(
+                PROVENANCE,
+                "function_call_expression first-class callable",
+            ),
             confidence: Confidence::Partial,
         });
         return;
@@ -1109,7 +1112,13 @@ fn extract_php_define_const(
         .filter(|(_, kind)| matches!(kind, SymbolKind::Module))
         .map(|(id, _)| id.clone());
     let span = span_from_node(node);
-    let id = symbol_id(&ctx.file, parent_id.as_ref(), SymbolKind::Const, &name, span);
+    let id = symbol_id(
+        &ctx.file,
+        parent_id.as_ref(),
+        SymbolKind::Const,
+        &name,
+        span,
+    );
     let mut attributes = vec!["php:const".to_string(), "php:define".to_string()];
     if let Some(namespace) = scope.current_namespace() {
         attributes.push(format!("php:namespace:{namespace}"));
@@ -1462,7 +1471,13 @@ fn extract_php_anonymous_class(
     }
     attributes.sort();
     attributes.dedup();
-    let id = symbol_id(&ctx.file, parent_id.as_ref(), SymbolKind::Class, &name, span);
+    let id = symbol_id(
+        &ctx.file,
+        parent_id.as_ref(),
+        SymbolKind::Class,
+        &name,
+        span,
+    );
     let symbol = ParsedSymbol {
         id,
         file_id: ctx.file.id.clone(),
@@ -1512,13 +1527,7 @@ fn extract_php_anonymous_class(
             }
             "base_clause" | "class_interface_clause" | "attribute_list" => {}
             _ => {
-                visit_php_node(
-                    child,
-                    ctx,
-                    next_parent.clone(),
-                    next_owner.clone(),
-                    scope,
-                );
+                visit_php_node(child, ctx, next_parent.clone(), next_owner.clone(), scope);
             }
         }
     }
@@ -1772,7 +1781,13 @@ fn extract_php_property_hooks(
         let arity = hook
             .child_by_field_name("parameters")
             .map(|params| u8::try_from(named_child_count(params)).unwrap_or(u8::MAX));
-        let hook_id = symbol_id(&ctx.file, Some(field_id), SymbolKind::Method, &hook_name, span);
+        let hook_id = symbol_id(
+            &ctx.file,
+            Some(field_id),
+            SymbolKind::Method,
+            &hook_name,
+            span,
+        );
         ctx.symbols.push(ParsedSymbol {
             id: hook_id.clone(),
             file_id: ctx.file.id.clone(),

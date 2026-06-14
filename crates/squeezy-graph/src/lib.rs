@@ -822,17 +822,26 @@ impl SemanticGraph {
         let mut facts = Vec::new();
         for fact in &self.java_project_facts {
             if file_in_project_of(&fact.source_file, file_id) {
-                facts.push((format!("{}:{}", fact.provider, fact.kind), fact.value.clone()));
+                facts.push((
+                    format!("{}:{}", fact.provider, fact.kind),
+                    fact.value.clone(),
+                ));
             }
         }
         for fact in &self.dotnet_project_facts {
             if file_in_project_of(&fact.source_file, file_id) {
-                facts.push((format!("{}:{}", fact.provider, fact.kind), fact.value.clone()));
+                facts.push((
+                    format!("{}:{}", fact.provider, fact.kind),
+                    fact.value.clone(),
+                ));
             }
         }
         for fact in &self.kotlin_project_facts {
             if file_in_project_of(&fact.source_file, file_id) {
-                facts.push((format!("{}:{}", fact.provider, fact.kind), fact.value.clone()));
+                facts.push((
+                    format!("{}:{}", fact.provider, fact.kind),
+                    fact.value.clone(),
+                ));
             }
         }
         facts
@@ -1529,9 +1538,7 @@ impl SemanticGraph {
         let mut seen = HashSet::from([member.clone()]);
         let mut tagged = Vec::new();
         let mut untagged = Vec::new();
-        for subtype in
-            self.inheritance_subtypes_transitive(owner, MEMBER_IMPL_MAX_SUBTYPE_DEPTH)
-        {
+        for subtype in self.inheritance_subtypes_transitive(owner, MEMBER_IMPL_MAX_SUBTYPE_DEPTH) {
             for child_id in self
                 .children_by_parent
                 .get(&subtype.id)

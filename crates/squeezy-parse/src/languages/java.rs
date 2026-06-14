@@ -99,12 +99,7 @@ pub(crate) fn visit_java_node(
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
                     if child.id() == body.id() {
-                        visit_java_children(
-                            child,
-                            ctx,
-                            next_parent.clone(),
-                            next_owner.clone(),
-                        );
+                        visit_java_children(child, ctx, next_parent.clone(), next_owner.clone());
                     } else {
                         visit_java_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
                     }
@@ -322,7 +317,13 @@ pub(crate) fn java_record_component_symbols(
         attributes.sort();
         attributes.dedup();
         let span = span_from_node(parameter);
-        let id = symbol_id(&ctx.file, parent_id.as_ref(), SymbolKind::Field, &name, span);
+        let id = symbol_id(
+            &ctx.file,
+            parent_id.as_ref(),
+            SymbolKind::Field,
+            &name,
+            span,
+        );
         symbols.push(ParsedSymbol {
             id,
             file_id: ctx.file.id.clone(),
@@ -393,12 +394,18 @@ pub(crate) fn extract_java_module(node: Node<'_>, ctx: &mut ExtractContext<'_>) 
     let mut cursor = body.walk();
     for directive in body.named_children(&mut cursor) {
         let (field, is_reexport, kind, provenance) = match directive.kind() {
-            "requires_module_directive" => {
-                ("module", false, ImportKind::Named, "module requires directive")
-            }
-            "exports_module_directive" => {
-                ("package", true, ImportKind::Unspecified, "module exports directive")
-            }
+            "requires_module_directive" => (
+                "module",
+                false,
+                ImportKind::Named,
+                "module requires directive",
+            ),
+            "exports_module_directive" => (
+                "package",
+                true,
+                ImportKind::Unspecified,
+                "module exports directive",
+            ),
             _ => continue,
         };
         let Some(path) = directive
@@ -829,7 +836,13 @@ pub(crate) fn java_anonymous_class_symbol(
     let body_span = body.map(span_from_node);
     let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
-    let id = symbol_id(&ctx.file, parent_id.as_ref(), SymbolKind::Class, &name, span);
+    let id = symbol_id(
+        &ctx.file,
+        parent_id.as_ref(),
+        SymbolKind::Class,
+        &name,
+        span,
+    );
     let mut attributes = vec!["java:anonymous-class".to_string()];
     if let Some(type_node) = node.child_by_field_name("type")
         && let Ok(text) = node_text(type_node, ctx.source)

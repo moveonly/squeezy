@@ -215,8 +215,7 @@ fn ruby_symbol_from_node(
     // promoted (that would mis-tag fixtures/setup helpers) — RSpec examples and
     // the Minitest `test "name" do` macro come through the call path instead.
     let mut symbol_kind = symbol_kind;
-    if matches!(symbol_kind, SymbolKind::Method | SymbolKind::Function)
-        && name.starts_with("test_")
+    if matches!(symbol_kind, SymbolKind::Method | SymbolKind::Function) && name.starts_with("test_")
     {
         symbol_kind = SymbolKind::Test;
         attributes.push("test".to_string());
@@ -781,11 +780,8 @@ fn extract_ruby_rails_macro(
             continue;
         }
         emitted_any = true;
-        if is_assoc
-            && let Some(host) = ctx.symbols.iter_mut().find(|s| s.id == *parent_id)
-        {
-            host.attributes
-                .push(format!("assoc:{method_name}:{name}"));
+        if is_assoc && let Some(host) = ctx.symbols.iter_mut().find(|s| s.id == *parent_id) {
+            host.attributes.push(format!("assoc:{method_name}:{name}"));
         }
         if emit_reader {
             push_synthetic_macro_accessor(ctx, parent_id, &name, method_name, span, raw);
@@ -1172,7 +1168,11 @@ fn extract_ruby_rspec_example(
         let mut cursor = args.walk();
         args.named_children(&mut cursor).next().and_then(|first| {
             ruby_string_literal_value(first, ctx.source)
-                .or_else(|| node_text(first, ctx.source).ok().map(|t| t.trim().to_string()))
+                .or_else(|| {
+                    node_text(first, ctx.source)
+                        .ok()
+                        .map(|t| t.trim().to_string())
+                })
                 .filter(|t| !t.is_empty())
         })
     });
@@ -1526,8 +1526,10 @@ fn ruby_apply_visibility_statement(
                     // `private` toggle (only the symmetric instance-visibility
                     // keywords flip the running default; `*_class_method` with
                     // no args is a no-op toggle we ignore).
-                    if matches!(method_name, "private" | "protected" | "public" | "module_function")
-                    {
+                    if matches!(
+                        method_name,
+                        "private" | "protected" | "public" | "module_function"
+                    ) {
                         *current = vis;
                     }
                 }

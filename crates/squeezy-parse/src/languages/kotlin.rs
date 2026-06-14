@@ -298,8 +298,7 @@ fn visit_kotlin_property_children(
     for child in node.named_children(&mut cursor) {
         match child.kind() {
             "getter" | "setter" => {
-                if let Some(symbol) =
-                    kotlin_accessor_symbol(child, ctx, host_symbol.as_ref(), node)
+                if let Some(symbol) = kotlin_accessor_symbol(child, ctx, host_symbol.as_ref(), node)
                 {
                     let owner = Some(symbol.id.clone());
                     ctx.symbols.push(symbol);
@@ -311,20 +310,10 @@ fn visit_kotlin_property_children(
                 } else {
                     // No host class (top-level property accessor) — fall back
                     // to the property as owner so calls aren't dropped.
-                    visit_kotlin_node(
-                        child,
-                        ctx,
-                        property_parent.clone(),
-                        property_owner.clone(),
-                    );
+                    visit_kotlin_node(child, ctx, property_parent.clone(), property_owner.clone());
                 }
             }
-            _ => visit_kotlin_node(
-                child,
-                ctx,
-                property_parent.clone(),
-                property_owner.clone(),
-            ),
+            _ => visit_kotlin_node(child, ctx, property_parent.clone(), property_owner.clone()),
         }
     }
 }
@@ -345,9 +334,7 @@ pub(crate) fn kotlin_symbol_from_node(
         "companion_object" => Some(kotlin_companion_object_symbol(node, ctx, parent_symbol)),
         "function_declaration" => kotlin_function_declaration_symbol(node, ctx, parent_symbol),
         "secondary_constructor" => kotlin_secondary_constructor_symbol(node, ctx, parent_symbol),
-        "anonymous_initializer" => {
-            kotlin_anonymous_initializer_symbol(node, ctx, parent_symbol)
-        }
+        "anonymous_initializer" => kotlin_anonymous_initializer_symbol(node, ctx, parent_symbol),
         "type_alias" => kotlin_type_alias_symbol(node, ctx, parent_symbol),
         "enum_entry" => kotlin_enum_entry_symbol(node, ctx, parent_symbol),
         _ => None,

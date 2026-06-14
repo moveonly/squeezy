@@ -3347,10 +3347,7 @@ fn resolve_hierarchy_root(
 /// back to the directory-aware `path_matches_filter` scan so a partial but
 /// unambiguous spelling still resolves. The File symbol is registered under the
 /// stable `file:{file_id}` id, so the lookup needs no private graph accessor.
-fn resolve_file_symbol(
-    graph: &squeezy_graph::SemanticGraph,
-    path: &str,
-) -> Option<GraphSymbol> {
+fn resolve_file_symbol(graph: &squeezy_graph::SemanticGraph, path: &str) -> Option<GraphSymbol> {
     if path.trim().is_empty() {
         return None;
     }
@@ -4054,9 +4051,7 @@ impl ToolRegistry {
         );
         let symbols: Vec<GraphSymbol> = symbols
             .into_iter()
-            .filter(|symbol| {
-                passes_test_scope(symbol_is_test(symbol), exclude_tests, tests_only)
-            })
+            .filter(|symbol| passes_test_scope(symbol_is_test(symbol), exclude_tests, tests_only))
             .filter(|symbol| confidence_scope.keeps(symbol.confidence))
             .filter(|symbol| !unused || symbol.scanned)
             .filter(|symbol| !unused || inbound_usage_count(graph, symbol) <= max_callers)
@@ -4378,8 +4373,7 @@ impl ToolRegistry {
         }
         // path/result_path scopes the RESULT packets, not just the root: drop any
         // caller/edge packet whose file path falls outside the requested subtree.
-        let result_path =
-            result_path_scope(args.path.as_deref(), args.result_path.as_deref());
+        let result_path = result_path_scope(args.path.as_deref(), args.result_path.as_deref());
         if result_path.is_some() {
             packets.retain(|packet| packet_matches_result_path(packet, result_path));
         }
@@ -4489,8 +4483,7 @@ impl ToolRegistry {
         }
         // path/result_path scopes the RESULT packets, not just the root: drop any
         // callee/edge packet whose file path falls outside the requested subtree.
-        let result_path =
-            result_path_scope(args.path.as_deref(), args.result_path.as_deref());
+        let result_path = result_path_scope(args.path.as_deref(), args.result_path.as_deref());
         if result_path.is_some() {
             packets.retain(|packet| packet_matches_result_path(packet, result_path));
         }
@@ -4773,9 +4766,17 @@ impl ToolRegistry {
         {
             Some(sym.clone())
         } else if let Some(q) = args.query.as_deref() {
-            graph_symbol_search(graph, Some(q), None, None, args.language.as_deref(), None, None)
-                .into_iter()
-                .next()
+            graph_symbol_search(
+                graph,
+                Some(q),
+                None,
+                None,
+                args.language.as_deref(),
+                None,
+                None,
+            )
+            .into_iter()
+            .next()
         } else {
             None
         };
@@ -4862,8 +4863,7 @@ impl ToolRegistry {
         // Page after filtering: skip `offset`, keep `max_results`.
         let offset = args.offset.unwrap_or(0);
         let truncated = related.len().saturating_sub(offset) > max_results;
-        let selected: Vec<&GraphSymbol> =
-            related.iter().skip(offset).take(max_results).collect();
+        let selected: Vec<&GraphSymbol> = related.iter().skip(offset).take(max_results).collect();
 
         let packets: Vec<Value> = selected
             .iter()
@@ -6854,7 +6854,10 @@ mod option_filter_tests {
         assert_eq!(parse_edge_kind_filter("Calls"), Some(EdgeKind::Calls));
         assert_eq!(parse_edge_kind_filter("ref"), Some(EdgeKind::References));
         assert_eq!(parse_edge_kind_filter("IMPORTS"), Some(EdgeKind::Imports));
-        assert_eq!(parse_edge_kind_filter("re-export"), Some(EdgeKind::Reexports));
+        assert_eq!(
+            parse_edge_kind_filter("re-export"),
+            Some(EdgeKind::Reexports)
+        );
         assert_eq!(parse_edge_kind_filter("nonsense"), None);
     }
 
@@ -6890,7 +6893,10 @@ mod option_filter_tests {
             parse_confidence_level("External"),
             Some(Confidence::External)
         );
-        assert_eq!(parse_confidence_level("resolved"), Some(Confidence::ImportResolved));
+        assert_eq!(
+            parse_confidence_level("resolved"),
+            Some(Confidence::ImportResolved)
+        );
         assert_eq!(parse_confidence_level("bogus"), None);
     }
 

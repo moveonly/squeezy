@@ -70,7 +70,10 @@ fn maps_visibility_keywords_and_calls() {
     assert_eq!(ruby_visibility_keyword("attr_reader"), None);
 
     assert_eq!(ruby_visibility_call("private"), Some("private"));
-    assert_eq!(ruby_visibility_call("private_class_method"), Some("private"));
+    assert_eq!(
+        ruby_visibility_call("private_class_method"),
+        Some("private")
+    );
     assert_eq!(ruby_visibility_call("public_class_method"), Some("public"));
     assert_eq!(ruby_visibility_call("protected"), Some("protected"));
     assert_eq!(ruby_visibility_call("nope"), None);

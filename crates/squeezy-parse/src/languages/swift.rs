@@ -749,7 +749,8 @@ fn swift_enum_raw_backing_type(node: Node<'_>, ifaces: &[String]) -> Option<Stri
 fn swift_is_primitive_raw_type(name: &str) -> bool {
     matches!(
         name,
-        "Int" | "Int8"
+        "Int"
+            | "Int8"
             | "Int16"
             | "Int32"
             | "Int64"
@@ -1249,8 +1250,7 @@ fn swift_import_has_attribute(node: Node<'_>, source: &str, name: &str) -> bool 
     };
     let mut cursor = modifiers.walk();
     modifiers.named_children(&mut cursor).any(|child| {
-        child.kind() == "attribute"
-            && swift_attribute_name(child, source).as_deref() == Some(name)
+        child.kind() == "attribute" && swift_attribute_name(child, source).as_deref() == Some(name)
     })
 }
 

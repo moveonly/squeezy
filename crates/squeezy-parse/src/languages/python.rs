@@ -392,7 +392,13 @@ pub(crate) fn extract_python_type_alias(
     }
 
     ctx.symbols.push(ParsedSymbol {
-        id: symbol_id(&ctx.file, parent_id.as_ref(), SymbolKind::TypeAlias, &name, span),
+        id: symbol_id(
+            &ctx.file,
+            parent_id.as_ref(),
+            SymbolKind::TypeAlias,
+            &name,
+            span,
+        ),
         file_id: ctx.file.id.clone(),
         parent_id,
         name,
@@ -483,7 +489,8 @@ pub(crate) fn extract_python_field_symbol(
         .map(|ann| python_field_type_name(ann).as_deref() == Some("TypeAlias"))
         .unwrap_or(false);
     let kind = if is_member {
-        if matches!(parent_kind, Some(SymbolKind::Enum)) && python_is_simple_enum_member(left, right)
+        if matches!(parent_kind, Some(SymbolKind::Enum))
+            && python_is_simple_enum_member(left, right)
         {
             SymbolKind::Variant
         } else {

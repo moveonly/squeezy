@@ -940,8 +940,11 @@ pub(crate) fn c_family_special_member_role(
             "operator_cast" => return Some("c++:conversion-operator"),
             "operator_name" => return Some("c++:operator"),
             "destructor_name" => return Some("c++:destructor"),
-            "function_declarator" | "pointer_declarator" | "reference_declarator"
-            | "parenthesized_declarator" | "init_declarator" => {
+            "function_declarator"
+            | "pointer_declarator"
+            | "reference_declarator"
+            | "parenthesized_declarator"
+            | "init_declarator" => {
                 match declarator
                     .child_by_field_name("declarator")
                     .or_else(|| first_named_child(declarator))

@@ -1374,10 +1374,7 @@ fn csharp_emit_primary_constructor_fields(
             visibility: Some("public".to_string()),
             docs: Vec::new(),
             attributes,
-            provenance: Provenance::new(
-                "tree-sitter-c-sharp",
-                "primary constructor parameter",
-            ),
+            provenance: Provenance::new("tree-sitter-c-sharp", "primary constructor parameter"),
             confidence: csharp_conditional_confidence(parameter, Confidence::ExactSyntax),
             freshness: Freshness::Fresh,
             arity: None,
@@ -1542,7 +1539,10 @@ pub(crate) fn csharp_identifier_is_member_access_name(node: Node<'_>) -> bool {
 pub(crate) fn csharp_node_in_conditional(node: Node<'_>) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
-        if matches!(parent.kind(), "preproc_if" | "preproc_elif" | "preproc_else") {
+        if matches!(
+            parent.kind(),
+            "preproc_if" | "preproc_elif" | "preproc_else"
+        ) {
             return true;
         }
         current = parent.parent();

@@ -152,8 +152,7 @@ fn visit_dart_node(
             // the standard Dart/Flutter test idioms. Lower a matching call into
             // a `Test` symbol so `kind=test` queries surface it and the calls
             // inside its closure attribute to the test (impact / affected_tests).
-            if let Some(test_symbol) =
-                dart_test_symbol_from_call(node, ctx, parent_symbol.as_ref())
+            if let Some(test_symbol) = dart_test_symbol_from_call(node, ctx, parent_symbol.as_ref())
             {
                 let next_parent = Some((test_symbol.id.clone(), test_symbol.kind));
                 let next_owner = Some(test_symbol.id.clone());
@@ -965,7 +964,9 @@ fn dart_collect_local_type_attributes(body: Node<'_>, source: &str, attributes: 
         // can resolve the receiver's type. We keep descending — a pattern can
         // nest more patterns (record/list/object) that bind further locals.
         match node.kind() {
-            "variable_pattern" => dart_collect_locals_from_variable_pattern(node, source, attributes),
+            "variable_pattern" => {
+                dart_collect_locals_from_variable_pattern(node, source, attributes)
+            }
             "cast_pattern" => dart_collect_locals_from_cast_pattern(node, source, attributes),
             _ => {}
         }
@@ -1499,7 +1500,11 @@ fn extract_dart_symbol_facts(node: Node<'_>, symbol: &ParsedSymbol, ctx: &mut Ex
             });
         }
     }
-    if symbol.attributes.iter().any(|attr| attr == "dart:constructor") {
+    if symbol
+        .attributes
+        .iter()
+        .any(|attr| attr == "dart:constructor")
+    {
         extract_dart_constructor_delegation(node, symbol, ctx);
     }
 }
@@ -1587,12 +1592,10 @@ fn dart_emit_initializer_delegation(
     let children: Vec<Node<'_>> = entry.children(&mut cursor).collect();
     // First top-level token is `super` / `this`; an optional trailing identifier
     // is the named-constructor selector.
-    let keyword = children
-        .iter()
-        .find_map(|c| match c.kind() {
-            "super" | "this" => Some(c.kind()),
-            _ => None,
-        });
+    let keyword = children.iter().find_map(|c| match c.kind() {
+        "super" | "this" => Some(c.kind()),
+        _ => None,
+    });
     let Some(keyword) = keyword else { return };
     let selector = entry
         .named_children(&mut entry.walk())
@@ -1614,7 +1617,11 @@ fn dart_emit_initializer_delegation(
                 return;
             }
             let (name, target_text, receiver) = match &selector {
-                Some(sel) => (sel.clone(), format!("{class_name}.{sel}"), Some(class_name.to_string())),
+                Some(sel) => (
+                    sel.clone(),
+                    format!("{class_name}.{sel}"),
+                    Some(class_name.to_string()),
+                ),
                 None => (class_name.to_string(), class_name.to_string(), None),
             };
             push_dart_delegation_call(ctx, owner_id, name, target_text, receiver, arity, span);
@@ -1665,7 +1672,11 @@ fn dart_emit_redirection_delegation(
         .unwrap_or(0);
     let span = span_from_node(node);
     let (name, target_text, receiver) = match &selector {
-        Some(sel) => (sel.clone(), format!("{class_name}.{sel}"), Some(class_name.to_string())),
+        Some(sel) => (
+            sel.clone(),
+            format!("{class_name}.{sel}"),
+            Some(class_name.to_string()),
+        ),
         None => (class_name.to_string(), class_name.to_string(), None),
     };
     push_dart_delegation_call(ctx, owner_id, name, target_text, receiver, arity, span);
@@ -1695,7 +1706,11 @@ fn dart_emit_redirecting_factory_delegation(
         .filter(|t| !t.is_empty());
     let span = span_from_node(node);
     let (name, target_text, receiver) = match &target_ctor {
-        Some(ctor) => (ctor.clone(), format!("{target}.{ctor}"), Some(target.clone())),
+        Some(ctor) => (
+            ctor.clone(),
+            format!("{target}.{ctor}"),
+            Some(target.clone()),
+        ),
         None => (target.clone(), target.clone(), None),
     };
     push_dart_delegation_call(ctx, owner_id, name, target_text, receiver, 0, span);
@@ -1790,7 +1805,8 @@ fn extract_dart_import_export(node: Node<'_>, ctx: &mut ExtractContext<'_>, is_r
         // apart from an eager prefixed import.
         let is_deferred = {
             let mut all = spec.walk();
-            spec.children(&mut all).any(|child| child.kind() == "deferred")
+            spec.children(&mut all)
+                .any(|child| child.kind() == "deferred")
         };
         let mut combinators = Vec::new();
         let mut alt_uris = Vec::new();
@@ -2066,7 +2082,10 @@ fn dart_test_symbol_from_call(
     if function_node.kind() != "identifier" {
         return None;
     }
-    let func_name = node_text(function_node, ctx.source).ok()?.trim().to_string();
+    let func_name = node_text(function_node, ctx.source)
+        .ok()?
+        .trim()
+        .to_string();
     if !matches!(func_name.as_str(), "test" | "testWidgets" | "group") {
         return None;
     }
@@ -2097,7 +2116,13 @@ fn dart_test_symbol_from_call(
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     // Disambiguate same-named tests within a file by call-site byte offset
     // (folded into `symbol_id`); keep the display name human-readable.
-    let id = symbol_id(&ctx.file, parent_id.as_ref(), SymbolKind::Test, &description, span);
+    let id = symbol_id(
+        &ctx.file,
+        parent_id.as_ref(),
+        SymbolKind::Test,
+        &description,
+        span,
+    );
     Some(ParsedSymbol {
         id,
         file_id: ctx.file.id.clone(),
@@ -2111,7 +2136,10 @@ fn dart_test_symbol_from_call(
         signature: String::new(),
         visibility: Some("public".to_string()),
         docs: Vec::new(),
-        attributes: vec!["dart:test".to_string(), format!("dart:test-idiom:{func_name}")],
+        attributes: vec![
+            "dart:test".to_string(),
+            format!("dart:test-idiom:{func_name}"),
+        ],
         provenance: Provenance::new("tree-sitter-dart", format!("{func_name} idiom")),
         confidence: Confidence::Heuristic,
         freshness: Freshness::Fresh,
