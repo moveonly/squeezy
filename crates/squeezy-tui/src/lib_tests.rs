@@ -22146,6 +22146,36 @@ async fn slash_theme_high_contrast_selects_builtin_theme() {
     assert_eq!(crate::render::theme::current_theme_name(), "default");
 }
 
+/// A high-contrast env opt-in forces the `high-contrast` palette onto the
+/// config, overriding the persisted theme, so startup renders with actual
+/// high contrast rather than only emitting a telemetry signal.
+#[test]
+fn high_contrast_env_override_wins_over_persisted_theme() {
+    let mut cfg = squeezy_core::AppConfig::default();
+    cfg.tui.theme = "bright".to_string();
+
+    assert!(crate::apply_high_contrast_env_override(&mut cfg, true));
+    assert_eq!(cfg.tui.theme, "high-contrast");
+}
+
+/// Without a request the persisted theme is left untouched, and a config that
+/// already names the high-contrast slug reports no change.
+#[test]
+fn high_contrast_env_override_is_a_noop_when_not_requested_or_already_set() {
+    let mut unrequested = squeezy_core::AppConfig::default();
+    unrequested.tui.theme = "bright".to_string();
+    assert!(!crate::apply_high_contrast_env_override(
+        &mut unrequested,
+        false
+    ));
+    assert_eq!(unrequested.tui.theme, "bright");
+
+    let mut already = squeezy_core::AppConfig::default();
+    already.tui.theme = "high-contrast".to_string();
+    assert!(!crate::apply_high_contrast_env_override(&mut already, true));
+    assert_eq!(already.tui.theme, "high-contrast");
+}
+
 /// Regression for `squeezy-ramu`: when the eval harness pins a settings
 /// path override, `/theme dark` must persist to the scratch file and
 /// must NOT touch the env-resolved (production-style "home") path. The

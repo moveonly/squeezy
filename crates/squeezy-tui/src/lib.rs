@@ -891,6 +891,12 @@ async fn run_inner_with_terminal(
     signal_teardown::install_signal_handlers();
     let direct_resume_requested = resume_session_id.is_some();
     let picker_route_enabled = !startup.skip_resume_picker && !direct_resume_requested;
+    // An explicit `SQUEEZY_HIGH_CONTRAST` opt-in wins for the palette before
+    // anything else reads the theme, so the env var delivers the same
+    // high-contrast presentation as `/theme high-contrast` instead of only a
+    // telemetry signal. Folded into `config` so the agent snapshot and the
+    // TuiApp below observe the override too.
+    apply_high_contrast_env_override(&mut config, high_contrast_requested());
     // Apply the persisted theme preference before the first render so the
     // initial paint already reflects the user's choice — without this the
     // first frame uses the auto-detected tone and pops to the override on
@@ -50982,6 +50988,21 @@ fn high_contrast_requested() -> bool {
         .ok()
         .and_then(|name| squeezy_core::normalize_tui_theme_name(&name))
         .is_some_and(|slug| slug == "high-contrast")
+}
+
+/// Force the built-in `high-contrast` palette onto `config` when the
+/// environment opted into a high-contrast presentation. An explicit
+/// accessibility request wins over the persisted theme preference, so the
+/// resolved palette matches what `/theme high-contrast` selects. Returns
+/// whether the override was applied; the boolean keeps the call site testable
+/// without inspecting global theme state. No-op when the config already names
+/// the high-contrast slug so an unrelated theme is never clobbered needlessly.
+fn apply_high_contrast_env_override(config: &mut AppConfig, requested: bool) -> bool {
+    if !requested || config.tui.theme == "high-contrast" {
+        return false;
+    }
+    config.tui.theme = "high-contrast".to_string();
+    true
 }
 
 /// Emit the terminal startup setup sequence into `writer`: the keyboard
