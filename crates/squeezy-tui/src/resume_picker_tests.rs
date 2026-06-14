@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
-use squeezy_store::{EventBranchTip, GlobalSessionIndexEntry, SessionMetadata, SessionStatus};
+use squeezy_store::{GlobalSessionIndexEntry, SessionMetadata, SessionStatus};
 
 use super::*;
 
@@ -171,8 +171,6 @@ fn summary_at(id: &str, cwd: &str) -> SessionSummary {
         repo_root: None,
         display_name: None,
         labels: Vec::new(),
-        branches: Vec::new(),
-        branch_load_failed: false,
     }
 }
 
@@ -283,18 +281,6 @@ fn picker_footer_warns_that_cross_project_rows_change_cwd() {
 }
 
 #[test]
-fn picker_legends_the_branch_load_failed_marker() {
-    let mut broken = summary("broken");
-    broken.branch_load_failed = true;
-    let state = ResumePickerState::new(vec![broken], cwd());
-    let text = render_state_to_text(&state, 90, 18);
-    assert!(
-        text.contains("branch data unavailable"),
-        "a `!` row gets a footer legend:\n{text}"
-    );
-}
-
-#[test]
 fn picker_ellipsises_long_labels_instead_of_hard_cropping() {
     let mut long = summary("long");
     long.first_user_task = Some("verylongsessiontitlewithnospaces".repeat(12));
@@ -328,7 +314,6 @@ fn picker_enter_on_candidate_resumes_that_session() {
         state.dispatch(press(KeyCode::Enter)),
         Some(ResumeChoice::Resume {
             session_id: "second".to_string(),
-            branch_tip: None,
         })
     );
 }
@@ -389,8 +374,6 @@ fn session_summary_label_keeps_long_prompts_for_wrapping() {
         repo_root: None,
         display_name: None,
         labels: Vec::new(),
-        branches: Vec::new(),
-        branch_load_failed: false,
     };
     let label = summary.label();
     assert_eq!(label.chars().count(), 200);
@@ -496,8 +479,6 @@ fn project_hint_prefers_repo_root_basename() {
         repo_root: Some("/work/other".to_string()),
         display_name: None,
         labels: Vec::new(),
-        branches: Vec::new(),
-        branch_load_failed: false,
     };
     assert_eq!(s.project_hint(), "other");
 }
@@ -514,8 +495,6 @@ fn project_hint_falls_back_to_cwd_tail() {
         repo_root: None,
         display_name: None,
         labels: Vec::new(),
-        branches: Vec::new(),
-        branch_load_failed: false,
     };
     assert_eq!(s.project_hint(), "sibling");
 }
@@ -536,91 +515,11 @@ fn filter_all_projects_keeps_cross_cwd_entries() {
     );
 }
 
-fn tip(tip_sequence: u64, branched_from: u64, ts: u64, message: &str) -> EventBranchTip {
-    EventBranchTip {
-        tip_sequence,
-        branched_from_sequence: branched_from,
-        tip_ts_unix_ms: ts,
-        first_message_after_branch: Some(message.to_string()),
-    }
-}
-
-#[test]
-fn picker_collapses_branched_sessions_to_single_linear_row() {
-    // Branched sessions should collapse to a single linear entry rather than
-    // emitting one row per branch tip. Branch-aware resume is not yet
-    // implemented; showing multiple rows and then silently ignoring the
-    // selected tip would resume the wrong branch.
-    let mut branched = summary("branched");
-    branched.branches = vec![
-        tip(5, 1, 200, "path B prompt"),
-        tip(3, 1, 100, "path A prompt"),
-    ];
-    let state = ResumePickerState::new(vec![branched.clone()], cwd());
-    assert_eq!(state.candidates.len(), 1);
-    assert_eq!(state.candidates[0].session_id(), "branched");
-    assert!(
-        state.candidates[0].branch_tip.is_none(),
-        "branched session must collapse to a linear row (no branch_tip)"
-    );
-}
-
-#[test]
-fn picker_enter_on_branched_session_row_resumes_without_branch_tip() {
-    // Branched sessions collapse to a single linear row. Selecting the row
-    // must return a `Resume` choice with `branch_tip: None` (latest state).
-    let mut branched = summary("branched");
-    branched.branches = vec![tip(5, 1, 200, "path B"), tip(3, 1, 100, "path A")];
-    let mut state = ResumePickerState::new(vec![branched], cwd());
-    // [start_fresh, the single collapsed row]. One Down lands on the row.
-    state.dispatch(press(KeyCode::Down));
-    assert_eq!(
-        state.dispatch(press(KeyCode::Enter)),
-        Some(ResumeChoice::Resume {
-            session_id: "branched".to_string(),
-            branch_tip: None,
-        })
-    );
-}
-
 #[test]
 fn picker_keeps_linear_session_as_single_row() {
     let linear = summary("linear");
     let state = ResumePickerState::new(vec![linear], cwd());
     assert_eq!(state.candidates.len(), 1);
-    assert!(state.candidates[0].branch_tip.is_none());
-}
-
-#[test]
-fn picker_handles_single_branch_tip_as_linear() {
-    // detect_branches refuses to report only one tip, but if a caller ever
-    // hands us a summary with a single tip we still want to render one row
-    // rather than dropping the session entirely.
-    let mut summary = summary("one-tip");
-    summary.branches = vec![tip(2, 0, 50, "only path")];
-    let state = ResumePickerState::new(vec![summary], cwd());
-    assert_eq!(state.candidates.len(), 1);
-    assert!(state.candidates[0].branch_tip.is_none());
-}
-
-#[test]
-fn picker_shows_branched_cross_project_session_as_single_row_after_tab_toggle() {
-    // Cross-project branched sessions also collapse to a single linear row.
-    let mut sibling = summary_at("sibling", "/work/other");
-    sibling.branches = vec![tip(4, 1, 90, "branch B"), tip(2, 1, 70, "branch A")];
-    let state = ResumePickerState::new(vec![sibling], cwd());
-    assert!(
-        state.candidates.is_empty(),
-        "scoped view hides cross-project session by default",
-    );
-    let mut state = state;
-    state.dispatch(press(KeyCode::Tab));
-    assert_eq!(state.candidates.len(), 1);
-    // Cross-project rows must surface as CrossProject so the user gets the
-    // chdir hint rather than an in-process resume that would silently jump cwds.
-    state.dispatch(press(KeyCode::Down));
-    let choice = state.dispatch(press(KeyCode::Enter));
-    assert!(matches!(choice, Some(ResumeChoice::CrossProject { .. })));
 }
 
 #[test]

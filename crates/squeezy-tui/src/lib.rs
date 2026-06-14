@@ -822,9 +822,8 @@ pub async fn run_with_startup_profile_in_terminal_and_telemetry(
 }
 
 pub fn startup_resume_question_available(config: &AppConfig) -> bool {
-    // Only a yes/no answer is needed here, so use the summary-only loader:
-    // skip the per-candidate event-log reads that `load_candidates` does for
-    // branch detection (the picker itself still does them when it renders).
+    // Only a yes/no answer is needed here, and the candidate list is built
+    // from session metadata alone, so no event-log reads are required.
     let candidates = resume_picker::load_candidate_summaries(config);
     resume_picker::has_scoped_candidates(&candidates, &config.workspace_root)
 }
@@ -1479,7 +1478,7 @@ fn maybe_pick_resume_session(
     if startup.skip_resume_picker {
         return Ok(ResumeStartup::Fresh);
     }
-    let candidates = resume_picker::load_candidates(config);
+    let candidates = resume_picker::load_candidate_summaries(config);
     if candidates.is_empty() {
         return Ok(ResumeStartup::Fresh);
     }
@@ -1495,13 +1494,7 @@ fn maybe_pick_resume_session(
     .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
     match choice {
         resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
-        // The picker only emits linear entries (branch-tip rows are collapsed
-        // until branch-aware resume is implemented), so `branch_tip` is always
-        // `None` here. The field is preserved in the enum for future use.
-        resume_picker::ResumeChoice::Resume {
-            session_id,
-            branch_tip: _,
-        } => Ok(ResumeStartup::Use(session_id)),
+        resume_picker::ResumeChoice::Resume { session_id } => Ok(ResumeStartup::Use(session_id)),
         resume_picker::ResumeChoice::CrossProject {
             session_id,
             target_cwd,

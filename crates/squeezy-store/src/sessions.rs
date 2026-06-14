@@ -2064,7 +2064,6 @@ impl SessionHandle {
                     "reason": "event exceeded max_event_bytes",
                     "original_bytes": payload.len(),
                 }),
-                parent_event_sequence: event.parent_event_sequence,
             })?;
         }
         payload.push(b'\n');
@@ -2550,20 +2549,6 @@ pub struct SessionEvent {
     pub turn_id: Option<String>,
     pub summary: Option<String>,
     pub payload: Value,
-    /// Optional pointer to the parent event's position in `events.jsonl`,
-    /// expressed as a zero-based sequence number. `None` (the default and
-    /// the wire shape for every legacy log) means the event continues the
-    /// previous one linearly, so the implicit parent is `sequence - 1`.
-    /// `Some(k)` makes the parent explicit and is used to encode branches
-    /// — re-prompting from an earlier turn creates a new event whose
-    /// parent is the earlier turn rather than the current tip, so the
-    /// resume picker can offer to navigate to either branch.
-    ///
-    /// Backward compatible: every existing log deserialises with the
-    /// field absent, and `skip_serializing_if` keeps the JSONL bytes
-    /// byte-identical for linear producers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_event_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2742,19 +2727,7 @@ impl SessionEvent {
             turn_id,
             summary,
             payload,
-            parent_event_sequence: None,
         }
-    }
-
-    /// Attach an explicit parent event sequence to this event. The sequence
-    /// is the zero-based position of the parent event inside the session's
-    /// `events.jsonl`. Producers that branch off an earlier turn (for
-    /// example, re-prompting after navigating to a previous user message)
-    /// call this so the resulting tree exposes both branches.
-    #[must_use]
-    pub fn with_parent_event_sequence(mut self, sequence: u64) -> Self {
-        self.parent_event_sequence = Some(sequence);
-        self
     }
 
     /// Build a `SessionEvent` from a typed [`SessionEventKind`]. The kind
@@ -2794,127 +2767,8 @@ impl SessionEvent {
             turn_id,
             summary,
             payload,
-            parent_event_sequence: None,
         }
     }
-}
-
-/// Tip of one branch in a session's event tree. Produced by
-/// [`detect_branches`] for sessions that contain at least two branches so
-/// the resume picker can offer to navigate to either branch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EventBranchTip {
-    /// Zero-based index of the tip event in the source `events.jsonl`. The
-    /// tip is the leaf of one branch — the most recent event on that path
-    /// from the root.
-    pub tip_sequence: u64,
-    /// Index of the deepest ancestor that has multiple children, i.e. the
-    /// event from which this branch diverged from its sibling(s). When the
-    /// fork is at the root, this is the root's sequence.
-    pub branched_from_sequence: u64,
-    /// `ts_unix_ms` recorded on the tip event. Used to sort branch tips
-    /// newest-first in the picker.
-    pub tip_ts_unix_ms: u64,
-    /// First user-message text encountered on this branch *after* the
-    /// divergence point. Lets the picker label otherwise-identical
-    /// branches with the prompt that re-opened that path. `None` when the
-    /// branch contains no user message after the fork (rare; only happens
-    /// when the tip itself sits directly on the fork).
-    pub first_message_after_branch: Option<String>,
-}
-
-/// Walk `events` as a tree and return the tips of each branch. Sessions
-/// that are purely linear — every event implicitly continues the previous
-/// one — return an empty vector, so callers can skip the branch picker UI
-/// without an extra check. When the session contains at least two leaves
-/// (i.e. two distinct branches), every leaf is reported.
-///
-/// The implicit-parent rule mirrors the serialised wire shape: an event at
-/// index `i` whose `parent_event_sequence` is `None` is assumed to descend
-/// from `i - 1`. Only events that set `parent_event_sequence = Some(k)`
-/// where `k < i - 1` participate in branching.
-pub fn detect_branches(events: &[SessionEvent]) -> Vec<EventBranchTip> {
-    if events.len() < 2 {
-        return Vec::new();
-    }
-    let len = events.len();
-    let parents: Vec<Option<u64>> = events
-        .iter()
-        .enumerate()
-        .map(|(i, event)| match event.parent_event_sequence {
-            Some(parent) if (parent as usize) < len && (parent as usize) != i => Some(parent),
-            // An explicit but out-of-range parent is treated as the implicit
-            // parent rather than panicking. Self-parent is likewise ignored.
-            _ if i == 0 => None,
-            _ => Some((i - 1) as u64),
-        })
-        .collect();
-
-    let mut child_count: Vec<u32> = vec![0; len];
-    for parent in parents.iter().flatten() {
-        let idx = *parent as usize;
-        if idx < len {
-            child_count[idx] = child_count[idx].saturating_add(1);
-        }
-    }
-
-    let leaves: Vec<u64> = (0..len)
-        .filter(|i| child_count[*i] == 0)
-        .map(|i| i as u64)
-        .collect();
-    if leaves.len() < 2 {
-        return Vec::new();
-    }
-
-    let mut tips: Vec<EventBranchTip> = leaves
-        .iter()
-        .map(|&tip| {
-            let mut path: Vec<u64> = vec![tip];
-            let mut cur = tip as usize;
-            while let Some(parent) = parents[cur] {
-                path.push(parent);
-                cur = parent as usize;
-            }
-            path.reverse();
-
-            // Deepest ancestor on this path that has multiple children. When
-            // no internal node on the path forks (only possible if `tip`
-            // itself is the lone leaf, which `leaves.len() < 2` already
-            // guarded against), fall back to the root so callers still get
-            // a sensible divergence point.
-            let branched_from = path
-                .iter()
-                .rev()
-                .find(|&&node| child_count[node as usize] > 1)
-                .copied()
-                .unwrap_or(path[0]);
-
-            let first_message_after_branch = path
-                .iter()
-                .skip_while(|&&node| node != branched_from)
-                .skip(1)
-                .find_map(|&node| {
-                    let event = &events[node as usize];
-                    if event.kind == "user_message" {
-                        event.summary.clone()
-                    } else {
-                        None
-                    }
-                });
-
-            EventBranchTip {
-                tip_sequence: tip,
-                branched_from_sequence: branched_from,
-                tip_ts_unix_ms: events[tip as usize].ts_unix_ms,
-                first_message_after_branch,
-            }
-        })
-        .collect();
-
-    // Newest tip first so the picker surfaces the most recent branch at the
-    // top of the candidate list.
-    tips.sort_by_key(|tip| std::cmp::Reverse(tip.tip_ts_unix_ms));
-    tips
 }
 
 /// Typed view over `SessionEvent` for the well-known event kinds Squeezy
@@ -4174,7 +4028,6 @@ fn serialize_event_payload(event: &SessionEvent, max_event_bytes: usize) -> Resu
                 "reason": "event exceeded max_event_bytes",
                 "original_bytes": payload.len(),
             }),
-            parent_event_sequence: event.parent_event_sequence,
         })?;
     }
     payload.push(b'\n');
