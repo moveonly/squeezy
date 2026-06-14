@@ -4170,7 +4170,7 @@ fn env_var_is_nonempty(name: &str) -> bool {
 /// `requires_key_setup` state matches the key the session will actually
 /// load instead of seeing only the named env var.
 fn provider_key_is_configured(inline: Option<&str>, api_key_env: &str) -> bool {
-    squeezy_llm::credentials::resolve_api_key_with_inline_optional(inline, api_key_env)
+    squeezy_llm::resolve_api_key_with_inline_optional(inline, api_key_env)
         .map(|resolved| !resolved.value.trim().is_empty())
         .unwrap_or(false)
 }

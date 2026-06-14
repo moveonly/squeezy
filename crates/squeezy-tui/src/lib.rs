@@ -45018,7 +45018,11 @@ fn render_breadcrumbs_strip(frame: &mut Frame<'_>, row: Rect, app: &TuiApp) {
         let reserve = if count > 1 {
             model
                 .get(last)
-                .map(|c| UnicodeWidthStr::width(&c.label).min(width / 2).max(1))
+                .map(|c| {
+                    UnicodeWidthStr::width(c.label.as_str())
+                        .min(width / 2)
+                        .max(1)
+                })
                 .unwrap_or(0)
         } else {
             0

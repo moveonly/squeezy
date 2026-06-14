@@ -36437,15 +36437,11 @@ fn main_surface_search_row_kinds_align_and_classify() {
         "main-surface row kinds are length-locked to the painted rows"
     );
     assert!(
-        kinds
-            .iter()
-            .any(|k| *k == crate::search::RowKind::ToolOutput),
+        kinds.contains(&crate::search::RowKind::ToolOutput),
         "tool-result rows classify as ToolOutput, not all-Normal"
     );
     assert!(
-        kinds
-            .iter()
-            .any(|k| *k == crate::search::RowKind::Reasoning),
+        kinds.contains(&crate::search::RowKind::Reasoning),
         "reasoning rows classify as Reasoning, not all-Normal"
     );
 }
@@ -36466,16 +36462,8 @@ fn main_surface_search_row_kinds_align_with_startup_card() {
     let rows = main_surface_rows(&app);
     let kinds = search_row_kinds(&app, selection::SelectionSurface::Main, rows.len());
     assert_eq!(kinds.len(), rows.len());
-    assert!(
-        kinds
-            .iter()
-            .any(|k| *k == crate::search::RowKind::ToolOutput)
-    );
-    assert!(
-        kinds
-            .iter()
-            .any(|k| *k == crate::search::RowKind::Reasoning)
-    );
+    assert!(kinds.contains(&crate::search::RowKind::ToolOutput));
+    assert!(kinds.contains(&crate::search::RowKind::Reasoning));
 }
 
 #[test]
