@@ -1321,6 +1321,19 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
+                label: "zen",
+                toml_path: &["tui", "zen"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::Immediate,
+                get: get_zen,
+                set: set_zen,
+                default_display: "false",
+                default: || FieldValue::Bool(false),
+                help: "Zen Mode: low-noise layout that hides secondary chrome. Toggle live with F10.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
                 label: "theme",
                 toml_path: &["tui", "theme"],
                 kind: FieldKind::String { multiline: false },
@@ -3197,6 +3210,19 @@ fn set_status_line_use_colors(cfg: &mut AppConfig, value: FieldValue) -> Result<
     match value {
         FieldValue::Bool(v) => {
             cfg.tui.status_line_use_colors = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_zen(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.tui.zen)
+}
+fn set_zen(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.tui.zen = v;
             Ok(())
         }
         _ => Err("expects bool"),

@@ -10521,6 +10521,10 @@ pub struct TuiConfig {
     /// Color status-line items with their accent palette.
     /// Defaults to `true`.
     pub status_line_use_colors: bool,
+    /// Whether the session opens in Zen Mode (§12.4.5): the low-noise layout that
+    /// hides secondary chrome and condenses the status block. Default `false`;
+    /// toggled at runtime with F10 and here in `/config`.
+    pub zen: bool,
     /// Active named TUI theme. Builtins are `default`, `bright`, `fun`,
     /// `catppuccin`, and `high-contrast`; user settings may add more names.
     pub theme: String,
@@ -10582,6 +10586,7 @@ impl TuiConfig {
             coalesce_tool_runs: settings.coalesce_tool_runs.unwrap_or(true),
             status_line: settings.status_line,
             status_line_use_colors: settings.status_line_use_colors.unwrap_or(true),
+            zen: settings.zen.unwrap_or(false),
             theme: settings
                 .theme
                 .unwrap_or_else(|| DEFAULT_TUI_THEME_NAME.to_string()),
@@ -10621,6 +10626,7 @@ pub struct TuiSettings {
     pub coalesce_tool_runs: Option<bool>,
     pub status_line: Option<Vec<String>>,
     pub status_line_use_colors: Option<bool>,
+    pub zen: Option<bool>,
     pub theme: Option<String>,
     pub spinner: Option<String>,
     pub themes: Option<BTreeMap<String, TuiThemeSettings>>,
@@ -10647,6 +10653,7 @@ impl TuiSettings {
                 "coalesce_tool_runs",
                 "status_line",
                 "status_line_use_colors",
+                "zen",
                 "theme",
                 "spinner",
                 "themes",
@@ -10716,6 +10723,7 @@ impl TuiSettings {
                 source,
                 &field(path, "status_line_use_colors"),
             )?,
+            zen: bool_value(table, "zen", source, &field(path, "zen"))?,
             theme: tui_theme_value(table, "theme", source, &field(path, "theme"))?,
             spinner: tui_spinner_value(table, "spinner", source, &field(path, "spinner"))?,
             themes: tui_themes_value(table, "themes", source, &field(path, "themes"))?,
@@ -10766,6 +10774,7 @@ impl TuiSettings {
             &mut self.status_line_use_colors,
             next.status_line_use_colors,
         );
+        replace_if_some(&mut self.zen, next.zen);
         replace_if_some(&mut self.theme, next.theme);
         merge_option(&mut self.themes, next.themes, merge_tui_theme_maps);
         replace_if_some(&mut self.desktop_notifications, next.desktop_notifications);
