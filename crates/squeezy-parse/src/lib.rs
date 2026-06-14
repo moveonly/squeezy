@@ -13,7 +13,7 @@ use squeezy_core::{
     SourcePoint, SourceSpan, SqueezyError, SymbolId, SymbolKind,
 };
 use squeezy_workspace::FileRecord;
-use tree_sitter::{InputEdit, Node, Point, Tree};
+use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
 pub(crate) use languages::{
     c_family::extract_c_family, csharp::extract_csharp, dart::extract_dart, go::extract_go,

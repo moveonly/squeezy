@@ -296,23 +296,23 @@ fn helper() {}
 #[test]
 fn language_parser_initializes_parsers_on_demand() {
     let mut parser = LanguageParser::new().unwrap();
-    assert!(parser.parsers.parsers.is_empty());
+    assert!(parser.parsers.is_empty());
 
     let rust_source = "pub fn run() {}\n";
     let rust_record = record("src/lib.rs", rust_source);
     parser
         .parse_source(&rust_record, rust_source.to_string())
         .unwrap();
-    assert!(parser.parsers.parsers.contains_key(&LanguageKind::Rust));
-    assert_eq!(parser.parsers.parsers.len(), 1);
+    assert!(parser.parsers.contains_language(LanguageKind::Rust));
+    assert_eq!(parser.parsers.len(), 1);
 
     let python_source = "def run():\n    return None\n";
     let python_record = python_record("src/app.py", python_source);
     parser
         .parse_source(&python_record, python_source.to_string())
         .unwrap();
-    assert!(parser.parsers.parsers.contains_key(&LanguageKind::Python));
-    assert_eq!(parser.parsers.parsers.len(), 2);
+    assert!(parser.parsers.contains_language(LanguageKind::Python));
+    assert_eq!(parser.parsers.len(), 2);
 }
 
 #[test]

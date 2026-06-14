@@ -113,6 +113,21 @@ impl ParserPool {
             }
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.parsers.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_language(&self, language: LanguageKind) -> bool {
+        self.parsers.contains_key(&language)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.parsers.len()
+    }
 }
 
 pub(crate) fn parser_for_language_kind(language: LanguageKind) -> Result<Parser> {
