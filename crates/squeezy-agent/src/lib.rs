@@ -5012,13 +5012,12 @@ impl Agent {
                     )
                     .await;
                     if let Some(session) = failure_session_log {
-                        let _ = session.append_typed_event(
-                            SessionEventKind::Failed {
-                                error: error.to_string(),
-                            },
+                        let _ = session.append_event(SessionEvent::new(
+                            "failed",
                             Some(turn_id.to_string()),
                             Some(error.to_string()),
-                        );
+                            json!({ "error": error.to_string() }),
+                        ));
                         let _ = session.update_metadata(|metadata| {
                             metadata.status = SessionStatus::Failed;
                             metadata.latest_summary = Some(error.to_string());
@@ -15591,11 +15590,12 @@ fn start_session_log(config: &AppConfig, provider: &str) -> Option<SessionHandle
     let metadata = SessionMetadata::new(config, provider);
     match store.start_session(metadata) {
         Ok(handle) => {
-            let _ = handle.append_typed_event(
-                SessionEventKind::SessionStarted,
+            let _ = handle.append_event(SessionEvent::new(
+                "session_started",
                 None,
                 Some("session started".to_string()),
-            );
+                json!({}),
+            ));
             Some(handle)
         }
         Err(error) => {
@@ -15764,92 +15764,12 @@ pub(crate) fn log_session_event(
     };
     let summary = summary.map(|value| redactor.redact(&value).text);
     let payload = redact_json_payload(payload, redactor);
-    let event = typed_session_event(kind, turn_id, summary, payload);
-    let _ = session.append_event(event);
-}
-
-fn typed_session_event(
-    kind: &str,
-    turn_id: Option<TurnId>,
-    summary: Option<String>,
-    payload: Value,
-) -> SessionEvent {
-    let turn_id = turn_id.map(|value| value.to_string());
-    let typed = match kind {
-        "user_message" => Some(SessionEventKind::UserMessage {
-            text: summary.clone().unwrap_or_default(),
-        }),
-        "assistant_completed" => Some(SessionEventKind::AssistantCompleted {
-            text: summary.clone().unwrap_or_default(),
-            response_id: payload
-                .get("response_id")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        }),
-        "tool_call" => Some(SessionEventKind::ToolCall {
-            call_id: payload
-                .get("call_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            tool: payload
-                .get("tool")
-                .and_then(Value::as_str)
-                .or(summary.as_deref())
-                .unwrap_or_default()
-                .to_string(),
-            arguments: payload.get("arguments").cloned().unwrap_or(Value::Null),
-        }),
-        "tool_result" => Some(SessionEventKind::ToolResult {
-            output: payload.get("output").cloned().unwrap_or(Value::Null),
-        }),
-        "approval_requested" => Some(SessionEventKind::ApprovalRequested {
-            tool: payload
-                .get("tool")
-                .and_then(Value::as_str)
-                .or(summary.as_deref())
-                .unwrap_or_default()
-                .to_string(),
-            payload: payload.clone(),
-        }),
-        "approval_decided" => Some(SessionEventKind::ApprovalDecided {
-            tool: payload
-                .get("tool")
-                .and_then(Value::as_str)
-                .or(summary.as_deref())
-                .unwrap_or_default()
-                .to_string(),
-            decision: payload
-                .get("decision")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            payload: payload.clone(),
-        }),
-        "session_started" => Some(SessionEventKind::SessionStarted),
-        "session_resumed" => Some(SessionEventKind::SessionResumed),
-        "session_ended" => Some(SessionEventKind::SessionEnded {
-            status: payload
-                .get("status")
-                .and_then(Value::as_str)
-                .or(summary.as_deref())
-                .unwrap_or_default()
-                .to_string(),
-        }),
-        "cancelled" => Some(SessionEventKind::Cancelled),
-        "failed" => Some(SessionEventKind::Failed {
-            error: payload
-                .get("error")
-                .and_then(Value::as_str)
-                .or(summary.as_deref())
-                .unwrap_or_default()
-                .to_string(),
-        }),
-        _ => None,
-    };
-    typed
-        .map(|event| SessionEvent::from_typed(event, turn_id.clone(), summary.clone()))
-        .unwrap_or_else(|| SessionEvent::new(kind, turn_id, summary, payload))
+    let _ = session.append_event(SessionEvent::new(
+        kind,
+        turn_id.map(|value| value.to_string()),
+        summary,
+        payload,
+    ));
 }
 
 fn log_job_lifecycle(
