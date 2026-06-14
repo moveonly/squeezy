@@ -4010,6 +4010,12 @@ impl ToolRegistry {
         if exclude_tests || tests_only {
             packets.retain(|packet| packet_matches_test_scope(packet, exclude_tests, tests_only));
         }
+        // edge_kind: keep only edge-bearing packets whose kind matches the
+        // requested kind (case-insensitive). An unknown token parses to `None`
+        // and leaves every packet in place.
+        if let Some(want) = args.edge_kind.as_deref().and_then(parse_edge_kind_filter) {
+            packets.retain(|packet| packet_matches_edge_kind(packet, Some(want)));
+        }
         let truncated = overflowed;
         let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
         let mut payload = graph_payload("upstream_flow", manager, refresh);
@@ -4090,6 +4096,12 @@ impl ToolRegistry {
         let tests_only = args.tests_only.unwrap_or(false);
         if exclude_tests || tests_only {
             packets.retain(|packet| packet_matches_test_scope(packet, exclude_tests, tests_only));
+        }
+        // edge_kind: keep only edge-bearing packets whose kind matches the
+        // requested kind (case-insensitive). An unknown token parses to `None`
+        // and leaves every packet in place.
+        if let Some(want) = args.edge_kind.as_deref().and_then(parse_edge_kind_filter) {
+            packets.retain(|packet| packet_matches_edge_kind(packet, Some(want)));
         }
         let truncated = overflowed;
         let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
