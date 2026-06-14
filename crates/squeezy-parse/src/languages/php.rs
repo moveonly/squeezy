@@ -1847,6 +1847,110 @@ fn extract_php_symbol_facts(
     if node.kind() == "method_declaration" && symbol.name == "__construct" {
         extract_php_promoted_fields(node, symbol, ctx, scope);
     }
+    // Docblock types are the dominant type carrier in real/legacy PHP and the
+    // only place generics like `array<int, User>` appear. Mine the symbol's
+    // `@param`/`@return`/`@var`/... tags for Heuristic Type references.
+    mine_php_docblock_types(symbol, ctx);
+}
+
+fn mine_php_docblock_types(symbol: &ParsedSymbol, ctx: &mut ExtractContext<'_>) {
+    if symbol.docs.is_empty() {
+        return;
+    }
+    let mut seen = HashSet::new();
+    for doc in &symbol.docs {
+        for line in doc.lines() {
+            // Strip the leading ` * ` decoration common to `/** */` blocks.
+            let line = line.trim().trim_start_matches('*').trim();
+            let Some(rest) = line.strip_prefix('@') else {
+                continue;
+            };
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let Some(tag) = parts.next() else {
+                continue;
+            };
+            if !php_docblock_tag_carries_type(tag) {
+                continue;
+            }
+            let Some(remainder) = parts.next() else {
+                continue;
+            };
+            for name in php_docblock_type_names(remainder.trim()) {
+                if seen.insert(name.clone()) {
+                    ctx.references.push(ParsedReference {
+                        file_id: ctx.file.id.clone(),
+                        owner_id: Some(symbol.id.clone()),
+                        text: name,
+                        kind: ReferenceKind::Type,
+                        span: symbol.span,
+                        provenance: Provenance::new(PROVENANCE, "docblock type reference"),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn php_docblock_tag_carries_type(tag: &str) -> bool {
+    // Normalise Psalm/PHPStan vendor prefixes (`@psalm-param`,
+    // `@phpstan-return`) onto their base tag before matching.
+    let base = tag
+        .strip_prefix("psalm-")
+        .or_else(|| tag.strip_prefix("phpstan-"))
+        .unwrap_or(tag);
+    matches!(
+        base,
+        "param"
+            | "return"
+            | "var"
+            | "throws"
+            | "template"
+            | "template-covariant"
+            | "property"
+            | "property-read"
+            | "property-write"
+            | "method"
+    )
+}
+
+fn php_docblock_type_names(remainder: &str) -> Vec<String> {
+    // The type expression is the leading run of the tag body up to the first
+    // top-level whitespace — that boundary ends the type and begins the
+    // `$variable` / description. Spaces *inside* generics (`array<int, User>`)
+    // stay part of the type because they sit at bracket depth > 0.
+    let mut depth: i32 = 0;
+    let mut type_expr = String::new();
+    for ch in remainder.chars() {
+        match ch {
+            '<' | '(' | '[' | '{' => {
+                depth += 1;
+                type_expr.push(ch);
+            }
+            '>' | ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                type_expr.push(ch);
+            }
+            ' ' | '\t' if depth == 0 => break,
+            _ => type_expr.push(ch),
+        }
+    }
+    // Tokenise the bounded type expression on every structural separator and
+    // recover each class-like leaf, dropping keywords and `$var`/`...$var`.
+    type_expr
+        .split(|ch: char| {
+            matches!(
+                ch,
+                '<' | '>' | '|' | '&' | ',' | '(' | ')' | '[' | ']' | '{' | '}' | ':' | ' ' | '\t'
+            )
+        })
+        .filter_map(|token| {
+            let token = token.trim_matches(|ch: char| ch == '?' || ch == '!' || ch == '.');
+            if token.is_empty() || token.starts_with('$') {
+                return None;
+            }
+            php_type_name_from_annotation(token)
+        })
+        .collect()
 }
 
 fn extract_php_promoted_fields(
