@@ -289,6 +289,7 @@ pub enum SectionId {
     Feedback,
     Redaction,
     Web,
+    Tools,
     McpServers,
     /// Synthetic section that hosts tier-wide reset actions ("delete the
     /// user file", "delete the repo file", "delete the local file"). Has
@@ -316,6 +317,7 @@ impl SectionId {
             Self::Feedback => "feedback",
             Self::Redaction => "redaction",
             Self::Web => "web",
+            Self::Tools => "tools",
             Self::McpServers => "mcp-servers",
             Self::Reset => "reset",
         }
@@ -2512,6 +2514,24 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
         ],
     },
     ConfigSectionMeta {
+        id: SectionId::Tools,
+        label: "Tools",
+        description: "Local tool behavior such as the checkpoint/undo safety net",
+        fields: &[FieldMeta {
+            label: "checkpoints_enabled",
+            toml_path: &["tools", "checkpoints_enabled"],
+            kind: FieldKind::Bool,
+            tier: ApplyTier::Restart,
+            get: get_checkpoints_enabled,
+            set: set_checkpoints_enabled,
+            default_display: "false",
+            default: || FieldValue::Bool(false),
+            help: "Enable local git-snapshot checkpoints with /undo and /revert (off by default).",
+            env_override: Some("SQUEEZY_CHECKPOINTS_ENABLED"),
+            secret: false,
+        }],
+    },
+    ConfigSectionMeta {
         id: SectionId::McpServers,
         label: "MCP Servers",
         // Render path: the `/mcp` page renders one row per configured
@@ -4183,6 +4203,21 @@ fn set_exploration_graph(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &
     match value {
         FieldValue::Bool(v) => {
             cfg.exploration_graph = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+// ─── Tools ────────────────────────────────────────────────────────────────────
+
+fn get_checkpoints_enabled(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.checkpoints_enabled)
+}
+fn set_checkpoints_enabled(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.checkpoints_enabled = v;
             Ok(())
         }
         _ => Err("expects bool"),
