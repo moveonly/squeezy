@@ -687,6 +687,27 @@ pub(crate) fn symbol_context_spec() -> ToolSpec {
     }
 }
 
+pub(crate) fn symbol_at_spec() -> ToolSpec {
+    ToolSpec {
+        name: "symbol_at".to_string(),
+        description: "Resolve a source position to the smallest enclosing graph symbol. Pass `path` plus a position — `line` (1-based, optionally with `column`) or a raw `byte` offset. Returns the symbol_id you can chain into definition_search, symbol_context, upstream_flow, read_slice, and the other graph tools. Use it to turn a compiler/diagnostic location or a grep hit into a graph anchor.".to_string(),
+        capability: PermissionCapability::Read,
+        parallel_safe: true,
+        parameters: tool_schema(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": {"type": "string", "description": "Workspace-relative file path to resolve the position within."},
+                "line": {"type": "integer", "minimum": 1, "description": "1-based line number of the position."},
+                "column": {"type": "integer", "minimum": 1, "description": "Optional 1-based column on `line` to disambiguate nested spans."},
+                "byte": {"type": "integer", "minimum": 0, "description": "Raw byte offset of the position; an alternative to line/column."}
+            },
+            "required": ["path"]
+        })),
+        prepare_arguments: None,
+    }
+}
+
 pub(crate) fn list_skills_spec() -> ToolSpec {
     ToolSpec {
         name: "list_skills".to_string(),
