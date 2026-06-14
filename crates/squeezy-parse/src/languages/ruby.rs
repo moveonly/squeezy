@@ -722,6 +722,29 @@ fn push_synthetic_attr(
     });
 }
 
+/// True for Ruby metaprogramming sinks whose callee is resolved at runtime
+/// (`obj.send(:foo)`, `define_method(:bar) { ... }`, `instance_eval(src)`).
+/// Tagging these `ParsedCallKind::Macro` lets the graph resolver emit an
+/// `InvokesMacro` classification for dynamic dispatch instead of pretending it
+/// is an ordinary call.
+fn ruby_is_macro_dispatch(name: &str) -> bool {
+    matches!(
+        name,
+        "send"
+            | "public_send"
+            | "__send__"
+            | "define_method"
+            | "method"
+            | "eval"
+            | "instance_eval"
+            | "class_eval"
+            | "module_eval"
+            | "instance_exec"
+            | "class_exec"
+            | "module_exec"
+    )
+}
+
 fn extract_ruby_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
     let Some(method_node) = node.child_by_field_name("method") else {
         return;
@@ -746,7 +769,16 @@ fn extract_ruby_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Opt
         .child_by_field_name("arguments")
         .map(named_child_count)
         .unwrap_or_default();
-    let call_kind = if receiver_text.is_some() {
+    // Known dynamic-dispatch sinks (metaprogramming) are tagged `Macro` so the
+    // resolver's `InvokesMacro` classification fires for them rather than
+    // treating them as ordinary method/direct calls. The actual callee is not
+    // statically known (it's a runtime symbol/string), so resolution stays
+    // `MacroOpaque` — but the edge kind alone lets callers find dynamic dispatch
+    // sites. Receiver shape is irrelevant: both `obj.send(:foo)` and a bare
+    // `define_method(:foo)` are dynamic dispatch.
+    let call_kind = if ruby_is_macro_dispatch(&name) {
+        ParsedCallKind::Macro
+    } else if receiver_text.is_some() {
         ParsedCallKind::Method
     } else {
         ParsedCallKind::Direct
