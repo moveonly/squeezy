@@ -2,7 +2,11 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-pub(crate) fn git_text<I, S>(cwd: &Path, args: I) -> std::result::Result<String, String>
+#[cfg(test)]
+#[path = "git_command_tests.rs"]
+mod tests;
+
+pub(super) fn git_text<I, S>(cwd: &Path, args: I) -> std::result::Result<String, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -11,7 +15,7 @@ where
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-pub(crate) fn git_output<I, S>(cwd: &Path, args: I) -> std::result::Result<Output, String>
+pub(super) fn git_output<I, S>(cwd: &Path, args: I) -> std::result::Result<Output, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -19,7 +23,7 @@ where
     git_output_allow_status(cwd, args, &[0])
 }
 
-pub(crate) fn git_output_allow_status<I, S>(
+pub(super) fn git_output_allow_status<I, S>(
     cwd: &Path,
     args: I,
     success: &[i32],
@@ -37,7 +41,7 @@ where
     )
 }
 
-pub(crate) fn git_output_vec_allow_status(
+pub(super) fn git_output_vec_allow_status(
     cwd: &Path,
     args: Vec<String>,
     success: &[i32],
@@ -45,7 +49,7 @@ pub(crate) fn git_output_vec_allow_status(
     git_output_vec_with_stdin_allow_status(cwd, args, Vec::new(), success)
 }
 
-pub(crate) fn git_output_vec_with_stdin_allow_status(
+pub(super) fn git_output_vec_with_stdin_allow_status(
     cwd: &Path,
     args: Vec<String>,
     stdin: Vec<u8>,
@@ -95,7 +99,7 @@ pub(crate) fn git_output_vec_with_stdin_allow_status(
     }
 }
 
-pub(crate) fn hooks_off_value() -> &'static str {
+pub(super) fn hooks_off_value() -> &'static str {
     if cfg!(windows) { "NUL" } else { "/dev/null" }
 }
 
@@ -111,7 +115,7 @@ pub(crate) fn hooks_off_value() -> &'static str {
 /// Any `fatal:` / `error:` / unknown diagnostic line, even mixed in after
 /// the header, causes this to return `false` so the real error still
 /// propagates through `SqueezyError::Tool`.
-pub(crate) fn is_add_ignored_advisory_only(stderr: &str) -> bool {
+pub(super) fn is_add_ignored_advisory_only(stderr: &str) -> bool {
     let mut saw_header = false;
     for raw_line in stderr.lines() {
         let line = raw_line.trim();
