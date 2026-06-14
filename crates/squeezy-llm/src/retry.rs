@@ -8,7 +8,7 @@ pub use request::{send_with_auth_retry, send_with_retry};
 pub use stream::with_stream_retry;
 
 #[cfg(test)]
-pub(crate) use classifier::is_terminal_quota_error;
+pub(crate) use classifier::{is_retryable_stream_error, is_terminal_quota_error};
 #[cfg(test)]
 pub(crate) use policy::{JITTER_FRACTION, apply_jitter, backoff, capped_backoff, jitter_sample};
 #[cfg(test)]
