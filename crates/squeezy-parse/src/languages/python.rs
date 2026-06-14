@@ -98,6 +98,16 @@ pub(crate) fn visit_python_node(
         extract_python_import(node, ctx, owner_symbol.clone());
     }
 
+    // PEP 695 `type Alias[T] = ...`. tree-sitter-python models this as a
+    // dedicated `type_alias_statement` node (not an `assignment`), which
+    // `python_symbol_from_node` does not recognise, so emit the TypeAlias
+    // symbol here.
+    if kind == "type_alias_statement" {
+        extract_python_type_alias(node, ctx, parent_symbol.as_ref());
+        visit_python_children(node, ctx, parent_symbol, owner_symbol);
+        return;
+    }
+
     if let Some(symbol) = python_symbol_from_node(node, ctx, parent_symbol.as_ref()) {
         extract_python_symbol_facts(node, &symbol, ctx);
         let next_parent = Some((symbol.id.clone(), symbol.kind));
@@ -185,6 +195,70 @@ pub(crate) fn extract_python_import(
             is_global: false,
         });
     }
+}
+
+/// Emit a `TypeAlias` symbol for a PEP 695 `type Alias[T] = <type>` statement,
+/// recording the RHS as a Type reference. The `left` field holds the alias
+/// name (with optional `[T, ...]` type parameters); only the leading
+/// identifier is the symbol name.
+pub(crate) fn extract_python_type_alias(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) {
+    let left = node
+        .child_by_field_name("left")
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .unwrap_or_default();
+    // Strip the optional `[T, ...]` type-parameter list, then take the leaf
+    // identifier of the alias name.
+    let name_text = left.split('[').next().unwrap_or(left).trim();
+    let Some(name) = python_field_type_name(name_text) else {
+        return;
+    };
+    let span = span_from_node(node);
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let signature = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    let mut attributes = vec!["python:type-alias".to_string()];
+    if let Some(target) = node
+        .child_by_field_name("right")
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .and_then(python_field_type_name)
+    {
+        attributes.push(format!("type:{target}"));
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: parent_id.clone(),
+            text: target,
+            kind: ReferenceKind::Type,
+            span,
+            provenance: Provenance::new("tree-sitter-python", "type alias reference"),
+        });
+    }
+
+    ctx.symbols.push(ParsedSymbol {
+        id: symbol_id(&ctx.file, parent_id.as_ref(), SymbolKind::TypeAlias, &name, span),
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name,
+        kind: SymbolKind::TypeAlias,
+        language_identity: None,
+        span,
+        body_span: None,
+        signature_span: None,
+        signature,
+        visibility: None,
+        docs: Vec::new(),
+        attributes,
+        provenance: Provenance::new("tree-sitter-python", "type_alias_statement declaration"),
+        confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+        arity: None,
+    });
 }
 
 pub(crate) fn split_python_alias(text: &str) -> (&str, Option<&str>) {
