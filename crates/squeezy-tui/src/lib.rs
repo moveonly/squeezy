@@ -6405,6 +6405,16 @@ fn handle_workspace_profile_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
         KeyCode::Char('s') => workspace_profile_save(app, agent),
         KeyCode::Char('r') => workspace_profile_restore(app, agent),
         KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => workspace_profile_reset(app),
+        // Direct field-focus keys `a`..`d` (the keyboard twin of clicking a field
+        // row); disjoint from the `j`/`k` nav and `s`/`r`/`x` verb keys.
+        KeyCode::Char(c @ 'a'..='d') => {
+            let index = (c as u8 - b'a') as usize;
+            if let Some(state) = app.workspace_profile.as_mut() {
+                state.focus_field(index);
+            }
+            app.status = workspace_profile_status(app);
+            app.needs_redraw = true;
+        }
         _ => {}
     }
     // The overlay is modal: swallow every key so nothing leaks to the composer
@@ -12048,6 +12058,19 @@ fn handle_transcript_index_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
             transcript_index_jump_to_selected(app);
         }
+        // First-letter jump keys (`u`/`a`/`r`/…): select + jump to the category
+        // whose label starts with the typed letter. Checked after the `j`/`k`/`l`
+        // nav keys above, so those never reach here.
+        KeyCode::Char(c) if c.is_ascii_alphabetic() => {
+            let target = c.to_ascii_lowercase();
+            if let Some(pos) = categories.iter().position(|cat| {
+                cat.label().chars().next().map(|f| f.to_ascii_lowercase()) == Some(target)
+            }) {
+                app.transcript_index_selected = pos;
+                app.transcript_index_anchor = None;
+                transcript_index_jump_to_selected(app);
+            }
+        }
         // Swallow every other key so the overlay is modal: a stray keystroke
         // cannot leak into the composer underneath while the overlay owns focus.
         _ => {}
@@ -14746,6 +14769,22 @@ fn handle_action_palette_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         }
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
             run_selected_action_palette_action(app);
+        }
+        // Direct select keys `a`..`i` run the matching row (the keyboard twin of
+        // a row click). Bounded to the live action count, and disjoint from the
+        // `j`/`k`/`l` nav keys, so no stray key collides.
+        KeyCode::Char(c @ 'a'..='i') => {
+            let index = (c as u8 - b'a') as usize;
+            if app
+                .action_palette
+                .as_ref()
+                .is_some_and(|palette| index < palette.actions().len())
+            {
+                if let Some(palette) = app.action_palette.as_mut() {
+                    palette.select(index);
+                }
+                run_selected_action_palette_action(app);
+            }
         }
         // Swallow every other key so the palette is modal: a stray keystroke
         // cannot leak into the composer underneath while the palette owns focus.
@@ -29725,7 +29764,10 @@ fn render_workspace_profile_surface(
         .saturating_add(inner.height)
         .saturating_sub(rows_top)
         .saturating_sub(1); // reserve the last inner row for the footer legend
-    let value_col = inner.x.saturating_add(20).min(inner.x + inner.width);
+    // Reserve room for the 2-col marker + the 4-col `[x] ` focus-key tag + the
+    // widest field label ("Transcript detail") before the value column, so the
+    // tag never pushes a label into the value text.
+    let value_col = inner.x.saturating_add(24).min(inner.x + inner.width);
 
     for (index, field) in workspace_profile::FIELDS
         .iter()
@@ -29755,6 +29797,12 @@ fn render_workspace_profile_surface(
                 } else {
                     crate::render::theme::quiet()
                 }),
+            ),
+            // Per-field focus key: press `a`..`d` to jump straight to that field
+            // (the keyboard twin of clicking it), instead of stepping with ↑/↓.
+            Span::styled(
+                format!("[{}] ", (b'a' + index as u8) as char),
+                Style::default().fg(crate::render::theme::quiet()),
             ),
             Span::styled(field.label(), label_style),
         ]);
@@ -30861,6 +30909,15 @@ fn render_transcript_index_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             Style::default().fg(crate::render::theme::foreground())
         };
         let count = app.transcript_index.count(category);
+        // First-letter jump key: each category label starts with a distinct
+        // letter (User/Assistant/Reasoning/Tool/Error/…), so `[u]`/`[a]`/`[r]`/…
+        // both documents and binds a one-press jump to that category.
+        let jump_key = category
+            .label()
+            .chars()
+            .next()
+            .map(|c| c.to_ascii_lowercase())
+            .unwrap_or(' ');
         let line = Line::from(vec![
             Span::styled(
                 marker,
@@ -30869,6 +30926,10 @@ fn render_transcript_index_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
                 } else {
                     crate::render::theme::quiet()
                 }),
+            ),
+            Span::styled(
+                format!("[{jump_key}] "),
+                Style::default().fg(crate::render::theme::quiet()),
             ),
             Span::styled(format!("{:<12}", category.label()), label_style),
             Span::styled(
@@ -32647,17 +32708,27 @@ fn render_action_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp
         // The default keyboard chord for the action, where it has one, so the menu
         // doubles as a discoverability hint (the spec's "current bindings" goal).
         let hint = action_palette_action_hint(app, *action);
-        let mut spans = vec![
-            Span::styled(
-                caret,
-                Style::default().fg(if is_selected {
-                    crate::render::theme::secondary()
-                } else {
-                    crate::render::theme::quiet()
-                }),
-            ),
-            Span::styled(action.label(palette.collapsed).to_string(), label_style),
-        ];
+        let mut spans = vec![Span::styled(
+            caret,
+            Style::default().fg(if is_selected {
+                crate::render::theme::secondary()
+            } else {
+                crate::render::theme::quiet()
+            }),
+        )];
+        // Per-action select key: press `a`..`i` to run that row directly. The
+        // palette never offers more than 9 actions, so `a`..`i` covers it and
+        // stays clear of the `j`/`k` (down/up) and `l` (activate) nav keys.
+        if offset < 9 {
+            spans.push(Span::styled(
+                format!("[{}] ", (b'a' + offset as u8) as char),
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
+        }
+        spans.push(Span::styled(
+            action.label(palette.collapsed).to_string(),
+            label_style,
+        ));
         if let Some(hint) = hint {
             spans.push(Span::styled(
                 format!("  ({hint})"),
