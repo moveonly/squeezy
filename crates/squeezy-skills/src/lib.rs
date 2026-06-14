@@ -13,8 +13,7 @@ mod validation;
 pub(crate) use catalog::SkillEntry;
 pub use catalog::{
     LoadedSkill, SkillActivation, SkillActivationKind, SkillActivationWarning, SkillCatalog,
-    SkillContextBreakdown, SkillDiscoverySummary, SkillSource, SkillSummary, escape_body_breakouts,
-    xml_escape,
+    SkillContextBreakdown, SkillDiscoverySummary, SkillSource, SkillSummary, xml_escape,
 };
 pub use frontmatter::SkillContextMode;
 pub use help::{

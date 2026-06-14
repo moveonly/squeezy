@@ -1367,6 +1367,15 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         related: &["tui", "config"],
     },
     SlashCommandHelp {
+        name: "/reveal",
+        what: "Temporarily show presentation-mode metadata without leaving presentation mode.",
+        syntax: "/reveal",
+        examples: &["/reveal  — reveal metadata hidden by presentation mode"],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["tui", "statusline"],
+    },
+    SlashCommandHelp {
         name: "/cost",
         what: "Show cumulative token and cost accounting for the current session.",
         syntax: "/cost",

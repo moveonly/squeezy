@@ -342,6 +342,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         true,
         &[PermissionCapability::Edit],
     ),
+    slash("/reveal", "temporarily show presentation-mode metadata"),
     slash_args_caps(
         "/theme",
         "switch color theme (or open theme config)",
@@ -500,9 +501,8 @@ impl SlashCommand {
                 SlashCategory::Export
             }
             "/config" | "/model" | "/permissions" | "/theme" | "/mcp" | "/tool-verbosity"
-            | "/statusline" | "/keymap" | "/terminal" | "/terminal-reset" | "/reviewer" => {
-                SlashCategory::Settings
-            }
+            | "/statusline" | "/reveal" | "/keymap" | "/terminal" | "/terminal-reset"
+            | "/reviewer" => SlashCategory::Settings,
             other => unreachable!("slash command {other} is not assigned to a SlashCategory"),
         }
     }
