@@ -2447,6 +2447,13 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
     {
         events.push(event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))?);
     }
+    if events.len() == 1
+        && is_legacy_alt_prefix_event(&events[0])
+        && event::poll(Duration::from_millis(25))
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?
+    {
+        events.push(event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))?);
+    }
     dispatch_input_events(app, agent, events).await
 }
 
@@ -2460,6 +2467,7 @@ async fn dispatch_input_events(
     agent: &mut Agent,
     mut events: Vec<Event>,
 ) -> Result<bool> {
+    events = normalise_legacy_alt_events(events);
     // While the transcript overlay holds mouse-drag capture, handle a key
     // ahead of the drag repaint flood, then fall through to drain the rest
     // of the batch (the key is removed from `events`, so it is not replayed).
@@ -2475,6 +2483,66 @@ async fn dispatch_input_events(
         }
     }
     Ok(false)
+}
+
+fn normalise_legacy_alt_events(events: Vec<Event>) -> Vec<Event> {
+    let mut normalised = Vec::with_capacity(events.len());
+    let mut iter = events.into_iter().peekable();
+    while let Some(event) = iter.next() {
+        if is_legacy_alt_prefix_event(&event)
+            && let Some(Event::Key(next)) = iter.peek()
+            && let Some(alt_key) = legacy_alt_key_from_suffix(*next)
+        {
+            let _ = iter.next();
+            normalised.push(Event::Key(alt_key));
+            continue;
+        }
+        normalised.push(event);
+    }
+    normalised
+}
+
+fn is_legacy_alt_prefix_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Esc,
+            modifiers,
+            kind: KeyEventKind::Press | KeyEventKind::Repeat,
+            ..
+        }) if modifiers.is_empty()
+    )
+}
+
+fn legacy_alt_key_from_suffix(mut key: KeyEvent) -> Option<KeyEvent> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return None;
+    }
+    if key
+        .modifiers
+        .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SUPER)
+    {
+        return None;
+    }
+    if !matches!(
+        key.code,
+        KeyCode::Char(_)
+            | KeyCode::Enter
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::BackTab
+            | KeyCode::Tab
+    ) {
+        return None;
+    }
+    key.modifiers.insert(KeyModifiers::ALT);
+    Some(key)
 }
 
 fn take_priority_key_event_for_dispatch(app: &TuiApp, events: &mut Vec<Event>) -> Option<Event> {
@@ -19444,15 +19512,7 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
                     app.status = "turn deselected".to_string();
                 } else {
                     app.selected_entry = Some(index);
-                    // Say what selecting a turn is FOR and how to drop it — the
-                    // focus is the target of the per-entry verbs, which is
-                    // otherwise an invisible mode behind a bare `›` caret.
-                    let fold = key_hint(app, keymap::Action::ToggleFocusedFold);
-                    let compare = key_hint(app, keymap::Action::TogglePinnedCompare);
-                    app.status = format!(
-                        "turn {} selected · {fold} fold · d detail · {compare} compare · Esc deselect",
-                        app.transcript[index].id + 1
-                    );
+                    app.status = selected_transcript_entry_status(app, index);
                 }
                 app.needs_redraw = true;
             }
@@ -24546,7 +24606,7 @@ fn select_previous_transcript_entry(app: &mut TuiApp) {
         None => last,
     };
     app.selected_entry = Some(index);
-    app.status = format!("selected transcript entry {}", app.transcript[index].id + 1);
+    app.status = selected_transcript_entry_status(app, index);
 }
 
 /// Move the focused-entry cursor one entry later, used by the per-entry fold
@@ -24563,7 +24623,17 @@ fn select_next_transcript_entry(app: &mut TuiApp) {
         None => 0,
     };
     app.selected_entry = Some(index);
-    app.status = format!("selected transcript entry {}", app.transcript[index].id + 1);
+    app.status = selected_transcript_entry_status(app, index);
+}
+
+fn selected_transcript_entry_status(app: &TuiApp, index: usize) -> String {
+    let actions = key_hint(app, keymap::Action::OpenActionPalette);
+    let fold = key_hint(app, keymap::Action::ToggleFocusedFold);
+    let detail = key_hint(app, keymap::Action::OpenFocusedInDetail);
+    format!(
+        "turn {} selected · {actions} actions · {fold} fold · {detail} detail · Esc deselect",
+        app.transcript[index].id + 1
+    )
 }
 
 /// Handle a keystroke while the full-screen transcript overlay is open.
@@ -33025,14 +33095,9 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
         )))
         .map(|rect| rect.y)
         .unwrap_or(area.y);
-    let action_lines = hover_preview_selected_action_lines(app, preview);
-    let content_rows = if action_lines.is_empty() {
-        preview.body.len()
-    } else {
-        action_lines.len()
-    };
+    let content_rows = preview.body.len();
     // The meta line (turn · size · cost), when present, occupies one content row
-    // beyond the body excerpt/action inventory.
+    // beyond the body excerpt.
     let body_rows = content_rows + usize::from(preview.meta.is_some());
     let Some(rect) = hover_preview::popover_rect(area, anchor_row, body_rows) else {
         app.hover_preview_rect.set(None);
@@ -33099,15 +33164,9 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
             Style::default().fg(crate::render::theme::secondary()),
         )));
     }
-    // Body excerpt, or when the entry is already selected, the complete action
-    // inventory for that selected entry. Actions are sourced from the same
-    // applicable-action list the action palette runs.
-    let body_source = if action_lines.is_empty() {
-        &preview.body
-    } else {
-        &action_lines
-    };
-    for body_line in body_source {
+    // Body excerpt only. Commands for the selected entry belong in the
+    // contextual action palette, keeping hover as a quiet meta/cost peek.
+    for body_line in &preview.body {
         lines.push(Line::from(Span::styled(
             body_line.clone(),
             Style::default().fg(crate::render::theme::quiet()),
@@ -33147,42 +33206,13 @@ fn hover_preview_entry_is_selected(app: &TuiApp, preview: &hover_preview::HoverP
 
 fn hover_preview_footer_hint(app: &TuiApp, preview: &hover_preview::HoverPreview) -> String {
     if hover_preview_entry_is_selected(app, preview) {
-        "selected entry · actions above work now".to_string()
+        format!(
+            "selected entry · {} for actions",
+            key_hint(app, keymap::Action::OpenActionPalette)
+        )
     } else {
         preview.activate_hint().to_string()
     }
-}
-
-fn hover_preview_selected_action_lines(
-    app: &TuiApp,
-    preview: &hover_preview::HoverPreview,
-) -> Vec<String> {
-    if !hover_preview_entry_is_selected(app, preview) {
-        return Vec::new();
-    }
-    let Some(entry) =
-        active_selected_entry(app).and_then(|index| active_transcript_entries(app).get(index))
-    else {
-        return Vec::new();
-    };
-    let kind = action_palette_unit_kind(entry);
-    let actions = action_palette::applicable_actions(kind, entry_has_detail_pane_content(entry));
-    let palette_hint = key_hint(app, keymap::Action::OpenActionPalette);
-    let parts: Vec<String> = actions
-        .into_iter()
-        .map(|action| {
-            let label = action.label(entry.collapsed);
-            if let Some(hint) = action_palette_action_hint(app, action) {
-                format!("{hint} {label}")
-            } else {
-                format!("{palette_hint} menu: {label}")
-            }
-        })
-        .collect();
-    if parts.is_empty() {
-        return Vec::new();
-    }
-    hover_preview::wrap_preview_text(&format!("Actions: {}", parts.join(" · ")), 6)
 }
 
 /// Paint the Subagent Hover Preview popover (§12.8.2) as a quiet, fixed-size,
@@ -35552,10 +35582,10 @@ fn register_transcript_card_targets(
         .saturating_sub(from_bottom);
     let bottom_row = total_rows.min(top_row + viewport_h);
 
-    // Build the entry offsets at the SAME width the frame painted with
+    // Build the entry header offsets at the SAME width the frame painted with
     // (`build_width`: `Some(width)` while wrapping, `None` no-wrap), so the
     // offset units match `total_rows` and the screen `y` lands on the real row.
-    let entry_offsets = transcript_entry_offsets(app, build_width, include_startup_card);
+    let entry_offsets = transcript_entry_header_offsets(app, build_width, include_startup_card);
     let entries = active_transcript_entries(app);
     for (i, &header_row) in entry_offsets.iter().enumerate() {
         let Some(entry) = entries.get(i) else {
@@ -35729,7 +35759,7 @@ fn render_entry_annotation_markers(
         .saturating_sub(from_bottom);
     let bottom_row = total_rows.min(top_row + viewport_h);
 
-    let entry_offsets = transcript_entry_offsets(app, build_width, include_startup_card);
+    let entry_offsets = transcript_entry_header_offsets(app, build_width, include_startup_card);
     let entries = active_transcript_entries(app);
     for (i, &header_row) in entry_offsets.iter().enumerate() {
         let Some(entry) = entries.get(i) else {
@@ -35829,7 +35859,7 @@ fn render_entry_rename_labels(
         .saturating_sub(from_bottom);
     let bottom_row = total_rows.min(top_row + viewport_h);
 
-    let entry_offsets = transcript_entry_offsets(app, build_width, include_startup_card);
+    let entry_offsets = transcript_entry_header_offsets(app, build_width, include_startup_card);
     let entries = active_transcript_entries(app);
     for (i, &header_row) in entry_offsets.iter().enumerate() {
         let Some(entry) = entries.get(i) else {
@@ -35955,7 +35985,7 @@ fn render_hover_affordance(
         .saturating_sub(from_bottom);
     let bottom_row = total_rows.min(top_row + viewport_h);
 
-    let entry_offsets = transcript_entry_offsets(app, build_width, include_startup_card);
+    let entry_offsets = transcript_entry_header_offsets(app, build_width, include_startup_card);
     let entries = active_transcript_entries(app);
     for (i, &header_row) in entry_offsets.iter().enumerate() {
         let Some(entry) = entries.get(i) else {
@@ -36519,8 +36549,9 @@ fn transcript_main_text_and_scrollbar_areas(area: Rect) -> (Rect, Option<Rect>) 
     (text_area, Some(scrollbar_area))
 }
 
-/// Fixed terminal-native scrollbar colors. Transcript scrollbars are positional
-/// chrome, not semantic emphasis, so keep them independent of the active theme.
+/// Fixed scrollbar colors. Transcript scrollbars are positional chrome, not
+/// semantic emphasis, so keep them independent of the active theme while still
+/// clearing the accessibility contrast gate on dark backgrounds.
 fn transcript_scrollbar_thumb_style() -> Style {
     Style::default()
         .fg(Color::Gray)
@@ -36528,7 +36559,7 @@ fn transcript_scrollbar_thumb_style() -> Style {
 }
 
 fn transcript_scrollbar_track_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().fg(Color::Rgb(96, 96, 96))
 }
 
 /// Draw the main-view scrollbar thumb on a quiet track.
@@ -37913,7 +37944,7 @@ fn transcript_lines_for_overlay(
                         extras,
                         shortcut,
                     );
-                    push_rail_work_block(
+                    let _ = push_rail_work_block(
                         &mut lines,
                         &mut block,
                         &mut prev_work,
@@ -37944,7 +37975,7 @@ fn transcript_lines_for_overlay(
                     ToolCardSurface::Plain,
                     shortcut,
                 );
-                push_rail_work_block(
+                let _ = push_rail_work_block(
                     &mut lines,
                     &mut block,
                     &mut prev_work,
@@ -37973,7 +38004,7 @@ fn transcript_lines_for_overlay(
             shortcut,
         );
         if is_rail_work_node(&entry.kind) {
-            push_rail_work_block(
+            let _ = push_rail_work_block(
                 &mut lines,
                 &mut block,
                 &mut prev_work,
@@ -38126,7 +38157,7 @@ pub(crate) fn wrap_entries(
                         shortcut,
                     );
                     let base = lines.len();
-                    push_rail_work_block(
+                    let _ = push_rail_work_block(
                         &mut lines,
                         &mut block,
                         &mut prev_work,
@@ -38160,7 +38191,7 @@ pub(crate) fn wrap_entries(
                     shortcut,
                 );
                 let base = lines.len();
-                push_rail_work_block(
+                let _ = push_rail_work_block(
                     &mut lines,
                     &mut block,
                     &mut prev_work,
@@ -38192,7 +38223,7 @@ pub(crate) fn wrap_entries(
         );
         if is_rail_work_node(&entry.kind) {
             let base = lines.len();
-            push_rail_work_block(
+            let _ = push_rail_work_block(
                 &mut lines,
                 &mut block,
                 &mut prev_work,
@@ -38645,19 +38676,21 @@ fn push_rail_work_block(
     block: &mut Vec<Line<'static>>,
     prev_work: &mut bool,
     chrome: Color,
-) {
+) -> Option<usize> {
     while block.last().is_some_and(line_is_blank) {
         block.pop();
     }
     if block.is_empty() {
-        return;
+        return None;
     }
     if *prev_work {
         lines.push(rail::connector_line(chrome));
     }
+    let header_row = lines.len();
     rail::apply_block_gutter(block, false, chrome);
     lines.append(block);
     *prev_work = true;
+    Some(header_row)
 }
 
 pub(crate) fn transcript_lines_for_render(
@@ -38751,6 +38784,21 @@ fn transcript_entry_offsets(
     cached_main_rows(app, width, include_startup_card).1.clone()
 }
 
+/// Header-row offsets for the cached main render.
+///
+/// Segment offsets include connector chrome inserted before consecutive work
+/// entries; header offsets point at the first visible row of the entry itself.
+/// Screen-space affordances use this map so clicks and badges land on the icon /
+/// title row the user can see, while wrapping and jump navigation keep using the
+/// segment offsets above.
+fn transcript_entry_header_offsets(
+    app: &TuiApp,
+    width: Option<u16>,
+    include_startup_card: bool,
+) -> Vec<usize> {
+    cached_main_rows(app, width, include_startup_card).2.clone()
+}
+
 /// Per-row [`search::RowKind`] tags for the cached main render, in lock-step with
 /// the wrapped rows `transcript_lines_for_render` returns for the same
 /// `(width, include_startup_card)`. The incremental-search find pass reads this so
@@ -38762,7 +38810,7 @@ fn transcript_row_kinds(
     width: Option<u16>,
     include_startup_card: bool,
 ) -> Vec<search::RowKind> {
-    cached_main_rows(app, width, include_startup_card).2.clone()
+    cached_main_rows(app, width, include_startup_card).3.clone()
 }
 
 /// Shared cache front door returning the `Arc<(rows, offsets)>` without cloning
@@ -38905,13 +38953,21 @@ fn transcript_lines_and_entry_offsets_uncached(
     app: &TuiApp,
     width: Option<u16>,
     include_startup_card: bool,
-) -> (Vec<Line<'static>>, Vec<usize>, Vec<search::RowKind>) {
+) -> (
+    Vec<Line<'static>>,
+    Vec<usize>,
+    Vec<usize>,
+    Vec<search::RowKind>,
+) {
     let mut lines = Vec::new();
-    // Logical-line index at which each entry's block starts. Filled lazily —
+    // Logical-line index at which each entry's segment starts. Filled lazily —
     // `entry_line_starts[i]` is set to `lines.len()` the first time entry `i`
-    // is reached, before any of its lines are pushed.
+    // is reached, before any of its lines are pushed. A separate
+    // `entry_header_line_starts` tracks the first visible row owned by that
+    // entry, after rail connector chrome has been inserted, for hit testing.
     let entries_len = active_transcript_entries(app).len();
     let mut entry_line_starts: Vec<usize> = vec![0; entries_len];
+    let mut entry_header_line_starts: Vec<usize> = vec![0; entries_len];
     if let Some(title) = active_conversation_title(app) {
         lines.push(title);
         lines.push(Line::from(""));
@@ -38953,6 +39009,7 @@ fn transcript_lines_and_entry_offsets_uncached(
         // run members never push lines, so their offset stays at the position
         // they would have occupied — close enough for "jump near this entry".
         entry_line_starts[index] = lines.len();
+        entry_header_line_starts[index] = lines.len();
         // A filtered-out entry emits nothing — no block, no rail connector, no
         // turn divider — but still keeps its `entry_line_starts` slot (set above)
         // at the position it would have occupied, so jump-nav offsets stay
@@ -38986,12 +39043,14 @@ fn transcript_lines_and_entry_offsets_uncached(
                 settle,
                 shortcut,
             );
-            push_rail_work_block(
+            if let Some(header) = push_rail_work_block(
                 &mut lines,
                 &mut block,
                 &mut prev_work,
                 rail_chrome(&item.kind, subagent_view),
-            );
+            ) {
+                entry_header_line_starts[index] = header;
+            }
             maybe_push_overlay_turn_divider(
                 &mut lines,
                 turn_divider,
@@ -39014,12 +39073,14 @@ fn transcript_lines_and_entry_offsets_uncached(
                         extras,
                         shortcut,
                     );
-                    push_rail_work_block(
+                    if let Some(header) = push_rail_work_block(
                         &mut lines,
                         &mut block,
                         &mut prev_work,
                         rail_chrome(&item.kind, subagent_view),
-                    );
+                    ) {
+                        entry_header_line_starts[index] = header;
+                    }
                 }
                 maybe_push_overlay_turn_divider(
                     &mut lines,
@@ -39045,12 +39106,14 @@ fn transcript_lines_and_entry_offsets_uncached(
                     ToolCardSurface::Tinted,
                     shortcut,
                 );
-                push_rail_work_block(
+                if let Some(header) = push_rail_work_block(
                     &mut lines,
                     &mut block,
                     &mut prev_work,
                     rail_chrome(&item.kind, subagent_view),
-                );
+                ) {
+                    entry_header_line_starts[index] = header;
+                }
                 maybe_push_overlay_turn_divider(
                     &mut lines,
                     turn_divider,
@@ -39074,18 +39137,23 @@ fn transcript_lines_and_entry_offsets_uncached(
             shortcut,
         );
         if is_rail_work_node(&item.kind) {
-            push_rail_work_block(
+            if let Some(header) = push_rail_work_block(
                 &mut lines,
                 &mut block,
                 &mut prev_work,
                 rail_chrome(&item.kind, subagent_view),
-            );
+            ) {
+                entry_header_line_starts[index] = header;
+            }
         } else {
             // Leaving the rail (the answer, a diff, …) after a work run: a `│`
             // connector threads the gutter down into the conclusion, whose own
             // marker sits in the gutter column.
             if prev_work {
                 lines.push(rail::connector_line(rail::dim()));
+            }
+            if !block.is_empty() {
+                entry_header_line_starts[index] = lines.len();
             }
             lines.append(&mut block);
             prev_work = false;
@@ -39154,6 +39222,7 @@ fn transcript_lines_and_entry_offsets_uncached(
         let w = usize::from(width.max(1));
         let mut rows: Vec<Line<'static>> = Vec::with_capacity(lines.len());
         let mut entry_offsets: Vec<usize> = vec![0; entry_line_starts.len()];
+        let mut entry_header_offsets: Vec<usize> = vec![0; entry_line_starts.len()];
         // Search classification parallel to `rows` (deep-search row-kinds): every
         // entry's wrapped rows carry that entry's kind, while head chrome and the
         // streaming tail are `Normal`. Length-locked to `rows` by construction so
@@ -39183,10 +39252,24 @@ fn transcript_lines_and_entry_offsets_uncached(
             }
             // This entry's wrapped block begins at the current row count.
             entry_offsets[index] = rows.len();
+            entry_header_offsets[index] = rows.len();
             if seg_hi <= cursor {
                 // Empty segment (suppressed run member / coalesced entry):
                 // nothing to wrap, offset is the position it would occupy.
                 continue;
+            }
+            let header_lo = entry_header_line_starts
+                .get(index)
+                .copied()
+                .unwrap_or(seg_lo)
+                .min(seg_hi)
+                .max(cursor);
+            if header_lo > cursor {
+                let mut scratch: Vec<Line<'static>> = Vec::new();
+                for line in &lines[cursor..header_lo] {
+                    wrap_transcript_overlay_line(line, w, &mut scratch);
+                }
+                entry_header_offsets[index] = rows.len() + scratch.len();
             }
             let entry = &entries[index];
             let segment = &lines[cursor..seg_hi];
@@ -39248,15 +39331,21 @@ fn transcript_lines_and_entry_offsets_uncached(
         for (index, &start) in entry_line_starts.iter().enumerate() {
             if start >= n {
                 entry_offsets[index] = rows.len();
+                entry_header_offsets[index] = rows.len();
             }
         }
-        (rows, entry_offsets, row_kinds)
+        (rows, entry_offsets, entry_header_offsets, row_kinds)
     } else {
         // Unwrapped (logical-line) path: per-logical-line classification. Lines
         // owned by an entry carry its kind; head chrome and the tail are `Normal`.
         let line_kinds =
             main_logical_line_kinds(entries, &entry_line_starts, entry_region_end, &lines);
-        (lines, entry_line_starts, line_kinds)
+        (
+            lines,
+            entry_line_starts,
+            entry_header_line_starts,
+            line_kinds,
+        )
     }
 }
 

@@ -15,10 +15,11 @@
 //!    width we just saw is a hit. Capacity is bounded so memory never grows
 //!    unbounded across a long session. This mirrors `transcript_surface.rs`'s
 //!    `row_cache()` LRU shape (cap 32).
-//! 2. **Caches `(rows, entry_offsets)` together.** The main row builder
-//!    (`transcript_lines_and_entry_offsets`) returns both the wrapped rows and a
-//!    per-entry offset map used by jump-nav and card hit-testing. Both are
-//!    produced by the same loop, so both are cached together under one key.
+//! 2. **Caches `(rows, offsets, header_offsets)` together.** The main row builder
+//!    (`transcript_lines_and_entry_offsets`) returns the wrapped rows, a
+//!    per-entry segment offset map used by jump-nav, and a per-entry visible
+//!    header offset map used by card hit-testing. They are produced by the same
+//!    loop, so they are cached together under one key.
 //!
 //! ## What is cached, and what is NOT
 //!
@@ -65,15 +66,21 @@ use std::sync::{Arc, Mutex, OnceLock};
 use lru::LruCache;
 use ratatui::text::Line;
 
-/// Cached value: the wrapped rows painted by the main view, the per-entry offset
-/// map (`entry_offsets[i]` = wrapped-row index where entry `i`'s block begins),
-/// and a per-row [`crate::search::RowKind`] tag in lock-step with the rows so the
-/// incremental-search toggles (Ctrl+O / Ctrl+R) can exclude tool-output /
-/// reasoning rows on the main surface against the SAME rows that were painted.
+/// Cached value: the wrapped rows painted by the main view, the per-entry segment
+/// offset map (`entry_offsets[i]` = wrapped-row index where entry `i`'s block
+/// begins), the per-entry visible header offset map, and a per-row
+/// [`crate::search::RowKind`] tag in lock-step with the rows so the incremental
+/// search toggles (Ctrl+O / Ctrl+R) can exclude tool-output / reasoning rows on
+/// the main surface against the SAME rows that were painted.
 /// Stored behind an `Arc` so a hit clones the pointer, not the vectors, then the
 /// caller clones the inner `Vec`s once on the way out (the existing render APIs
 /// own their `Vec`s).
-pub(crate) type MainRows = Arc<(Vec<Line<'static>>, Vec<usize>, Vec<crate::search::RowKind>)>;
+pub(crate) type MainRows = Arc<(
+    Vec<Line<'static>>,
+    Vec<usize>,
+    Vec<usize>,
+    Vec<crate::search::RowKind>,
+)>;
 
 /// LRU capacity for the assembled main-render cache.
 ///
@@ -196,7 +203,12 @@ fn main_render_cache() -> &'static Mutex<LruCache<MainRenderKey, MainRows>> {
 /// and the stale slot ages out under the bound.
 pub(crate) fn get_or_compute_main(
     key: MainRenderKey,
-    compute: impl FnOnce() -> (Vec<Line<'static>>, Vec<usize>, Vec<crate::search::RowKind>),
+    compute: impl FnOnce() -> (
+        Vec<Line<'static>>,
+        Vec<usize>,
+        Vec<usize>,
+        Vec<crate::search::RowKind>,
+    ),
 ) -> MainRows {
     if let Ok(mut cache) = main_render_cache().lock()
         && let Some(value) = cache.get(&key)
