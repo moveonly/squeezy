@@ -3978,6 +3978,45 @@ fn signature_span_excludes_body_across_languages() {
     );
 }
 
+#[test]
+fn js_ts_code_token_offset_survives_multibyte_char_in_code_context() {
+    use crate::languages::js_ts::js_ts_code_token_offset;
+    // Regression: the scan walks the line byte-by-byte, so `idx` could land
+    // inside a multi-byte UTF-8 char (here `☽`). Slicing `line[idx..]` off that
+    // boundary panicked. The needle must still be found past the multi-byte char.
+    let line = r#"const ☽ = require("luna");"#;
+    let mut in_block_comment = false;
+    assert_eq!(
+        js_ts_code_token_offset(line, "require(", &mut in_block_comment),
+        line.find("require(")
+    );
+    assert!(!in_block_comment);
+
+    // A multi-byte char in code context with no needle present must yield None,
+    // not panic.
+    let mut none_state = false;
+    assert_eq!(
+        js_ts_code_token_offset("phase = ☽☾ + δ", "require(", &mut none_state),
+        None
+    );
+}
+
+#[test]
+fn js_ts_commonjs_scan_does_not_panic_on_multibyte_code_char() {
+    // Mirrors the real crash: parsing a `.js` file whose *code* (not a string or
+    // comment) contains a multi-byte char used to panic inside
+    // `extract_js_ts_commonjs_facts`. Parsing must succeed and still pick up the
+    // CommonJS require on the clean line.
+    let source = "const luna = require(\"luna\");\nconst phase = ☽;\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = js_record("src/moon.js", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    assert!(
+        parsed.imports.iter().any(|import| import.path == "luna"),
+        "CommonJS require should still be extracted alongside a multi-byte code char"
+    );
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("parse-record");
     let path = root.join(relative_path);

@@ -499,7 +499,14 @@ pub(crate) fn js_ts_code_token_offset(
             }
             _ => {}
         }
-        if found.is_none() && line[idx..].starts_with(needle) {
+        // `idx` walks the line byte-by-byte, so it can land inside a multi-byte
+        // UTF-8 character (e.g. when the line contains `☽`). Slicing `line[idx..]`
+        // there panics. Needles are ASCII and can only ever begin on a char
+        // boundary, so a non-boundary `idx` can never start a match — skip the
+        // needle test rather than slicing. (The byte state machine above is
+        // unaffected: continuation bytes are all >= 0x80 and match none of its
+        // ASCII cases.)
+        if found.is_none() && line.is_char_boundary(idx) && line[idx..].starts_with(needle) {
             found = Some(idx);
             // Keep scanning so `in_block_comment` is correct at end of line, but
             // do not advance into the needle's interior (it is plain code).
