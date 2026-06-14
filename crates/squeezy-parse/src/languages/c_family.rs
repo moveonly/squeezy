@@ -247,10 +247,29 @@ pub(crate) fn c_family_symbol_from_node(
         kind = SymbolKind::Method;
     }
 
-    let name = c_family_symbol_name(node, kind, ctx.source)?;
+    let mut name = c_family_symbol_name(node, kind, ctx.source)?;
     if name.is_empty() {
         return None;
     }
+
+    // gtest / Boost.Test macros (`TEST(Suite, Name) { … }`,
+    // `BOOST_AUTO_TEST_CASE(name) { … }`) parse as `function_definition` whose
+    // declarator name is the macro and whose arguments are the suite/case
+    // identifiers. Reclassify them as `Test` and name them after the macro
+    // arguments so `decl_search kind=test` and the test-impact queries see
+    // them. Only top-level (non-member) definitions qualify; a method literally
+    // called `TEST` should stay a method.
+    let mut test_macro = false;
+    if kind == SymbolKind::Function
+        && node.kind() == "function_definition"
+        && c_family_is_test_macro_name(&name)
+        && let Some(test_name) = c_family_test_macro_label(node, &name, ctx.source)
+    {
+        name = test_name;
+        kind = SymbolKind::Test;
+        test_macro = true;
+    }
+
     let body = c_family_body_node(node);
     let span = span_from_node(node);
     let body_span = body.map(span_from_node);
@@ -271,6 +290,9 @@ pub(crate) fn c_family_symbol_from_node(
         && c_family_has_c_linkage(node, ctx.source)
     {
         attributes.push("c++:c-linkage".to_string());
+    }
+    if test_macro {
+        attributes.push("c-family:test".to_string());
     }
     attributes.sort();
     attributes.dedup();
@@ -810,6 +832,59 @@ pub(crate) fn c_declarator_inner_is_function_name(node: Node<'_>) -> bool {
 pub(crate) fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).next()
+}
+
+/// Recognise the gtest / Boost.Test macros that parse as a
+/// `function_definition` because their arguments are bare identifiers. Catch2's
+/// `TEST_CASE("name", "[tag]")` takes string-literal arguments and does not
+/// parse as a function definition, so it is intentionally excluded here.
+pub(crate) fn c_family_is_test_macro_name(name: &str) -> bool {
+    matches!(
+        name,
+        "TEST"
+            | "TEST_F"
+            | "TEST_P"
+            | "TYPED_TEST"
+            | "TYPED_TEST_P"
+            | "FRIEND_TEST"
+            | "BOOST_AUTO_TEST_CASE"
+            | "BOOST_FIXTURE_TEST_CASE"
+            | "BOOST_AUTO_TEST_CASE_TEMPLATE"
+    )
+}
+
+/// Build a readable label for a test-macro definition from the macro arguments.
+///
+/// The arguments live in the `function_declarator`'s `parameter_list`, where
+/// tree-sitter parses each bare identifier as a type-only `parameter_declaration`
+/// (`TEST(Suite, Name)` → `Suite`, `Name`). We join the identifier-shaped
+/// arguments with `.` (`Suite.Name`), prefixed by the macro name so two cases
+/// in different suites never collide (`TEST.Suite.Name`). Returns `None` when no
+/// usable argument identifier is found so a bare `TEST() {}` is left a function.
+pub(crate) fn c_family_test_macro_label(
+    node: Node<'_>,
+    macro_name: &str,
+    source: &str,
+) -> Option<String> {
+    let declarator = node.child_by_field_name("declarator")?;
+    if declarator.kind() != "function_declarator" {
+        return None;
+    }
+    let parameters = declarator.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    let mut parts = vec![macro_name.to_string()];
+    for param in parameters.named_children(&mut cursor) {
+        if let Ok(text) = node_text(param, source) {
+            let leaf = c_family_last_name(text);
+            if !leaf.is_empty() {
+                parts.push(leaf);
+            }
+        }
+    }
+    if parts.len() <= 1 {
+        return None;
+    }
+    Some(parts.join("."))
 }
 
 /// Classify a C++ special member declaration (constructor, destructor,
