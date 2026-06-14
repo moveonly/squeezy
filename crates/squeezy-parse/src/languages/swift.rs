@@ -373,7 +373,21 @@ fn swift_symbol_from_node(
         // The superclass becomes `base:` (lowered to `Extends`); conformances
         // become `iface:` (lowered to `Implements`) by the shared generic
         // inheritance-edge pass in `squeezy-graph`.
-        let (bases, ifaces) = swift_categorized_inheritance(node, &decl_kind_text, ctx.source);
+        let (bases, mut ifaces) = swift_categorized_inheritance(node, &decl_kind_text, ctx.source);
+        // A RawRepresentable enum (`enum E: Int { ... }`) lists its raw backing
+        // type first, syntactically identical to a protocol conformance. When
+        // detected, record it as `swift:rawtype:<T>` rather than `iface:<T>` so
+        // the backing type isn't mistaken for a conformed protocol.
+        if kind == SymbolKind::Enum
+            && let Some(raw_type) = swift_enum_raw_backing_type(node, &ifaces)
+        {
+            // The raw type is always the first listed supertype; drop it from
+            // the conformance list and stamp the dedicated attribute.
+            if ifaces.first() == Some(&raw_type) {
+                ifaces.remove(0);
+            }
+            attributes.push(format!("swift:rawtype:{raw_type}"));
+        }
         attributes.extend(bases.into_iter().map(|base| format!("base:{base}")));
         attributes.extend(ifaces.into_iter().map(|iface| format!("iface:{iface}")));
     }
@@ -522,7 +536,22 @@ fn swift_enum_entry_symbols(
     let visibility = swift_visibility_text(node, ctx.source);
     let docs = swift_docs_for_node(node, ctx.source);
     let signature = signature_text(node, None, ctx.source);
-    let attributes = swift_attributes_for_node(node, ctx.source);
+    let mut attributes = swift_attributes_for_node(node, ctx.source);
+    // Associated-value payload types, e.g. `case point(x: Int, y: Int)` →
+    // `[Int, Int]`. Swift forbids associated values in comma-separated case
+    // lists, so a payload-bearing entry always has exactly one case name.
+    let payload_types = swift_enum_case_payload_types(node, ctx.source);
+    let arity = u8::try_from(payload_types.len()).unwrap_or(u8::MAX);
+    for ty in &payload_types {
+        attributes.push(format!("type:{ty}"));
+    }
+    attributes.sort();
+    attributes.dedup();
+    let case_arity = if payload_types.is_empty() {
+        None
+    } else {
+        Some(arity)
+    };
 
     // `enum_entry` may contain multiple name fields when the source
     // declares `case foo, bar` in a single clause.
@@ -570,10 +599,34 @@ fn swift_enum_entry_symbols(
             provenance: Provenance::new("tree-sitter-swift", "enum_entry case"),
             confidence: Confidence::ExactSyntax,
             freshness: Freshness::Fresh,
-            arity: None,
+            arity: case_arity,
         });
     }
     symbols
+}
+
+/// Collect the associated-value types of an `enum_entry` from its
+/// `data_contents` (`enum_type_parameters`) field. Each `name` field of the
+/// `enum_type_parameters` is one payload slot; labels (`case p(x: Int)`) carry
+/// no type and are skipped. Returns the leaf type name per slot in order.
+fn swift_enum_case_payload_types(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(data) = node.child_by_field_name("data_contents") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = data.walk();
+    for (idx, child) in data.children(&mut cursor).enumerate() {
+        if data.field_name_for_child(idx as u32) != Some("name") {
+            continue;
+        }
+        if let Ok(text) = node_text(child, source) {
+            let leaf = swift_type_leaf_name(text.trim());
+            if !leaf.is_empty() {
+                out.push(leaf);
+            }
+        }
+    }
+    out
 }
 
 fn child_index_of(parent: Node<'_>, target: Node<'_>) -> usize {
@@ -676,6 +729,55 @@ fn swift_inheritance_names(node: Node<'_>, source: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// Detect an enum's raw-value backing type. Swift requires the raw type to be
+/// the first entry in the inheritance clause, but it is syntactically identical
+/// to a protocol conformance. We treat the first supertype as the raw type when
+/// either a case carries an explicit raw value (`case a = 1`, the unambiguous
+/// RawRepresentable signal) or the first supertype is a well-known primitive
+/// raw type (`Int`/`String`/`Double`/…), which conform implicitly.
+fn swift_enum_raw_backing_type(node: Node<'_>, ifaces: &[String]) -> Option<String> {
+    let first = ifaces.first()?;
+    if swift_is_primitive_raw_type(first) || swift_enum_has_explicit_raw_value(node) {
+        Some(first.clone())
+    } else {
+        None
+    }
+}
+
+fn swift_is_primitive_raw_type(name: &str) -> bool {
+    matches!(
+        name,
+        "Int" | "Int8"
+            | "Int16"
+            | "Int32"
+            | "Int64"
+            | "UInt"
+            | "UInt8"
+            | "UInt16"
+            | "UInt32"
+            | "UInt64"
+            | "String"
+            | "Character"
+            | "Double"
+            | "Float"
+            | "Float16"
+            | "Float80"
+            | "Bool"
+    )
+}
+
+/// True when any `enum_entry` in the enum body declares an explicit raw value
+/// (`case a = 1`), which only RawRepresentable enums can do.
+fn swift_enum_has_explicit_raw_value(node: Node<'_>) -> bool {
+    let Some(body) = node.child_by_field_name("body") else {
+        return false;
+    };
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor).any(|child| {
+        child.kind() == "enum_entry" && child.child_by_field_name("raw_value").is_some()
+    })
 }
 
 /// Split a type declaration's `inheritance_specifier` list into superclasses
