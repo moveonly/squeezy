@@ -980,18 +980,19 @@ fn swift_node_is_declaration_name(node: Node<'_>) -> bool {
 }
 
 fn extract_swift_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
-    let raw = node_text(node, ctx.source).unwrap_or_default();
-    let trimmed = raw.trim();
-    let Some(rest) = trimmed.strip_prefix("import") else {
-        return;
-    };
-    // `import struct CoreGraphics.CGRect` etc. — drop the leading kind keyword.
-    let rest = rest.trim();
-    let rest = strip_swift_import_kind(rest);
-    let path = rest.trim().trim_end_matches(';').trim().to_string();
+    // The module-qualified path lives in the `identifier` child, regardless of
+    // any leading modifier (`@testable`, `private`) or attribute (`@_exported`,
+    // `@_implementationOnly`) and regardless of a kind keyword
+    // (`import struct M.T`). Reading the child instead of string-stripping the
+    // raw text is what lets modifier/attribute-prefixed imports survive — the
+    // old `strip_prefix("import")` silently dropped `@testable import Foo`
+    // because the text begins with the modifier, not `import`.
+    let path = swift_import_path(node, ctx.source).unwrap_or_default();
     if path.is_empty() {
         return;
     }
+    // `@_exported import Foo` re-exports `Foo` to every importer of this module.
+    let is_reexport = swift_import_has_attribute(node, ctx.source, "_exported");
     let imported_name = Some(last_path_segment(&path));
     ctx.imports.push(ParsedImport {
         file_id: ctx.file.id.clone(),
@@ -999,7 +1000,7 @@ fn extract_swift_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: 
         path,
         alias: None,
         is_glob: false,
-        is_reexport: false,
+        is_reexport,
         is_static: false,
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-swift", "import declaration"),
@@ -1007,6 +1008,44 @@ fn extract_swift_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: 
         imported_name,
         is_global: false,
     });
+}
+
+/// Read the module-qualified path from an `import_declaration`'s `identifier`
+/// child (e.g. `CoreGraphics.CGRect`), falling back to a text scan that strips
+/// the `import`/modifier/kind-keyword prefix for grammar shapes that don't
+/// surface a clean `identifier` child.
+fn swift_import_path(node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "identifier"
+            && let Ok(text) = node_text(child, source)
+        {
+            let path = text.trim().to_string();
+            if !path.is_empty() {
+                return Some(path);
+            }
+        }
+    }
+    // Fallback for any grammar variant that does not expose `identifier`:
+    // drop everything up to and including `import`, then the kind keyword.
+    let raw = node_text(node, source).ok()?;
+    let after_import = raw.split("import").nth(1)?.trim();
+    let rest = strip_swift_import_kind(after_import);
+    let path = rest.trim().trim_end_matches(';').trim().to_string();
+    if path.is_empty() { None } else { Some(path) }
+}
+
+/// True when the `import_declaration`'s `modifiers` child carries an attribute
+/// whose name (after the leading `@`) matches `name` — e.g. `_exported`.
+fn swift_import_has_attribute(node: Node<'_>, source: &str, name: &str) -> bool {
+    let Some(modifiers) = swift_modifiers_node(node) else {
+        return false;
+    };
+    let mut cursor = modifiers.walk();
+    modifiers.named_children(&mut cursor).any(|child| {
+        child.kind() == "attribute"
+            && swift_attribute_name(child, source).as_deref() == Some(name)
+    })
 }
 
 fn strip_swift_import_kind(text: &str) -> &str {
