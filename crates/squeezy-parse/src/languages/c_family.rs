@@ -255,6 +255,9 @@ pub(crate) fn c_family_symbol_from_node(
     {
         attributes.push(role.to_string());
     }
+    if kind == SymbolKind::Field {
+        attributes.extend(c_family_bitfield_attributes(node, ctx.source));
+    }
     attributes.sort();
     attributes.dedup();
     let confidence = c_family_symbol_confidence(node, &attributes);
@@ -1117,6 +1120,30 @@ pub(crate) fn c_family_is_template_specialization(node: Node<'_>) -> bool {
         return false;
     };
     name.kind() == "template_type"
+}
+
+/// Emit `c-family:bitfield` (and `c-family:bitfield-width:<n>` when the width is
+/// an integer literal) for a `field_declaration` carrying a `bitfield_clause`
+/// (`unsigned flags : 4;`). tree-sitter models the width as the clause's
+/// `expression` child; non-literal widths (`: kBits`) still get the marker so
+/// `decl_search attribute=c-family:bitfield` finds them.
+pub(crate) fn c_family_bitfield_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut cursor = node.walk();
+    let Some(clause) = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == "bitfield_clause")
+    else {
+        return Vec::new();
+    };
+    let mut attributes = vec!["c-family:bitfield".to_string()];
+    if let Some(width) = first_named_child(clause)
+        .and_then(|expr| node_text(expr, source).ok())
+        .map(str::trim)
+        .filter(|width| !width.is_empty() && width.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        attributes.push(format!("c-family:bitfield-width:{width}"));
+    }
+    attributes
 }
 
 /// Detect a C++ scoped enum (`enum class E` / `enum struct E`). tree-sitter-cpp
