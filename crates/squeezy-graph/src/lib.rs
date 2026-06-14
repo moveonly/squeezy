@@ -1292,6 +1292,19 @@ impl SemanticGraph {
             .unwrap_or_default()
     }
 
+    /// Iterate the graph edges whose target is `to`, in index order, using the
+    /// `edges_by_to` index instead of scanning the full edge vector. The
+    /// inbound dual of [`Self::outgoing_edges`]: callers that only want a
+    /// particular [`EdgeKind`] (callers, subtypes, references) can filter the
+    /// returned iterator without materialising an intermediate `Vec`.
+    pub fn inbound_edges(&self, to: &SymbolId) -> impl Iterator<Item = &GraphEdge> + '_ {
+        self.edges_by_to
+            .get(to)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.edges.get(*index))
+    }
+
     pub fn callees(&self, caller: &SymbolId) -> Vec<CallEdgeHit> {
         self.edges_by_from
             .get(caller)
