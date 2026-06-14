@@ -64,6 +64,48 @@ impl SemanticGraph {
         let references = std::mem::take(&mut self.references);
         self.add_reference_edges(&references);
         self.references = references;
+
+        self.add_python_route_edges();
+    }
+
+    /// Route/registry decorators (`@MyRouter.get`, bare `@register`) record a
+    /// `framework:web-route`/`route:` marker on the decorated handler but no
+    /// call edge, so the registrar that ultimately invokes the handler is
+    /// invisible to call-graph navigation. Emit a registrar -> handler edge for
+    /// the allow-listed, uniquely-resolvable cases; the dominant instance
+    /// registrar form (`router = APIRouter()`) declines (no symbol for the
+    /// module-level variable) and simply yields no edge.
+    fn add_python_route_edges(&mut self) {
+        let handlers: Vec<SymbolId> = self
+            .symbols
+            .values()
+            .filter(|symbol| {
+                matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
+                    && symbol.attributes.iter().any(|attribute| {
+                        attribute == "framework:web-route" || attribute.starts_with("route:")
+                    })
+            })
+            .map(|symbol| symbol.id.clone())
+            .collect();
+        let edges: Vec<GraphEdge> = handlers
+            .iter()
+            .filter_map(|handler_id| {
+                let registrar = self.python_route_decorator_registrar(handler_id)?;
+                let handler = self.symbols.get(handler_id)?;
+                Some(GraphEdge {
+                    from: registrar,
+                    to: Some(handler_id.clone()),
+                    target_text: handler.name.clone(),
+                    kind: EdgeKind::Calls,
+                    span: Some(handler.span),
+                    confidence: Confidence::Heuristic,
+                    freshness: Freshness::Fresh,
+                    provenance: Provenance::new("python", "route decorator registrar"),
+                    candidates: Vec::new(),
+                })
+            })
+            .collect();
+        self.edges.extend(edges);
     }
 
     /// Resolve at most one edge per input item, in parallel.
@@ -387,6 +429,17 @@ impl SemanticGraph {
             );
         }
 
+        if call.kind == ParsedCallKind::Direct
+            && let Some(callee) = self.php_type_candidate_for_reference(caller_id, call)
+        {
+            return (
+                Some(callee),
+                Confidence::Heuristic,
+                "php psr4 type",
+                Vec::new(),
+            );
+        }
+
         if call.kind == ParsedCallKind::Method
             && let Some(callee) = self.inherited_python_method(caller_id, call)
         {
@@ -495,6 +548,14 @@ impl SemanticGraph {
                     Vec::new(),
                 );
             }
+            if let Some(id) = self.csharp_receiver_field_method(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "csharp field receiver",
+                    Vec::new(),
+                );
+            }
             if let Some(id) = self.kotlin_extension_function_call(&candidates, caller_id, call) {
                 return (
                     Some(id),
@@ -508,6 +569,14 @@ impl SemanticGraph {
                     Some(id),
                     Confidence::Heuristic,
                     "kotlin companion member",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.kotlin_receiver_field_method(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "kotlin field receiver",
                     Vec::new(),
                 );
             }
@@ -527,6 +596,14 @@ impl SemanticGraph {
                     Vec::new(),
                 );
             }
+            if let Some(id) = self.python_manager_dispatch_call(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "python manager dispatch",
+                    Vec::new(),
+                );
+            }
             if let Some(id) = self.python_module_qualified_call(&candidates, caller_id, call) {
                 return (
                     Some(id),
@@ -540,6 +617,14 @@ impl SemanticGraph {
                     Some(id),
                     Confidence::ImportResolved,
                     "go package import",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.go_receiver_method_call(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "go receiver method",
                     Vec::new(),
                 );
             }
@@ -580,6 +665,22 @@ impl SemanticGraph {
                     Some(id),
                     Confidence::Heuristic,
                     "dart typed local receiver",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.ts_receiver_typed_method(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "js/ts typed receiver",
+                    Vec::new(),
+                );
+            }
+            if let Some(id) = self.cpp_member_method_call(caller_id, call) {
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "cpp member method",
                     Vec::new(),
                 );
             }
