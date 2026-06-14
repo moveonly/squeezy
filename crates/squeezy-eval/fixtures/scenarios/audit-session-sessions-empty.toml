@@ -9,7 +9,7 @@ status string is the literal `sessions_list:0` produced in
 """
 
 [workspace]
-local = "/tmp/audit-session-sessions-empty-workspace"
+ephemeral = true
 
 [squeezy]
 provider = "mock"

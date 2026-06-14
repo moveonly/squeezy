@@ -71,6 +71,22 @@ sha = "deadbeef"
 }
 
 #[test]
+fn parses_ephemeral_workspace() {
+    let toml = r#"
+id = "eph"
+title = "Ephemeral"
+
+[workspace]
+ephemeral = true
+"#;
+    let scenario: Scenario = toml::from_str(toml).unwrap();
+    match scenario.workspace {
+        WorkspaceSpec::Ephemeral { ephemeral } => assert!(ephemeral),
+        other => panic!("expected ephemeral workspace, got {other:?}"),
+    }
+}
+
+#[test]
 fn parses_fixture_skills_block() {
     let toml = r#"
 id = "skills"

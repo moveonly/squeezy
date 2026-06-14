@@ -8,7 +8,7 @@ Asserts that the dispatch produces a `SessionRenamed` outcome whose
 """
 
 [workspace]
-local = "/tmp/audit-session-session-rename-workspace"
+ephemeral = true
 
 [squeezy]
 provider = "mock"

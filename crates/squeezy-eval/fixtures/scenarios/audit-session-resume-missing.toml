@@ -8,7 +8,7 @@ an agent-side handler that silently fails on a missing session.
 """
 
 [workspace]
-local = "/tmp/audit-session-resume-missing-workspace"
+ephemeral = true
 
 [squeezy]
 provider = "mock"

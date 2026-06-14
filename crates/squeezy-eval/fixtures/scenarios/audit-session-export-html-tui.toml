@@ -14,7 +14,7 @@ never know.
 """
 
 [workspace]
-local = "/tmp/audit-session-export-html-tui-workspace"
+ephemeral = true
 
 [squeezy]
 provider = "mock"

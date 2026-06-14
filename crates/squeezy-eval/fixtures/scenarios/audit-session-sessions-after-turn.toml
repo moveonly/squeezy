@@ -8,7 +8,7 @@ the session store before /sessions queries it, so the count should be
 """
 
 [workspace]
-local = "/tmp/audit-session-sessions-after-turn-workspace"
+ephemeral = true
 
 [squeezy]
 provider = "mock"

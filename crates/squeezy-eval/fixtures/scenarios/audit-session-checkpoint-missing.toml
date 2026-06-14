@@ -7,7 +7,7 @@ short-circuiting them to an Error variant.
 """
 
 [workspace]
-local = "/tmp/audit-session-checkpoint-missing-workspace"
+ephemeral = true
 
 [squeezy]
 provider = "mock"

@@ -6,7 +6,7 @@ attempt to wire checkpoints through dispatch_command_raw is caught.
 """
 
 [workspace]
-local = "/tmp/audit-session-checkpoints-bare-workspace"
+ephemeral = true
 
 [squeezy]
 provider = "mock"

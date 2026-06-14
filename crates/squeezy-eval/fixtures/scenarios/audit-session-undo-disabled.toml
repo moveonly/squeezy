@@ -12,7 +12,7 @@ the user hasn't opted into should be a clean no-op rather than an error.
 """
 
 [workspace]
-local = "/tmp/audit-session-undo-disabled-workspace"
+ephemeral = true
 
 [squeezy]
 provider = "mock"
