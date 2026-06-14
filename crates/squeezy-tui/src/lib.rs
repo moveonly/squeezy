@@ -8600,6 +8600,21 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         app.terminal_title_state = TerminalTitleState::Cleared;
     }
 
+    // Approval/MCP/user-input prompts are injected by the agent/tool loop and
+    // must take priority over an already-open paste decision: a paste prompt is
+    // only a composer safety gate, while these prompts unblock the active turn.
+    if handle_approval_key(app, key) {
+        return Ok(false);
+    }
+
+    if handle_mcp_elicitation_key(app, key) {
+        return Ok(false);
+    }
+
+    if handle_request_user_input_key(app, key) {
+        return Ok(false);
+    }
+
     // The inline large-paste question (§11G.6) is modal in behavior: while it is
     // open it owns the keyboard outright (Enter / y confirm, Esc / n cancel)
     // BEFORE any selection-clear, search, pin-picker, chord, or keymap dispatch
@@ -9294,14 +9309,6 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
-    if handle_mcp_elicitation_key(app, key) {
-        return Ok(false);
-    }
-
-    if handle_request_user_input_key(app, key) {
-        return Ok(false);
-    }
-
     if handle_plan_choice_key(app, agent, key).await {
         return Ok(false);
     }
@@ -9422,10 +9429,6 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // when there is actually something to interrupt, so a bare Esc with
     // nothing running still falls through to reset the pane view.
     if key.code == KeyCode::Esc && !app.subagent_pane.focused && request_turn_interrupt(app) {
-        return Ok(false);
-    }
-
-    if handle_approval_key(app, key) {
         return Ok(false);
     }
 
@@ -34724,13 +34727,20 @@ fn register_modal_option_targets(
 }
 
 fn render_approval(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    if let Some(preview) = app.paste_preview.as_ref() {
-        render_paste_preview_inline(frame, area, app, preview);
-        return;
-    }
-    if let Some(menu) = app.paste_transform.as_ref() {
-        render_paste_transform_inline(frame, area, app, menu);
-        return;
+    match modal::active_inline_decision_surface(app) {
+        Some(modal::SurfaceKind::PastePreview) => {
+            if let Some(preview) = app.paste_preview.as_ref() {
+                render_paste_preview_inline(frame, area, app, preview);
+            }
+            return;
+        }
+        Some(modal::SurfaceKind::PasteTransform) => {
+            if let Some(menu) = app.paste_transform.as_ref() {
+                render_paste_transform_inline(frame, area, app, menu);
+            }
+            return;
+        }
+        _ => {}
     }
     // Approvals render through the height-capped builder so the decision
     // options always fit the chunk the layout reserved for them; the other

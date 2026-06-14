@@ -165,18 +165,19 @@ pub(crate) fn any_active_surface_matching(
 }
 
 pub(crate) fn active_inline_decision_surface(app: &crate::TuiApp) -> Option<SurfaceKind> {
-    RENDER_ORDER.iter().copied().find(|kind| {
-        matches!(
-            kind,
-            SurfaceKind::PastePreview
-                | SurfaceKind::PasteTransform
-                | SurfaceKind::PendingApproval
-                | SurfaceKind::PendingMcpElicitation
-                | SurfaceKind::PendingUserInput
-                | SurfaceKind::PendingPlanChoice
-                | SurfaceKind::PendingFeedback
-        ) && kind.is_active(app)
-    })
+    const INLINE_DECISION_PRIORITY: &[SurfaceKind] = &[
+        SurfaceKind::PendingApproval,
+        SurfaceKind::PendingMcpElicitation,
+        SurfaceKind::PendingUserInput,
+        SurfaceKind::PastePreview,
+        SurfaceKind::PasteTransform,
+        SurfaceKind::PendingPlanChoice,
+        SurfaceKind::PendingFeedback,
+    ];
+    INLINE_DECISION_PRIORITY
+        .iter()
+        .copied()
+        .find(|kind| kind.is_active(app))
 }
 
 impl SurfaceDescriptor {
