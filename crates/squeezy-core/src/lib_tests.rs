@@ -6624,7 +6624,8 @@ fn config_init_target_project_prefers_existing_ancestor() {
     ));
     let nested = root.join("workspace").join("src").join("bin");
     fs::create_dir_all(&nested).expect("mkdir nested");
-    let project_path = root.join("workspace").join(PROJECT_SETTINGS_FILE);
+    let canonical_root = fs::canonicalize(&root).expect("canonicalize root");
+    let project_path = canonical_root.join("workspace").join(PROJECT_SETTINGS_FILE);
     fs::write(&project_path, "# project\n").expect("write project settings");
 
     let target = config_init_target(ConfigInitScope::Project, &nested);
