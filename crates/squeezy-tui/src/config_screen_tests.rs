@@ -70,8 +70,8 @@ fn opens_at_models_when_no_focus() {
     assert_eq!(state.current_section().id, SectionId::Models);
 }
 
-#[test]
-fn discard_all_skips_tier_files_changed_externally() {
+#[tokio::test]
+async fn discard_all_skips_tier_files_changed_externally() {
     let nonce = TEMP_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!("squeezy_discard_conflict_{nonce}"));
     std::fs::create_dir_all(&root).expect("create temp config dir");
@@ -116,8 +116,8 @@ fn discard_all_skips_tier_files_changed_externally() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-#[test]
-fn discard_all_restores_files_unchanged_since_session_write() {
+#[tokio::test]
+async fn discard_all_restores_files_unchanged_since_session_write() {
     let nonce = TEMP_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!("squeezy_discard_clean_{nonce}"));
     std::fs::create_dir_all(&root).expect("create temp config dir");
