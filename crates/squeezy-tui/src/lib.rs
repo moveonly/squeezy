@@ -3853,19 +3853,6 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         return true;
     }
 
-    // Zen Mode minimal status line (§12.4.5): a left-click anywhere on the terse
-    // status line zen paints leaves zen — the mouse twin of the `ToggleZenMode`
-    // (`Ctrl+Alt+.`) keyboard verb. Like the density / attention indicators above,
-    // the line is painted on the footer status row in ABSOLUTE screen coordinates,
-    // so it is hit-tested in absolute coordinates here.
-    if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
-        && let Some((interaction::TargetKey::Chrome(interaction::ChromeKey::ZenStatusLine), action)) =
-            app.click_target_at(mouse.column, mouse.row)
-    {
-        dispatch_click_action(app, action);
-        return true;
-    }
-
     // Docked auxiliary panel header (§12.4.4): a left-click on the docked panel's
     // header cycles its dock position — the mouse twin of the `CycleDockPanel`
     // (`Ctrl+Alt+F`) keyboard verb. The header is a dedicated non-text affordance
@@ -3960,13 +3947,25 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         {
             return app.needs_redraw;
         }
+        // Same reachability keep-alive for the subagent peek: while the pointer is
+        // inside its last-painted rect, keep it and consume the Move so the user
+        // can move ONTO the popover to read it, instead of it dismissing the
+        // instant the pointer leaves the subagent row beneath it.
+        if app.subagent_preview.is_some()
+            && let Some(rect) = app.subagent_preview_rect.get()
+            && smart_split::rect_contains(rect, mouse.column, mouse.row)
+        {
+            return app.needs_redraw;
+        }
         // Subagent Hover Preview (§12.8.2): a bare Move over a subagent timeline row
-        // reveals the subagent preview popover after the same hover-intent dwell.
-        // Checked first (and in every active source, since the pane is always
-        // painted in the footer) so a subagent-row hover is honored even while a
-        // subagent conversation is the active source; only outside the fullscreen
-        // overlay / config screen and a live selection. A keyboard-pinned subagent
-        // peek (`Alt+6`) is sticky against incidental drift.
+        // reveals the subagent preview popover on hover. (It is not yet routed
+        // through the hover-intent recognizer the entry preview uses, so it reveals
+        // without the dwell; the reachability keep-alive above is what makes it
+        // readable.) Checked here (and in every active source, since the pane is
+        // always painted in the footer) so a subagent-row hover is honored even
+        // while a subagent conversation is the active source; only outside the
+        // fullscreen overlay / config screen and a live selection. A keyboard-pinned
+        // subagent peek (`Alt+6`) is sticky against incidental drift.
         if app.transcript_overlay.is_none()
             && app.config_screen.is_none()
             && app.selection.is_none()
@@ -4186,6 +4185,34 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     {
         dispatch_click_action(app, action);
         return true;
+    }
+
+    // Click-elsewhere deselect: a main-view left press that lands on no entry
+    // affordance (empty transcript space / inter-card chrome) clears a focused
+    // turn — the native "click blank space to deselect". Mutually exclusive with
+    // the card-affordance block above (which requires an Entry/RowSpan target),
+    // and non-consuming, so the same press still falls through to arm a text
+    // selection below. Guarded to the MAIN source via `active_selected_entry`, so
+    // it never clears an invisible subagent-masked focus.
+    if app.transcript_overlay.is_none()
+        && app.config_screen.is_none()
+        && matches!(app.subagent_pane.active, ConversationSource::Main)
+        && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
+        && active_selected_entry(app).is_some()
+    {
+        let on_entry = app
+            .click_target_at(mouse.column, mouse.row)
+            .is_some_and(|(key, _)| {
+                matches!(
+                    key,
+                    interaction::TargetKey::Entry(_) | interaction::TargetKey::RowSpan(_, _)
+                )
+            });
+        if !on_entry {
+            app.selected_entry = None;
+            app.status = "turn deselected".to_string();
+            app.needs_redraw = true;
+        }
     }
 
     // Visual selection over the MAIN transcript text area. Only outside the
@@ -7660,7 +7687,10 @@ fn toggle_zen_mode(app: &mut TuiApp) {
     persist_zen(app);
     if !app.status.contains("save failed") {
         app.status = if now_active {
-            "\u{2713} zen on — Ctrl+Alt+. / click to exit".to_string()
+            format!(
+                "\u{2713} zen on — {} to exit",
+                key_hint(app, keymap::Action::ToggleZenMode)
+            )
         } else {
             "\u{2713} zen off — chrome restored".to_string()
         };
@@ -9003,7 +9033,14 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         && (app.selection.is_some()
             || !app.selection_set.is_empty()
             || app.input_selection.is_some()
-            || app.screen_selection.is_some())
+            || app.screen_selection.is_some()
+            // Turn focus (the `selected_entry` cursor) counts as "an active
+            // selection" for this gate too, so the first Esc clears a focused
+            // turn BEFORE Esc can fall through to `request_turn_interrupt` and
+            // cancel the live turn by mistake. Keyed off `active_selected_entry`
+            // (not the raw field) so a subagent-masked stale focus can never
+            // swallow the interrupt.
+            || active_selected_entry(app).is_some())
         && app.config_screen.is_none()
         && app.transcript_overlay.is_none()
         && app.status_line_setup.is_none()
@@ -9011,6 +9048,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         && !app.pin_picker_active
         && app.pending_chord.is_none()
     {
+        let had_text_selection = app.selection.is_some()
+            || !app.selection_set.is_empty()
+            || app.input_selection.is_some()
+            || app.screen_selection.is_some();
         app.selection = None;
         app.selection_set.clear();
         // The composer + screen-buffer selections are part of "an active
@@ -9018,7 +9059,12 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         // the mutual-exclusion clears on press).
         input::clear_input_selection(app);
         clear_screen_selection(app);
-        app.status = "selection cleared".to_string();
+        app.selected_entry = None;
+        app.status = if had_text_selection {
+            "selection cleared".to_string()
+        } else {
+            "turn deselected".to_string()
+        };
         return Ok(false);
     }
 
@@ -19258,8 +19304,23 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
         }
         interaction::Action::FocusEntry(id) => {
             if let Some(index) = entry_index_for_id(app, id) {
-                app.selected_entry = Some(index);
-                app.status = format!("selected transcript entry {}", app.transcript[index].id + 1);
+                if app.selected_entry == Some(index) {
+                    // Click the already-selected header again → toggle the focus
+                    // off. The idempotent "click it again to deselect" affordance.
+                    app.selected_entry = None;
+                    app.status = "turn deselected".to_string();
+                } else {
+                    app.selected_entry = Some(index);
+                    // Say what selecting a turn is FOR and how to drop it — the
+                    // focus is the target of the per-entry verbs, which is
+                    // otherwise an invisible mode behind a bare `›` caret.
+                    let fold = key_hint(app, keymap::Action::ToggleFocusedFold);
+                    let compare = key_hint(app, keymap::Action::TogglePinnedCompare);
+                    app.status = format!(
+                        "turn {} selected · {fold} fold · d detail · {compare} compare · Esc deselect",
+                        app.transcript[index].id + 1
+                    );
+                }
                 app.needs_redraw = true;
             }
         }
@@ -20853,6 +20914,10 @@ fn close_config_screen(app: &mut TuiApp, agent: &Agent, status: impl Into<String
         return;
     };
     emit_config_screen_telemetry(agent, &mut state);
+    // Zen is a runtime layout latch (not re-read each frame), so a `/config` edit
+    // to `[tui].zen` would otherwise not take effect until the next launch. Apply
+    // the final effective value — across all scopes — the moment the screen closes.
+    app.zen = zen::ZenMode::from_persisted(Some(state.effective.tui.zen));
     app.status = status.into();
 }
 
@@ -32879,6 +32944,7 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
 /// terminal), a quiet body, and a footer naming the jump verb.
 fn render_subagent_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let Some(preview) = app.subagent_preview.as_ref() else {
+        app.subagent_preview_rect.set(None);
         return;
     };
     // Anchor next to the previewed subagent's live row when it is on-screen;
@@ -32890,8 +32956,12 @@ fn render_subagent_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiA
         .unwrap_or_else(|| area.y.saturating_add(area.height.saturating_sub(1)));
     let body = preview.body();
     let Some(rect) = hover_preview::popover_rect(area, anchor_row, body.len()) else {
+        app.subagent_preview_rect.set(None);
         return;
     };
+    // Record the painted rect so the mouse-move path can keep the popover alive
+    // while the pointer is inside it (reachability — see `subagent_preview_rect`).
+    app.subagent_preview_rect.set(Some(rect));
 
     // Color the status tag by lifecycle (red failed, green done, silver running,
     // quiet capped) — but always carry the status WORD too, so meaning never
@@ -34241,11 +34311,18 @@ fn render_metrics_hud(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(Paragraph::new(text).block(block), rect);
 }
 
-fn should_show_live_completed_turn_divider(app: &TuiApp, flushed_generation: Option<u64>) -> bool {
-    let Some(snapshot) = live_turn_divider_snapshot(app) else {
-        return false;
-    };
-    flushed_generation != Some(snapshot.generation)
+fn should_show_live_completed_turn_divider(
+    _app: &TuiApp,
+    _flushed_generation: Option<u64>,
+) -> bool {
+    // The completed-turn marker now bakes directly into the inline transcript
+    // (`transcript_turn_divider_snapshot`), one per turn, persisting in
+    // scrollback. The task panel therefore no longer paints a transient copy — a
+    // second presentation in a different place each frame was the "it doesn't
+    // stay put" inconsistency. Kept as a predicate (rather than deleting the
+    // threaded flag) so the §12.9.3 layout-fallback geometry contract is
+    // unchanged.
+    false
 }
 
 fn transcript_prompt_gap_height(app: &TuiApp) -> u16 {
@@ -34582,18 +34659,15 @@ fn turn_divider_line(snapshot: TurnDividerSnapshot, width: u16) -> Line<'static>
         ]);
     }
 
-    let label = format!("   ─ {state_text} ");
-    let label_width = label.chars().count();
-    let fill_width = (width as usize).saturating_sub(label_width);
+    // Success/idle: a quiet, unobtrusive end-of-turn marker. Gray text, no bold,
+    // and no full-width rule — the saturated accent + full rule are reserved for
+    // the Failed/Cancelled variants above. The marker stays in scrollback, one per
+    // turn, but reads as a faint footnote rather than a hard divider.
     Line::from(vec![
         Span::raw("   "),
         Span::styled("─ ", Style::default().fg(crate::render::theme::quiet())),
         Span::styled(
             state_text,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" {}", "─".repeat(fill_width)),
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ])
@@ -34622,9 +34696,15 @@ fn overlay_turn_divider_snapshot(app: &TuiApp) -> Option<TurnDividerSnapshot> {
 }
 
 fn transcript_turn_divider_snapshot(app: &TuiApp) -> Option<TurnDividerSnapshot> {
-    if active_subagent_record(app).is_some() || app.last_turn_duration.is_some() {
+    if active_subagent_record(app).is_some() {
         return None;
     }
+    // Bake the completed-turn marker into the inline transcript as soon as it is
+    // pending — i.e. the instant the turn finishes, not only once the next turn
+    // starts. Together with the task panel no longer painting a transient copy
+    // (see `should_show_live_completed_turn_divider`), the marker appears once,
+    // in one place, and stays there — instead of showing in the task panel and
+    // then "moving" into scrollback.
     app.pending_turn_divider
 }
 
@@ -35206,6 +35286,25 @@ fn register_transcript_card_targets(
         }
         let id = transcript_surface::EntryId(entry.id);
         let screen_y = text_area.y + (header_row - top_row) as u16;
+        // A reasoning entry's header leads with a '▾'/'▸' disclosure glyph that
+        // the Quiet Rail gutter pushes past the narrow caret zone, so the old
+        // caret(toggle)/remainder(focus) split left the visible affordance
+        // un-clickable — clicking "▾ reasoning" only re-focused. A reasoning
+        // header is a single row with no selectable prose, so register the WHOLE
+        // row as the fold toggle: clicking anywhere on it folds/unfolds it.
+        if matches!(entry.kind, TranscriptEntryKind::Reasoning(_)) {
+            app.register_click(
+                Rect {
+                    x: text_area.x,
+                    y: screen_y,
+                    width: text_area.width,
+                    height: 1,
+                },
+                interaction::TargetKey::Entry(id),
+                interaction::Action::ToggleEntryCollapsed(id),
+            );
+            continue;
+        }
         let caret_w = CARD_CARET_WIDTH.min(text_area.width);
         // Caret zone → toggle collapse.
         app.register_click(
@@ -40269,13 +40368,19 @@ fn reasoning_block_lines_with_extras(
             style,
         )));
     } else {
+        // The whole header row is a click target (see
+        // `register_transcript_card_targets`); advertise the collapse affordance
+        // inline so it is discoverable rather than a hidden mode.
         let header = if extras > 0 {
             format!(
-                "{marker}▾ reasoning ({} lines · +{extras} more)",
+                "{marker}▾ reasoning ({} lines · +{extras} more · click to fold)",
                 body_lines.len().max(1)
             )
         } else {
-            format!("{marker}▾ reasoning ({} lines)", body_lines.len().max(1))
+            format!(
+                "{marker}▾ reasoning ({} lines · click to fold)",
+                body_lines.len().max(1)
+            )
         };
         lines.push(Line::from(Span::styled(header, style)));
         for raw in body_lines {
@@ -45463,20 +45568,16 @@ fn render_zen_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     // than spreading the terse line out.
     let row = Rect { height: 1, ..area };
     let label = format!("{}:{}", app.provider_name, app.model);
-    let text = app.zen.minimal_status(&label);
+    // The terse line names the mode and the exact keyboard verb to leave it, so
+    // the way out is always on screen. Zen is keyboard-driven (and toggleable
+    // from `/config`); it is intentionally NOT a click target.
+    let exit_hint = key_hint(app, keymap::Action::ToggleZenMode);
+    let text = app.zen.minimal_status(&label, &exit_hint);
     let line = Line::from(Span::styled(
         text,
         Style::default().fg(crate::render::theme::quiet()),
     ));
     frame.render_widget(Paragraph::new(line), row);
-    // The whole line is the exit affordance: a left click anywhere on it toggles
-    // zen back off — the mouse twin of the `ToggleZenMode` keyboard verb, driving
-    // the same `toggle_zen_mode` handler so parity holds by construction.
-    app.register_click(
-        row,
-        interaction::TargetKey::Chrome(interaction::ChromeKey::ZenStatusLine),
-        interaction::Action::ToggleZenMode,
-    );
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -48350,6 +48451,13 @@ pub(crate) struct TuiApp {
     /// user was reaching for. Refreshed each frame by `render_hover_preview_popover`
     /// (`Some(rect)` when painted, `None` when not).
     pub(crate) hover_preview_rect: std::cell::Cell<Option<Rect>>,
+    /// The on-screen rect the Subagent Hover Preview popover last painted into, or
+    /// `None` when none is showing. The twin of `hover_preview_rect` for the
+    /// subagent peek: without it, moving the pointer onto the subagent popover to
+    /// read it lands on an unregistered cell, leaves every subagent row, and
+    /// dismisses the peek before it can be read. Refreshed each frame by
+    /// `render_subagent_preview_popover` (`Some(rect)` when painted, else `None`).
+    pub(crate) subagent_preview_rect: std::cell::Cell<Option<Rect>>,
     /// The live Subagent Hover Preview popover (§12.8.2), or `None` when none is
     /// showing (the resting state, paints nothing extra and costs nothing idle).
     /// `Some` holds the previewed subagent's pane index, name, distilled status,
@@ -49252,6 +49360,7 @@ impl TuiApp {
             tool_actions: None,
             hover_preview: None,
             hover_preview_rect: std::cell::Cell::new(None),
+            subagent_preview_rect: std::cell::Cell::new(None),
             subagent_preview: None,
             subagent_return_anchor: None,
             command_palette: None,

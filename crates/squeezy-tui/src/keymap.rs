@@ -1143,11 +1143,11 @@ impl Action {
             // family above. The always-available equivalent is a click on the
             // status-line `[present]` indicator.
             | Self::TogglePresentation
-            // Zen Mode toggle (§12.4.5) is `Ctrl+Alt+.` — a Ctrl+Alt (Meta) chord,
-            // the same classically-unreliable encoding across Linux terminals,
-            // tmux, and SSH as the rest of the Ctrl+Alt overlay/policy family above.
-            // The always-available equivalent is a click on the minimal zen status
-            // line that the mode itself paints.
+            // Zen Mode toggle (§12.4.5) is `F10` — a bare function key. Function
+            // keys are simple to press but some terminals and multiplexers grab them
+            // (menus, app shortcuts), so it is honestly flagged terminal-dependent;
+            // the discoverable fallbacks are the shortcut printed on the zen status
+            // line and the `[tui].zen` toggle in `/config`.
             | Self::ToggleZenMode
             // Terminal Restore Command (§12.9.2) is `Ctrl+Alt+,` — a Ctrl+Alt
             // (Meta) punctuation chord, the same classically-unreliable encoding
@@ -1680,17 +1680,13 @@ impl Action {
                 KeyCode::Char('c'),
                 KeyModifiers::CONTROL | KeyModifiers::ALT,
             ),
-            // Zen Mode (§12.4.5). Every `Ctrl+Alt` LETTER is taken (the §12.4.6
-            // Presentation toggle above claimed the last free one, `Ctrl+Alt+C`),
-            // and every `Alt`+letter / `Alt`+digit chord is a copy/nav/overlay verb,
-            // so Zen takes `Ctrl+Alt+.` — a free `Ctrl+Alt` punctuation chord (no
-            // other action binds `Ctrl+Alt`+punctuation). It stays in the same
-            // Ctrl+Alt overlay/policy family while colliding with nothing; the
-            // always-available equivalent is a click on the minimal zen status line.
-            Self::ToggleZenMode => KeyBinding::new(
-                KeyCode::Char('.'),
-                KeyModifiers::CONTROL | KeyModifiers::ALT,
-            ),
+            // Zen Mode (§12.4.5) toggles with `F10` — a single unmodified keypress,
+            // the simplest free binding, sitting right next to `F11` (the config
+            // screen). The discoverable way back is the shortcut printed on the zen
+            // status line plus the `[tui].zen` toggle in `/config`; the binding is
+            // rebindable like any other. A bare function key is honestly classified
+            // terminal-dependent (see `terminal_compat_note`).
+            Self::ToggleZenMode => KeyBinding::new(KeyCode::F(10), KeyModifiers::NONE),
             // Terminal Restore Command (§12.9.2). `Ctrl+Alt+,` is a free `Ctrl+Alt`
             // punctuation chord — every `Ctrl+Alt` LETTER is taken by the overlay /
             // picker / editor / policy family, the §12.4.5 Zen toggle claimed the

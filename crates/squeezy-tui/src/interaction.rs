@@ -320,11 +320,6 @@ pub(crate) enum ChromeKey {
     /// 2=split ratio) so a click focuses + adjusts exactly that row (the mouse twin
     /// of ↑↓ + ←→/Space).
     SmartSplitField(usize),
-    /// The Zen Mode (§12.4.5) minimal status line painted where the detailed
-    /// status block would sit while zen is on. A single affordance with no identity
-    /// of its own; a click anywhere on it leaves zen — the mouse twin of the
-    /// `ToggleZenMode` (`Ctrl+Alt+.`) verb.
-    ZenStatusLine,
     /// The `[restore]` affordance painted in the Session Auto-Save Checkpoints
     /// overlay (§12.9.5). A single affordance with no identity of its own; a click
     /// on it restores the saved checkpoint onto the running session — the mouse

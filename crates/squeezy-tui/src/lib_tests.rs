@@ -493,6 +493,68 @@ async fn focused_pane_esc_closes_pane_without_cancelling_turn() {
 }
 
 #[tokio::test]
+async fn esc_clears_focused_turn_before_cancelling_the_running_turn() {
+    // Regression: a focused turn (the `selected_entry` cursor) must be cleared by
+    // the FIRST Esc — the same precedence as a text selection — so Esc never
+    // cancels the live turn by mistake. A SECOND Esc, with nothing left to
+    // deselect, then reaches the interrupt.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    select_previous_transcript_entry(&mut app);
+    assert_eq!(app.selected_entry, Some(0), "a turn is focused");
+    let cancel = CancellationToken::new();
+    app.cancel = Some(cancel.clone()); // a turn is in flight
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+    assert!(
+        app.selected_entry.is_none(),
+        "first Esc clears the focused turn"
+    );
+    assert!(
+        !cancel.is_cancelled(),
+        "Esc that clears a focused turn must NOT cancel the running turn"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc again");
+    assert!(
+        cancel.is_cancelled(),
+        "a second Esc, with nothing to deselect, interrupts the turn"
+    );
+}
+
+#[test]
+fn clicking_the_focused_header_again_toggles_the_focus_off() {
+    // Regression: clicking an already-selected turn header toggles the focus off
+    // (the idempotent "click it again to deselect"), instead of re-selecting it
+    // forever with no way out.
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    let id = transcript_surface::EntryId(app.transcript[0].id);
+
+    dispatch_click_action(&mut app, interaction::Action::FocusEntry(id));
+    assert_eq!(app.selected_entry, Some(0), "first click focuses the turn");
+
+    dispatch_click_action(&mut app, interaction::Action::FocusEntry(id));
+    assert!(
+        app.selected_entry.is_none(),
+        "clicking the same header again toggles the focus off"
+    );
+}
+
+#[tokio::test]
 async fn typing_releases_focused_pane_to_the_composer() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -14152,7 +14214,7 @@ fn fullscreen_transcript_inserts_pending_turn_divider_before_queued_prompt_for_a
         (
             TurnVisualState::Succeeded,
             "─ Worked for 4s",
-            crate::render::theme::green(),
+            crate::render::theme::quiet(),
             false,
         ),
         (
@@ -14813,7 +14875,17 @@ fn completed_turn_shows_worked_duration_divider() {
     assert!(output.contains("─ Worked for 13m 23s"), "{output}");
     assert!(!output.contains("╰─☽ Worked for 13m 23s"), "{output}");
     assert!(output.contains("Worked for 13m 23s"), "{output}");
-    assert_eq!(line.spans[2].style.fg, Some(crate::render::theme::green()));
+    // The everyday success divider is de-emphasized: quiet gray text, no accent
+    // color, no bold, and no full-width rule (only Failed/Cancelled stay loud).
+    assert_eq!(line.spans[2].style.fg, Some(crate::render::theme::quiet()));
+    assert!(
+        !line.spans[2].style.add_modifier.contains(Modifier::BOLD),
+        "success divider must not be bold"
+    );
+    assert!(
+        line.spans.iter().all(|span| !span.content.contains("──")),
+        "success divider must not draw a full-width rule: {line:?}"
+    );
     assert!(!output.contains("Working ("), "{output}");
     assert!(!output.contains("• Done"), "{output}");
 }
@@ -20913,12 +20985,9 @@ fn deliver_copy_prefers_osc52_first_on_ssh_session() {
 // Zen Mode (§12.4.5)
 // ===========================================================================
 
-/// `Ctrl+Alt+.` resolves to `ToggleZenMode`.
+/// `F10` resolves to `ToggleZenMode`.
 fn toggle_zen_key() -> KeyEvent {
-    KeyEvent::new(
-        KeyCode::Char('.'),
-        KeyModifiers::CONTROL | KeyModifiers::ALT,
-    )
+    KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE)
 }
 
 /// A test app seeded with transcript content and the secondary chrome (minimap
@@ -20945,15 +21014,15 @@ async fn zen_keyboard_toggle_hides_chrome_but_keeps_transcript() {
         "breadcrumbs strip paints its ▸ trail before zen: {before}"
     );
     assert!(
-        !before.contains("click to exit"),
-        "the zen exit hint is absent before zen: {before}"
+        !before.contains("zen \u{00b7}"),
+        "the zen minimal line is absent before zen: {before}"
     );
 
     // Toggle zen on through the real key dispatcher.
     handle_key(&mut app, &mut agent, toggle_zen_key())
         .await
         .unwrap();
-    assert!(app.zen.is_active(), "Ctrl+Alt+. turned zen on");
+    assert!(app.zen.is_active(), "F10 turned zen on");
 
     let after = render_to_string(&app, 120, 24);
     // The transcript and composer survive — zen is layout policy, not a content
@@ -20965,7 +21034,7 @@ async fn zen_keyboard_toggle_hides_chrome_but_keeps_transcript() {
     // The minimal one-line state replaces the detailed status block, and names the
     // way out so the exit is always on screen.
     assert!(
-        after.contains("click to exit"),
+        after.contains("to exit"),
         "zen paints its minimal exit line: {after}"
     );
     // Secondary chrome is gone: the breadcrumbs strip no longer paints its trail.
@@ -20987,45 +21056,33 @@ async fn zen_keyboard_toggle_hides_chrome_but_keeps_transcript() {
     handle_key(&mut app, &mut agent, toggle_zen_key())
         .await
         .unwrap();
-    assert!(!app.zen.is_active(), "second Ctrl+Alt+. turned zen off");
+    assert!(!app.zen.is_active(), "second F10 turned zen off");
     let restored = render_to_string(&app, 120, 24);
     assert!(
         restored.contains('\u{25b8}'),
         "breadcrumbs strip returns when zen is off: {restored}"
     );
     assert!(
-        !restored.contains("click to exit"),
-        "the zen exit hint is gone when zen is off: {restored}"
+        !restored.contains("zen \u{00b7}"),
+        "the zen minimal line is gone when zen is off: {restored}"
     );
 }
 
 #[test]
-fn zen_minimal_status_line_click_exits_zen() {
+fn zen_minimal_status_line_names_the_keyboard_exit_and_is_not_clickable() {
     let mut app = zen_test_app();
-    // Enter zen, then paint so the minimal status line registers its click target.
     app.zen.toggle();
     assert!(app.zen.is_active());
-    let _ = render_to_string(&app, 120, 24);
-    let rect = app
-        .registered_rect_for(interaction::TargetKey::Chrome(
-            interaction::ChromeKey::ZenStatusLine,
-        ))
-        .expect("the zen minimal status line registered a click target");
-
-    // A left-click anywhere on the line is the mouse twin of Ctrl+Alt+.: it leaves
-    // zen, driving the same handler.
-    handle_mouse(
-        &mut app,
-        crossterm::event::MouseEvent {
-            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: rect.x + 1,
-            row: rect.y,
-            modifiers: KeyModifiers::NONE,
-        },
+    let output = render_to_string(&app, 120, 24);
+    // The line names the keyboard way out (the resolved shortcut + "exit") so the
+    // way back is always on screen, and it is deliberately NOT a click affordance.
+    assert!(
+        output.contains("to exit"),
+        "names the keyboard exit: {output}"
     );
     assert!(
-        !app.zen.is_active(),
-        "clicking the minimal zen status line exits zen",
+        !output.contains("click"),
+        "zen is keyboard-driven, not a click affordance: {output}"
     );
 }
 
@@ -21043,8 +21100,8 @@ fn zen_renders_on_empty_transcript_and_tiny_terminal_without_panicking() {
     // A roomier empty-transcript zen frame still names the way out.
     let output = render_to_string(&app, 80, 12);
     assert!(
-        output.contains("click to exit"),
-        "empty-transcript zen still paints the exit line: {output}"
+        output.contains("to exit"),
+        "empty-transcript zen still names the way out: {output}"
     );
 }
 
@@ -21057,15 +21114,8 @@ fn zen_survives_resize_where_the_minimal_status_paints() {
     for (w, h) in [(120u16, 24u16), (60, 40), (200, 10)] {
         let output = render_to_string(&app, w, h);
         assert!(
-            output.contains("click to exit"),
+            output.contains("to exit"),
             "zen exit line survives resize to {w}x{h}: {output}"
-        );
-        assert!(
-            app.registered_rect_for(interaction::TargetKey::Chrome(
-                interaction::ChromeKey::ZenStatusLine,
-            ))
-            .is_some(),
-            "the zen click target re-registers after resize to {w}x{h}",
         );
         // The transcript content keeps painting through every reflow.
         assert!(
@@ -21187,28 +21237,48 @@ async fn zen_persist_failure_notes_status_but_keeps_the_latch() {
 }
 
 #[test]
-fn zen_registers_status_and_click_target_at_the_smallest_nondegenerate_size() {
+fn zen_status_line_paints_at_the_smallest_nondegenerate_size() {
     // The tiny-terminal boundary: at the smallest size that still has a status row,
-    // zen must paint its minimal status line AND register the click target (not just
-    // avoid a panic).
+    // zen must paint its minimal status line (not just avoid a panic).
     let mut app = zen_test_app();
     app.zen.toggle();
     assert!(app.zen.is_active());
     // 20x4 is the smallest non-degenerate frame the existing no-panic test
-    // exercises. The full "… click to exit" cue clips at this width, but the line's
-    // leading "zen" mode marker survives, and — load-bearing — the whole line still
-    // registers its click target so the mouse exit stays reachable.
+    // exercises. The full "… to exit" cue clips at this width, but the line's
+    // leading "zen" mode marker survives.
     let output = render_to_string(&app, 20, 4);
     assert!(
         output.contains("zen"),
         "the minimal zen status line paints (its leading marker survives) at 20x4: {output}"
     );
+}
+
+#[test]
+fn closing_config_applies_the_edited_zen_value_to_the_live_latch() {
+    // The /config `[tui].zen` toggle drives the runtime zen latch when the screen
+    // closes — zen is a layout latch, not re-read each frame.
+    let agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(!app.zen.is_active(), "starts out of zen");
+
+    // Edit zen ON in the config screen's effective config, then close.
+    let mut cfg_on = test_config(SessionMode::Build);
+    cfg_on.tui.zen = true;
+    app.config_screen = Some(config_screen::ConfigScreenState::new(cfg_on, None));
+    close_config_screen(&mut app, &agent, "closed");
     assert!(
-        app.registered_rect_for(interaction::TargetKey::Chrome(
-            interaction::ChromeKey::ZenStatusLine,
-        ))
-        .is_some(),
-        "the zen status line registers a click target even at the smallest size",
+        app.zen.is_active(),
+        "closing /config with zen on enters zen"
+    );
+
+    // And the reverse: editing it OFF leaves zen on close.
+    let mut cfg_off = test_config(SessionMode::Build);
+    cfg_off.tui.zen = false;
+    app.config_screen = Some(config_screen::ConfigScreenState::new(cfg_off, None));
+    close_config_screen(&mut app, &agent, "closed");
+    assert!(
+        !app.zen.is_active(),
+        "closing /config with zen off leaves zen"
     );
 }
 
