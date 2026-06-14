@@ -443,6 +443,11 @@ pub struct SemanticGraph {
     /// hash lookup. Glob aliased imports (whose leaf would be `*`) live in
     /// `wildcard_aliased_imports` instead.
     imports_by_alias_target: HashMap<String, Vec<usize>>,
+    /// Aliased imports grouped by their **local alias** (the in-file binding
+    /// name), the dual of [`Self::imports_by_alias_target`]. `reference_search`
+    /// uses this to answer "which imports bind the local name `text`?" without
+    /// scanning every import in the workspace.
+    imports_by_alias: HashMap<String, Vec<usize>>,
     /// Aliased imports whose path leaf is a wildcard (e.g. JS/TS
     /// `import * as M from 'mod'`). These do not bucket by target name, so
     /// they are scanned alongside the by-target hit list.
@@ -552,6 +557,7 @@ impl SemanticGraph {
             ancestor_edges_by_from: HashMap::new(),
             imports_by_file: HashMap::new(),
             imports_by_alias_target: HashMap::new(),
+            imports_by_alias: HashMap::new(),
             wildcard_aliased_imports: Vec::new(),
             java_package_by_file: HashMap::new(),
             kotlin_package_by_file: HashMap::new(),
@@ -1027,10 +1033,13 @@ impl SemanticGraph {
         // `references_to_symbol` — already does this via
         // `reference_candidate_indexes_for_symbol`; this is the symmetric
         // forward path.
-        for import in &self.imports {
-            if import.alias.as_deref() != Some(text) {
-                continue;
-            }
+        for import in self
+            .imports_by_alias
+            .get(text)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.imports.get(*index))
+        {
             let leaf = last_path_segment(&import.path);
             if leaf.is_empty() || leaf == "*" || leaf == text {
                 continue;
@@ -2149,17 +2158,32 @@ impl SemanticGraph {
     fn rebuild_import_indexes(&mut self) {
         self.imports_by_file.clear();
         self.imports_by_alias_target.clear();
+        self.imports_by_alias.clear();
         self.wildcard_aliased_imports.clear();
         self.java_package_by_file.clear();
         self.kotlin_package_by_file.clear();
         self.scala_package_by_file.clear();
         self.imports_by_file.reserve(self.imports.len());
         self.imports_by_alias_target.reserve(self.imports.len());
+        self.imports_by_alias.reserve(self.imports.len());
         for (index, import) in self.imports.iter().enumerate() {
             self.imports_by_file
                 .entry(import.file_id.clone())
                 .or_default()
                 .push(index);
+            // Index every aliased import by its local alias so the forward
+            // alias-aware `reference_search` can look up "imports binding `x`"
+            // directly. Package markers are skipped: their alias is an internal
+            // sentinel (`__java_package__`, etc.) that a real reference text
+            // can never equal, so indexing them would only add dead entries.
+            if !crate::is_package_marker_alias(import.alias.as_deref())
+                && let Some(alias) = import.alias.as_deref()
+            {
+                self.imports_by_alias
+                    .entry(alias.to_string())
+                    .or_default()
+                    .push(index);
+            }
             if crate::is_package_marker_alias(import.alias.as_deref()) {
                 let segments = path_segments(&import.path);
                 if !segments.is_empty() {
