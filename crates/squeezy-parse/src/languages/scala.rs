@@ -257,11 +257,7 @@ fn scala_symbol_from_node(
         kind,
         SymbolKind::Class | SymbolKind::Struct | SymbolKind::Trait | SymbolKind::Enum
     ) {
-        attributes.extend(
-            scala_extends_names(node, ctx.source)
-                .into_iter()
-                .map(|base| format!("base:{base}")),
-        );
+        attributes.extend(scala_inheritance_attributes(node, ctx.source));
     }
     if is_case_class {
         attributes.push("scala:case-class".to_string());
@@ -653,15 +649,61 @@ fn scala_anonymous_given_name(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-fn scala_extends_names(node: Node<'_>, source: &str) -> Vec<String> {
-    let mut names = Vec::new();
+/// Emit ordered inheritance attributes for a class/trait/enum: the first
+/// supertype in the `extends` clause is the superclass (`base:`), every
+/// subsequent `with`-mixin or comma-separated parent is a trait mixin
+/// (`mixin:`). Order is significant — Scala loses no information at parse time
+/// about which parent is the primary super and which are mixed-in traits, so we
+/// must not sort before splitting. The `compound_type` form (`extends A with B`
+/// collapsed into one node) separates `base` from `extra` structurally.
+fn scala_inheritance_attributes(node: Node<'_>, source: &str) -> Vec<String> {
     let Some(extend) = node.child_by_field_name("extend") else {
-        return names;
+        return Vec::new();
     };
-    collect_scala_type_names(extend, source, &mut names);
-    names.sort();
-    names.dedup();
-    names
+    let mut names = Vec::new();
+    scala_collect_constructor_applications(extend, source, &mut names);
+    let mut attributes = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (index, name) in names.into_iter().enumerate() {
+        // First parent is the superclass; the rest are mixed-in traits. A
+        // single type still emits a `base:` so the generic inheritance pass can
+        // lower it to an Extends/Implements edge.
+        let prefix = if index == 0 { "base" } else { "mixin" };
+        let attribute = format!("{prefix}:{name}");
+        if seen.insert(attribute.clone()) {
+            attributes.push(attribute);
+        }
+    }
+    attributes
+}
+
+/// Walk the `extends_clause`'s `type` field, which is a `_constructor_applications`
+/// (either comma-separated or `with`-separated constructor applications), pushing
+/// each parent type's leaf name in source order. A `compound_type` constructor
+/// application contributes its `base` first, then each `extra` mixin.
+fn scala_collect_constructor_applications(node: Node<'_>, source: &str, names: &mut Vec<String>) {
+    let mut cursor = node.walk();
+    for child in node.children_by_field_name("type", &mut cursor) {
+        scala_collect_ordered_type_names(child, source, names);
+    }
+}
+
+/// Push the ordered leaf type names contributed by a single constructor
+/// application. `compound_type` is handled specially so the structural
+/// base/extra split is preserved in emission order; everything else falls back
+/// to the recursive leaf collector.
+fn scala_collect_ordered_type_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {
+    if node.kind() == "compound_type" {
+        if let Some(base) = node.child_by_field_name("base") {
+            collect_scala_type_names(base, source, names);
+        }
+        let mut cursor = node.walk();
+        for extra in node.children_by_field_name("extra", &mut cursor) {
+            collect_scala_type_names(extra, source, names);
+        }
+        return;
+    }
+    collect_scala_type_names(node, source, names);
 }
 
 fn collect_scala_type_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {

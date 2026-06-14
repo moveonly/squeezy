@@ -62,3 +62,41 @@ fn keeps_nested_qualified_path_prefix_reference() {
         "expected nested qualified-prefix path body hit, got {path_hits:?}"
     );
 }
+
+fn scala_symbol<'a>(parsed: &'a ParsedFile, name: &str) -> &'a ParsedSymbol {
+    parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == name)
+        .unwrap_or_else(|| panic!("expected symbol {name}, got {:?}", parsed.symbols))
+}
+
+#[test]
+fn separates_superclass_from_with_mixins() {
+    // `extends Base with A with B` records the first parent as the superclass
+    // (`base:`) and each `with`-mixin as a trait mixin (`mixin:`), so
+    // decl_search(iface:/mixin:) and the generic inheritance edge pass can tell
+    // an extended class from a mixed-in trait.
+    let parsed = parse_scala("class Admin extends User with Auditable with Loggable");
+    let admin = scala_symbol(&parsed, "Admin");
+    assert!(
+        admin.attributes.iter().any(|a| a == "base:User"),
+        "expected base:User, got {:?}",
+        admin.attributes
+    );
+    assert!(
+        admin.attributes.iter().any(|a| a == "mixin:Auditable"),
+        "expected mixin:Auditable, got {:?}",
+        admin.attributes
+    );
+    assert!(
+        admin.attributes.iter().any(|a| a == "mixin:Loggable"),
+        "expected mixin:Loggable, got {:?}",
+        admin.attributes
+    );
+    assert!(
+        !admin.attributes.iter().any(|a| a == "base:Auditable"),
+        "with-mixin must not be flattened to base:, got {:?}",
+        admin.attributes
+    );
+}
