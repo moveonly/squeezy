@@ -101,11 +101,15 @@ pub(crate) fn visit_kotlin_node(
         for symbol in symbols {
             ctx.symbols.push(symbol);
         }
-        visit_kotlin_children(
+        visit_kotlin_property_children(
             node,
             ctx,
-            next_parent.or(parent_symbol),
-            next_owner.or(owner_symbol),
+            // The property is the parent/owner for non-accessor children
+            // (initializer expression, delegate). Accessor `getter`/`setter`
+            // children are re-parented to the property's host class instead.
+            next_parent.clone().or(parent_symbol.clone()),
+            next_owner.clone().or(owner_symbol.clone()),
+            parent_symbol,
         );
         return;
     }
@@ -187,6 +191,10 @@ pub(crate) fn visit_kotlin_node(
             extract_kotlin_call_expression(node, ctx, owner_symbol.clone());
             visit_kotlin_children(node, ctx, parent_symbol, owner_symbol);
         }
+        "infix_expression" => {
+            extract_kotlin_infix_expression(node, ctx, owner_symbol.clone());
+            visit_kotlin_children(node, ctx, parent_symbol, owner_symbol);
+        }
         "constructor_invocation" => {
             extract_kotlin_constructor_invocation(node, ctx, owner_symbol.clone());
             visit_kotlin_children(node, ctx, parent_symbol, owner_symbol);
@@ -199,8 +207,20 @@ pub(crate) fn visit_kotlin_node(
             extract_kotlin_user_type_reference(node, ctx, owner_symbol.clone());
             visit_kotlin_children(node, ctx, parent_symbol, owner_symbol);
         }
+        "callable_reference" => {
+            extract_kotlin_callable_reference(node, ctx, owner_symbol.clone());
+            // Recurse so a receiver type (`String` in `String::length`) still
+            // surfaces as its own Type reference via the `user_type` arm.
+            visit_kotlin_children(node, ctx, parent_symbol, owner_symbol);
+        }
         "annotation" => {
-            extract_kotlin_annotation_reference(node, ctx, owner_symbol);
+            extract_kotlin_annotation_reference(node, ctx, owner_symbol.clone());
+            // kotlin spec §5: recurse into the annotation's *argument*
+            // expressions so calls/refs inside `@Cfg(value = compute())` are
+            // captured. We deliberately walk only the `value_arguments` (not
+            // the annotation type's `constructor_invocation` itself), so the
+            // annotation class is not mistaken for an instantiated call.
+            visit_kotlin_annotation_arguments(node, ctx, parent_symbol, owner_symbol);
         }
         "property_delegate" => {
             // kotlin spec §4g: bind the delegate target to the enclosing
@@ -237,6 +257,67 @@ pub(crate) fn visit_kotlin_children(
     }
 }
 
+/// kotlin spec §5: walk an `annotation` node's argument expressions so calls
+/// and references inside annotation arguments are captured. The annotation's
+/// name is already emitted by `extract_kotlin_annotation_reference`, and the
+/// annotation-type `constructor_invocation` is intentionally NOT re-walked as
+/// a call (an annotation use is not a constructor call), so we descend only
+/// into the `value_arguments` of each `_unescaped_annotation`.
+fn visit_kotlin_annotation_arguments(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<(SymbolId, SymbolKind)>,
+    owner_symbol: Option<SymbolId>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        // `@[A B]` multi-annotation and the single `@A(...)` form both nest a
+        // `constructor_invocation` whose `value_arguments` hold the arguments.
+        if child.kind() == "constructor_invocation"
+            && let Some(args) = kotlin_first_child_of_kind(child, "value_arguments")
+        {
+            visit_kotlin_children(args, ctx, parent_symbol.clone(), owner_symbol.clone());
+        }
+    }
+}
+
+/// Walk a `property_declaration`'s children, routing `getter`/`setter`
+/// accessors to dedicated `Method` symbols owned by the property's host class
+/// (kotlin spec §2). Non-accessor children (the initializer expression, the
+/// delegate) keep the property as their parent/owner so initializer calls
+/// continue attributing to the property symbol. Accessor-body calls attribute
+/// to the synthesized accessor `Method` instead of the (non-callable) property.
+fn visit_kotlin_property_children(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    property_parent: Option<(SymbolId, SymbolKind)>,
+    property_owner: Option<SymbolId>,
+    host_symbol: Option<(SymbolId, SymbolKind)>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "getter" | "setter" => {
+                if let Some(symbol) = kotlin_accessor_symbol(child, ctx, host_symbol.as_ref(), node)
+                {
+                    let owner = Some(symbol.id.clone());
+                    ctx.symbols.push(symbol);
+                    // Recurse accessor children with the accessor as owner so
+                    // body calls attribute to it. The host class stays the
+                    // parent for any nested declarations (there shouldn't be
+                    // any, but keep the scope consistent).
+                    visit_kotlin_children(child, ctx, host_symbol.clone(), owner);
+                } else {
+                    // No host class (top-level property accessor) — fall back
+                    // to the property as owner so calls aren't dropped.
+                    visit_kotlin_node(child, ctx, property_parent.clone(), property_owner.clone());
+                }
+            }
+            _ => visit_kotlin_node(child, ctx, property_parent.clone(), property_owner.clone()),
+        }
+    }
+}
+
 /// Returns a `ParsedSymbol` for declaration nodes that map 1:1 to a single
 /// symbol. Returns `None` for nodes handled out-of-band (`property_declaration`
 /// multi-bindings, `class_parameter` field promotion).
@@ -253,6 +334,7 @@ pub(crate) fn kotlin_symbol_from_node(
         "companion_object" => Some(kotlin_companion_object_symbol(node, ctx, parent_symbol)),
         "function_declaration" => kotlin_function_declaration_symbol(node, ctx, parent_symbol),
         "secondary_constructor" => kotlin_secondary_constructor_symbol(node, ctx, parent_symbol),
+        "anonymous_initializer" => kotlin_anonymous_initializer_symbol(node, ctx, parent_symbol),
         "type_alias" => kotlin_type_alias_symbol(node, ctx, parent_symbol),
         "enum_entry" => kotlin_enum_entry_symbol(node, ctx, parent_symbol),
         _ => None,
@@ -280,11 +362,8 @@ fn kotlin_class_declaration_symbol(
     let signature = signature_text(node, body, ctx.source);
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
     let mut attributes = kotlin_attributes_for_node(node, ctx.source);
-    attributes.extend(
-        kotlin_type_inheritance_names(node, ctx.source)
-            .into_iter()
-            .map(|base| format!("base:{base}")),
-    );
+    attributes.extend(kotlin_inheritance_attributes(node, ctx.source));
+    attributes.extend(kotlin_generic_bound_attributes(node, ctx.source));
     if kotlin_class_modifier_present(node, "data") {
         attributes.push("kotlin:data".to_string());
     }
@@ -296,6 +375,17 @@ fn kotlin_class_declaration_symbol(
     }
     if kotlin_class_modifier_present(node, "inner") {
         attributes.push("kotlin:inner".to_string());
+    }
+    // `value class` / `value` modifier (inline value classes). `inline` is a
+    // function-only modifier in this grammar, so `value` is the SAM-free flag.
+    if kotlin_class_modifier_present(node, "value") {
+        attributes.push("kotlin:value".to_string());
+    }
+    // A functional interface (`fun interface Foo`) is a SAM type. The grammar
+    // emits `fun` and `interface` as anonymous tokens, so scan the unnamed
+    // children for the `fun` keyword preceding `interface`.
+    if kotlin_class_is_fun_interface(node) {
+        attributes.push("kotlin:fun-interface".to_string());
     }
     attributes.sort();
     attributes.dedup();
@@ -342,11 +432,7 @@ fn kotlin_object_declaration_symbol(
     );
     let mut attributes = kotlin_attributes_for_node(node, ctx.source);
     attributes.push("kotlin:object".to_string());
-    attributes.extend(
-        kotlin_type_inheritance_names(node, ctx.source)
-            .into_iter()
-            .map(|base| format!("base:{base}")),
-    );
+    attributes.extend(kotlin_inheritance_attributes(node, ctx.source));
     attributes.sort();
     attributes.dedup();
 
@@ -397,11 +483,7 @@ fn kotlin_object_literal_symbol(
         "kotlin:anonymous-object".to_string(),
         "kotlin:object".to_string(),
     ];
-    attributes.extend(
-        kotlin_type_inheritance_names(node, ctx.source)
-            .into_iter()
-            .map(|base| format!("base:{base}")),
-    );
+    attributes.extend(kotlin_inheritance_attributes(node, ctx.source));
     attributes.sort();
     attributes.dedup();
 
@@ -501,6 +583,7 @@ fn kotlin_function_declaration_symbol(
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
 
     let mut attributes = kotlin_attributes_for_node(node, ctx.source);
+    attributes.extend(kotlin_generic_bound_attributes(node, ctx.source));
     if kotlin_function_modifier_present(node, "suspend") {
         attributes.push("kotlin:suspend".to_string());
     }
@@ -662,6 +745,158 @@ fn kotlin_secondary_constructor_symbol(
         freshness: Freshness::Fresh,
         arity,
     })
+}
+
+/// kotlin spec: model an `init { ... }` block as a dedicated callable so
+/// construction-time calls are scopable rather than attributed to the class
+/// symbol. The `anonymous_initializer` node's single child is the `block`,
+/// which becomes the symbol's `body_span` — that triggers the owner switch in
+/// `visit_kotlin_node`, so calls inside the block attribute to this symbol
+/// instead of leaking onto the enclosing class.
+fn kotlin_anonymous_initializer_symbol(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    let parent = parent_symbol?;
+    // Only meaningful inside a class-like body.
+    if !matches!(
+        parent.1,
+        SymbolKind::Class | SymbolKind::Trait | SymbolKind::Enum | SymbolKind::Struct,
+    ) {
+        return None;
+    }
+    let span = span_from_node(node);
+    let name = "<init>".to_string();
+    let body = kotlin_first_child_of_kind(node, "block");
+    let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
+    let signature = signature_text(node, body, ctx.source);
+    let id = symbol_id(&ctx.file, Some(&parent.0), SymbolKind::Method, &name, span);
+    let attributes = vec!["kotlin:init".to_string()];
+
+    Some(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id: Some(parent.0.clone()),
+        name,
+        kind: SymbolKind::Method,
+        language_identity: None,
+        span,
+        body_span,
+        signature_span,
+        signature,
+        visibility: None,
+        docs: kotlin_docs_for_node(node, ctx.source),
+        attributes,
+        provenance: Provenance::new("tree-sitter-kotlin", "anonymous initializer"),
+        confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+        arity: None,
+    })
+}
+
+/// kotlin spec §2: model a custom property accessor (`get() = ...` /
+/// `set(value) { ... }`) as a `Method` symbol owned by the property's host
+/// class. Naming follows `<get-foo>` / `<set-foo>` so a property `foo` with
+/// both accessors yields two distinctly-named methods. The accessor's
+/// `function_body` becomes `body_span`, so calls inside the accessor attribute
+/// to it (via the owner switch) rather than to the non-callable property.
+/// Returns `None` for accessors with no host class (e.g. top-level
+/// properties), letting the caller fall back to property-owned attribution.
+fn kotlin_accessor_symbol(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    host_symbol: Option<&(SymbolId, SymbolKind)>,
+    property_node: Node<'_>,
+) -> Option<ParsedSymbol> {
+    let host = host_symbol?;
+    if !matches!(
+        host.1,
+        SymbolKind::Class | SymbolKind::Trait | SymbolKind::Enum | SymbolKind::Struct,
+    ) {
+        return None;
+    }
+    let is_getter = node.kind() == "getter";
+    let prefix = if is_getter { "get" } else { "set" };
+    let property_name = kotlin_property_first_name(property_node, ctx.source)
+        .unwrap_or_else(|| "<property>".to_string());
+    let name = format!("<{prefix}-{property_name}>");
+    let span = span_from_node(node);
+    // A custom accessor may be an expression body (`get() = field`) or a block
+    // body (`get() { ... }`); both surface as `function_body`. An accessor
+    // with no body (`get`/`set` only, declaring custom visibility) is not a
+    // distinct callable, so skip it.
+    let body = kotlin_first_child_of_kind(node, "function_body")?;
+    let body_span = Some(span_from_node(body));
+    let signature_span = signature_span_from_nodes(node, Some(body));
+    let signature = signature_text(node, Some(body), ctx.source);
+    let id = symbol_id(&ctx.file, Some(&host.0), SymbolKind::Method, &name, span);
+    let mut attributes = vec![if is_getter {
+        "kotlin:getter".to_string()
+    } else {
+        "kotlin:setter".to_string()
+    }];
+    if let Some(vis) = kotlin_visibility_text(node, ctx.source) {
+        attributes.push(format!("kotlin:accessor-visibility:{vis}"));
+    }
+    attributes.sort();
+    attributes.dedup();
+
+    Some(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id: Some(host.0.clone()),
+        name,
+        kind: SymbolKind::Method,
+        language_identity: None,
+        span,
+        body_span,
+        signature_span,
+        signature,
+        visibility: kotlin_visibility_text(node, ctx.source),
+        docs: Vec::new(),
+        attributes,
+        provenance: Provenance::new("tree-sitter-kotlin", "property accessor"),
+        confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+        // A getter takes 0 args; a setter takes 1 (`set(value)`).
+        arity: Some(if is_getter { 0 } else { 1 }),
+    })
+}
+
+/// First declared binding name of a `property_declaration` (the property name
+/// for single bindings; the first name for destructuring bindings).
+fn kotlin_property_first_name(node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "variable_declaration" => {
+                if let Some(name) = kotlin_first_child_of_kind(child, "identifier")
+                    .and_then(|n| node_text(n, source).ok())
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty())
+                {
+                    return Some(name);
+                }
+            }
+            "multi_variable_declaration" => {
+                let mut inner = child.walk();
+                for grand in child.named_children(&mut inner) {
+                    if grand.kind() == "variable_declaration"
+                        && let Some(name) = kotlin_first_child_of_kind(grand, "identifier")
+                            .and_then(|n| node_text(n, source).ok())
+                            .map(|text| text.trim().to_string())
+                            .filter(|text| !text.is_empty())
+                    {
+                        return Some(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn kotlin_type_alias_symbol(
@@ -1117,6 +1352,59 @@ pub(crate) fn extract_kotlin_call_expression(
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
 }
 
+/// Kotlin infix calls (`a to b`, `x shl 1`, `1 until n`, custom `infix fun`s)
+/// parse as `infix_expression` with three positional named children:
+/// `<left expression> <operator identifier> <right expression>`. The node has
+/// no field names, so we select children by position. We emit a single
+/// `ParsedCall` (kind `Method`, name = operator identifier, receiver = the
+/// left operand text) mirroring `scala.rs`'s `infix_expression` handling.
+pub(crate) fn extract_kotlin_infix_expression(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let left = node.named_child(0);
+    let operator = node.named_child(1);
+    let Some(operator) = operator else {
+        return;
+    };
+    // The operator must be a bare `identifier`; `is`/`in`/`!is`/`!in` and the
+    // range/elvis operators are not infix-function identifiers and either
+    // surface under different node kinds or are anonymous tokens.
+    if operator.kind() != "identifier" {
+        return;
+    }
+    let name = node_text(operator, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if name.is_empty() || is_kotlin_keyword(&name) {
+        return;
+    }
+    let receiver = left
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let raw = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name,
+        target_text: raw,
+        receiver,
+        // An infix call passes exactly one argument (the right operand).
+        arity: 1,
+        kind: ParsedCallKind::Method,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-kotlin", "infix_expression"),
+        confidence: Confidence::CandidateSet,
+    });
+    extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+}
+
 pub(crate) fn extract_kotlin_constructor_invocation(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
@@ -1465,6 +1753,54 @@ pub(crate) fn extract_kotlin_user_type_reference(
     });
 }
 
+/// kotlin spec §9: a receiverless callable reference (`::transform`,
+/// `foo(::standalone)`) or a typed one (`String::length`, `MyClass::new`)
+/// parses as `callable_reference` = `[receiver_type]? :: identifier`. We emit a
+/// `ParsedReference` (kind `Field`) for the trailing identifier so the
+/// referenced function/member is discoverable; the receiver `user_type`, if
+/// present, is captured separately by the recursing `user_type` arm. Treating
+/// `::` references as full `Calls` edges is a separate cross-language decision.
+pub(crate) fn extract_kotlin_callable_reference(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    // The member name is the *last* direct `identifier` child (the receiver
+    // type, when present, is a `user_type` / `nullable_type`, not a bare
+    // identifier). `X::class` uses an anonymous `class` token and therefore
+    // surfaces no named identifier — nothing to bind.
+    let mut cursor = node.walk();
+    let Some(name_node) = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "identifier")
+        .last()
+    else {
+        return;
+    };
+    let text = node_text(name_node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if text.is_empty() || is_kotlin_keyword(&text) {
+        return;
+    }
+    ctx.references.push(ParsedReference {
+        file_id: ctx.file.id.clone(),
+        owner_id: owner_id.clone(),
+        text: text.clone(),
+        kind: ReferenceKind::Field,
+        span: span_from_node(name_node),
+        provenance: Provenance::new("tree-sitter-kotlin", "callable reference"),
+    });
+    ctx.body_hits.push(BodyHit {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        text,
+        kind: BodyHitKind::Path,
+        span: span_from_node(node),
+    });
+}
+
 pub(crate) fn extract_kotlin_annotation_reference(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
@@ -1574,6 +1910,23 @@ fn kotlin_class_is_interface(node: Node<'_>) -> bool {
     let mut cursor = node.walk();
     node.children(&mut cursor)
         .any(|child| child.kind() == "interface")
+}
+
+/// True when the declaration is a `fun interface` (a Kotlin SAM / functional
+/// interface). The `fun` and `interface` keywords are anonymous tokens, so
+/// both must be present among the (unnamed) children.
+fn kotlin_class_is_fun_interface(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    let mut saw_fun = false;
+    let mut saw_interface = false;
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "fun" => saw_fun = true,
+            "interface" => saw_interface = true,
+            _ => {}
+        }
+    }
+    saw_fun && saw_interface
 }
 
 fn kotlin_class_is_enum(node: Node<'_>) -> bool {
@@ -1720,23 +2073,109 @@ fn kotlin_docs_for_node(node: Node<'_>, source: &str) -> Vec<String> {
     docs
 }
 
-fn kotlin_type_inheritance_names(node: Node<'_>, source: &str) -> Vec<String> {
-    let mut names = Vec::new();
+/// Returns the supertype attribute strings for a class/object declaration,
+/// classifying each delegation specifier into `base:` (the superclass) or
+/// `iface:` (interfaces / delegated interfaces).
+///
+/// Kotlin's grammar makes this decidable without name resolution: a
+/// `delegation_specifier` that wraps a `constructor_invocation` (`: Base()`)
+/// invokes the superclass constructor and is therefore the single superclass;
+/// a bare `type` / `user_type` (`: Iface`) or an `explicit_delegation`
+/// (`: Iface by impl`) is an interface. There can be at most one superclass,
+/// so the first constructor-invocation specifier wins `base:` and any later
+/// constructor invocation (syntactically invalid Kotlin) falls back to
+/// `iface:` rather than being dropped.
+fn kotlin_inheritance_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut attributes = Vec::new();
+    let mut saw_base = false;
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.kind() == "delegation_specifiers" {
-            let mut inner = child.walk();
-            for spec in child.named_children(&mut inner) {
-                if spec.kind() != "delegation_specifier" {
-                    continue;
-                }
-                collect_kotlin_type_names(spec, source, &mut names);
+        if child.kind() != "delegation_specifiers" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for spec in child.named_children(&mut inner) {
+            if spec.kind() != "delegation_specifier" {
+                continue;
+            }
+            let mut names = Vec::new();
+            collect_kotlin_type_names(spec, source, &mut names);
+            let Some(name) = names.into_iter().next() else {
+                continue;
+            };
+            // The superclass is the one specifier that calls a constructor.
+            let is_superclass =
+                !saw_base && kotlin_first_child_of_kind(spec, "constructor_invocation").is_some();
+            if is_superclass {
+                saw_base = true;
+                attributes.push(format!("base:{name}"));
+            } else {
+                attributes.push(format!("iface:{name}"));
             }
         }
     }
-    names.sort();
-    names.dedup();
-    names
+    attributes.sort();
+    attributes.dedup();
+    attributes
+}
+
+/// kotlin spec §7: collect generic upper-bound attributes for a declaration.
+/// Both inline bounds (`<T : Bound>` on `type_parameters -> type_parameter`)
+/// and `where` clauses (`type_constraints -> type_constraint`) are emitted as
+/// `bound:<param>:<bound>` so `decl_search` can find constraint-bounded
+/// generics. A dedicated `bound:` namespace is used (rather than overloading
+/// `base:`) to keep type-parameter constraints distinguishable from real
+/// supertypes. Aligning Swift (currently `base:`) and JS/TS onto this same
+/// namespace is a cross-language follow-up that touches their extractors.
+fn kotlin_generic_bound_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut attributes = Vec::new();
+    // Inline bounds: `type_parameters -> type_parameter[identifier, : type]`.
+    if let Some(params) = kotlin_first_child_of_kind(node, "type_parameters") {
+        let mut cursor = params.walk();
+        for param in params.named_children(&mut cursor) {
+            if param.kind() != "type_parameter" {
+                continue;
+            }
+            let Some(name) = kotlin_first_child_of_kind(param, "identifier")
+                .and_then(|n| node_text(n, source).ok())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+            else {
+                continue;
+            };
+            if let Some(bound) = kotlin_first_child_of_kind(param, "type")
+                .and_then(|t| node_text(t, source).ok())
+                .and_then(kotlin_type_name_from_text)
+            {
+                attributes.push(format!("bound:{name}:{bound}"));
+            }
+        }
+    }
+    // `where` clauses: `type_constraints -> type_constraint[identifier, type]`.
+    if let Some(constraints) = kotlin_first_child_of_kind(node, "type_constraints") {
+        let mut cursor = constraints.walk();
+        for constraint in constraints.named_children(&mut cursor) {
+            if constraint.kind() != "type_constraint" {
+                continue;
+            }
+            let Some(name) = kotlin_first_child_of_kind(constraint, "identifier")
+                .and_then(|n| node_text(n, source).ok())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+            else {
+                continue;
+            };
+            if let Some(bound) = kotlin_first_child_of_kind(constraint, "type")
+                .and_then(|t| node_text(t, source).ok())
+                .and_then(kotlin_type_name_from_text)
+            {
+                attributes.push(format!("bound:{name}:{bound}"));
+            }
+        }
+    }
+    attributes.sort();
+    attributes.dedup();
+    attributes
 }
 
 fn collect_kotlin_type_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {

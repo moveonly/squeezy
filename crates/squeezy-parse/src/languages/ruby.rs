@@ -24,6 +24,7 @@ pub(crate) fn extract_ruby(file: FileRecord, source: &str, tree: &Tree) -> Parse
     record_parse_error_diagnostics(root, &mut ctx);
 
     visit_ruby_node(root, &mut ctx, None, None, None);
+    apply_ruby_visibility(root, &mut ctx);
     dedup_ruby_facts(&mut ctx);
 
     ParsedFile {
@@ -98,9 +99,32 @@ fn visit_ruby_node(
             // include/extend/prepend produced a Type reference + class
             // attribute, or attr_* synthesized methods. The call itself is
             // not emitted as a `ParsedCall`.
+        } else if extract_ruby_alias_method_call(
+            node,
+            ctx,
+            parent_symbol.as_ref(),
+            host_class.as_ref(),
+        ) {
+            // `alias_method :new, :old` synthesized an aliased Method symbol
+            // plus a reference to the original; the call itself is not emitted.
+        } else if let Some(test_symbol) =
+            extract_ruby_rspec_example(node, ctx, parent_symbol.as_ref())
+        {
+            // RSpec `describe`/`context`/`it`/... block: synthesize a `Test`
+            // symbol and descend into the block with the Test as the new parent
+            // so nested examples and body references attach to it.
+            extract_body_hit(node, BodyHitKind::Call, ctx, owner_symbol.clone());
+            let next_parent = Some((test_symbol.id.clone(), test_symbol.kind));
+            let next_owner = Some(test_symbol.id.clone());
+            ctx.symbols.push(test_symbol);
+            visit_ruby_children(node, ctx, next_parent, next_owner, host_class);
+            return;
         } else {
             extract_ruby_call(node, ctx, owner_symbol.clone());
         }
+    } else if kind == "alias" {
+        // `alias new_name old_name` keyword form.
+        extract_ruby_alias_keyword(node, ctx, parent_symbol.as_ref());
     } else if kind == "assignment" {
         extract_ruby_assignment_symbol(
             node,
@@ -110,6 +134,11 @@ fn visit_ruby_node(
             owner_symbol.clone(),
         );
     } else if kind == "identifier" {
+        extract_ruby_reference(node, ReferenceKind::Identifier, ctx, owner_symbol.clone());
+    } else if kind == "global_variable" {
+        // `$var` occurrence (a read, or the LHS of `$var = ...` whose Static
+        // symbol is emitted separately by the assignment arm). Emit an
+        // Identifier reference + body hit so `$config` reads are searchable.
         extract_ruby_reference(node, ReferenceKind::Identifier, ctx, owner_symbol.clone());
     } else if kind == "constant" {
         let ref_kind = if ruby_constant_in_type_position(node) {
@@ -178,8 +207,27 @@ fn ruby_symbol_from_node(
     let signature_span = signature_span_from_nodes(node, body);
     let signature = signature_text(node, body, ctx.source);
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
-    let id = symbol_id(&ctx.file, parent_id.as_ref(), symbol_kind, &name, span);
     let mut attributes = Vec::new();
+    // Minitest: a method whose name starts with `test_` is a test by the
+    // framework's auto-discovery convention. Promote it to `Test` so
+    // `kind=test` queries surface Ruby tests, and tag it with a bare `test`
+    // attribute for attribute search. Helper `def`s in a spec/test file are NOT
+    // promoted (that would mis-tag fixtures/setup helpers) — RSpec examples and
+    // the Minitest `test "name" do` macro come through the call path instead.
+    let mut symbol_kind = symbol_kind;
+    if matches!(symbol_kind, SymbolKind::Method | SymbolKind::Function) && name.starts_with("test_")
+    {
+        symbol_kind = SymbolKind::Test;
+        attributes.push("test".to_string());
+        attributes.push("ruby:test".to_string());
+    } else if matches!(symbol_kind, SymbolKind::Method | SymbolKind::Function)
+        && ruby_is_test_filename(&ctx.file.relative_path)
+    {
+        // A plain method in a test/spec file: keep its kind but flag it so the
+        // file's symbols are discoverable as test-adjacent.
+        attributes.push("ruby:test-host".to_string());
+    }
+    let id = symbol_id(&ctx.file, parent_id.as_ref(), symbol_kind, &name, span);
     if symbol_kind == SymbolKind::Class
         && let Some(base) = ruby_superclass_name(node, ctx.source)
     {
@@ -194,7 +242,10 @@ fn ruby_symbol_from_node(
             attributes.push(format!("ruby:singleton-receiver:{}", receiver.trim()));
         }
     }
-    let arity = if matches!(symbol_kind, SymbolKind::Function | SymbolKind::Method) {
+    let arity = if matches!(
+        symbol_kind,
+        SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+    ) {
         node.child_by_field_name("parameters")
             .map(|params| u8::try_from(named_child_count(params)).unwrap_or(u8::MAX))
     } else {
@@ -350,6 +401,33 @@ fn extract_ruby_assignment_symbol(
                 arity: None,
             });
         }
+        "global_variable" => {
+            // `$config = ...` is a process-global. Model it as a file-scoped
+            // `Static` (the closest analogue to a module-level constant binding
+            // that is mutable and not namespaced) so `$config` is queryable as a
+            // declaration. Globals have no lexical owner, so the symbol is
+            // parented at the file regardless of the enclosing class/method.
+            let id = symbol_id(&ctx.file, None, SymbolKind::Static, left_text, span);
+            ctx.symbols.push(ParsedSymbol {
+                id,
+                file_id: ctx.file.id.clone(),
+                parent_id: None,
+                name: left_text.to_string(),
+                kind: SymbolKind::Static,
+                language_identity: None,
+                span,
+                body_span: None,
+                signature_span: None,
+                signature: raw.to_string(),
+                visibility: None,
+                docs: Vec::new(),
+                attributes: vec!["ruby:global".to_string()],
+                provenance: Provenance::new("tree-sitter-ruby", "global variable assignment"),
+                confidence: Confidence::Heuristic,
+                freshness: Freshness::Fresh,
+                arity: None,
+            });
+        }
         "instance_variable" | "class_variable" => {
             // Ivar/cvar Fields attach to the nearest enclosing class/module,
             // not the immediate parent symbol (which is usually the method).
@@ -467,6 +545,9 @@ fn extract_ruby_import(
     } else {
         raw_path.clone()
     };
+    // Leaf of the required path (e.g. `user` for `app/models/user.rb`). Kept so
+    // the resolver can fall back to leaf-name matching even though the binding
+    // is a whole-file glob.
     let imported_name = ruby_imported_name_from_path(&resolved_path);
     let provenance_label = if kind_label == "load" {
         "ruby:load"
@@ -479,12 +560,19 @@ fn extract_ruby_import(
         owner_id: owner_id.clone(),
         path: resolved_path,
         alias: None,
-        is_glob: false,
+        // `require`/`require_relative`/`load` evaluate the whole target file,
+        // exposing every top-level definition to the requiring file — the same
+        // whole-file 'expose everything' semantics as C's `#include` (which is
+        // `Wildcard` + `is_glob`). Model them as globs so the resolver routes
+        // single-candidate require edges through the glob branch (it switches on
+        // `is_glob`, not `ImportKind`) and `Wildcard` keeps the binding shape
+        // honest. `autoload` stays `Named` — it binds exactly one constant.
+        is_glob: true,
         is_reexport: false,
         is_static: false,
         span,
         provenance: Provenance::new("tree-sitter-ruby", provenance_label),
-        kind: ImportKind::Named,
+        kind: ImportKind::Wildcard,
         imported_name,
         is_global: false,
     });
@@ -636,7 +724,124 @@ fn extract_ruby_mixin_or_attr(
         return true;
     }
 
+    if extract_ruby_rails_macro(node, ctx, parent_id, method_name) {
+        let _ = owner_id;
+        return true;
+    }
+
     false
+}
+
+/// Rails / ActiveSupport class-body macros that implicitly define accessor
+/// methods. Synthesizes `Partial` Method symbols (one reader, optionally a
+/// writer/predicate) for each declared name and records association targets as
+/// an `assoc:<macro>:<name>` attribute on the host class. Returns `true` when
+/// the call was a recognised macro (so the caller skips the anonymous call).
+fn extract_ruby_rails_macro(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_id: &SymbolId,
+    method_name: &str,
+) -> bool {
+    // (emit_reader, emit_writer, emit_predicate, is_association)
+    let (emit_reader, emit_writer, emit_predicate, is_assoc) = match method_name {
+        // ActiveRecord associations: implicit reader + writer accessor.
+        "has_many" | "has_one" | "belongs_to" | "has_and_belongs_to_many" => {
+            (true, true, false, true)
+        }
+        // ActiveSupport attribute macros: reader + writer (+ predicate for
+        // `class_attribute`).
+        "class_attribute" => (true, true, true, false),
+        "cattr_accessor" | "mattr_accessor" => (true, true, false, false),
+        "cattr_reader" | "mattr_reader" => (true, false, false, false),
+        "cattr_writer" | "mattr_writer" => (false, true, false, false),
+        // `delegate :a, :b, to: :x` exposes reader methods for each name; the
+        // trailing `to:`/options hash is skipped below.
+        "delegate" => (true, false, false, false),
+        _ => return false,
+    };
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let span = span_from_node(node);
+    let raw = node_text(node, ctx.source).unwrap_or_default().trim();
+    let mut cursor = args.walk();
+    let mut emitted_any = false;
+    for child in args.named_children(&mut cursor) {
+        // Options hashes (`to: :user`, `class_name: "Post"`, `dependent:
+        // :destroy`) and inline `pair`s are not accessor names — stop/skip.
+        if matches!(child.kind(), "pair" | "hash" | "keyword_argument") {
+            continue;
+        }
+        let Some(name) = ruby_symbol_arg_value(child, ctx.source) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        emitted_any = true;
+        if is_assoc && let Some(host) = ctx.symbols.iter_mut().find(|s| s.id == *parent_id) {
+            host.attributes.push(format!("assoc:{method_name}:{name}"));
+        }
+        if emit_reader {
+            push_synthetic_macro_accessor(ctx, parent_id, &name, method_name, span, raw);
+        }
+        if emit_writer {
+            push_synthetic_macro_accessor(
+                ctx,
+                parent_id,
+                &format!("{name}="),
+                method_name,
+                span,
+                raw,
+            );
+        }
+        if emit_predicate {
+            push_synthetic_macro_accessor(
+                ctx,
+                parent_id,
+                &format!("{name}?"),
+                method_name,
+                span,
+                raw,
+            );
+        }
+    }
+    emitted_any
+}
+
+fn push_synthetic_macro_accessor(
+    ctx: &mut ExtractContext<'_>,
+    parent_id: &SymbolId,
+    name: &str,
+    macro_name: &str,
+    span: SourceSpan,
+    raw: &str,
+) {
+    let writer = name.ends_with('=');
+    let id = symbol_id(&ctx.file, Some(parent_id), SymbolKind::Method, name, span);
+    ctx.symbols.push(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id: Some(parent_id.clone()),
+        name: name.to_string(),
+        kind: SymbolKind::Method,
+        language_identity: None,
+        span,
+        body_span: None,
+        signature_span: None,
+        signature: raw.to_string(),
+        visibility: None,
+        docs: Vec::new(),
+        attributes: vec![
+            "ruby:synthesized".to_string(),
+            format!("ruby:macro:{macro_name}"),
+        ],
+        provenance: Provenance::new("tree-sitter-ruby", "rails macro accessor synthesis"),
+        confidence: Confidence::Partial,
+        freshness: Freshness::Fresh,
+        arity: Some(if writer { 1 } else { 0 }),
+    });
 }
 
 fn push_synthetic_attr(
@@ -680,6 +885,29 @@ fn push_synthetic_attr(
     });
 }
 
+/// True for Ruby metaprogramming sinks whose callee is resolved at runtime
+/// (`obj.send(:foo)`, `define_method(:bar) { ... }`, `instance_eval(src)`).
+/// Tagging these `ParsedCallKind::Macro` lets the graph resolver emit an
+/// `InvokesMacro` classification for dynamic dispatch instead of pretending it
+/// is an ordinary call.
+fn ruby_is_macro_dispatch(name: &str) -> bool {
+    matches!(
+        name,
+        "send"
+            | "public_send"
+            | "__send__"
+            | "define_method"
+            | "method"
+            | "eval"
+            | "instance_eval"
+            | "class_eval"
+            | "module_eval"
+            | "instance_exec"
+            | "class_exec"
+            | "module_exec"
+    )
+}
+
 fn extract_ruby_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
     let Some(method_node) = node.child_by_field_name("method") else {
         return;
@@ -704,7 +932,16 @@ fn extract_ruby_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Opt
         .child_by_field_name("arguments")
         .map(named_child_count)
         .unwrap_or_default();
-    let call_kind = if receiver_text.is_some() {
+    // Known dynamic-dispatch sinks (metaprogramming) are tagged `Macro` so the
+    // resolver's `InvokesMacro` classification fires for them rather than
+    // treating them as ordinary method/direct calls. The actual callee is not
+    // statically known (it's a runtime symbol/string), so resolution stays
+    // `MacroOpaque` — but the edge kind alone lets callers find dynamic dispatch
+    // sites. Receiver shape is irrelevant: both `obj.send(:foo)` and a bare
+    // `define_method(:foo)` are dynamic dispatch.
+    let call_kind = if ruby_is_macro_dispatch(&name) {
+        ParsedCallKind::Macro
+    } else if receiver_text.is_some() {
         ParsedCallKind::Method
     } else {
         ParsedCallKind::Direct
@@ -765,6 +1002,247 @@ fn extract_ruby_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Opt
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
 }
 
+/// `alias new_name old_name` keyword form. Synthesizes a `Method` symbol for
+/// `new_name` carrying a `ruby:alias-of:<old_name>` attribute and emits an
+/// Identifier reference to `old_name` so the alias links back to the original.
+fn extract_ruby_alias_keyword(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) {
+    let new_name = node
+        .child_by_field_name("name")
+        .and_then(|n| ruby_method_name_text(n, ctx.source));
+    let orig_name = node
+        .child_by_field_name("alias")
+        .and_then(|n| ruby_method_name_text(n, ctx.source));
+    let (Some(new_name), Some(orig_name)) = (new_name, orig_name) else {
+        return;
+    };
+    push_ruby_alias_symbol(node, ctx, parent_symbol, &new_name, &orig_name);
+    if let Some(orig_node) = node.child_by_field_name("alias") {
+        push_ruby_alias_origin_reference(orig_node, ctx, parent_symbol, &orig_name);
+    }
+}
+
+/// `alias_method :new, :old` call form. Returns `true` if it was consumed (so
+/// the caller skips emitting an anonymous `ParsedCall`).
+fn extract_ruby_alias_method_call(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+    host_class: Option<&(SymbolId, SymbolKind)>,
+) -> bool {
+    if node.child_by_field_name("receiver").is_some() {
+        return false;
+    }
+    let Some(method_node) = node.child_by_field_name("method") else {
+        return false;
+    };
+    let method_name = node_text(method_node, ctx.source).unwrap_or_default();
+    if method_name.trim() != "alias_method" {
+        return false;
+    }
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = args.walk();
+    let mut args_iter = args.named_children(&mut cursor);
+    let new_arg = args_iter.next();
+    let orig_arg = args_iter.next();
+    let (Some(new_arg), Some(orig_arg)) = (new_arg, orig_arg) else {
+        return false;
+    };
+    let new_name = ruby_symbol_arg_value(new_arg, ctx.source);
+    let orig_name = ruby_symbol_arg_value(orig_arg, ctx.source);
+    let (Some(new_name), Some(orig_name)) = (new_name, orig_name) else {
+        return false;
+    };
+    // `alias_method` is namespaced inside its class body, so prefer the
+    // enclosing class-like host for parenting; fall back to the lexical parent.
+    let owner = host_class.or(parent_symbol);
+    push_ruby_alias_symbol(node, ctx, owner, &new_name, &orig_name);
+    push_ruby_alias_origin_reference(orig_arg, ctx, owner, &orig_name);
+    true
+}
+
+/// Synthesize the aliased `Method`/`Function` symbol. Methods inside a
+/// class/module are `Method`; top-level aliases are `Function`.
+fn push_ruby_alias_symbol(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+    new_name: &str,
+    orig_name: &str,
+) {
+    let symbol_kind = match parent_symbol.map(|(_, k)| *k) {
+        Some(SymbolKind::Class) | Some(SymbolKind::Module) => SymbolKind::Method,
+        _ => SymbolKind::Function,
+    };
+    let span = span_from_node(node);
+    let raw = node_text(node, ctx.source).unwrap_or_default().trim();
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let id = symbol_id(&ctx.file, parent_id.as_ref(), symbol_kind, new_name, span);
+    ctx.symbols.push(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name: new_name.to_string(),
+        kind: symbol_kind,
+        language_identity: None,
+        span,
+        body_span: None,
+        signature_span: None,
+        signature: raw.to_string(),
+        visibility: None,
+        docs: Vec::new(),
+        attributes: vec![
+            "ruby:synthesized".to_string(),
+            format!("ruby:alias-of:{orig_name}"),
+        ],
+        provenance: Provenance::new("tree-sitter-ruby", "alias synthesis"),
+        confidence: Confidence::Partial,
+        freshness: Freshness::Fresh,
+        arity: None,
+    });
+}
+
+/// Emit an Identifier reference to the aliased original method name so the
+/// alias links back to (and a resolver can bind) the original definition.
+fn push_ruby_alias_origin_reference(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+    orig_name: &str,
+) {
+    ctx.references.push(ParsedReference {
+        file_id: ctx.file.id.clone(),
+        owner_id: parent_symbol.map(|(id, _)| id.clone()),
+        text: orig_name.to_string(),
+        kind: ReferenceKind::Identifier,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-ruby", "alias original method"),
+    });
+}
+
+/// RSpec example/group DSL (`describe`/`context`/`it`/`specify`/`feature`/
+/// `scenario`/`example`) — a receiver-less call carrying a block. Synthesizes a
+/// `Test` symbol named after the description argument so `kind=test` surfaces
+/// RSpec examples. Gated to test/spec files so a project's own `describe`/`it`
+/// method is not misclassified. Returns the symbol when consumed.
+fn extract_ruby_rspec_example(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    if !ruby_is_test_filename(&ctx.file.relative_path) {
+        return None;
+    }
+    if node.child_by_field_name("receiver").is_some() {
+        return None;
+    }
+    // An RSpec example/group is always a block-bearing call.
+    let block = node.child_by_field_name("block")?;
+    let method_node = node.child_by_field_name("method")?;
+    let method_name = node_text(method_node, ctx.source).ok()?.trim().to_string();
+    if !matches!(
+        method_name.as_str(),
+        "describe"
+            | "context"
+            | "it"
+            | "specify"
+            | "feature"
+            | "scenario"
+            | "example"
+            | "xdescribe"
+            | "xcontext"
+            | "xit"
+            | "fdescribe"
+            | "fcontext"
+            | "fit"
+    ) {
+        return None;
+    }
+    // Name from the first argument (description string or `describe SomeClass`).
+    let description = node.child_by_field_name("arguments").and_then(|args| {
+        let mut cursor = args.walk();
+        args.named_children(&mut cursor).next().and_then(|first| {
+            ruby_string_literal_value(first, ctx.source)
+                .or_else(|| {
+                    node_text(first, ctx.source)
+                        .ok()
+                        .map(|t| t.trim().to_string())
+                })
+                .filter(|t| !t.is_empty())
+        })
+    });
+    let name = match description {
+        Some(desc) => format!("{method_name} {desc}"),
+        None => method_name.clone(),
+    };
+    let span = span_from_node(node);
+    let body_span = Some(span_from_node(block));
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let id = symbol_id(&ctx.file, parent_id.as_ref(), SymbolKind::Test, &name, span);
+    // Signature is the call header only (`describe "..."`), not the block body,
+    // which could be arbitrarily large. Slice the source from the call start up
+    // to the block start.
+    let header_end = block.start_byte().min(node.end_byte());
+    let signature = ctx
+        .source
+        .get(node.start_byte()..header_end)
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| name.clone());
+    Some(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name,
+        kind: SymbolKind::Test,
+        language_identity: None,
+        span,
+        body_span,
+        signature_span: None,
+        signature,
+        visibility: None,
+        docs: Vec::new(),
+        attributes: vec![
+            "test".to_string(),
+            "ruby:test".to_string(),
+            "ruby:synthesized".to_string(),
+            format!("ruby:rspec:{method_name}"),
+        ],
+        provenance: Provenance::new("tree-sitter-ruby", "rspec example synthesis"),
+        confidence: Confidence::Heuristic,
+        freshness: Freshness::Fresh,
+        arity: None,
+    })
+}
+
+/// Text of a `_method_name` node (identifier/operator/constant/setter) or a
+/// symbol literal (`:foo`), stripped of a leading `:` for symbols.
+fn ruby_method_name_text(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() == "simple_symbol"
+        && let Some(value) = ruby_symbol_arg_value(node, source)
+    {
+        return Some(value);
+    }
+    let raw = node_text(node, source).ok()?.trim();
+    if raw.is_empty() {
+        None
+    } else {
+        // `:"foo"` (delimited_symbol) or a bare method name; strip a leading
+        // symbol colon and surrounding quotes so the stored name is the bare
+        // method identifier.
+        Some(
+            raw.trim_start_matches(':')
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_string(),
+        )
+    }
+}
+
 fn extract_ruby_reference(
     node: Node<'_>,
     kind: ReferenceKind,
@@ -822,8 +1300,18 @@ fn ruby_node_is_declared_name(node: Node<'_>) -> bool {
     {
         return matches!(
             parent.kind(),
-            "class" | "module" | "method" | "singleton_method" | "scope_resolution"
+            "class" | "module" | "method" | "singleton_method" | "scope_resolution" | "alias"
         );
+    }
+    // `alias new old`: both `name` (handled above) and `alias` (the original)
+    // are handled by `extract_ruby_alias_keyword` — it synthesizes the symbol
+    // and emits the origin reference explicitly, so suppress the auto-visit of
+    // the `alias` field to avoid a duplicate reference.
+    if parent.kind() == "alias"
+        && let Some(orig) = parent.child_by_field_name("alias")
+        && orig.id() == node.id()
+    {
+        return true;
     }
     if parent.kind() == "call"
         && let Some(method) = parent.child_by_field_name("method")
@@ -918,12 +1406,217 @@ fn ruby_imported_name_from_path(path: &str) -> Option<String> {
     }
 }
 
+/// True for Ruby test/spec files: a `*_test.rb` / `*_spec.rb` basename, or any
+/// file under a `test/` or `spec/` directory (the Minitest/RSpec conventions).
+fn ruby_is_test_filename(relative_path: &str) -> bool {
+    let lower = relative_path.to_ascii_lowercase();
+    let file_name = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+    if file_name.ends_with("_test.rb") || file_name.ends_with("_spec.rb") {
+        return true;
+    }
+    lower
+        .split(['/', '\\'])
+        .any(|segment| segment == "test" || segment == "spec")
+}
+
+/// Apply Ruby visibility (`private`/`protected`/`public`) to method symbols.
+///
+/// Ruby visibility is set two ways inside a class/module body:
+///   1. Toggle form — a bare `private` (or `protected`/`public`) flips the
+///      default visibility for every subsequent direct method definition in the
+///      body. `module_function` (bare) flips the default to a module-function
+///      mode that is also private on the instance side; we record it as
+///      `private`.
+///   2. Targeted form — `private :foo, :bar` / `private def baz; end` /
+///      `private_class_method :qux` set visibility on the named method(s) only.
+///
+/// Computed as a post-pass over the parse tree so it can observe body order
+/// without threading mutable state through the cloning recursive descent. The
+/// resulting `start_byte -> visibility` map patches `ParsedSymbol.visibility`.
+fn apply_ruby_visibility(root: Node<'_>, ctx: &mut ExtractContext<'_>) {
+    let mut visibility_by_start: std::collections::HashMap<u32, &'static str> =
+        std::collections::HashMap::new();
+    collect_ruby_visibility(root, ctx.source, &mut visibility_by_start);
+    if visibility_by_start.is_empty() {
+        return;
+    }
+    for symbol in &mut ctx.symbols {
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Method | SymbolKind::Function | SymbolKind::Test
+        ) {
+            continue;
+        }
+        if let Some(vis) = visibility_by_start.get(&symbol.span.start_byte) {
+            symbol.visibility = Some((*vis).to_string());
+        }
+    }
+}
+
+/// Recursively walk class/module/singleton_class bodies, tracking the running
+/// default visibility, and fill `out` with `method-def start_byte -> visibility`.
+fn collect_ruby_visibility(
+    node: Node<'_>,
+    source: &str,
+    out: &mut std::collections::HashMap<u32, &'static str>,
+) {
+    let kind = node.kind();
+    if matches!(kind, "class" | "module" | "singleton_class") {
+        // The body of a class/module is a `body_statement`; a `singleton_class`
+        // (`class << self`) likewise hosts a `body_statement`. Iterate its
+        // direct statements in document order.
+        let body = node
+            .child_by_field_name("body")
+            .or_else(|| ruby_first_child_of_kind(node, "body_statement"));
+        if let Some(body) = body {
+            let mut current = "public";
+            let mut cursor = body.walk();
+            for stmt in body.named_children(&mut cursor) {
+                ruby_apply_visibility_statement(stmt, source, &mut current, out);
+            }
+        }
+    }
+    // Descend so nested classes/modules get their own visibility scope.
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_ruby_visibility(child, source, out);
+    }
+}
+
+/// Handle one direct statement of a class/module body for visibility tracking.
+fn ruby_apply_visibility_statement(
+    stmt: Node<'_>,
+    source: &str,
+    current: &mut &'static str,
+    out: &mut std::collections::HashMap<u32, &'static str>,
+) {
+    match stmt.kind() {
+        // A direct instance-method definition takes the running default. The
+        // toggle does not govern `singleton_method` (`def self.foo`) — those are
+        // class methods whose visibility is set only by `private_class_method`/
+        // `public_class_method`, handled in the targeted-call arm.
+        "method" => {
+            out.insert(span_from_node(stmt).start_byte, *current);
+        }
+        // Bare `private` / `protected` / `public` (parsed as an identifier
+        // statement) toggles the default for subsequent definitions.
+        "identifier" => {
+            let text = node_text(stmt, source).unwrap_or_default();
+            if let Some(v) = ruby_visibility_keyword(text.trim()) {
+                *current = v;
+            }
+        }
+        "call" => {
+            // A `private`/`protected`/`public`/`module_function`/
+            // `*_class_method` call. With no args it is a toggle; with args it
+            // is the targeted form.
+            if stmt.child_by_field_name("receiver").is_some() {
+                return;
+            }
+            let Some(method_node) = stmt.child_by_field_name("method") else {
+                return;
+            };
+            let method_name = node_text(method_node, source).unwrap_or_default();
+            let method_name = method_name.trim();
+            let Some(vis) = ruby_visibility_call(method_name) else {
+                return;
+            };
+            match stmt.child_by_field_name("arguments") {
+                None => {
+                    // `private` toggle (only the symmetric instance-visibility
+                    // keywords flip the running default; `*_class_method` with
+                    // no args is a no-op toggle we ignore).
+                    if matches!(
+                        method_name,
+                        "private" | "protected" | "public" | "module_function"
+                    ) {
+                        *current = vis;
+                    }
+                }
+                Some(args) => {
+                    let mut cursor = args.walk();
+                    for arg in args.named_children(&mut cursor) {
+                        // `private def foo; end` — the arg is a method def.
+                        if matches!(arg.kind(), "method" | "singleton_method") {
+                            out.insert(span_from_node(arg).start_byte, vis);
+                            continue;
+                        }
+                        // `private :foo` — resolve the symbol name to the
+                        // sibling method definition and tag it.
+                        if let Some(name) = ruby_symbol_arg_value(arg, source)
+                            && let Some(parent) = stmt.parent()
+                        {
+                            ruby_tag_sibling_method(parent, source, &name, vis, out);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Map a bare visibility keyword to its canonical visibility string.
+fn ruby_visibility_keyword(text: &str) -> Option<&'static str> {
+    match text {
+        "private" => Some("private"),
+        "protected" => Some("protected"),
+        "public" => Some("public"),
+        // `module_function` (bare) makes subsequent defs private on instances.
+        "module_function" => Some("private"),
+        _ => None,
+    }
+}
+
+/// Map a visibility-setting call name to the visibility it applies.
+fn ruby_visibility_call(name: &str) -> Option<&'static str> {
+    match name {
+        "private" | "private_class_method" | "module_function" => Some("private"),
+        "protected" => Some("protected"),
+        "public" | "public_class_method" => Some("public"),
+        _ => None,
+    }
+}
+
+/// Find the direct-child method named `name` within `body_owner` (a class/
+/// module body or its `body_statement`) and record its visibility.
+fn ruby_tag_sibling_method(
+    body_owner: Node<'_>,
+    source: &str,
+    name: &str,
+    vis: &'static str,
+    out: &mut std::collections::HashMap<u32, &'static str>,
+) {
+    let mut cursor = body_owner.walk();
+    for child in body_owner.named_children(&mut cursor) {
+        if matches!(child.kind(), "method" | "singleton_method")
+            && ruby_symbol_name(child, source).as_deref() == Some(name)
+        {
+            out.insert(span_from_node(child).start_byte, vis);
+        }
+    }
+}
+
+/// First named child of `node` with the given kind.
+fn ruby_first_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find(|c| c.kind() == kind)
+}
+
 /// One Field per `(host class, ivar/cvar name)` (spec §3); same for
-/// duplicate include/extend/prepend mixin attributes. Calls and references
-/// are not deduped — every call site is its own data point.
+/// duplicate include/extend/prepend mixin attributes and one Static per
+/// global-variable name (`$config = ...` may be re-assigned many times).
+/// Calls and references are not deduped — every call site is its own data
+/// point.
 fn dedup_ruby_facts(ctx: &mut ExtractContext<'_>) {
     let mut seen_fields = std::collections::HashSet::new();
+    let mut seen_globals = std::collections::HashSet::new();
     ctx.symbols.retain(|symbol| {
+        if symbol.kind == SymbolKind::Static
+            && symbol.attributes.iter().any(|attr| attr == "ruby:global")
+        {
+            return seen_globals.insert(symbol.name.clone());
+        }
         if symbol.kind != SymbolKind::Field {
             return true;
         }

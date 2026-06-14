@@ -45,7 +45,20 @@ pub(crate) fn visit_js_ts_node(
         ctx.symbols.push(symbol);
     }
 
-    if let Some(symbol) = js_ts_symbol_from_node(node, ctx, parent_symbol.as_ref()) {
+    if let Some(mut symbol) = js_ts_symbol_from_node(node, ctx, parent_symbol.as_ref()) {
+        // `abstract class` / `abstract member` carry no dedicated named field in
+        // the grammar (the `abstract` keyword is an anonymous token), so the
+        // shared symbol builder cannot distinguish them. Tag them here, on the
+        // node kind, so `decl_search attribute=typescript:abstract` and
+        // this/super reasoning can tell abstract bases from concrete ones.
+        if matches!(
+            kind,
+            "abstract_class_declaration" | "abstract_method_signature"
+        ) {
+            symbol.attributes.push("typescript:abstract".to_string());
+            symbol.attributes.sort();
+            symbol.attributes.dedup();
+        }
         extract_js_ts_symbol_facts(node, &symbol, ctx);
         let next_parent = Some((symbol.id.clone(), symbol.kind));
         let next_owner = if symbol.body_span.is_some() {

@@ -51,6 +51,10 @@ use crate::languages::{
 
 pub const CRATE_NAME: &str = "squeezy-graph";
 const BODY_HIT_TRIGRAM_INDEX_MAX_HITS: usize = 100_000;
+/// Depth cap for the transitive subtype walk that backs
+/// [`SemanticGraph::member_implementations`]. Generous enough to cover any
+/// realistic inheritance chain while still bounding pathological/cyclic graphs.
+const MEMBER_IMPL_MAX_SUBTYPE_DEPTH: usize = 64;
 // v2: graph partitions and resolver-cache rows are now stored DEFLATE-compressed
 // (squeezy-store `encode_graph`/`decode_graph`) instead of plain JSON. Bumping
 // this invalidates any v1 plain-JSON cache via the metadata gate so it is wiped
@@ -803,6 +807,46 @@ impl SemanticGraph {
         &self.kotlin_project_facts
     }
 
+    /// Collect the Java / .NET / Kotlin project facts that apply to `file_id`
+    /// as `(label, detail)` string pairs for agent display.
+    ///
+    /// A fact applies to the file when the build manifest that produced it
+    /// (`source_file`, e.g. `pom.xml` / `*.csproj` / `build.gradle.kts`) lives
+    /// in a directory that is an ancestor of — or the same directory as — the
+    /// file. That is the standard "nearest project root" containment: a
+    /// `module-a/pom.xml` fact applies to `module-a/src/Foo.java` but not to a
+    /// sibling `module-b/...`. The label is `"{provider}:{kind}"` (e.g.
+    /// `maven:dependency`) and the detail is the fact's value. Returns an empty
+    /// `Vec` when no project fact covers the file.
+    pub fn language_facts_for_file(&self, file_id: &FileId) -> Vec<(String, String)> {
+        let mut facts = Vec::new();
+        for fact in &self.java_project_facts {
+            if file_in_project_of(&fact.source_file, file_id) {
+                facts.push((
+                    format!("{}:{}", fact.provider, fact.kind),
+                    fact.value.clone(),
+                ));
+            }
+        }
+        for fact in &self.dotnet_project_facts {
+            if file_in_project_of(&fact.source_file, file_id) {
+                facts.push((
+                    format!("{}:{}", fact.provider, fact.kind),
+                    fact.value.clone(),
+                ));
+            }
+        }
+        for fact in &self.kotlin_project_facts {
+            if file_in_project_of(&fact.source_file, file_id) {
+                facts.push((
+                    format!("{}:{}", fact.provider, fact.kind),
+                    fact.value.clone(),
+                ));
+            }
+        }
+        facts
+    }
+
     pub fn cargo_facts(&self) -> Option<&CargoCompilerFacts> {
         self.cargo_facts.as_ref()
     }
@@ -1217,6 +1261,56 @@ impl SemanticGraph {
         symbols
     }
 
+    /// Return the narrowest declaration in `file_id` whose line span
+    /// `[span.start.line, span.end.line]` (inclusive) contains `line`.
+    ///
+    /// "Narrowest" is measured by line height first, then by byte width as a
+    /// tie-break, so a method nested inside a class is preferred over the
+    /// enclosing class when both contain the probed line. The whole-file
+    /// pseudo-symbol ([`SymbolKind::File`]) is never returned — callers asking
+    /// "which declaration is at this line?" want a real declaration, and the
+    /// file symbol would otherwise win whenever a line falls between two
+    /// top-level decls. Returns a clone, or `None` when no declaration spans
+    /// the line.
+    pub fn symbol_at_line(&self, file_id: &FileId, line: u32) -> Option<GraphSymbol> {
+        self.symbols
+            .values()
+            .filter(|symbol| {
+                symbol.kind != SymbolKind::File
+                    && &symbol.file_id == file_id
+                    && symbol.span.start.line <= line
+                    && line <= symbol.span.end.line
+            })
+            .min_by(|left, right| {
+                span_line_height(&left.span)
+                    .cmp(&span_line_height(&right.span))
+                    .then_with(|| span_byte_width(&left.span).cmp(&span_byte_width(&right.span)))
+            })
+            .cloned()
+    }
+
+    /// Return the narrowest declaration in `file_id` whose byte span contains
+    /// `byte`. The byte-precise counterpart of [`Self::symbol_at_line`]:
+    /// "narrowest" is measured by byte width (line height is the tie-break),
+    /// and the whole-file pseudo-symbol is never returned. Returns a clone, or
+    /// `None` when no declaration spans the byte.
+    pub fn symbol_at_byte(&self, file_id: &FileId, byte: u32) -> Option<GraphSymbol> {
+        self.symbols
+            .values()
+            .filter(|symbol| {
+                symbol.kind != SymbolKind::File
+                    && &symbol.file_id == file_id
+                    && symbol.span.start_byte <= byte
+                    && byte <= symbol.span.end_byte
+            })
+            .min_by(|left, right| {
+                span_byte_width(&left.span)
+                    .cmp(&span_byte_width(&right.span))
+                    .then_with(|| span_line_height(&left.span).cmp(&span_line_height(&right.span)))
+            })
+            .cloned()
+    }
+
     /// Iterate the graph edges whose source is `from`, in index order, using
     /// the `edges_by_from` index instead of scanning the full edge vector.
     /// Callers that only need a subset (a particular [`EdgeKind`], say) can
@@ -1225,6 +1319,31 @@ impl SemanticGraph {
     pub fn outgoing_edges(&self, from: &SymbolId) -> impl Iterator<Item = &GraphEdge> + '_ {
         self.edges_by_from
             .get(from)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.edges.get(*index))
+    }
+
+    /// Public read over the reverse-import index: the files that directly
+    /// import `file_id` (one hop, no transitive propagation). Returns an empty
+    /// `Vec` when nothing imports the file. This is the single-file dual of the
+    /// impact computation in [`Self::compute_impact`]; callers that want the
+    /// transitive downstream set should feed the result back through that.
+    pub fn direct_importers(&self, file_id: &FileId) -> Vec<FileId> {
+        self.importers_by_file
+            .get(file_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Iterate the graph edges whose target is `to`, in index order, using the
+    /// `edges_by_to` index instead of scanning the full edge vector. The
+    /// inbound dual of [`Self::outgoing_edges`]: callers that only want a
+    /// particular [`EdgeKind`] (callers, subtypes, references) can filter the
+    /// returned iterator without materialising an intermediate `Vec`.
+    pub fn inbound_edges(&self, to: &SymbolId) -> impl Iterator<Item = &GraphEdge> + '_ {
+        self.edges_by_to
+            .get(to)
             .into_iter()
             .flatten()
             .filter_map(|index| self.edges.get(*index))
@@ -1348,6 +1467,110 @@ impl SemanticGraph {
             })
             .cloned()
             .collect()
+    }
+
+    /// Breadth-first transitive closure of [`Self::inheritance_direct_subtypes`]:
+    /// every type that inherits from `target` directly or indirectly, up to
+    /// `max_depth` hops (depth 1 = direct subtypes). `target` itself is never
+    /// included, and a `visited` set keyed by `SymbolId` keeps cyclic or
+    /// diamond hierarchies from re-emitting a type or looping forever. Results
+    /// are returned in BFS order (nearest subtypes first); `max_depth == 0`
+    /// yields an empty `Vec`.
+    pub fn inheritance_subtypes_transitive(
+        &self,
+        target: &SymbolId,
+        max_depth: usize,
+    ) -> Vec<GraphSymbol> {
+        let mut out = Vec::new();
+        if max_depth == 0 {
+            return out;
+        }
+        // `visited` tracks every id ever enqueued (including `target`) so a
+        // type reachable by two inheritance paths is emitted once and a cycle
+        // back to an ancestor is dropped.
+        let mut visited = HashSet::from([target.clone()]);
+        let mut frontier = vec![target.clone()];
+        for _ in 0..max_depth {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for current in &frontier {
+                for subtype in self.inheritance_direct_subtypes(current) {
+                    if visited.insert(subtype.id.clone()) {
+                        next.push(subtype.id.clone());
+                        out.push(subtype);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        out
+    }
+
+    /// Find the implementations / overrides of a type member across the type's
+    /// transitive subtypes.
+    ///
+    /// `member` is the `SymbolId` of a method/property declared on some type
+    /// (its owning type is read from the member's `parent_id`). For every
+    /// transitive subtype of that owning type, this collects the subtype's
+    /// direct child members that share the member's name. When *both* the base
+    /// member and a candidate carry an arity, the arities must match (an
+    /// overload with a different parameter count is not an override); when
+    /// either side lacks arity information the name match alone qualifies, since
+    /// not every parser records arity.
+    ///
+    /// Members that explicitly carry an override/abstract attribute (e.g.
+    /// `kotlin:override`, `csharp:abstract`) are ranked first so the strongest
+    /// signals lead, but same-name members on subtypes are still returned even
+    /// when the language never tags overrides (Java without `@Override`, Python,
+    /// JS/TS) — the attribute is a sort hint, not a hard filter. The base
+    /// `member` itself is never included. Results are de-duplicated by
+    /// `SymbolId`.
+    pub fn member_implementations(&self, member: &SymbolId) -> Vec<GraphSymbol> {
+        let Some(base) = self.symbols.get(member) else {
+            return Vec::new();
+        };
+        let Some(owner) = base.parent_id.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut seen = HashSet::from([member.clone()]);
+        let mut tagged = Vec::new();
+        let mut untagged = Vec::new();
+        for subtype in self.inheritance_subtypes_transitive(owner, MEMBER_IMPL_MAX_SUBTYPE_DEPTH) {
+            for child_id in self
+                .children_by_parent
+                .get(&subtype.id)
+                .into_iter()
+                .flatten()
+            {
+                let Some(child) = self.symbols.get(child_id) else {
+                    continue;
+                };
+                if child.name != base.name {
+                    continue;
+                }
+                // Reject a different-arity overload only when both sides know
+                // their arity; a `None` on either side means the parser could
+                // not count parameters, so we fall back to the name match.
+                if let (Some(base_arity), Some(child_arity)) = (base.arity, child.arity)
+                    && base_arity != child_arity
+                {
+                    continue;
+                }
+                if !seen.insert(child.id.clone()) {
+                    continue;
+                }
+                if is_override_or_abstract(child) {
+                    tagged.push(child.clone());
+                } else {
+                    untagged.push(child.clone());
+                }
+            }
+        }
+        tagged.extend(untagged);
+        tagged
     }
 
     /// Compute the impact set for a set of changed file IDs. Returns all files
@@ -3935,6 +4158,54 @@ fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> Lan
 
 fn line_ranges_intersect(start: u32, end: u32, dirty: DirtyRange) -> bool {
     start <= dirty.end_line && dirty.start_line <= end
+}
+
+/// Inclusive line height of a span (`end.line - start.line`), used to rank
+/// enclosing declarations from narrowest to widest. `saturating_sub` keeps a
+/// malformed span where `end < start` from underflowing.
+fn span_line_height(span: &SourceSpan) -> u32 {
+    span.end.line.saturating_sub(span.start.line)
+}
+
+/// Byte width of a span (`end_byte - start_byte`), the byte-precise tie-break
+/// for ranking enclosing declarations. `saturating_sub` guards against a
+/// malformed span where `end_byte < start_byte`.
+fn span_byte_width(span: &SourceSpan) -> u32 {
+    span.end_byte.saturating_sub(span.start_byte)
+}
+
+/// True when `file` lives in (or below) the project directory rooted at the
+/// build manifest `manifest`. Both ids are slash-normalized relative paths, so
+/// the manifest's directory is its path with the final `/<basename>` stripped;
+/// the file belongs to the project when that directory is `""` (repo-root
+/// manifest, applies to everything) or a `dir/`-bounded prefix of the file's
+/// path. The `dir/` boundary stops `module-a` from matching `module-ab/...`.
+fn file_in_project_of(manifest: &FileId, file: &FileId) -> bool {
+    let manifest_dir = match manifest.0.rsplit_once('/') {
+        Some((dir, _)) => dir,
+        None => "",
+    };
+    if manifest_dir.is_empty() {
+        return true;
+    }
+    let file_path = file.0.as_str();
+    file_path
+        .strip_prefix(manifest_dir)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// True when a symbol carries an override-style or abstract modifier. The
+/// parsers tag these as language-namespaced attributes (`kotlin:override`,
+/// `scala:abstract`, `csharp:abstract`, `java:override`, …), so this matches on
+/// the `:override` / `:abstract` suffix rather than enumerating every language.
+/// The bare forms are accepted too in case an attribute is emitted unprefixed.
+fn is_override_or_abstract(symbol: &GraphSymbol) -> bool {
+    symbol.attributes.iter().any(|attribute| {
+        attribute.ends_with(":override")
+            || attribute.ends_with(":abstract")
+            || attribute == "override"
+            || attribute == "abstract"
+    })
 }
 
 fn spans_intersect(left: SourceSpan, right: SourceSpan) -> bool {

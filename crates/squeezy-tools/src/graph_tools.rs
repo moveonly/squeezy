@@ -41,13 +41,31 @@ pub(crate) struct SymbolContextArgs {
     path: Option<String>,
     diff_only: Option<bool>,
     mode: Option<DiffMode>,
+    /// Restrict resolved symbols to a single language. See `language_matches`.
+    language: Option<String>,
+    /// Filter result packets to symbols in test code only / excluding tests.
+    exclude_tests: Option<bool>,
+    tests_only: Option<bool>,
+    /// Pipe-separated confidence allow-set (e.g. `exact_syntax|import_resolved`).
+    /// See [`ConfidenceScope`].
+    confidence: Option<String>,
+    /// Drop out-of-workspace (`External`) targets.
+    exclude_external: Option<bool>,
+    /// Keep ONLY out-of-workspace (`External`) targets (wins over
+    /// `exclude_external`).
+    external_only: Option<bool>,
     max_references: Option<usize>,
     max_results: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepoMapArgs {
+    /// Restrict the map to roots whose declaring file is under this path scope.
+    path: Option<String>,
+    /// Restrict the map to roots in a single language.
+    language: Option<String>,
     max_depth: Option<usize>,
     max_files: Option<usize>,
 }
@@ -62,6 +80,27 @@ struct DeclSearchArgs {
     visibility: Option<String>,
     attribute: Option<String>,
     transitive: Option<bool>,
+    /// Dead-code mode: when `true`, retain only scanned declarations that have
+    /// zero inbound `Calls`/`References`/`TestOf` edges (no resolved use). The
+    /// usual query/kind/path/language/visibility/attribute filters still scope
+    /// the candidate set first. Public/exported candidates are flagged rather
+    /// than dropped, and candidates whose only edges resolve at a low
+    /// confidence are caveated, never silently reported as dead.
+    unused: Option<bool>,
+    /// In `unused` mode, the inbound-edge count above which a declaration is
+    /// considered "used" and excluded. Defaults to 0 (strictly zero inbound
+    /// edges). Lets a caller surface near-dead declarations (e.g. used once).
+    max_callers: Option<usize>,
+    /// Drop test-code declarations from the result (see `path_is_test`).
+    exclude_tests: Option<bool>,
+    /// Keep ONLY test-code declarations. Wins over `exclude_tests` when both set.
+    tests_only: Option<bool>,
+    /// Pipe-separated confidence allow-set (see [`ConfidenceScope`]).
+    confidence: Option<String>,
+    /// Drop out-of-workspace (`External`) declarations.
+    exclude_external: Option<bool>,
+    /// Keep ONLY out-of-workspace (`External`) declarations.
+    external_only: Option<bool>,
     max_results: Option<usize>,
     offset: Option<usize>,
 }
@@ -74,7 +113,16 @@ struct DefinitionSearchArgs {
     kind: Option<String>,
     path: Option<String>,
     language: Option<String>,
+    /// Pipe-separated confidence allow-set (see [`ConfidenceScope`]).
+    confidence: Option<String>,
+    /// Drop out-of-workspace (`External`) candidates.
+    exclude_external: Option<bool>,
+    /// Keep ONLY out-of-workspace (`External`) candidates.
+    external_only: Option<bool>,
     max_results: Option<usize>,
+    /// Skip the first N candidates after sorting, before `max_results`. Lets a
+    /// caller page through a large candidate set.
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +132,21 @@ struct ReferenceSearchArgs {
     text: Option<String>,
     symbol_id: Option<String>,
     path: Option<String>,
+    /// Restrict reference hits to a single language (matched against the
+    /// declaring file of each hit). See `language_matches`.
+    language: Option<String>,
+    /// Restrict to a reference kind (e.g. `call`, `import`); see
+    /// `reference_kind_matches`.
+    reference_kind: Option<String>,
+    exclude_tests: Option<bool>,
+    tests_only: Option<bool>,
+    /// Pipe-separated confidence allow-set over the reference hits (see
+    /// [`ConfidenceScope`]).
+    confidence: Option<String>,
+    /// Drop out-of-workspace (`External`) reference hits.
+    exclude_external: Option<bool>,
+    /// Keep ONLY out-of-workspace (`External`) reference hits.
+    external_only: Option<bool>,
     max_results: Option<usize>,
     offset: Option<usize>,
 }
@@ -95,10 +158,27 @@ struct FlowArgs {
     query: Option<String>,
     kind: Option<String>,
     path: Option<String>,
+    /// Restrict the resolved root (when resolved by query) to a single language.
+    language: Option<String>,
+    /// Restrict result packets to a single edge kind
+    /// (`Calls`|`References`|`Imports`|`Reexports`); see `edge_kind_matches`.
+    edge_kind: Option<String>,
+    /// Filter the RESULT packets (not just the root) to this path scope.
+    result_path: Option<String>,
+    exclude_tests: Option<bool>,
+    tests_only: Option<bool>,
+    /// Pipe-separated confidence allow-set over the result packets (see
+    /// [`ConfidenceScope`]).
+    confidence: Option<String>,
+    /// Drop out-of-workspace (`External`) result packets.
+    exclude_external: Option<bool>,
+    /// Keep ONLY out-of-workspace (`External`) result packets.
+    external_only: Option<bool>,
     target_symbol_id: Option<String>,
     target_query: Option<String>,
     max_depth: Option<usize>,
     max_results: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,8 +188,15 @@ struct HierarchyArgs {
     query: Option<String>,
     kind: Option<String>,
     path: Option<String>,
+    /// Restrict the resolved root (when resolved by query) to a single language.
+    language: Option<String>,
+    /// Filter the RESULT nodes (not just the root) to this path scope.
+    result_path: Option<String>,
+    exclude_tests: Option<bool>,
+    tests_only: Option<bool>,
     max_depth: Option<usize>,
     max_results: Option<usize>,
+    offset: Option<usize>,
 }
 
 /// Arguments for the `impact` graph tool. Accepts a symbol, a file path, or
@@ -126,8 +213,44 @@ struct ImpactArgs {
     /// Additional file paths that are also part of the changed set.
     #[serde(default)]
     extra_paths: Vec<String>,
+    /// When `true`, return ONLY the files that directly import each changed
+    /// file (one BFS hop, no transitive fan-out). Skips the
+    /// `affected_symbols`/`affected_tests` computation entirely. Defaults to
+    /// `false` (the full transitive impact).
+    direct_only: Option<bool>,
+    /// Restrict the affected-symbol packets to a single language.
+    language: Option<String>,
+    /// Drop / keep-only test-code symbols among the affected set.
+    exclude_tests: Option<bool>,
+    tests_only: Option<bool>,
+    /// Pipe-separated confidence allow-set over the affected symbols (see
+    /// [`ConfidenceScope`]).
+    confidence: Option<String>,
+    /// Drop out-of-workspace (`External`) affected symbols.
+    exclude_external: Option<bool>,
+    /// Keep ONLY out-of-workspace (`External`) affected symbols.
+    external_only: Option<bool>,
     /// Maximum number of affected symbols to return (default 50).
     max_results: Option<usize>,
+    /// Skip the first N affected symbols after sorting, before `max_results`.
+    offset: Option<usize>,
+}
+
+/// Arguments for the `symbol_at` graph tool: resolve a source position
+/// (line, or byte offset) inside a file to the smallest enclosing symbol.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SymbolAtArgs {
+    /// File path to resolve the position inside.
+    path: String,
+    /// 1-based line number. Used when `byte` is absent.
+    line: Option<u32>,
+    /// Column (currently advisory; the line span already pins the symbol).
+    /// Accepted so editor cursors can pass a full position without an error.
+    #[allow(dead_code)]
+    column: Option<u32>,
+    /// Byte offset into the file. When set, takes precedence over `line`.
+    byte: Option<u32>,
 }
 
 /// Arguments for the `inheritance_hierarchy` graph tool.
@@ -140,13 +263,39 @@ struct InheritanceHierarchyArgs {
     query: Option<String>,
     /// When `false` (default), return all transitive supertypes of the root
     /// via a BFS over `UsesTrait`/`Extends`/`Implements` edges (ancestors).
-    /// When `true`, return only the **first-generation** direct subtypes
-    /// (symbols that carry an edge pointing *to* the root). A transitive
-    /// subtype walk is not available in a single tool call; issue multiple
-    /// calls using the returned symbols as new roots.
+    /// When `true`, return the direct subtypes of the root (symbols that carry
+    /// an edge pointing *to* the root). Combine with `transitive=true` to return
+    /// the full subtype closure instead of just the first generation.
     subtypes: Option<bool>,
+    /// When `true` (with `subtypes=true`), return the transitive subtype closure
+    /// via a bounded BFS over the inheritance edges instead of only the direct
+    /// subtypes. Ignored when `subtypes` is unset (ancestors are already a
+    /// transitive walk) or when in member mode. See `max_depth`.
+    transitive: Option<bool>,
+    /// When `true` and the resolved root is a member (Method/Field), return the
+    /// overrides/implementations of that member across transitive subtypes
+    /// instead of the type-to-type ancestor/subtype walk. Ignored (falls back to
+    /// the type walk) when the root is not a member.
+    member: Option<bool>,
+    /// Restrict the resolved root (when resolved by query) and the related
+    /// symbols to a single language. See `language_matches`.
+    language: Option<String>,
+    /// Transitive subtype walk depth when `subtypes=true` and `transitive=true`.
+    /// Clamped to the graph's traversal bounds; defaults to the standard
+    /// depth-bounded-walk default. Ignored unless the transitive subtype closure
+    /// is requested.
+    max_depth: Option<usize>,
+    /// Pipe-separated confidence allow-set over the related symbols (see
+    /// [`ConfidenceScope`]).
+    confidence: Option<String>,
+    /// Drop out-of-workspace (`External`) related symbols.
+    exclude_external: Option<bool>,
+    /// Keep ONLY out-of-workspace (`External`) related symbols.
+    external_only: Option<bool>,
     /// Maximum results (default 50).
     max_results: Option<usize>,
+    /// Skip the first N related symbols after sorting, before `max_results`.
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1021,8 +1170,30 @@ fn cargo_diagnostic_hit_json(hit: &CargoDiagnosticHit) -> Value {
 }
 
 fn graph_language_counts_json(graph: &squeezy_graph::SemanticGraph) -> Value {
+    graph_language_counts_scoped_json(graph, None, None)
+}
+
+/// Per-language file counts, optionally restricted to a `path` subtree and/or a
+/// single `language`. Used by `repo_map` so its coverage map reflects the same
+/// scope as its hierarchy when the caller narrows by path/language. Empty
+/// filters fall through to the whole-graph count.
+fn graph_language_counts_scoped_json(
+    graph: &squeezy_graph::SemanticGraph,
+    path: Option<&str>,
+    language: Option<&str>,
+) -> Value {
+    let path = path.map(str::trim).filter(|value| !value.is_empty());
+    let language = language.map(str::trim).filter(|value| !value.is_empty());
     let mut counts = BTreeMap::<&'static str, usize>::new();
     for file in graph.files.values() {
+        if let Some(path) = path
+            && !path_matches_filter(file.relative_path.as_str(), path)
+        {
+            continue;
+        }
+        if !file_language_matches(graph, &file.id, language) {
+            continue;
+        }
         *counts.entry(file.language.display_name()).or_default() += 1;
     }
     json!(counts)
@@ -1065,10 +1236,58 @@ fn parse_symbol_kind_filter(value: &str) -> Option<SymbolKindFilter> {
     parse_symbol_kind(value).map(SymbolKindFilter::Single)
 }
 
+/// Split a possibly pipe-separated `kind` argument into its individual,
+/// trimmed, non-empty tokens (e.g. `"struct|enum|trait"` → three tokens).
+/// Returns `None` when no kind was supplied or every token is blank, so callers
+/// fall back to their existing single-kind / no-kind path. A single-valued kind
+/// yields a one-element vec, preserving the original behavior.
+fn split_kind_tokens(kind: Option<&str>) -> Option<Vec<&str>> {
+    let kind = kind?;
+    let tokens: Vec<&str> = kind
+        .split('|')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens)
+    }
+}
+
 fn single_symbol_kind(filter: Option<SymbolKindFilter>) -> Option<SymbolKind> {
     match filter {
         Some(SymbolKindFilter::Single(kind)) => Some(kind),
         _ => None,
+    }
+}
+
+/// Run a single-kind symbol search once per pipe-separated `kind` token and
+/// union the results, deduplicating by symbol id while preserving first-seen
+/// order. A `None`/single-token kind runs `search` exactly once (with the
+/// original argument), so the no-kind and single-kind paths are unchanged. This
+/// is how the multi-valued `kind` ("struct|enum|trait") matcher reuses the
+/// existing single-kind search instead of teaching the matcher about lists.
+fn multi_kind_symbol_union(
+    kind: Option<&str>,
+    mut search: impl FnMut(Option<&str>) -> Vec<GraphSymbol>,
+) -> Vec<GraphSymbol> {
+    match split_kind_tokens(kind) {
+        Some(tokens) if tokens.len() > 1 => {
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for token in tokens {
+                for symbol in search(Some(token)) {
+                    if seen.insert(symbol.id.clone()) {
+                        out.push(symbol);
+                    }
+                }
+            }
+            out
+        }
+        // No kind, a single token, or an all-blank kind: one pass with the
+        // original argument so trigram seeding and ranking are untouched.
+        _ => search(kind),
     }
 }
 
@@ -1543,6 +1762,313 @@ fn decl_counts_by_kind(symbols: &[GraphSymbol]) -> Value {
     json!(counts)
 }
 
+/// True when a path looks like test code. Recognises the common per-language
+/// conventions: a `test`/`tests`/`__tests__`/`spec`/`testing` directory
+/// segment, or a file name ending in a test/spec suffix
+/// (`_test`/`_tests`/`.test`/`.spec`/`Test`/`Tests`/`Spec`). Used by the
+/// `exclude_tests`/`tests_only` scoping shared across the read tools.
+fn path_is_test(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let dir_marker = lower.split('/').any(|segment| {
+        matches!(
+            segment,
+            "test" | "tests" | "__tests__" | "spec" | "specs" | "testing"
+        )
+    });
+    if dir_marker {
+        return true;
+    }
+    let file = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    // Strip a trailing extension so `foo_test.rs` / `foo.test.ts` both match.
+    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
+    stem.ends_with("_test")
+        || stem.ends_with("_tests")
+        || stem.ends_with(".test")
+        || stem.ends_with(".spec")
+        || stem.ends_with("test")
+        || stem.ends_with("tests")
+        || stem.ends_with("spec")
+}
+
+/// True when a symbol is part of test code: either its kind is `Test` or its
+/// declaring file path looks like test code (see [`path_is_test`]).
+fn symbol_is_test(symbol: &GraphSymbol) -> bool {
+    symbol.kind == SymbolKind::Test || path_is_test(symbol.file_id.0.as_str())
+}
+
+/// Apply an `exclude_tests`/`tests_only` pair to a test-ness verdict. When both
+/// are set, `tests_only` wins (the more specific request). Returns whether the
+/// item should be KEPT.
+fn passes_test_scope(is_test: bool, exclude_tests: bool, tests_only: bool) -> bool {
+    if tests_only {
+        is_test
+    } else if exclude_tests {
+        !is_test
+    } else {
+        true
+    }
+}
+
+/// Parse an `edge_kind` filter token to an [`EdgeKind`]. Accepts the
+/// case-insensitive names the flow/symbol_context tools advertise:
+/// `calls`/`references`/`imports`/`reexports`. Returns `None` for anything
+/// else so an unknown token is treated as "no filter" by the caller.
+fn parse_edge_kind_filter(value: &str) -> Option<EdgeKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "calls" | "call" => Some(EdgeKind::Calls),
+        "references" | "reference" | "ref" => Some(EdgeKind::References),
+        "imports" | "import" => Some(EdgeKind::Imports),
+        "reexports" | "reexport" | "re-export" => Some(EdgeKind::Reexports),
+        _ => None,
+    }
+}
+
+/// True when a result packet's `edge.kind` matches the requested edge kind.
+/// Packets that carry no `edge` body (pure symbol/reference packets) are kept
+/// only when no edge-kind filter is active — an edge-kind filter is meaningful
+/// only for edge-bearing packets, so a `reference`/`symbol` packet is dropped
+/// when the caller asked for a specific edge kind.
+fn packet_matches_edge_kind(packet: &Value, want: Option<EdgeKind>) -> bool {
+    let Some(want) = want else {
+        return true;
+    };
+    let want_label = format!("{want:?}");
+    packet
+        .get("edge")
+        .and_then(|edge| edge.get("kind"))
+        .and_then(Value::as_str)
+        .map(|kind| kind == want_label)
+        .unwrap_or(false)
+}
+
+/// Best-effort extraction of the workspace-relative path a result packet points
+/// at, for the `result_path` filter on the flow/hierarchy/symbol_context tools.
+/// Looks at the packet bodies these tools emit: `symbol.path`, `reference.path`,
+/// the first `spans[].path`, and (for edge packets) the `edge.from` symbol's
+/// file via the `spans` entry. Returns `None` when no path can be determined.
+fn packet_path(packet: &Value) -> Option<&str> {
+    if let Some(path) = packet
+        .get("symbol")
+        .and_then(|symbol| symbol.get("path"))
+        .and_then(Value::as_str)
+    {
+        return Some(path);
+    }
+    if let Some(path) = packet
+        .get("reference")
+        .and_then(|reference| reference.get("path"))
+        .and_then(Value::as_str)
+    {
+        return Some(path);
+    }
+    if let Some(path) = packet
+        .get("caller")
+        .and_then(|caller| caller.get("path"))
+        .and_then(Value::as_str)
+    {
+        return Some(path);
+    }
+    packet
+        .get("spans")
+        .and_then(Value::as_array)
+        .and_then(|spans| spans.first())
+        .and_then(|span| span.get("path"))
+        .and_then(Value::as_str)
+}
+
+/// True when a result packet passes the optional `result_path` scope. Packets
+/// whose path can't be determined are KEPT (the filter is a positive scope, not
+/// a hard gate that would silently drop edges the extractor couldn't anchor).
+fn packet_matches_result_path(packet: &Value, filter: Option<&str>) -> bool {
+    let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    match packet_path(packet) {
+        Some(path) => path_matches_filter(path, filter),
+        None => true,
+    }
+}
+
+/// Pick the effective path scope for RESULT packets on the flow/hierarchy tools.
+/// An explicit `result_path` wins (it lets a caller decouple the root scope from
+/// the result scope); otherwise the plain `path` argument scopes the results too,
+/// satisfying the "path scopes RESULT packets" contract. Empty/whitespace tokens
+/// are treated as absent so a blank string never collapses the result set.
+fn result_path_scope<'a>(path: Option<&'a str>, result_path: Option<&'a str>) -> Option<&'a str> {
+    result_path
+        .or(path)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// True when a result packet passes the `exclude_tests`/`tests_only` scope,
+/// keyed on the packet's path (see [`packet_path`]/[`path_is_test`]). Packets
+/// with no determinable path are KEPT under `exclude_tests` and DROPPED under
+/// `tests_only` (a path-less packet can't be confirmed as a test).
+fn packet_matches_test_scope(packet: &Value, exclude_tests: bool, tests_only: bool) -> bool {
+    if !exclude_tests && !tests_only {
+        return true;
+    }
+    match packet_path(packet) {
+        Some(path) => passes_test_scope(path_is_test(path), exclude_tests, tests_only),
+        None => !tests_only,
+    }
+}
+
+/// Edge kinds that count as a "use" of a declaration for dead-code analysis:
+/// a resolved call site, a textual/identifier reference, or a test exercising
+/// it. Inbound `Contains`/`Imports`/inheritance edges are structural, not uses,
+/// so they are excluded.
+fn is_usage_edge(kind: EdgeKind) -> bool {
+    matches!(
+        kind,
+        EdgeKind::Calls | EdgeKind::References | EdgeKind::TestOf
+    )
+}
+
+/// Count inbound usage edges (`Calls`/`References`/`TestOf`) pointing at this
+/// symbol via the graph's `edges_by_to` index.
+fn inbound_usage_count(graph: &squeezy_graph::SemanticGraph, symbol: &GraphSymbol) -> usize {
+    graph
+        .inbound_edges(&symbol.id)
+        .filter(|edge| is_usage_edge(edge.kind))
+        .count()
+}
+
+/// True when the symbol's visibility marks it as part of a public/exported
+/// surface. Such a declaration may have callers outside the scanned graph
+/// (downstream crates, reflection, FFI), so dead-code mode FLAGS it rather than
+/// asserting it is dead. Treats anything that is not explicitly
+/// `private`/`protected`/`internal`/`fileprivate` as exported, matching the
+/// graph's own permissive export heuristic.
+fn visibility_is_exported(symbol: &GraphSymbol) -> bool {
+    match symbol.visibility.as_deref() {
+        None => false,
+        Some(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "private" | "protected" | "internal" | "fileprivate" | "module" | "package"
+        ),
+    }
+}
+
+/// Confidence levels at which "zero inbound usage edges" is NOT trustworthy
+/// evidence of dead code: a macro-opaque/conditional/external/candidate-set
+/// declaration may well be used through an edge the resolver could not pin
+/// down. Such candidates are caveated, never reported as confidently dead.
+fn confidence_is_unresolved(confidence: Confidence) -> bool {
+    matches!(
+        confidence,
+        Confidence::MacroOpaque
+            | Confidence::ConditionalUnknown
+            | Confidence::External
+            | Confidence::CandidateSet
+    )
+}
+
+/// Parse a confidence-level filter token to a [`Confidence`]. Accepts the
+/// stable snake_case ids ([`Confidence::id`]) case-insensitively, plus a couple
+/// of obvious aliases. Returns `None` for an unknown token so the caller treats
+/// it as "no constraint" rather than silently dropping everything.
+fn parse_confidence_level(value: &str) -> Option<Confidence> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "exact_syntax" | "exact" => Some(Confidence::ExactSyntax),
+        "import_resolved" | "resolved" => Some(Confidence::ImportResolved),
+        "heuristic" => Some(Confidence::Heuristic),
+        "candidate_set" | "candidate" => Some(Confidence::CandidateSet),
+        "external" => Some(Confidence::External),
+        "macro_opaque" | "macro" => Some(Confidence::MacroOpaque),
+        "conditional_unknown" | "conditional" => Some(Confidence::ConditionalUnknown),
+        "unsupported" => Some(Confidence::Unsupported),
+        "stale" => Some(Confidence::Stale),
+        "partial" => Some(Confidence::Partial),
+        _ => None,
+    }
+}
+
+/// Confidence-scoping options shared by the read tools (O10). `levels` is an
+/// optional allow-set parsed from a pipe-separated `confidence` argument;
+/// `exclude_external` drops out-of-workspace (`External`) targets; `external_only`
+/// keeps only them (and wins over `exclude_external` when both are set).
+#[derive(Debug)]
+struct ConfidenceScope {
+    levels: Option<Vec<Confidence>>,
+    exclude_external: bool,
+    external_only: bool,
+}
+
+impl ConfidenceScope {
+    /// Build from the raw args. An all-unknown / blank `confidence` string yields
+    /// no level constraint so a typo never empties the result silently.
+    fn new(confidence: Option<&str>, exclude_external: bool, external_only: bool) -> Self {
+        let levels = confidence.and_then(|raw| {
+            let parsed: Vec<Confidence> = raw
+                .split('|')
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .filter_map(parse_confidence_level)
+                .collect();
+            (!parsed.is_empty()).then_some(parsed)
+        });
+        Self {
+            levels,
+            exclude_external,
+            external_only,
+        }
+    }
+
+    /// True when no constraint is active, so callers can skip the filter pass.
+    fn is_noop(&self) -> bool {
+        self.levels.is_none() && !self.exclude_external && !self.external_only
+    }
+
+    /// Whether a target with this confidence is kept under the scope.
+    fn keeps(&self, confidence: Confidence) -> bool {
+        if self.external_only {
+            return confidence == Confidence::External;
+        }
+        if self.exclude_external && confidence == Confidence::External {
+            return false;
+        }
+        match &self.levels {
+            Some(levels) => levels.contains(&confidence),
+            None => true,
+        }
+    }
+
+    /// Packet-level variant for JSON packets (flows): reads the `confidence` id
+    /// from the packet's `symbol`/`reference`/`edge` body. A packet with no
+    /// determinable confidence is KEPT (the scope is a positive filter, not a
+    /// hard gate that would drop un-anchored packets).
+    fn keeps_packet(&self, packet: &Value) -> bool {
+        if self.is_noop() {
+            return true;
+        }
+        match packet_confidence_id(packet) {
+            Some(id) => match parse_confidence_level(id) {
+                Some(confidence) => self.keeps(confidence),
+                None => true,
+            },
+            None => true,
+        }
+    }
+}
+
+/// Best-effort extraction of a packet's confidence id from the bodies the graph
+/// tools emit (`symbol`/`reference`/`edge`). Returns `None` when no confidence
+/// can be located.
+fn packet_confidence_id(packet: &Value) -> Option<&str> {
+    for body in ["symbol", "reference", "edge"] {
+        if let Some(id) = packet
+            .get(body)
+            .and_then(|value| value.get("confidence"))
+            .and_then(Value::as_str)
+        {
+            return Some(id);
+        }
+    }
+    packet.get("confidence").and_then(Value::as_str)
+}
+
 pub(crate) fn resolve_definition_candidates(
     graph: &squeezy_graph::SemanticGraph,
     symbol_id: Option<&str>,
@@ -1651,13 +2177,25 @@ fn language_matches(
     symbol: &GraphSymbol,
     language: Option<&str>,
 ) -> bool {
-    let Some(language) = language else {
+    file_language_matches(graph, &symbol.file_id, language)
+}
+
+/// Language predicate keyed directly on a `FileId`. Shared by `language_matches`
+/// (symbol-based) and by tools whose results are keyed on a file rather than a
+/// symbol (reference hits, importer files). Returns `true` when no language
+/// filter is set; `false` when the file is unknown to the graph.
+fn file_language_matches(
+    graph: &squeezy_graph::SemanticGraph,
+    file_id: &FileId,
+    language: Option<&str>,
+) -> bool {
+    let Some(language) = language.map(str::trim).filter(|value| !value.is_empty()) else {
         return true;
     };
-    let Some(file) = graph.files.get(&symbol.file_id) else {
+    let Some(file) = graph.files.get(file_id) else {
         return false;
     };
-    let language = language.trim().to_ascii_lowercase();
+    let language = language.to_ascii_lowercase();
     file.language.display_name().to_ascii_lowercase() == language
         || format!("{:?}", file.language).to_ascii_lowercase() == language
         || file
@@ -1950,12 +2488,25 @@ fn symbol_context_packet(
         if !callees.is_empty() {
             object.insert("callees".to_string(), json!(callees));
         }
-        let diagnostics = graph
+        let mut diagnostics = graph
             .cargo_diagnostics_for_symbol(symbol)
             .into_iter()
             .take(max_references)
             .map(|hit| cargo_diagnostic_hit_json(&hit))
             .collect::<Vec<_>>();
+        // Java/Dotnet/Kotlin build facts are diagnostics too: the cargo path
+        // above only covers Rust. Append the language project facts for this
+        // symbol's file (labelled `(label, detail)` pairs) so non-Rust build
+        // signals surface in `symbol_context` instead of being Rust-only.
+        for (label, detail) in graph.language_facts_for_file(&symbol.file_id) {
+            diagnostics.push(json!({
+                "level": "info",
+                "label": label,
+                "message": detail,
+                "path": symbol.file_id.0,
+                "source": "language_project_facts",
+            }));
+        }
         if !diagnostics.is_empty() {
             object.insert("diagnostics".to_string(), json!(diagnostics));
         }
@@ -1994,6 +2545,26 @@ fn reference_packet(hit: &ReferenceHit) -> Value {
         object.insert("reference".to_string(), reference_json(hit.clone()));
     }
     packet
+}
+
+/// Canonical lower-case label for a reference's syntactic kind, derived from the
+/// `Debug` rendering of `ReferenceKind` (the same source `reference_json` uses
+/// for the wire `kind`). Kept string-based so it needs no non-test dependency on
+/// `squeezy-parse`'s `ReferenceKind` enum.
+fn reference_kind_label(hit: &ReferenceHit) -> String {
+    format!("{:?}", hit.reference.kind).to_ascii_lowercase()
+}
+
+/// True when a reference hit matches the requested `reference_kind` filter
+/// (`identifier`|`type`|`path`|`field`|`attribute`, case-insensitive). An empty
+/// or whitespace-only filter is treated as "no filter" and keeps every hit; an
+/// unrecognized token simply matches nothing (the caller asked for a kind that
+/// can't occur), which is the conservative, non-surprising behavior.
+fn reference_kind_matches(hit: &ReferenceHit, filter: Option<&str>) -> bool {
+    let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    reference_kind_label(hit) == filter.to_ascii_lowercase()
 }
 
 fn reference_matches_path(hit: &ReferenceHit, filter: &str) -> bool {
@@ -2537,6 +3108,54 @@ fn hierarchy_node_count(node: &HierarchyNode) -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Filter a list of root [`HierarchyNode`]s by the test-scope of their
+/// declaring file. Used by `hierarchy`'s `exclude_tests`/`tests_only`. Only the
+/// root nodes are filtered (a non-test root may legitimately contain test
+/// children and vice versa); children are kept intact under a surviving root.
+fn filter_hierarchy_nodes_by_test_scope(
+    graph: &squeezy_graph::SemanticGraph,
+    nodes: Vec<HierarchyNode>,
+    exclude_tests: bool,
+    tests_only: bool,
+) -> Vec<HierarchyNode> {
+    if !exclude_tests && !tests_only {
+        return nodes;
+    }
+    nodes
+        .into_iter()
+        .filter(|node| {
+            let is_test = graph
+                .symbols
+                .get(&node.id)
+                .map(symbol_is_test)
+                .unwrap_or(false);
+            passes_test_scope(is_test, exclude_tests, tests_only)
+        })
+        .collect()
+}
+
+/// Scope hierarchy nodes to a `result_path` subtree (see [`result_path_scope`]).
+/// A node is kept when its declaring file path matches the filter; nodes with no
+/// resolved symbol (and thus no path) are kept so an unanchored node is never
+/// silently dropped. Returns the input unchanged when the filter is empty.
+fn filter_hierarchy_nodes_by_path(
+    graph: &squeezy_graph::SemanticGraph,
+    nodes: Vec<HierarchyNode>,
+    filter: Option<&str>,
+) -> Vec<HierarchyNode> {
+    let Some(filter) = filter else {
+        return nodes;
+    };
+    nodes
+        .into_iter()
+        .filter(|node| match graph.symbols.get(&node.id) {
+            Some(symbol) => path_matches_filter(symbol.file_id.0.as_str(), filter),
+            None => true,
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn hierarchy_result(
     call: &ToolCall,
     manager: &GraphManager,
@@ -2549,10 +3168,16 @@ fn hierarchy_result(
     total_roots: usize,
     max_depth: usize,
     max_results: Option<usize>,
+    offset: usize,
     root: Option<GraphSymbol>,
 ) -> ToolResult {
     let max_results = graph_limit(max_results);
-    let selected = nodes.iter().take(max_results).collect::<Vec<_>>();
+    // Page the forest roots: skip `offset`, then keep `max_results`.
+    let selected = nodes
+        .iter()
+        .skip(offset)
+        .take(max_results)
+        .collect::<Vec<_>>();
     // Count the total serialized nodes (roots + all recursively-emitted
     // children), not just the number of roots. A single wide root can blow past
     // `max_results` in the serialized `hierarchy`/`packets` while
@@ -2561,7 +3186,8 @@ fn hierarchy_result(
         .iter()
         .map(|node| hierarchy_node_count(node))
         .sum::<usize>();
-    let truncated = total_roots > max_results || serialized_nodes > max_results;
+    let truncated =
+        total_roots.saturating_sub(offset) > max_results || serialized_nodes > max_results;
     let hierarchy = selected
         .iter()
         .map(|node| hierarchy_node_json(graph, node))
@@ -2572,6 +3198,7 @@ fn hierarchy_result(
         .collect::<Vec<_>>();
     let mut payload = graph_payload("hierarchy", manager, refresh);
     payload.insert("max_depth".to_string(), json!(max_depth));
+    payload.insert("offset".to_string(), json!(offset));
     payload.insert(
         "root".to_string(),
         json!(root.as_ref().map(|symbol| symbol_json(graph, symbol))),
@@ -2608,7 +3235,7 @@ fn resolve_single_symbol(
         Some(query),
         args.kind.as_deref(),
         args.path.as_deref(),
-        None,
+        args.language.as_deref(),
         None,
         None,
     )
@@ -2704,12 +3331,34 @@ fn resolve_hierarchy_root(
         Some(query),
         args.kind.as_deref(),
         args.path.as_deref(),
-        None,
+        args.language.as_deref(),
         None,
         None,
     )
     .into_iter()
     .next()
+}
+
+/// Resolve a `path` filter to its workspace File symbol (kind `File`). Used by
+/// the file-outline path of `hierarchy`: rooting the tree at the File symbol
+/// yields that file's declaration tree instead of the whole-workspace forest.
+///
+/// Prefers a case-insensitive exact lookup (O(1), Windows-friendly) and falls
+/// back to the directory-aware `path_matches_filter` scan so a partial but
+/// unambiguous spelling still resolves. The File symbol is registered under the
+/// stable `file:{file_id}` id, so the lookup needs no private graph accessor.
+fn resolve_file_symbol(graph: &squeezy_graph::SemanticGraph, path: &str) -> Option<GraphSymbol> {
+    if path.trim().is_empty() {
+        return None;
+    }
+    let file = graph.find_file_case_insensitive(path).or_else(|| {
+        graph
+            .files
+            .values()
+            .find(|file| path_matches_filter(&file.relative_path, path))
+    })?;
+    let file_symbol_id = SymbolId::new(format!("file:{}", file.id.0));
+    graph.symbols.get(&file_symbol_id).cloned()
 }
 
 fn unresolved_hierarchy_result(
@@ -3204,6 +3853,10 @@ impl ToolRegistry {
                 Ok(args) => self.execute_impact_blocking(call, args, manager, &refresh),
                 Err(err) => tool_arg_error(call, err),
             },
+            "symbol_at" => match serde_json::from_value::<SymbolAtArgs>(call.arguments.clone()) {
+                Ok(args) => self.execute_symbol_at_blocking(call, args, manager, &refresh),
+                Err(err) => tool_arg_error(call, err),
+            },
             "read_slice" => match serde_json::from_value::<ReadSliceArgs>(call.arguments.clone()) {
                 Ok(args) => self.execute_read_slice_blocking(call, args, Some(graph)),
                 Err(err) => tool_arg_error(call, err),
@@ -3228,10 +3881,36 @@ impl ToolRegistry {
         let graph = manager.graph();
         let max_depth = args.max_depth.unwrap_or(2).clamp(1, MAX_GRAPH_MAX_DEPTH);
         let max_files = args.max_files.unwrap_or(50).clamp(1, 200);
+        let path_filter = args.path.as_deref().filter(|p| !p.trim().is_empty());
+        let language_filter = args.language.as_deref().filter(|l| !l.trim().is_empty());
         // Cap the roots before expansion instead of building the entire forest
         // and discarding all but `max_files`; `total_roots` is the pre-cap count
         // used for the truncation signal.
-        let (nodes, total_roots) = graph.hierarchy_capped(None, max_depth, max_files);
+        //
+        // When a path/language scope is requested the cap can't run before the
+        // filter (it would cap on unscoped roots and under-return), so build the
+        // full forest, filter the roots by the declaring file's path/language,
+        // then cap. Unscoped repo_map keeps the cheap pre-capped fast path.
+        let (nodes, total_roots) = if path_filter.is_some() || language_filter.is_some() {
+            let all = graph.hierarchy(None, max_depth);
+            let filtered: Vec<HierarchyNode> = all
+                .into_iter()
+                .filter(|node| {
+                    let Some(symbol) = graph.symbols.get(&node.id) else {
+                        return false;
+                    };
+                    path_filter
+                        .map(|p| path_matches_filter(symbol.file_id.0.as_str(), p))
+                        .unwrap_or(true)
+                        && file_language_matches(graph, &symbol.file_id, language_filter)
+                })
+                .collect();
+            let total = filtered.len();
+            let capped = filtered.into_iter().take(max_files).collect::<Vec<_>>();
+            (capped, total)
+        } else {
+            graph.hierarchy_capped(None, max_depth, max_files)
+        };
         let selected = nodes.iter().collect::<Vec<_>>();
         // Count total serialized nodes (roots + recursively-emitted children),
         // not just the number of roots, so a single wide root that exceeds
@@ -3253,7 +3932,23 @@ impl ToolRegistry {
         let mut payload = graph_payload("repo_map", manager, refresh);
         payload.insert("max_depth".to_string(), json!(max_depth));
         payload.insert("stats".to_string(), graph_stats_json(graph));
-        payload.insert("languages".to_string(), graph_language_counts_json(graph));
+        // Coverage counts honor the same path/language scope as the hierarchy so
+        // a scoped `repo_map` reports the languages present in that subtree, not
+        // the whole workspace. The `stats` block stays whole-graph (its cargo /
+        // index aggregates are not file-scopable) and is tagged accordingly.
+        if path_filter.is_some() || language_filter.is_some() {
+            payload.insert(
+                "languages".to_string(),
+                graph_language_counts_scoped_json(graph, path_filter, language_filter),
+            );
+            payload.insert("scoped".to_string(), json!(true));
+            payload.insert(
+                "stats_scope".to_string(),
+                json!("whole_graph; languages restricted to path/language scope"),
+            );
+        } else {
+            payload.insert("languages".to_string(), graph_language_counts_json(graph));
+        }
         payload.insert("hierarchy".to_string(), json!(hierarchy));
         payload.insert("packets".to_string(), json!(packets));
         payload.insert("unsupported_files".to_string(), json!(unsupported));
@@ -3304,30 +3999,63 @@ impl ToolRegistry {
                 .filter(|attr| attribute_has_inheritance_prefix(attr))
                 .map(seed_type_names)
         });
+        // `kind` is multi-valued: "struct|enum|trait" matches any of the listed
+        // kinds. Each pass reuses the existing single-kind search and the union
+        // dedups by id; a single-token / absent kind runs exactly one pass.
         let (symbols, closure_capped) = match transitive_seed {
-            Some(Some(seed_names)) if !seed_names.is_empty() => graph_transitive_subtype_closure(
-                graph,
-                args.query.as_deref(),
-                args.kind.as_deref(),
-                args.path.as_deref(),
-                args.language.as_deref(),
-                args.visibility.as_deref(),
-                &seed_names,
-                TRANSITIVE_CLOSURE_CAP,
-            ),
+            Some(Some(seed_names)) if !seed_names.is_empty() => {
+                let mut capped = false;
+                let symbols = multi_kind_symbol_union(args.kind.as_deref(), |kind| {
+                    let (symbols, pass_capped) = graph_transitive_subtype_closure(
+                        graph,
+                        args.query.as_deref(),
+                        kind,
+                        args.path.as_deref(),
+                        args.language.as_deref(),
+                        args.visibility.as_deref(),
+                        &seed_names,
+                        TRANSITIVE_CLOSURE_CAP,
+                    );
+                    capped |= pass_capped;
+                    symbols
+                });
+                (symbols, capped)
+            }
             _ => (
-                graph_symbol_search(
-                    graph,
-                    args.query.as_deref(),
-                    args.kind.as_deref(),
-                    args.path.as_deref(),
-                    args.language.as_deref(),
-                    args.visibility.as_deref(),
-                    args.attribute.as_deref(),
-                ),
+                multi_kind_symbol_union(args.kind.as_deref(), |kind| {
+                    graph_symbol_search(
+                        graph,
+                        args.query.as_deref(),
+                        kind,
+                        args.path.as_deref(),
+                        args.language.as_deref(),
+                        args.visibility.as_deref(),
+                        args.attribute.as_deref(),
+                    )
+                }),
                 false,
             ),
         };
+        // Dead-code mode: drop any scanned declaration that has more than
+        // `max_callers` (default 0) inbound usage edges. Unscanned stubs
+        // (external/parse-failed) are dropped outright — they are not real
+        // declarations in this workspace and would be false positives.
+        let unused = args.unused.unwrap_or(false);
+        let max_callers = args.max_callers.unwrap_or(0);
+        let exclude_tests = args.exclude_tests.unwrap_or(false);
+        let tests_only = args.tests_only.unwrap_or(false);
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
+        let symbols: Vec<GraphSymbol> = symbols
+            .into_iter()
+            .filter(|symbol| passes_test_scope(symbol_is_test(symbol), exclude_tests, tests_only))
+            .filter(|symbol| confidence_scope.keeps(symbol.confidence))
+            .filter(|symbol| !unused || symbol.scanned)
+            .filter(|symbol| !unused || inbound_usage_count(graph, symbol) <= max_callers)
+            .collect();
         // The closure cap is a distinct truncation source from the result-window
         // cap: fold it into `truncated` so the page is flagged, and also surface
         // it as a separate `closure_capped` signal so a caller can tell the
@@ -3343,7 +4071,42 @@ impl ToolRegistry {
             .iter()
             .map(|symbol| {
                 let rank_label = args.query.as_deref().map(|q| symbol_rank_label(symbol, q));
-                symbol_packet(graph, symbol, "decl_search", rank_label)
+                let mut packet = symbol_packet(graph, symbol, "decl_search", rank_label);
+                // In dead-code mode, annotate each surviving candidate so the
+                // model never treats a flagged/caveated result as confidently
+                // dead: `exported` (may have callers outside this graph) and
+                // `caveat` (only low-confidence edges, so absence of resolved
+                // uses is not proof). A clean candidate gets `confidently dead`.
+                if unused
+                    && let Some(object) = packet.as_object_mut()
+                {
+                    let exported = visibility_is_exported(symbol);
+                    let caveat = confidence_is_unresolved(symbol.confidence);
+                    let mut flags = serde_json::Map::new();
+                    flags.insert("exported".to_string(), json!(exported));
+                    if caveat {
+                        flags.insert(
+                            "caveat".to_string(),
+                            json!("no resolved references found; this declaration's edges resolved at low confidence (macro/conditional/external/candidate), so absence of uses is not proof of dead code"),
+                        );
+                    }
+                    if exported {
+                        flags.insert(
+                            "note".to_string(),
+                            json!("public/exported: may have callers outside the scanned workspace"),
+                        );
+                    }
+                    flags.insert(
+                        "verdict".to_string(),
+                        json!(if exported || caveat {
+                            "possibly_dead"
+                        } else {
+                            "likely_dead"
+                        }),
+                    );
+                    object.insert("dead_code".to_string(), Value::Object(flags));
+                }
+                packet
             })
             .collect::<Vec<_>>();
         let confidence_distribution =
@@ -3374,6 +4137,10 @@ impl ToolRegistry {
         payload.insert("counts_by_kind".to_string(), decl_counts_by_kind(&symbols));
         payload.insert("truncated".to_string(), json!(truncated));
         payload.insert("closure_capped".to_string(), json!(closure_capped));
+        if unused {
+            payload.insert("unused".to_string(), json!(true));
+            payload.insert("max_callers".to_string(), json!(max_callers));
+        }
         make_result(
             call,
             ToolStatus::Success,
@@ -3397,17 +4164,36 @@ impl ToolRegistry {
     ) -> ToolResult {
         let graph = manager.graph();
         let max_results = graph_limit(args.max_results);
-        let symbols = resolve_definition_candidates(
-            graph,
-            args.symbol_id.as_deref(),
-            args.query.as_deref(),
-            args.kind.as_deref(),
-            args.path.as_deref(),
-            args.language.as_deref(),
+        // `kind` is multi-valued ("struct|enum|trait"): resolve candidates once
+        // per kind token and union by id, reusing the single-kind resolver.
+        let mut symbols = multi_kind_symbol_union(args.kind.as_deref(), |kind| {
+            resolve_definition_candidates(
+                graph,
+                args.symbol_id.as_deref(),
+                args.query.as_deref(),
+                kind,
+                args.path.as_deref(),
+                args.language.as_deref(),
+            )
+        });
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
         );
-        let truncated = symbols.len() > max_results;
+        if !confidence_scope.is_noop() {
+            symbols.retain(|symbol| confidence_scope.keeps(symbol.confidence));
+        }
         let candidate_count = symbols.len();
-        let selected = symbols.into_iter().take(max_results).collect::<Vec<_>>();
+        // Page after sorting: skip `offset`, then keep `max_results`. `truncated`
+        // reflects whether anything remains past the returned window.
+        let offset = args.offset.unwrap_or(0);
+        let truncated = candidate_count.saturating_sub(offset) > max_results;
+        let selected = symbols
+            .into_iter()
+            .skip(offset)
+            .take(max_results)
+            .collect::<Vec<_>>();
         let packets = selected
             .iter()
             .map(|symbol| {
@@ -3430,6 +4216,7 @@ impl ToolRegistry {
                 packet_count,
             ),
         );
+        payload.insert("offset".to_string(), json!(offset));
         payload.insert("truncated".to_string(), json!(truncated));
         payload.insert("total_candidates".to_string(), json!(candidate_count));
         make_result(
@@ -3468,6 +4255,13 @@ impl ToolRegistry {
                 None,
             );
         };
+        let exclude_tests = args.exclude_tests.unwrap_or(false);
+        let tests_only = args.tests_only.unwrap_or(false);
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
         let filtered = hits
             .into_iter()
             .filter(|hit| {
@@ -3476,6 +4270,18 @@ impl ToolRegistry {
                     .map(|path| reference_matches_path(hit, path))
                     .unwrap_or(true)
             })
+            .filter(|hit| {
+                passes_test_scope(
+                    path_is_test(hit.reference.file_id.0.as_str()),
+                    exclude_tests,
+                    tests_only,
+                )
+            })
+            .filter(|hit| {
+                file_language_matches(graph, &hit.reference.file_id, args.language.as_deref())
+            })
+            .filter(|hit| reference_kind_matches(hit, args.reference_kind.as_deref()))
+            .filter(|hit| confidence_scope.keeps(hit.confidence))
             .collect::<Vec<_>>();
         let truncated = filtered.len().saturating_sub(offset) > max_results;
         let selected = filtered
@@ -3554,11 +4360,45 @@ impl ToolRegistry {
                 packets.push(reference_packet(&hit));
             }
         }
-        let truncated = overflowed;
+        let exclude_tests = args.exclude_tests.unwrap_or(false);
+        let tests_only = args.tests_only.unwrap_or(false);
+        if exclude_tests || tests_only {
+            packets.retain(|packet| packet_matches_test_scope(packet, exclude_tests, tests_only));
+        }
+        // edge_kind: keep only edge-bearing packets whose kind matches the
+        // requested kind (case-insensitive). An unknown token parses to `None`
+        // and leaves every packet in place.
+        if let Some(want) = args.edge_kind.as_deref().and_then(parse_edge_kind_filter) {
+            packets.retain(|packet| packet_matches_edge_kind(packet, Some(want)));
+        }
+        // path/result_path scopes the RESULT packets, not just the root: drop any
+        // caller/edge packet whose file path falls outside the requested subtree.
+        let result_path = result_path_scope(args.path.as_deref(), args.result_path.as_deref());
+        if result_path.is_some() {
+            packets.retain(|packet| packet_matches_result_path(packet, result_path));
+        }
+        // Confidence scope: keep only packets at an allowed confidence, and/or
+        // drop / isolate out-of-workspace (`External`) targets.
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
+        if !confidence_scope.is_noop() {
+            packets.retain(|packet| confidence_scope.keeps_packet(packet));
+        }
+        // Pagination over the filtered packets: skip `offset`, keep `max_results`.
+        // The page can be truncated either because the BFS overflowed upstream or
+        // because filtered packets remain past the returned window.
+        let offset = args.offset.unwrap_or(0);
+        let filtered_total = packets.len();
+        let truncated = overflowed || filtered_total.saturating_sub(offset) > max_results;
+        let packets: Vec<Value> = packets.into_iter().skip(offset).take(max_results).collect();
         let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
         let mut payload = graph_payload("upstream_flow", manager, refresh);
         payload.insert("symbol".to_string(), symbol_json(graph, &symbol));
         payload.insert("max_depth".to_string(), json!(max_depth));
+        payload.insert("offset".to_string(), json!(offset));
         let packet_count = packets.len();
         payload.insert("packets".to_string(), json!(packets));
         payload.insert("truncated".to_string(), json!(truncated));
@@ -3630,11 +4470,45 @@ impl ToolRegistry {
                 packets.push(edge_packet(graph, edge, "downstream_flow"));
             }
         }
-        let truncated = overflowed;
+        let exclude_tests = args.exclude_tests.unwrap_or(false);
+        let tests_only = args.tests_only.unwrap_or(false);
+        if exclude_tests || tests_only {
+            packets.retain(|packet| packet_matches_test_scope(packet, exclude_tests, tests_only));
+        }
+        // edge_kind: keep only edge-bearing packets whose kind matches the
+        // requested kind (case-insensitive). An unknown token parses to `None`
+        // and leaves every packet in place.
+        if let Some(want) = args.edge_kind.as_deref().and_then(parse_edge_kind_filter) {
+            packets.retain(|packet| packet_matches_edge_kind(packet, Some(want)));
+        }
+        // path/result_path scopes the RESULT packets, not just the root: drop any
+        // callee/edge packet whose file path falls outside the requested subtree.
+        let result_path = result_path_scope(args.path.as_deref(), args.result_path.as_deref());
+        if result_path.is_some() {
+            packets.retain(|packet| packet_matches_result_path(packet, result_path));
+        }
+        // Confidence scope: keep only packets at an allowed confidence, and/or
+        // drop / isolate out-of-workspace (`External`) targets.
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
+        if !confidence_scope.is_noop() {
+            packets.retain(|packet| confidence_scope.keeps_packet(packet));
+        }
+        // Pagination over the filtered packets: skip `offset`, keep `max_results`.
+        // The page can be truncated either because the BFS overflowed downstream
+        // or because filtered packets remain past the returned window.
+        let offset = args.offset.unwrap_or(0);
+        let filtered_total = packets.len();
+        let truncated = overflowed || filtered_total.saturating_sub(offset) > max_results;
+        let packets: Vec<Value> = packets.into_iter().skip(offset).take(max_results).collect();
         let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
         let mut payload = graph_payload("downstream_flow", manager, refresh);
         payload.insert("symbol".to_string(), symbol_json(graph, &symbol));
         payload.insert("max_depth".to_string(), json!(max_depth));
+        payload.insert("offset".to_string(), json!(offset));
         let packet_count = packets.len();
         payload.insert("packets".to_string(), json!(packets));
         payload.insert("truncated".to_string(), json!(truncated));
@@ -3665,7 +4539,15 @@ impl ToolRegistry {
         let max_references = args.max_references.unwrap_or(12).min(50);
         let max_results = graph_limit(args.max_results);
         let path_filter = args.path.as_deref();
+        let language_filter = args.language.as_deref();
         let diff_only = args.diff_only.unwrap_or(false);
+        let exclude_tests = args.exclude_tests.unwrap_or(false);
+        let tests_only = args.tests_only.unwrap_or(false);
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
         // A live symbol_id from a sibling tool resolves the target directly;
         // a stale id (graph re-indexed since it was minted) falls through to
         // the name query so the call still lands on the right symbol.
@@ -3683,7 +4565,7 @@ impl ToolRegistry {
                 Some(&args.query),
                 None,
                 path_filter,
-                None,
+                language_filter,
                 None,
                 None,
             ),
@@ -3692,22 +4574,40 @@ impl ToolRegistry {
         .filter(|symbol| {
             !diff_only || symbol.dirty.is_some() || dirty_paths.contains(&symbol.file_id.0)
         })
+        .filter(|symbol| language_matches(graph, symbol, language_filter))
+        .filter(|symbol| passes_test_scope(symbol_is_test(symbol), exclude_tests, tests_only))
+        .filter(|symbol| confidence_scope.keeps(symbol.confidence))
         .collect::<Vec<_>>();
+        // Page after filtering/sorting: skip `offset`, keep `max_results`.
+        let offset = args.offset.unwrap_or(0);
         let mut pre_take_len = candidates.len();
-        let mut symbols = candidates.into_iter().take(max_results).collect::<Vec<_>>();
+        let mut symbols = candidates
+            .into_iter()
+            .skip(offset)
+            .take(max_results)
+            .collect::<Vec<_>>();
         if symbols.is_empty() && diff_only {
             let fallback = graph
                 .dirty_symbols()
                 .into_iter()
                 .filter(|symbol| symbol_matches_path_filter(symbol, path_filter))
+                .filter(|symbol| language_matches(graph, symbol, language_filter))
+                .filter(|symbol| {
+                    passes_test_scope(symbol_is_test(symbol), exclude_tests, tests_only)
+                })
+                .filter(|symbol| confidence_scope.keeps(symbol.confidence))
                 .filter(|symbol| {
                     symbol.name.contains(&args.query) || symbol.signature.contains(&args.query)
                 })
                 .collect::<Vec<_>>();
             pre_take_len = fallback.len();
-            symbols = fallback.into_iter().take(max_results).collect();
+            symbols = fallback
+                .into_iter()
+                .skip(offset)
+                .take(max_results)
+                .collect();
         }
-        let truncated = pre_take_len > max_results;
+        let truncated = pre_take_len.saturating_sub(offset) > max_results;
         // One cache shared across every result packet: a file referenced by
         // several of the returned symbols is read from disk once, not per symbol.
         let mut sources = SourceCache::default();
@@ -3725,6 +4625,7 @@ impl ToolRegistry {
             json!(diff_mode_str(args.mode.unwrap_or_default())),
         );
         payload.insert("diff_only".to_string(), json!(diff_only));
+        payload.insert("offset".to_string(), json!(offset));
         let packet_count = packets.len();
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
@@ -3764,12 +4665,17 @@ impl ToolRegistry {
             .max_depth
             .unwrap_or(DEFAULT_GRAPH_MAX_DEPTH)
             .clamp(1, MAX_GRAPH_MAX_DEPTH);
+        let offset = args.offset.unwrap_or(0);
+        // Result-packet scope: `result_path` (or the plain `path`) restricts the
+        // emitted nodes to a subtree, not just the root resolution.
+        let result_path = result_path_scope(args.path.as_deref(), args.result_path.as_deref());
         let root = resolve_hierarchy_root(graph, &args);
         if args.symbol_id.is_some() || args.query.is_some() {
             let Some(root) = root else {
                 return unresolved_hierarchy_result(call, manager, refresh, &args);
             };
             let nodes = graph.hierarchy(Some(&root.id), max_depth);
+            let nodes = filter_hierarchy_nodes_by_path(graph, nodes, result_path);
             let total_roots = nodes.len();
             return hierarchy_result(
                 call,
@@ -3780,13 +4686,53 @@ impl ToolRegistry {
                 total_roots,
                 max_depth,
                 args.max_results,
+                offset,
                 Some(root),
             );
         }
+        // File outline: a `path` with no symbol_id/query roots the hierarchy at
+        // the file's File symbol so the result is that file's declaration tree
+        // (functions/classes/etc.), not the whole-workspace rootless forest.
+        if let Some(path) = args.path.as_deref()
+            && let Some(file_sym) = resolve_file_symbol(graph, path)
+        {
+            let nodes = graph.hierarchy(Some(&file_sym.id), max_depth);
+            // The file is already the path scope; an explicit `result_path` can
+            // narrow further within that file's declaration tree.
+            let nodes = filter_hierarchy_nodes_by_path(graph, nodes, args.result_path.as_deref());
+            let total_roots = nodes.len();
+            return hierarchy_result(
+                call,
+                manager,
+                refresh,
+                graph,
+                nodes,
+                total_roots,
+                max_depth,
+                args.max_results,
+                offset,
+                Some(file_sym),
+            );
+        }
         // Rootless map: cap the forest roots before expansion instead of
-        // building the whole forest and discarding all but `max_results`.
+        // building the whole forest and discarding all but `max_results`. The cap
+        // must include `offset` so the requested page is still reachable.
         let max_results = graph_limit(args.max_results);
-        let (nodes, total_roots) = graph.hierarchy_capped(None, max_depth, max_results);
+        let cap = offset.saturating_add(max_results);
+        let (nodes, total_roots) = graph.hierarchy_capped(None, max_depth, cap);
+        let exclude_tests = args.exclude_tests.unwrap_or(false);
+        let tests_only = args.tests_only.unwrap_or(false);
+        let nodes = filter_hierarchy_nodes_by_test_scope(graph, nodes, exclude_tests, tests_only);
+        let path_scoped = result_path.is_some();
+        let nodes = filter_hierarchy_nodes_by_path(graph, nodes, result_path);
+        // `total_roots` came from the pre-filter cap; recompute against the
+        // surviving roots so `truncated` reflects what the caller can actually
+        // page through under the test/path scope.
+        let total_roots = if exclude_tests || tests_only || path_scoped {
+            nodes.len()
+        } else {
+            total_roots
+        };
         hierarchy_result(
             call,
             manager,
@@ -3796,6 +4742,7 @@ impl ToolRegistry {
             total_roots,
             max_depth,
             args.max_results,
+            offset,
             None,
         )
     }
@@ -3819,9 +4766,17 @@ impl ToolRegistry {
         {
             Some(sym.clone())
         } else if let Some(q) = args.query.as_deref() {
-            graph_symbol_search(graph, Some(q), None, None, None, None, None)
-                .into_iter()
-                .next()
+            graph_symbol_search(
+                graph,
+                Some(q),
+                None,
+                None,
+                args.language.as_deref(),
+                None,
+                None,
+            )
+            .into_iter()
+            .next()
         } else {
             None
         };
@@ -3866,27 +4821,71 @@ impl ToolRegistry {
             );
         };
 
-        let related: Vec<GraphSymbol> = if subtypes {
-            graph.inheritance_direct_subtypes(&root_sym.id)
+        // Member mode: when the root is a Method/Field and `member=true`, return
+        // the overrides/implementations of that member across subtypes instead
+        // of the type-to-type walk. A non-member root falls back to the type
+        // walk so the flag never dead-ends a mistargeted call.
+        let member_requested = args.member.unwrap_or(false);
+        let member_mode =
+            member_requested && matches!(root_sym.kind, SymbolKind::Method | SymbolKind::Field);
+        // Transitive subtype closure: only meaningful in subtype mode (ancestors
+        // are already a full transitive walk; member mode resolves overrides
+        // directly). `max_depth` is clamped to the graph's traversal bounds; the
+        // default matches the other depth-bounded graph walks.
+        let transitive_subtypes = subtypes && !member_mode && args.transitive.unwrap_or(false);
+        let subtype_depth = args
+            .max_depth
+            .unwrap_or(DEFAULT_GRAPH_MAX_DEPTH)
+            .clamp(1, MAX_GRAPH_MAX_DEPTH);
+        let related: Vec<GraphSymbol> = if member_mode {
+            graph.member_implementations(&root_sym.id)
+        } else if subtypes {
+            if transitive_subtypes {
+                graph.inheritance_subtypes_transitive(&root_sym.id, subtype_depth)
+            } else {
+                graph.inheritance_direct_subtypes(&root_sym.id)
+            }
         } else {
             graph.inheritance_ancestors(&root_sym.id)
         };
+        let language_filter = args.language.as_deref();
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
+        let related: Vec<GraphSymbol> = related
+            .into_iter()
+            .filter(|sym| language_matches(graph, sym, language_filter))
+            .filter(|sym| confidence_scope.keeps(sym.confidence))
+            .collect();
 
-        let truncated = related.len() > max_results;
-        let selected: Vec<&GraphSymbol> = related.iter().take(max_results).collect();
+        // Page after filtering: skip `offset`, keep `max_results`.
+        let offset = args.offset.unwrap_or(0);
+        let truncated = related.len().saturating_sub(offset) > max_results;
+        let selected: Vec<&GraphSymbol> = related.iter().skip(offset).take(max_results).collect();
 
         let packets: Vec<Value> = selected
             .iter()
             .map(|sym| symbol_packet(graph, sym, "inheritance_hierarchy", None))
             .collect();
 
+        let direction = if member_mode {
+            "member_implementations"
+        } else if subtypes {
+            if transitive_subtypes {
+                "subtypes_transitive"
+            } else {
+                "subtypes"
+            }
+        } else {
+            "supertypes"
+        };
         let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
         let mut payload = graph_payload("inheritance_hierarchy", manager, refresh);
         payload.insert("root".to_string(), symbol_json(graph, &root_sym));
-        payload.insert(
-            "direction".to_string(),
-            json!(if subtypes { "subtypes" } else { "supertypes" }),
-        );
+        payload.insert("direction".to_string(), json!(direction));
+        payload.insert("offset".to_string(), json!(offset));
         payload.insert(
             "symbols".to_string(),
             json!(
@@ -3977,6 +4976,72 @@ impl ToolRegistry {
             );
         }
 
+        // direct_only: return just the first-hop importer files of every
+        // changed file, with no transitive fan-out and no
+        // affected_symbols/affected_tests computation. Deterministic by sorting
+        // on the relative path; each importer is emitted once across all roots.
+        if args.direct_only.unwrap_or(false) {
+            let mut importers: HashSet<FileId> = HashSet::new();
+            for file_id in &changed {
+                for importer in graph.direct_importers(file_id) {
+                    // Don't list a changed file as an importer of itself.
+                    if !changed.contains(&importer) {
+                        importers.insert(importer);
+                    }
+                }
+            }
+            let mut importer_files: Vec<&squeezy_workspace::FileRecord> = importers
+                .iter()
+                .filter_map(|fid| graph.files.get(fid))
+                .collect();
+            importer_files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+            let total = importer_files.len();
+            // Page after sorting: skip `offset`, keep `max_results`.
+            let offset = args.offset.unwrap_or(0);
+            let truncated = total.saturating_sub(offset) > max_results;
+            let packets: Vec<Value> = importer_files
+                .iter()
+                .skip(offset)
+                .take(max_results)
+                .map(|file| {
+                    json!({
+                        "importer": {
+                            "file_id": file.id.0,
+                            "path": file.relative_path,
+                        }
+                    })
+                })
+                .collect();
+            let returned = packets.len();
+            let mut payload = graph_payload("impact", manager, refresh);
+            payload.insert(
+                "changed_files".to_string(),
+                json!(
+                    changed
+                        .iter()
+                        .filter_map(|fid| graph.files.get(fid))
+                        .map(|f| f.relative_path.clone())
+                        .collect::<Vec<_>>()
+                ),
+            );
+            payload.insert("direct_only".to_string(), json!(true));
+            payload.insert("offset".to_string(), json!(offset));
+            payload.insert("packets".to_string(), json!(packets));
+            payload.insert("importer_count".to_string(), json!(total));
+            payload.insert("truncated".to_string(), json!(truncated));
+            return make_result(
+                call,
+                ToolStatus::Success,
+                Value::Object(payload),
+                ToolCostHint {
+                    matches_returned: returned as u64,
+                    truncated,
+                    ..ToolCostHint::default()
+                },
+                None,
+            );
+        }
+
         // All changed files are treated as potentially propagating for
         // worst-case impact; callers needing finer control can supply dirty
         // annotations through `annotate_dirty_ranges` first.
@@ -3984,9 +5049,41 @@ impl ToolRegistry {
         let removed: HashSet<FileId> = HashSet::new();
         let impact = graph.compute_impact(&changed, &propagating, &removed);
 
-        let truncated = impact.affected_symbols.len() > max_results;
-        let selected_symbols: Vec<&squeezy_graph::GraphSymbol> =
-            impact.affected_symbols.iter().take(max_results).collect();
+        // Scope the affected set by test-ness and language when requested.
+        let exclude_tests = args.exclude_tests.unwrap_or(false);
+        let tests_only = args.tests_only.unwrap_or(false);
+        let language_filter = args.language.as_deref();
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
+        let mut affected_symbols: Vec<&squeezy_graph::GraphSymbol> = impact
+            .affected_symbols
+            .iter()
+            .filter(|sym| passes_test_scope(symbol_is_test(sym), exclude_tests, tests_only))
+            .filter(|sym| language_matches(graph, sym, language_filter))
+            .filter(|sym| confidence_scope.keeps(sym.confidence))
+            .collect();
+        // `compute_impact` collects from a HashMap, so iteration order is not
+        // stable. Sort deterministically (path, span, id) before paging so the
+        // `offset` window is reproducible across calls.
+        affected_symbols.sort_by(|a, b| {
+            a.file_id
+                .0
+                .cmp(&b.file_id.0)
+                .then(a.span.start.line.cmp(&b.span.start.line))
+                .then(a.span.start.column.cmp(&b.span.start.column))
+                .then(a.id.0.cmp(&b.id.0))
+        });
+        // Page after sorting: skip `offset`, keep `max_results`.
+        let offset = args.offset.unwrap_or(0);
+        let truncated = affected_symbols.len().saturating_sub(offset) > max_results;
+        let selected_symbols: Vec<&squeezy_graph::GraphSymbol> = affected_symbols
+            .into_iter()
+            .skip(offset)
+            .take(max_results)
+            .collect();
 
         let packets: Vec<Value> = selected_symbols
             .iter()
@@ -4026,6 +5123,7 @@ impl ToolRegistry {
             "affected_file_count".to_string(),
             json!(impact.affected_files.len()),
         );
+        payload.insert("offset".to_string(), json!(offset));
         payload.insert("packets".to_string(), json!(packets));
         payload.insert("test_symbols".to_string(), json!(test_symbols_json));
         payload.insert("truncated".to_string(), json!(truncated));
@@ -4044,6 +5142,110 @@ impl ToolRegistry {
             },
             None,
         )
+    }
+
+    /// Resolve a source position (byte offset or 1-based line) inside a file to
+    /// the smallest enclosing symbol. `byte` wins over `line` when both are
+    /// present. On a hit, returns the standard symbol packet so the caller can
+    /// chain straight into `symbol_context`/`read_slice`; on a miss, returns a
+    /// `symbol: null` body with a `read_slice` next_action so the model can still
+    /// read the requested slice.
+    fn execute_symbol_at_blocking(
+        &self,
+        call: &ToolCall,
+        args: SymbolAtArgs,
+        manager: &GraphManager,
+        refresh: &squeezy_graph::RefreshReport,
+    ) -> ToolResult {
+        let graph = manager.graph();
+        // Resolve the path to an indexed file (case-insensitive exact first,
+        // then the directory-aware fallback) and derive its FileId.
+        let file = graph.find_file_case_insensitive(&args.path).or_else(|| {
+            graph
+                .files
+                .values()
+                .find(|file| path_matches_filter(&file.relative_path, &args.path))
+        });
+        let Some(file) = file else {
+            let mut payload = graph_payload("symbol_at", manager, refresh);
+            payload.insert(
+                "fallback".to_string(),
+                graph_zero_hit_fallback(graph, None, Some(&args.path), None, 0),
+            );
+            payload.insert("symbol".to_string(), Value::Null);
+            payload.insert("packets".to_string(), json!([]));
+            return make_result(
+                call,
+                ToolStatus::Success,
+                Value::Object(payload),
+                ToolCostHint::default(),
+                None,
+            );
+        };
+        let file_id = file.id.clone();
+        let rel_path = file.relative_path.clone();
+
+        let symbol = if let Some(byte) = args.byte {
+            graph.symbol_at_byte(&file_id, byte)
+        } else {
+            // Default the line to 1 when neither byte nor line was supplied so a
+            // bare `{path}` resolves the file's first enclosing symbol instead
+            // of erroring.
+            graph.symbol_at_line(&file_id, args.line.unwrap_or(1))
+        };
+
+        let mut payload = graph_payload("symbol_at", manager, refresh);
+        payload.insert("path".to_string(), json!(rel_path));
+        if let Some(byte) = args.byte {
+            payload.insert("byte".to_string(), json!(byte));
+        } else {
+            payload.insert("line".to_string(), json!(args.line.unwrap_or(1)));
+        }
+        match symbol {
+            Some(symbol) => {
+                let packet = symbol_packet(graph, &symbol, "symbol_at", None);
+                let confidence_distribution =
+                    ToolCostHint::confidence_distribution_from(std::iter::once(symbol.confidence));
+                payload.insert("symbol".to_string(), symbol_json(graph, &symbol));
+                payload.insert("packets".to_string(), json!([packet]));
+                make_result(
+                    call,
+                    ToolStatus::Success,
+                    Value::Object(payload),
+                    ToolCostHint {
+                        matches_returned: 1,
+                        confidence_distribution,
+                        ..ToolCostHint::default()
+                    },
+                    None,
+                )
+            }
+            None => {
+                payload.insert("symbol".to_string(), Value::Null);
+                payload.insert("packets".to_string(), json!([]));
+                payload.insert("reason".to_string(), json!("no_enclosing_symbol"));
+                // Steer the model to read the requested slice anyway. Anchor on
+                // the line when one is known so `read_slice` lands at the cursor.
+                let start_line = args.line.unwrap_or(1);
+                payload.insert(
+                    "next_action".to_string(),
+                    json!({
+                        "tool": "read_slice",
+                        "arguments": {
+                            "path": rel_path,
+                            "start_line": start_line,
+                        },
+                    }),
+                );
+                make_result(
+                    call,
+                    ToolStatus::Success,
+                    Value::Object(payload),
+                    ToolCostHint::default(),
+                    None,
+                )
+            }
+        }
     }
 
     fn execute_read_slice_blocking(
@@ -5635,5 +6837,115 @@ mod windows_path_normalization_tests {
                 || (path_lower3.starts_with(filter_with_slash.as_str())),
             "case-folded prefix match must work"
         );
+    }
+}
+
+#[cfg(test)]
+mod option_filter_tests {
+    use super::{
+        ConfidenceScope, parse_confidence_level, parse_edge_kind_filter, result_path_scope,
+        split_kind_tokens,
+    };
+    use serde_json::json;
+    use squeezy_core::{Confidence, EdgeKind};
+
+    #[test]
+    fn edge_kind_filter_is_case_insensitive_and_aliased() {
+        assert_eq!(parse_edge_kind_filter("Calls"), Some(EdgeKind::Calls));
+        assert_eq!(parse_edge_kind_filter("ref"), Some(EdgeKind::References));
+        assert_eq!(parse_edge_kind_filter("IMPORTS"), Some(EdgeKind::Imports));
+        assert_eq!(
+            parse_edge_kind_filter("re-export"),
+            Some(EdgeKind::Reexports)
+        );
+        assert_eq!(parse_edge_kind_filter("nonsense"), None);
+    }
+
+    #[test]
+    fn split_kind_tokens_splits_on_pipe_and_trims() {
+        assert_eq!(
+            split_kind_tokens(Some("struct| enum |trait")),
+            Some(vec!["struct", "enum", "trait"])
+        );
+        // A single token still yields a one-element vec.
+        assert_eq!(split_kind_tokens(Some("struct")), Some(vec!["struct"]));
+        // All-blank / empty collapses to no-filter.
+        assert_eq!(split_kind_tokens(Some(" | ")), None);
+        assert_eq!(split_kind_tokens(None), None);
+    }
+
+    #[test]
+    fn result_path_scope_prefers_result_path_then_path() {
+        assert_eq!(result_path_scope(Some("src"), Some("src/a")), Some("src/a"));
+        assert_eq!(result_path_scope(Some("src"), None), Some("src"));
+        // Blank tokens are treated as absent.
+        assert_eq!(result_path_scope(Some("  "), None), None);
+        assert_eq!(result_path_scope(None, None), None);
+    }
+
+    #[test]
+    fn confidence_level_parses_ids_and_aliases() {
+        assert_eq!(
+            parse_confidence_level("exact_syntax"),
+            Some(Confidence::ExactSyntax)
+        );
+        assert_eq!(
+            parse_confidence_level("External"),
+            Some(Confidence::External)
+        );
+        assert_eq!(
+            parse_confidence_level("resolved"),
+            Some(Confidence::ImportResolved)
+        );
+        assert_eq!(parse_confidence_level("bogus"), None);
+    }
+
+    #[test]
+    fn confidence_scope_noop_keeps_everything() {
+        let scope = ConfidenceScope::new(None, false, false);
+        assert!(scope.is_noop());
+        assert!(scope.keeps(Confidence::External));
+        assert!(scope.keeps(Confidence::ExactSyntax));
+    }
+
+    #[test]
+    fn confidence_scope_allow_set_filters_by_level() {
+        let scope = ConfidenceScope::new(Some("exact_syntax|import_resolved"), false, false);
+        assert!(!scope.is_noop());
+        assert!(scope.keeps(Confidence::ExactSyntax));
+        assert!(scope.keeps(Confidence::ImportResolved));
+        assert!(!scope.keeps(Confidence::Heuristic));
+        // An all-unknown allow-set degrades to no constraint (never empties).
+        let typo = ConfidenceScope::new(Some("typo"), false, false);
+        assert!(typo.keeps(Confidence::Heuristic));
+    }
+
+    #[test]
+    fn confidence_scope_external_isolation() {
+        let drop_ext = ConfidenceScope::new(None, true, false);
+        assert!(!drop_ext.keeps(Confidence::External));
+        assert!(drop_ext.keeps(Confidence::ExactSyntax));
+
+        let only_ext = ConfidenceScope::new(None, false, true);
+        assert!(only_ext.keeps(Confidence::External));
+        assert!(!only_ext.keeps(Confidence::ExactSyntax));
+
+        // external_only wins when both are set.
+        let both = ConfidenceScope::new(None, true, true);
+        assert!(both.keeps(Confidence::External));
+    }
+
+    #[test]
+    fn confidence_scope_packet_uses_body_confidence() {
+        let scope = ConfidenceScope::new(None, true, false);
+        // Edge packet pointing at an external target is dropped.
+        let external_edge = json!({"edge": {"confidence": "external"}});
+        assert!(!scope.keeps_packet(&external_edge));
+        // A symbol packet at exact confidence is kept.
+        let local_symbol = json!({"symbol": {"confidence": "exact_syntax"}});
+        assert!(scope.keeps_packet(&local_symbol));
+        // A packet with no determinable confidence is kept (positive filter).
+        let bare = json!({"spans": []});
+        assert!(scope.keeps_packet(&bare));
     }
 }

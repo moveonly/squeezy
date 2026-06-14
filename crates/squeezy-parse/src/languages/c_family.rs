@@ -155,6 +155,8 @@ pub(crate) fn visit_c_family_node(
         extract_c_include(node, ctx, owner_symbol.cloned());
     } else if matches!(kind, "using_declaration" | "using_directive") {
         extract_c_using(node, ctx, owner_symbol.cloned());
+    } else if kind == "friend_declaration" {
+        extract_c_family_friend(node, ctx, parent_symbol.map(|(id, _)| id.clone()));
     }
 
     if let Some(symbol) = c_family_symbol_from_node(node, ctx, parent_symbol) {
@@ -216,6 +218,13 @@ pub(crate) fn c_family_symbol_from_node(
         "enumerator" => SymbolKind::Variant,
         "function_definition" => SymbolKind::Function,
         "declaration" if c_declaration_is_function(node) => SymbolKind::Function,
+        "declaration" if c_family_is_global_value_declaration(node) => {
+            if c_family_declaration_is_const(node, ctx.source) {
+                SymbolKind::Const
+            } else {
+                SymbolKind::Static
+            }
+        }
         "field_declaration" if c_declaration_is_function(node) => SymbolKind::Function,
         "field_declaration" => SymbolKind::Field,
         "type_definition" | "alias_declaration" => SymbolKind::TypeAlias,
@@ -238,10 +247,29 @@ pub(crate) fn c_family_symbol_from_node(
         kind = SymbolKind::Method;
     }
 
-    let name = c_family_symbol_name(node, kind, ctx.source)?;
+    let mut name = c_family_symbol_name(node, kind, ctx.source)?;
     if name.is_empty() {
         return None;
     }
+
+    // gtest / Boost.Test macros (`TEST(Suite, Name) { … }`,
+    // `BOOST_AUTO_TEST_CASE(name) { … }`) parse as `function_definition` whose
+    // declarator name is the macro and whose arguments are the suite/case
+    // identifiers. Reclassify them as `Test` and name them after the macro
+    // arguments so `decl_search kind=test` and the test-impact queries see
+    // them. Only top-level (non-member) definitions qualify; a method literally
+    // called `TEST` should stay a method.
+    let mut test_macro = false;
+    if kind == SymbolKind::Function
+        && node.kind() == "function_definition"
+        && c_family_is_test_macro_name(&name)
+        && let Some(test_name) = c_family_test_macro_label(node, &name, ctx.source)
+    {
+        name = test_name;
+        kind = SymbolKind::Test;
+        test_macro = true;
+    }
+
     let body = c_family_body_node(node);
     let span = span_from_node(node);
     let body_span = body.map(span_from_node);
@@ -250,6 +278,22 @@ pub(crate) fn c_family_symbol_from_node(
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let mut attributes = c_family_attributes_for_node(node, kind, &signature);
     attributes.extend(c_family_base_class_attributes(node, kind, ctx.source));
+    if matches!(kind, SymbolKind::Function | SymbolKind::Method)
+        && let Some(role) = c_family_special_member_role(node, &name, ctx.source)
+    {
+        attributes.push(role.to_string());
+    }
+    if kind == SymbolKind::Field {
+        attributes.extend(c_family_bitfield_attributes(node, ctx.source));
+    }
+    if matches!(kind, SymbolKind::Function | SymbolKind::Method)
+        && c_family_has_c_linkage(node, ctx.source)
+    {
+        attributes.push("c++:c-linkage".to_string());
+    }
+    if test_macro {
+        attributes.push("c-family:test".to_string());
+    }
     attributes.sort();
     attributes.dedup();
     let confidence = c_family_symbol_confidence(node, &attributes);
@@ -312,9 +356,38 @@ pub(crate) fn extract_c_family_symbol_facts(
         }
     }
 
+    // `enum class E : uint8_t {…}` carries its underlying integral type in the
+    // `base` field. Record it as a Type reference (skipping the built-in
+    // integer spellings) so the enum's dependency on a user-defined alias is
+    // visible to reference queries.
+    if symbol.kind == SymbolKind::Enum
+        && let Some(base) = node.child_by_field_name("base")
+        && let Ok(text) = node_text(base, ctx.source)
+    {
+        let name = c_family_last_name(text);
+        if !name.is_empty() && !c_family_builtin_type(&name) {
+            ctx.references.push(ParsedReference {
+                file_id: ctx.file.id.clone(),
+                owner_id: Some(symbol.id.clone()),
+                text: name,
+                kind: ReferenceKind::Type,
+                span: span_from_node(base),
+                provenance: Provenance::new(
+                    c_family_parser_name(ctx.file.language),
+                    "enum underlying type",
+                ),
+            });
+        }
+    }
+
     if matches!(
         symbol.kind,
-        SymbolKind::Function | SymbolKind::Method | SymbolKind::Field | SymbolKind::TypeAlias
+        SymbolKind::Function
+            | SymbolKind::Method
+            | SymbolKind::Field
+            | SymbolKind::TypeAlias
+            | SymbolKind::Const
+            | SymbolKind::Static
     ) {
         for type_name in c_family_type_names_from_signature(&symbol.signature) {
             ctx.references.push(ParsedReference {
@@ -348,6 +421,20 @@ pub(crate) fn extract_c_include(
     let Some(path) = c_include_path(raw) else {
         return;
     };
+    // `<...>` includes resolve against the toolchain's system header search
+    // path, never the workspace, while `"..."` includes are local first.
+    // tree-sitter exposes the distinction as the `path` node kind
+    // (`system_lib_string` vs `string_literal`); a text-opener fallback keeps
+    // the classification working if the field is ever absent. The provenance
+    // reason carries the origin (both keep the `include directive` substring the
+    // resolver already filters on) so the include resolver can skip
+    // workspace path-matching for system headers without overloading
+    // `is_global` (which is reserved for C# global using).
+    let reason = if c_include_is_system(node, raw) {
+        "system include directive"
+    } else {
+        "include directive"
+    };
     // `#include "x.h"` exposes every declaration in `x.h` to the including
     // file the same way Rust's `use module::*;` does. Marking the import as
     // a glob lets `add_import_edges` and the call resolver consult the
@@ -361,11 +448,24 @@ pub(crate) fn extract_c_include(
         is_reexport: false,
         is_static: false,
         span: span_from_node(node),
-        provenance: Provenance::new(c_family_parser_name(ctx.file.language), "include directive"),
+        provenance: Provenance::new(c_family_parser_name(ctx.file.language), reason),
         kind: ImportKind::Wildcard,
         imported_name: None,
         is_global: false,
     });
+}
+
+/// True for a `<...>` system include. Prefers the `path` node kind
+/// (`system_lib_string`) and falls back to the raw opening delimiter.
+pub(crate) fn c_include_is_system(node: Node<'_>, raw: &str) -> bool {
+    if let Some(path) = node.child_by_field_name("path") {
+        return path.kind() == "system_lib_string";
+    }
+    let trimmed = raw.trim();
+    trimmed
+        .find(['"', '<'])
+        .map(|index| trimmed.as_bytes()[index] == b'<')
+        .unwrap_or(false)
 }
 
 pub(crate) fn c_include_path(raw: &str) -> Option<String> {
@@ -444,6 +544,47 @@ pub(crate) fn extract_c_using(
         imported_name,
         is_global: false,
     });
+}
+
+/// Record a C++ `friend` grant on the enclosing class.
+///
+/// tree-sitter-cpp models `friend class Bar;` / `friend Bar;` as a
+/// `friend_declaration` whose named child is a `type_identifier`,
+/// `qualified_identifier`, or `template_type`; friend *functions*
+/// (`friend void f();`) wrap a `declaration` / `function_definition` that the
+/// regular visitor still descends into. We emit a `Type` reference for the
+/// granted name tagged with a `friend grant` provenance so the access grant is
+/// distinguishable from an ordinary type mention. The reference is owned by the
+/// granting class so "who does Foo befriend" is answerable.
+pub(crate) fn extract_c_family_friend(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if !matches!(
+            child.kind(),
+            "type_identifier" | "qualified_identifier" | "template_type"
+        ) {
+            continue;
+        }
+        let Ok(text) = node_text(child, ctx.source) else {
+            continue;
+        };
+        let name = c_family_last_name(text);
+        if name.is_empty() {
+            continue;
+        }
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: owner_id.clone(),
+            text: name,
+            kind: ReferenceKind::Type,
+            span: span_from_node(child),
+            provenance: Provenance::new(c_family_parser_name(ctx.file.language), "friend grant"),
+        });
+    }
 }
 
 pub(crate) fn extract_c_family_call(
@@ -625,6 +766,43 @@ pub(crate) fn c_declaration_is_function(node: Node<'_>) -> bool {
         .unwrap_or(false)
 }
 
+/// True when a non-function `declaration` is a file- or namespace-scope value
+/// (a global / static / const / extern variable) that deserves its own symbol.
+///
+/// Gated on the syntactic parent so locals inside function bodies, `for`-init
+/// clauses, parameters, and class-member declarations never leak in: only the
+/// translation unit, a namespace body (`declaration_list`), and an
+/// `extern "C"` block (`linkage_specification`) host real globals. A bare
+/// `declarator` is still required so forward type declarations (`struct Foo;`,
+/// which have a type but no declarator) are left to the type-symbol path.
+pub(crate) fn c_family_is_global_value_declaration(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if !matches!(
+        parent.kind(),
+        "translation_unit" | "declaration_list" | "linkage_specification"
+    ) {
+        return false;
+    }
+    node.child_by_field_name("declarator").is_some()
+}
+
+/// True when a declaration carries a `const`/`constexpr`/`consteval`/`constinit`
+/// qualifier, so a global value should be classified as `Const` rather than
+/// `Static`. tree-sitter surfaces `const`/`volatile` as `type_qualifier`
+/// children and the others as keyword tokens, so a whole-token scan over the
+/// pre-initializer head is the robust check.
+pub(crate) fn c_family_declaration_is_const(node: Node<'_>, source: &str) -> bool {
+    let Ok(text) = node_text(node, source) else {
+        return false;
+    };
+    let head = text.split('=').next().unwrap_or(text);
+    ["const", "constexpr", "consteval", "constinit"]
+        .iter()
+        .any(|keyword| signature_has_keyword(head, keyword))
+}
+
 /// Returns true when the declarator describes a real function/method, not a
 /// function pointer field/variable.
 ///
@@ -683,6 +861,174 @@ pub(crate) fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     node.named_children(&mut cursor).next()
 }
 
+/// Recognise the gtest / Boost.Test macros that parse as a
+/// `function_definition` because their arguments are bare identifiers. Catch2's
+/// `TEST_CASE("name", "[tag]")` takes string-literal arguments and does not
+/// parse as a function definition, so it is intentionally excluded here.
+pub(crate) fn c_family_is_test_macro_name(name: &str) -> bool {
+    matches!(
+        name,
+        "TEST"
+            | "TEST_F"
+            | "TEST_P"
+            | "TYPED_TEST"
+            | "TYPED_TEST_P"
+            | "FRIEND_TEST"
+            | "BOOST_AUTO_TEST_CASE"
+            | "BOOST_FIXTURE_TEST_CASE"
+            | "BOOST_AUTO_TEST_CASE_TEMPLATE"
+    )
+}
+
+/// Build a readable label for a test-macro definition from the macro arguments.
+///
+/// The arguments live in the `function_declarator`'s `parameter_list`, where
+/// tree-sitter parses each bare identifier as a type-only `parameter_declaration`
+/// (`TEST(Suite, Name)` → `Suite`, `Name`). We join the identifier-shaped
+/// arguments with `.` (`Suite.Name`), prefixed by the macro name so two cases
+/// in different suites never collide (`TEST.Suite.Name`). Returns `None` when no
+/// usable argument identifier is found so a bare `TEST() {}` is left a function.
+pub(crate) fn c_family_test_macro_label(
+    node: Node<'_>,
+    macro_name: &str,
+    source: &str,
+) -> Option<String> {
+    let declarator = node.child_by_field_name("declarator")?;
+    if declarator.kind() != "function_declarator" {
+        return None;
+    }
+    let parameters = declarator.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    let mut parts = vec![macro_name.to_string()];
+    for param in parameters.named_children(&mut cursor) {
+        if let Ok(text) = node_text(param, source) {
+            let leaf = c_family_last_name(text);
+            if !leaf.is_empty() {
+                parts.push(leaf);
+            }
+        }
+    }
+    if parts.len() <= 1 {
+        return None;
+    }
+    Some(parts.join("."))
+}
+
+/// Classify a C++ special member declaration (constructor, destructor,
+/// operator, or conversion operator) by inspecting its declarator shape and,
+/// for constructors, comparing the member name against the enclosing class.
+///
+/// - `operator_cast` declarator (`operator int()`) → conversion operator.
+/// - `operator_name` declarator (`operator+`) → operator overload.
+/// - `destructor_name` declarator or a leading `~` → destructor.
+/// - member name equal to the enclosing `class`/`struct`/`union` name and not
+///   an operator/destructor → constructor.
+///
+/// Returns the role attribute string, mirroring Dart's `dart:constructor` /
+/// `dart:operator` markers so `decl_search` can filter C++ special members.
+pub(crate) fn c_family_special_member_role(
+    node: Node<'_>,
+    name: &str,
+    source: &str,
+) -> Option<&'static str> {
+    // Walk the declarator chain to the innermost name node so wrapped shapes
+    // (`Foo()` inside `function_declarator`, `operator int()` as `operator_cast`)
+    // are classified the same way.
+    let mut declarator = node.child_by_field_name("declarator").unwrap_or(node);
+    loop {
+        match declarator.kind() {
+            "operator_cast" => return Some("c++:conversion-operator"),
+            "operator_name" => return Some("c++:operator"),
+            "destructor_name" => return Some("c++:destructor"),
+            "function_declarator"
+            | "pointer_declarator"
+            | "reference_declarator"
+            | "parenthesized_declarator"
+            | "init_declarator" => {
+                match declarator
+                    .child_by_field_name("declarator")
+                    .or_else(|| first_named_child(declarator))
+                {
+                    Some(inner) if inner.id() != declarator.id() => declarator = inner,
+                    _ => break,
+                }
+            }
+            _ => break,
+        }
+    }
+
+    if name.starts_with('~') {
+        return Some("c++:destructor");
+    }
+    if name.starts_with("operator") {
+        return Some("c++:operator");
+    }
+
+    // Out-of-line definition (`Foo::Foo()` / `Foo::~Foo()`): the declarator is
+    // a `qualified_identifier` whose trailing qualifier names the class. A
+    // qualifier leaf equal to the member name marks a constructor.
+    if declarator.kind() == "qualified_identifier"
+        && let Ok(text) = node_text(declarator, source)
+    {
+        let head = text.split('(').next().unwrap_or(text);
+        if let Some((qualifier, _)) = head.rsplit_once("::") {
+            let class = c_family_last_name(qualifier);
+            if !class.is_empty() && class == name {
+                return Some("c++:constructor");
+            }
+        }
+    }
+
+    // In-class constructor: bare member name matching the enclosing aggregate.
+    match c_family_enclosing_class_name(node, source) {
+        Some(class) if class == name => Some("c++:constructor"),
+        _ => None,
+    }
+}
+
+/// True when `node` sits inside an `extern "C"` block / declaration. C++ models
+/// this as a `linkage_specification` whose `value` field is the string literal
+/// `"C"`; `extern "C++"` and other linkages are left untagged. Walking
+/// ancestors covers both `extern "C" void f();` and the braced
+/// `extern "C" { … }` form.
+pub(crate) fn c_family_has_c_linkage(node: Node<'_>, source: &str) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "linkage_specification"
+            && let Some(value) = parent.child_by_field_name("value")
+            && let Ok(text) = node_text(value, source)
+        {
+            return text.trim().trim_matches('"').trim() == "C";
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+/// The leaf name of the nearest enclosing `class`/`struct`/`union` specifier,
+/// used to recognise in-class constructor declarations. Out-of-line
+/// definitions (`Foo::Foo()`) are named via the qualified declarator and never
+/// reach this path with a bare match, so they are handled by the declarator
+/// chain plus name comparison above when the qualifier is stripped.
+pub(crate) fn c_family_enclosing_class_name(node: Node<'_>, source: &str) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) && let Some(name) = parent
+            .child_by_field_name("name")
+            .and_then(|name| node_text(name, source).ok())
+            .map(c_family_last_name)
+            .filter(|name| !name.is_empty())
+        {
+            return Some(name);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
 pub(crate) fn c_family_symbol_name(
     node: Node<'_>,
     kind: SymbolKind,
@@ -691,7 +1037,9 @@ pub(crate) fn c_family_symbol_name(
     match kind {
         SymbolKind::Macro => c_macro_definition_name(node, source),
         SymbolKind::TypeAlias => c_type_alias_name(node, source),
-        SymbolKind::Field => c_declarator_name(node, source),
+        SymbolKind::Field | SymbolKind::Const | SymbolKind::Static => {
+            c_declarator_name(node, source)
+        }
         SymbolKind::Function | SymbolKind::Method => node
             .child_by_field_name("declarator")
             .and_then(|declarator| c_declarator_name(declarator, source))
@@ -868,6 +1216,9 @@ pub(crate) fn c_family_attributes_for_node(
             attributes.push("preprocessor:opaque".to_string());
         }
         "template_declaration" => attributes.push("c++:template".to_string()),
+        "enum_specifier" if c_family_enum_is_scoped(node) => {
+            attributes.push("c++:scoped-enum".to_string())
+        }
         _ => {}
     }
 
@@ -879,15 +1230,13 @@ pub(crate) fn c_family_attributes_for_node(
         attributes.push("preprocessor:conditional".to_string());
     }
 
-    // `virtual` is only meaningful for function/method symbols, and the
-    // signature slice is already start..body_start so the search avoids
-    // scanning the full class body.
+    // Function/method modifiers. The signature slice is already
+    // start..body_start so the keyword scans never reach into the class body.
     if matches!(
         kind,
         SymbolKind::Function | SymbolKind::Method | SymbolKind::Field
-    ) && signature_has_keyword(signature, "virtual")
-    {
-        attributes.push("c++:virtual".to_string());
+    ) {
+        c_family_collect_function_modifiers(signature, &mut attributes);
     }
 
     if matches!(
@@ -923,6 +1272,56 @@ fn c_family_ancestor_kinds(node: Node<'_>) -> CFamilyAncestorFlags {
     flags
 }
 
+/// Stamp the C++ function/method modifier attributes that survive in the
+/// signature slice (`start..body_start`). Leading specifiers (`virtual`,
+/// `static`, `explicit`, `constexpr`) and the `= delete` / `= default` clauses
+/// are matched anywhere in the slice; trailing qualifiers (`const`, `override`,
+/// `final`, `noexcept`) are matched only after the last `)` so a `const`
+/// return type does not masquerade as a const member function.
+pub(crate) fn c_family_collect_function_modifiers(signature: &str, attributes: &mut Vec<String>) {
+    for (keyword, attribute) in [
+        ("virtual", "c++:virtual"),
+        ("static", "c++:static"),
+        ("explicit", "c++:explicit"),
+        ("constexpr", "c++:constexpr"),
+    ] {
+        if signature_has_keyword(signature, keyword) {
+            attributes.push(attribute.to_string());
+        }
+    }
+
+    // `= delete` / `= default`. The signature slice keeps the `= delete;`
+    // tail because such declarations have no compound-statement body.
+    if signature_has_keyword(signature, "delete") {
+        attributes.push("c++:deleted".to_string());
+    }
+    if signature_has_keyword(signature, "default") {
+        attributes.push("c++:defaulted".to_string());
+    }
+
+    // Trailing qualifiers live after the parameter list. Scan only the slice
+    // following the last close-paren to avoid return-type `const`/`noexcept`.
+    // A trailing return type (`-> const T`) starts at `->`, so truncate there
+    // before scanning so its `const` is not mistaken for a const member.
+    let mut trailing = signature
+        .rfind(')')
+        .map(|index| &signature[index + 1..])
+        .unwrap_or("");
+    if let Some(arrow) = trailing.find("->") {
+        trailing = &trailing[..arrow];
+    }
+    for (keyword, attribute) in [
+        ("const", "c++:const"),
+        ("override", "c++:override"),
+        ("final", "c++:final"),
+        ("noexcept", "c++:noexcept"),
+    ] {
+        if signature_has_keyword(trailing, keyword) {
+            attributes.push(attribute.to_string());
+        }
+    }
+}
+
 /// True when the given identifier appears as a whole-token keyword in the
 /// signature slice. Avoids substring matches like `nonvirtual` or strings
 /// embedded in default parameter values.
@@ -944,6 +1343,40 @@ pub(crate) fn c_family_is_template_specialization(node: Node<'_>) -> bool {
         return false;
     };
     name.kind() == "template_type"
+}
+
+/// Emit `c-family:bitfield` (and `c-family:bitfield-width:<n>` when the width is
+/// an integer literal) for a `field_declaration` carrying a `bitfield_clause`
+/// (`unsigned flags : 4;`). tree-sitter models the width as the clause's
+/// `expression` child; non-literal widths (`: kBits`) still get the marker so
+/// `decl_search attribute=c-family:bitfield` finds them.
+pub(crate) fn c_family_bitfield_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut cursor = node.walk();
+    let Some(clause) = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == "bitfield_clause")
+    else {
+        return Vec::new();
+    };
+    let mut attributes = vec!["c-family:bitfield".to_string()];
+    if let Some(width) = first_named_child(clause)
+        .and_then(|expr| node_text(expr, source).ok())
+        .map(str::trim)
+        .filter(|width| !width.is_empty() && width.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        attributes.push(format!("c-family:bitfield-width:{width}"));
+    }
+    attributes
+}
+
+/// Detect a C++ scoped enum (`enum class E` / `enum struct E`). tree-sitter-cpp
+/// emits the `class`/`struct` token as an anonymous child between the `enum`
+/// keyword and the name field, so we scan the immediate children for it rather
+/// than reading a field that does not exist.
+pub(crate) fn c_family_enum_is_scoped(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| matches!(child.kind(), "class" | "struct"))
 }
 
 /// Emit `base:<Leaf>` inheritance attributes for each base class of a C++

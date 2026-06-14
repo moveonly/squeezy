@@ -96,6 +96,13 @@ fn visit_php_node(
             extract_body_hit(node, BodyHitKind::Literal, ctx, owner_symbol.clone());
             return;
         }
+        // Property hooks are minted (and their bodies recursed with the
+        // accessor as owner) by `extract_php_property_symbols` /
+        // `extract_php_promoted_fields`. Skip the generic descent so hook
+        // bodies are not re-rooted to the enclosing class.
+        "property_hook_list" => {
+            return;
+        }
         _ => {}
     }
 
@@ -143,7 +150,7 @@ fn visit_php_node(
     }
 
     if let Some(symbol) = php_symbol_from_node(node, ctx, parent_symbol.as_ref(), scope) {
-        extract_php_symbol_facts(node, &symbol, ctx);
+        extract_php_symbol_facts(node, &symbol, ctx, scope);
         let next_parent = Some((symbol.id.clone(), symbol.kind));
         let next_owner = if symbol.body_span.is_some() {
             Some(symbol.id.clone())
@@ -188,12 +195,23 @@ fn visit_php_node(
         }
         "function_call_expression" => {
             extract_php_function_call(node, ctx, owner_symbol.clone());
+            // `define('NAME', value)` is the canonical PHP global-constant
+            // idiom; mint a top-level `Const` symbol in addition to the call.
+            if php_call_callee_name(node, ctx.source).as_deref() == Some("define") {
+                extract_php_define_const(node, ctx, parent_symbol.as_ref(), scope);
+            }
             // Suppress descent into eval() arguments per the spec (the literal
             // body otherwise leaks as identifiers/refs the resolver cannot
             // bind).
             if php_call_callee_name(node, ctx.source).as_deref() == Some("eval") {
                 return;
             }
+        }
+        "global_declaration" | "function_static_declaration" => {
+            // `global $x;` and `static $cache = ...;` inside a function bind
+            // names into the local scope. Record the bound variables as
+            // identifier references so the binding site is visible/linkable.
+            extract_php_variable_bindings(node, ctx, owner_symbol.clone());
         }
         "member_call_expression" | "nullsafe_member_call_expression" => {
             extract_php_member_call(node, ctx, owner_symbol.clone());
@@ -202,7 +220,39 @@ fn visit_php_node(
             extract_php_scoped_call(node, ctx, owner_symbol.clone());
         }
         "object_creation_expression" => {
+            // `new class(...) extends Base implements I { ... }` carries an
+            // `anonymous_class` child. Model it as a Partial synthetic Class so
+            // its members parent correctly and its bases produce edges, then
+            // stop the generic descent below from re-parenting the body.
+            if let Some(anon) = php_anonymous_class_child(node) {
+                extract_php_anonymous_class(
+                    node,
+                    anon,
+                    ctx,
+                    parent_symbol.as_ref(),
+                    owner_symbol.clone(),
+                    scope,
+                );
+                return;
+            }
             extract_php_object_creation(node, ctx, owner_symbol.clone());
+        }
+        "class_constant_access_expression" => {
+            // `Foo::Bar` / `self::CONST` / enum-case match arms. Emit a Type
+            // reference for the class qualifier and a Field reference for the
+            // accessed constant / enum case, then stop so the inner `name`
+            // nodes do not also surface as bare identifiers.
+            extract_php_class_constant_access(node, ctx, owner_symbol.clone(), scope);
+            return;
+        }
+        "binary_expression"
+            if php_binary_operator(node, ctx.source).as_deref() == Some("instanceof") =>
+        {
+            // `$x instanceof Foo` — the RHS class is a Type test. Emit a Type
+            // reference for it and descend only into the LHS so the class name
+            // is not also recorded as a bare identifier.
+            extract_php_instanceof(node, ctx, owner_symbol.clone(), scope);
+            return;
         }
         "qualified_name" if !is_php_declaration_name(node) => {
             extract_php_reference(node, ReferenceKind::Path, ctx, owner_symbol.clone());
@@ -305,7 +355,7 @@ fn php_symbol_from_node(
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
     scope: &PhpScope,
 ) -> Option<ParsedSymbol> {
-    let kind = match node.kind() {
+    let mut kind = match node.kind() {
         "class_declaration" => SymbolKind::Class,
         "interface_declaration" => SymbolKind::Interface,
         "trait_declaration" => SymbolKind::Trait,
@@ -336,6 +386,22 @@ fn php_symbol_from_node(
     }
     if matches!(kind, SymbolKind::Method) && name == "__destruct" {
         attributes.push("php:dtor".to_string());
+    }
+    // PHPUnit promotes a method to a `Test` symbol when it carries a `#[Test]`/
+    // `#[DataProvider]` attribute, is named `test*`, or lives in a `*Test.php`
+    // file / `TestCase`-derived class. Mirrors the C# `Fact`/`Test` promotion.
+    if matches!(kind, SymbolKind::Method)
+        && !is_php_magic_method(&name)
+        && php_is_test_method(
+            node,
+            &name,
+            &attributes_raw,
+            ctx.source,
+            &ctx.file.relative_path,
+        )
+    {
+        kind = SymbolKind::Test;
+        attributes.push("php:test".to_string());
     }
     if let Some(namespace) = scope.current_namespace() {
         attributes.push(format!("php:namespace:{namespace}"));
@@ -915,6 +981,22 @@ fn extract_php_trait_use(
     }
 }
 
+/// PHP 8.1 first-class callable syntax — `strlen(...)` / `$obj->m(...)` /
+/// `Foo::bar(...)`. The lone `variadic_placeholder` named child means the call
+/// captures the callable rather than invoking it, so it must not be recorded
+/// as a real invocation with a bogus arity of 1 (that arity feeds
+/// `arity_unique_candidate` and would falsely resolve `foo(...)` to a 1-arg
+/// `foo`).
+fn php_is_first_class_callable(arguments: Option<Node<'_>>) -> bool {
+    let Some(arguments) = arguments else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    let mut children = arguments.named_children(&mut cursor);
+    matches!(children.next(), Some(first) if first.kind() == "variadic_placeholder")
+        && children.next().is_none()
+}
+
 fn extract_php_function_call(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
@@ -934,10 +1016,28 @@ fn extract_php_function_call(
     if name.is_empty() {
         return;
     }
-    let arity = node
-        .child_by_field_name("arguments")
-        .map(|arguments| named_child_count(arguments))
-        .unwrap_or_default();
+    let arguments = node.child_by_field_name("arguments");
+    // First-class callable: record a Partial Calls edge with arity 0 and no
+    // Call body-hit, so resolution does not treat it as a 1-arg invocation.
+    if php_is_first_class_callable(arguments) {
+        ctx.calls.push(ParsedCall {
+            file_id: ctx.file.id.clone(),
+            caller_id: owner_id,
+            name,
+            target_text: target_text.clone(),
+            receiver: receiver_from_direct_call(&target_text),
+            arity: 0,
+            kind: ParsedCallKind::Direct,
+            span: span_from_node(node),
+            provenance: Provenance::new(
+                PROVENANCE,
+                "function_call_expression first-class callable",
+            ),
+            confidence: Confidence::Partial,
+        });
+        return;
+    }
+    let arity = arguments.map(named_child_count).unwrap_or_default();
     let is_eval = name == "eval";
     let is_guard = matches!(
         name.as_str(),
@@ -976,6 +1076,130 @@ fn php_call_callee_name(node: Node<'_>, source: &str) -> Option<String> {
     Some(last_path_segment(raw))
 }
 
+fn extract_php_define_const(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+    scope: &PhpScope,
+) {
+    // `define('NAME', value)` — the first argument is a string literal naming
+    // the global constant. Anything else (a dynamically computed name) is left
+    // as the plain call already recorded by the caller.
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = arguments.walk();
+    let Some(first_arg) = arguments.named_children(&mut cursor).next() else {
+        return;
+    };
+    if first_arg.kind() != "argument" {
+        return;
+    }
+    let Ok(arg_text) = node_text(first_arg, ctx.source) else {
+        return;
+    };
+    let Some(raw_name) = first_php_string_literal(arg_text) else {
+        return;
+    };
+    let name = raw_name.trim().to_string();
+    if name.is_empty() {
+        return;
+    }
+    // Only a constant parent (the file namespace `Module`, if any) carries a
+    // `define()`; class-scoped `define` is illegal PHP, so a non-Module parent
+    // means we are at file scope and the const stays top-level.
+    let parent_id = parent_symbol
+        .filter(|(_, kind)| matches!(kind, SymbolKind::Module))
+        .map(|(id, _)| id.clone());
+    let span = span_from_node(node);
+    let id = symbol_id(
+        &ctx.file,
+        parent_id.as_ref(),
+        SymbolKind::Const,
+        &name,
+        span,
+    );
+    let mut attributes = vec!["php:const".to_string(), "php:define".to_string()];
+    if let Some(namespace) = scope.current_namespace() {
+        attributes.push(format!("php:namespace:{namespace}"));
+    }
+    attributes.sort();
+    attributes.dedup();
+    ctx.symbols.push(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name,
+        kind: SymbolKind::Const,
+        language_identity: None,
+        span,
+        body_span: None,
+        signature_span: None,
+        signature: node_text(node, ctx.source)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        visibility: None,
+        docs: Vec::new(),
+        attributes,
+        provenance: Provenance::new(PROVENANCE, "define constant"),
+        confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+        arity: None,
+    });
+}
+
+fn extract_php_variable_bindings(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    // `global $a, $b;` lists `variable_name` children directly;
+    // `static $x = ...;` wraps each in a `static_variable_declaration` whose
+    // `name` field is the `variable_name`. Record each bound name as an
+    // identifier reference tagged with the binding kind.
+    let reason = if node.kind() == "global_declaration" {
+        "global binding"
+    } else {
+        "static binding"
+    };
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let variable = match child.kind() {
+            "variable_name" => child,
+            "static_variable_declaration" => {
+                let Some(name_node) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                name_node
+            }
+            _ => continue,
+        };
+        let Ok(text) = node_text(variable, ctx.source) else {
+            continue;
+        };
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: owner_id.clone(),
+            text: trimmed.clone(),
+            kind: ReferenceKind::Identifier,
+            span: span_from_node(variable),
+            provenance: Provenance::new(PROVENANCE, reason),
+        });
+        ctx.body_hits.push(BodyHit {
+            file_id: ctx.file.id.clone(),
+            owner_id: owner_id.clone(),
+            text: trimmed,
+            kind: BodyHitKind::Identifier,
+            span: span_from_node(variable),
+        });
+    }
+}
+
 fn extract_php_member_call(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
@@ -996,10 +1220,7 @@ fn extract_php_member_call(
         .and_then(|receiver| node_text(receiver, ctx.source).ok())
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
-    let arity = node
-        .child_by_field_name("arguments")
-        .map(|arguments| named_child_count(arguments))
-        .unwrap_or_default();
+    let arguments = node.child_by_field_name("arguments");
     let target_text = node_text(node, ctx.source)
         .unwrap_or_default()
         .split('(')
@@ -1007,6 +1228,22 @@ fn extract_php_member_call(
         .unwrap_or_default()
         .trim()
         .to_string();
+    if php_is_first_class_callable(arguments) {
+        ctx.calls.push(ParsedCall {
+            file_id: ctx.file.id.clone(),
+            caller_id: owner_id,
+            name,
+            target_text,
+            receiver,
+            arity: 0,
+            kind: ParsedCallKind::Method,
+            span: span_from_node(node),
+            provenance: Provenance::new(PROVENANCE, "member_call_expression first-class callable"),
+            confidence: Confidence::Partial,
+        });
+        return;
+    }
+    let arity = arguments.map(named_child_count).unwrap_or_default();
     let mut confidence = Confidence::Heuristic;
     if is_php_implicit_dispatch_target(&name) {
         confidence = Confidence::Partial;
@@ -1046,10 +1283,13 @@ fn extract_php_scoped_call(
         .and_then(|scope| node_text(scope, ctx.source).ok())
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
-    let arity = node
-        .child_by_field_name("arguments")
-        .map(|arguments| named_child_count(arguments))
-        .unwrap_or_default();
+    let arguments = node.child_by_field_name("arguments");
+    let first_class = php_is_first_class_callable(arguments);
+    let arity = if first_class {
+        0
+    } else {
+        arguments.map(named_child_count).unwrap_or_default()
+    };
     let target_text = node_text(node, ctx.source)
         .unwrap_or_default()
         .split('(')
@@ -1057,10 +1297,16 @@ fn extract_php_scoped_call(
         .unwrap_or_default()
         .trim()
         .to_string();
-    let mut confidence = Confidence::Heuristic;
-    if is_php_implicit_dispatch_target(&name) {
-        confidence = Confidence::Partial;
-    }
+    let (confidence, reason) = if first_class {
+        (
+            Confidence::Partial,
+            "scoped_call_expression first-class callable",
+        )
+    } else if is_php_implicit_dispatch_target(&name) {
+        (Confidence::Partial, "scoped_call_expression")
+    } else {
+        (Confidence::Heuristic, "scoped_call_expression")
+    };
     ctx.calls.push(ParsedCall {
         file_id: ctx.file.id.clone(),
         caller_id: owner_id.clone(),
@@ -1070,7 +1316,7 @@ fn extract_php_scoped_call(
         arity,
         kind: ParsedCallKind::Method,
         span: span_from_node(node),
-        provenance: Provenance::new(PROVENANCE, "scoped_call_expression"),
+        provenance: Provenance::new(PROVENANCE, reason),
         confidence,
     });
     // Static call sites also stamp the receiver as a type reference so
@@ -1088,7 +1334,11 @@ fn extract_php_scoped_call(
             provenance: Provenance::new(PROVENANCE, "scoped call receiver"),
         });
     }
-    extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+    // First-class callables capture the method rather than invoking it, so no
+    // Call body-hit is recorded (matching the function/member call paths).
+    if !first_class {
+        extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+    }
 }
 
 fn extract_php_object_creation(
@@ -1167,6 +1417,123 @@ fn extract_php_object_creation(
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
 }
 
+fn php_anonymous_class_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "anonymous_class")
+}
+
+fn extract_php_anonymous_class(
+    creation_node: Node<'_>,
+    anon_node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+    owner_id: Option<SymbolId>,
+    scope: &mut PhpScope,
+) {
+    // Record the construction itself as a Partial direct call so the call site
+    // is still visible; an anonymous class has no nameable callee, so it lands
+    // as `<anonymous>` with Partial confidence.
+    let mut arg_cursor = anon_node.walk();
+    let arity = anon_node
+        .children(&mut arg_cursor)
+        .find(|child| child.kind() == "arguments")
+        .map(named_child_count)
+        .unwrap_or_default();
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name: "<anonymous>".to_string(),
+        target_text: "class".to_string(),
+        receiver: None,
+        arity,
+        kind: ParsedCallKind::Direct,
+        span: span_from_node(creation_node),
+        provenance: Provenance::new(PROVENANCE, "object_creation_expression anonymous"),
+        confidence: Confidence::Partial,
+    });
+
+    let span = span_from_node(anon_node);
+    let name = format!(
+        "__anonymous_class_{}_{}",
+        span.start.line, span.start.column
+    );
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let body = anon_node.child_by_field_name("body");
+    let signature = signature_text(anon_node, body, ctx.source);
+    let bases = php_collect_base_types(anon_node, ctx.source);
+    let mut attributes = vec![
+        "php:anonymous-class".to_string(),
+        "php:partial-parse".to_string(),
+    ];
+    for base in &bases {
+        attributes.push(format!("base:{base}"));
+    }
+    attributes.sort();
+    attributes.dedup();
+    let id = symbol_id(
+        &ctx.file,
+        parent_id.as_ref(),
+        SymbolKind::Class,
+        &name,
+        span,
+    );
+    let symbol = ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name: name.clone(),
+        kind: SymbolKind::Class,
+        // Anonymous classes have no addressable type identity, matching how
+        // Kotlin object literals are modelled.
+        language_identity: None,
+        span,
+        body_span: body.map(span_from_node),
+        signature_span: signature_span_from_nodes(anon_node, body),
+        signature,
+        visibility: None,
+        docs: Vec::new(),
+        attributes,
+        provenance: Provenance::new(PROVENANCE, "anonymous class declaration"),
+        confidence: Confidence::Partial,
+        freshness: Freshness::Fresh,
+        arity: None,
+    };
+    // Base/interface bases also surface as Type references owned by the
+    // synthetic class so the resolver can synthesize `Extends`/`Implements`.
+    for base in bases {
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: Some(symbol.id.clone()),
+            text: base,
+            kind: ReferenceKind::Type,
+            span: symbol.span,
+            provenance: Provenance::new(PROVENANCE, "anonymous base type reference"),
+        });
+    }
+    let next_parent = Some((symbol.id.clone(), symbol.kind));
+    let next_owner = symbol.body_span.map(|_| symbol.id.clone());
+    scope.type_path.push(symbol.name.clone());
+    ctx.symbols.push(symbol);
+
+    // Descend selectively: the constructor `arguments` are evaluated in the
+    // enclosing scope, the body parents to the synthetic class, and base /
+    // interface clauses are already captured as attributes + Type refs.
+    let mut cursor = anon_node.walk();
+    for child in anon_node.named_children(&mut cursor) {
+        match child.kind() {
+            "arguments" => {
+                visit_php_children(child, ctx, parent_symbol.cloned(), owner_id.clone(), scope);
+            }
+            "base_clause" | "class_interface_clause" | "attribute_list" => {}
+            _ => {
+                visit_php_node(child, ctx, next_parent.clone(), next_owner.clone(), scope);
+            }
+        }
+    }
+    scope.type_path.pop();
+}
+
 fn extract_php_reference(
     node: Node<'_>,
     kind: ReferenceKind,
@@ -1207,11 +1574,79 @@ fn extract_php_reference(
     });
 }
 
+fn php_binary_operator(node: Node<'_>, source: &str) -> Option<String> {
+    node.child_by_field_name("operator")
+        .and_then(|op| node_text(op, source).ok())
+        .map(|text| text.trim().to_string())
+}
+
+fn extract_php_class_constant_access(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+    scope: &mut PhpScope,
+) {
+    // The grammar emits `<qualifier> :: <name>` with no field names; the first
+    // named child is the class qualifier and the last is the constant / enum
+    // case `name`.
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+    let Some(qualifier) = children.first().copied() else {
+        return;
+    };
+    match qualifier.kind() {
+        "name" | "qualified_name" | "relative_name" => {
+            // A static class qualifier (`Foo::`, but not `self::`/`static::`/
+            // `parent::`, which `extract_php_reference` filters as keywords) is
+            // a Type reference.
+            extract_php_reference(qualifier, ReferenceKind::Type, ctx, owner_id.clone());
+        }
+        _ => {
+            // Dynamic qualifier such as `$class::CONST` — descend so the
+            // variable/expression is still recorded.
+            visit_php_node(qualifier, ctx, None, owner_id.clone(), scope);
+        }
+    }
+    // The accessed constant / enum case (last child) is a Field reference so
+    // enum-case match arms link to the variant rather than degrading to a bare
+    // identifier.
+    if let Some(constant) = children.last().copied()
+        && constant.id() != qualifier.id()
+        && constant.kind() == "name"
+    {
+        extract_php_reference(constant, ReferenceKind::Field, ctx, owner_id);
+    }
+}
+
+fn extract_php_instanceof(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+    scope: &mut PhpScope,
+) {
+    // Descend the left operand normally (it is the tested value).
+    if let Some(left) = node.child_by_field_name("left") {
+        visit_php_node(left, ctx, None, owner_id.clone(), scope);
+    }
+    let Some(right) = node.child_by_field_name("right") else {
+        return;
+    };
+    match right.kind() {
+        "name" | "qualified_name" | "relative_name" => {
+            extract_php_reference(right, ReferenceKind::Type, ctx, owner_id);
+        }
+        _ => {
+            // `$x instanceof $class` — dynamic, descend so the variable lands.
+            visit_php_node(right, ctx, None, owner_id, scope);
+        }
+    }
+}
+
 fn extract_php_property_symbols(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
-    scope: &PhpScope,
+    scope: &mut PhpScope,
 ) {
     let Some((parent_id, parent_kind)) = parent_symbol else {
         return;
@@ -1222,6 +1657,7 @@ fn extract_php_property_symbols(
     ) {
         return;
     }
+    let parent_id = parent_id.clone();
     let attributes_raw = php_attribute_strings(node, ctx.source);
     let modifiers = php_modifier_strings(node, ctx.source);
     let mut base_attributes = php_semantic_attributes(node, &attributes_raw, &modifiers);
@@ -1231,6 +1667,11 @@ fn extract_php_property_symbols(
         .and_then(|node| node_text(node, ctx.source).ok())
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
+    // PHP 8.4 property hooks (`public int $x { get => ...; set { ... } }`)
+    // sit in a single `property_hook_list` alongside the property element.
+    let hook_list = node
+        .children(&mut node.walk())
+        .find(|child| child.kind() == "property_hook_list");
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() != "property_element" {
@@ -1251,13 +1692,16 @@ fn extract_php_property_symbols(
         if let Some(type_text) = type_text.clone() {
             attributes.push(format!("type:{}", last_path_segment(&type_text)));
         }
+        if hook_list.is_some() {
+            attributes.push("php:hooked".to_string());
+        }
         attributes.sort();
         attributes.dedup();
         let signature =
             signature_text(node, child.child_by_field_name("default_value"), ctx.source);
-        let id = symbol_id(&ctx.file, Some(parent_id), SymbolKind::Field, &name, span);
+        let field_id = symbol_id(&ctx.file, Some(&parent_id), SymbolKind::Field, &name, span);
         ctx.symbols.push(ParsedSymbol {
-            id,
+            id: field_id.clone(),
             file_id: ctx.file.id.clone(),
             parent_id: Some(parent_id.clone()),
             name: name.clone(),
@@ -1285,7 +1729,97 @@ fn extract_php_property_symbols(
                 provenance: Provenance::new(PROVENANCE, "property type reference"),
             });
         }
+        if let Some(hook_list) = hook_list {
+            extract_php_property_hooks(hook_list, &field_id, &name, ctx, scope);
+        }
     }
+}
+
+/// Mint a `Method` accessor symbol for each `property_hook` (`get`/`set`) under
+/// `hook_list`, parented to the owning property `Field`, then recurse the hook
+/// body with that accessor as the owner so hook-body calls attribute to the
+/// accessor rather than leaking to the enclosing class.
+fn extract_php_property_hooks(
+    hook_list: Node<'_>,
+    field_id: &SymbolId,
+    field_name: &str,
+    ctx: &mut ExtractContext<'_>,
+    scope: &mut PhpScope,
+) {
+    // Qualify the accessor's member identity by the owning field so two fields
+    // each exposing a `get` hook do not collide on `M:Class.get`.
+    scope.callable_path.push(field_name.to_string());
+    let mut cursor = hook_list.walk();
+    for hook in hook_list.named_children(&mut cursor) {
+        if hook.kind() != "property_hook" {
+            continue;
+        }
+        let mut name_cursor = hook.walk();
+        let Some(name_node) = hook
+            .named_children(&mut name_cursor)
+            .find(|child| child.kind() == "name")
+        else {
+            continue;
+        };
+        let Ok(raw_name) = node_text(name_node, ctx.source) else {
+            continue;
+        };
+        let hook_name = raw_name.trim().to_string();
+        if hook_name.is_empty() {
+            continue;
+        }
+        let span = span_from_node(hook);
+        let body = hook.child_by_field_name("body");
+        let signature = signature_text(hook, body, ctx.source);
+        let attributes_raw = php_attribute_strings(hook, ctx.source);
+        let modifiers = php_modifier_strings(hook, ctx.source);
+        let mut attributes = php_semantic_attributes(hook, &attributes_raw, &modifiers);
+        attributes.push("php:property-hook".to_string());
+        attributes.push(format!("php:accessor:{hook_name}"));
+        attributes.sort();
+        attributes.dedup();
+        let arity = hook
+            .child_by_field_name("parameters")
+            .map(|params| u8::try_from(named_child_count(params)).unwrap_or(u8::MAX));
+        let hook_id = symbol_id(
+            &ctx.file,
+            Some(field_id),
+            SymbolKind::Method,
+            &hook_name,
+            span,
+        );
+        ctx.symbols.push(ParsedSymbol {
+            id: hook_id.clone(),
+            file_id: ctx.file.id.clone(),
+            parent_id: Some(field_id.clone()),
+            name: hook_name.clone(),
+            kind: SymbolKind::Method,
+            language_identity: php_language_identity(SymbolKind::Method, &hook_name, scope),
+            span,
+            body_span: body.map(span_from_node),
+            signature_span: signature_span_from_nodes(hook, body),
+            signature,
+            visibility: None,
+            docs: Vec::new(),
+            attributes,
+            provenance: Provenance::new(PROVENANCE, "property hook accessor"),
+            confidence: Confidence::ExactSyntax,
+            freshness: Freshness::Fresh,
+            arity,
+        });
+        // Re-root descent: the hook body and its parameters belong to the
+        // accessor, so hook-body calls/refs own to the accessor symbol.
+        let next_parent = Some((hook_id.clone(), SymbolKind::Method));
+        let next_owner = Some(hook_id.clone());
+        let mut child_cursor = hook.walk();
+        for child in hook.named_children(&mut child_cursor) {
+            if child.kind() == "name" {
+                continue;
+            }
+            visit_php_node(child, ctx, next_parent.clone(), next_owner.clone(), scope);
+        }
+    }
+    scope.callable_path.pop();
 }
 
 fn extract_php_const_symbols(
@@ -1386,7 +1920,12 @@ fn php_enum_backing_type(node: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
-fn extract_php_symbol_facts(node: Node<'_>, symbol: &ParsedSymbol, ctx: &mut ExtractContext<'_>) {
+fn extract_php_symbol_facts(
+    node: Node<'_>,
+    symbol: &ParsedSymbol,
+    ctx: &mut ExtractContext<'_>,
+    scope: &mut PhpScope,
+) {
     if matches!(
         node.kind(),
         "class_declaration" | "interface_declaration" | "enum_declaration"
@@ -1413,6 +1952,213 @@ fn extract_php_symbol_facts(node: Node<'_>, symbol: &ParsedSymbol, ctx: &mut Ext
         }
         if let Some(return_type) = node.child_by_field_name("return_type") {
             push_php_type_reference(return_type, symbol, ctx, "return type reference");
+        }
+    }
+    // Constructor property promotion (`public readonly Foo $bar` in
+    // `__construct`) mints class-parented Field symbols. Promoted properties
+    // are the dominant modern PHP/Symfony/Laravel state declaration, so they
+    // need to surface as real `Field` symbols rather than vanishing into a
+    // single constructor-owned parameter type reference.
+    if node.kind() == "method_declaration" && symbol.name == "__construct" {
+        extract_php_promoted_fields(node, symbol, ctx, scope);
+    }
+    // Docblock types are the dominant type carrier in real/legacy PHP and the
+    // only place generics like `array<int, User>` appear. Mine the symbol's
+    // `@param`/`@return`/`@var`/... tags for Heuristic Type references.
+    mine_php_docblock_types(symbol, ctx);
+}
+
+fn mine_php_docblock_types(symbol: &ParsedSymbol, ctx: &mut ExtractContext<'_>) {
+    if symbol.docs.is_empty() {
+        return;
+    }
+    let mut seen = HashSet::new();
+    for doc in &symbol.docs {
+        for line in doc.lines() {
+            // Strip the leading ` * ` decoration common to `/** */` blocks.
+            let line = line.trim().trim_start_matches('*').trim();
+            let Some(rest) = line.strip_prefix('@') else {
+                continue;
+            };
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let Some(tag) = parts.next() else {
+                continue;
+            };
+            if !php_docblock_tag_carries_type(tag) {
+                continue;
+            }
+            let Some(remainder) = parts.next() else {
+                continue;
+            };
+            for name in php_docblock_type_names(remainder.trim()) {
+                if seen.insert(name.clone()) {
+                    ctx.references.push(ParsedReference {
+                        file_id: ctx.file.id.clone(),
+                        owner_id: Some(symbol.id.clone()),
+                        text: name,
+                        kind: ReferenceKind::Type,
+                        span: symbol.span,
+                        provenance: Provenance::new(PROVENANCE, "docblock type reference"),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn php_docblock_tag_carries_type(tag: &str) -> bool {
+    // Normalise Psalm/PHPStan vendor prefixes (`@psalm-param`,
+    // `@phpstan-return`) onto their base tag before matching.
+    let base = tag
+        .strip_prefix("psalm-")
+        .or_else(|| tag.strip_prefix("phpstan-"))
+        .unwrap_or(tag);
+    matches!(
+        base,
+        "param"
+            | "return"
+            | "var"
+            | "throws"
+            | "template"
+            | "template-covariant"
+            | "property"
+            | "property-read"
+            | "property-write"
+            | "method"
+    )
+}
+
+fn php_docblock_type_names(remainder: &str) -> Vec<String> {
+    // The type expression is the leading run of the tag body up to the first
+    // top-level whitespace — that boundary ends the type and begins the
+    // `$variable` / description. Spaces *inside* generics (`array<int, User>`)
+    // stay part of the type because they sit at bracket depth > 0.
+    let mut depth: i32 = 0;
+    let mut type_expr = String::new();
+    for ch in remainder.chars() {
+        match ch {
+            '<' | '(' | '[' | '{' => {
+                depth += 1;
+                type_expr.push(ch);
+            }
+            '>' | ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                type_expr.push(ch);
+            }
+            ' ' | '\t' if depth == 0 => break,
+            _ => type_expr.push(ch),
+        }
+    }
+    // Tokenise the bounded type expression on every structural separator and
+    // recover each class-like leaf, dropping keywords and `$var`/`...$var`.
+    type_expr
+        .split(|ch: char| {
+            matches!(
+                ch,
+                '<' | '>' | '|' | '&' | ',' | '(' | ')' | '[' | ']' | '{' | '}' | ':' | ' ' | '\t'
+            )
+        })
+        .filter_map(|token| {
+            let token = token.trim_matches(|ch: char| ch == '?' || ch == '!' || ch == '.');
+            if token.is_empty() || token.starts_with('$') {
+                return None;
+            }
+            php_type_name_from_annotation(token)
+        })
+        .collect()
+}
+
+fn extract_php_promoted_fields(
+    method_node: Node<'_>,
+    method_symbol: &ParsedSymbol,
+    ctx: &mut ExtractContext<'_>,
+    scope: &mut PhpScope,
+) {
+    // Promoted fields are parented to the enclosing class, which is the
+    // constructor's own parent. Without a class parent (e.g. a stray
+    // `__construct` at file scope) there is nothing to promote onto.
+    let Some(class_id) = method_symbol.parent_id.clone() else {
+        return;
+    };
+    let Some(parameters) = method_node.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter.kind() != "property_promotion_parameter" {
+            continue;
+        }
+        let Some(name_node) = parameter.child_by_field_name("name") else {
+            continue;
+        };
+        let Ok(raw_name) = node_text(name_node, ctx.source) else {
+            continue;
+        };
+        let name = raw_name.trim().trim_start_matches('$').to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let attributes_raw = php_attribute_strings(parameter, ctx.source);
+        let modifiers = php_modifier_strings(parameter, ctx.source);
+        let mut attributes = php_semantic_attributes(parameter, &attributes_raw, &modifiers);
+        attributes.push("php:field".to_string());
+        attributes.push("php:promoted".to_string());
+        let type_text = parameter
+            .child_by_field_name("type")
+            .and_then(|node| node_text(node, ctx.source).ok())
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        if let Some(type_text) = type_text.clone() {
+            attributes.push(format!("type:{}", last_path_segment(&type_text)));
+        }
+        // A hooked promoted param carries its `property_hook_list` as a plain
+        // child of the parameter.
+        let hook_list = parameter
+            .children(&mut parameter.walk())
+            .find(|child| child.kind() == "property_hook_list");
+        if hook_list.is_some() {
+            attributes.push("php:hooked".to_string());
+        }
+        attributes.sort();
+        attributes.dedup();
+        let span = span_from_node(parameter);
+        let field_id = symbol_id(&ctx.file, Some(&class_id), SymbolKind::Field, &name, span);
+        ctx.symbols.push(ParsedSymbol {
+            id: field_id.clone(),
+            file_id: ctx.file.id.clone(),
+            parent_id: Some(class_id.clone()),
+            name: name.clone(),
+            kind: SymbolKind::Field,
+            language_identity: php_language_identity(SymbolKind::Field, &name, scope),
+            span,
+            body_span: None,
+            signature_span: None,
+            signature: node_text(parameter, ctx.source)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            visibility: php_visibility(&modifiers),
+            docs: Vec::new(),
+            attributes,
+            provenance: Provenance::new(PROVENANCE, "constructor property promotion"),
+            confidence: Confidence::ExactSyntax,
+            freshness: Freshness::Fresh,
+            arity: None,
+        });
+        if let Some(type_text) = type_text {
+            for type_name in php_type_names_from_annotation(&type_text) {
+                ctx.references.push(ParsedReference {
+                    file_id: ctx.file.id.clone(),
+                    owner_id: Some(class_id.clone()),
+                    text: type_name,
+                    kind: ReferenceKind::Type,
+                    span,
+                    provenance: Provenance::new(PROVENANCE, "promoted property type reference"),
+                });
+            }
+        }
+        if let Some(hook_list) = hook_list {
+            extract_php_property_hooks(hook_list, &field_id, &name, ctx, scope);
         }
     }
 }
@@ -1541,6 +2287,65 @@ fn is_php_magic_method(name: &str) -> bool {
             | "__set_state"
             | "__debugInfo"
     )
+}
+
+fn php_is_test_method(
+    node: Node<'_>,
+    name: &str,
+    attributes_raw: &[String],
+    source: &str,
+    relative_path: &str,
+) -> bool {
+    // PHPUnit attribute markers (`#[Test]`, `#[DataProvider]`, `#[TestWith]`,
+    // `#[TestDox]`) are an unambiguous signal.
+    if attributes_raw.iter().any(|attribute| {
+        matches!(
+            php_attribute_head(attribute).as_str(),
+            "Test" | "DataProvider" | "TestWith" | "TestDox" | "Group" | "CoversClass"
+        )
+    }) {
+        return true;
+    }
+    // The classic `test*`-prefix convention, but only inside a test context
+    // (a `*Test.php` file or a `TestCase`-derived class) so a stray
+    // `testimony()` helper in production code is not misclassified.
+    php_method_name_is_test_prefixed(name)
+        && (php_is_test_filename(relative_path) || php_method_in_testcase_class(node, source))
+}
+
+fn php_method_name_is_test_prefixed(name: &str) -> bool {
+    // `test` followed by an uppercase letter or underscore — matches
+    // `testFoo`/`test_foo` but not `testimony`.
+    let Some(rest) = name.strip_prefix("test") else {
+        return false;
+    };
+    rest.chars()
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_uppercase())
+}
+
+fn php_is_test_filename(relative_path: &str) -> bool {
+    let file_name = relative_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(relative_path);
+    let stem = file_name.strip_suffix(".php").unwrap_or(file_name);
+    stem.ends_with("Test") || stem.ends_with("TestCase")
+}
+
+fn php_method_in_testcase_class(node: Node<'_>, source: &str) -> bool {
+    // Walk up to the enclosing class and check its base list for a
+    // `TestCase` ancestor (PHPUnit's base class, optionally namespaced).
+    let mut walker = node;
+    while let Some(parent) = walker.parent() {
+        if matches!(parent.kind(), "class_declaration" | "anonymous_class") {
+            return php_collect_base_types(parent, source)
+                .iter()
+                .any(|base| base == "TestCase");
+        }
+        walker = parent;
+    }
+    false
 }
 
 fn is_php_implicit_dispatch_target(name: &str) -> bool {

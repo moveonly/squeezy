@@ -36,6 +36,8 @@ pub(crate) fn visit_node(
     let kind = node.kind();
     if kind == "use_declaration" {
         extract_import(node, ctx, owner_symbol.clone());
+    } else if kind == "extern_crate_declaration" {
+        extract_extern_crate(node, ctx, owner_symbol.clone());
     }
 
     if let Some(symbol) = symbol_from_node(node, ctx, parent_symbol.clone()) {
@@ -110,6 +112,10 @@ pub(crate) fn symbol_from_node(
     if kind == SymbolKind::Function && is_test_function(&attributes) {
         kind = SymbolKind::Test;
     }
+    // Doc comments must be read from the literal `#[doc = ...]`/`///` attributes
+    // before we append synthesized `derive:`/`cfg:` tokens, otherwise the
+    // `attribute_path == "doc"` filter would have to skip the new tokens too.
+    let docs = docs_from_attributes(&attributes);
     // Record the declared type of a struct field as a queryable `type:` attribute,
     // mirroring the Java/Kotlin field extractors so `decl_search attribute=type:X`
     // and field hierarchy listings expose it.
@@ -117,14 +123,49 @@ pub(crate) fn symbol_from_node(
         && let Some(field_type) = rust_field_type(node, ctx.source)
     {
         attributes.push(format!("type:{field_type}"));
-        attributes.sort();
-        attributes.dedup();
     }
+    // Normalize `#[derive(..)]`/`#[cfg(..)]` and other attribute items into
+    // queryable tokens (`derive:Serialize`, `cfg:<predicate>`, `rust:attr:<path>`)
+    // so `decl_search attribute=derive:X` and cfg filtering work, mirroring the
+    // C#/Java/JS-TS normalized-attribute passes.
+    attributes.extend(rust_semantic_attributes(&attributes));
+    // Supertrait bounds (`trait Sub: Super`) live in the `bounds` field, not as
+    // literal `#[..]` attributes; expose each as a `base:` token so Rust trait
+    // hierarchies are queryable the same way Python/JS-TS class bases are.
+    if kind == SymbolKind::Trait {
+        attributes.extend(
+            rust_supertrait_bases(node, ctx.source)
+                .into_iter()
+                .map(|base| format!("base:{base}")),
+        );
+    }
+    // Record the impl's self-type and (optional) trait as queryable tokens so an
+    // inheritance-edge builder can emit Implements/Extends/InherentImpl/TraitImpl
+    // without re-parsing the impl header string on every query.
+    if kind == SymbolKind::Impl {
+        if let Some(self_type) = rust_impl_self_type(node, ctx.source) {
+            attributes.push(format!("impl-for:{self_type}"));
+        }
+        if let Some(trait_name) = rust_impl_trait(node, ctx.source) {
+            attributes.push(format!("impl-trait:{trait_name}"));
+        }
+    }
+    attributes.sort();
+    attributes.dedup();
 
     let name = symbol_name(node, kind, ctx.source)?;
     if kind == SymbolKind::Const && name == "_" {
         return None;
     }
+    // Store the bare self-type on the Impl symbol's `language_identity` (as a
+    // `T:<type>` token, matching the C# convention) so cross-file self-type
+    // attribution and the partials index can read a stored identity instead of
+    // re-running the impl-header string match on every query.
+    let language_identity = if kind == SymbolKind::Impl {
+        rust_impl_self_type(node, ctx.source).map(|self_type| format!("T:{self_type}"))
+    } else {
+        None
+    };
     let body = node.child_by_field_name("body");
     let span = span_from_node(node);
     let body_span = body.map(span_from_node);
@@ -141,6 +182,14 @@ pub(crate) fn symbol_from_node(
     } else {
         None
     };
+    // cfg-gated items can be compiled out; downgrade their confidence to
+    // ConditionalUnknown (mirroring C/C++ `preprocessor:conditional`) since a
+    // single-config parse cannot know whether the symbol is actually present.
+    let confidence = if attributes.iter().any(|attr| attr == "rust:conditional") {
+        Confidence::ConditionalUnknown
+    } else {
+        Confidence::ExactSyntax
+    };
 
     Some(ParsedSymbol {
         id,
@@ -148,16 +197,16 @@ pub(crate) fn symbol_from_node(
         parent_id: parent_symbol,
         name,
         kind,
-        language_identity: None,
+        language_identity,
         span,
         body_span,
         signature_span,
         signature,
         visibility,
-        docs: docs_from_attributes(&attributes),
+        docs,
         attributes,
         provenance: Provenance::new("tree-sitter-rust", format!("{} declaration", node.kind())),
-        confidence: Confidence::ExactSyntax,
+        confidence,
         freshness: Freshness::Fresh,
         arity,
     })
@@ -1088,18 +1137,6 @@ pub(crate) fn java_docs_for_node(node: Node<'_>, source: &str) -> Vec<String> {
     docs
 }
 
-pub(crate) fn java_type_inheritance_names(node: Node<'_>, source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    for field in ["superclass", "interfaces"] {
-        if let Some(child) = node.child_by_field_name(field) {
-            collect_java_type_names(child, source, &mut names);
-        }
-    }
-    names.sort();
-    names.dedup();
-    names
-}
-
 pub(crate) fn collect_java_type_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {
     if matches!(
         node.kind(),
@@ -1740,6 +1777,115 @@ pub(crate) fn attribute_path(attribute: &str) -> Option<String> {
     }
 }
 
+/// Normalize the raw `#[..]` attribute strings already collected for a symbol
+/// into queryable tokens:
+///
+/// - `#[derive(Serialize, Clone)]` -> `derive:Serialize`, `derive:Clone`
+/// - `#[cfg(feature = "x")]` / `#[cfg_attr(..)]` -> `cfg:<predicate>` plus a
+///   `rust:conditional` marker used to downgrade the symbol confidence.
+/// - any other attribute path -> `rust:attr:<path>` so the bare attribute name
+///   is searchable without scanning the raw string.
+///
+/// The input is the raw attribute list (each element looks like `#[..]` or
+/// `#![..]`); the returned tokens are appended to the symbol's attributes.
+pub(crate) fn rust_semantic_attributes(raw_attributes: &[String]) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for attribute in raw_attributes {
+        let Some(path) = attribute_path(attribute) else {
+            continue;
+        };
+        let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+        match leaf {
+            "derive" => {
+                for name in rust_attribute_inner_paths(attribute) {
+                    let trait_name = last_path_segment(&name);
+                    if !trait_name.is_empty() {
+                        tokens.push(format!("derive:{trait_name}"));
+                    }
+                }
+            }
+            "cfg" | "cfg_attr" => {
+                tokens.push("rust:conditional".to_string());
+                if let Some(predicate) = rust_attribute_arguments(attribute) {
+                    let predicate = collapse_whitespace(&predicate);
+                    if !predicate.is_empty() {
+                        tokens.push(format!("cfg:{predicate}"));
+                    }
+                }
+                tokens.push(format!("rust:attr:{path}"));
+            }
+            "doc" => {}
+            _ => tokens.push(format!("rust:attr:{path}")),
+        }
+    }
+    tokens
+}
+
+/// Return the comma-separated argument list inside an attribute's `(..)`, e.g.
+/// `#[derive(Serialize, Clone)]` -> `"Serialize, Clone"`. Returns `None` for
+/// attributes with no parenthesized arguments (`#[inline]`, `#[doc = "x"]`).
+fn rust_attribute_arguments(attribute: &str) -> Option<String> {
+    let open = attribute.find('(')?;
+    let close = matching_close_paren(attribute, open)?;
+    Some(attribute[open + 1..close].trim().to_string())
+}
+
+/// Split the parenthesized arguments of a `#[derive(..)]` attribute into the
+/// individual trait paths, ignoring nested generics/commas.
+fn rust_attribute_inner_paths(attribute: &str) -> Vec<String> {
+    let Some(args) = rust_attribute_arguments(attribute) else {
+        return Vec::new();
+    };
+    split_top_level_commas(&args)
+        .into_iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+/// The self-type of an `impl_item` (`impl Foo`, `impl Trait for Foo`), reduced
+/// to its final path segment with generics/refs stripped.
+pub(crate) fn rust_impl_self_type(node: Node<'_>, source: &str) -> Option<String> {
+    let type_node = node.child_by_field_name("type")?;
+    let raw = node_text(type_node, source).ok()?;
+    let name = rust_type_name_from_text(raw);
+    (!name.is_empty()).then_some(name)
+}
+
+/// The implemented trait of an `impl Trait for Type` block, reduced to its
+/// final path segment. `None` for inherent impls (`impl Foo { .. }`).
+pub(crate) fn rust_impl_trait(node: Node<'_>, source: &str) -> Option<String> {
+    let trait_node = node.child_by_field_name("trait")?;
+    let raw = node_text(trait_node, source).ok()?;
+    let name = rust_type_name_from_text(raw);
+    (!name.is_empty()).then_some(name)
+}
+
+/// Collect the supertrait names from a `trait_item`'s `bounds` field
+/// (`trait Sub: Super + Other`). Lifetimes and `?Sized`-style markers are
+/// dropped; each remaining bound is reduced to its final path segment.
+pub(crate) fn rust_supertrait_bases(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(bounds) = node.child_by_field_name("bounds") else {
+        return Vec::new();
+    };
+    let mut bases = Vec::new();
+    let mut cursor = bounds.walk();
+    for child in bounds.named_children(&mut cursor) {
+        if child.kind() == "lifetime" {
+            continue;
+        }
+        let Ok(raw) = node_text(child, source) else {
+            continue;
+        };
+        let trimmed = raw.trim().trim_start_matches('?').trim();
+        let name = rust_type_name_from_text(trimmed);
+        if !name.is_empty() {
+            bases.push(name);
+        }
+    }
+    bases
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 
 struct ImportSpec {
@@ -1907,6 +2053,50 @@ pub(crate) fn extract_import(
             is_global: false,
         });
     }
+}
+
+/// Handle `extern crate foo;` / `extern crate foo as bar;`. The 2015-edition
+/// and `no_std`/proc-macro syntax is parsed by tree-sitter as a dedicated
+/// `extern_crate_declaration` node (distinct from `use_declaration`), so it is
+/// never routed through `extract_import`. We emit a `Named` import for the crate
+/// name, honoring the `as` alias, so the crate dependency is visible to the
+/// import graph and `Imports` edge resolution.
+pub(crate) fn extract_extern_crate(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let Some(name) = node
+        .child_by_field_name("name")
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+    else {
+        return;
+    };
+    let alias = node
+        .child_by_field_name("alias")
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty() && text != "_");
+    let is_reexport = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim_start()
+        .starts_with("pub");
+    ctx.imports.push(ParsedImport {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        is_glob: false,
+        is_reexport,
+        is_static: false,
+        path: name.clone(),
+        alias,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-rust", "extern crate declaration"),
+        kind: ImportKind::Named,
+        imported_name: Some(name),
+        is_global: false,
+    });
 }
 
 pub(crate) fn extract_direct_call(

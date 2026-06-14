@@ -155,6 +155,12 @@ fn visit_scala_node(
             // reference for the wrapper node text itself.
             visit_scala_children(node, ctx, parent_symbol, owner_symbol, inside_inline);
         }
+        "case_class_pattern" => {
+            extract_scala_case_class_pattern(node, ctx, owner_symbol.clone());
+            // Recurse so the extractor type emits its Type reference and any
+            // nested `case_class_pattern`s emit their own unapply calls.
+            visit_scala_children(node, ctx, parent_symbol, owner_symbol, inside_inline);
+        }
         "annotation" => {
             extract_scala_annotation(node, ctx, owner_symbol.clone());
             visit_scala_children(node, ctx, parent_symbol, owner_symbol, inside_inline);
@@ -257,11 +263,21 @@ fn scala_symbol_from_node(
         kind,
         SymbolKind::Class | SymbolKind::Struct | SymbolKind::Trait | SymbolKind::Enum
     ) {
-        attributes.extend(
-            scala_extends_names(node, ctx.source)
-                .into_iter()
-                .map(|base| format!("base:{base}")),
-        );
+        attributes.extend(scala_inheritance_attributes(node, ctx.source));
+        attributes.extend(scala_derives_attributes(node, ctx.source));
+        attributes.extend(scala_self_type_attributes(node, ctx.source));
+    }
+    if matches!(
+        kind,
+        SymbolKind::Class
+            | SymbolKind::Struct
+            | SymbolKind::Trait
+            | SymbolKind::Enum
+            | SymbolKind::Function
+            | SymbolKind::Method
+            | SymbolKind::TypeAlias
+    ) {
+        attributes.extend(scala_type_parameter_bound_attributes(node, ctx.source));
     }
     if is_case_class {
         attributes.push("scala:case-class".to_string());
@@ -283,6 +299,17 @@ fn scala_symbol_from_node(
     {
         // Scala 2 implicit def → implicit conversion candidate.
         attributes.push("scala:implicit-conversion".to_string());
+    }
+    if matches!(node_kind, "function_definition" | "function_declaration") {
+        // Companion/object `apply` is a factory; `unapply`/`unapplySeq` is the
+        // extractor invoked by pattern-match deconstruction. Tag them so
+        // factory/extractor sites are queryable and the bare `Type(args)` →
+        // companion `apply` resolution has a marker to dispatch against.
+        match name.as_str() {
+            "apply" => attributes.push("scala:factory".to_string()),
+            "unapply" | "unapplySeq" => attributes.push("scala:extractor".to_string()),
+            _ => {}
+        }
     }
     if scala_modifier_present(node, ctx.source, "sealed") {
         attributes.push("scala:sealed".to_string());
@@ -653,15 +680,229 @@ fn scala_anonymous_given_name(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-fn scala_extends_names(node: Node<'_>, source: &str) -> Vec<String> {
-    let mut names = Vec::new();
+/// Emit ordered inheritance attributes for a class/trait/enum: the first
+/// supertype in the `extends` clause is the superclass (`base:`), every
+/// subsequent `with`-mixin or comma-separated parent is a trait mixin
+/// (`mixin:`). Order is significant — Scala loses no information at parse time
+/// about which parent is the primary super and which are mixed-in traits, so we
+/// must not sort before splitting. The `compound_type` form (`extends A with B`
+/// collapsed into one node) separates `base` from `extra` structurally.
+fn scala_inheritance_attributes(node: Node<'_>, source: &str) -> Vec<String> {
     let Some(extend) = node.child_by_field_name("extend") else {
-        return names;
+        return Vec::new();
     };
-    collect_scala_type_names(extend, source, &mut names);
-    names.sort();
-    names.dedup();
-    names
+    let mut names = Vec::new();
+    scala_collect_constructor_applications(extend, source, &mut names);
+    let mut attributes = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (index, name) in names.into_iter().enumerate() {
+        // First parent is the superclass; the rest are mixed-in traits. A
+        // single type still emits a `base:` so the generic inheritance pass can
+        // lower it to an Extends/Implements edge.
+        let prefix = if index == 0 { "base" } else { "mixin" };
+        let attribute = format!("{prefix}:{name}");
+        if seen.insert(attribute.clone()) {
+            attributes.push(attribute);
+        }
+    }
+    attributes
+}
+
+/// Walk the `extends_clause`'s `type` field, which is a `_constructor_applications`
+/// (either comma-separated or `with`-separated constructor applications), pushing
+/// each parent type's leaf name in source order. A `compound_type` constructor
+/// application contributes its `base` first, then each `extra` mixin.
+fn scala_collect_constructor_applications(node: Node<'_>, source: &str, names: &mut Vec<String>) {
+    let mut cursor = node.walk();
+    for child in node.children_by_field_name("type", &mut cursor) {
+        scala_collect_ordered_type_names(child, source, names);
+    }
+}
+
+/// Push the ordered leaf type names contributed by a single constructor
+/// application. `compound_type` is handled specially so the structural
+/// base/extra split is preserved in emission order; everything else falls back
+/// to the recursive leaf collector.
+fn scala_collect_ordered_type_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {
+    if node.kind() == "compound_type" {
+        if let Some(base) = node.child_by_field_name("base") {
+            collect_scala_type_names(base, source, names);
+        }
+        let mut cursor = node.walk();
+        for extra in node.children_by_field_name("extra", &mut cursor) {
+            collect_scala_type_names(extra, source, names);
+        }
+        return;
+    }
+    collect_scala_type_names(node, source, names);
+}
+
+/// Read the Scala 3 `derives` clause, recording each derived typeclass as a
+/// `derives:<Typeclass>` attribute so "which types derive X" is a structured
+/// query rather than an undifferentiated `Type` mention.
+fn scala_derives_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(derive) = node.child_by_field_name("derive") else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut cursor = derive.walk();
+    for child in derive.children_by_field_name("type", &mut cursor) {
+        collect_scala_type_names(child, source, &mut names);
+    }
+    let mut attributes = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for name in names {
+        let attribute = format!("derives:{name}");
+        if seen.insert(attribute.clone()) {
+            attributes.push(attribute);
+        }
+    }
+    attributes
+}
+
+/// Record cake-pattern self-type constraints (`self: T with U =>`) as
+/// `scala:self-type:<T>` attributes on the enclosing trait/class so required
+/// mixins are enumerable. The `self_type` node lives directly inside the
+/// `template_body`; its leading self-identifier is skipped and only the ascribed
+/// types are recorded.
+fn scala_self_type_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut attributes = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut cursor = node.walk();
+    for body in node.children_by_field_name("body", &mut cursor) {
+        let mut body_cursor = body.walk();
+        for child in body.named_children(&mut body_cursor) {
+            if child.kind() != "self_type" {
+                continue;
+            }
+            let mut names = Vec::new();
+            let mut self_cursor = child.walk();
+            for component in child.named_children(&mut self_cursor) {
+                // Skip the leading self-identifier (`self`); only the ascribed
+                // types after the `:` are required mixins.
+                if matches!(component.kind(), "identifier" | "operator_identifier") {
+                    continue;
+                }
+                collect_scala_type_names(component, source, &mut names);
+            }
+            for name in names {
+                let attribute = format!("scala:self-type:{name}");
+                if seen.insert(attribute.clone()) {
+                    attributes.push(attribute);
+                }
+            }
+        }
+    }
+    attributes
+}
+
+/// Extract type-parameter bounds as structured attributes:
+/// - context (`T: Ordering`) and view (`T <% X`) bounds → `bound:<Typeclass>`
+/// - upper bounds (`T <: Foo`) → `upper-bound:<Foo>`
+/// - lower bounds (`T >: Bar`) → `lower-bound:<Bar>`
+///
+/// Bounds appear on the `type_parameters` node directly (the `bound` field) and
+/// on each variant param child (`covariant_type_parameter` /
+/// `contravariant_type_parameter`). For functions the `type_parameters` node is
+/// one of the (multiple) `parameters` field entries; for classes/traits/enums
+/// it is the dedicated `type_parameters` field.
+fn scala_type_parameter_bound_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut attributes = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for type_params in scala_type_parameter_nodes(node) {
+        scala_collect_type_parameter_bounds(type_params, source, &mut attributes, &mut seen);
+    }
+    attributes
+}
+
+/// Collect every `type_parameters` node attached to a declaration: the
+/// dedicated `type_parameters` field (classes/traits/enums/type aliases) and any
+/// `type_parameters` appearing among a function's `parameters` field entries.
+fn scala_type_parameter_nodes<'a>(node: Node<'a>) -> Vec<Node<'a>> {
+    let mut nodes = Vec::new();
+    if let Some(direct) = node.child_by_field_name("type_parameters") {
+        nodes.push(direct);
+    }
+    let mut cursor = node.walk();
+    for child in node.children_by_field_name("parameters", &mut cursor) {
+        if child.kind() == "type_parameters" {
+            nodes.push(child);
+        }
+    }
+    nodes
+}
+
+/// Walk a `type_parameters` node, mapping its `bound` field entries and the
+/// bounds nested in variant param children to structured attributes.
+fn scala_collect_type_parameter_bounds(
+    type_params: Node<'_>,
+    source: &str,
+    attributes: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let mut cursor = type_params.walk();
+    for bound in type_params.children_by_field_name("bound", &mut cursor) {
+        scala_push_bound_attribute(bound, source, attributes, seen);
+    }
+    let mut child_cursor = type_params.walk();
+    for child in type_params.named_children(&mut child_cursor) {
+        if matches!(
+            child.kind(),
+            "covariant_type_parameter" | "contravariant_type_parameter"
+        ) {
+            let mut inner = child.walk();
+            for bound in child.children_by_field_name("bound", &mut inner) {
+                scala_push_bound_attribute(bound, source, attributes, seen);
+            }
+        }
+    }
+}
+
+/// Map a single bound node to its attribute prefix and push one attribute per
+/// constraint type. Unknown bound kinds are ignored.
+fn scala_push_bound_attribute(
+    bound: Node<'_>,
+    source: &str,
+    attributes: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let prefix = match bound.kind() {
+        // Context/view bounds name a typeclass the parameter must satisfy.
+        "context_bound" | "view_bound" => "bound",
+        "upper_bound" => "upper-bound",
+        "lower_bound" => "lower-bound",
+        _ => return,
+    };
+    let Some(type_node) = bound.child_by_field_name("type") else {
+        return;
+    };
+    // Record the head type name (the typeclass / bound type itself), not the
+    // nested type arguments — `T: Numeric` and `T <: Comparable[T]` should
+    // record `Numeric` / `Comparable`, not the parameter `T`.
+    let Some(name) = scala_head_type_name(type_node, source) else {
+        return;
+    };
+    let attribute = format!("{prefix}:{name}");
+    if seen.insert(attribute.clone()) {
+        attributes.push(attribute);
+    }
+}
+
+/// The head (constructor) type name of a type node: for a plain
+/// `type_identifier` it is the identifier; for a `generic_type` /
+/// `applied_constructor_type` it is the applied constructor, ignoring the type
+/// arguments. Returns `None` for shapes with no leading nominal type.
+fn scala_head_type_name(node: Node<'_>, source: &str) -> Option<String> {
+    if matches!(node.kind(), "type_identifier" | "stable_type_identifier") {
+        return node_text(node, source)
+            .ok()
+            .and_then(scala_type_name_from_text);
+    }
+    // `generic_type` / `applied_constructor_type` (and any other wrapper) defer
+    // to their first child that yields a nominal head type.
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| scala_head_type_name(child, source))
 }
 
 fn collect_scala_type_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {
@@ -1098,6 +1339,44 @@ fn extract_scala_instance(
         text: target_text,
         kind: BodyHitKind::Call,
         span: span_from_node(node),
+    });
+}
+
+/// A `case Foo(x, y)` deconstruction invokes the extractor's `unapply` (or
+/// `unapplySeq`) — synthesized for case classes, user-defined for custom
+/// extractors. Emit a synthetic `unapply` `Method` call with the pattern type
+/// as receiver so "where is this extractor used" resolves to a call, not just a
+/// bare Type mention. Heuristic confidence: which `unapply` overload runs is a
+/// type-checker decision.
+fn extract_scala_case_class_pattern(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
+    let receiver = match node_text(type_node, ctx.source) {
+        Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
+        _ => return,
+    };
+    // The number of bound sub-patterns approximates the extracted arity.
+    let arity = node
+        .children_by_field_name("pattern", &mut node.walk())
+        .filter(|child| child.is_named())
+        .count();
+    let span = span_from_node(node);
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id,
+        name: "unapply".to_string(),
+        target_text: format!("{receiver}.unapply"),
+        receiver: Some(receiver),
+        arity,
+        kind: ParsedCallKind::Method,
+        span,
+        provenance: Provenance::new("tree-sitter-scala", "case_class_pattern unapply"),
+        confidence: Confidence::Heuristic,
     });
 }
 

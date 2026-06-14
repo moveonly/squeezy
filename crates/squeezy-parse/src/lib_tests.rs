@@ -1418,7 +1418,7 @@ record Helper(String name) {
             && symbol.kind == SymbolKind::Class
             && symbol.visibility.as_deref() == Some("public")
             && symbol.attributes.contains(&"base:BaseRunner".to_string())
-            && symbol.attributes.contains(&"base:Runnable".to_string())
+            && symbol.attributes.contains(&"iface:Runnable".to_string())
     }));
     assert!(
         parsed
@@ -1624,14 +1624,16 @@ data class Person(val name: String, val age: Int)
     assert_eq!(greeter.kind, SymbolKind::Trait);
     assert!(greeter.attributes.contains(&"kotlin:sealed".to_string()));
 
-    // delegation base recorded on FriendlyGreeter
+    // interface delegation recorded as iface: on FriendlyGreeter (Greeter is a
+    // sealed interface; Kotlin superclasses always carry `()`, so a bare `:
+    // Greeter` is interface conformance).
     let friendly = parsed
         .symbols
         .iter()
         .find(|symbol| symbol.name == "FriendlyGreeter")
         .expect("FriendlyGreeter class");
     assert_eq!(friendly.kind, SymbolKind::Class);
-    assert!(friendly.attributes.contains(&"base:Greeter".to_string()));
+    assert!(friendly.attributes.contains(&"iface:Greeter".to_string()));
 
     // companion-object child re-parented to host class
     let create = parsed
@@ -3666,11 +3668,13 @@ func freeFunction() -> Int { return 1 }
     );
 
     let user_endpoint = by_name("UserEndpoint", SymbolKind::Struct).expect("UserEndpoint struct");
+    // Endpoint is a protocol and UserEndpoint is a struct, so the conformance is
+    // an interface (`iface:`), not a superclass (`base:`).
     assert!(
         user_endpoint
             .attributes
             .iter()
-            .any(|a| a == "base:Endpoint")
+            .any(|a| a == "iface:Endpoint")
     );
 
     assert!(by_name("Endpoint", SymbolKind::Trait).is_some(), "protocol");

@@ -209,6 +209,13 @@ fn visit_swift_node(
             extract_swift_attribute_reference(node, ctx, owner_symbol.clone());
             visit_swift_children(node, ctx, parent_symbol, owner_symbol, extension_owner);
         }
+        "macro_invocation" => {
+            // Freestanding macro use, e.g. `#stringify(x)`. Emit a `Macro`-kind
+            // call so the generic resolver materializes an `InvokesMacro` edge
+            // from the surrounding owner to the macro declaration.
+            extract_swift_macro_invocation(node, ctx, owner_symbol.clone());
+            visit_swift_children(node, ctx, parent_symbol, owner_symbol, extension_owner);
+        }
         "type_identifier" | "user_type" | "simple_user_type" => {
             if !swift_node_is_declaration_name(node) {
                 extract_swift_type_reference(node, ctx, owner_symbol.clone());
@@ -303,6 +310,25 @@ fn swift_symbol_from_node(
         "deinit_declaration" => (SymbolKind::Method, "deinit".to_string()),
         "subscript_declaration" => (SymbolKind::Method, "subscript".to_string()),
         "typealias_declaration" => (SymbolKind::TypeAlias, "typealias".to_string()),
+        // A protocol's `associatedtype Foo: Bar` is the one protocol-member
+        // kind that was previously unmatched. Model it as a TypeAlias so
+        // decl/definition search can find it; its `must_inherit` / `where`
+        // constraints surface as `iface:` attributes below.
+        "associatedtype_declaration" => (SymbolKind::TypeAlias, "associatedtype".to_string()),
+        // Custom operator declarations (`infix operator <=>`) and
+        // `precedencegroup` declarations are the canonical definition sites of
+        // public-API operators. They have no `name` field — the name is a
+        // `custom_operator` / `simple_identifier` child — so `swift_symbol_name`
+        // resolves them via a dedicated path below. Modelled as `Const` since
+        // they are nominal, value-like declarations with no body or callable
+        // signature.
+        "operator_declaration" => (SymbolKind::Const, "operator".to_string()),
+        "precedence_group_declaration" => (SymbolKind::Const, "precedencegroup".to_string()),
+        // `macro Foo(...) = #externalMacro(...)` — a macro definition site. The
+        // generic resolver already turns a `Macro`-kind call into an
+        // `InvokesMacro` edge, so emitting the symbol enables def→use macro
+        // navigation. No `name` field; the name is a `simple_identifier` child.
+        "macro_declaration" => (SymbolKind::Macro, "macro".to_string()),
         "enum_entry" => return None, // handled separately, multiple symbols per node
         _ => return None,
     };
@@ -331,16 +357,48 @@ fn swift_symbol_from_node(
         "init_declaration" => attributes.push("swift:init".to_string()),
         "deinit_declaration" => attributes.push("swift:deinit".to_string()),
         "subscript_declaration" => attributes.push("swift:subscript".to_string()),
+        "operator_declaration" => attributes.push("swift:operator".to_string()),
+        "precedence_group_declaration" => attributes.push("swift:precedencegroup".to_string()),
         _ => {}
     }
     if matches!(
         kind,
         SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Trait
     ) {
+        // Swift's grammar lists every supertype and protocol conformance under
+        // an identical `inheritance_specifier`, so we split them by language
+        // rule: only a `class` may declare a superclass, and Swift requires it
+        // to be the first listed type. Everything that follows (and every
+        // supertype of a struct/enum/protocol/actor) is a protocol conformance.
+        // The superclass becomes `base:` (lowered to `Extends`); conformances
+        // become `iface:` (lowered to `Implements`) by the shared generic
+        // inheritance-edge pass in `squeezy-graph`.
+        let (bases, mut ifaces) = swift_categorized_inheritance(node, &decl_kind_text, ctx.source);
+        // A RawRepresentable enum (`enum E: Int { ... }`) lists its raw backing
+        // type first, syntactically identical to a protocol conformance. When
+        // detected, record it as `swift:rawtype:<T>` rather than `iface:<T>` so
+        // the backing type isn't mistaken for a conformed protocol.
+        if kind == SymbolKind::Enum
+            && let Some(raw_type) = swift_enum_raw_backing_type(node, &ifaces)
+        {
+            // The raw type is always the first listed supertype; drop it from
+            // the conformance list and stamp the dedicated attribute.
+            if ifaces.first() == Some(&raw_type) {
+                ifaces.remove(0);
+            }
+            attributes.push(format!("swift:rawtype:{raw_type}"));
+        }
+        attributes.extend(bases.into_iter().map(|base| format!("base:{base}")));
+        attributes.extend(ifaces.into_iter().map(|iface| format!("iface:{iface}")));
+    }
+    if node.kind() == "associatedtype_declaration" {
+        // `associatedtype Foo: Bar` and `associatedtype Foo where Bar: X`
+        // constrain the associated type to conform to a protocol — record it
+        // like a conformance so the constraint survives decl/definition search.
         attributes.extend(
-            swift_inheritance_names(node, ctx.source)
+            swift_associatedtype_constraints(node, ctx.source)
                 .into_iter()
-                .map(|base| format!("base:{base}")),
+                .map(|c| format!("iface:{c}")),
         );
     }
     if matches!(
@@ -401,10 +459,24 @@ fn swift_property_symbols_from_node(
     if let Some(field_type) = swift_property_type(node, ctx.source) {
         attributes.push(format!("type:{field_type}"));
     }
+    // `lazy` parses as a `property_behavior_modifier`. The grammar may place it
+    // inside the `modifiers` node (handled by `swift_attributes_for_node`) or
+    // directly under the `property_declaration`; cover the direct-child case so
+    // `lazy var` reliably carries `swift:lazy`, consistent with weak/unowned.
+    if swift_has_named_child_kind(node, "property_behavior_modifier") {
+        attributes.push("swift:lazy".to_string());
+    }
     if node.child_by_field_name("computed_value").is_some()
         || node.kind() == "protocol_property_declaration"
     {
         attributes.push("swift:computed".to_string());
+    }
+    // A stored property with `willSet`/`didSet` observers parses a
+    // `willset_didset_block` child. Mark it `swift:observed` so it is
+    // distinguishable from a plain stored property (observer-body calls
+    // already attribute to the property via the visitor's `next_owner`).
+    if swift_has_named_child_kind(node, "willset_didset_block") {
+        attributes.push("swift:observed".to_string());
     }
     attributes.sort();
     attributes.dedup();
@@ -464,7 +536,22 @@ fn swift_enum_entry_symbols(
     let visibility = swift_visibility_text(node, ctx.source);
     let docs = swift_docs_for_node(node, ctx.source);
     let signature = signature_text(node, None, ctx.source);
-    let attributes = swift_attributes_for_node(node, ctx.source);
+    let mut attributes = swift_attributes_for_node(node, ctx.source);
+    // Associated-value payload types, e.g. `case point(x: Int, y: Int)` →
+    // `[Int, Int]`. Swift forbids associated values in comma-separated case
+    // lists, so a payload-bearing entry always has exactly one case name.
+    let payload_types = swift_enum_case_payload_types(node, ctx.source);
+    let arity = u8::try_from(payload_types.len()).unwrap_or(u8::MAX);
+    for ty in &payload_types {
+        attributes.push(format!("type:{ty}"));
+    }
+    attributes.sort();
+    attributes.dedup();
+    let case_arity = if payload_types.is_empty() {
+        None
+    } else {
+        Some(arity)
+    };
 
     // `enum_entry` may contain multiple name fields when the source
     // declares `case foo, bar` in a single clause.
@@ -512,10 +599,34 @@ fn swift_enum_entry_symbols(
             provenance: Provenance::new("tree-sitter-swift", "enum_entry case"),
             confidence: Confidence::ExactSyntax,
             freshness: Freshness::Fresh,
-            arity: None,
+            arity: case_arity,
         });
     }
     symbols
+}
+
+/// Collect the associated-value types of an `enum_entry` from its
+/// `data_contents` (`enum_type_parameters`) field. Each `name` field of the
+/// `enum_type_parameters` is one payload slot; labels (`case p(x: Int)`) carry
+/// no type and are skipped. Returns the leaf type name per slot in order.
+fn swift_enum_case_payload_types(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(data) = node.child_by_field_name("data_contents") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = data.walk();
+    for (idx, child) in data.children(&mut cursor).enumerate() {
+        if data.field_name_for_child(idx as u32) != Some("name") {
+            continue;
+        }
+        if let Ok(text) = node_text(child, source) {
+            let leaf = swift_type_leaf_name(text.trim());
+            if !leaf.is_empty() {
+                out.push(leaf);
+            }
+        }
+    }
+    out
 }
 
 fn child_index_of(parent: Node<'_>, target: Node<'_>) -> usize {
@@ -541,6 +652,28 @@ fn swift_symbol_name(
             "subscript_declaration" => return Some("subscript".to_string()),
             _ => {}
         }
+    }
+    // Operator / precedencegroup / macro declarations carry no `name` field;
+    // their identifier is the first `custom_operator` (e.g. `<=>`) or
+    // `simple_identifier` (precedencegroup / macro name) child. Parameter
+    // identifiers live inside nested `parameter` nodes, so the first direct
+    // `simple_identifier` named child is the declaration name.
+    if matches!(
+        node.kind(),
+        "operator_declaration" | "precedence_group_declaration" | "macro_declaration"
+    ) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if matches!(child.kind(), "custom_operator" | "simple_identifier")
+                && let Ok(text) = node_text(child, source)
+            {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        return None;
     }
     let name_node = node.child_by_field_name("name")?;
     // For `class_declaration`, the `name` field on a regular type
@@ -598,6 +731,83 @@ fn swift_inheritance_names(node: Node<'_>, source: &str) -> Vec<String> {
     names
 }
 
+/// Detect an enum's raw-value backing type. Swift requires the raw type to be
+/// the first entry in the inheritance clause, but it is syntactically identical
+/// to a protocol conformance. We treat the first supertype as the raw type when
+/// either a case carries an explicit raw value (`case a = 1`, the unambiguous
+/// RawRepresentable signal) or the first supertype is a well-known primitive
+/// raw type (`Int`/`String`/`Double`/…), which conform implicitly.
+fn swift_enum_raw_backing_type(node: Node<'_>, ifaces: &[String]) -> Option<String> {
+    let first = ifaces.first()?;
+    if swift_is_primitive_raw_type(first) || swift_enum_has_explicit_raw_value(node) {
+        Some(first.clone())
+    } else {
+        None
+    }
+}
+
+fn swift_is_primitive_raw_type(name: &str) -> bool {
+    matches!(
+        name,
+        "Int"
+            | "Int8"
+            | "Int16"
+            | "Int32"
+            | "Int64"
+            | "UInt"
+            | "UInt8"
+            | "UInt16"
+            | "UInt32"
+            | "UInt64"
+            | "String"
+            | "Character"
+            | "Double"
+            | "Float"
+            | "Float16"
+            | "Float80"
+            | "Bool"
+    )
+}
+
+/// True when any `enum_entry` in the enum body declares an explicit raw value
+/// (`case a = 1`), which only RawRepresentable enums can do.
+fn swift_enum_has_explicit_raw_value(node: Node<'_>) -> bool {
+    let Some(body) = node.child_by_field_name("body") else {
+        return false;
+    };
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor).any(|child| {
+        child.kind() == "enum_entry" && child.child_by_field_name("raw_value").is_some()
+    })
+}
+
+/// Split a type declaration's `inheritance_specifier` list into superclasses
+/// (`base:`) and protocol conformances (`iface:`).
+///
+/// Swift permits a superclass only on a `class`, and the language requires it
+/// to be the first entry in the inheritance clause. Every other entry — and
+/// every entry on a `struct`/`enum`/`protocol`/`actor` — is a protocol
+/// conformance. We can't tell a class-named first entry from a protocol-named
+/// one without type-checking, so we follow the syntactic position rule: for a
+/// `class`, the first name is the superclass and the rest are conformances.
+fn swift_categorized_inheritance(
+    node: Node<'_>,
+    decl_kind: &str,
+    source: &str,
+) -> (Vec<String>, Vec<String>) {
+    let names = swift_inheritance_names(node, source);
+    // Only a `class` can carry a superclass; `actor` (which also maps to
+    // SymbolKind::Class) and value/protocol types conform to protocols only.
+    if decl_kind == "class" {
+        let mut iter = names.into_iter();
+        let bases: Vec<String> = iter.by_ref().take(1).collect();
+        let ifaces: Vec<String> = iter.collect();
+        (bases, ifaces)
+    } else {
+        (Vec::new(), names)
+    }
+}
+
 fn swift_callable_generic_constraints(node: Node<'_>, source: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cursor = node.walk();
@@ -647,6 +857,27 @@ fn swift_callable_generic_constraints(node: Node<'_>, source: &str) -> Vec<Strin
             _ => {}
         }
     }
+    out
+}
+
+/// Collect the protocol constraints on an `associatedtype` declaration: the
+/// `must_inherit` field (`associatedtype Foo: Bar`) plus any `where`-clause
+/// constraints carried in a `type_constraints` child.
+fn swift_associatedtype_constraints(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(must_inherit) = node.child_by_field_name("must_inherit")
+        && let Ok(text) = node_text(must_inherit, source)
+    {
+        // A `must_inherit` can be a `protocol_composition_type` (`A & B`); keep
+        // each leaf as its own conformance attribute.
+        for part in text.split('&') {
+            let leaf = swift_type_leaf_name(part);
+            if !leaf.is_empty() {
+                out.push(leaf);
+            }
+        }
+    }
+    out.extend(swift_callable_generic_constraints(node, source));
     out
 }
 
@@ -751,6 +982,13 @@ fn swift_modifiers_node(node: Node<'_>) -> Option<Node<'_>> {
         .find(|child| child.kind() == "modifiers")
 }
 
+/// True when `node` has a direct named child of the given kind.
+fn swift_has_named_child_kind(node: Node<'_>, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == kind)
+}
+
 fn swift_async_modifier(node: Node<'_>, source: &str) -> bool {
     swift_has_keyword_child(node, source, "async")
 }
@@ -807,6 +1045,7 @@ fn swift_attributes_for_node(node: Node<'_>, source: &str) -> Vec<String> {
             | "mutation_modifier"
             | "ownership_modifier"
             | "property_modifier"
+            | "property_behavior_modifier"
             | "member_modifier"
             | "function_modifier" => {
                 if let Ok(text) = node_text(child, source) {
@@ -936,6 +1175,7 @@ fn swift_node_is_declaration_name(node: Node<'_>) -> bool {
                     | "init_declaration"
                     | "subscript_declaration"
                     | "typealias_declaration"
+                    | "associatedtype_declaration"
                     | "property_declaration"
                     | "protocol_property_declaration"
                     | "enum_entry"
@@ -947,18 +1187,19 @@ fn swift_node_is_declaration_name(node: Node<'_>) -> bool {
 }
 
 fn extract_swift_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
-    let raw = node_text(node, ctx.source).unwrap_or_default();
-    let trimmed = raw.trim();
-    let Some(rest) = trimmed.strip_prefix("import") else {
-        return;
-    };
-    // `import struct CoreGraphics.CGRect` etc. — drop the leading kind keyword.
-    let rest = rest.trim();
-    let rest = strip_swift_import_kind(rest);
-    let path = rest.trim().trim_end_matches(';').trim().to_string();
+    // The module-qualified path lives in the `identifier` child, regardless of
+    // any leading modifier (`@testable`, `private`) or attribute (`@_exported`,
+    // `@_implementationOnly`) and regardless of a kind keyword
+    // (`import struct M.T`). Reading the child instead of string-stripping the
+    // raw text is what lets modifier/attribute-prefixed imports survive — the
+    // old `strip_prefix("import")` silently dropped `@testable import Foo`
+    // because the text begins with the modifier, not `import`.
+    let path = swift_import_path(node, ctx.source).unwrap_or_default();
     if path.is_empty() {
         return;
     }
+    // `@_exported import Foo` re-exports `Foo` to every importer of this module.
+    let is_reexport = swift_import_has_attribute(node, ctx.source, "_exported");
     let imported_name = Some(last_path_segment(&path));
     ctx.imports.push(ParsedImport {
         file_id: ctx.file.id.clone(),
@@ -966,7 +1207,7 @@ fn extract_swift_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: 
         path,
         alias: None,
         is_glob: false,
-        is_reexport: false,
+        is_reexport,
         is_static: false,
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-swift", "import declaration"),
@@ -974,6 +1215,43 @@ fn extract_swift_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: 
         imported_name,
         is_global: false,
     });
+}
+
+/// Read the module-qualified path from an `import_declaration`'s `identifier`
+/// child (e.g. `CoreGraphics.CGRect`), falling back to a text scan that strips
+/// the `import`/modifier/kind-keyword prefix for grammar shapes that don't
+/// surface a clean `identifier` child.
+fn swift_import_path(node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "identifier"
+            && let Ok(text) = node_text(child, source)
+        {
+            let path = text.trim().to_string();
+            if !path.is_empty() {
+                return Some(path);
+            }
+        }
+    }
+    // Fallback for any grammar variant that does not expose `identifier`:
+    // drop everything up to and including `import`, then the kind keyword.
+    let raw = node_text(node, source).ok()?;
+    let after_import = raw.split("import").nth(1)?.trim();
+    let rest = strip_swift_import_kind(after_import);
+    let path = rest.trim().trim_end_matches(';').trim().to_string();
+    if path.is_empty() { None } else { Some(path) }
+}
+
+/// True when the `import_declaration`'s `modifiers` child carries an attribute
+/// whose name (after the leading `@`) matches `name` — e.g. `_exported`.
+fn swift_import_has_attribute(node: Node<'_>, source: &str, name: &str) -> bool {
+    let Some(modifiers) = swift_modifiers_node(node) else {
+        return false;
+    };
+    let mut cursor = modifiers.walk();
+    modifiers.named_children(&mut cursor).any(|child| {
+        child.kind() == "attribute" && swift_attribute_name(child, source).as_deref() == Some(name)
+    })
 }
 
 fn strip_swift_import_kind(text: &str) -> &str {
@@ -1066,6 +1344,51 @@ fn extract_swift_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Op
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-swift", "call_expression"),
         confidence,
+    });
+    extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+}
+
+fn extract_swift_macro_invocation(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    // `macro_invocation` shape: `simple_identifier (call_suffix)?`. The leading
+    // `#` is an anonymous token, so the macro name is the `simple_identifier`.
+    let mut cursor = node.walk();
+    let Some(name) = node
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "simple_identifier")
+        .and_then(|c| node_text(c, ctx.source).ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    else {
+        return;
+    };
+    let raw = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let arity = node
+        .named_children(&mut node.walk())
+        .find(|c| c.kind() == "call_suffix")
+        .and_then(|s| {
+            s.named_children(&mut s.walk())
+                .find(|c| c.kind() == "value_arguments")
+        })
+        .map(named_child_count)
+        .unwrap_or(0);
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name,
+        target_text: raw,
+        receiver: None,
+        arity,
+        kind: ParsedCallKind::Macro,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-swift", "macro_invocation"),
+        confidence: Confidence::MacroOpaque,
     });
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
 }

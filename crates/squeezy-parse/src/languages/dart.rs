@@ -148,6 +148,18 @@ fn visit_dart_node(
     match kind {
         "call_expression" => {
             extract_dart_call(node, ctx, owner_symbol.clone());
+            // `test('desc', () {...})` / `testWidgets(...)` / `group(...)` are
+            // the standard Dart/Flutter test idioms. Lower a matching call into
+            // a `Test` symbol so `kind=test` queries surface it and the calls
+            // inside its closure attribute to the test (impact / affected_tests).
+            if let Some(test_symbol) = dart_test_symbol_from_call(node, ctx, parent_symbol.as_ref())
+            {
+                let next_parent = Some((test_symbol.id.clone(), test_symbol.kind));
+                let next_owner = Some(test_symbol.id.clone());
+                ctx.symbols.push(test_symbol);
+                visit_dart_children(node, ctx, next_parent, next_owner);
+                return;
+            }
             visit_dart_children(node, ctx, parent_symbol, owner_symbol);
             return;
         }
@@ -946,6 +958,18 @@ fn dart_collect_local_type_attributes(body: Node<'_>, source: &str, attributes: 
             // dispatch.
             continue;
         }
+        // Explicitly-typed pattern bindings introduce locals just like a plain
+        // declaration: `if (obj case Foo x)` / `switch (v) { case Foo x: }` /
+        // `final (Foo a, Bar b) = pair;`. Record them so `x.method()` dispatch
+        // can resolve the receiver's type. We keep descending — a pattern can
+        // nest more patterns (record/list/object) that bind further locals.
+        match node.kind() {
+            "variable_pattern" => {
+                dart_collect_locals_from_variable_pattern(node, source, attributes)
+            }
+            "cast_pattern" => dart_collect_locals_from_cast_pattern(node, source, attributes),
+            _ => {}
+        }
         // Skip descending into nested closures / nested function
         // declarations so their locals don't leak onto the enclosing
         // symbol's attribute set.
@@ -964,6 +988,77 @@ fn dart_collect_local_type_attributes(body: Node<'_>, source: &str, attributes: 
             stack.push(child);
         }
     }
+}
+
+/// `variable_pattern` = `<final|var|[final] Type> name`. Only the explicitly
+/// typed form (`Foo x`, `final Foo x`) carries a `type` child and is resolvable;
+/// `var x` / `final x` have no static type to attach.
+fn dart_collect_locals_from_variable_pattern(
+    node: Node<'_>,
+    source: &str,
+    attributes: &mut Vec<String>,
+) {
+    let Some(name) = node
+        .child_by_field_name("name")
+        .and_then(|name| node_text(name, source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+    else {
+        return;
+    };
+    let mut cursor = node.walk();
+    let Some(ty) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "type")
+        .and_then(|type_node| dart_pattern_type_name(type_node, source))
+    else {
+        return;
+    };
+    attributes.push(format!("dart-local:{name}:{ty}"));
+}
+
+/// `cast_pattern` = `<primary_pattern> as Type`. The cast `type` is the static
+/// type of the bound variable, so `var x as Foo` makes `x` a `Foo`.
+fn dart_collect_locals_from_cast_pattern(
+    node: Node<'_>,
+    source: &str,
+    attributes: &mut Vec<String>,
+) {
+    let Some(ty) = node
+        .child_by_field_name("type")
+        .and_then(|type_node| dart_pattern_type_name(type_node, source))
+    else {
+        return;
+    };
+    // The bound name is the first sub-pattern: a `variable_pattern` (`var x`)
+    // or a bare `identifier`. Nested cast targets are emitted by the walker.
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let name = match child.kind() {
+            "variable_pattern" => child
+                .child_by_field_name("name")
+                .and_then(|name| node_text(name, source).ok()),
+            "identifier" => node_text(child, source).ok(),
+            _ => None,
+        };
+        if let Some(name) = name
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+        {
+            attributes.push(format!("dart-local:{name}:{ty}"));
+            return;
+        }
+    }
+}
+
+/// Normalise a pattern `type` node to a bare leaf type name, dropping generic
+/// arguments and a trailing nullable `?` (mirrors local-declaration handling).
+fn dart_pattern_type_name(type_node: Node<'_>, source: &str) -> Option<String> {
+    node_text(type_node, source)
+        .ok()
+        .map(|text| dart_strip_type_args(text.trim()).to_string())
+        .map(|text| text.trim_end_matches('?').trim().to_string())
+        .filter(|text| !text.is_empty() && text != "?")
 }
 
 fn dart_collect_locals_from_declaration(
@@ -1405,6 +1500,250 @@ fn extract_dart_symbol_facts(node: Node<'_>, symbol: &ParsedSymbol, ctx: &mut Ex
             });
         }
     }
+    if symbol
+        .attributes
+        .iter()
+        .any(|attr| attr == "dart:constructor")
+    {
+        extract_dart_constructor_delegation(node, symbol, ctx);
+    }
+}
+
+/// Emit constructor-delegation call edges for `super(...)`/`super.named(...)`,
+/// generative redirection (`: this(...)` / `: this.named(...)`) and redirecting
+/// factories (`factory Foo() = Bar.named;`). Without these the delegation target
+/// is invisible to flow/impact (the redirecting-factory target previously leaked
+/// only a generic `Type` reference).
+fn extract_dart_constructor_delegation(
+    node: Node<'_>,
+    symbol: &ParsedSymbol,
+    ctx: &mut ExtractContext<'_>,
+) {
+    // The host class name is the leading segment of the constructor symbol name
+    // (`Foo` for `Foo`/`Foo.named`). Used to bind `this`-redirection like an
+    // ordinary `new Foo.named()` so the existing constructor resolution applies.
+    let class_name = symbol
+        .name
+        .split('.')
+        .next()
+        .unwrap_or(symbol.name.as_str())
+        .trim()
+        .to_string();
+    let owner_id = Some(symbol.id.clone());
+    // Gather the delegation-bearing nodes. Initializers/redirection live as
+    // siblings of the body inside the signature wrapper (method_signature) or
+    // directly under a body-less `declaration`; a redirecting factory carries
+    // its target on the signature node itself. Scan the signature subtree but
+    // never the constructor body (a nested `super()`/`this()` call there would
+    // be a real object creation, not delegation).
+    let signature = node.child_by_field_name("signature");
+    let scan_roots: Vec<Node<'_>> = signature.into_iter().chain(std::iter::once(node)).collect();
+    let mut seen = std::collections::HashSet::new();
+    for root in scan_roots {
+        let mut cursor = root.walk();
+        for child in root.named_children(&mut cursor) {
+            if !seen.insert(child.id()) {
+                continue;
+            }
+            match child.kind() {
+                "initializers" => {
+                    let mut inner = child.walk();
+                    for entry in child.named_children(&mut inner) {
+                        if entry.kind() == "initializer_list_entry" {
+                            dart_emit_initializer_delegation(
+                                entry,
+                                &class_name,
+                                owner_id.clone(),
+                                ctx,
+                            );
+                        }
+                    }
+                }
+                "redirection" => {
+                    dart_emit_redirection_delegation(child, &class_name, owner_id.clone(), ctx);
+                }
+                "redirecting_factory_constructor_signature" => {
+                    dart_emit_redirecting_factory_delegation(child, owner_id.clone(), ctx);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// `: super(...)` / `: super.named(...)` / `: this.named(...)` initializer entry.
+fn dart_emit_initializer_delegation(
+    entry: Node<'_>,
+    class_name: &str,
+    owner_id: Option<SymbolId>,
+    ctx: &mut ExtractContext<'_>,
+) {
+    // `field_initializer` (`this.x = v`) and `assertion` are also wrapped in an
+    // `initializer_list_entry` and the former starts with a nested `this` token;
+    // they are not super/this delegation, so skip them.
+    let mut named_cursor = entry.walk();
+    if entry
+        .named_children(&mut named_cursor)
+        .any(|c| matches!(c.kind(), "field_initializer" | "assertion"))
+    {
+        return;
+    }
+    let mut cursor = entry.walk();
+    let children: Vec<Node<'_>> = entry.children(&mut cursor).collect();
+    // First top-level token is `super` / `this`; an optional trailing identifier
+    // is the named-constructor selector.
+    let keyword = children.iter().find_map(|c| match c.kind() {
+        "super" | "this" => Some(c.kind()),
+        _ => None,
+    });
+    let Some(keyword) = keyword else { return };
+    let selector = entry
+        .named_children(&mut entry.walk())
+        .find(|c| c.kind() == "identifier")
+        .and_then(|c| node_text(c, ctx.source).ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let arguments = entry
+        .named_children(&mut entry.walk())
+        .find(|c| c.kind() == "arguments");
+    let arity = arguments.map(dart_arg_count).unwrap_or(0);
+    let span = span_from_node(entry);
+
+    match keyword {
+        // `this.named(...)` redirects to a constructor on the *same* class; bind
+        // it like `new ClassName.named(...)`.
+        "this" => {
+            if class_name.is_empty() {
+                return;
+            }
+            let (name, target_text, receiver) = match &selector {
+                Some(sel) => (
+                    sel.clone(),
+                    format!("{class_name}.{sel}"),
+                    Some(class_name.to_string()),
+                ),
+                None => (class_name.to_string(), class_name.to_string(), None),
+            };
+            push_dart_delegation_call(ctx, owner_id, name, target_text, receiver, arity, span);
+        }
+        // `super(...)` / `super.named(...)` targets the superclass constructor.
+        // The superclass name isn't available on this node, so the receiver is
+        // `super`; binding to the parent constructor is left to the resolver.
+        _ => {
+            let name = selector.clone().unwrap_or_else(|| "super".to_string());
+            let target_text = match &selector {
+                Some(sel) => format!("super.{sel}"),
+                None => "super".to_string(),
+            };
+            push_dart_delegation_call(
+                ctx,
+                owner_id,
+                name,
+                target_text,
+                Some("super".to_string()),
+                arity,
+                span,
+            );
+        }
+    }
+}
+
+/// `: this(...)` / `: this.named(...)` generative redirection on a body-less
+/// constructor. Bound like an object creation of the same class.
+fn dart_emit_redirection_delegation(
+    node: Node<'_>,
+    class_name: &str,
+    owner_id: Option<SymbolId>,
+    ctx: &mut ExtractContext<'_>,
+) {
+    if class_name.is_empty() {
+        return;
+    }
+    let selector = node
+        .named_children(&mut node.walk())
+        .find(|c| c.kind() == "identifier")
+        .and_then(|c| node_text(c, ctx.source).ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let arity = node
+        .named_children(&mut node.walk())
+        .find(|c| c.kind() == "arguments")
+        .map(dart_arg_count)
+        .unwrap_or(0);
+    let span = span_from_node(node);
+    let (name, target_text, receiver) = match &selector {
+        Some(sel) => (
+            sel.clone(),
+            format!("{class_name}.{sel}"),
+            Some(class_name.to_string()),
+        ),
+        None => (class_name.to_string(), class_name.to_string(), None),
+    };
+    push_dart_delegation_call(ctx, owner_id, name, target_text, receiver, arity, span);
+}
+
+/// `factory Foo() = Bar.named;` — bind the redirect target like `new Bar.named()`
+/// so the factory's actual implementation is reachable (previously only a Type
+/// reference to `Bar` survived).
+fn dart_emit_redirecting_factory_delegation(
+    node: Node<'_>,
+    owner_id: Option<SymbolId>,
+    ctx: &mut ExtractContext<'_>,
+) {
+    let Some(target) = node
+        .child_by_field_name("target")
+        .and_then(|t| node_text(t, ctx.source).ok())
+        .map(|t| dart_strip_type_args(t.trim()).to_string())
+        .map(|t| t.trim_end_matches('?').trim().to_string())
+        .filter(|t| !t.is_empty())
+    else {
+        return;
+    };
+    let target_ctor = node
+        .child_by_field_name("target_constructor")
+        .and_then(|c| node_text(c, ctx.source).ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let span = span_from_node(node);
+    let (name, target_text, receiver) = match &target_ctor {
+        Some(ctor) => (
+            ctor.clone(),
+            format!("{target}.{ctor}"),
+            Some(target.clone()),
+        ),
+        None => (target.clone(), target.clone(), None),
+    };
+    push_dart_delegation_call(ctx, owner_id, name, target_text, receiver, 0, span);
+}
+
+/// Push a constructor-delegation `ParsedCall`. Emitted as `Direct` with the
+/// owning/target class as the receiver, mirroring exactly how
+/// `extract_dart_object_creation` records `new Foo.named(...)` so the same
+/// constructor candidate-set resolution applies.
+fn push_dart_delegation_call(
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+    name: String,
+    target_text: String,
+    receiver: Option<String>,
+    arity: usize,
+    span: SourceSpan,
+) {
+    if name.is_empty() {
+        return;
+    }
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id,
+        name,
+        target_text,
+        receiver,
+        arity,
+        kind: ParsedCallKind::Direct,
+        span,
+        provenance: Provenance::new("tree-sitter-dart", "constructor delegation"),
+        confidence: Confidence::Heuristic,
+    });
 }
 
 fn extract_dart_library_directive(node: Node<'_>, ctx: &mut ExtractContext<'_>) {
@@ -1449,7 +1788,7 @@ fn extract_dart_import_export(node: Node<'_>, ctx: &mut ExtractContext<'_>, is_r
     // import_specification (or configurable_uri for exports). The import
     // specification holds the URI, optional `as` alias, and combinator(s)
     // (`show`/`hide`).
-    let (uri_node, alias, combinators, alt_uris) = if node.kind() == "library_import" {
+    let (uri_node, alias, combinators, alt_uris, is_deferred) = if node.kind() == "library_import" {
         let mut cursor = node.walk();
         let spec = node
             .named_children(&mut cursor)
@@ -1460,6 +1799,15 @@ fn extract_dart_import_export(node: Node<'_>, ctx: &mut ExtractContext<'_>, is_r
             .child_by_field_name("alias")
             .and_then(|alias| node_text(alias, ctx.source).ok())
             .map(|text| text.trim().to_string());
+        // `import '...' deferred as p;` carries a `deferred` keyword token
+        // (anonymous in the grammar) before the `as` alias. Scan all children,
+        // not just named ones, so we can tell a lazy-loaded library boundary
+        // apart from an eager prefixed import.
+        let is_deferred = {
+            let mut all = spec.walk();
+            spec.children(&mut all)
+                .any(|child| child.kind() == "deferred")
+        };
         let mut combinators = Vec::new();
         let mut alt_uris = Vec::new();
         let mut spec_cursor = spec.walk();
@@ -1480,7 +1828,7 @@ fn extract_dart_import_export(node: Node<'_>, ctx: &mut ExtractContext<'_>, is_r
                 }
             }
         }
-        (uri, alias, combinators, alt_uris)
+        (uri, alias, combinators, alt_uris, is_deferred)
     } else {
         // library_export: configurable_uri is a direct child, combinator(s) too.
         let uri = node.child_by_field_name("uri").or_else(|| {
@@ -1495,7 +1843,7 @@ fn extract_dart_import_export(node: Node<'_>, ctx: &mut ExtractContext<'_>, is_r
                 combinators.push(dart_combinator_clause(child, ctx.source));
             }
         }
-        (uri, None, combinators, Vec::new())
+        (uri, None, combinators, Vec::new(), false)
     };
 
     let Some(uri_node) = uri_node else { return };
@@ -1535,6 +1883,8 @@ fn extract_dart_import_export(node: Node<'_>, ctx: &mut ExtractContext<'_>, is_r
             "tree-sitter-dart",
             if is_reexport {
                 "export directive"
+            } else if is_deferred {
+                "deferred import directive"
             } else {
                 "import directive"
             },
@@ -1714,6 +2064,93 @@ fn dart_combinator_clause(node: Node<'_>, source: &str) -> (String, Vec<String>)
         }
     }
     (keyword, names)
+}
+
+/// Recognise a `package:test` / `flutter_test` test-declaration idiom call and
+/// build a `Test` symbol for it. Matches `test(...)`, `testWidgets(...)` and
+/// `group(...)` invoked as a plain function (no receiver) whose first argument
+/// is a string literal description and which passes a closure body. The symbol
+/// is named after the description so `kind=test` results read naturally.
+fn dart_test_symbol_from_call(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    let function_node = node.child_by_field_name("function")?;
+    // Only bare-identifier calls: `test(...)`, not `foo.test(...)` (which would
+    // be an unrelated method on some object).
+    if function_node.kind() != "identifier" {
+        return None;
+    }
+    let func_name = node_text(function_node, ctx.source)
+        .ok()?
+        .trim()
+        .to_string();
+    if !matches!(func_name.as_str(), "test" | "testWidgets" | "group") {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let mut description: Option<String> = None;
+    let mut has_closure = false;
+    for child in arguments.named_children(&mut cursor) {
+        match child.kind() {
+            kind if is_dart_string_literal(kind) && description.is_none() => {
+                description = dart_uri_string(child, ctx.source);
+            }
+            "function_expression" => has_closure = true,
+            _ => {}
+        }
+    }
+    // The closure argument is what makes this a test/group body rather than an
+    // arbitrary call that merely happens to be named `test`.
+    if !has_closure {
+        return None;
+    }
+    let description = description?;
+    let span = span_from_node(node);
+    let body_span = node
+        .child_by_field_name("arguments")
+        .map(span_from_node)
+        .or(Some(span));
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    // Disambiguate same-named tests within a file by call-site byte offset
+    // (folded into `symbol_id`); keep the display name human-readable.
+    let id = symbol_id(
+        &ctx.file,
+        parent_id.as_ref(),
+        SymbolKind::Test,
+        &description,
+        span,
+    );
+    Some(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name: description,
+        kind: SymbolKind::Test,
+        language_identity: None,
+        span,
+        body_span,
+        signature_span: None,
+        signature: String::new(),
+        visibility: Some("public".to_string()),
+        docs: Vec::new(),
+        attributes: vec![
+            "dart:test".to_string(),
+            format!("dart:test-idiom:{func_name}"),
+        ],
+        provenance: Provenance::new("tree-sitter-dart", format!("{func_name} idiom")),
+        confidence: Confidence::Heuristic,
+        freshness: Freshness::Fresh,
+        arity: None,
+    })
+}
+
+/// True for any Dart string-literal node kind (plain, raw, single/double,
+/// single/multi-line). Used to spot a test description argument.
+fn is_dart_string_literal(kind: &str) -> bool {
+    kind == "string_literal" || (kind.contains("string_literal") && kind.contains("quotes"))
 }
 
 fn extract_dart_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {

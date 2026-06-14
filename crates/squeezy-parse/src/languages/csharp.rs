@@ -313,6 +313,19 @@ fn csharp_symbol_from_node(
     {
         attributes.push("csharp:test-host".to_string());
     }
+    // C# extension method: a `static` method whose first parameter carries the
+    // `this` modifier. Tag it `csharp:extension` and capture the receiver type
+    // so a future `csharp_extension_method_call` resolver branch can route
+    // `value.Method()` to this static definition (parallels Kotlin/Swift/
+    // Scala/Dart). The receiver leaf is also recorded as a `type:` attribute,
+    // mirroring how the Swift resolver discovers the extended type.
+    if matches!(node.kind(), "method_declaration")
+        && modifiers.iter().any(|modifier| modifier == "static")
+        && let Some(receiver) = csharp_extension_receiver_type(node, ctx.source)
+    {
+        attributes.push("csharp:extension".to_string());
+        attributes.push(format!("csharp:extension-receiver:{receiver}"));
+    }
     if let Some(namespace) = scope.current_namespace() {
         attributes.push(format!("csharp:namespace:{namespace}"));
     }
@@ -365,7 +378,7 @@ fn csharp_symbol_from_node(
             "tree-sitter-c-sharp",
             format!("{} declaration", node.kind()),
         ),
-        confidence: Confidence::ExactSyntax,
+        confidence: csharp_conditional_confidence(node, Confidence::ExactSyntax),
         freshness: Freshness::Fresh,
         arity,
     })
@@ -811,13 +824,22 @@ pub(crate) fn extract_csharp_using_directive(
     if path.is_empty() {
         return;
     }
+    // Classify the binding shape so the parse-coverage histogram reflects it:
+    //   `using static N.C;`     -> Static  (members of C in scope)
+    //   `using Alias = N.Type;` -> Named   (a single aliased name in scope)
+    //   `using N;`              -> Namespace (every name under N in scope)
     let kind = if is_static {
         ImportKind::Static
+    } else if alias.is_some() {
+        ImportKind::Named
     } else {
         ImportKind::Namespace
     };
     let imported_name = if is_static {
         None
+    } else if let Some(alias) = alias.as_deref() {
+        // For an alias, the bound leaf is the alias identifier itself.
+        Some(alias.to_string())
     } else {
         Some(last_path_segment(&path))
     };
@@ -872,7 +894,7 @@ pub(crate) fn extract_csharp_call(
         kind,
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-c-sharp", "invocation_expression"),
-        confidence: Confidence::Heuristic,
+        confidence: csharp_conditional_confidence(node, Confidence::Heuristic),
     });
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
 }
@@ -959,7 +981,7 @@ pub(crate) fn extract_csharp_object_creation(
         kind: ParsedCallKind::Direct,
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-c-sharp", "object_creation_expression"),
-        confidence: Confidence::Heuristic,
+        confidence: csharp_conditional_confidence(node, Confidence::Heuristic),
     });
     ctx.references.push(ParsedReference {
         file_id: ctx.file.id.clone(),
@@ -1038,6 +1060,27 @@ fn extract_csharp_field_symbols(
     if node.kind() == "event_field_declaration" {
         base_attributes.push("csharp:event".to_string());
     }
+    // A `const` field is a compile-time constant, not mutable storage; mint it
+    // as `SymbolKind::Const` so `decl_search kind=const` finds it and the
+    // member can be distinguished from a mutable field. `readonly`/`volatile`
+    // stay `Field` but carry their own flag so callers can filter on them.
+    // (Events never carry these modifiers.)
+    let is_const = node.kind() != "event_field_declaration"
+        && modifiers.iter().any(|modifier| modifier == "const");
+    let field_kind = if is_const {
+        SymbolKind::Const
+    } else {
+        SymbolKind::Field
+    };
+    if is_const {
+        base_attributes.push("csharp:const".to_string());
+    }
+    if modifiers.iter().any(|modifier| modifier == "readonly") {
+        base_attributes.push("csharp:readonly".to_string());
+    }
+    if modifiers.iter().any(|modifier| modifier == "volatile") {
+        base_attributes.push("csharp:volatile".to_string());
+    }
     let mut cursor = node.walk();
     let mut declarations = Vec::new();
     for child in node.named_children(&mut cursor) {
@@ -1078,11 +1121,11 @@ fn extract_csharp_field_symbols(
                 ctx.source,
             );
             ctx.symbols.push(ParsedSymbol {
-                id: symbol_id(&ctx.file, Some(parent_id), SymbolKind::Field, &name, span),
+                id: symbol_id(&ctx.file, Some(parent_id), field_kind, &name, span),
                 file_id: ctx.file.id.clone(),
                 parent_id: Some(parent_id.clone()),
                 name: name.clone(),
-                kind: SymbolKind::Field,
+                kind: field_kind,
                 language_identity: csharp_field_language_identity(node, &name, scope),
                 span,
                 body_span: None,
@@ -1092,7 +1135,7 @@ fn extract_csharp_field_symbols(
                 docs: Vec::new(),
                 attributes,
                 provenance: Provenance::new("tree-sitter-c-sharp", "field declaration"),
-                confidence: Confidence::ExactSyntax,
+                confidence: csharp_conditional_confidence(node, Confidence::ExactSyntax),
                 freshness: Freshness::Fresh,
                 arity: None,
             });
@@ -1156,6 +1199,28 @@ pub(crate) fn extract_csharp_symbol_facts(
                 provenance: Provenance::new("tree-sitter-c-sharp", "base type reference"),
             });
         }
+        // `csharp_collect_base_types` only returns the leaf of each base
+        // (`IReadOnlyList`), so a type used solely as a generic argument of a
+        // base (`: IEnumerable<MyEnum>`) would never bind. Walk the raw
+        // `base_list` subtree to emit a `Type` ref per nested argument.
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "base_list" {
+                csharp_push_generic_argument_refs(
+                    child,
+                    symbol,
+                    ctx,
+                    "base type argument reference",
+                );
+            }
+        }
+        // Positional records (`record Customer(string Name, int Age)`) and C# 12
+        // primary-constructor classes/structs declare their parameters directly
+        // on the type. The grammar models them as a `parameter_list` child of
+        // the type declaration. Each one becomes an init-only property of the
+        // type, so mint a `Field` member per parameter (plus its `Type` ref) —
+        // otherwise the type shows field-less and `Customer.Name` has no decl.
+        csharp_emit_primary_constructor_fields(node, symbol, ctx);
     }
     if matches!(
         node.kind(),
@@ -1176,6 +1241,153 @@ pub(crate) fn extract_csharp_symbol_facts(
             push_csharp_type_reference(returns, symbol, ctx, "return type reference");
         }
     }
+    // Generic constraint clauses (`where T : IEntity, new()`). The grammar
+    // never gets read by the generic identifier path, so an interface/enum used
+    // *only* as a constraint was emitted as `Identifier`-kind and rejected by
+    // the binder. Emit a `Type` ref per constraint type so `where T : IEntity`
+    // binds and surfaces in `reference_search`/`impact`. (The `new()` /
+    // `class` / `struct` / `notnull` keyword constraints carry no type.)
+    csharp_emit_constraint_type_references(node, symbol, ctx);
+}
+
+/// Emit a `Type` reference for every type named in a declaration's
+/// `type_parameter_constraints_clause`s (`where T : Base, IFace`). Each clause
+/// holds `type_parameter_constraint` children whose `type` field is the
+/// constraint type; keyword-only constraints (`new()`, `class`, …) are skipped.
+fn csharp_emit_constraint_type_references(
+    node: Node<'_>,
+    symbol: &ParsedSymbol,
+    ctx: &mut ExtractContext<'_>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "type_parameter_constraints_clause" {
+            continue;
+        }
+        let mut constraint_cursor = child.walk();
+        for constraint in child.named_children(&mut constraint_cursor) {
+            if constraint.kind() != "type_parameter_constraint" {
+                continue;
+            }
+            if let Some(type_node) = constraint.child_by_field_name("type") {
+                push_csharp_type_reference(type_node, symbol, ctx, "type constraint reference");
+            }
+        }
+    }
+}
+
+/// Returns the leaf receiver type of a C# extension method, i.e. the `type`
+/// of the first parameter when that parameter carries the `this` modifier.
+/// tree-sitter-c-sharp aliases the `this`/`ref`/`in`/`out` parameter prefixes
+/// to named `modifier` nodes, so we scan the first parameter's children.
+pub(crate) fn csharp_extension_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
+    let parameters = node.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    let first = parameters
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "parameter")?;
+    let has_this = csharp_modifiers(first, source)
+        .iter()
+        .any(|modifier| modifier == "this");
+    if !has_this {
+        return None;
+    }
+    let type_node = first.child_by_field_name("type")?;
+    let text = node_text(type_node, source).ok()?;
+    csharp_type_name_from_annotation(text)
+}
+
+/// Mint a `Field` member for each positional-record / primary-constructor
+/// parameter of a type declaration. These parameters become public init-only
+/// properties of the type, so they are surfaced as members (DocComment-ID
+/// prefix `P:`) parented to the type, each with a `Type` reference.
+fn csharp_emit_primary_constructor_fields(
+    node: Node<'_>,
+    type_symbol: &ParsedSymbol,
+    ctx: &mut ExtractContext<'_>,
+) {
+    let mut cursor = node.walk();
+    let Some(parameter_list) = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == "parameter_list")
+    else {
+        return;
+    };
+    // Property DocComment-ID owner derived from the type's own `T:` identity.
+    let owner_identity = type_symbol
+        .language_identity
+        .as_deref()
+        .and_then(|identity| identity.strip_prefix("T:"))
+        .map(str::to_string);
+    let mut param_cursor = parameter_list.walk();
+    for parameter in parameter_list.named_children(&mut param_cursor) {
+        if parameter.kind() != "parameter" {
+            continue;
+        }
+        let Some(name_node) = parameter.child_by_field_name("name") else {
+            continue;
+        };
+        let Some(name) = node_text(name_node, ctx.source)
+            .ok()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let type_node = parameter.child_by_field_name("type");
+        let type_text = type_node
+            .and_then(|n| node_text(n, ctx.source).ok())
+            .map(|text| text.trim().to_string());
+        let span = span_from_node(parameter);
+        let mut attributes = vec![
+            "csharp:field".to_string(),
+            "csharp:primary-constructor-param".to_string(),
+        ];
+        if let Some(text) = type_text.as_ref() {
+            attributes.push(format!("type:{}", last_path_segment(text)));
+        }
+        attributes.sort();
+        attributes.dedup();
+        let language_identity = owner_identity
+            .as_ref()
+            .map(|owner| format!("P:{owner}.{name}"));
+        ctx.symbols.push(ParsedSymbol {
+            id: symbol_id(
+                &ctx.file,
+                Some(&type_symbol.id),
+                SymbolKind::Field,
+                &name,
+                span,
+            ),
+            file_id: ctx.file.id.clone(),
+            parent_id: Some(type_symbol.id.clone()),
+            name: name.clone(),
+            kind: SymbolKind::Field,
+            language_identity,
+            span,
+            body_span: None,
+            signature_span: None,
+            signature: node_text(parameter, ctx.source)
+                .ok()
+                .map(|text| text.trim().to_string())
+                .unwrap_or_default(),
+            visibility: Some("public".to_string()),
+            docs: Vec::new(),
+            attributes,
+            provenance: Provenance::new("tree-sitter-c-sharp", "primary constructor parameter"),
+            confidence: csharp_conditional_confidence(parameter, Confidence::ExactSyntax),
+            freshness: Freshness::Fresh,
+            arity: None,
+        });
+        if let Some(type_node) = type_node {
+            push_csharp_type_reference(
+                type_node,
+                type_symbol,
+                ctx,
+                "primary constructor parameter type reference",
+            );
+        }
+    }
 }
 
 pub(crate) fn push_csharp_type_reference(
@@ -1184,21 +1396,59 @@ pub(crate) fn push_csharp_type_reference(
     ctx: &mut ExtractContext<'_>,
     reason: &'static str,
 ) {
-    let Ok(text) = node_text(type_node, ctx.source) else {
-        return;
-    };
-    let cleaned = csharp_type_name_from_annotation(text);
-    let Some(cleaned) = cleaned else {
-        return;
-    };
-    ctx.references.push(ParsedReference {
-        file_id: ctx.file.id.clone(),
-        owner_id: Some(symbol.id.clone()),
-        text: cleaned,
-        kind: ReferenceKind::Type,
-        span: symbol.span,
-        provenance: Provenance::new("tree-sitter-c-sharp", reason),
-    });
+    if let Ok(text) = node_text(type_node, ctx.source)
+        && let Some(cleaned) = csharp_type_name_from_annotation(text)
+    {
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: Some(symbol.id.clone()),
+            text: cleaned,
+            kind: ReferenceKind::Type,
+            span: symbol.span,
+            provenance: Provenance::new("tree-sitter-c-sharp", reason),
+        });
+    }
+    // `csharp_type_name_from_annotation` truncates at the first `<`, so the
+    // outer ref only names the open generic (e.g. `List`). Recurse into every
+    // nested `type_argument_list` and emit a `Type` ref per argument so a type
+    // used *only* as a generic argument (`List<MyEnum>`) still binds — the
+    // binder rejects `Identifier`-kind refs for interfaces/enums/aliases.
+    csharp_push_generic_argument_refs(type_node, symbol, ctx, reason);
+}
+
+/// Walk the subtree of a type node, pushing a `Type` reference for each named
+/// argument found inside any `type_argument_list` (handles nesting such as
+/// `Dictionary<string, List<Foo>>`).
+fn csharp_push_generic_argument_refs(
+    node: Node<'_>,
+    symbol: &ParsedSymbol,
+    ctx: &mut ExtractContext<'_>,
+    reason: &'static str,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "type_argument_list" {
+            let mut arg_cursor = child.walk();
+            for argument in child.named_children(&mut arg_cursor) {
+                if let Ok(text) = node_text(argument, ctx.source)
+                    && let Some(cleaned) = csharp_type_name_from_annotation(text)
+                {
+                    ctx.references.push(ParsedReference {
+                        file_id: ctx.file.id.clone(),
+                        owner_id: Some(symbol.id.clone()),
+                        text: cleaned,
+                        kind: ReferenceKind::Type,
+                        span: symbol.span,
+                        provenance: Provenance::new("tree-sitter-c-sharp", reason),
+                    });
+                }
+                // Descend so deeper argument lists are captured too.
+                csharp_push_generic_argument_refs(argument, symbol, ctx, reason);
+            }
+        } else {
+            csharp_push_generic_argument_refs(child, symbol, ctx, reason);
+        }
+    }
 }
 
 pub(crate) fn csharp_type_name_from_annotation(annotation: &str) -> Option<String> {
@@ -1278,6 +1528,36 @@ pub(crate) fn csharp_identifier_is_member_access_name(node: Node<'_>) -> bool {
         .child_by_field_name("name")
         .map(|name_node| name_node.id() == node.id())
         .unwrap_or(false)
+}
+
+/// True when `node` sits inside a `#if`/`#elif`/`#else` preprocessor branch.
+/// tree-sitter-c-sharp nests the conditional body as children of the
+/// `preproc_if`/`preproc_elif`/`preproc_else` node, so a single ancestor walk
+/// detects it. `#region`/`#pragma`/`#nullable` are *not* conditional — they
+/// never gate code out — so they are deliberately ignored, mirroring the
+/// C/C++ extractor's `ConditionalUnknown` downgrade.
+pub(crate) fn csharp_node_in_conditional(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "preproc_if" | "preproc_elif" | "preproc_else"
+        ) {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+/// Downgrade a base confidence to `ConditionalUnknown` when the node lives in a
+/// preprocessor-gated branch whose activation we cannot evaluate.
+pub(crate) fn csharp_conditional_confidence(node: Node<'_>, base: Confidence) -> Confidence {
+    if csharp_node_in_conditional(node) {
+        Confidence::ConditionalUnknown
+    } else {
+        base
+    }
 }
 
 pub(crate) fn is_csharp_literal(kind: &str) -> bool {

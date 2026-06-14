@@ -5420,7 +5420,7 @@ fun buildGreeter(): Greeter = object : Greeter {
         .expect("anonymous object literal emits a partial class symbol");
     assert_eq!(anonymous.kind, SymbolKind::Class);
     assert_eq!(anonymous.confidence, Confidence::Partial);
-    assert!(anonymous.attributes.contains(&"base:Greeter".to_string()));
+    assert!(anonymous.attributes.contains(&"iface:Greeter".to_string()));
 
     let greet = graph
         .find_symbol_by_name("greet")
@@ -6887,7 +6887,7 @@ enum APIResult<Value, Failure: Error> {
             .find_symbol_by_name("UserEndpoint")
             .iter()
             .any(|s| s.kind == SymbolKind::Struct
-                && s.attributes.contains(&"base:Endpoint".to_string())),
+                && s.attributes.contains(&"iface:Endpoint".to_string())),
         "struct UserEndpoint must record `base:Endpoint`"
     );
     assert!(
