@@ -721,13 +721,6 @@ fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Statu
             c.preset.as_str(),
             credential_check(c.api_key.as_deref(), &c.api_key_env),
         ),
-        ProviderConfig::Faux(_) => (
-            "faux",
-            (
-                Status::Ok,
-                "in-process scripted provider (no credential required)".to_string(),
-            ),
-        ),
     }
 }
 
@@ -2737,10 +2730,6 @@ pub(crate) async fn probe_provider(provider: &ProviderConfig) -> (Status, String
             "probe not implemented for GitHub Copilot \
              (the chat backend does not expose a stable list-models endpoint)"
                 .to_string(),
-        ),
-        ProviderConfig::Faux(_) => (
-            Status::Ok,
-            "faux provider is in-process; no remote endpoint to probe".to_string(),
         ),
         ProviderConfig::OpenAiCompatible(c) => {
             let mut extra = Vec::new();

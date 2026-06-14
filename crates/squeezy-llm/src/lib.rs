@@ -48,7 +48,6 @@ mod cache_policy;
 mod compatible;
 mod contribution;
 mod credentials;
-mod faux;
 mod google;
 pub mod limits;
 pub mod model_discovery;
@@ -83,7 +82,6 @@ pub use credentials::{
     delete_api_key, fallback_env_var, resolve_api_key, resolve_api_key_from_credentials_file,
     resolve_api_key_with_inline, resolve_api_key_with_inline_optional, static_api_key_source,
 };
-pub use faux::{DEFAULT_FAUX_NAME, FauxProvider, FauxScript, FauxStep, FauxToolCall, FauxTurn};
 pub use google::GoogleProvider;
 pub use limits::{
     ContextLimitInput, LimitConfidence, LimitSource, ResolvedContextLimits,

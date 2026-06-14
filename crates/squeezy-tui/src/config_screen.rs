@@ -1978,7 +1978,6 @@ pub(crate) fn provider_variant_label(provider: &squeezy_core::ProviderConfig) ->
         P::OpenAiCodex(_) => "openai_codex",
         P::GitHubCopilot(_) => "github_copilot",
         P::OpenAiCompatible(config) => config.preset.as_str(),
-        P::Faux(_) => "faux",
     }
 }
 
@@ -2047,10 +2046,9 @@ pub(crate) fn provider_api_key_env(
         P::Google(c) => Some(("Google", c.api_key_env.clone())),
         P::AzureOpenAi(c) => Some(("Azure OpenAI", c.api_key_env.clone())),
         // Bedrock uses AWS SDK creds; OAuth providers store tokens at
-        // `~/.squeezy/auth/`; the faux provider runs in-process and
-        // has no credential. None of these have an env-var keychain
+        // `~/.squeezy/auth/`. None of these have an env-var keychain
         // entry the screen can write.
-        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
+        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) => None,
         // Ollama can optionally use a bearer token for Cloud / reverse-proxy
         // deployments. Surface the key entry when api_key_env is set.
         P::Ollama(c) => {
@@ -2083,10 +2081,8 @@ pub(crate) fn provider_section_name(
         P::Google(_) => Some("google"),
         P::AzureOpenAi(_) => Some("azure_openai"),
         // OAuth provider credentials live in auth token files, not
-        // provider TOML tables. The faux provider exposes `script`
-        // instead of an api_key, which is handled by the field-level
-        // editor rather than the secret-entry path.
-        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
+        // provider TOML tables.
+        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) => None,
         // Ollama supports an optional inline api_key for Cloud / reverse-proxy
         // deployments; write it under [providers.ollama] like any key-bearing provider.
         P::Ollama(c) => {
@@ -2111,7 +2107,7 @@ pub(crate) fn provider_inline_api_key(provider: &squeezy_core::ProviderConfig) -
         P::Anthropic(c) => c.api_key.clone(),
         P::Google(c) => c.api_key.clone(),
         P::AzureOpenAi(c) => c.api_key.clone(),
-        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => None,
+        P::Bedrock(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) => None,
         P::Ollama(c) => c.api_key.clone(),
         P::OpenAiCompatible(c) => c.api_key.clone(),
     }

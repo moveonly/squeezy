@@ -2534,9 +2534,8 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
         DEFAULT_GITHUB_COPILOT_MODEL, DEFAULT_GOOGLE_BASE_URL, DEFAULT_GOOGLE_MODEL,
         DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_BASE_URL,
         DEFAULT_OPENAI_CODEX_BASE_URL, DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_CODEX_ORIGINATOR,
-        DEFAULT_OPENAI_MODEL, FauxConfig, GitHubCopilotConfig, GoogleConfig, OllamaConfig,
-        OpenAiCodexConfig, OpenAiCompatibleConfig, OpenAiCompatiblePreset, OpenAiConfig,
-        ProviderTransportConfig,
+        DEFAULT_OPENAI_MODEL, GitHubCopilotConfig, GoogleConfig, OllamaConfig, OpenAiCodexConfig,
+        OpenAiCompatibleConfig, OpenAiCompatiblePreset, OpenAiConfig, ProviderTransportConfig,
     };
     let transport = ProviderTransportConfig::default();
     let (provider, default_model) = match s {
@@ -2615,14 +2614,6 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
             }),
             DEFAULT_OLLAMA_MODEL,
         ),
-        "faux" | "mock" => (
-            ProviderConfig::Faux(FauxConfig {
-                script: None,
-                name: None,
-                transport,
-            }),
-            crate::DEFAULT_FAUX_MODEL,
-        ),
         other => {
             let preset = OpenAiCompatiblePreset::parse(other).ok_or("unknown provider")?;
             let default_model = preset.default_model();
@@ -2660,7 +2651,6 @@ fn provider_to_str(p: &ProviderConfig) -> &'static str {
         ProviderConfig::OpenAiCodex(_) => "openai_codex",
         ProviderConfig::GitHubCopilot(_) => "github_copilot",
         ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
-        ProviderConfig::Faux(_) => "faux",
     }
 }
 
@@ -2674,7 +2664,6 @@ pub fn default_model_for(provider: &str) -> &'static str {
         "ollama" => DEFAULT_OLLAMA_MODEL,
         "openai_codex" | "openai-codex" | "chatgpt" => DEFAULT_OPENAI_CODEX_MODEL,
         "github_copilot" | "github-copilot" | "copilot" => DEFAULT_GITHUB_COPILOT_MODEL,
-        "faux" | "mock" => crate::DEFAULT_FAUX_MODEL,
         other => match OpenAiCompatiblePreset::parse(other) {
             Some(preset) => preset.default_model(),
             None => DEFAULT_OPENAI_MODEL,

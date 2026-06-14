@@ -133,10 +133,9 @@ fn set_effective_provider_api_key(cfg: &mut AppConfig, value: &str) {
         P::AzureOpenAi(c) => c.api_key = v,
         P::OpenAiCompatible(c) => c.api_key = v,
         // OAuth providers hold credentials in auth files, not TOML
-        // `api_key` fields. The faux provider has no credential at
-        // all. Ignoring the inline write here keeps the config screen
-        // surface a no-op for these variants.
-        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) | P::Faux(_) => {}
+        // `api_key` fields. Ignoring the inline write here keeps the
+        // config screen surface a no-op for these variants.
+        P::Bedrock(_) | P::Ollama(_) | P::OpenAiCodex(_) | P::GitHubCopilot(_) => {}
     }
 }
 
