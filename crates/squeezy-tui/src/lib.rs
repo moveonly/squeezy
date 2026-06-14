@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) use approval::PendingApproval;
 use crossterm::{
     Command,
     cursor::{Hide, MoveTo},
@@ -50730,11 +50731,6 @@ pub(crate) struct TurnProgress {
     pub(crate) tool_count: u64,
     pub(crate) input_tokens: u64,
     pub(crate) micro_usd: u64,
-}
-
-pub(crate) struct PendingApproval {
-    pub(crate) request: ToolApprovalRequest,
-    pub(crate) decision_tx: oneshot::Sender<ToolApprovalDecision>,
 }
 
 pub(crate) struct PendingMcpElicitation {

@@ -13,8 +13,9 @@
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use squeezy_agent::ToolApprovalRequest;
+use squeezy_agent::{ToolApprovalDecision, ToolApprovalRequest};
 use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRisk, PermissionRule};
+use tokio::sync::oneshot;
 
 use crate::compact_text;
 
@@ -24,6 +25,11 @@ use crate::compact_text;
 /// full patch via `/diff` once the call lands.
 const APPROVAL_DIFF_BODY_CAP: usize = 18;
 const APPROVAL_CONTEXT_WRAP: usize = 96;
+
+pub(crate) struct PendingApproval {
+    pub(crate) request: ToolApprovalRequest,
+    pub(crate) decision_tx: oneshot::Sender<ToolApprovalDecision>,
+}
 
 /// The preview block split into its regions, so the renderer can elide the
 /// lower-priority rows (rationale, rule) before the command line — and never
