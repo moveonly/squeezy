@@ -2069,6 +2069,19 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
+                label: "help_strict_local",
+                toml_path: &["subagents", "help_strict_local"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::NextPrompt,
+                get: get_subagent_help_strict_local,
+                set: set_subagent_help_strict_local,
+                default_display: "false",
+                default: || FieldValue::Bool(false),
+                help: "Answer /help fully locally — never call the DocHelp model subagent.",
+                env_override: Some("SQUEEZY_HELP_STRICT_LOCAL"),
+                secret: false,
+            },
+            FieldMeta {
                 label: "max_concurrent",
                 toml_path: &["subagents", "max_concurrent"],
                 kind: FieldKind::Integer {
@@ -4342,6 +4355,22 @@ fn set_subagent_explore_enabled(
     match value {
         FieldValue::Bool(v) => {
             cfg.subagents.explore_enabled = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_subagent_help_strict_local(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.subagents.help_strict_local)
+}
+fn set_subagent_help_strict_local(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.subagents.help_strict_local = v;
             Ok(())
         }
         _ => Err("expects bool"),
