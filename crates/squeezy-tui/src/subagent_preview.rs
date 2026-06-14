@@ -232,9 +232,9 @@ impl SubagentPreview {
     /// honest about whether double-click / jump does anything here.
     pub(crate) fn activate_hint(&self) -> &'static str {
         if self.can_jump() {
-            "double-click / jump to open transcript"
+            "double-click row / jump to open transcript"
         } else {
-            "click to select"
+            "click row to select"
         }
     }
 }

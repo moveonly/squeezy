@@ -14404,7 +14404,7 @@ fn toggle_hover_preview(app: &mut TuiApp) {
         app.needs_redraw = true;
         return;
     };
-    let hint = preview.activate_hint();
+    let hint = hover_preview_footer_hint(app, &preview);
     let verb = if preview.can_activate() {
         "Ctrl+Enter opens"
     } else {
@@ -33030,9 +33030,15 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
         )))
         .map(|rect| rect.y)
         .unwrap_or(area.y);
+    let action_lines = hover_preview_selected_action_lines(app, preview);
+    let content_rows = if action_lines.is_empty() {
+        preview.body.len()
+    } else {
+        action_lines.len()
+    };
     // The meta line (turn · size · cost), when present, occupies one content row
-    // beyond the body excerpt.
-    let body_rows = preview.body.len() + usize::from(preview.meta.is_some());
+    // beyond the body excerpt/action inventory.
+    let body_rows = content_rows + usize::from(preview.meta.is_some());
     let Some(rect) = hover_preview::popover_rect(area, anchor_row, body_rows) else {
         app.hover_preview_rect.set(None);
         return;
@@ -33098,8 +33104,15 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
             Style::default().fg(crate::render::theme::secondary()),
         )));
     }
-    // Body excerpt: quiet, so the peek reads as ambient context, not chrome.
-    for body_line in &preview.body {
+    // Body excerpt, or when the entry is already selected, the complete action
+    // inventory for that selected entry. Actions are sourced from the same
+    // applicable-action list the action palette runs.
+    let body_source = if action_lines.is_empty() {
+        &preview.body
+    } else {
+        &action_lines
+    };
+    for body_line in body_source {
         lines.push(Line::from(Span::styled(
             body_line.clone(),
             Style::default().fg(crate::render::theme::quiet()),
@@ -33110,12 +33123,13 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
     // palette acts on, so name its chord in context — the one place a keyboard user
     // learns the card has a contextual menu without hunting the command palette.
     let mut footer_spans = vec![Span::styled(
-        preview.activate_hint().to_string(),
+        hover_preview_footer_hint(app, preview),
         Style::default()
             .fg(crate::render::theme::secondary())
             .add_modifier(Modifier::DIM),
     )];
-    if preview.is_keyboard() {
+    let previewed_is_selected = hover_preview_entry_is_selected(app, preview);
+    if preview.is_keyboard() && !previewed_is_selected {
         footer_spans.push(Span::styled(
             format!(
                 " \u{00b7} {} for actions",
@@ -33128,6 +33142,52 @@ fn render_hover_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
     }
     lines.push(Line::from(footer_spans));
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn hover_preview_entry_is_selected(app: &TuiApp, preview: &hover_preview::HoverPreview) -> bool {
+    active_selected_entry(app)
+        .and_then(|index| active_transcript_entries(app).get(index))
+        .is_some_and(|entry| entry.id == preview.entry_id)
+}
+
+fn hover_preview_footer_hint(app: &TuiApp, preview: &hover_preview::HoverPreview) -> String {
+    if hover_preview_entry_is_selected(app, preview) {
+        "selected entry · actions above work now".to_string()
+    } else {
+        preview.activate_hint().to_string()
+    }
+}
+
+fn hover_preview_selected_action_lines(
+    app: &TuiApp,
+    preview: &hover_preview::HoverPreview,
+) -> Vec<String> {
+    if !hover_preview_entry_is_selected(app, preview) {
+        return Vec::new();
+    }
+    let Some(entry) =
+        active_selected_entry(app).and_then(|index| active_transcript_entries(app).get(index))
+    else {
+        return Vec::new();
+    };
+    let kind = action_palette_unit_kind(entry);
+    let actions = action_palette::applicable_actions(kind, entry_has_detail_pane_content(entry));
+    let palette_hint = key_hint(app, keymap::Action::OpenActionPalette);
+    let parts: Vec<String> = actions
+        .into_iter()
+        .map(|action| {
+            let label = action.label(entry.collapsed);
+            if let Some(hint) = action_palette_action_hint(app, action) {
+                format!("{hint} {label}")
+            } else {
+                format!("{palette_hint} menu: {label}")
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        return Vec::new();
+    }
+    hover_preview::wrap_preview_text(&format!("Actions: {}", parts.join(" · ")), 6)
 }
 
 /// Paint the Subagent Hover Preview popover (§12.8.2) as a quiet, fixed-size,
@@ -33212,7 +33272,8 @@ fn render_subagent_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             Style::default().fg(crate::render::theme::quiet()),
         )));
     }
-    // Footer hint: honest about whether double-click / jump opens a transcript.
+    // Footer hint: name the real hit target. The popover is passive chrome; the
+    // row underneath owns selection and activation.
     lines.push(Line::from(Span::styled(
         preview.activate_hint().to_string(),
         Style::default()
@@ -33224,8 +33285,8 @@ fn render_subagent_preview_popover(frame: &mut Frame<'_>, area: Rect, app: &TuiA
 
 /// The default keyboard chord that drives the same handler a palette action runs,
 /// for the menu's "current binding" hint — or `None` for an action whose only
-/// reach is the palette itself (quote-into-composer, jump, fold-by-id). Reads the
-/// live keymap so a rebound chord still reads back correctly.
+/// reach is the palette itself (quote-into-composer, jump). Reads the live keymap
+/// so a rebound chord still reads back correctly.
 fn action_palette_action_hint(
     app: &TuiApp,
     action: action_palette::PaletteAction,
@@ -33237,11 +33298,10 @@ fn action_palette_action_hint(
         PaletteAction::CopyToolOutput => keymap::Action::CopyCurrentToolOutput,
         PaletteAction::Annotate => keymap::Action::AnnotateEntry,
         PaletteAction::OpenInDetail => keymap::Action::OpenFocusedInDetail,
+        PaletteAction::ToggleFold => keymap::Action::ToggleFocusedFold,
         PaletteAction::RelatedLinks => keymap::Action::ToggleRelatedLinks,
         // No dedicated global chord; reachable only through the palette.
-        PaletteAction::QuoteToCompose | PaletteAction::ToggleFold | PaletteAction::JumpToEntry => {
-            return None;
-        }
+        PaletteAction::QuoteToCompose | PaletteAction::JumpToEntry => return None,
     };
     Some(key_hint(app, keymap_action))
 }
@@ -35455,6 +35515,10 @@ fn search_status_text(state: &search::SearchState) -> String {
 /// padding occupy the leading columns; a click there toggles the entry's fold,
 /// while a click on the rest of the header focuses the entry.
 const CARD_CARET_WIDTH: u16 = 3;
+/// Wider fold hit zone for card-style headers whose visible fold/status marker
+/// can be shifted by the rail/gutter. The remainder of the header still focuses
+/// the entry, so the preview's "click row to select" guidance stays true.
+const CARD_HEADER_FOLD_WIDTH: u16 = 12;
 
 /// Register the per-entry card-header hit targets for every transcript entry
 /// whose header row is currently visible. This is the bridge between the
@@ -35506,26 +35570,7 @@ fn register_transcript_card_targets(
         }
         let id = transcript_surface::EntryId(entry.id);
         let screen_y = text_area.y + (header_row - top_row) as u16;
-        // A reasoning entry's header leads with a '▾'/'▸' disclosure glyph that
-        // the Quiet Rail gutter pushes past the narrow caret zone, so the old
-        // caret(toggle)/remainder(focus) split left the visible affordance
-        // un-clickable — clicking "▾ reasoning" only re-focused. A reasoning
-        // header is a single row with no selectable prose, so register the WHOLE
-        // row as the fold toggle: clicking anywhere on it folds/unfolds it.
-        if matches!(entry.kind, TranscriptEntryKind::Reasoning(_)) {
-            app.register_click(
-                Rect {
-                    x: text_area.x,
-                    y: screen_y,
-                    width: text_area.width,
-                    height: 1,
-                },
-                interaction::TargetKey::Entry(id),
-                interaction::Action::ToggleEntryCollapsed(id),
-            );
-            continue;
-        }
-        let caret_w = CARD_CARET_WIDTH.min(text_area.width);
+        let caret_w = card_header_fold_width(&entry.kind).min(text_area.width);
         // Caret zone → toggle collapse.
         app.register_click(
             Rect {
@@ -35553,6 +35598,21 @@ fn register_transcript_card_targets(
                 interaction::Action::FocusEntry(id),
             );
         }
+    }
+}
+
+fn card_header_fold_width(kind: &TranscriptEntryKind) -> u16 {
+    if matches!(
+        kind,
+        TranscriptEntryKind::ToolResult(_)
+            | TranscriptEntryKind::Log(_)
+            | TranscriptEntryKind::PlanCard(_)
+            | TranscriptEntryKind::Diff(_)
+            | TranscriptEntryKind::Reasoning(_)
+    ) {
+        CARD_HEADER_FOLD_WIDTH
+    } else {
+        CARD_CARET_WIDTH
     }
 }
 
