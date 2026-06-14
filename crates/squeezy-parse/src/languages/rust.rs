@@ -1,3 +1,4 @@
+use crate::languages::common::visit_named_children;
 use crate::languages::java::java_first_name_descendant;
 use crate::*;
 
@@ -73,10 +74,9 @@ pub(crate) fn visit_children(
     parent_symbol: Option<SymbolId>,
     owner_symbol: Option<SymbolId>,
 ) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
+    visit_named_children(node, |child| {
         visit_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
-    }
+    });
 }
 
 pub(crate) fn symbol_from_node(

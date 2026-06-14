@@ -1,4 +1,5 @@
 pub mod c_family;
+pub mod common;
 pub mod csharp;
 pub mod dart;
 pub mod go;
