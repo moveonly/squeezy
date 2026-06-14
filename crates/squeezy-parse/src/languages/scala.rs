@@ -155,6 +155,12 @@ fn visit_scala_node(
             // reference for the wrapper node text itself.
             visit_scala_children(node, ctx, parent_symbol, owner_symbol, inside_inline);
         }
+        "case_class_pattern" => {
+            extract_scala_case_class_pattern(node, ctx, owner_symbol.clone());
+            // Recurse so the extractor type emits its Type reference and any
+            // nested `case_class_pattern`s emit their own unapply calls.
+            visit_scala_children(node, ctx, parent_symbol, owner_symbol, inside_inline);
+        }
         "annotation" => {
             extract_scala_annotation(node, ctx, owner_symbol.clone());
             visit_scala_children(node, ctx, parent_symbol, owner_symbol, inside_inline);
@@ -1322,6 +1328,44 @@ fn extract_scala_instance(
         text: target_text,
         kind: BodyHitKind::Call,
         span: span_from_node(node),
+    });
+}
+
+/// A `case Foo(x, y)` deconstruction invokes the extractor's `unapply` (or
+/// `unapplySeq`) — synthesized for case classes, user-defined for custom
+/// extractors. Emit a synthetic `unapply` `Method` call with the pattern type
+/// as receiver so "where is this extractor used" resolves to a call, not just a
+/// bare Type mention. Heuristic confidence: which `unapply` overload runs is a
+/// type-checker decision.
+fn extract_scala_case_class_pattern(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
+    let receiver = match node_text(type_node, ctx.source) {
+        Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
+        _ => return,
+    };
+    // The number of bound sub-patterns approximates the extracted arity.
+    let arity = node
+        .children_by_field_name("pattern", &mut node.walk())
+        .filter(|child| child.is_named())
+        .count();
+    let span = span_from_node(node);
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id,
+        name: "unapply".to_string(),
+        target_text: format!("{receiver}.unapply"),
+        receiver: Some(receiver),
+        arity,
+        kind: ParsedCallKind::Method,
+        span,
+        provenance: Provenance::new("tree-sitter-scala", "case_class_pattern unapply"),
+        confidence: Confidence::Heuristic,
     });
 }
 

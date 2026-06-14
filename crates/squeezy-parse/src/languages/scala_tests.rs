@@ -170,3 +170,21 @@ fn records_type_parameter_bounds() {
         cage.attributes
     );
 }
+
+#[test]
+fn emits_unapply_call_for_case_class_pattern() {
+    // `case Email(user, domain) =>` deconstructs via the extractor's `unapply`,
+    // so the parser emits a synthetic `unapply` Method call with the pattern
+    // type as receiver — "where is this extractor used" then resolves to a call.
+    let parsed = parse_scala(
+        "object M {\n  def f(x: Any): Int = x match {\n    case Email(user, domain) => 1\n    case _ => 0\n  }\n}",
+    );
+    let unapply = parsed
+        .calls
+        .iter()
+        .find(|call| call.name == "unapply" && call.receiver.as_deref() == Some("Email"))
+        .unwrap_or_else(|| panic!("expected Email.unapply call, got {:?}", parsed.calls));
+    assert_eq!(unapply.kind, ParsedCallKind::Method);
+    assert_eq!(unapply.arity, 2, "expected arity 2, got {}", unapply.arity);
+    assert_eq!(unapply.confidence, Confidence::Heuristic);
+}
