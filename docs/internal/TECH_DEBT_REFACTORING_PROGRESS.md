@@ -3,7 +3,7 @@
 Source audit: `docs/internal/TECH_DEBT_REFACTORING_AUDIT.md` (2026-06-14)
 
 Status reflects coverage in `origin/main..HEAD` on branch
-`tech-debt-audit-refactor` as of `1e5434ca`.
+`techdebt-full-agent-hotpath`.
 
 Legend: `Done` means the current branch directly completes the item. `Partial`
 means the branch adds a guardrail, helper, or first slice but leaves the audit
@@ -14,7 +14,7 @@ action incomplete. `Open` means no current-branch coverage found.
 | Status | Owner slice | Action | Evidence | PR/commit |
 | --- | --- | --- | --- | --- |
 | Open | TUI | Split the TUI monolith into owned surface, state, input, and render modules. | No modal registry, render split, or `TuiApp` state grouping in current branch. | TBD |
-| Open | Agent/store | Split the agent turn runtime into request, stream, tool-round, and terminal phases. | Current branch centralizes compaction decisions only; `TurnRuntime::run` remains unsplit. | TBD |
+| Done | Agent/store | Split the agent turn runtime into request, stream, tool-round, and terminal phases. | Added `crates/squeezy-agent/src/turn_phases/` with request helpers, cancellation-aware stream polling, tool-round execution/batching, and terminal `finish_turn`; moved `TurnRuntime::run` out of `lib.rs`. | this branch |
 | Partial | Core/CLI/config | Centralize config metadata and path resolution. | Added core `ConfigInitScope`, `ConfigInitTarget`, and `config_init_target`; schema/template unification remains open. | `df298934`, `9c777a5b` |
 | Partial | Tools/shell/MCP | Introduce first-party tool descriptors. | Added `FirstPartyToolExecutor` dispatch guardrail, but not a full `ToolDescriptor` catalog with specs, permissions, prepare hooks, and executors. | `b0fdfc27`, `4788440c` |
 | Partial | Graph/language/provider | Make language and provider metadata single-source. | Added language registry coverage across core, parse, graph, and workspace; provider/auth metadata remains split. | `d8170431` |
@@ -28,12 +28,12 @@ action incomplete. `Open` means no current-branch coverage found.
 | Open | TUI | Break `TuiApp` into nested state groups. | No `ComposerState`, `TranscriptViewState`, `OverlayState`, `NavigationState`, or `PromptQueueState` extraction. | TBD |
 | Open | TUI | Move shared test helpers out of the bottom of `lib_tests.rs`. | Current branch adjusts render tests but does not create TUI test support. | TBD |
 | Open | TUI | Split `lib_tests.rs` by feature owner. | No paired TUI `*_tests.rs` migration in current branch. | TBD |
-| Open | Agent/store | Split `TurnRuntime::run` into phases. | No turn phase modules added. | TBD |
-| Open | Agent/store | Centralize session persistence through a commit/snapshot type. | No `ConversationCommit` or `SessionPersistenceSnapshot` introduced. | TBD |
-| Open | Agent/store | Extract bootstrap services from `Agent`. | Agent construction/service wiring remains in `crates/squeezy-agent/src/lib.rs`. | TBD |
+| Done | Agent/store | Split `TurnRuntime::run` into phases. | Added `turn_phases::{request,stream,tools,terminal}` and moved the run loop plus tool execution hot path behind those phase boundaries. | this branch |
+| Blocked | Agent/store | Centralize session persistence through a commit/snapshot type. | Blocker: this behavior-preserving slice only moved terminal `finish_turn`; `persist_turn_state`, `persist_turn_accounting`, replay writes, task-state publication, and metadata updates still share live `TurnRuntime` state. Closing this safely needs a `ConversationCommit` / `SessionPersistenceSnapshot` contract and fixture coverage for resume/replay event order. | blocked |
+| Blocked | Agent/store | Extract bootstrap services from `Agent`. | Blocker: `Agent::build` / turn construction still own provider, MCP refresh, job registry, hooks, and session wiring in `crates/squeezy-agent/src/lib.rs`; extracting them is a separate bootstrap-service refactor outside the hot turn-orchestration body. | blocked |
 | Done | Agent/store | Make compaction eligibility a typed decision. | Added `ContextCompactionDecision` and routed auto-compaction through `context_compaction_decision`. | `6d185457`, `50a76f24` |
-| Partial | Agent/store | Split `crates/squeezy-store/src/sessions.rs` into store, handle, writer, replay, index, and cleanup modules. | Extracted replay state and JSONL helpers into `sessions_replay.rs`; other store areas remain in `sessions.rs`. | `eb75270e` |
-| Open | Agent/store | Finish migration from string event kinds to typed session events. | No agent logging migration away from string event kinds in current branch. | TBD |
+| Partial | Agent/store | Split `crates/squeezy-store/src/sessions.rs` into store, handle, writer, replay, index, and cleanup modules. | Existing `sessions_replay.rs` extraction remains; blocker: store, handle, writer, index, and cleanup APIs are still interleaved in `sessions.rs`, and closing this row safely requires a wider store crate module migration. | `eb75270e`, blocked |
+| Done | Agent/store | Finish migration from string event kinds to typed session events. | Startup/resume/failure paths use `append_typed_event`, and central `log_session_event` converts known agent kinds to `SessionEventKind` before append while preserving raw custom kinds. | this branch |
 | Open | Core/CLI/config | Split `crates/squeezy-core/src/lib.rs` into domain modules. | Config init target helper was added, but no core module split. | TBD |
 | Open | Core/CLI/config | Make config templates and schema share metadata. | Template/schema metadata still not unified. | TBD |
 | Open | Core/CLI/config | Move config explain parsing/source lookup out of CLI. | CLI explain logic remains in `crates/squeezy-cli/src/main.rs`. | TBD |
