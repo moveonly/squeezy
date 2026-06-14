@@ -7,7 +7,7 @@ use crate::*;
 /// O(distinct files). The cache lives for a single query, so it never serves
 /// stale bytes across queries.
 #[derive(Default)]
-pub(crate) struct SourceCache {
+pub struct SourceCache {
     files: HashMap<FileId, Option<String>>,
     reads: usize,
 }

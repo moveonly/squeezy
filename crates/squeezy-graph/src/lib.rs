@@ -10,6 +10,7 @@ pub mod backend;
 pub mod cross_file;
 mod languages;
 mod references;
+pub use references::SourceCache;
 mod resolution;
 pub mod resolver_cache;
 pub mod watcher;
@@ -1147,7 +1148,7 @@ impl SemanticGraph {
         self.references_to_symbol_with_cache(symbol_id, &mut sources)
     }
 
-    pub(crate) fn references_to_symbol_with_cache(
+    pub fn references_to_symbol_with_cache(
         &self,
         symbol_id: &SymbolId,
         sources: &mut references::SourceCache,
@@ -2967,7 +2968,7 @@ impl GraphManager {
     ///    edge actually changed — so a one-file refresh no longer pays the cost
     ///    of re-encoding every resolver row plus the whole adjacency blob.
     fn extend_resolver_cache_batch(&self, batch: &mut GraphWriteBatch, scope: ResolverCacheScope) {
-        let mut upsert_entry = |file_id: &FileId, batch: &mut GraphWriteBatch| {
+        let upsert_entry = |file_id: &FileId, batch: &mut GraphWriteBatch| {
             let Some(file) = self.graph.files.get(file_id) else {
                 return;
             };
