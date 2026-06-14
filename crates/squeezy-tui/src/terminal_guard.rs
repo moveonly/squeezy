@@ -24,16 +24,16 @@ use squeezy_core::{Result, SqueezyError, TuiSynchronizedOutput};
 use crate::terminal_writer::TerminalWriter;
 use crate::{
     BEGIN_SYNCHRONIZED_UPDATE, END_SYNCHRONIZED_UPDATE, MIRROR_FALLBACK_WIDTH, TuiApp,
-    close_subagent_compare, compensate_main_scroll_for_append, dogfood,
-    emit_finish_fullscreen_mirror_streamed, emit_finish_fullscreen_restore,
+    apply_startup_terminal_profile, close_subagent_compare, compensate_main_scroll_for_append,
+    dogfood, emit_finish_fullscreen_mirror_streamed, emit_finish_fullscreen_restore,
     emit_terminal_emergency_teardown, emit_terminal_enter_setup, main_render_cache,
     mark_full_redraw_after_resume, metrics, precheck_terminal_environment, prompt_elapsed_ms,
     refresh_attention_route, refresh_change_summary, refresh_duplicate_folds, refresh_error_lenses,
     refresh_health_markers, refresh_lane_fold, refresh_related_links, refresh_review_board,
     refresh_session_timeline, refresh_subagent_timeline, refresh_transcript_index,
-    refresh_turn_outline, render, resolve_mouse_capture, resolve_synchronized_output,
-    review_board_reconcile_cursor, signal_teardown, subagent_compare_records_present,
-    terminal_restore, terminal_title_for, toast, transcript_lines_for_render,
+    refresh_turn_outline, render, resolve_synchronized_output, review_board_reconcile_cursor,
+    signal_teardown, subagent_compare_records_present, terminal_restore, terminal_title_for, toast,
+    transcript_lines_for_render,
 };
 // Editor handoff (suspend → external $EDITOR) is Unix-only; these are used solely by the
 // #[cfg(unix)] suspend_and_resume / run_pending_editor_handoff methods below, so the import
@@ -115,12 +115,14 @@ impl TerminalGuard {
         // `Arc` to reset/read it across each `draw_app`.
         let byte_counter: metrics::ByteCounter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         writer.set_byte_counter(Arc::clone(&byte_counter));
-        // Mouse capture defaults ON in fullscreen (the alt-screen norm:
-        // click-to-focus / scroll / drag are part of the UI). It hijacks
-        // native text selection and scrollback, so Shift+drag / Shift+wheel
-        // are the escape hatch. Only the literal `SQUEEZY_MOUSE_CAPTURE=0`
-        // disables it; any other value (including empty) leaves it on.
-        let mouse_capture = resolve_mouse_capture(|key| std::env::var_os(key));
+        // Apply the persisted terminal profile (§12.7.3) before the first paint:
+        // pin the saved colour-depth override into the palette and resolve mouse
+        // capture from the profile. Mouse capture defaults ON in fullscreen (the
+        // alt-screen norm: click-to-focus / scroll / drag are part of the UI) and
+        // hijacks native text selection / scrollback, so Shift+drag / Shift+wheel
+        // are the escape hatch. The literal `SQUEEZY_MOUSE_CAPTURE=0` (and
+        // `$NO_COLOR` for colour) still win over the profile.
+        let mouse_capture = apply_startup_terminal_profile();
         // Emit the whole startup setup sequence (keyboard flags, alt-screen
         // entry, bracketed paste / focus, mouse capture) through the shared free
         // helper so a test can drive the exact same bytes into a `Capture`

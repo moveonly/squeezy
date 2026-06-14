@@ -1043,6 +1043,13 @@ async fn run_inner_with_terminal(
     // session that never picked one keeps the built-in Unicode default; a malformed
     // value is ignored.
     restore_glyph_mode(&mut app);
+    // Per-Terminal Profiles (§12.7.3): pin the saved profile override and reflect
+    // its glyph fidelity into the live glyph mode before the first paint. The
+    // mouse + colour legs of the same profile were already applied at terminal
+    // entry (they must precede mouse-capture arming and the palette's first
+    // resolution); this covers the override pin and the glyph leg. Runs after
+    // `restore_glyph_mode` so a dedicated `[tui].glyph_mode` key still wins.
+    restore_terminal_profile(&mut app);
     // Gesture Settings (§12.7.5): load the saved gesture/input accommodations
     // (wheel step, Shift-wheel pan, hover dwell, double-click routing, drag-select)
     // before the first event so the live input path honours them without the user
@@ -6558,20 +6565,7 @@ fn read_persisted_terminal_profile(
     app: &TuiApp,
     caps: terminal_profile::TerminalCapabilities,
 ) -> Option<terminal_profile::TerminalProfile> {
-    let fallback = terminal_profile::TerminalProfile::resolve(caps);
-    let kind = caps.kind.as_str();
-    let text = std::fs::read_to_string(app.user_settings_path()).ok()?;
-    let doc = text.parse::<toml::Table>().ok()?;
-    let table = doc
-        .get("tui")?
-        .as_table()?
-        .get("terminal_profiles")?
-        .as_table()?
-        .get(kind)?
-        .as_table()?;
-    terminal_profile::TerminalProfile::from_config_lookup(fallback, |key| {
-        table.get(key).and_then(|v| v.as_str()).map(str::to_string)
-    })
+    read_startup_terminal_profile(&app.user_settings_path(), caps)
 }
 
 /// The status line shown while the Per-Terminal Profiles overlay is open: the
@@ -6938,6 +6932,28 @@ fn read_persisted_glyph_mode(app: &TuiApp) -> Option<glyph_mode::GlyphMode> {
 fn restore_glyph_mode(app: &mut TuiApp) {
     if let Some(mode) = read_persisted_glyph_mode(app) {
         app.glyph_mode = mode;
+    }
+}
+
+/// Per-Terminal Profiles (§12.7.3): load the persisted profile for the detected
+/// terminal into the live `terminal_profile_override` before the first event, and
+/// reflect its glyph fidelity into `app.glyph_mode` so a saved ASCII profile draws
+/// ASCII chrome. The mouse + colour legs are applied earlier, at terminal entry
+/// (they must land before the first paint and before mouse capture is armed); this
+/// covers the override pin and the glyph leg, which live on the `TuiApp`. The
+/// dedicated `[tui].glyph_mode` key wins when set (the user picked a glyph mode
+/// explicitly), so this only maps the profile's `ascii` glyphs onto the glyph mode
+/// when no separate glyph-mode override is persisted.
+fn restore_terminal_profile(app: &mut TuiApp) {
+    let caps = terminal_profile::TerminalCapabilities::detect();
+    let Some(profile) = read_persisted_terminal_profile(app, caps) else {
+        return;
+    };
+    app.terminal_profile_override = Some(profile);
+    if profile.glyphs == terminal_profile::GlyphSet::Ascii
+        && read_persisted_glyph_mode(app).is_none()
+    {
+        app.glyph_mode = glyph_mode::GlyphMode::Ascii;
     }
 }
 
@@ -49956,6 +49972,85 @@ where
     env_get("SQUEEZY_MOUSE_CAPTURE")
         .map(|v| v != "0")
         .unwrap_or(true)
+}
+
+/// Read the resolved per-terminal profile (§12.7.3) for the *detected* terminal
+/// from the user-scope settings file, before the `TuiApp` exists. Returns the
+/// profile layered onto the built-in default table, or `None` when nothing is
+/// persisted (or the file is absent / unreadable). Used at startup to apply the
+/// saved mouse / colour / glyph policy before the first paint. `caps` is injected
+/// so the precedence/no-profile behaviour is unit-testable without a real TTY.
+pub(crate) fn read_startup_terminal_profile(
+    settings_path: &Path,
+    caps: terminal_profile::TerminalCapabilities,
+) -> Option<terminal_profile::TerminalProfile> {
+    let fallback = terminal_profile::TerminalProfile::resolve(caps);
+    let kind = caps.kind.as_str();
+    let text = std::fs::read_to_string(settings_path).ok()?;
+    let doc = text.parse::<toml::Table>().ok()?;
+    let table = doc
+        .get("tui")?
+        .as_table()?
+        .get("terminal_profiles")?
+        .as_table()?
+        .get(kind)?
+        .as_table()?;
+    terminal_profile::TerminalProfile::from_config_lookup(fallback, |key| {
+        table.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    })
+}
+
+/// Resolve the effective mouse-capture policy at startup (§12.7.3): the env opt-out
+/// `SQUEEZY_MOUSE_CAPTURE` is the highest-precedence signal and always wins; with
+/// no env override a persisted terminal profile that disables the mouse suppresses
+/// capture; otherwise capture defaults ON. `profile` is the resolved startup
+/// profile (or `None` when none is persisted). Injected `env_get` keeps it
+/// testable without mutating real process env.
+pub(crate) fn resolve_mouse_capture_with_profile<F>(
+    env_get: F,
+    profile: Option<terminal_profile::TerminalProfile>,
+) -> bool
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    if let Some(value) = env_get("SQUEEZY_MOUSE_CAPTURE") {
+        return value != "0";
+    }
+    match profile {
+        Some(p) => matches!(p.mouse, terminal_profile::MouseMode::Enabled),
+        None => true,
+    }
+}
+
+/// Map a persisted terminal-profile [`ColorDepth`](terminal_profile::ColorDepth)
+/// onto the renderer's [`ColorLevel`](render::palette::ColorLevel).
+pub(crate) fn profile_color_level(
+    depth: terminal_profile::ColorDepth,
+) -> render::palette::ColorLevel {
+    match depth {
+        terminal_profile::ColorDepth::TrueColor => render::palette::ColorLevel::TrueColor,
+        terminal_profile::ColorDepth::Indexed256 => render::palette::ColorLevel::Ansi256,
+        terminal_profile::ColorDepth::Ansi16 => render::palette::ColorLevel::Ansi16,
+        terminal_profile::ColorDepth::Monochrome => render::palette::ColorLevel::NoColor,
+    }
+}
+
+/// Apply the persisted terminal profile's mouse + colour policy at startup, before
+/// the first paint, and return the resolved mouse-capture decision. Reads the
+/// profile from the user-scope settings file for the detected terminal, pins the
+/// colour-depth override into the palette (env `$NO_COLOR` still wins inside
+/// [`render::palette::color_level`]), and resolves mouse capture with env taking
+/// precedence over the profile. Glyph fidelity is applied separately from the
+/// `TuiApp` restore block (it lives on `app.glyph_mode`, which does not exist
+/// here). Best-effort: an absent / unreadable profile leaves the autodetected
+/// defaults in place.
+pub(crate) fn apply_startup_terminal_profile() -> bool {
+    let caps = terminal_profile::TerminalCapabilities::detect();
+    let profile = read_startup_terminal_profile(&squeezy_core::default_settings_path(), caps);
+    if let Some(p) = profile {
+        render::palette::set_color_override(profile_color_level(p.color));
+    }
+    resolve_mouse_capture_with_profile(|key| std::env::var_os(key), profile)
 }
 
 /// Resolve the initial state of the hidden render-budget HUD from the

@@ -31168,6 +31168,158 @@ async fn terminal_profile_field_navigation_and_reset() {
     );
 }
 
+#[test]
+fn resolve_mouse_capture_with_profile_precedence() {
+    use crate::terminal_profile::{ColorDepth, GlyphSet, MouseMode, TerminalProfile};
+    let off = TerminalProfile {
+        glyphs: GlyphSet::Unicode,
+        mouse: MouseMode::Disabled,
+        color: ColorDepth::TrueColor,
+    };
+    let on = TerminalProfile {
+        mouse: MouseMode::Enabled,
+        ..off
+    };
+    // No env override: the profile decides.
+    assert!(
+        !resolve_mouse_capture_with_profile(|_| None, Some(off)),
+        "a profile that disables the mouse suppresses capture"
+    );
+    assert!(
+        resolve_mouse_capture_with_profile(|_| None, Some(on)),
+        "a profile that enables the mouse keeps capture on"
+    );
+    // No profile at all: capture defaults on.
+    assert!(
+        resolve_mouse_capture_with_profile(|_| None, None),
+        "no profile keeps the on-by-default capture"
+    );
+    // Env is the highest-precedence signal and wins over the profile both ways.
+    assert!(
+        !resolve_mouse_capture_with_profile(
+            |k| (k == "SQUEEZY_MOUSE_CAPTURE").then(|| std::ffi::OsString::from("0")),
+            Some(on),
+        ),
+        "SQUEEZY_MOUSE_CAPTURE=0 disables capture even when the profile enables it"
+    );
+    assert!(
+        resolve_mouse_capture_with_profile(
+            |k| (k == "SQUEEZY_MOUSE_CAPTURE").then(|| std::ffi::OsString::from("1")),
+            Some(off),
+        ),
+        "a non-zero SQUEEZY_MOUSE_CAPTURE enables capture even when the profile disables it"
+    );
+}
+
+#[test]
+fn profile_color_level_maps_every_depth() {
+    use crate::render::palette::ColorLevel;
+    use crate::terminal_profile::ColorDepth;
+    assert_eq!(
+        profile_color_level(ColorDepth::TrueColor),
+        ColorLevel::TrueColor
+    );
+    assert_eq!(
+        profile_color_level(ColorDepth::Indexed256),
+        ColorLevel::Ansi256
+    );
+    assert_eq!(profile_color_level(ColorDepth::Ansi16), ColorLevel::Ansi16);
+    assert_eq!(
+        profile_color_level(ColorDepth::Monochrome),
+        ColorLevel::NoColor
+    );
+}
+
+#[test]
+fn restore_terminal_profile_pins_override_and_applies_ascii_glyphs() {
+    // Write an ASCII profile for the *detected* terminal kind (so the read keys on
+    // the same table regardless of the CI terminal), then restore: the override is
+    // pinned and the glyph fidelity reflects into the live glyph mode.
+    let dir = temp_workspace("restore_terminal_profile");
+    let settings_path = dir.join("settings.toml");
+    let kind = crate::terminal_profile::TerminalCapabilities::detect()
+        .kind
+        .as_str();
+    std::fs::write(
+        &settings_path,
+        format!(
+            "[tui.terminal_profiles.{kind}]\nglyphs = \"ascii\"\nmouse = \"off\"\ncolor = \"mono\"\n"
+        ),
+    )
+    .expect("write scratch settings");
+
+    let mut app = test_app(SessionMode::Build);
+    app.set_settings_path_override(Some(settings_path.clone()));
+    assert_eq!(
+        app.glyph_mode,
+        glyph_mode::GlyphMode::Unicode,
+        "a fresh app starts on the default glyph mode"
+    );
+    assert!(
+        app.terminal_profile_override.is_none(),
+        "no override pinned before restore"
+    );
+
+    restore_terminal_profile(&mut app);
+
+    assert!(
+        app.terminal_profile_override.is_some(),
+        "restore pins the persisted profile override"
+    );
+    let pinned = app.terminal_profile_override.unwrap();
+    assert_eq!(
+        pinned.glyphs,
+        crate::terminal_profile::GlyphSet::Ascii,
+        "the saved ASCII glyph set was read back"
+    );
+    assert_eq!(
+        pinned.mouse,
+        crate::terminal_profile::MouseMode::Disabled,
+        "the saved mouse-off policy was read back"
+    );
+    assert_eq!(
+        pinned.color,
+        crate::terminal_profile::ColorDepth::Monochrome,
+        "the saved monochrome colour was read back"
+    );
+    assert_eq!(
+        app.glyph_mode,
+        glyph_mode::GlyphMode::Ascii,
+        "an ASCII profile maps onto the live glyph mode when no [tui].glyph_mode key is set"
+    );
+}
+
+#[test]
+fn restore_terminal_profile_defers_to_explicit_glyph_mode_key() {
+    // A dedicated [tui].glyph_mode key is the user's explicit glyph choice and must
+    // win over the profile's glyph fidelity. Mirror the production restore order
+    // (`restore_glyph_mode` then `restore_terminal_profile`): a Compact key plus an
+    // ASCII profile must settle on Compact, proving the profile deferred.
+    let dir = temp_workspace("restore_terminal_profile_glyph_key");
+    let settings_path = dir.join("settings.toml");
+    let kind = crate::terminal_profile::TerminalCapabilities::detect()
+        .kind
+        .as_str();
+    std::fs::write(
+        &settings_path,
+        format!(
+            "[tui]\nglyph_mode = \"compact\"\n\n[tui.terminal_profiles.{kind}]\nglyphs = \"ascii\"\n"
+        ),
+    )
+    .expect("write scratch settings");
+
+    let mut app = test_app(SessionMode::Build);
+    app.set_settings_path_override(Some(settings_path.clone()));
+    restore_glyph_mode(&mut app);
+    restore_terminal_profile(&mut app);
+
+    assert_eq!(
+        app.glyph_mode,
+        glyph_mode::GlyphMode::Compact,
+        "the explicit [tui].glyph_mode key wins over the profile's ASCII glyphs"
+    );
+}
+
 #[tokio::test]
 async fn terminal_profile_clicking_a_field_row_cycles_it() {
     // Mouse parity: a left click on a painted field row focuses that field and

@@ -1,4 +1,10 @@
-use std::{env, sync::OnceLock};
+use std::{
+    env,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 
 use ratatui::style::Color;
 
@@ -10,6 +16,45 @@ pub(crate) enum ColorLevel {
     Ansi16,
     Ansi256,
     TrueColor,
+}
+
+/// A persisted terminal-profile colour override, encoded for the atomic: `0`
+/// means "no override, autodetect", otherwise the stored byte is the
+/// [`ColorLevel`] discriminant + 1. The override is honoured by
+/// [`color_level`] *unless* `$NO_COLOR` is set, which always wins. Set once
+/// before the first paint via [`set_color_override`].
+static COLOR_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+impl ColorLevel {
+    /// Decode an override byte back into a level, or `None` when unset.
+    fn from_override_byte(byte: u8) -> Option<ColorLevel> {
+        match byte {
+            1 => Some(ColorLevel::NoColor),
+            2 => Some(ColorLevel::Ansi16),
+            3 => Some(ColorLevel::Ansi256),
+            4 => Some(ColorLevel::TrueColor),
+            _ => None,
+        }
+    }
+
+    /// Encode a level into the non-zero override byte.
+    fn to_override_byte(self) -> u8 {
+        match self {
+            ColorLevel::NoColor => 1,
+            ColorLevel::Ansi16 => 2,
+            ColorLevel::Ansi256 => 3,
+            ColorLevel::TrueColor => 4,
+        }
+    }
+}
+
+/// Pin a colour-depth override resolved from the persisted terminal profile
+/// (§12.7.3). Takes effect from the next [`color_level`] resolution; because
+/// `color_level` caches its first result, callers set this before the first
+/// paint. `$NO_COLOR` still wins over any override (env is the highest-precedence
+/// signal). Idempotent and cheap — one relaxed atomic store.
+pub(crate) fn set_color_override(level: ColorLevel) {
+    COLOR_OVERRIDE.store(level.to_override_byte(), Ordering::Relaxed);
 }
 
 pub(crate) fn palette_generation() -> u64 {
@@ -89,8 +134,15 @@ pub(crate) fn rgb_components(color: Color) -> (u8, u8, u8) {
 }
 
 fn detect_color_level() -> ColorLevel {
+    // `$NO_COLOR` is the highest-precedence signal and wins over any saved
+    // terminal-profile colour override (env beats persisted policy).
     if env::var_os("NO_COLOR").is_some() {
         return ColorLevel::NoColor;
+    }
+    // A persisted terminal-profile colour depth (§12.7.3) takes precedence over
+    // the probabilistic autodetect below.
+    if let Some(level) = ColorLevel::from_override_byte(COLOR_OVERRIDE.load(Ordering::Relaxed)) {
+        return level;
     }
     match supports_color::on_cached(supports_color::Stream::Stdout) {
         Some(level) if level.has_16m => ColorLevel::TrueColor,
