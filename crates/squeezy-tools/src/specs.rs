@@ -407,7 +407,7 @@ pub(crate) fn repo_map_spec() -> ToolSpec {
 pub(crate) fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or Dart `with` mixers `mixin:<Type>`; prefix-free `attribute=\"<Type>\"` matches all three at once. Pipe-separate to match several (`base:A|base:B`). Pass as `attribute`, not `base:` in `query`. Set transitive=true with an inheritance attribute (base:/iface:/mixin:) to return the full transitive subtype closure, not just direct subtypes. One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". Do not also call definition_search or symbol_context with the same query in one turn unless this result is ambiguous. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
+        description: "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or Dart `with` mixers `mixin:<Type>`; prefix-free `attribute=\"<Type>\"` matches all three at once. Pipe-separate to match several (`base:A|base:B`). Pass as `attribute`, not `base:` in `query`. Set transitive=true with an inheritance attribute (base:/iface:/mixin:) to return the full transitive subtype closure, not just direct subtypes (for transitive supertypes/ancestors use inheritance_hierarchy). One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". Do not also call definition_search or symbol_context with the same query in one turn unless this result is ambiguous. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -522,7 +522,7 @@ pub(crate) fn downstream_flow_spec() -> ToolSpec {
 pub(crate) fn hierarchy_spec() -> ToolSpec {
     ToolSpec {
         name: "hierarchy".to_string(),
-        description: "Return graph containment hierarchy (file → module → class → members) for the workspace, a symbol_id, or a declaration query. This is containment, NOT inheritance — for subclasses/implementers/Dart mixers use `decl_search` with `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or `mixin:<Type>` (Dart `with`); prefix-free `attribute=\"<Type>\"` matches all three. For every method/field/variant of one class, call `hierarchy(symbol_id=<class>)` first to enumerate the member set before reading bodies, replacing member-by-member reads or greps.".to_string(),
+        description: "Return graph containment hierarchy (file → module → class → members) for the workspace, a symbol_id, or a declaration query — the tool for enumerating what a scope contains. For every method/field/variant of one class, call `hierarchy(symbol_id=<class>)` first to enumerate the member set before reading bodies, replacing member-by-member reads or greps. This is containment, NOT inheritance — for subclasses/implementers/Dart mixers use `decl_search` with `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or `mixin:<Type>` (Dart `with`); prefix-free `attribute=\"<Type>\"` matches all three, and for supertypes/ancestors use `inheritance_hierarchy`.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -544,7 +544,7 @@ pub(crate) fn hierarchy_spec() -> ToolSpec {
 pub(crate) fn inheritance_hierarchy_spec() -> ToolSpec {
     ToolSpec {
         name: "inheritance_hierarchy".to_string(),
-        description: "Return inheritance relationships for one class-like symbol. Default returns transitive supertypes through UsesTrait/Extends/Implements edges; set subtypes=true for first-generation direct inheritors. Use for inheritance questions, not containment.".to_string(),
+        description: "Return inheritance relationships for one class-like symbol. Default returns transitive supertypes through UsesTrait/Extends/Implements edges; set subtypes=true for first-generation direct inheritors. Use for inheritance questions, not containment — for the FULL transitive subtype closure use decl_search attribute=\"base:<Type>\" (or iface:/mixin:) with transitive=true.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
