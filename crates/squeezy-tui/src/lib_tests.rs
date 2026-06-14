@@ -35901,6 +35901,17 @@ async fn record_turn_outcome_captures_success_and_edits() {
     );
 }
 
+fn expected_if_prev_succeeded_marker() -> &'static str {
+    if matches!(
+        render::palette::color_level(),
+        render::palette::ColorLevel::NoColor
+    ) {
+        queue_conditions::QueueCondition::IfPrevSucceeded.marker_glyph_ascii()
+    } else {
+        queue_conditions::QueueCondition::IfPrevSucceeded.marker_glyph()
+    }
+}
+
 #[tokio::test]
 async fn overlay_paints_condition_marker_through_real_render() {
     // The open overlay paints a condition tag next to a conditioned prompt and
@@ -35919,7 +35930,7 @@ async fn overlay_paints_condition_marker_through_real_render() {
         "base hint advertises the v verb: {base}"
     );
     assert!(
-        !base.contains("[✓]"),
+        !base.contains(expected_if_prev_succeeded_marker()),
         "no condition glyph when all unconditional: {base}"
     );
     // Condition the front prompt on "if previous succeeded".
@@ -35931,8 +35942,9 @@ async fn overlay_paints_condition_marker_through_real_render() {
     .await
     .expect("condition front prompt");
     let painted = render_to_string(&app, 100, 20);
+    let marker = expected_if_prev_succeeded_marker();
     assert!(
-        painted.contains("[✓]"),
+        painted.contains(marker),
         "the if-succeeded marker is painted: {painted}"
     );
 }
@@ -35993,8 +36005,9 @@ async fn condition_marker_survives_a_narrow_resize() {
         // pre-existing overlay constraint, not a marker bug; the assertion above
         // already proves the narrow render does not panic.
         if width >= 120 {
+            let marker = expected_if_prev_succeeded_marker();
             assert!(
-                rendered.contains("[✓]"),
+                rendered.contains(marker),
                 "marker painted at width {width}: {rendered}"
             );
         }
