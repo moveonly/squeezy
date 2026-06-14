@@ -99,8 +99,12 @@ fn visit_ruby_node(
             // include/extend/prepend produced a Type reference + class
             // attribute, or attr_* synthesized methods. The call itself is
             // not emitted as a `ParsedCall`.
-        } else if extract_ruby_alias_method_call(node, ctx, parent_symbol.as_ref(), host_class.as_ref())
-        {
+        } else if extract_ruby_alias_method_call(
+            node,
+            ctx,
+            parent_symbol.as_ref(),
+            host_class.as_ref(),
+        ) {
             // `alias_method :new, :old` synthesized an aliased Method symbol
             // plus a reference to the original; the call itself is not emitted.
         } else if let Some(test_symbol) =
