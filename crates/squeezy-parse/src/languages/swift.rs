@@ -457,6 +457,13 @@ fn swift_property_symbols_from_node(
     {
         attributes.push("swift:computed".to_string());
     }
+    // A stored property with `willSet`/`didSet` observers parses a
+    // `willset_didset_block` child. Mark it `swift:observed` so it is
+    // distinguishable from a plain stored property (observer-body calls
+    // already attribute to the property via the visitor's `next_owner`).
+    if swift_has_named_child_kind(node, "willset_didset_block") {
+        attributes.push("swift:observed".to_string());
+    }
     attributes.sort();
     attributes.dedup();
 
