@@ -171,6 +171,15 @@ pub enum WorkspaceSpec {
     Github {
         github: GithubWorkspace,
     },
+    /// A fresh, empty, per-run scratch directory the harness creates and
+    /// cleans up. For scenarios that only exercise command dispatch / session
+    /// state and want an isolated sandbox rather than repo content — no
+    /// external setup or committed fixture required. The boolean is just the
+    /// serde discriminant for this untagged variant (write `ephemeral = true`).
+    Ephemeral {
+        #[serde(rename = "ephemeral")]
+        ephemeral: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

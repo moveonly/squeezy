@@ -9,7 +9,7 @@ the dedupe path in `Agent::add_session_label`.
 """
 
 [workspace]
-local = "/tmp/audit-session-session-label-workspace"
+ephemeral = true
 
 [squeezy]
 provider = "mock"

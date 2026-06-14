@@ -10,7 +10,7 @@ paths.
 """
 
 [workspace]
-local = "/tmp/audit-session-session-export-after-turn-workspace"
+ephemeral = true
 
 [squeezy]
 provider = "mock"

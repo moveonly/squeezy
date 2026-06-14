@@ -8,7 +8,7 @@ doesn't error.
 """
 
 [workspace]
-local = "/tmp/audit-session-checkpoints-tui-workspace"
+ephemeral = true
 
 [squeezy]
 provider = "mock"

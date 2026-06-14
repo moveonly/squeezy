@@ -11,7 +11,7 @@ Expected status: `tui_only:fork`.
 """
 
 [workspace]
-local = "/tmp/audit-session-fork-bare-workspace"
+ephemeral = true
 
 [squeezy]
 provider = "mock"

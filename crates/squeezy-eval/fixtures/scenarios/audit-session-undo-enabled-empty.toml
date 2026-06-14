@@ -11,7 +11,7 @@ Pinning skipped=true here means a future regression that flips
 """
 
 [workspace]
-local = "/tmp/audit-session-undo-enabled-empty-workspace"
+ephemeral = true
 
 [squeezy]
 provider = "mock"

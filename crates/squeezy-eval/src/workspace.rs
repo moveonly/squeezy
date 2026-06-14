@@ -122,6 +122,32 @@ pub fn provision(
                 cleanup: Some(WorkspaceCleanup::Directory { path: target }),
             })
         }
+        WorkspaceSpec::Ephemeral { .. } => {
+            // A fresh, empty, per-run sandbox. The unique suffix (pid +
+            // nanosecond timestamp + monotonic counter) matches the GitHub
+            // scratch convention so concurrent runs never collide on the same
+            // path — [`WorkspaceCleanup::Directory`] rmrf's it on drop.
+            fs::create_dir_all(scratch_root)
+                .map_err(|err| EvalError::Io(format!("create_dir_all {scratch_root:?}: {err}")))?;
+            let ns_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let seq = RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+            let target = scratch_root.join(format!(
+                "ephemeral-{}-{}-{}",
+                std::process::id(),
+                ns_ts,
+                seq
+            ));
+            fs::create_dir_all(&target)
+                .map_err(|err| EvalError::Io(format!("create_dir_all {target:?}: {err}")))?;
+            Ok(ProvisionedWorkspace {
+                path: target.clone(),
+                source: WorkspaceSource::Local(target.clone()),
+                cleanup: Some(WorkspaceCleanup::Directory { path: target }),
+            })
+        }
     }
 }
 
