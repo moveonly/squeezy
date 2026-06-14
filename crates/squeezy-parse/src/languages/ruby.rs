@@ -132,8 +132,8 @@ fn visit_ruby_node(
     } else if kind == "identifier" {
         extract_ruby_reference(node, ReferenceKind::Identifier, ctx, owner_symbol.clone());
     } else if kind == "global_variable" {
-        // `$var` read (the LHS of an assignment is handled by the assignment
-        // arm and suppressed here via `ruby_node_is_declared_name`). Emit an
+        // `$var` occurrence (a read, or the LHS of `$var = ...` whose Static
+        // symbol is emitted separately by the assignment arm). Emit an
         // Identifier reference + body hit so `$config` reads are searchable.
         extract_ruby_reference(node, ReferenceKind::Identifier, ctx, owner_symbol.clone());
     } else if kind == "constant" {
