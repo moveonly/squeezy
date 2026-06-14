@@ -96,17 +96,32 @@ pub(crate) enum VisualScenario {
     /// still painted exactly once when the composer is non-empty (focus
     /// present) and to exercise a non-trivial composer row.
     ComposerText,
+    /// A diff card pinned into the open transcript overlay — the `/diff` review
+    /// surface. Captures the diff-card header, summary, and `+/-` body so a
+    /// regression on the diff surface flips the grid.
+    DiffOverlay,
+    /// The Live Review Board open over a multi-worker fan-out, grouped into
+    /// lanes. Captures the lane headers, the caret on the selected card, and
+    /// the per-worker metrics.
+    ReviewBoard,
+    /// The diff/detail pane split off the right of the transcript overlay, with
+    /// a bulky diff entry pinned. Captures the pane separator and the
+    /// independently-scrolled detail body beside the transcript.
+    DiffDetailPane,
 }
 
 impl VisualScenario {
     /// Every scenario, in a stable order, so the dashboard sweeps the suite
     /// deterministically.
-    pub(crate) const ALL: [VisualScenario; 5] = [
+    pub(crate) const ALL: [VisualScenario; 8] = [
         VisualScenario::Empty,
         VisualScenario::ShortChat,
         VisualScenario::LongSession,
         VisualScenario::ScrolledLongSession,
         VisualScenario::ComposerText,
+        VisualScenario::DiffOverlay,
+        VisualScenario::ReviewBoard,
+        VisualScenario::DiffDetailPane,
     ];
 
     /// Stable slug for HTML anchors / log identification.
@@ -117,6 +132,9 @@ impl VisualScenario {
             VisualScenario::LongSession => "long_session",
             VisualScenario::ScrolledLongSession => "scrolled_long_session",
             VisualScenario::ComposerText => "composer_text",
+            VisualScenario::DiffOverlay => "diff_overlay",
+            VisualScenario::ReviewBoard => "review_board",
+            VisualScenario::DiffDetailPane => "diff_detail_pane",
         }
     }
 
@@ -128,7 +146,23 @@ impl VisualScenario {
             VisualScenario::LongSession => "Long session (tail)",
             VisualScenario::ScrolledLongSession => "Long session (scrolled)",
             VisualScenario::ComposerText => "Composer with text",
+            VisualScenario::DiffOverlay => "Diff card in overlay",
+            VisualScenario::ReviewBoard => "Live review board",
+            VisualScenario::DiffDetailPane => "Diff detail pane (split)",
         }
+    }
+
+    /// Whether this scenario opens a fullscreen overlay surface (transcript
+    /// overlay or review board) that takes over the screen. Those surfaces paint
+    /// no main-view composer, so the "exactly one composer caret" invariant
+    /// applies only to the non-overlay scenarios.
+    pub(crate) fn is_overlay(self) -> bool {
+        matches!(
+            self,
+            VisualScenario::DiffOverlay
+                | VisualScenario::ReviewBoard
+                | VisualScenario::DiffDetailPane
+        )
     }
 
     /// Build the [`TuiApp`] this scenario captures at `size`. Self-contained: a
@@ -158,6 +192,22 @@ impl VisualScenario {
                 app.push_transcript_item(TranscriptItem::user("draft the migration plan"));
                 app.push_transcript_item(TranscriptItem::assistant("Here is the migration plan."));
                 app.input = "wip: still typing the next prompt".to_string();
+            }
+            VisualScenario::DiffOverlay => {
+                seed_diff_card(&mut app);
+                app.selected_entry = Some(app.transcript.len().saturating_sub(1));
+                app.transcript_overlay = Some(crate::TranscriptOverlayState::default());
+            }
+            VisualScenario::ReviewBoard => {
+                seed_review_board(&mut app);
+                app.review_board_open = true;
+            }
+            VisualScenario::DiffDetailPane => {
+                let entry_id = seed_diff_card(&mut app);
+                app.selected_entry = Some(app.transcript.len().saturating_sub(1));
+                app.transcript_overlay = Some(crate::TranscriptOverlayState::default());
+                app.diff_detail_pane =
+                    Some(crate::diff_detail_pane::DiffDetailPaneState::new(entry_id));
             }
         }
         app
@@ -878,6 +928,67 @@ fn seed_long_session(app: &mut TuiApp, turns: usize) {
             "Answer {i}: the relevant module lives under crates and the fix is local."
         )));
     }
+}
+
+/// Push a deterministic diff card and return its transcript-entry id. Fixed
+/// paths / `+/-` body so the captured grid is stable across runs.
+fn seed_diff_card(app: &mut TuiApp) -> u64 {
+    use ratatui::text::{Line, Span};
+    let lines: Vec<Line<'static>> = vec![
+        Line::from(Span::raw("--- a/src/lib.rs".to_string())),
+        Line::from(Span::raw("+++ b/src/lib.rs".to_string())),
+        Line::from(Span::raw(
+            "+    let clamped = offset.min(rows);".to_string(),
+        )),
+        Line::from(Span::raw("-    let clamped = offset;".to_string())),
+    ];
+    app.push_diff_card(crate::DiffCardData {
+        summary: "1 file · +1 -1".to_string(),
+        plain: "--- a/src/lib.rs\n+++ b/src/lib.rs\n+    let clamped = offset.min(rows);\n-    let clamped = offset;\n".to_string(),
+        lines,
+    });
+    app.transcript
+        .last()
+        .map(|entry| entry.id)
+        .unwrap_or_default()
+}
+
+/// Seed a deterministic multi-worker review board (one card per lane) and park
+/// the cursor on the first card so the caret renders.
+fn seed_review_board(app: &mut TuiApp) {
+    use crate::subagent_timeline::{SubagentTimelineSource, SubagentTimelineStatus};
+    let sources = vec![
+        SubagentTimelineSource {
+            id: 1,
+            agent: "implement".to_string(),
+            status: SubagentTimelineStatus::Running,
+            latest: "editing src/lib.rs".to_string(),
+            elapsed_secs: Some(42),
+            tool_count: 3,
+            cost_micros: Some(1_500_000),
+        },
+        SubagentTimelineSource {
+            id: 2,
+            agent: "review".to_string(),
+            status: SubagentTimelineStatus::Failed,
+            latest: "test failed".to_string(),
+            elapsed_secs: Some(17),
+            tool_count: 2,
+            cost_micros: Some(500_000),
+        },
+        SubagentTimelineSource {
+            id: 3,
+            agent: "explore".to_string(),
+            status: SubagentTimelineStatus::Completed,
+            latest: "found the call site".to_string(),
+            elapsed_secs: Some(88),
+            tool_count: 4,
+            cost_micros: Some(900_000),
+        },
+    ];
+    let fingerprint = crate::review_board::ReviewBoard::fingerprint_of(sources.iter());
+    app.review_board.rebuild_if_stale(fingerprint, &sources);
+    app.review_board_cursor = app.review_board.card_at(0).map(|card| card.id);
 }
 
 /// Scroll the active transcript up so the view stops following the tail.
