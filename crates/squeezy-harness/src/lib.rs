@@ -577,6 +577,9 @@ async fn run_agent_with_config(
 ) -> Result<RunnerOutput> {
     let root = materialize_workspace(task)?;
     disable_product_telemetry(&mut config);
+    // Non-interactive benchmark runs should not auto-extract memory (cost) or
+    // accumulate cross-session memory from batch tasks.
+    config.context_compaction.user_memory_max_bytes = 0;
     config.workspace_root = root.clone();
     let workspace_note = format!(
         "\n\nWorkspace root for this task: {}",

@@ -807,6 +807,33 @@ pub(crate) fn observations_spec() -> ToolSpec {
     }
 }
 
+pub(crate) fn memory_spec() -> ToolSpec {
+    ToolSpec {
+        name: "memory".to_string(),
+        description: "Curate durable cross-session memory in `~/.squeezy/`: facts about the user, your working agreements with them, project context, and external references — anything you'd want a future session to know but cannot re-derive from the code or git history. `op`: `save` (requires name, type, description, body) writes one fact to its own file and indexes it, overwriting any same-named memory; `delete` (requires name) removes one; `read` (requires name) returns one memory's full text; `list` (no other fields) shows saved memories with their descriptions. Follow the memory guidance in your instructions for what is and isn't worth saving.".to_string(),
+        capability: PermissionCapability::Read,
+        // Read-modify-writes the shared `~/.squeezy/MEMORY.md` index plus topic
+        // files; serialize so two saves in one turn cannot interleave and clobber
+        // each other's index update.
+        parallel_safe: false,
+        parameters: tool_schema(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "op": {"type": "string", "enum": ["save", "delete", "list", "read"], "description": "save | delete | list | read"},
+                "name": {"type": "string", "description": "Slug identifying the memory file: lowercase letters, digits, '-' and '_' only, e.g. 'prefers-bun-over-npm'. Required for save/delete/read."},
+                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"], "description": "Memory kind. Required for save."},
+                "description": {"type": "string", "maxLength": 280, "description": "One-line summary, used to judge relevance on recall. Required for save."},
+                "body": {"type": "string", "maxLength": 8192, "description": "The fact itself — one paragraph about a single thing. For feedback/project memories add a **Why:** line and a **How to apply:** line. Required for save."},
+                "title": {"type": "string", "maxLength": 80, "description": "Optional short title for the index pointer; defaults to a title-cased slug."},
+                "hook": {"type": "string", "maxLength": 200, "description": "Optional one-line hook for the index pointer; defaults to the description."}
+            },
+            "required": ["op"]
+        })),
+        prepare_arguments: None,
+    }
+}
+
 pub(crate) fn plan_patch_spec() -> ToolSpec {
     ToolSpec {
         name: "plan_patch".to_string(),

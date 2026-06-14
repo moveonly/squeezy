@@ -146,8 +146,8 @@ use specs::{
     downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, impact_spec,
     inheritance_hierarchy_spec, list_skills_spec, load_skill_spec,
     mcp_list_resource_templates_spec, mcp_list_resources_spec, mcp_read_resource_spec,
-    mcp_tool_spec, notebook_edit_spec, notes_recall_spec, notes_remember_spec, observations_spec,
-    plan_patch_spec, prepare_path_arguments, read_file_spec, read_slice_spec,
+    mcp_tool_spec, memory_spec, notebook_edit_spec, notes_recall_spec, notes_remember_spec,
+    observations_spec, plan_patch_spec, prepare_path_arguments, read_file_spec, read_slice_spec,
     read_tool_output_spec, reference_search_spec, refresh_compiler_facts_spec, repo_map_spec,
     shell_spec, symbol_at_spec, symbol_context_spec, upstream_flow_spec, verify_spec,
     webfetch_spec, websearch_spec, write_file_spec,
@@ -2076,6 +2076,13 @@ impl ToolRegistry {
             notes_remember_spec(),
             notes_recall_spec(),
             observations_spec(),
+            // Always advertised, like the `notes_*` durable-store tools: the
+            // agent gates the memory *guidance + index* on
+            // `user_memory_max_bytes`, but the tool itself stays available so an
+            // explicit "remember this" still works and the registry needs no
+            // config handle. Disabling memory (max_bytes = 0) drops the guidance,
+            // not the tool.
+            memory_spec(),
         ];
         if !self.mcp.has_no_enabled_servers() {
             specs.extend([
@@ -3502,6 +3509,7 @@ impl ToolRegistry {
                 "notes_remember" => self.execute_notes_remember(&call).await,
                 "notes_recall" => self.execute_notes_recall(&call).await,
                 "observations" => self.execute_observations(&call).await,
+                "memory" => self.execute_memory(&call).await,
                 _ => make_result(
                     &call,
                     ToolStatus::Error,
@@ -3799,6 +3807,129 @@ impl ToolRegistry {
                 )
             }
             Err(err) => tool_error(call, format!("observations failed: {err}")),
+        }
+    }
+
+    async fn execute_memory(&self, call: &ToolCall) -> ToolResult {
+        use squeezy_store::memory::{Memory, MemoryType};
+        let args = match serde_json::from_value::<MemoryArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        // The workspace root supplies the project scope; the type the model
+        // picks routes the save to global (~/.squeezy) or project
+        // (<workspace>/.squeezy) automatically.
+        let memory = Memory::new(Some(self.root.as_path()));
+        match args.op.trim().to_ascii_lowercase().as_str() {
+            "save" => {
+                let (Some(name), Some(type_raw), Some(description), Some(body)) = (
+                    args.name.as_deref(),
+                    args.memory_type.as_deref(),
+                    args.description.as_deref(),
+                    args.body.as_deref(),
+                ) else {
+                    return tool_error(
+                        call,
+                        "memory save requires name, type, description, and body",
+                    );
+                };
+                let Some(ty) = MemoryType::parse(type_raw) else {
+                    return tool_error(
+                        call,
+                        format!(
+                            "memory save: unknown type {type_raw:?}; expected one of user, feedback, project, reference"
+                        ),
+                    );
+                };
+                match memory.save(
+                    name,
+                    ty,
+                    description,
+                    body,
+                    args.title.as_deref(),
+                    args.hook.as_deref(),
+                ) {
+                    Ok(saved) => make_result(
+                        call,
+                        ToolStatus::Success,
+                        json!({
+                            "saved": saved.name,
+                            "type": ty.as_str(),
+                            "scope": saved.scope.as_str(),
+                            "path": saved.path.display().to_string(),
+                            "bytes": saved.bytes,
+                        }),
+                        ToolCostHint::default(),
+                        None,
+                    ),
+                    Err(err) => tool_error(call, format!("memory save failed: {err}")),
+                }
+            }
+            "delete" => {
+                let Some(name) = args.name.as_deref() else {
+                    return tool_error(call, "memory delete requires name");
+                };
+                match memory.delete(name) {
+                    Ok(removed) => make_result(
+                        call,
+                        ToolStatus::Success,
+                        json!({ "deleted": removed, "name": name }),
+                        ToolCostHint::default(),
+                        None,
+                    ),
+                    Err(err) => tool_error(call, format!("memory delete failed: {err}")),
+                }
+            }
+            "list" => match memory.list() {
+                Ok(entries) => {
+                    let items: Vec<Value> = entries
+                        .into_iter()
+                        .map(|entry| {
+                            json!({
+                                "name": entry.name,
+                                "scope": entry.scope.as_str(),
+                                "type": entry.memory_type,
+                                "description": entry.description,
+                                "bytes": entry.bytes,
+                            })
+                        })
+                        .collect();
+                    make_result(
+                        call,
+                        ToolStatus::Success,
+                        json!({ "memories": items }),
+                        ToolCostHint::default(),
+                        None,
+                    )
+                }
+                Err(err) => tool_error(call, format!("memory list failed: {err}")),
+            },
+            "read" => {
+                let Some(name) = args.name.as_deref() else {
+                    return tool_error(call, "memory read requires name");
+                };
+                match memory.read(name) {
+                    Ok(Some((scope, body))) => make_result(
+                        call,
+                        ToolStatus::Success,
+                        json!({ "name": name, "found": true, "scope": scope.as_str(), "content": body }),
+                        ToolCostHint::default(),
+                        None,
+                    ),
+                    Ok(None) => make_result(
+                        call,
+                        ToolStatus::Success,
+                        json!({ "name": name, "found": false, "content": Value::Null }),
+                        ToolCostHint::default(),
+                        None,
+                    ),
+                    Err(err) => tool_error(call, format!("memory read failed: {err}")),
+                }
+            }
+            other => tool_error(
+                call,
+                format!("memory: unknown op {other:?}; expected one of save, delete, list, read"),
+            ),
         }
     }
 
@@ -5762,6 +5893,24 @@ struct ObservationsArgs {
     query: Option<String>,
     #[serde(default)]
     limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryArgs {
+    op: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default, rename = "type")]
+    memory_type: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    hook: Option<String>,
 }
 
 /// Locate a notebook cell by its `id` or the `cell-N` numeric-index

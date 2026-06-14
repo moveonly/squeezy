@@ -10,6 +10,7 @@ const DOCS: &[(&str, &str)] = &[
     ("INSTALL.md", "docs/external/INSTALL.md"),
     ("LANGUAGES.md", "docs/external/LANGUAGES.md"),
     ("MCP_AND_WEB.md", "docs/external/MCP_AND_WEB.md"),
+    ("MEMORY.md", "docs/external/MEMORY.md"),
     ("PLATFORMS.md", "docs/external/PLATFORMS.md"),
     ("PROVIDERS.md", "docs/external/PROVIDERS.md"),
     ("REPO_PROFILE.md", "docs/external/REPO_PROFILE.md"),

@@ -161,6 +161,10 @@ pub async fn run_scenario(
     };
     let config_load_ms = t_config.elapsed().as_millis() as u64;
     disable_product_telemetry(&mut config);
+    // Eval must be deterministic and cost-bounded: disable the file-memory
+    // surface (its `~/.squeezy` prompt injection *and* the auto-extraction LLM
+    // call) unless a scenario explicitly opts back in via its overlay below.
+    config.context_compaction.user_memory_max_bytes = 0;
     apply_overlay(&mut config, &scenario.squeezy, &workspace.path)?;
     apply_mcp_overlay(&mut config, &scenario.mcp)?;
     let t_provider = Instant::now();

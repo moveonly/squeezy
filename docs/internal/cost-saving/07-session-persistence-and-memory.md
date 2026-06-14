@@ -20,10 +20,9 @@ to "see what changed" can either re-read them (paying to dump
 contents into the conversation again) or reference a recorded diff.
 
 Squeezy implements all three: checkpoint-anchored resume from
-`events.jsonl`, static user memory ingested from `~/.squeezy/MEMORY.md`
-(falling back to lowercase `memory.md`), durable note tools backed by the
-local store, and a journal-backed checkpoint provider that snapshots the
-worktree on every edit.
+`events.jsonl`, model-curated file memory under `~/.squeezy/memory/` indexed
+by `~/.squeezy/MEMORY.md`, durable note tools backed by the local store, and a
+journal-backed checkpoint provider that snapshots the worktree on every edit.
 
 ## Mechanism
 
@@ -200,20 +199,30 @@ keeps the fork viable as long as `events.jsonl` is intact.
 
 ### Cross-session memory
 
-There are two cross-session memory surfaces:
+There are two cross-session memory surfaces, both on by default:
 
-- **Static prompt memory.** At session start the agent reads
-  `~/.squeezy/MEMORY.md` first and falls back to `~/.squeezy/memory.md`.
-  The body is truncated to `context_compaction.user_memory_max_bytes`
-  before being stitched into base instructions.
+- **File-based memory (model-curated).** The primary surface. Durable facts
+  live as Markdown topic files with YAML frontmatter (`name`, `description`,
+  `metadata.type`; kinds `user`, `feedback`, `project`, `reference`), pointed to
+  by a `MEMORY.md` index. The kind picks the **scope** automatically: `user` +
+  `feedback` are global (`~/.squeezy/memory/`), `project` + `reference` are
+  per-repo (`<workspace>/.squeezy/memory/`). At session start the agent stitches
+  the memory **guidance** plus both **indexes** into base instructions (each
+  index truncated to `context_compaction.user_memory_max_bytes`); topic files
+  are read on demand. Two writers feed it: the model-callable `memory` tool
+  (`save` / `delete` / `list` / `read`) and an automatic extraction pass — a
+  cheap auxiliary LLM call after a turn settles that distils durable facts into
+  memory, gated by `memory_auto_extract` (default on) plus a recorded-session +
+  cheap-model + new-prose threshold so it stays cheap and never fires in
+  tests/eval. The whole surface is gated by `user_memory_max_bytes > 0`.
 - **Durable notes.** The model-callable `notes_remember` and `notes_recall`
   tools store and retrieve decisions, conventions, preferences, dead ends,
-  and notes from the persistent store. These are queried during compaction
-  summaries and can be used before re-deriving old decisions.
+  and notes from the persistent `redb` store. These are queried during
+  compaction summaries and can be used before re-deriving old decisions.
 
 The legacy `SessionStore::memory_path`, `remember`, and `recall` helpers still
-target lowercase `~/.squeezy/memory.md`. They remain useful Rust primitives,
-but they are no longer the complete prompt-ingestion story:
+target lowercase `~/.squeezy/memory.md` and are distinct from the model-curated
+`memory` tool above. They remain useful Rust primitives:
 
 ```rust
 // crates/squeezy-store/src/sessions.rs:280-282
@@ -278,19 +287,21 @@ pub fn recall(max_bytes: usize) -> Option<String> {
 The prompt-ingestion cap is `context_compaction.user_memory_max_bytes`:
 
 ```rust
-// crates/squeezy-core/src/lib.rs:3928-3933
-/// Maximum bytes of `~/.squeezy/MEMORY.md` (or lowercase `memory.md`)
-/// stitched into the base instructions at session start. 0 disables
-/// ingestion.
+// crates/squeezy-core/src/lib.rs (ContextCompactionConfig)
+/// Master switch for the file-based memory feature, and the cap (in
+/// bytes) on how much of the `~/.squeezy/MEMORY.md` index is stitched
+/// into the base instructions at session start. When `> 0` the agent
+/// injects the memory guidance plus the index and advertises the
+/// model-curated surface; `0` disables the whole feature.
 pub user_memory_max_bytes: usize,
 ```
 
 Default is `16_384` bytes (`DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES` at
-`crates/squeezy-core/src/lib.rs`). Static memory ingestion runs once at
-session start. Durable notes are separate: `notes_remember` writes typed
-observations to the local store and `notes_recall` returns recent matching
-notes, so the model does not have to append arbitrary prose to the static
-prompt file.
+`crates/squeezy-core/src/lib.rs`), so memory is on by default. Memory
+ingestion runs once at session start and, being part of the frozen base
+instructions, stays in the cached prompt prefix. Durable notes are separate:
+`notes_remember` writes typed observations to the `redb` store and
+`notes_recall` returns recent matching notes.
 
 ### Global session index
 

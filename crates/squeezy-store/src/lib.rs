@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use squeezy_core::{FileId, Result, SqueezyError, repo_settings_id};
 
 mod fs_util;
+pub mod memory;
 pub mod migrations;
 pub mod repo_profile;
 pub mod reports;

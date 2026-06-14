@@ -2055,6 +2055,10 @@ impl AppConfig {
             self.context_compaction.user_memory_max_bytes
         ));
         output.push_str(&format!(
+            "memory_auto_extract = {}\n",
+            self.context_compaction.memory_auto_extract
+        ));
+        output.push_str(&format!(
             "enabled_mid_turn = {}\n",
             self.context_compaction.enabled_mid_turn
         ));
@@ -6267,6 +6271,7 @@ pub struct ContextCompactionSettings {
     pub compaction_max_summary_bytes: Option<usize>,
     pub repo_doc_max_bytes: Option<usize>,
     pub user_memory_max_bytes: Option<usize>,
+    pub memory_auto_extract: Option<bool>,
     pub enabled_mid_turn: Option<bool>,
     pub model_context_window: Option<u64>,
     pub effective_context_window_percent: Option<u8>,
@@ -6299,6 +6304,7 @@ impl ContextCompactionSettings {
                 "compaction_max_summary_bytes",
                 "repo_doc_max_bytes",
                 "user_memory_max_bytes",
+                "memory_auto_extract",
                 "enabled_mid_turn",
                 "model_context_window",
                 "effective_context_window_percent",
@@ -6362,6 +6368,12 @@ impl ContextCompactionSettings {
                 "user_memory_max_bytes",
                 source,
                 &field(path, "user_memory_max_bytes"),
+            )?,
+            memory_auto_extract: bool_value(
+                table,
+                "memory_auto_extract",
+                source,
+                &field(path, "memory_auto_extract"),
             )?,
             enabled_mid_turn: bool_value(
                 table,
@@ -6491,6 +6503,7 @@ impl ContextCompactionSettings {
         );
         replace_if_some(&mut self.repo_doc_max_bytes, next.repo_doc_max_bytes);
         replace_if_some(&mut self.user_memory_max_bytes, next.user_memory_max_bytes);
+        replace_if_some(&mut self.memory_auto_extract, next.memory_auto_extract);
         replace_if_some(&mut self.enabled_mid_turn, next.enabled_mid_turn);
         replace_if_some(&mut self.model_context_window, next.model_context_window);
         replace_if_some(
@@ -6884,12 +6897,18 @@ pub struct ContextCompactionConfig {
     /// Maximum bytes of concatenated AGENTS.md content stitched into the
     /// base instructions at session start. 0 disables ingestion.
     pub repo_doc_max_bytes: usize,
-    /// Maximum bytes of `~/.squeezy/MEMORY.md` (or lowercase `memory.md`)
-    /// stitched into the base instructions at session start. 0 disables
-    /// ingestion. The static file is the only cross-session memory
-    /// surface; see `docs/internal/MEMORY_SCOPE.md` for the deferred
-    /// tool-mediated pipeline decision.
+    /// Master switch for the file-based memory feature, and the cap (in
+    /// bytes) on how much of the `~/.squeezy/MEMORY.md` index is stitched
+    /// into the base instructions at session start. When `> 0` the agent
+    /// injects the memory guidance plus the index and advertises the
+    /// model-curated surface; `0` disables the whole feature (no guidance,
+    /// no index). See `docs/internal/MEMORY_SCOPE.md`.
     pub user_memory_max_bytes: usize,
+    /// When true (and memory is on), a cheap auxiliary pass runs after a turn
+    /// settles to distil durable facts from the conversation into memory
+    /// automatically. `false` keeps the file memory + inline `memory` tool but
+    /// never makes the extra extraction LLM call.
+    pub memory_auto_extract: bool,
     /// When true, the turn loop runs the trim (micro) pass between LLM events
     /// so a long tool-heavy turn reclaims older tool-output bytes before it can
     /// outgrow the window. Summarize never runs mid-turn; it waits for the turn
@@ -6994,6 +7013,10 @@ impl ContextCompactionConfig {
                     .user_memory_max_bytes
                     .unwrap_or(DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES),
             ),
+            memory_auto_extract: get_var("SQUEEZY_CONTEXT_MEMORY_AUTO_EXTRACT")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.memory_auto_extract.unwrap_or(true)),
             enabled_mid_turn: get_var("SQUEEZY_CONTEXT_COMPACTION_ENABLED_MID_TURN")
                 .as_deref()
                 .map(parse_enabled_bool)
@@ -7170,6 +7193,7 @@ impl Default for ContextCompactionConfig {
             max_summary_bytes: DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES,
             repo_doc_max_bytes: DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES,
             user_memory_max_bytes: DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES,
+            memory_auto_extract: true,
             enabled_mid_turn: true,
             model_context_window: None,
             effective_context_window_percent: None,

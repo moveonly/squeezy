@@ -178,6 +178,10 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     ),
     slash("/cost", "show token usage and dollar spend"),
     slash("/context", "show context-window usage and headroom"),
+    slash(
+        "/memory",
+        "show what squeezy has remembered across sessions",
+    ),
     slash("/reviewer", "show recent auto-review decisions"),
     slash_args_caps(
         "/attach",
@@ -479,9 +483,8 @@ impl SlashCommand {
             "/help" | "/plan" | "/build" | "/plans" | "/feedback" | "/report" => {
                 SlashCategory::ChatModes
             }
-            "/context" | "/attach" | "/pin" | "/compact" | "/clear" | "/pins" | "/unpin" => {
-                SlashCategory::Context
-            }
+            "/context" | "/memory" | "/attach" | "/pin" | "/compact" | "/clear" | "/pins"
+            | "/unpin" => SlashCategory::Context,
             "/cost" | "/effort" | "/cheap" | "/parent" | "/router" => SlashCategory::Cost,
             // `/diff` (uncommitted working-tree changes) and the `/task*`
             // background-task commands are all "what is happening in my workspace
