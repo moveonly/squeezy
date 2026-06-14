@@ -40,11 +40,7 @@
 //! the cost here is paid only on crash/suspend, never on the hot render path.
 
 use std::io::{self, Write};
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
 use std::sync::Mutex;
-#[cfg(unix)]
-use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::terminal::disable_raw_mode;
@@ -60,13 +56,6 @@ use crossterm::terminal::disable_raw_mode;
 /// alt-screen leave (the mode restores are themselves idempotent).
 // SeqCst: crash-path atomicity — see the module-level "Concurrency" note.
 static ALT_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// Original stdout file-status flags captured before the TUI set fd 1
-/// nonblocking. Unlike raw mode / alternate-screen state, file-status flags live
-/// on the open file description, so an abnormal exit path must restore them
-/// before returning control to the parent shell. `-1` means "nothing to restore".
-#[cfg(unix)]
-static STDOUT_RESTORE_FLAGS: AtomicI32 = AtomicI32::new(-1);
 
 /// Set by the `SIGTSTP` (Ctrl+Z) handler to ask the main loop to suspend at the
 /// next safe point. The loop owns the actual suspend/resume because it holds the
@@ -132,27 +121,6 @@ pub(crate) fn take_alt_screen_active() -> bool {
     ALT_SCREEN_ACTIVE.swap(false, Ordering::SeqCst)
 }
 
-/// Publish the stdout flags the emergency teardown should restore if the process
-/// exits through a panic hook or OS-signal handler instead of `TerminalGuard`'s
-/// normal `Drop` path.
-#[cfg(unix)]
-pub(crate) fn set_stdout_restore_flags(flags: Option<i32>) {
-    STDOUT_RESTORE_FLAGS.store(flags.unwrap_or(-1), Ordering::SeqCst);
-}
-
-#[cfg(unix)]
-fn restore_stdout_status_flags() {
-    let flags = STDOUT_RESTORE_FLAGS.swap(-1, Ordering::SeqCst);
-    if flags < 0 {
-        return;
-    }
-    let fd = io::stdout().as_raw_fd();
-    // SAFETY: best-effort restoration of fd 1's file-status flags captured by
-    // `TerminalGuard::enter`; this runs from cooperative panic/signal tasks, not
-    // from an async-signal context.
-    let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
-}
-
 /// Run the idempotent emergency teardown against the real `stdout`, then disable
 /// raw mode. This is the crash-path equivalent of `TerminalGuard::Drop`'s body,
 /// but it owns its own `stdout` handle because the panic hook and signal handlers
@@ -174,8 +142,6 @@ pub(crate) fn run_emergency_teardown() {
     // Raw mode is a crossterm mode call, not a byte; disable it last (best-effort)
     // so any preceding CRLF-free restore writes are unaffected.
     let _ = disable_raw_mode();
-    #[cfg(unix)]
-    restore_stdout_status_flags();
 }
 
 /// Install the panic hook that restores the terminal BEFORE the default panic
