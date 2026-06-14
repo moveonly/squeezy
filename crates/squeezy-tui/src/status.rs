@@ -450,7 +450,11 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
             Some(compact_text(&text, 54))
         }
         StatusLineItem::ReasoningEffort => app
-            .reasoning_effort
+            // The live routed effort (tier-effort) wins while a turn is routed,
+            // so the bar shows what's actually on the wire; falls back to the
+            // user's configured pin between turns.
+            .active_routed_effort
+            .or(app.reasoning_effort)
             .map(|effort| format!("effort {}", effort.as_str())),
         StatusLineItem::CurrentDir => Some(compact_text(&app.directory, 48)),
         StatusLineItem::ProjectName => app

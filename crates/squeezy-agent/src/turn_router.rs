@@ -26,7 +26,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::Deserialize;
-use squeezy_core::{AppConfig, CostSnapshot, ModelTier, RoutingConfig, SessionMode, TierLadder};
+use squeezy_core::{
+    AppConfig, CostSnapshot, ModelTier, ReasoningEffort, RoutingConfig, SessionMode, TierLadder,
+};
 use squeezy_llm::{
     CacheRetention, CacheSpec, LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest,
     provider_honors_output_schema,
@@ -473,21 +475,44 @@ fn phrase_occurs_at_clause_start(text: &str, phrase: &str) -> bool {
 #[derive(Debug, Deserialize)]
 struct JudgeReply {
     route: String,
+    /// Optional per-task reasoning effort, requested only when
+    /// `[routing].judge_effort` is on. Parsed leniently via `ReasoningEffort`.
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default, rename = "reason")]
     _reason: String,
 }
 
+/// A parsed judge verdict: the tier the judge picked plus, when judge-effort is
+/// enabled and the judge supplied one, a per-task reasoning effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JudgeVerdict {
+    tier: ModelTier,
+    effort: Option<ReasoningEffort>,
+}
+
 /// Strict JSON-schema contract mirroring [`JudgeReply`]: a required `route`
 /// constrained to the three tiers [`parse_judge_reply`] canonically emits plus
-/// the `reason` the prompt asks for. Attached to the judge request only on
-/// providers that forward `output_schema` ([`provider_honors_output_schema`])
-/// so the judge returns a schema-valid object instead of fenced/prose-wrapped
-/// JSON that costs a retry round — providers that drop the schema keep the
-/// loose-parse path (which also still accepts the legacy `cheap`/`parent`).
-fn judge_output_schema() -> LlmOutputSchema {
-    LlmOutputSchema {
-        name: "turn_route".to_string(),
-        schema: serde_json::json!({
+/// the `reason` the prompt asks for, and — when `with_effort` — a required
+/// `effort` enum. Attached to the judge request only on providers that forward
+/// `output_schema` ([`provider_honors_output_schema`]) so the judge returns a
+/// schema-valid object instead of fenced/prose-wrapped JSON that costs a retry
+/// round — providers that drop the schema keep the loose-parse path (which also
+/// still accepts the legacy `cheap`/`parent`).
+fn judge_output_schema(with_effort: bool) -> LlmOutputSchema {
+    let schema = if with_effort {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "route": { "type": "string", "enum": ["weak", "medium", "strong"] },
+                "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh"] },
+                "reason": { "type": "string" },
+            },
+            "required": ["route", "effort", "reason"],
+            "additionalProperties": false,
+        })
+    } else {
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "route": { "type": "string", "enum": ["weak", "medium", "strong"] },
@@ -495,7 +520,11 @@ fn judge_output_schema() -> LlmOutputSchema {
             },
             "required": ["route", "reason"],
             "additionalProperties": false,
-        }),
+        })
+    };
+    LlmOutputSchema {
+        name: "turn_route".to_string(),
+        schema,
         strict: true,
     }
 }
@@ -535,6 +564,10 @@ pub(crate) struct ClassifyResult {
     /// caller attributes judge spend to the judge model and never invents a
     /// per-model ledger key for a call that did not happen.
     pub judge_model: Option<Arc<str>>,
+    /// The per-task reasoning effort the judge picked, when `[routing].judge_effort`
+    /// is on and the judge supplied one. Overrides the static tier→effort map for
+    /// this turn's starting rung; `None` everywhere else.
+    pub judge_effort: Option<ReasoningEffort>,
 }
 
 impl ClassifyResult {
@@ -543,6 +576,7 @@ impl ClassifyResult {
             decision: TurnRoutingDecision::Parent,
             judge_cost: CostSnapshot::default(),
             judge_model: None,
+            judge_effort: None,
         }
     }
 
@@ -555,6 +589,7 @@ impl ClassifyResult {
             },
             judge_cost: CostSnapshot::default(),
             judge_model: None,
+            judge_effort: None,
         }
     }
 }
@@ -650,20 +685,30 @@ pub(crate) async fn classify_turn(
     }
     let judge_model = judge_model_for(inputs.provider_name, inputs.config, &weak_model);
     // Custom judge prompt (per-provider override → global) falls back to the
-    // built-in per-provider instructions.
-    let instructions = inputs
+    // built-in per-provider instructions; when judge-effort is on, the prompt
+    // also asks for a per-task effort estimate.
+    let with_effort = cfg.judge_effort;
+    let base_instructions = inputs
         .config
         .providers
         .get(inputs.provider_name)
         .and_then(|p| p.judge_prompt.as_deref())
         .or(cfg.judge_prompt.as_deref())
         .unwrap_or_else(|| judge_instructions_for(inputs.provider_name));
+    let effort_instructions;
+    let instructions: &str = if with_effort {
+        effort_instructions = format!("{base_instructions}\n\n{JUDGE_EFFORT_INSTRUCTION}");
+        effort_instructions.as_str()
+    } else {
+        base_instructions
+    };
     let (verdict, judge_cost) = run_judge(
         inputs.provider,
         inputs.provider_name,
         &judge_model,
         instructions,
         inputs.user_input,
+        with_effort,
         cancel,
     )
     .await;
@@ -671,13 +716,18 @@ pub(crate) async fn classify_turn(
         // The judge names a tier; clamp it up to the cheapest rung the ladder
         // actually populates at or above that difficulty. A `strong` verdict (or
         // a clamp that lands on the strong rung) keeps the turn on the parent.
-        Some(tier) => {
-            let (actual_tier, model) = ladder.at_least(tier);
+        // The per-task effort (when judge-effort is on) rides along on either
+        // outcome — including the strong/parent turn, the case where one task
+        // wants Opus@xhigh and another Opus@medium.
+        Some(verdict) => {
+            let judge_effort = with_effort.then_some(verdict.effort).flatten();
+            let (actual_tier, model) = ladder.at_least(verdict.tier);
             if actual_tier == ModelTier::Strong {
                 ClassifyResult {
                     decision: TurnRoutingDecision::Parent,
                     judge_cost,
                     judge_model: Some(judge_model),
+                    judge_effort,
                 }
             } else {
                 ClassifyResult {
@@ -688,6 +738,7 @@ pub(crate) async fn classify_turn(
                     },
                     judge_cost,
                     judge_model: Some(judge_model),
+                    judge_effort,
                 }
             }
         }
@@ -695,6 +746,7 @@ pub(crate) async fn classify_turn(
             decision: TurnRoutingDecision::Parent,
             judge_cost,
             judge_model: Some(judge_model),
+            judge_effort: None,
         },
     }
 }
@@ -769,14 +821,24 @@ fn judge_instructions_for(provider_name: &str) -> &'static str {
 const JUDGE_TIMEOUT_MS: u64 = 10_000;
 const JUDGE_MAX_OUTPUT_TOKENS: u32 = 512;
 
+/// Appended to the judge prompt only when `[routing].judge_effort` is on, so the
+/// judge also estimates per-task reasoning depth (orthogonal to the tier).
+const JUDGE_EFFORT_INSTRUCTION: &str = concat!(
+    "Also include an \"effort\" field — one of \"low\", \"medium\", \"high\", \"xhigh\" — estimating how much ",
+    "REASONING DEPTH this specific task needs, independent of which tier runs it: a tricky concurrency bug, ",
+    "subtle algorithm, or hard design trade-off is \"xhigh\"; a routine, well-specified edit is \"low\"; most ",
+    "tasks are \"medium\".",
+);
+
 async fn run_judge(
     provider: &Arc<dyn LlmProvider>,
     provider_name: &str,
     judge_model: &Arc<str>,
     instructions: &str,
     user_input: &str,
+    with_effort: bool,
     cancel: CancellationToken,
-) -> (Option<ModelTier>, CostSnapshot) {
+) -> (Option<JudgeVerdict>, CostSnapshot) {
     // The judge prompt is intentionally short. It sits below hosted
     // providers' useful prompt-cache minimums, so leave caching off
     // instead of surfacing misleading cache telemetry.
@@ -784,8 +846,8 @@ async fn run_judge(
         key: None,
         retention: CacheRetention::None,
     };
-    let output_schema =
-        provider_honors_output_schema(provider_name, judge_model).then(judge_output_schema);
+    let output_schema = provider_honors_output_schema(provider_name, judge_model)
+        .then(|| judge_output_schema(with_effort));
     let request = LlmRequest {
         model: judge_model.clone(),
         instructions: Arc::from(instructions.to_string()),
@@ -862,7 +924,7 @@ fn is_deictic_followup(user_input: &str) -> bool {
         .any(|marker| lower == *marker || lower.starts_with(&format!("{marker} ")))
 }
 
-fn parse_judge_reply(raw: &str) -> Option<ModelTier> {
+fn parse_judge_reply(raw: &str) -> Option<JudgeVerdict> {
     let trimmed = raw.trim();
     let body = trimmed
         .strip_prefix("```json")
@@ -872,8 +934,11 @@ fn parse_judge_reply(raw: &str) -> Option<ModelTier> {
     let reply: JudgeReply = serde_json::from_str(body).ok()?;
     // `ModelTier::parse` accepts the canonical weak/medium/strong as well as the
     // legacy binary cheap/parent vocabulary, so an older judge prompt — or the
-    // scripted test provider — keeps routing correctly.
-    ModelTier::parse(reply.route.trim())
+    // scripted test provider — keeps routing correctly. `effort` is best-effort:
+    // an absent or unparseable value just leaves the per-task effort unset.
+    let tier = ModelTier::parse(reply.route.trim())?;
+    let effort = reply.effort.as_deref().and_then(ReasoningEffort::parse);
+    Some(JudgeVerdict { tier, effort })
 }
 
 /// Per-turn escalation state. The streaming loop calls

@@ -145,6 +145,20 @@ impl ModelTier {
         }
     }
 
+    /// The reasoning effort this rung warrants by default — cheap work runs
+    /// shallow, the flagship runs deep. Applied by the router only when the user
+    /// has not pinned an effort and `[routing].tier_effort` is on; overridable
+    /// per tier via `RoutingConfig::effort_for_tier`. Reasoning effort is a
+    /// cost lever orthogonal to model choice (a stronger rung at low effort can
+    /// be cheaper than a weaker rung at high effort).
+    pub const fn default_effort(self) -> ReasoningEffort {
+        match self {
+            Self::Weak => ReasoningEffort::Low,
+            Self::Medium => ReasoningEffort::Medium,
+            Self::Strong => ReasoningEffort::High,
+        }
+    }
+
     /// Parse a tier from a judge verdict or user input, accepting the historical
     /// `cheap`/`parent` binary vocabulary alongside the new weak/medium/strong
     /// and a few colloquial synonyms so the judge prompt and `/cheap`,`/parent`
@@ -640,6 +654,13 @@ pub const DEFAULT_ROUTING_ENABLED: bool = true;
 /// judge so users can disable one without the other.
 pub const DEFAULT_ROUTING_HEURISTIC: bool = true;
 pub const DEFAULT_ROUTING_LLM_JUDGE: bool = true;
+/// Default for `[routing].tier_effort`: route reasoning effort by tier (cheap
+/// rungs shallow, the flagship deep) when the user hasn't pinned an effort.
+pub const DEFAULT_ROUTING_TIER_EFFORT: bool = true;
+/// Default for `[routing].judge_effort`: off — the judge estimates only the tier
+/// by default; per-task effort estimation is opt-in (cheap judges calibrate
+/// effort less reliably than they pick a tier).
+pub const DEFAULT_ROUTING_JUDGE_EFFORT: bool = false;
 /// Char-budget below which a turn is treated as a short follow-up ("ok",
 /// "continue", "yes") and inherits the previous turn's routing decision
 /// instead of paying for a judge call — a follow-up to a big parent turn
@@ -2144,6 +2165,28 @@ impl AppConfig {
         output.push_str(&format!(
             "judge_max_chars = {}\n",
             self.routing.judge_max_chars
+        ));
+        output.push_str(&format!(
+            "tier_effort = {}  # run each routed rung at its own reasoning effort (user /effort pin wins)\n",
+            self.routing.tier_effort
+        ));
+        for (key, value) in [
+            ("effort_weak", self.routing.effort_weak),
+            ("effort_medium", self.routing.effort_medium),
+            ("effort_strong", self.routing.effort_strong),
+        ] {
+            match value {
+                Some(effort) => {
+                    output.push_str(&format!("{key} = {}\n", toml_string(effort.as_str())))
+                }
+                None => output.push_str(&format!(
+                    "# {key} = unset  # uses the tier default (weak=low, medium=medium, strong=high)\n"
+                )),
+            }
+        }
+        output.push_str(&format!(
+            "judge_effort = {}  # judge also estimates per-task effort, overriding the tier map (needs llm_judge)\n",
+            self.routing.judge_effort
         ));
         // judge_model / judge_prompt / expensive_models below show the value
         // resolved for the ACTIVE provider; set them per provider under
@@ -5306,9 +5349,40 @@ pub struct RoutingConfig {
     /// OS. The name reflects where the keywords originate, not where the
     /// guard activates.
     pub linux_sandbox_sensitive_parent: bool,
+    /// When `true` (default), a routed turn runs at the reasoning effort its
+    /// rung warrants (`ModelTier::default_effort`, overridable per tier below)
+    /// instead of one global effort for every rung. Reasoning effort is a cost
+    /// lever orthogonal to model. Ignored when the user has pinned an effort
+    /// (`[model].reasoning_effort` / `/effort`), which always wins, and gated by
+    /// `enabled`.
+    pub tier_effort: bool,
+    /// Per-tier reasoning-effort overrides for `tier_effort`. `None` = use the
+    /// tier's built-in default (Weak→Low, Medium→Medium, Strong→High).
+    pub effort_weak: Option<ReasoningEffort>,
+    pub effort_medium: Option<ReasoningEffort>,
+    pub effort_strong: Option<ReasoningEffort>,
+    /// When `true`, the LLM routing judge additionally estimates a per-TASK
+    /// reasoning effort (not just the tier), which overrides the static
+    /// tier→effort map for that turn — so two turns on the same rung can run at
+    /// different depths (e.g. Opus@xhigh for a tricky bug vs Opus@medium for a
+    /// routine edit). Falls back to the tier map on turns the judge doesn't run,
+    /// and is dropped on escalation (the judge's estimate proved wrong). Default
+    /// off: a cheap judge calibrating effort is less reliable than picking a
+    /// tier, so opt in. A user `/effort` pin still wins. Requires `llm_judge`.
+    pub judge_effort: bool,
 }
 
 impl RoutingConfig {
+    /// The configured effort override for `tier`, or `None` to fall back to
+    /// [`ModelTier::default_effort`].
+    pub fn effort_for_tier(&self, tier: ModelTier) -> Option<ReasoningEffort> {
+        match tier {
+            ModelTier::Weak => self.effort_weak,
+            ModelTier::Medium => self.effort_medium,
+            ModelTier::Strong => self.effort_strong,
+        }
+    }
+
     fn from_settings_and_env(
         settings: RoutingSettings,
         get_var: &mut impl FnMut(&str) -> Option<String>,
@@ -5394,6 +5468,30 @@ impl RoutingConfig {
                     .linux_sandbox_sensitive_parent
                     .unwrap_or(DEFAULT_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT),
             ),
+            tier_effort: get_var("SQUEEZY_ROUTING_TIER_EFFORT")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.tier_effort.unwrap_or(DEFAULT_ROUTING_TIER_EFFORT)),
+            effort_weak: get_var("SQUEEZY_ROUTING_EFFORT_WEAK")
+                .as_deref()
+                .and_then(ReasoningEffort::parse)
+                .or(settings.effort_weak),
+            effort_medium: get_var("SQUEEZY_ROUTING_EFFORT_MEDIUM")
+                .as_deref()
+                .and_then(ReasoningEffort::parse)
+                .or(settings.effort_medium),
+            effort_strong: get_var("SQUEEZY_ROUTING_EFFORT_STRONG")
+                .as_deref()
+                .and_then(ReasoningEffort::parse)
+                .or(settings.effort_strong),
+            judge_effort: get_var("SQUEEZY_ROUTING_JUDGE_EFFORT")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(
+                    settings
+                        .judge_effort
+                        .unwrap_or(DEFAULT_ROUTING_JUDGE_EFFORT),
+                ),
         }
     }
 
@@ -5429,6 +5527,11 @@ pub struct RoutingSettings {
     pub judge_model: Option<String>,
     pub extra_heuristic_verbs: Option<Vec<String>>,
     pub linux_sandbox_sensitive_parent: Option<bool>,
+    pub tier_effort: Option<bool>,
+    pub effort_weak: Option<ReasoningEffort>,
+    pub effort_medium: Option<ReasoningEffort>,
+    pub effort_strong: Option<ReasoningEffort>,
+    pub judge_effort: Option<bool>,
 }
 
 impl RoutingSettings {
@@ -5452,6 +5555,11 @@ impl RoutingSettings {
                 "judge_model",
                 "extra_heuristic_verbs",
                 "linux_sandbox_sensitive_parent",
+                "tier_effort",
+                "effort_weak",
+                "effort_medium",
+                "effort_strong",
+                "judge_effort",
             ],
             source,
             path,
@@ -5533,6 +5641,26 @@ impl RoutingSettings {
                 source,
                 &field(path, "linux_sandbox_sensitive_parent"),
             )?,
+            tier_effort: bool_value(table, "tier_effort", source, &field(path, "tier_effort"))?,
+            effort_weak: reasoning_effort_value(
+                table,
+                "effort_weak",
+                source,
+                &field(path, "effort_weak"),
+            )?,
+            effort_medium: reasoning_effort_value(
+                table,
+                "effort_medium",
+                source,
+                &field(path, "effort_medium"),
+            )?,
+            effort_strong: reasoning_effort_value(
+                table,
+                "effort_strong",
+                source,
+                &field(path, "effort_strong"),
+            )?,
+            judge_effort: bool_value(table, "judge_effort", source, &field(path, "judge_effort"))?,
         })
     }
 
@@ -5568,6 +5696,11 @@ impl RoutingSettings {
             &mut self.linux_sandbox_sensitive_parent,
             next.linux_sandbox_sensitive_parent,
         );
+        replace_if_some(&mut self.tier_effort, next.tier_effort);
+        replace_if_some(&mut self.effort_weak, next.effort_weak);
+        replace_if_some(&mut self.effort_medium, next.effort_medium);
+        replace_if_some(&mut self.effort_strong, next.effort_strong);
+        replace_if_some(&mut self.judge_effort, next.judge_effort);
     }
 }
 
