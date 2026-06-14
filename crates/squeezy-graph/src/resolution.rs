@@ -8,6 +8,17 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+/// Which inheritance edge an attribute prefix lowers to in
+/// [`SemanticGraph::add_generic_inheritance_edges`]. `Base` maps to
+/// `Extends`/`Implements` depending on the resolved target's kind; `Iface`
+/// always to `Implements`; `Mixin` always to `UsesTrait`.
+#[derive(Clone, Copy)]
+enum GenericInheritanceKind {
+    Base,
+    Iface,
+    Mixin,
+}
+
 impl SemanticGraph {
     pub(crate) fn rebuild_semantic_edges(&mut self) {
         self.rebuild_semantic_edges_with_cached_resolver(false);
@@ -34,6 +45,14 @@ impl SemanticGraph {
         self.js_ts_resolver.update_from_files(&self.files);
         self.add_csharp_type_edges();
         self.add_php_type_edges();
+        // C# and PHP own their inheritance edges above; every other language
+        // only records inheritance as `base:`/`iface:`/`mixin:` attributes on
+        // the type symbol. Lower those attributes into Extends/Implements/
+        // UsesTrait edges so the ancestor walk and edge-driven inheritance
+        // queries work uniformly across all languages. Must run before
+        // `build_ancestor_edge_index` so the new edges are indexed for the
+        // call-resolution-phase ancestor walk.
+        self.add_generic_inheritance_edges();
         // The inheritance edges are now final for this rebuild; index them by
         // `from` so the call-resolution-phase ancestor walk does O(out-degree)
         // lookups instead of rescanning the whole edge vector per BFS node.
@@ -66,6 +85,172 @@ impl SemanticGraph {
         self.references = references;
 
         self.add_python_route_edges();
+    }
+
+    /// Lower the `base:`/`iface:`/`mixin:` inheritance attributes that every
+    /// non-C#/PHP extractor stamps onto type symbols into concrete
+    /// `Extends`/`Implements`/`UsesTrait` edges.
+    ///
+    /// C# (`add_csharp_type_edges`) and PHP (`add_php_type_edges`) already
+    /// materialize their own inheritance edges, so this pass skips those two
+    /// languages to avoid duplicates. Every other language (Rust, Java, Kotlin,
+    /// Scala, Go, Swift, Dart, JS/TS, Python, Ruby, C/C++) only recorded
+    /// inheritance as attributes, which left `inheritance_hierarchy` and the
+    /// edge-driven ancestor walk empty for them.
+    ///
+    /// Resolution is scope-aware: same-file declarations win, then a single
+    /// unique-by-name type across the workspace. Ambiguous or unresolved names
+    /// produce no edge (we never emit a `to: None` inheritance edge). Edges are
+    /// deduplicated per `(EdgeKind, target)` so Ruby — which stamps a mixin
+    /// under several attribute spellings (`mixin:T`, `mixin:include:T`,
+    /// `mixin:Ns::T`) — yields a single `UsesTrait` edge per included module.
+    ///
+    /// Idempotent across rebuilds: `rebuild_semantic_edges` drops every
+    /// non-`Contains` edge before this runs, so each rebuild simply re-emits.
+    fn add_generic_inheritance_edges(&mut self) {
+        let symbols = self
+            .symbols
+            .values()
+            .filter(|symbol| self.symbol_uses_generic_inheritance(symbol))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut edges = Vec::new();
+        for symbol in symbols {
+            // De-duplicate per (kind, resolved target): several attribute
+            // spellings can resolve to the same supertype symbol.
+            let mut seen: HashSet<(EdgeKind, SymbolId)> = HashSet::new();
+            for (attribute_kind, raw_name) in self.generic_inheritance_attributes(&symbol) {
+                let Some(target_id) =
+                    self.generic_inheritance_target(&symbol.file_id, &raw_name)
+                else {
+                    continue;
+                };
+                let kind = match attribute_kind {
+                    GenericInheritanceKind::Base => self
+                        .symbols
+                        .get(&target_id)
+                        .map(|target| {
+                            if target.kind == SymbolKind::Interface {
+                                EdgeKind::Implements
+                            } else {
+                                EdgeKind::Extends
+                            }
+                        })
+                        .unwrap_or(EdgeKind::Extends),
+                    GenericInheritanceKind::Iface => EdgeKind::Implements,
+                    GenericInheritanceKind::Mixin => EdgeKind::UsesTrait,
+                };
+                if !seen.insert((kind, target_id.clone())) {
+                    continue;
+                }
+                edges.push(GraphEdge {
+                    from: symbol.id.clone(),
+                    to: Some(target_id),
+                    target_text: last_path_segment(&raw_name),
+                    kind,
+                    span: Some(symbol.span),
+                    confidence: Confidence::Heuristic,
+                    freshness: Freshness::Fresh,
+                    provenance: Provenance::new("graph", "generic inheritance attribute edge"),
+                    candidates: Vec::new(),
+                });
+            }
+        }
+        self.edges.extend(edges);
+    }
+
+    /// A type-like symbol whose file language is handled by the generic
+    /// inheritance lowering (i.e. everything except the C#/PHP builders).
+    fn symbol_uses_generic_inheritance(&self, symbol: &GraphSymbol) -> bool {
+        if !matches!(
+            symbol.kind,
+            SymbolKind::Class
+                | SymbolKind::Interface
+                | SymbolKind::Struct
+                | SymbolKind::Enum
+                | SymbolKind::Trait
+                | SymbolKind::Union
+        ) {
+            return false;
+        }
+        self.files
+            .get(&symbol.file_id)
+            .map(|file| !matches!(file.language, LanguageKind::CSharp | LanguageKind::Php))
+            .unwrap_or(false)
+    }
+
+    /// The `base:`/`iface:`/`mixin:` inheritance attributes on `symbol`, tagged
+    /// with the edge kind each maps to. Ruby's kind-tagged mixin spellings
+    /// (`mixin:include:T`) survive here but their leaf (`include:T`) declines in
+    /// resolution; the bare `mixin:T` form supplies the resolvable name and the
+    /// per-target de-duplication in the caller collapses the rest.
+    fn generic_inheritance_attributes(
+        &self,
+        symbol: &GraphSymbol,
+    ) -> Vec<(GenericInheritanceKind, String)> {
+        symbol
+            .attributes
+            .iter()
+            .filter_map(|attribute| {
+                if let Some(name) = attribute.strip_prefix("base:") {
+                    Some((GenericInheritanceKind::Base, name.to_string()))
+                } else if let Some(name) = attribute.strip_prefix("iface:") {
+                    Some((GenericInheritanceKind::Iface, name.to_string()))
+                } else if let Some(name) = attribute.strip_prefix("mixin:") {
+                    Some((GenericInheritanceKind::Mixin, name.to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Resolve an inheritance attribute's `<Name>` to a single concrete type
+    /// symbol. Reuses the per-language scoped candidate helper where one exists
+    /// and is callable (C/C++, Java, Python); for the rest a generic
+    /// same-file-then-unique-by-name lookup is used. Returns `None` when the
+    /// name is unknown or ambiguous so the caller emits no edge.
+    fn generic_inheritance_target(&self, file_id: &FileId, name: &str) -> Option<SymbolId> {
+        let language = self.files.get(file_id).map(|file| file.language);
+        let candidates = match language {
+            Some(LanguageKind::Java) => self.java_class_candidates_for_name_in_file(file_id, name),
+            Some(LanguageKind::Python) => {
+                self.python_class_candidates_for_name_in_file(file_id, name)
+            }
+            Some(LanguageKind::C | LanguageKind::Cpp) => {
+                self.cpp_class_candidates_for_name_in_file(file_id, name)
+            }
+            _ => self.generic_type_candidates_for_name_in_file(file_id, name),
+        };
+        single_symbol(candidates.into_iter())
+    }
+
+    /// Generic scope-aware type lookup for languages without a dedicated
+    /// candidate helper reachable here. Same-file type-like declarations win;
+    /// failing that, a single unique-by-name type across the workspace. Anything
+    /// ambiguous yields the empty set so the caller declines.
+    fn generic_type_candidates_for_name_in_file(
+        &self,
+        file_id: &FileId,
+        name: &str,
+    ) -> Vec<SymbolId> {
+        let leaf = last_path_segment(name);
+        let typed = self
+            .symbols_by_name(&leaf)
+            .iter()
+            .filter_map(|id| self.symbols.get(id))
+            .filter(|symbol| is_class_like_kind(symbol.kind) || symbol.kind == SymbolKind::Union)
+            .collect::<Vec<_>>();
+        let same_file = typed
+            .iter()
+            .filter(|symbol| symbol.file_id == *file_id)
+            .map(|symbol| symbol.id.clone());
+        if let Some(id) = single_symbol(same_file) {
+            return vec![id];
+        }
+        single_symbol(typed.iter().map(|symbol| symbol.id.clone()))
+            .into_iter()
+            .collect()
     }
 
     /// Route/registry decorators (`@MyRouter.get`, bare `@register`) record a
