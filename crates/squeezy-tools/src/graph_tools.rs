@@ -46,6 +46,14 @@ pub(crate) struct SymbolContextArgs {
     /// Filter result packets to symbols in test code only / excluding tests.
     exclude_tests: Option<bool>,
     tests_only: Option<bool>,
+    /// Pipe-separated confidence allow-set (e.g. `exact_syntax|import_resolved`).
+    /// See [`ConfidenceScope`].
+    confidence: Option<String>,
+    /// Drop out-of-workspace (`External`) targets.
+    exclude_external: Option<bool>,
+    /// Keep ONLY out-of-workspace (`External`) targets (wins over
+    /// `exclude_external`).
+    external_only: Option<bool>,
     max_references: Option<usize>,
     max_results: Option<usize>,
     offset: Option<usize>,
@@ -87,6 +95,12 @@ struct DeclSearchArgs {
     exclude_tests: Option<bool>,
     /// Keep ONLY test-code declarations. Wins over `exclude_tests` when both set.
     tests_only: Option<bool>,
+    /// Pipe-separated confidence allow-set (see [`ConfidenceScope`]).
+    confidence: Option<String>,
+    /// Drop out-of-workspace (`External`) declarations.
+    exclude_external: Option<bool>,
+    /// Keep ONLY out-of-workspace (`External`) declarations.
+    external_only: Option<bool>,
     max_results: Option<usize>,
     offset: Option<usize>,
 }
@@ -99,6 +113,12 @@ struct DefinitionSearchArgs {
     kind: Option<String>,
     path: Option<String>,
     language: Option<String>,
+    /// Pipe-separated confidence allow-set (see [`ConfidenceScope`]).
+    confidence: Option<String>,
+    /// Drop out-of-workspace (`External`) candidates.
+    exclude_external: Option<bool>,
+    /// Keep ONLY out-of-workspace (`External`) candidates.
+    external_only: Option<bool>,
     max_results: Option<usize>,
     /// Skip the first N candidates after sorting, before `max_results`. Lets a
     /// caller page through a large candidate set.
@@ -120,6 +140,13 @@ struct ReferenceSearchArgs {
     reference_kind: Option<String>,
     exclude_tests: Option<bool>,
     tests_only: Option<bool>,
+    /// Pipe-separated confidence allow-set over the reference hits (see
+    /// [`ConfidenceScope`]).
+    confidence: Option<String>,
+    /// Drop out-of-workspace (`External`) reference hits.
+    exclude_external: Option<bool>,
+    /// Keep ONLY out-of-workspace (`External`) reference hits.
+    external_only: Option<bool>,
     max_results: Option<usize>,
     offset: Option<usize>,
 }
@@ -140,6 +167,13 @@ struct FlowArgs {
     result_path: Option<String>,
     exclude_tests: Option<bool>,
     tests_only: Option<bool>,
+    /// Pipe-separated confidence allow-set over the result packets (see
+    /// [`ConfidenceScope`]).
+    confidence: Option<String>,
+    /// Drop out-of-workspace (`External`) result packets.
+    exclude_external: Option<bool>,
+    /// Keep ONLY out-of-workspace (`External`) result packets.
+    external_only: Option<bool>,
     target_symbol_id: Option<String>,
     target_query: Option<String>,
     max_depth: Option<usize>,
@@ -189,6 +223,13 @@ struct ImpactArgs {
     /// Drop / keep-only test-code symbols among the affected set.
     exclude_tests: Option<bool>,
     tests_only: Option<bool>,
+    /// Pipe-separated confidence allow-set over the affected symbols (see
+    /// [`ConfidenceScope`]).
+    confidence: Option<String>,
+    /// Drop out-of-workspace (`External`) affected symbols.
+    exclude_external: Option<bool>,
+    /// Keep ONLY out-of-workspace (`External`) affected symbols.
+    external_only: Option<bool>,
     /// Maximum number of affected symbols to return (default 50).
     max_results: Option<usize>,
     /// Skip the first N affected symbols after sorting, before `max_results`.
@@ -244,6 +285,13 @@ struct InheritanceHierarchyArgs {
     /// depth-bounded-walk default. Ignored unless the transitive subtype closure
     /// is requested.
     max_depth: Option<usize>,
+    /// Pipe-separated confidence allow-set over the related symbols (see
+    /// [`ConfidenceScope`]).
+    confidence: Option<String>,
+    /// Drop out-of-workspace (`External`) related symbols.
+    exclude_external: Option<bool>,
+    /// Keep ONLY out-of-workspace (`External`) related symbols.
+    external_only: Option<bool>,
     /// Maximum results (default 50).
     max_results: Option<usize>,
     /// Skip the first N related symbols after sorting, before `max_results`.
@@ -1917,6 +1965,110 @@ fn confidence_is_unresolved(confidence: Confidence) -> bool {
     )
 }
 
+/// Parse a confidence-level filter token to a [`Confidence`]. Accepts the
+/// stable snake_case ids ([`Confidence::id`]) case-insensitively, plus a couple
+/// of obvious aliases. Returns `None` for an unknown token so the caller treats
+/// it as "no constraint" rather than silently dropping everything.
+fn parse_confidence_level(value: &str) -> Option<Confidence> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "exact_syntax" | "exact" => Some(Confidence::ExactSyntax),
+        "import_resolved" | "resolved" => Some(Confidence::ImportResolved),
+        "heuristic" => Some(Confidence::Heuristic),
+        "candidate_set" | "candidate" => Some(Confidence::CandidateSet),
+        "external" => Some(Confidence::External),
+        "macro_opaque" | "macro" => Some(Confidence::MacroOpaque),
+        "conditional_unknown" | "conditional" => Some(Confidence::ConditionalUnknown),
+        "unsupported" => Some(Confidence::Unsupported),
+        "stale" => Some(Confidence::Stale),
+        "partial" => Some(Confidence::Partial),
+        _ => None,
+    }
+}
+
+/// Confidence-scoping options shared by the read tools (O10). `levels` is an
+/// optional allow-set parsed from a pipe-separated `confidence` argument;
+/// `exclude_external` drops out-of-workspace (`External`) targets; `external_only`
+/// keeps only them (and wins over `exclude_external` when both are set).
+#[derive(Debug)]
+struct ConfidenceScope {
+    levels: Option<Vec<Confidence>>,
+    exclude_external: bool,
+    external_only: bool,
+}
+
+impl ConfidenceScope {
+    /// Build from the raw args. An all-unknown / blank `confidence` string yields
+    /// no level constraint so a typo never empties the result silently.
+    fn new(confidence: Option<&str>, exclude_external: bool, external_only: bool) -> Self {
+        let levels = confidence.and_then(|raw| {
+            let parsed: Vec<Confidence> = raw
+                .split('|')
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .filter_map(parse_confidence_level)
+                .collect();
+            (!parsed.is_empty()).then_some(parsed)
+        });
+        Self {
+            levels,
+            exclude_external,
+            external_only,
+        }
+    }
+
+    /// True when no constraint is active, so callers can skip the filter pass.
+    fn is_noop(&self) -> bool {
+        self.levels.is_none() && !self.exclude_external && !self.external_only
+    }
+
+    /// Whether a target with this confidence is kept under the scope.
+    fn keeps(&self, confidence: Confidence) -> bool {
+        if self.external_only {
+            return confidence == Confidence::External;
+        }
+        if self.exclude_external && confidence == Confidence::External {
+            return false;
+        }
+        match &self.levels {
+            Some(levels) => levels.contains(&confidence),
+            None => true,
+        }
+    }
+
+    /// Packet-level variant for JSON packets (flows): reads the `confidence` id
+    /// from the packet's `symbol`/`reference`/`edge` body. A packet with no
+    /// determinable confidence is KEPT (the scope is a positive filter, not a
+    /// hard gate that would drop un-anchored packets).
+    fn keeps_packet(&self, packet: &Value) -> bool {
+        if self.is_noop() {
+            return true;
+        }
+        match packet_confidence_id(packet) {
+            Some(id) => match parse_confidence_level(id) {
+                Some(confidence) => self.keeps(confidence),
+                None => true,
+            },
+            None => true,
+        }
+    }
+}
+
+/// Best-effort extraction of a packet's confidence id from the bodies the graph
+/// tools emit (`symbol`/`reference`/`edge`). Returns `None` when no confidence
+/// can be located.
+fn packet_confidence_id(packet: &Value) -> Option<&str> {
+    for body in ["symbol", "reference", "edge"] {
+        if let Some(id) = packet
+            .get(body)
+            .and_then(|value| value.get("confidence"))
+            .and_then(Value::as_str)
+        {
+            return Some(id);
+        }
+    }
+    packet.get("confidence").and_then(Value::as_str)
+}
+
 pub(crate) fn resolve_definition_candidates(
     graph: &squeezy_graph::SemanticGraph,
     symbol_id: Option<&str>,
@@ -3003,6 +3155,7 @@ fn filter_hierarchy_nodes_by_path(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hierarchy_result(
     call: &ToolCall,
     manager: &GraphManager,
@@ -3894,11 +4047,17 @@ impl ToolRegistry {
         let max_callers = args.max_callers.unwrap_or(0);
         let exclude_tests = args.exclude_tests.unwrap_or(false);
         let tests_only = args.tests_only.unwrap_or(false);
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
         let symbols: Vec<GraphSymbol> = symbols
             .into_iter()
             .filter(|symbol| {
                 passes_test_scope(symbol_is_test(symbol), exclude_tests, tests_only)
             })
+            .filter(|symbol| confidence_scope.keeps(symbol.confidence))
             .filter(|symbol| !unused || symbol.scanned)
             .filter(|symbol| !unused || inbound_usage_count(graph, symbol) <= max_callers)
             .collect();
@@ -4012,7 +4171,7 @@ impl ToolRegistry {
         let max_results = graph_limit(args.max_results);
         // `kind` is multi-valued ("struct|enum|trait"): resolve candidates once
         // per kind token and union by id, reusing the single-kind resolver.
-        let symbols = multi_kind_symbol_union(args.kind.as_deref(), |kind| {
+        let mut symbols = multi_kind_symbol_union(args.kind.as_deref(), |kind| {
             resolve_definition_candidates(
                 graph,
                 args.symbol_id.as_deref(),
@@ -4022,6 +4181,14 @@ impl ToolRegistry {
                 args.language.as_deref(),
             )
         });
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
+        if !confidence_scope.is_noop() {
+            symbols.retain(|symbol| confidence_scope.keeps(symbol.confidence));
+        }
         let candidate_count = symbols.len();
         // Page after sorting: skip `offset`, then keep `max_results`. `truncated`
         // reflects whether anything remains past the returned window.
@@ -4095,6 +4262,11 @@ impl ToolRegistry {
         };
         let exclude_tests = args.exclude_tests.unwrap_or(false);
         let tests_only = args.tests_only.unwrap_or(false);
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
         let filtered = hits
             .into_iter()
             .filter(|hit| {
@@ -4114,6 +4286,7 @@ impl ToolRegistry {
                 file_language_matches(graph, &hit.reference.file_id, args.language.as_deref())
             })
             .filter(|hit| reference_kind_matches(hit, args.reference_kind.as_deref()))
+            .filter(|hit| confidence_scope.keeps(hit.confidence))
             .collect::<Vec<_>>();
         let truncated = filtered.len().saturating_sub(offset) > max_results;
         let selected = filtered
@@ -4209,6 +4382,16 @@ impl ToolRegistry {
             result_path_scope(args.path.as_deref(), args.result_path.as_deref());
         if result_path.is_some() {
             packets.retain(|packet| packet_matches_result_path(packet, result_path));
+        }
+        // Confidence scope: keep only packets at an allowed confidence, and/or
+        // drop / isolate out-of-workspace (`External`) targets.
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
+        if !confidence_scope.is_noop() {
+            packets.retain(|packet| confidence_scope.keeps_packet(packet));
         }
         // Pagination over the filtered packets: skip `offset`, keep `max_results`.
         // The page can be truncated either because the BFS overflowed upstream or
@@ -4311,6 +4494,16 @@ impl ToolRegistry {
         if result_path.is_some() {
             packets.retain(|packet| packet_matches_result_path(packet, result_path));
         }
+        // Confidence scope: keep only packets at an allowed confidence, and/or
+        // drop / isolate out-of-workspace (`External`) targets.
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
+        if !confidence_scope.is_noop() {
+            packets.retain(|packet| confidence_scope.keeps_packet(packet));
+        }
         // Pagination over the filtered packets: skip `offset`, keep `max_results`.
         // The page can be truncated either because the BFS overflowed downstream
         // or because filtered packets remain past the returned window.
@@ -4357,6 +4550,11 @@ impl ToolRegistry {
         let diff_only = args.diff_only.unwrap_or(false);
         let exclude_tests = args.exclude_tests.unwrap_or(false);
         let tests_only = args.tests_only.unwrap_or(false);
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
         // A live symbol_id from a sibling tool resolves the target directly;
         // a stale id (graph re-indexed since it was minted) falls through to
         // the name query so the call still lands on the right symbol.
@@ -4385,6 +4583,7 @@ impl ToolRegistry {
         })
         .filter(|symbol| language_matches(graph, symbol, language_filter))
         .filter(|symbol| passes_test_scope(symbol_is_test(symbol), exclude_tests, tests_only))
+        .filter(|symbol| confidence_scope.keeps(symbol.confidence))
         .collect::<Vec<_>>();
         // Page after filtering/sorting: skip `offset`, keep `max_results`.
         let offset = args.offset.unwrap_or(0);
@@ -4403,6 +4602,7 @@ impl ToolRegistry {
                 .filter(|symbol| {
                     passes_test_scope(symbol_is_test(symbol), exclude_tests, tests_only)
                 })
+                .filter(|symbol| confidence_scope.keeps(symbol.confidence))
                 .filter(|symbol| {
                     symbol.name.contains(&args.query) || symbol.signature.contains(&args.query)
                 })
@@ -4648,9 +4848,15 @@ impl ToolRegistry {
             graph.inheritance_ancestors(&root_sym.id)
         };
         let language_filter = args.language.as_deref();
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
         let related: Vec<GraphSymbol> = related
             .into_iter()
             .filter(|sym| language_matches(graph, sym, language_filter))
+            .filter(|sym| confidence_scope.keeps(sym.confidence))
             .collect();
 
         // Page after filtering: skip `offset`, keep `max_results`.
@@ -4847,11 +5053,17 @@ impl ToolRegistry {
         let exclude_tests = args.exclude_tests.unwrap_or(false);
         let tests_only = args.tests_only.unwrap_or(false);
         let language_filter = args.language.as_deref();
+        let confidence_scope = ConfidenceScope::new(
+            args.confidence.as_deref(),
+            args.exclude_external.unwrap_or(false),
+            args.external_only.unwrap_or(false),
+        );
         let mut affected_symbols: Vec<&squeezy_graph::GraphSymbol> = impact
             .affected_symbols
             .iter()
             .filter(|sym| passes_test_scope(symbol_is_test(sym), exclude_tests, tests_only))
             .filter(|sym| language_matches(graph, sym, language_filter))
+            .filter(|sym| confidence_scope.keeps(sym.confidence))
             .collect();
         // `compute_impact` collects from a HashMap, so iteration order is not
         // stable. Sort deterministically (path, span, id) before paging so the
@@ -6625,5 +6837,109 @@ mod windows_path_normalization_tests {
                 || (path_lower3.starts_with(filter_with_slash.as_str())),
             "case-folded prefix match must work"
         );
+    }
+}
+
+#[cfg(test)]
+mod option_filter_tests {
+    use super::{
+        ConfidenceScope, parse_confidence_level, parse_edge_kind_filter, result_path_scope,
+        split_kind_tokens,
+    };
+    use serde_json::json;
+    use squeezy_core::{Confidence, EdgeKind};
+
+    #[test]
+    fn edge_kind_filter_is_case_insensitive_and_aliased() {
+        assert_eq!(parse_edge_kind_filter("Calls"), Some(EdgeKind::Calls));
+        assert_eq!(parse_edge_kind_filter("ref"), Some(EdgeKind::References));
+        assert_eq!(parse_edge_kind_filter("IMPORTS"), Some(EdgeKind::Imports));
+        assert_eq!(parse_edge_kind_filter("re-export"), Some(EdgeKind::Reexports));
+        assert_eq!(parse_edge_kind_filter("nonsense"), None);
+    }
+
+    #[test]
+    fn split_kind_tokens_splits_on_pipe_and_trims() {
+        assert_eq!(
+            split_kind_tokens(Some("struct| enum |trait")),
+            Some(vec!["struct", "enum", "trait"])
+        );
+        // A single token still yields a one-element vec.
+        assert_eq!(split_kind_tokens(Some("struct")), Some(vec!["struct"]));
+        // All-blank / empty collapses to no-filter.
+        assert_eq!(split_kind_tokens(Some(" | ")), None);
+        assert_eq!(split_kind_tokens(None), None);
+    }
+
+    #[test]
+    fn result_path_scope_prefers_result_path_then_path() {
+        assert_eq!(result_path_scope(Some("src"), Some("src/a")), Some("src/a"));
+        assert_eq!(result_path_scope(Some("src"), None), Some("src"));
+        // Blank tokens are treated as absent.
+        assert_eq!(result_path_scope(Some("  "), None), None);
+        assert_eq!(result_path_scope(None, None), None);
+    }
+
+    #[test]
+    fn confidence_level_parses_ids_and_aliases() {
+        assert_eq!(
+            parse_confidence_level("exact_syntax"),
+            Some(Confidence::ExactSyntax)
+        );
+        assert_eq!(
+            parse_confidence_level("External"),
+            Some(Confidence::External)
+        );
+        assert_eq!(parse_confidence_level("resolved"), Some(Confidence::ImportResolved));
+        assert_eq!(parse_confidence_level("bogus"), None);
+    }
+
+    #[test]
+    fn confidence_scope_noop_keeps_everything() {
+        let scope = ConfidenceScope::new(None, false, false);
+        assert!(scope.is_noop());
+        assert!(scope.keeps(Confidence::External));
+        assert!(scope.keeps(Confidence::ExactSyntax));
+    }
+
+    #[test]
+    fn confidence_scope_allow_set_filters_by_level() {
+        let scope = ConfidenceScope::new(Some("exact_syntax|import_resolved"), false, false);
+        assert!(!scope.is_noop());
+        assert!(scope.keeps(Confidence::ExactSyntax));
+        assert!(scope.keeps(Confidence::ImportResolved));
+        assert!(!scope.keeps(Confidence::Heuristic));
+        // An all-unknown allow-set degrades to no constraint (never empties).
+        let typo = ConfidenceScope::new(Some("typo"), false, false);
+        assert!(typo.keeps(Confidence::Heuristic));
+    }
+
+    #[test]
+    fn confidence_scope_external_isolation() {
+        let drop_ext = ConfidenceScope::new(None, true, false);
+        assert!(!drop_ext.keeps(Confidence::External));
+        assert!(drop_ext.keeps(Confidence::ExactSyntax));
+
+        let only_ext = ConfidenceScope::new(None, false, true);
+        assert!(only_ext.keeps(Confidence::External));
+        assert!(!only_ext.keeps(Confidence::ExactSyntax));
+
+        // external_only wins when both are set.
+        let both = ConfidenceScope::new(None, true, true);
+        assert!(both.keeps(Confidence::External));
+    }
+
+    #[test]
+    fn confidence_scope_packet_uses_body_confidence() {
+        let scope = ConfidenceScope::new(None, true, false);
+        // Edge packet pointing at an external target is dropped.
+        let external_edge = json!({"edge": {"confidence": "external"}});
+        assert!(!scope.keeps_packet(&external_edge));
+        // A symbol packet at exact confidence is kept.
+        let local_symbol = json!({"symbol": {"confidence": "exact_syntax"}});
+        assert!(scope.keeps_packet(&local_symbol));
+        // A packet with no determinable confidence is kept (positive filter).
+        let bare = json!({"spans": []});
+        assert!(scope.keeps_packet(&bare));
     }
 }
