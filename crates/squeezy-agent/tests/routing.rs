@@ -74,6 +74,26 @@ fn end_turn_reply(text: &str) -> Vec<Result<LlmEvent>> {
     ]
 }
 
+/// Like `end_turn_reply` but with a known provider spend on the terminal
+/// `Completed`, so a test can assert how that spend is attributed.
+fn end_turn_reply_with_cost(text: &str, usd_micros: u64) -> Vec<Result<LlmEvent>> {
+    vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(text.to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: None,
+            cost: CostSnapshot {
+                input_tokens: Some(1_000),
+                output_tokens: Some(200),
+                estimated_usd_micros: Some(usd_micros),
+                ..Default::default()
+            },
+            stop_reason: Some(squeezy_llm::StopReason::EndTurn),
+            reasoning_only_stop: false,
+        }),
+    ]
+}
+
 /// A canned provider that pops one scripted `Vec<LlmEvent>` per call.
 /// Provider name is `"anthropic"` so `cheap_model_for(...)` resolves to
 /// Haiku and the router has a real cheap tier to target.
@@ -638,6 +658,95 @@ async fn cache_isolation_switch_keeps_the_cheap_turn_in_loop() {
             AgentEvent::TurnRouted { reason, .. } if reason == "routed_subagent"
         )),
         "switch mode must not isolate into a subagent"
+    );
+}
+
+#[tokio::test]
+async fn cache_isolation_runs_the_judged_mid_tier_model_in_the_subagent() {
+    // Isolation must run the rung the router actually chose, not always the weak
+    // tier. With a "medium" judge verdict and cache_isolation=Subagent, the
+    // scoped subagent runs the Sonnet mid rung (carried through via
+    // `model_override`), so the only turn request lands on MEDIUM_MODEL.
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        judge_reply("medium"),
+        end_turn_reply("handled on sonnet, isolated"),
+    ]));
+    let mut config = config_with_routing();
+    config.routing.cache_isolation = squeezy_core::CacheIsolation::Subagent;
+    let agent = Agent::new(config, provider.clone());
+    let events = drain_until_terminal(agent.start_turn(
+        "add a focused null-check to the parser in src/parse.rs".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "judge + isolated turn produce two requests"
+    );
+    assert_eq!(
+        &*requests[0].model, CHEAP_MODEL,
+        "judge dispatches on the cheap tier"
+    );
+    assert_eq!(
+        &*requests[1].model, MEDIUM_MODEL,
+        "the isolated subagent runs the judged mid rung, not the weak tier"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnRouted { to, reason, .. }
+                if reason == "routed_subagent" && to == MEDIUM_MODEL
+        )),
+        "isolation must announce the routed_subagent on the mid rung"
+    );
+}
+
+#[tokio::test]
+async fn cache_isolation_folds_the_subagent_spend_into_the_turn_cost() {
+    // The isolated turn runs its work in a subagent whose provider spend would
+    // otherwise be invisible to the turn ledger (the main loop never dispatches).
+    // The fold makes both the turn's headline cost and the session cap basis
+    // reflect the subagent's actual usage instead of reading as ~$0.
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply_with_cost(
+        "done in subagent",
+        4_200,
+    )]));
+    let mut config = config_with_routing();
+    config.routing.cache_isolation = squeezy_core::CacheIsolation::Subagent;
+    let agent = Agent::new(config, provider.clone());
+    let events = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+
+    // "checkout main" is a heuristic slam-dunk, so there is no judge call — the
+    // subagent's 4_200 µ$ is the only spend in the turn.
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "only the isolated subagent dispatches"
+    );
+    let (cost, session_cost) = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::Completed {
+                cost, session_cost, ..
+            } => Some((cost.clone(), session_cost.clone())),
+            _ => None,
+        })
+        .expect("the turn completes from the subagent's summary");
+    assert_eq!(
+        cost.estimated_usd_micros,
+        Some(4_200),
+        "the isolated subagent's spend must be folded into the turn's headline cost"
+    );
+    assert_eq!(
+        session_cost.and_then(|snapshot| snapshot.estimated_usd_micros),
+        Some(4_200),
+        "the isolated subagent's spend must advance the session cap basis"
     );
 }
 

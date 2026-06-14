@@ -14037,7 +14037,17 @@ fn build_entry_preview_meta(app: &TuiApp, entry: &TranscriptEntry, turn: u32) ->
         && active_subagent_record(app).is_none()
         && let Some(metrics) = app.turn_costs.get(&turn)
     {
-        let provider = &metrics.provider;
+        // An isolated cheap turn records its spend under the subagent slot (the
+        // work ran in a scoped subagent, not the main loop), so fall back to it
+        // when the main provider is empty — otherwise the peek reads $0.
+        let provider = if metrics.provider.estimated_usd_micros.is_some()
+            || metrics.provider.input_tokens.is_some()
+            || metrics.provider.output_tokens.is_some()
+        {
+            &metrics.provider
+        } else {
+            &metrics.subagent_provider
+        };
         if let Some(usd) = provider.estimated_usd_micros {
             parts.push(format_cost_usd(usd));
         }
@@ -14062,23 +14072,41 @@ fn build_entry_preview_meta(app: &TuiApp, entry: &TranscriptEntry, turn: u32) ->
 /// per-model main spend (older sessions, or local/help turns), so the meta line
 /// simply omits the model rather than guessing.
 fn turn_primary_model(metrics: &squeezy_core::TurnMetrics) -> Option<&str> {
-    metrics
-        .model_ledger
-        .0
-        .values()
-        .filter(|bucket| {
-            let main = &bucket.main;
-            main.estimated_usd_micros.is_some()
-                || main.input_tokens.is_some()
-                || main.output_tokens.is_some()
-        })
-        .max_by_key(|bucket| {
-            (
-                bucket.main.estimated_usd_micros.unwrap_or(0),
-                bucket.main.output_tokens.unwrap_or(0),
-            )
-        })
-        .map(|bucket| bucket.model.as_str())
+    fn best(metrics: &squeezy_core::TurnMetrics, subagent: bool) -> Option<&str> {
+        metrics
+            .model_ledger
+            .0
+            .values()
+            .filter_map(|bucket| {
+                let cost = if subagent {
+                    &bucket.subagent
+                } else {
+                    &bucket.main
+                };
+                let has = cost.estimated_usd_micros.is_some()
+                    || cost.input_tokens.is_some()
+                    || cost.output_tokens.is_some();
+                has.then_some((bucket, cost))
+            })
+            .max_by_key(|(_, cost)| {
+                (
+                    cost.estimated_usd_micros.unwrap_or(0),
+                    cost.output_tokens.unwrap_or(0),
+                )
+            })
+            .map(|(bucket, _)| bucket.model.as_str())
+    }
+    // Prefer the main bucket that did the bulk of the work. A cache-isolated turn
+    // has no main bucket — its work ran entirely in the scoped routed subagent —
+    // so for that turn (and only that turn) name the subagent's model instead.
+    // Turns whose only spend is a helper subagent (e.g. an Explore the parent
+    // spawned) still name no model: that helper isn't the turn's chosen model.
+    best(metrics, false).or_else(|| {
+        metrics
+            .routed_to_subagent
+            .then(|| best(metrics, true))
+            .flatten()
+    })
 }
 
 /// `Alt+1`: toggle the Hover Preview popover (§12.1.4) for the currently focused
