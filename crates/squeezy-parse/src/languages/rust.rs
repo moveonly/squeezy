@@ -129,6 +129,16 @@ pub(crate) fn symbol_from_node(
     // so `decl_search attribute=derive:X` and cfg filtering work, mirroring the
     // C#/Java/JS-TS normalized-attribute passes.
     attributes.extend(rust_semantic_attributes(&attributes));
+    // Supertrait bounds (`trait Sub: Super`) live in the `bounds` field, not as
+    // literal `#[..]` attributes; expose each as a `base:` token so Rust trait
+    // hierarchies are queryable the same way Python/JS-TS class bases are.
+    if kind == SymbolKind::Trait {
+        attributes.extend(
+            rust_supertrait_bases(node, ctx.source)
+                .into_iter()
+                .map(|base| format!("base:{base}")),
+        );
+    }
     attributes.sort();
     attributes.dedup();
 
@@ -1823,6 +1833,31 @@ fn rust_attribute_inner_paths(attribute: &str) -> Vec<String> {
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty())
         .collect()
+}
+
+/// Collect the supertrait names from a `trait_item`'s `bounds` field
+/// (`trait Sub: Super + Other`). Lifetimes and `?Sized`-style markers are
+/// dropped; each remaining bound is reduced to its final path segment.
+pub(crate) fn rust_supertrait_bases(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(bounds) = node.child_by_field_name("bounds") else {
+        return Vec::new();
+    };
+    let mut bases = Vec::new();
+    let mut cursor = bounds.walk();
+    for child in bounds.named_children(&mut cursor) {
+        if child.kind() == "lifetime" {
+            continue;
+        }
+        let Ok(raw) = node_text(child, source) else {
+            continue;
+        };
+        let trimmed = raw.trim().trim_start_matches('?').trim();
+        let name = rust_type_name_from_text(trimmed);
+        if !name.is_empty() {
+            bases.push(name);
+        }
+    }
+    bases
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
