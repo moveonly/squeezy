@@ -136,6 +136,49 @@ pub struct ContextCompactionReport {
     pub post_compact: Vec<ResumeItem>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContextCompactionDecision {
+    pub estimate: ContextEstimate,
+    pub tokens_with_overhead: u64,
+    pub threshold: u64,
+    pub over_high_water: bool,
+    pub effective_keep: usize,
+    pub should_compact: bool,
+}
+
+/// Compute the post-turn auto-compaction gate, including request overhead and
+/// the high-water `min_items` bypass. Callers that only need to know whether
+/// the automatic path will attempt a compaction should use this instead of
+/// mirroring the threshold predicates.
+pub(crate) fn context_compaction_decision(
+    conversation: &[LlmInputItem],
+    config: &AppConfig,
+    overhead_tokens: u64,
+) -> ContextCompactionDecision {
+    let cc = &config.context_compaction;
+    let estimate = estimate_context(conversation);
+    let tokens_with_overhead = estimate.estimated_tokens.saturating_add(overhead_tokens);
+    let threshold = cc.summarize_threshold();
+    let over_high_water = tokens_with_overhead >= cc.min_items_bypass_threshold();
+    let mut effective_keep = cc.recent_items.max(1);
+    if over_high_water {
+        effective_keep = effective_keep.min(estimate.items / 2).max(1);
+    }
+    let should_compact = cc.enabled
+        && (estimate.items >= cc.min_items || over_high_water)
+        && estimate.items > effective_keep
+        && tokens_with_overhead >= threshold;
+
+    ContextCompactionDecision {
+        estimate,
+        tokens_with_overhead,
+        threshold,
+        over_high_water,
+        effective_keep,
+        should_compact,
+    }
+}
+
 /// Trigger post-turn summarize when the conversation crosses the
 /// `summarize_threshold`. Routes through `compact_conversation_with_strategy`
 /// so the configured strategy applies to the automatic path as well as manual
@@ -154,24 +197,7 @@ pub(crate) async fn maybe_compact_conversation(
     trigger: ContextCompactionTrigger,
     overhead_tokens: u64,
 ) -> Option<ContextCompactionReport> {
-    if !config.context_compaction.enabled {
-        return None;
-    }
-    let cc = &config.context_compaction;
-    let estimate = estimate_context(conversation);
-    // The conversation estimate omits the system instructions and tool
-    // schemas that ride along on every request; fold in the caller's measured
-    // request overhead so the gate reflects the real input size (finding #2).
-    let tokens = estimate.estimated_tokens.saturating_add(overhead_tokens);
-    // Lossy summarize fires only once usage crosses the window-relative
-    // summarize threshold. The cheap trim pre-pass runs before this (at the
-    // call site) so tool-output bytes are reclaimed before any summary head.
-    let ceiling = cc.summarize_threshold();
-    // A few but enormous items can dwarf the window while sitting under
-    // `min_items`; once over the high-water mark, bypass the item floor so
-    // they still summarize proactively.
-    let over_high_water = tokens >= cc.min_items_bypass_threshold();
-    if (estimate.items < cc.min_items && !over_high_water) || tokens < ceiling {
+    if !context_compaction_decision(conversation, config, overhead_tokens).should_compact {
         return None;
     }
     compact_conversation_with_strategy(

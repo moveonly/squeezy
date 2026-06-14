@@ -7,8 +7,8 @@ use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus, sha256_he
 use super::{
     COMPACTION_DURABLE_LINES_LIMIT, COMPACTION_UNRESOLVED_LINES_LIMIT, ContextCompactionTrigger,
     PendingToolResult, SeenToolOutputs, build_compaction_summary,
-    build_structured_compaction_prompt, compact_conversation, durable_context_lines,
-    estimate_context, is_structured_compaction_summary, pack_tool_results,
+    build_structured_compaction_prompt, compact_conversation, context_compaction_decision,
+    durable_context_lines, estimate_context, is_structured_compaction_summary, pack_tool_results,
     strip_media_for_compaction, unresolved_question_lines,
 };
 
@@ -1152,6 +1152,69 @@ fn few_but_huge_conversation() -> Vec<LlmInputItem> {
     (0..8)
         .map(|i| LlmInputItem::UserText(format!("item {i}: {}", "x".repeat(40_000))))
         .collect()
+}
+
+fn many_item_conversation(bytes_per_item: usize) -> Vec<LlmInputItem> {
+    (0..20)
+        .map(|i| LlmInputItem::UserText(format!("item {i}: {}", "x".repeat(bytes_per_item))))
+        .collect()
+}
+
+#[test]
+fn compaction_decision_is_false_below_summarize_threshold() {
+    let conversation = many_item_conversation(100);
+    let config = config_with_window(Some(1_000_000));
+    let decision = context_compaction_decision(&conversation, &config, 0);
+
+    assert!(
+        decision.estimate.items >= config.context_compaction.min_items,
+        "scenario should satisfy the item floor"
+    );
+    assert!(
+        decision.estimate.items > decision.effective_keep,
+        "scenario should have a foldable older slice"
+    );
+    assert!(
+        decision.tokens_with_overhead < decision.threshold,
+        "scenario should sit below the summarize threshold"
+    );
+    assert!(
+        !decision.should_compact,
+        "hook-facing decision must stay false below the auto-compaction threshold"
+    );
+}
+
+#[test]
+fn compaction_decision_is_true_above_summarize_threshold() {
+    let mut conversation = many_item_conversation(2_000);
+    let config = config_with_window(Some(20_000));
+    let decision = context_compaction_decision(&conversation, &config, 0);
+
+    assert!(
+        decision.tokens_with_overhead >= decision.threshold,
+        "scenario should cross the summarize threshold"
+    );
+    assert!(
+        decision.should_compact,
+        "hook-facing decision must match auto-compaction eligibility"
+    );
+
+    let mut state = ContextCompactionState::default();
+    let report = compact_conversation(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        None,
+        &config,
+        ContextCompactionTrigger::Auto,
+        false,
+        0,
+    );
+    assert!(
+        report.is_some(),
+        "eligible decision should have a foldable older slice"
+    );
 }
 
 #[test]
