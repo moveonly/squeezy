@@ -30520,6 +30520,33 @@ async fn workspace_profile_restore_on_launch_applies_the_saved_profile() {
 }
 
 #[tokio::test]
+async fn workspace_profile_letter_key_focuses_that_field() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let _scope = ScopedWorkspaceProfile::new(&mut app, "focus_letter");
+
+    handle_key(&mut app, &mut agent, workspace_profile_key())
+        .await
+        .unwrap();
+    assert_eq!(app.workspace_profile.as_ref().unwrap().field_index(), 0);
+
+    // `c` jump-focuses the third field directly (the keyboard twin of clicking
+    // its row), instead of stepping with ↓.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.workspace_profile.as_ref().unwrap().field_index(),
+        2,
+        "a per-field letter key focuses the matching field",
+    );
+}
+
+#[tokio::test]
 async fn workspace_profile_keyboard_navigation_and_esc_close() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -45094,6 +45121,39 @@ async fn action_palette_renders_across_resizes() {
         app.action_palette.as_ref().unwrap().len(),
         count,
         "the gathered action list is width-independent",
+    );
+}
+
+#[tokio::test]
+async fn action_palette_letter_key_runs_that_action() {
+    let mut app = app_with_action_palette(2);
+    let mut agent = test_agent(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+    )
+    .await
+    .expect("open palette");
+    assert!(
+        app.action_palette
+            .as_ref()
+            .is_some_and(|palette| !palette.actions().is_empty()),
+        "palette opens with at least one action",
+    );
+
+    // `a` runs the first action directly — the keyboard twin of clicking it —
+    // which closes the palette.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("letter key");
+    assert!(
+        app.action_palette.is_none(),
+        "a per-action letter key runs the action and closes the palette",
     );
 }
 
