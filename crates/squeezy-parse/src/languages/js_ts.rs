@@ -64,7 +64,11 @@ pub(crate) fn visit_js_ts_node(
         .unwrap_or(false)
         && matches!(
             kind,
-            "method_definition" | "public_field_definition" | "field_definition"
+            "method_definition"
+                | "method_signature"
+                | "abstract_method_signature"
+                | "public_field_definition"
+                | "field_definition"
         )
     {
         visit_js_ts_children(node, ctx, None, owner_symbol);
@@ -717,7 +721,8 @@ pub(crate) fn js_ts_reference_is_declaration_name(node: Node<'_>) -> bool {
     };
     matches!(
         parent.kind(),
-        "class_declaration"
+        "abstract_class_declaration"
+            | "class_declaration"
             | "enum_declaration"
             | "function_declaration"
             | "function"
@@ -726,6 +731,7 @@ pub(crate) fn js_ts_reference_is_declaration_name(node: Node<'_>) -> bool {
             | "generator_function_declaration"
             | "generator_function"
             | "interface_declaration"
+            | "abstract_method_signature"
             | "method_definition"
             | "method_signature"
             | "public_field_definition"
