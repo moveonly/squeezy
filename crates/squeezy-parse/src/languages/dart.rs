@@ -946,6 +946,16 @@ fn dart_collect_local_type_attributes(body: Node<'_>, source: &str, attributes: 
             // dispatch.
             continue;
         }
+        // Explicitly-typed pattern bindings introduce locals just like a plain
+        // declaration: `if (obj case Foo x)` / `switch (v) { case Foo x: }` /
+        // `final (Foo a, Bar b) = pair;`. Record them so `x.method()` dispatch
+        // can resolve the receiver's type. We keep descending — a pattern can
+        // nest more patterns (record/list/object) that bind further locals.
+        match node.kind() {
+            "variable_pattern" => dart_collect_locals_from_variable_pattern(node, source, attributes),
+            "cast_pattern" => dart_collect_locals_from_cast_pattern(node, source, attributes),
+            _ => {}
+        }
         // Skip descending into nested closures / nested function
         // declarations so their locals don't leak onto the enclosing
         // symbol's attribute set.
@@ -964,6 +974,77 @@ fn dart_collect_local_type_attributes(body: Node<'_>, source: &str, attributes: 
             stack.push(child);
         }
     }
+}
+
+/// `variable_pattern` = `<final|var|[final] Type> name`. Only the explicitly
+/// typed form (`Foo x`, `final Foo x`) carries a `type` child and is resolvable;
+/// `var x` / `final x` have no static type to attach.
+fn dart_collect_locals_from_variable_pattern(
+    node: Node<'_>,
+    source: &str,
+    attributes: &mut Vec<String>,
+) {
+    let Some(name) = node
+        .child_by_field_name("name")
+        .and_then(|name| node_text(name, source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+    else {
+        return;
+    };
+    let mut cursor = node.walk();
+    let Some(ty) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "type")
+        .and_then(|type_node| dart_pattern_type_name(type_node, source))
+    else {
+        return;
+    };
+    attributes.push(format!("dart-local:{name}:{ty}"));
+}
+
+/// `cast_pattern` = `<primary_pattern> as Type`. The cast `type` is the static
+/// type of the bound variable, so `var x as Foo` makes `x` a `Foo`.
+fn dart_collect_locals_from_cast_pattern(
+    node: Node<'_>,
+    source: &str,
+    attributes: &mut Vec<String>,
+) {
+    let Some(ty) = node
+        .child_by_field_name("type")
+        .and_then(|type_node| dart_pattern_type_name(type_node, source))
+    else {
+        return;
+    };
+    // The bound name is the first sub-pattern: a `variable_pattern` (`var x`)
+    // or a bare `identifier`. Nested cast targets are emitted by the walker.
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let name = match child.kind() {
+            "variable_pattern" => child
+                .child_by_field_name("name")
+                .and_then(|name| node_text(name, source).ok()),
+            "identifier" => node_text(child, source).ok(),
+            _ => None,
+        };
+        if let Some(name) = name
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+        {
+            attributes.push(format!("dart-local:{name}:{ty}"));
+            return;
+        }
+    }
+}
+
+/// Normalise a pattern `type` node to a bare leaf type name, dropping generic
+/// arguments and a trailing nullable `?` (mirrors local-declaration handling).
+fn dart_pattern_type_name(type_node: Node<'_>, source: &str) -> Option<String> {
+    node_text(type_node, source)
+        .ok()
+        .map(|text| dart_strip_type_args(text.trim()).to_string())
+        .map(|text| text.trim_end_matches('?').trim().to_string())
+        .filter(|text| !text.is_empty() && text != "?")
 }
 
 fn dart_collect_locals_from_declaration(
