@@ -36,6 +36,8 @@ pub(crate) fn visit_node(
     let kind = node.kind();
     if kind == "use_declaration" {
         extract_import(node, ctx, owner_symbol.clone());
+    } else if kind == "extern_crate_declaration" {
+        extract_extern_crate(node, ctx, owner_symbol.clone());
     }
 
     if let Some(symbol) = symbol_from_node(node, ctx, parent_symbol.clone()) {
@@ -1907,6 +1909,50 @@ pub(crate) fn extract_import(
             is_global: false,
         });
     }
+}
+
+/// Handle `extern crate foo;` / `extern crate foo as bar;`. The 2015-edition
+/// and `no_std`/proc-macro syntax is parsed by tree-sitter as a dedicated
+/// `extern_crate_declaration` node (distinct from `use_declaration`), so it is
+/// never routed through `extract_import`. We emit a `Named` import for the crate
+/// name, honoring the `as` alias, so the crate dependency is visible to the
+/// import graph and `Imports` edge resolution.
+pub(crate) fn extract_extern_crate(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let Some(name) = node
+        .child_by_field_name("name")
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+    else {
+        return;
+    };
+    let alias = node
+        .child_by_field_name("alias")
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty() && text != "_");
+    let is_reexport = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim_start()
+        .starts_with("pub");
+    ctx.imports.push(ParsedImport {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        is_glob: false,
+        is_reexport,
+        is_static: false,
+        path: name.clone(),
+        alias,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-rust", "extern crate declaration"),
+        kind: ImportKind::Named,
+        imported_name: Some(name),
+        is_global: false,
+    });
 }
 
 pub(crate) fn extract_direct_call(
