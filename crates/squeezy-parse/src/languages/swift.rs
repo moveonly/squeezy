@@ -209,6 +209,13 @@ fn visit_swift_node(
             extract_swift_attribute_reference(node, ctx, owner_symbol.clone());
             visit_swift_children(node, ctx, parent_symbol, owner_symbol, extension_owner);
         }
+        "macro_invocation" => {
+            // Freestanding macro use, e.g. `#stringify(x)`. Emit a `Macro`-kind
+            // call so the generic resolver materializes an `InvokesMacro` edge
+            // from the surrounding owner to the macro declaration.
+            extract_swift_macro_invocation(node, ctx, owner_symbol.clone());
+            visit_swift_children(node, ctx, parent_symbol, owner_symbol, extension_owner);
+        }
         "type_identifier" | "user_type" | "simple_user_type" => {
             if !swift_node_is_declaration_name(node) {
                 extract_swift_type_reference(node, ctx, owner_symbol.clone());
@@ -317,6 +324,11 @@ fn swift_symbol_from_node(
         // signature.
         "operator_declaration" => (SymbolKind::Const, "operator".to_string()),
         "precedence_group_declaration" => (SymbolKind::Const, "precedencegroup".to_string()),
+        // `macro Foo(...) = #externalMacro(...)` — a macro definition site. The
+        // generic resolver already turns a `Macro`-kind call into an
+        // `InvokesMacro` edge, so emitting the symbol enables def→use macro
+        // navigation. No `name` field; the name is a `simple_identifier` child.
+        "macro_declaration" => (SymbolKind::Macro, "macro".to_string()),
         "enum_entry" => return None, // handled separately, multiple symbols per node
         _ => return None,
     };
@@ -574,12 +586,14 @@ fn swift_symbol_name(
             _ => {}
         }
     }
-    // Operator / precedencegroup declarations carry no `name` field; their
-    // identifier is the `custom_operator` (e.g. `<=>`) or `simple_identifier`
-    // (e.g. a precedencegroup name) child.
+    // Operator / precedencegroup / macro declarations carry no `name` field;
+    // their identifier is the first `custom_operator` (e.g. `<=>`) or
+    // `simple_identifier` (precedencegroup / macro name) child. Parameter
+    // identifiers live inside nested `parameter` nodes, so the first direct
+    // `simple_identifier` named child is the declaration name.
     if matches!(
         node.kind(),
-        "operator_declaration" | "precedence_group_declaration"
+        "operator_declaration" | "precedence_group_declaration" | "macro_declaration"
     ) {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -1206,6 +1220,51 @@ fn extract_swift_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Op
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-swift", "call_expression"),
         confidence,
+    });
+    extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+}
+
+fn extract_swift_macro_invocation(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    // `macro_invocation` shape: `simple_identifier (call_suffix)?`. The leading
+    // `#` is an anonymous token, so the macro name is the `simple_identifier`.
+    let mut cursor = node.walk();
+    let Some(name) = node
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "simple_identifier")
+        .and_then(|c| node_text(c, ctx.source).ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    else {
+        return;
+    };
+    let raw = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let arity = node
+        .named_children(&mut node.walk())
+        .find(|c| c.kind() == "call_suffix")
+        .and_then(|s| {
+            s.named_children(&mut s.walk())
+                .find(|c| c.kind() == "value_arguments")
+        })
+        .map(named_child_count)
+        .unwrap_or(0);
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name,
+        target_text: raw,
+        receiver: None,
+        arity,
+        kind: ParsedCallKind::Macro,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-swift", "macro_invocation"),
+        confidence: Confidence::MacroOpaque,
     });
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
 }
