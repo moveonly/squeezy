@@ -164,6 +164,72 @@ pub(crate) fn any_active_surface_matching(
     active_surface_descriptors(app).any(predicate)
 }
 
+pub(crate) fn active_inline_decision_surface(app: &crate::TuiApp) -> Option<SurfaceKind> {
+    RENDER_ORDER.iter().copied().find(|kind| {
+        matches!(
+            kind,
+            SurfaceKind::PastePreview
+                | SurfaceKind::PasteTransform
+                | SurfaceKind::PendingApproval
+                | SurfaceKind::PendingMcpElicitation
+                | SurfaceKind::PendingUserInput
+                | SurfaceKind::PendingPlanChoice
+                | SurfaceKind::PendingFeedback
+        ) && kind.is_active(app)
+    })
+}
+
+impl SurfaceDescriptor {
+    pub(crate) fn blocks_keymap_actions(self) -> bool {
+        matches!(
+            self.kind,
+            SurfaceKind::PendingApproval
+                | SurfaceKind::PendingMcpElicitation
+                | SurfaceKind::PendingUserInput
+                | SurfaceKind::PendingPlanChoice
+                | SurfaceKind::PendingFeedback
+        )
+    }
+
+    pub(crate) fn blocks_composer_paste(self) -> bool {
+        matches!(
+            self.kind,
+            SurfaceKind::KeybindingEditor
+                | SurfaceKind::ThemeEditor
+                | SurfaceKind::WorkspaceProfile
+                | SurfaceKind::SessionCheckpoint
+                | SurfaceKind::TerminalProfile
+                | SurfaceKind::GestureSettings
+                | SurfaceKind::GlyphMode
+                | SurfaceKind::SmartSplit
+                | SurfaceKind::PendingApproval
+                | SurfaceKind::PendingMcpElicitation
+                | SurfaceKind::PendingUserInput
+                | SurfaceKind::PendingPlanChoice
+                | SurfaceKind::PendingFeedback
+                | SurfaceKind::PastePreview
+                | SurfaceKind::PasteTransform
+                | SurfaceKind::EditorHandoff
+        )
+    }
+
+    pub(crate) fn blocks_prompt_queue_drain(self) -> bool {
+        matches!(
+            self.kind,
+            SurfaceKind::ConfigScreen
+                | SurfaceKind::TranscriptOverlay
+                | SurfaceKind::SlashOverlay
+                | SurfaceKind::PendingApproval
+                | SurfaceKind::PendingMcpElicitation
+                | SurfaceKind::PendingUserInput
+                | SurfaceKind::PendingPlanChoice
+                | SurfaceKind::PendingFeedback
+                | SurfaceKind::PastePreview
+                | SurfaceKind::PasteTransform
+        )
+    }
+}
+
 impl SurfaceKind {
     fn is_active(self, app: &crate::TuiApp) -> bool {
         match self {
@@ -207,7 +273,7 @@ impl SurfaceKind {
             SurfaceKind::PendingApproval => app.pending_approval.is_some(),
             SurfaceKind::PendingMcpElicitation => app.pending_mcp_elicitation.is_some(),
             SurfaceKind::PendingUserInput => app.pending_request_user_input.is_some(),
-            SurfaceKind::PendingPlanChoice => app.pending_plan_choice.is_some(),
+            SurfaceKind::PendingPlanChoice => app.plan.pending_choice.is_some(),
             SurfaceKind::PendingFeedback => app.pending_feedback.is_some(),
         }
     }

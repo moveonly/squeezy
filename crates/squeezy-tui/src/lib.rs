@@ -109,6 +109,7 @@ mod editor_handoff;
 mod error_lens;
 mod events;
 mod export_destination;
+mod feedback_prompt;
 mod first_run_hints;
 mod focus_resize;
 mod fuzzy;
@@ -142,6 +143,7 @@ mod overlay;
 mod paste_preview;
 mod paste_transform;
 mod pinned_compare;
+mod plan_choice;
 mod presentation;
 mod prompt_history;
 mod prompt_queue;
@@ -185,6 +187,8 @@ mod terminal_guard;
 mod terminal_profile;
 mod terminal_restore;
 mod terminal_writer;
+#[cfg(test)]
+mod test_support;
 mod theme_editor;
 mod toast;
 mod tool_actions;
@@ -236,6 +240,7 @@ use input::{
 };
 
 use notification::DesktopNotifier;
+use plan_choice::{PLAN_CHOICES, PendingPlanChoice, PlanChoiceAction, PlanPauseState, PlanUiState};
 use render::palette::{self, blend_color};
 pub(crate) use terminal_guard::{DrawStatus, TerminalGuard};
 use toast::ToastQueue;
@@ -1560,19 +1565,19 @@ fn restore_cancelled_prompt(app: &mut TuiApp) -> bool {
 }
 
 async fn handle_plan_choice_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
-    let Some(mut pending) = app.pending_plan_choice.take() else {
+    let Some(mut pending) = app.plan.pending_choice.take() else {
         return false;
     };
     let len = PLAN_CHOICES.len();
     let activate_index = match key.code {
         KeyCode::Up => {
             pending.selection_index = pending.selection_index.saturating_sub(1);
-            app.pending_plan_choice = Some(pending);
+            app.plan.pending_choice = Some(pending);
             return true;
         }
         KeyCode::Down => {
             pending.selection_index = (pending.selection_index + 1).min(len - 1);
-            app.pending_plan_choice = Some(pending);
+            app.plan.pending_choice = Some(pending);
             return true;
         }
         KeyCode::Esc => {
@@ -1586,7 +1591,7 @@ async fn handle_plan_choice_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
             // Shift+Tab is the canonical mode toggle; let it fall through
             // so a user who pressed it while the prompt was open still
             // switches modes instead of being stuck.
-            app.pending_plan_choice = Some(pending);
+            app.plan.pending_choice = Some(pending);
             return false;
         }
         KeyCode::Enter => Some(pending.selection_index.min(len - 1)),
@@ -1599,7 +1604,7 @@ async fn handle_plan_choice_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
         _ => None,
     };
     let Some(idx) = activate_index else {
-        app.pending_plan_choice = Some(pending);
+        app.plan.pending_choice = Some(pending);
         return true;
     };
     apply_plan_choice(app, agent, &pending, idx).await;
@@ -1721,12 +1726,12 @@ async fn apply_plan_choice(
                         pending.plan_id,
                         compact_path(&removed)
                     ));
-                    if app.current_plan_id.as_deref() == Some(pending.plan_id.as_str()) {
-                        app.current_plan_id = None;
+                    if app.plan.current_id.as_deref() == Some(pending.plan_id.as_str()) {
+                        app.plan.current_id = None;
                     }
-                    if app.pending_plan_handoff.as_deref() == Some(pending.plan_path.as_path()) {
-                        app.pending_plan_handoff = None;
-                        app.plan_handoff_turns_seen = 0;
+                    if app.plan.pending_handoff.as_deref() == Some(pending.plan_path.as_path()) {
+                        app.plan.pending_handoff = None;
+                        app.plan.handoff_turns_seen = 0;
                     }
                 }
                 Err(err) => {
@@ -2990,7 +2995,7 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         dispatch_click_action(app, action);
         return true;
     }
-    if app.pending_plan_choice.is_some()
+    if app.plan.pending_choice.is_some()
         && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
         && let Some((
             interaction::TargetKey::Chrome(interaction::ChromeKey::PlanChoiceOption(_)),
@@ -8518,13 +8523,8 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         // wait so a wedged clipboard helper never freezes the event loop; a
         // timeout falls through to the same unavailable handling as no helper.
         if app.config_screen.is_none()
-            && app.theme_editor.is_none()
             && !app.scratchpad_open
-            && app.pending_approval.is_none()
-            && app.pending_mcp_elicitation.is_none()
-            && app.paste_preview.is_none()
-            && app.paste_transform.is_none()
-            && app.editor_handoff.is_none()
+            && !modal::any_active_surface_matching(app, |surface| surface.blocks_composer_paste())
         {
             let image = match app.clipboard.read_image() {
                 Some(image) => Some(image),
@@ -9718,16 +9718,10 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
         insert_input_text(app, &normalized);
         return Ok(());
     }
-    if app.pending_approval.is_some() || app.pending_mcp_elicitation.is_some() {
-        app.status = "paste unavailable while a modal prompt is open".to_string();
-        return Ok(());
-    }
-    // The paste/editor questions (§11G.6 preview, §12.6.4 transform,
-    // §12.6.5 editor handoff) are modal in behavior even though they render
-    // inline. A second paste while one is open must be rejected, not silently
-    // overwrite the pending text or leak into the composer beneath.
-    if app.paste_preview.is_some() || app.paste_transform.is_some() || app.editor_handoff.is_some()
-    {
+    // Descriptor-backed modal paste gate: pending prompts and inline
+    // paste/editor questions own the composer while active, so a second paste
+    // must not overwrite their pending text or leak underneath.
+    if modal::any_active_surface_matching(app, |surface| surface.blocks_composer_paste()) {
         app.status = "paste unavailable while a paste/editor question is open".to_string();
         return Ok(());
     }
@@ -10422,12 +10416,7 @@ fn dispatch_keymap_action_inner(
     // which run after this dispatch; each consumes raw key codes, not keymap
     // actions. Blocking every keymap action here keeps an overlay-opening chord
     // (e.g. ToggleSnippets) from firing on top of the modal.
-    if app.pending_request_user_input.is_some()
-        || app.pending_plan_choice.is_some()
-        || app.pending_approval.is_some()
-        || app.pending_mcp_elicitation.is_some()
-        || app.pending_feedback.is_some()
-    {
+    if modal::any_active_surface_matching(app, |surface| surface.blocks_keymap_actions()) {
         return false;
     }
     match action {
@@ -19476,7 +19465,7 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
             // not in scope on the click path. Arm it; the event loop drains it
             // where the agent is available (mirrors the command-palette / theme-
             // editor click path), so mouse and keyboard run the same handler.
-            if let Some(pending) = app.pending_plan_choice.as_mut() {
+            if let Some(pending) = app.plan.pending_choice.as_mut() {
                 pending.selection_index = index;
             }
             app.plan_choice_click_activate = true;
@@ -22794,10 +22783,10 @@ fn plans_delete(app: &mut TuiApp, sid: &str, plan_id: &str, flag: Option<&str>) 
         Ok(path) => {
             // Clear the in-memory active plan id if this was it; the
             // pointer file has already been cleaned by `delete_plan`.
-            if app.current_plan_id.as_deref() == Some(plan_id) {
-                app.current_plan_id = None;
-                app.pending_plan_handoff = None;
-                app.plan_handoff_turns_seen = 0;
+            if app.plan.current_id.as_deref() == Some(plan_id) {
+                app.plan.current_id = None;
+                app.plan.pending_handoff = None;
+                app.plan.handoff_turns_seen = 0;
             }
             app.status = format!("deleted plan {plan_id}");
             app.push_log(format!("plan {plan_id} deleted ({})", compact_path(&path)));
@@ -22809,7 +22798,7 @@ fn plans_delete(app: &mut TuiApp, sid: &str, plan_id: &str, flag: Option<&str>) 
 fn plans_set_active(app: &mut TuiApp, sid: &str, plan_id: &str) {
     match proposed_plan::set_active_plan(&app.workspace_root, sid, plan_id) {
         Ok(()) => {
-            app.current_plan_id = Some(plan_id.to_string());
+            app.plan.current_id = Some(plan_id.to_string());
             app.status = format!("active plan → {plan_id}");
             app.push_log(format!("set active plan: {plan_id}"));
         }
@@ -25371,17 +25360,8 @@ pub(crate) async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Age
 }
 
 fn prompt_queue_drain_blocked(app: &TuiApp) -> bool {
-    app.config_screen.is_some()
-        || app.status_line_setup.is_some()
-        || app.transcript_overlay.is_some()
-        || app.overlay.is_some()
-        || app.paste_preview.is_some()
-        || app.paste_transform.is_some()
-        || app.pending_approval.is_some()
-        || app.pending_mcp_elicitation.is_some()
-        || app.pending_request_user_input.is_some()
-        || app.pending_plan_choice.is_some()
-        || app.pending_feedback.is_some()
+    app.status_line_setup.is_some()
+        || modal::any_active_surface_matching(app, |surface| surface.blocks_prompt_queue_drain())
         || app.editing_queue_id.is_some()
 }
 
@@ -25547,8 +25527,8 @@ pub(crate) fn strip_plan_handoff_prefix(content: &str) -> Option<String> {
 }
 
 fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
-    let plan_path = app.pending_plan_handoff.clone()?;
-    if app.plan_handoff_turns_seen > 0 {
+    let plan_path = app.plan.pending_handoff.clone()?;
+    if app.plan.handoff_turns_seen > 0 {
         // Subsequent turns: lightweight marker.
         let marker = proposed_plan::BUILD_PLAN_STILL_IN_EFFECT_FORMAT
             .replace("{path}", &plan_path.display().to_string());
@@ -25560,12 +25540,12 @@ fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
     match proposed_plan::read_plan_body(&plan_path) {
         Ok(body) => {
             let trimmed = body.trim_end();
-            app.plan_handoff_turns_seen = app.plan_handoff_turns_seen.saturating_add(1);
+            app.plan.handoff_turns_seen = app.plan.handoff_turns_seen.saturating_add(1);
             // PR-G item 6: when this Plan→Build crossing is a resume
             // from a Shift+Tab pause, prefix the body with a short
             // marker so the model knows it's mid-execution and learns
             // whether the plan was refined during the pause window.
-            let resume_marker = app.plan_resume_marker.take().unwrap_or_default();
+            let resume_marker = app.plan.resume_marker.take().unwrap_or_default();
             Some(format!(
                 "{resume_marker}[plan from previous session — {path}]\n{trimmed}\n[end plan]\n\n",
                 path = plan_path.display(),
@@ -25576,8 +25556,8 @@ fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
                 "could not read plan file {} for Build handoff: {err}",
                 compact_path(&plan_path)
             ));
-            app.pending_plan_handoff = None;
-            app.plan_handoff_turns_seen = 0;
+            app.plan.pending_handoff = None;
+            app.plan.handoff_turns_seen = 0;
             None
         }
     }
@@ -25600,11 +25580,12 @@ fn switch_mode(
     let is_build_to_plan_pause = app.mode == SessionMode::Build
         && target == SessionMode::Plan
         && app.turn_rx.is_some()
-        && app.current_plan_id.is_some();
+        && app.plan.current_id.is_some();
     if is_build_to_plan_pause {
         request_turn_interrupt(app);
-        app.plan_pause = app
-            .current_plan_id
+        app.plan.pause = app
+            .plan
+            .current_id
             .clone()
             .map(|plan_id| PlanPauseState { plan_id });
         app.push_status("plan execution paused (Shift+Tab)".to_string());
@@ -25631,23 +25612,23 @@ fn switch_mode(
         app.status = format!("mode switched to {}", app.mode.as_str());
         // A mode switch supersedes any post-plan choice prompt — the
         // user's decision has been made by toggling the mode itself.
-        app.pending_plan_choice = None;
+        app.plan.pending_choice = None;
         match (previous, target) {
             (SessionMode::Plan, SessionMode::Build) => {
-                if let Some(plan_id) = app.current_plan_id.as_deref() {
+                if let Some(plan_id) = app.plan.current_id.as_deref() {
                     let sid = app.plan_session_id().to_string();
                     let plan_path =
                         proposed_plan::plan_file_for(&app.workspace_root, &sid, plan_id);
                     if plan_path.exists() {
-                        app.pending_plan_handoff = Some(plan_path.clone());
+                        app.plan.pending_handoff = Some(plan_path.clone());
                         // Fresh handoff: next Build turn gets the full plan
                         // body; turns 2+ get the lighter marker.
-                        app.plan_handoff_turns_seen = 0;
+                        app.plan.handoff_turns_seen = 0;
                         // Resume marker (PR-G item 6): if the previous
                         // Build→Plan was a pause, tell the model which
                         // plan id it resumes from and whether the body
                         // changed during the pause window.
-                        if let Some(pause) = app.plan_pause.take() {
+                        if let Some(pause) = app.plan.pause.take() {
                             let refined = pause.plan_id != plan_id;
                             let note = if refined {
                                 format!(
@@ -25657,7 +25638,7 @@ fn switch_mode(
                             } else {
                                 format!("[resuming from plan {plan_id} — plan unchanged]\n")
                             };
-                            app.plan_resume_marker = Some(note);
+                            app.plan.resume_marker = Some(note);
                         }
                         app.push_status(format!(
                             "plan attached for next Build turn: {}",
@@ -25671,8 +25652,8 @@ fn switch_mode(
                 // longer relevant once the user goes back to Plan; drop it
                 // so the next Build entry recomputes from the current
                 // plan file instead of attaching a stale path.
-                app.pending_plan_handoff = None;
-                app.plan_handoff_turns_seen = 0;
+                app.plan.pending_handoff = None;
+                app.plan.handoff_turns_seen = 0;
             }
             _ => {}
         }
@@ -26439,85 +26420,11 @@ fn mcp_elicitation_response_preview(input: &str) -> String {
 }
 
 fn format_plan_choice_menu_lines(pending: &PendingPlanChoice) -> Vec<Line<'static>> {
-    let selected = pending.selection_index.min(PLAN_CHOICES.len() - 1);
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            "Plan ready",
-            Style::default()
-                .fg(crate::render::theme::secondary())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" · {}", pending.plan_id),
-            Style::default().fg(crate::render::theme::quiet()),
-        ),
-    ])];
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            compact_path(&pending.plan_path),
-            Style::default().fg(palette::muted_fg()),
-        ),
-    ]));
-    for (idx, option) in PLAN_CHOICES.iter().enumerate() {
-        let is_selected = idx == selected;
-        let marker = if is_selected { "› " } else { "  " };
-        let label_style = if is_selected {
-            Style::default().fg(crate::render::theme::secondary())
-        } else {
-            Style::default().fg(palette::muted_fg())
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                marker,
-                Style::default().fg(if is_selected {
-                    crate::render::theme::secondary()
-                } else {
-                    crate::render::theme::quiet()
-                }),
-            ),
-            Span::styled(
-                format!("[{}] {}", option.shortcut, option.label),
-                label_style,
-            ),
-            Span::styled(
-                format!(" · {}", option.hint),
-                Style::default().fg(crate::render::theme::quiet()),
-            ),
-        ]));
-    }
-    lines
+    plan_choice::menu_lines(pending, compact_path(&pending.plan_path))
 }
 
 fn format_feedback_prompt_lines(feedback: &PreparedFeedback) -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![
-            Span::styled(
-                "Send feedback?",
-                Style::default()
-                    .fg(crate::render::theme::secondary())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" · {}", feedback.feedback_id),
-                Style::default().fg(crate::render::theme::quiet()),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                compact_text(&feedback.message, 160),
-                Style::default().fg(palette::muted_fg()),
-            ),
-        ]),
-        // Keybind hint — styled as a footer row (2-space indent, footer tier,
-        // no `›` cursor) so it reads as guidance, not a selectable option. The
-        // prior `› ` marker made this line look like a highlighted choice.
-        Line::from(Span::styled(
-            "  Enter/Y send · Esc/N discard",
-            Style::default().fg(crate::render::theme::footer()),
-        )),
-    ]
+    feedback_prompt::menu_lines(&feedback.feedback_id, compact_text(&feedback.message, 160))
 }
 
 /// Visual `a) `, `b) `, … label for the Nth multiple-choice option. Past the
@@ -34712,40 +34619,68 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
     // long verbose labels — see squeezy-xtvg / wave2-06 Anthropic run.
     // `visual_line_count` mirrors the wrap pass used for the transcript
     // and live regions and is safe (it rounds up per line, never down).
-    if let Some(pending) = app.pending_approval.as_ref() {
-        visual_line_count(
-            &approval_block_full(&pending.request, app.approval_selection_index, width),
-            width,
-        )
-    } else if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
-        visual_line_count(
-            &format_mcp_elicitation_menu_lines(
-                &pending.request,
-                app.mcp_elicitation_selection_index,
-                &pending.answer,
-            ),
-            width,
-        )
-    } else if let Some(pending) = app.pending_request_user_input.as_ref() {
-        visual_line_count(
-            &format_request_user_input_menu_lines(
-                &pending.request,
-                pending.selection_index,
-                &pending.answer,
-                pending.answer_cursor,
-            ),
-            width,
-        )
-    } else if let Some(pending) = app.pending_plan_choice.as_ref() {
-        visual_line_count(&format_plan_choice_menu_lines(pending), width)
-    } else if let Some(feedback) = app.pending_feedback.as_ref() {
-        visual_line_count(&format_feedback_prompt_lines(feedback), width)
-    } else if let Some(preview) = app.paste_preview.as_ref() {
-        visual_line_count(&paste_preview_inline_lines(preview, width), width)
-    } else if let Some(menu) = app.paste_transform.as_ref() {
-        visual_line_count(&paste_transform_inline_lines(menu), width)
-    } else {
-        0
+    match modal::active_inline_decision_surface(app) {
+        Some(modal::SurfaceKind::PendingApproval) => app
+            .pending_approval
+            .as_ref()
+            .map(|pending| {
+                visual_line_count(
+                    &approval_block_full(&pending.request, app.approval_selection_index, width),
+                    width,
+                )
+            })
+            .unwrap_or(0),
+        Some(modal::SurfaceKind::PendingMcpElicitation) => app
+            .pending_mcp_elicitation
+            .as_ref()
+            .map(|pending| {
+                visual_line_count(
+                    &format_mcp_elicitation_menu_lines(
+                        &pending.request,
+                        app.mcp_elicitation_selection_index,
+                        &pending.answer,
+                    ),
+                    width,
+                )
+            })
+            .unwrap_or(0),
+        Some(modal::SurfaceKind::PendingUserInput) => app
+            .pending_request_user_input
+            .as_ref()
+            .map(|pending| {
+                visual_line_count(
+                    &format_request_user_input_menu_lines(
+                        &pending.request,
+                        pending.selection_index,
+                        &pending.answer,
+                        pending.answer_cursor,
+                    ),
+                    width,
+                )
+            })
+            .unwrap_or(0),
+        Some(modal::SurfaceKind::PendingPlanChoice) => app
+            .plan
+            .pending_choice
+            .as_ref()
+            .map(|pending| visual_line_count(&format_plan_choice_menu_lines(pending), width))
+            .unwrap_or(0),
+        Some(modal::SurfaceKind::PendingFeedback) => app
+            .pending_feedback
+            .as_ref()
+            .map(|feedback| visual_line_count(&format_feedback_prompt_lines(feedback), width))
+            .unwrap_or(0),
+        Some(modal::SurfaceKind::PastePreview) => app
+            .paste_preview
+            .as_ref()
+            .map(|preview| visual_line_count(&paste_preview_inline_lines(preview, width), width))
+            .unwrap_or(0),
+        Some(modal::SurfaceKind::PasteTransform) => app
+            .paste_transform
+            .as_ref()
+            .map(|menu| visual_line_count(&paste_transform_inline_lines(menu), width))
+            .unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -34853,7 +34788,7 @@ fn render_approval(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                     )
                 },
             );
-        } else if app.pending_plan_choice.is_some() {
+        } else if app.plan.pending_choice.is_some() {
             // The plan choices are the trailing rows of the block.
             let count = PLAN_CHOICES.len();
             register_modal_option_targets(
@@ -34880,29 +34815,52 @@ fn render_approval(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
-    if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
-        format_mcp_elicitation_menu_lines(
-            &pending.request,
-            app.mcp_elicitation_selection_index,
-            &pending.answer,
-        )
-    } else if let Some(pending) = app.pending_request_user_input.as_ref() {
-        format_request_user_input_menu_lines(
-            &pending.request,
-            pending.selection_index,
-            &pending.answer,
-            pending.answer_cursor,
-        )
-    } else if let Some(pending) = app.pending_plan_choice.as_ref() {
-        format_plan_choice_menu_lines(pending)
-    } else if let Some(feedback) = app.pending_feedback.as_ref() {
-        format_feedback_prompt_lines(feedback)
-    } else if let Some(preview) = app.paste_preview.as_ref() {
-        paste_preview_inline_lines(preview, 80)
-    } else if let Some(menu) = app.paste_transform.as_ref() {
-        paste_transform_inline_lines(menu)
-    } else {
-        Vec::new()
+    match modal::active_inline_decision_surface(app) {
+        Some(modal::SurfaceKind::PendingMcpElicitation) => app
+            .pending_mcp_elicitation
+            .as_ref()
+            .map(|pending| {
+                format_mcp_elicitation_menu_lines(
+                    &pending.request,
+                    app.mcp_elicitation_selection_index,
+                    &pending.answer,
+                )
+            })
+            .unwrap_or_default(),
+        Some(modal::SurfaceKind::PendingUserInput) => app
+            .pending_request_user_input
+            .as_ref()
+            .map(|pending| {
+                format_request_user_input_menu_lines(
+                    &pending.request,
+                    pending.selection_index,
+                    &pending.answer,
+                    pending.answer_cursor,
+                )
+            })
+            .unwrap_or_default(),
+        Some(modal::SurfaceKind::PendingPlanChoice) => app
+            .plan
+            .pending_choice
+            .as_ref()
+            .map(format_plan_choice_menu_lines)
+            .unwrap_or_default(),
+        Some(modal::SurfaceKind::PendingFeedback) => app
+            .pending_feedback
+            .as_ref()
+            .map(format_feedback_prompt_lines)
+            .unwrap_or_default(),
+        Some(modal::SurfaceKind::PastePreview) => app
+            .paste_preview
+            .as_ref()
+            .map(|preview| paste_preview_inline_lines(preview, 80))
+            .unwrap_or_default(),
+        Some(modal::SurfaceKind::PasteTransform) => app
+            .paste_transform
+            .as_ref()
+            .map(paste_transform_inline_lines)
+            .unwrap_or_default(),
+        _ => Vec::new(),
     }
 }
 
@@ -45422,7 +45380,7 @@ fn compact_token_count(tokens: u64) -> String {
 
 fn mode_status_text(app: &TuiApp) -> String {
     let base = format!("{} mode (Shift+Tab to cycle)", title_case_mode(app.mode));
-    let Some(plan_id) = app.current_plan_id.as_deref() else {
+    let Some(plan_id) = app.plan.current_id.as_deref() else {
         return base;
     };
     // Truncate the hex tail so the status bar stays compact on narrow
@@ -46540,7 +46498,7 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         return String::new();
     } else if app.pending_feedback.is_some() {
         return "Enter/Y send feedback · Esc/N discard".to_string();
-    } else if app.pending_plan_choice.is_some() {
+    } else if app.plan.pending_choice.is_some() {
         // The per-option `[e]/[c]/[r]/[d]` tags document the shortcuts inline;
         // the status row teaches movement and the dismiss/mode-switch verbs the
         // panel itself doesn't show.
@@ -47654,38 +47612,11 @@ pub(crate) struct TuiApp {
     /// hands one back; in that window plan IO falls back to
     /// [`proposed_plan::FALLBACK_SESSION_ID`].
     pub(crate) session_id: Option<String>,
-    /// Plan id of the most recent `<proposed_plan>` block persisted under
-    /// `.squeezy/plans/`. Used by Build-mode handoff and refinement turns
-    /// to identify which plan file is active without scanning the dir.
-    pub(crate) current_plan_id: Option<String>,
-    /// Path to a plan file that should be re-attached to upcoming Build-mode
-    /// turns. Set when the user switches Plan→Build while a plan is active.
-    /// Cleared on Build→Plan switch, on plan discard, and on the first
-    /// successful apply_patch / write_file in Build mode (the plan is "in
-    /// motion" — re-attaching it from there is just noise).
-    pub(crate) pending_plan_handoff: Option<PathBuf>,
-    /// Number of Build-mode turns since the current `pending_plan_handoff`
-    /// was queued. Turn 0 receives the full plan body as a prefix; turns
-    /// 1+ receive a lighter `[plan still in effect — <path>]` marker so
-    /// the model is reminded the plan applies without re-paying the
-    /// body's tokens on every turn (issue 16).
-    pub(crate) plan_handoff_turns_seen: u32,
-    /// Interactive Execute/Refine/Discard/View prompt rendered right after a
-    /// `<proposed_plan>` block lands. Set once on persist; cleared by an
-    /// explicit user choice. Blocks other input while present.
-    pub(crate) pending_plan_choice: Option<PendingPlanChoice>,
-    /// Pause/resume state for Build-mode plan execution (PR-G item 6).
-    /// Set when the user presses Shift+Tab while a Build turn is in
-    /// flight and an active plan exists: the turn is cancelled, the
-    /// captured plan id rides through Plan-mode, and the next Plan→
-    /// Build crossing surfaces a resume marker telling the model
-    /// whether the plan was refined while paused.
-    pub(crate) plan_pause: Option<PlanPauseState>,
-    /// One-shot resume marker queued during a Plan→Build crossing that
-    /// resumes from a pause. Consumed by [`take_pending_plan_prefix`]
-    /// on the first Build turn after the crossing so the marker rides
-    /// alongside the plan body.
-    pub(crate) plan_resume_marker: Option<String>,
+    /// Plan-mode UI/runtime cluster: active plan id, Build-mode handoff,
+    /// post-plan choice prompt, and pause/resume markers. Kept together so
+    /// plan surfaces own their state instead of scattering adjacent fields
+    /// across the app struct.
+    pub(crate) plan: PlanUiState,
     pub(crate) task_state: Option<TaskStateSnapshot>,
     pub(crate) mcp_status: Option<McpStatusSnapshot>,
     pub(crate) task_panel_collapsed: bool,
@@ -49142,12 +49073,7 @@ impl TuiApp {
             proposed_plan: proposed_plan::ProposedPlanExtractor::new(),
             workspace_root: config.workspace_root.clone(),
             session_id: None,
-            current_plan_id: None,
-            pending_plan_handoff: None,
-            plan_handoff_turns_seen: 0,
-            pending_plan_choice: None,
-            plan_pause: None,
-            plan_resume_marker: None,
+            plan: PlanUiState::default(),
             task_state: None,
             mcp_status: None,
             task_panel_collapsed: false,
@@ -50825,67 +50751,6 @@ pub(crate) struct PendingRequestUserInput {
     /// Byte cursor into `answer`.
     pub(crate) answer_cursor: usize,
 }
-
-/// Interactive prompt that appears after a `<proposed_plan>` block lands
-/// and persists. Lets the user execute, refine, discard, or view the
-/// plan file without typing a slash command.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingPlanChoice {
-    pub(crate) plan_id: String,
-    pub(crate) plan_path: PathBuf,
-    pub(crate) selection_index: usize,
-}
-
-/// Captured plan-execution state at the moment of a Shift+Tab pause
-/// (PR-G item 6). `plan_id` is compared against `current_plan_id` on
-/// the next Plan→Build crossing so the resume marker can tell the
-/// model whether the plan body was refined while paused.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PlanPauseState {
-    plan_id: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PlanChoiceAction {
-    Execute,
-    ExecuteClean,
-    Refine,
-    Discard,
-}
-
-struct PlanChoiceOption {
-    action: PlanChoiceAction,
-    label: &'static str,
-    hint: &'static str,
-    shortcut: char,
-}
-
-const PLAN_CHOICES: &[PlanChoiceOption] = &[
-    PlanChoiceOption {
-        action: PlanChoiceAction::Execute,
-        label: "Execute",
-        hint: "switch to Build; keep history; run the plan",
-        shortcut: 'e',
-    },
-    PlanChoiceOption {
-        action: PlanChoiceAction::ExecuteClean,
-        label: "Execute (clean)",
-        hint: "compact prior chat to a summary, then run the plan",
-        shortcut: 'c',
-    },
-    PlanChoiceOption {
-        action: PlanChoiceAction::Refine,
-        label: "Refine",
-        hint: "stay in Plan; describe what to change",
-        shortcut: 'r',
-    },
-    PlanChoiceOption {
-        action: PlanChoiceAction::Discard,
-        label: "Discard",
-        hint: "delete the plan file and dismiss this prompt",
-        shortcut: 'd',
-    },
-];
 
 pub(crate) fn exit_hint(session_id: Option<&str>) -> Option<String> {
     session_id.map(|session_id| {

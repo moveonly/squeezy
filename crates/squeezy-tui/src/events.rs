@@ -99,7 +99,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         // refinement of the active plan, not a first-
                         // time draft. Captured for the styled card /
                         // diff renderer (PR-F).
-                        let parent_plan_id = app.current_plan_id.clone();
+                        let parent_plan_id = app.plan.current_id.clone();
                         let meta = proposed_plan::PlanMeta {
                             parent_plan_id: parent_plan_id.clone(),
                             model: Some(app.model.clone()),
@@ -111,13 +111,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                             &meta,
                         ) {
                             Ok((plan_id, path)) => {
-                                app.current_plan_id = Some(plan_id.clone());
+                                app.plan.current_id = Some(plan_id.clone());
                                 app.push_plan_card(render::plan_card::PlanCardData {
                                     plan_id: plan_id.clone(),
                                     path: path.clone(),
                                     parent_plan_id,
                                 });
-                                app.pending_plan_choice = Some(PendingPlanChoice {
+                                app.plan.pending_choice = Some(PendingPlanChoice {
                                     plan_id,
                                     plan_path: path,
                                     selection_index: 0,
@@ -162,9 +162,9 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         // means the plan is "in motion" — re-attaching it
                         // on later Build turns is just noise. Clear the
                         // handoff so the marker stops firing (issue 16).
-                        if app.mode == SessionMode::Build && app.pending_plan_handoff.is_some() {
-                            app.pending_plan_handoff = None;
-                            app.plan_handoff_turns_seen = 0;
+                        if app.mode == SessionMode::Build && app.plan.pending_handoff.is_some() {
+                            app.plan.pending_handoff = None;
+                            app.plan.handoff_turns_seen = 0;
                             app.push_status("plan handoff cleared: plan is in motion".to_string());
                         }
                         // Plan-mode in-place refinement (issue 2): the model
@@ -174,7 +174,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         // body without having to wait for another
                         // <proposed_plan> emission.
                         if app.mode == SessionMode::Plan
-                            && let Some(plan_id) = app.current_plan_id.clone()
+                            && let Some(plan_id) = app.plan.current_id.clone()
                         {
                             let sid = app.plan_session_id().to_string();
                             let plan_path =
@@ -183,7 +183,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                                 app.push_log(format!(
                                     "plan {plan_id} refined in place (apply_patch)"
                                 ));
-                                app.pending_plan_choice = Some(PendingPlanChoice {
+                                app.plan.pending_choice = Some(PendingPlanChoice {
                                     plan_id,
                                     plan_path,
                                     selection_index: 0,

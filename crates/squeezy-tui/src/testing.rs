@@ -560,7 +560,7 @@ impl TuiHarness {
         if self.app.prompt_queue_overlay.is_some() {
             return Some("prompt_queue");
         }
-        if self.app.pending_plan_choice.is_some() {
+        if self.app.plan.pending_choice.is_some() {
             return Some("plan_choice");
         }
         if self.app.pending_feedback.is_some() {

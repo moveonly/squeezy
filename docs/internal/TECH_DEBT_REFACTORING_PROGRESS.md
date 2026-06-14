@@ -13,7 +13,7 @@ action incomplete. `Open` means no current-branch coverage found.
 
 | Status | Owner slice | Action | Evidence | PR/commit |
 | --- | --- | --- | --- | --- |
-| Open | TUI | Split the TUI monolith into owned surface, state, input, and render modules. | No modal registry, render split, or `TuiApp` state grouping in current branch. | TBD |
+| Done | TUI | Split the TUI monolith into owned surface, state, input, and render modules. | Extended the modal descriptor routing, moved plan-choice/feedback rendering and command-hyperlink tests to owner modules, and grouped plan runtime fields under `PlanUiState`. | `techdebt-tui-wave2` |
 | Open | Agent/store | Split the agent turn runtime into request, stream, tool-round, and terminal phases. | Current branch centralizes compaction decisions only; `TurnRuntime::run` remains unsplit. | TBD |
 | Partial | Core/CLI/config | Centralize config metadata and path resolution. | Added core `ConfigInitScope`, `ConfigInitTarget`, and `config_init_target`; schema/template unification remains open. | `df298934`, `9c777a5b` |
 | Partial | Tools/shell/MCP | Introduce first-party tool descriptors. | Added `FirstPartyToolExecutor` dispatch guardrail, but not a full `ToolDescriptor` catalog with specs, permissions, prepare hooks, and executors. | `b0fdfc27`, `4788440c` |
@@ -23,11 +23,11 @@ action incomplete. `Open` means no current-branch coverage found.
 
 | Status | Owner slice | Action | Evidence | PR/commit |
 | --- | --- | --- | --- | --- |
-| Open | TUI | Extract a modal surface registry. | No descriptor-based `is_open` / `handle_key` / `render` registry added. | TBD |
-| Open | TUI | Split render functions by surface. | Surface render helpers remain in `crates/squeezy-tui/src/lib.rs`. | TBD |
-| Open | TUI | Break `TuiApp` into nested state groups. | No `ComposerState`, `TranscriptViewState`, `OverlayState`, `NavigationState`, or `PromptQueueState` extraction. | TBD |
-| Open | TUI | Move shared test helpers out of the bottom of `lib_tests.rs`. | Current branch adjusts render tests but does not create TUI test support. | TBD |
-| Open | TUI | Split `lib_tests.rs` by feature owner. | No paired TUI `*_tests.rs` migration in current branch. | TBD |
+| Done | TUI | Extract a modal surface registry. | `modal::SurfaceDescriptor` now backs keymap, paste, prompt-queue drain, and inline decision render routing, including pending plan choice and feedback. | `techdebt-tui-wave2` |
+| Done | TUI | Split render functions by surface. | Moved plan-choice line rendering to `plan_choice.rs` and feedback prompt line rendering to `feedback_prompt.rs`; inline decision selection now routes through `modal::active_inline_decision_surface`. | `techdebt-tui-wave2` |
+| Done | TUI | Break `TuiApp` into nested state groups. | Added `plan_choice::PlanUiState` and migrated active plan id, pending choice, Build handoff, pause, and resume marker fields under `TuiApp::plan`. | `techdebt-tui-wave2` |
+| Done | TUI | Move shared test helpers out of the bottom of `lib_tests.rs`. | Added `crates/squeezy-tui/src/test_support.rs` for shared app/config/agent/temp workspace/render/clipboard helpers and removed the duplicate helper block from `lib_tests.rs`. | `techdebt-tui-wave2` |
+| Done | TUI | Split `lib_tests.rs` by feature owner. | Moved actionable command-hyperlink tests into the existing `crates/squeezy-tui/src/help_links_tests.rs` owner. | `techdebt-tui-wave2` |
 | Open | Agent/store | Split `TurnRuntime::run` into phases. | No turn phase modules added. | TBD |
 | Open | Agent/store | Centralize session persistence through a commit/snapshot type. | No `ConversationCommit` or `SessionPersistenceSnapshot` introduced. | TBD |
 | Open | Agent/store | Extract bootstrap services from `Agent`. | Agent construction/service wiring remains in `crates/squeezy-agent/src/lib.rs`. | TBD |
