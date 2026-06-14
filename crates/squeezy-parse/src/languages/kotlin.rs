@@ -214,7 +214,13 @@ pub(crate) fn visit_kotlin_node(
             visit_kotlin_children(node, ctx, parent_symbol, owner_symbol);
         }
         "annotation" => {
-            extract_kotlin_annotation_reference(node, ctx, owner_symbol);
+            extract_kotlin_annotation_reference(node, ctx, owner_symbol.clone());
+            // kotlin spec §5: recurse into the annotation's *argument*
+            // expressions so calls/refs inside `@Cfg(value = compute())` are
+            // captured. We deliberately walk only the `value_arguments` (not
+            // the annotation type's `constructor_invocation` itself), so the
+            // annotation class is not mistaken for an instantiated call.
+            visit_kotlin_annotation_arguments(node, ctx, parent_symbol, owner_symbol);
         }
         "property_delegate" => {
             // kotlin spec §4g: bind the delegate target to the enclosing
@@ -248,6 +254,30 @@ pub(crate) fn visit_kotlin_children(
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         visit_kotlin_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
+    }
+}
+
+/// kotlin spec §5: walk an `annotation` node's argument expressions so calls
+/// and references inside annotation arguments are captured. The annotation's
+/// name is already emitted by `extract_kotlin_annotation_reference`, and the
+/// annotation-type `constructor_invocation` is intentionally NOT re-walked as
+/// a call (an annotation use is not a constructor call), so we descend only
+/// into the `value_arguments` of each `_unescaped_annotation`.
+fn visit_kotlin_annotation_arguments(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<(SymbolId, SymbolKind)>,
+    owner_symbol: Option<SymbolId>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        // `@[A B]` multi-annotation and the single `@A(...)` form both nest a
+        // `constructor_invocation` whose `value_arguments` hold the arguments.
+        if child.kind() == "constructor_invocation"
+            && let Some(args) = kotlin_first_child_of_kind(child, "value_arguments")
+        {
+            visit_kotlin_children(args, ctx, parent_symbol.clone(), owner_symbol.clone());
+        }
     }
 }
 
