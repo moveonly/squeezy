@@ -303,6 +303,11 @@ fn swift_symbol_from_node(
         "deinit_declaration" => (SymbolKind::Method, "deinit".to_string()),
         "subscript_declaration" => (SymbolKind::Method, "subscript".to_string()),
         "typealias_declaration" => (SymbolKind::TypeAlias, "typealias".to_string()),
+        // A protocol's `associatedtype Foo: Bar` is the one protocol-member
+        // kind that was previously unmatched. Model it as a TypeAlias so
+        // decl/definition search can find it; its `must_inherit` / `where`
+        // constraints surface as `iface:` attributes below.
+        "associatedtype_declaration" => (SymbolKind::TypeAlias, "associatedtype".to_string()),
         "enum_entry" => return None, // handled separately, multiple symbols per node
         _ => return None,
     };
@@ -348,6 +353,16 @@ fn swift_symbol_from_node(
         let (bases, ifaces) = swift_categorized_inheritance(node, &decl_kind_text, ctx.source);
         attributes.extend(bases.into_iter().map(|base| format!("base:{base}")));
         attributes.extend(ifaces.into_iter().map(|iface| format!("iface:{iface}")));
+    }
+    if node.kind() == "associatedtype_declaration" {
+        // `associatedtype Foo: Bar` and `associatedtype Foo where Bar: X`
+        // constrain the associated type to conform to a protocol — record it
+        // like a conformance so the constraint survives decl/definition search.
+        attributes.extend(
+            swift_associatedtype_constraints(node, ctx.source)
+                .into_iter()
+                .map(|c| format!("iface:{c}")),
+        );
     }
     if matches!(
         kind,
@@ -683,6 +698,27 @@ fn swift_callable_generic_constraints(node: Node<'_>, source: &str) -> Vec<Strin
     out
 }
 
+/// Collect the protocol constraints on an `associatedtype` declaration: the
+/// `must_inherit` field (`associatedtype Foo: Bar`) plus any `where`-clause
+/// constraints carried in a `type_constraints` child.
+fn swift_associatedtype_constraints(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(must_inherit) = node.child_by_field_name("must_inherit")
+        && let Ok(text) = node_text(must_inherit, source)
+    {
+        // A `must_inherit` can be a `protocol_composition_type` (`A & B`); keep
+        // each leaf as its own conformance attribute.
+        for part in text.split('&') {
+            let leaf = swift_type_leaf_name(part);
+            if !leaf.is_empty() {
+                out.push(leaf);
+            }
+        }
+    }
+    out.extend(swift_callable_generic_constraints(node, source));
+    out
+}
+
 fn swift_type_leaf_name(raw: &str) -> String {
     // Trim generic specialisation, optional markers, and namespace prefixes.
     // e.g. `Foundation.Decoder` → `Decoder`, `Array<Element>` → `Array`.
@@ -969,6 +1005,7 @@ fn swift_node_is_declaration_name(node: Node<'_>) -> bool {
                     | "init_declaration"
                     | "subscript_declaration"
                     | "typealias_declaration"
+                    | "associatedtype_declaration"
                     | "property_declaration"
                     | "protocol_property_declaration"
                     | "enum_entry"
