@@ -1038,6 +1038,27 @@ fn extract_csharp_field_symbols(
     if node.kind() == "event_field_declaration" {
         base_attributes.push("csharp:event".to_string());
     }
+    // A `const` field is a compile-time constant, not mutable storage; mint it
+    // as `SymbolKind::Const` so `decl_search kind=const` finds it and the
+    // member can be distinguished from a mutable field. `readonly`/`volatile`
+    // stay `Field` but carry their own flag so callers can filter on them.
+    // (Events never carry these modifiers.)
+    let is_const = node.kind() != "event_field_declaration"
+        && modifiers.iter().any(|modifier| modifier == "const");
+    let field_kind = if is_const {
+        SymbolKind::Const
+    } else {
+        SymbolKind::Field
+    };
+    if is_const {
+        base_attributes.push("csharp:const".to_string());
+    }
+    if modifiers.iter().any(|modifier| modifier == "readonly") {
+        base_attributes.push("csharp:readonly".to_string());
+    }
+    if modifiers.iter().any(|modifier| modifier == "volatile") {
+        base_attributes.push("csharp:volatile".to_string());
+    }
     let mut cursor = node.walk();
     let mut declarations = Vec::new();
     for child in node.named_children(&mut cursor) {
@@ -1078,11 +1099,11 @@ fn extract_csharp_field_symbols(
                 ctx.source,
             );
             ctx.symbols.push(ParsedSymbol {
-                id: symbol_id(&ctx.file, Some(parent_id), SymbolKind::Field, &name, span),
+                id: symbol_id(&ctx.file, Some(parent_id), field_kind, &name, span),
                 file_id: ctx.file.id.clone(),
                 parent_id: Some(parent_id.clone()),
                 name: name.clone(),
-                kind: SymbolKind::Field,
+                kind: field_kind,
                 language_identity: csharp_field_language_identity(node, &name, scope),
                 span,
                 body_span: None,
