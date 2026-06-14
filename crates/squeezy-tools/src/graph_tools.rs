@@ -3573,10 +3573,10 @@ impl ToolRegistry {
         let mut overflowed = traversal.overflowed;
         packets.extend(traversal.packets);
         if packets.len() < max_results {
+            // Use the per-source edge index instead of scanning every edge in
+            // the graph; the kind filter stays the same.
             let outgoing = graph
-                .edges()
-                .iter()
-                .filter(|edge| edge.from == symbol.id)
+                .outgoing_edges(&symbol.id)
                 .filter(|edge| {
                     matches!(
                         edge.kind,
