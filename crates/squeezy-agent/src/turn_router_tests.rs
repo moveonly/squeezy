@@ -39,6 +39,8 @@ fn default_routing_config() -> RoutingConfig {
         extra_heuristic_verbs: Vec::new(),
         linux_sandbox_sensitive_parent:
             squeezy_core::DEFAULT_ROUTING_LINUX_SANDBOX_SENSITIVE_PARENT,
+        cache_isolation: squeezy_core::DEFAULT_ROUTING_CACHE_ISOLATION,
+        auto_prefix_token_threshold: squeezy_core::DEFAULT_ROUTING_AUTO_PREFIX_TOKEN_THRESHOLD,
     }
 }
 
@@ -1000,4 +1002,39 @@ fn linux_sandbox_sensitive_does_not_match_unrelated_prompts() {
     assert!(!super::is_linux_sandbox_sensitive("checkout main branch"));
     assert!(!super::is_linux_sandbox_sensitive("grep TODO src/"));
     assert!(!super::is_linux_sandbox_sensitive("format the code"));
+}
+
+// -- Cache-isolation gate ---------------------------------------------------
+
+#[test]
+fn should_isolate_truth_table() {
+    use squeezy_core::CacheIsolation;
+    let mut cfg = default_routing_config();
+
+    cfg.cache_isolation = CacheIsolation::Switch;
+    assert!(
+        !super::should_isolate(&cfg, 1_000_000, true),
+        "switch never isolates"
+    );
+
+    cfg.cache_isolation = CacheIsolation::Subagent;
+    assert!(
+        super::should_isolate(&cfg, 0, false),
+        "subagent always isolates"
+    );
+
+    cfg.cache_isolation = CacheIsolation::Auto;
+    cfg.auto_prefix_token_threshold = 8_000;
+    assert!(
+        !super::should_isolate(&cfg, 8_000, true),
+        "auto: at threshold is not over it"
+    );
+    assert!(
+        super::should_isolate(&cfg, 8_001, true),
+        "auto: over threshold with caching isolates"
+    );
+    assert!(
+        !super::should_isolate(&cfg, 1_000_000, false),
+        "auto: no caching support → no isolation"
+    );
 }

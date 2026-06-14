@@ -7565,6 +7565,36 @@ impl TurnRuntime {
                     .await;
             }
         }
+        // Cache isolation: rather than switch the main loop to the cheap model
+        // (which cold-rewrites the parent's prompt cache on any later
+        // escalation), run the scoped cheap work in a subagent on its own cache
+        // namespace while the main loop stays pinned to the parent. Engaged per
+        // `[routing].cache_isolation` (default Auto: only when the prefix is
+        // large enough to pay for it). On success the subagent's summary is the
+        // answer and the turn finishes here; otherwise we fall through to the
+        // normal in-loop cheap turn.
+        if on_cheap_turn {
+            let caching_supported = capabilities_for(self.provider.name(), &parent_model_str)
+                .is_some_and(|caps| caps.prompt_caching);
+            let prefix_tokens = estimate_context(&conversation).estimated_tokens;
+            if turn_router::should_isolate(&self.config.routing, prefix_tokens, caching_supported)
+                && self
+                    .run_isolated_cheap_turn(
+                        &task_title,
+                        &current_model,
+                        &parent_model_str,
+                        &mut conversation,
+                        &mut broker,
+                        &total_cost,
+                        user_transcript.clone(),
+                        context_compaction.clone(),
+                    )
+                    .await
+                    .is_some()
+            {
+                return Ok(());
+            }
+        }
         let mut escalation_state = turn_router::EscalationState::default();
         let mut cheap_provider_error_retry_used = false;
         let mut context_overflow_retry_used = false;
@@ -9471,6 +9501,147 @@ impl TurnRuntime {
     /// terminal-state site in the main turn loop so the event the
     /// user sees, the cumulative session counter, and the telemetry
     /// stream agree on the savings figure.
+    /// Run a cheap-routed turn's work in a scoped subagent (cache isolation): the
+    /// main loop never switches off the parent model, so the parent's prompt
+    /// cache stays warm and a later escalation never triggers a cold full-prefix
+    /// rewrite. The subagent runs the cheap model end-to-end — it can edit/run
+    /// (see `SubagentKind::is_write_capable`) and its approvals reach the user —
+    /// and its summary becomes the turn's answer. Returns `Some(())` when the
+    /// turn was completed here; `None` to fall through to the normal in-loop
+    /// cheap turn (e.g. the subagent produced nothing usable). The subagent's
+    /// spend is accounted to the subagent cost slot either way.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_isolated_cheap_turn(
+        &self,
+        task_title: &str,
+        cheap_model: &str,
+        parent_model_str: &str,
+        conversation: &mut Vec<LlmInputItem>,
+        broker: &mut CostBroker,
+        total_cost: &CostSnapshot,
+        user_transcript: TranscriptItem,
+        context_compaction: ContextCompactionState,
+    ) -> Option<()> {
+        let exploration_state = Arc::new(Mutex::new(ExplorationTurnState::from_plan(None)));
+        let ctx = ToolExecutionContext {
+            turn_id: self.turn_id,
+            origin: ToolOrigin::Model,
+            provider: self.provider.clone(),
+            tools: &self.tools,
+            jobs: &self.jobs,
+            config: &self.config,
+            telemetry: self.telemetry.clone(),
+            redactor: self.redactor.clone(),
+            tx: self.tx.clone(),
+            cancel: self.cancel.clone(),
+            approval_ids: self.approval_ids.clone(),
+            session_rules: self.session_rules.clone(),
+            ai_reviewer_state: self.ai_reviewer_state.clone(),
+            session_mode: self.session_mode.clone(),
+            session_log: self.session_log.clone(),
+            conversation_state: Some(self.conversation_state.clone()),
+            task_state: self.task_state.clone(),
+            all_tool_specs: &self.all_tool_specs,
+            loaded_tool_schemas: self.loaded_tool_schemas.clone(),
+            exploration_state,
+            subagents: self.subagents.clone(),
+            hooks: self.hooks.clone(),
+        };
+        let request = SubagentRequest {
+            prompt: task_title.to_string(),
+            scope: None,
+            thoroughness: None,
+            system_override: None,
+        };
+        let execution = run_subagent(&ctx, SubagentKind::Routed, request, None).await;
+
+        // The subagent ran and billed: account its spend to the subagent slot
+        // regardless of outcome (its model differs from the parent's).
+        broker
+            .metrics
+            .merge_subagent_tool_metrics(&execution.metrics);
+        record_subagent_kind_execution(
+            &mut broker.metrics,
+            SubagentKind::Routed,
+            &execution.metrics,
+        );
+        broker.metrics.model_ledger.record(
+            self.provider.name(),
+            &execution.model,
+            CostOrigin::Subagent,
+            &execution.metrics.provider,
+        );
+
+        if execution.status != ToolStatus::Success || execution.summary.trim().is_empty() {
+            self.log_event(
+                "routing_isolation_fallthrough",
+                Some(self.turn_id),
+                Some(format!(
+                    "routed subagent on {cheap_model} did not complete; running the cheap turn in-loop"
+                )),
+                json!({ "model": cheap_model, "status": execution.status_label }),
+            );
+            return None;
+        }
+
+        // Success: the subagent's summary is the turn's answer. The main loop
+        // never ran the parent model, so its prompt cache is untouched.
+        broker.metrics.routed_to_cheap = true;
+        broker.metrics.routed_to_subagent = true;
+        broker.metrics.routing_cheap_main_provider = execution.metrics.provider.clone();
+        self.stamp_routing_savings(&mut broker.metrics);
+
+        let summary = execution.summary;
+        conversation.push(redact_input_item(
+            LlmInputItem::AssistantText(summary.clone()),
+            &self.redactor,
+        ));
+        let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(&summary));
+
+        self.telemetry
+            .spawn(TelemetryEvent::routing_routed("routed_subagent"));
+        let _ = self
+            .tx
+            .send(AgentEvent::TurnRouted {
+                turn_id: self.turn_id,
+                from: parent_model_str.to_string(),
+                to: cheap_model.to_string(),
+                reason: "routed_subagent".to_string(),
+            })
+            .await;
+
+        self.publish_terminal_task_state(TaskStateStatus::Completed, None, task_title)
+            .await;
+        self.persist_turn_state(TurnPersistInput {
+            conversation: conversation.as_slice(),
+            response_id: None,
+            user: user_transcript,
+            assistant: message.clone(),
+            cost: total_cost,
+            metrics: &broker.metrics,
+            context_compaction,
+            token_calibration: broker.calibration.clone(),
+        })
+        .await;
+        let context_estimate = estimate_context(conversation);
+        let _ = self
+            .tx
+            .send(AgentEvent::Completed {
+                turn_id: self.turn_id,
+                message,
+                response_id: None,
+                cost: total_cost.clone(),
+                metrics: broker.metrics.clone(),
+                context_estimate,
+                stop_reason: Some(StopReason::EndTurn),
+                reasoning_only_stop: false,
+                session_cost: Some(broker.session_cost_snapshot()),
+            })
+            .await;
+        self.finish_turn(&broker.metrics).await;
+        Some(())
+    }
+
     fn stamp_routing_savings(&self, metrics: &mut TurnMetrics) {
         if !metrics.routed_to_cheap {
             return;
@@ -10094,6 +10265,12 @@ enum SubagentKind {
     /// learns to map onto this kind.
     #[allow(dead_code)]
     Skill,
+    /// Router-initiated cache-isolation worker: runs a cheap-routed turn's work
+    /// end-to-end on the cheap model in its own cache namespace, so the main
+    /// loop stays pinned to the parent model and the parent's prompt cache is
+    /// never cold-rewritten. Write-capable (it does the actual work) and spawned
+    /// directly by the turn loop, not by a model tool call.
+    Routed,
 }
 
 impl SubagentKind {
@@ -10105,6 +10282,7 @@ impl SubagentKind {
             Self::Plan => "plan",
             Self::Review => "review",
             Self::Skill => "skill",
+            Self::Routed => "routed",
         }
     }
 
@@ -10124,18 +10302,21 @@ impl SubagentKind {
             // skill body as their system prompt; they have no role
             // overlay.
             Self::Skill => None,
+            // Routed runs the parent's task as-is on the cheap model; no overlay.
+            Self::Routed => None,
         }
     }
 
     /// Whether this is a general-purpose worker that should be able to EDIT and
     /// RUN (write/shell), not just read. `Delegate` is the broad worker the main
-    /// model spawns to do scoped work end-to-end, so it gets the parent's full
-    /// toolset (minus subagent-spawn/control tools) and runs in the parent's
-    /// session mode rather than the read-only + forced-Plan sandbox. The
-    /// role-scoped kinds (Explorer/Planner/Reviewer) and DocHelp stay read-only
-    /// — a reviewer or planner shouldn't be mutating the tree.
+    /// model spawns to do scoped work end-to-end, and `Routed` runs a cheap turn
+    /// end-to-end for cache isolation — both get the parent's full toolset (minus
+    /// subagent-spawn/control tools) and run in the parent's session mode rather
+    /// than the read-only + forced-Plan sandbox. The role-scoped kinds
+    /// (Explorer/Planner/Reviewer) and DocHelp stay read-only — a reviewer or
+    /// planner shouldn't be mutating the tree.
     fn is_write_capable(self) -> bool {
-        matches!(self, Self::Delegate)
+        matches!(self, Self::Delegate | Self::Routed)
     }
 }
 
@@ -11192,7 +11373,10 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
         SubagentKind::Delegate
         | SubagentKind::Explore
         | SubagentKind::DocHelp
-        | SubagentKind::Skill => call
+        | SubagentKind::Skill
+        // Routed is spawned directly by the turn loop, never parsed from a tool
+        // call, but the match must stay exhaustive.
+        | SubagentKind::Routed => call
             .arguments
             .get("prompt")
             .and_then(Value::as_str)
@@ -12749,6 +12933,9 @@ fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> Strin
         SubagentKind::Skill => request.system_override.clone().unwrap_or_else(|| {
             "You are a Squeezy fork-mode skill subagent invoked without an explicit instruction body. Treat the user prompt as the entire task and return a concise summary for the parent agent. Do not modify files or run shell commands.".to_string()
         }),
+        SubagentKind::Routed => {
+            "You are Squeezy running this turn on a fast, cost-efficient model. Carry out the user's request fully using your tools — read, edit files, and run commands as needed (edits/commands prompt for approval where the user's policy requires it). When you are done, give the user a clear, direct answer to what they asked, exactly as the main assistant would; do not describe yourself as a subagent or dump raw tool output. If the task turns out to need deeper architectural reasoning than you can do well, say so plainly.".to_string()
+        }
     }
 }
 
@@ -12779,6 +12966,10 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
         // hold — falling to a cheap tier here would change behavior
         // silently for any skill that relies on planner-grade output.
         (SubagentKind::Skill, _) => parent_model,
+        // Cache-isolation worker runs the cheap tier (that's the whole point —
+        // do the cheap work off the parent's cache); fall back to parent only
+        // when no cheap tier exists.
+        (SubagentKind::Routed, _) => cheap_model_for(provider, config).unwrap_or(parent_model),
         (_, RoleModelPolicy::Parent) => parent_model,
         (_, RoleModelPolicy::Cheap) => cheap_model_for(provider, config).unwrap_or(parent_model),
     }
@@ -12882,7 +13073,11 @@ fn subagent_allowed_tools(
             .collect();
     }
     let names: BTreeSet<&str> = match kind {
-        SubagentKind::Delegate => DELEGATE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
+        // Delegate/Routed are write-capable and returned above; these arms are
+        // unreachable but keep the match exhaustive.
+        SubagentKind::Delegate | SubagentKind::Routed => {
+            DELEGATE_SUBAGENT_TOOL_NAMES.iter().copied().collect()
+        }
         SubagentKind::Explore => EXPLORE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
         SubagentKind::DocHelp => DOC_HELP_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
         // Skill subagents reuse the Delegate read-only research toolset
