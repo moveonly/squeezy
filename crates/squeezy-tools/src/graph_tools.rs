@@ -14,6 +14,7 @@ use squeezy_core::{
 use squeezy_graph::{
     CallEdgeHit, CargoDiagnosticHit, CargoFactFreshness, CargoFactsSummary, DirtyAnnotation,
     DirtyRange, GraphEdge, GraphManager, GraphSymbol, HierarchyNode, ReferenceHit, SignatureQuery,
+    SourceCache,
 };
 use squeezy_vcs::{
     DiffFileStatus, DiffHunk, DiffMode, DiffOptions, DiffSnapshot, canonicalize_workspace_root,
@@ -1912,14 +1913,18 @@ fn symbol_context_packet(
     graph: &squeezy_graph::SemanticGraph,
     symbol: &GraphSymbol,
     max_references: usize,
+    sources: &mut SourceCache,
 ) -> Value {
     let mut packet = symbol_packet(graph, symbol, "symbol_context", None);
     if let Some(object) = packet.as_object_mut() {
         // Insert each collection only when non-empty: the common case (a symbol
         // with no callers/callees/references/diagnostics) used to ship four
         // empty arrays per packet, paying tokens for nothing.
+        // Reuse a single shared `SourceCache` across every packet so a file
+        // referenced by multiple result symbols is read from disk only once
+        // per `symbol_context` call rather than once per symbol.
         let references = graph
-            .references_to_symbol(&symbol.id)
+            .references_to_symbol_with_cache(&symbol.id, sources)
             .into_iter()
             .take(max_references)
             .map(reference_json)
@@ -3705,9 +3710,12 @@ impl ToolRegistry {
             symbols = fallback.into_iter().take(max_results).collect();
         }
         let truncated = pre_take_len > max_results;
+        // One cache shared across every result packet: a file referenced by
+        // several of the returned symbols is read from disk once, not per symbol.
+        let mut sources = SourceCache::default();
         let packets = symbols
             .iter()
-            .map(|symbol| symbol_context_packet(graph, symbol, max_references))
+            .map(|symbol| symbol_context_packet(graph, symbol, max_references, &mut sources))
             .collect::<Vec<_>>();
         let confidence_distribution =
             ToolCostHint::confidence_distribution_from(symbols.iter().map(|s| s.confidence));
