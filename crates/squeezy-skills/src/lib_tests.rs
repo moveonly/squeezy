@@ -164,6 +164,25 @@ fn bundled_skills_render_through_catalog_helpers() {
 }
 
 #[test]
+fn non_ascii_trigger_does_not_panic_on_failed_boundary() {
+    // Regression: a trigger that begins with a multi-byte UTF-8 character
+    // ("ß" = bytes [195, 159]) preceded by a word byte in the input used to
+    // advance the scan cursor by exactly one byte, landing inside the
+    // multi-byte char and panicking on the next `lowered_input[cursor..]`
+    // slice. The first occurrence here fails the word-boundary check
+    // (preceded by 'a'); the second succeeds (preceded by a space).
+    assert!(input_matches_trigger("aßx ßx", "ßx"));
+    // And the all-failing case must simply return false rather than panic.
+    assert!(!input_matches_trigger("aßxbßxc", "ßx"));
+}
+
+#[test]
+fn ascii_trigger_word_boundaries_still_match() {
+    assert!(input_matches_trigger("please run the build now", "build"));
+    assert!(!input_matches_trigger("rebuilding things", "build"));
+}
+
+#[test]
 fn parses_skill_frontmatter_and_body() {
     let (metadata, body) = parse_skill_file(
         r#"---

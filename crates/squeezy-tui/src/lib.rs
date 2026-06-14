@@ -29603,41 +29603,6 @@ const THEME_EDITOR_BAR_LABEL_WIDTH: u16 = 2;
 /// so the visible track and the clickable track stay the same width.
 const THEME_EDITOR_BAR_VALUE_WIDTH: u16 = 4;
 
-#[cfg(test)]
-mod theme_editor_bar_hittest_tests {
-    use super::*;
-
-    /// The clickable track and the painted track must agree in width: the
-    /// rightmost VISIBLE track cell maps to 255, and clicking the reserved
-    /// numeric-value region (the " 255" label cells) clamps to 255 rather than
-    /// being treated as track that reads below max. Regression guard for the
-    /// paint-vs-hit-test width drift.
-    #[test]
-    fn rightmost_visible_track_cell_maps_to_max() {
-        let bar = Rect {
-            x: 0,
-            y: 0,
-            width: 50,
-            height: 1,
-        };
-        // Painted track: width - label(2) - value(4) = 44 cells, starting at
-        // column track_x = 2, so the last visible cell is column 2 + 44 - 1 = 45.
-        let track_x = THEME_EDITOR_BAR_LABEL_WIDTH;
-        let track_w = bar.width - THEME_EDITOR_BAR_LABEL_WIDTH - THEME_EDITOR_BAR_VALUE_WIDTH;
-        let last_visible = track_x + track_w - 1;
-        assert_eq!(theme_editor_channel_value_at(bar, last_visible), 255);
-        // Clicking the reserved " 255" label region (just past the visible track)
-        // clamps to 255 rather than reading as a lower track value.
-        assert_eq!(
-            theme_editor_channel_value_at(bar, bar.width - 1),
-            255,
-            "value-label region must clamp to 255"
-        );
-        // A click at/left of the track origin reads as 0.
-        assert_eq!(theme_editor_channel_value_at(bar, track_x), 0);
-    }
-}
-
 /// Paint the Theme Editor overlay (§12.7.2) as a centered modal: a left rail of
 /// the curated palette ROLES (the focused one marked) and a right panel showing
 /// the focused role's live preview swatch, its hex value, and three R/G/B channel

@@ -25,8 +25,9 @@ RS_SUFFIX = ".rs"
 FORBIDDEN_TESTS_FILENAME = "tests.rs"
 FORBIDDEN_MOD_FILENAME = "mod.rs"
 
-INLINE_MOD_TESTS = re.compile(
-    r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+tests\s*\{",
+INLINE_CFG_TEST_MOD = re.compile(
+    r"((?:^[ \t]*#\[[^\n]+\][ \t]*\n)+)"
+    r"[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?mod[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\{",
     re.MULTILINE,
 )
 EXTERNAL_MOD_TESTS = re.compile(
@@ -92,9 +93,10 @@ def check(roots: list[Path]) -> Report:
                 continue
 
             text = path.read_text(encoding="utf-8", errors="replace")
-            for match in INLINE_MOD_TESTS.finditer(text):
-                line = text.count("\n", 0, match.start()) + 1
-                report.inline.append(f"{rel(path)}:{line}")
+            for match in INLINE_CFG_TEST_MOD.finditer(text):
+                if CFG_TEST_ATTR.search(match.group(1)) is not None:
+                    line = text.count("\n", 0, match.start()) + 1
+                    report.inline.append(f"{rel(path)}:{line}")
 
             test_file = path.with_name(path.stem + TEST_SUFFIX)
             if test_file.is_file():
@@ -135,7 +137,7 @@ def format_report(report: Report) -> str:
         "",
     ]
     if report.inline:
-        lines.append("Rule 1: inline `mod tests {` is forbidden")
+        lines.append("Rule 1: inline `#[cfg(test)] mod ... {` is forbidden")
         lines.extend(f"  - {item}" for item in report.inline)
         lines.append("")
     if report.forbidden_tests_rs:
