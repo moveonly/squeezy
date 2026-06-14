@@ -2021,12 +2021,25 @@ fn symbol_context_packet(
         if !callees.is_empty() {
             object.insert("callees".to_string(), json!(callees));
         }
-        let diagnostics = graph
+        let mut diagnostics = graph
             .cargo_diagnostics_for_symbol(symbol)
             .into_iter()
             .take(max_references)
             .map(|hit| cargo_diagnostic_hit_json(&hit))
             .collect::<Vec<_>>();
+        // Java/Dotnet/Kotlin build facts are diagnostics too: the cargo path
+        // above only covers Rust. Append the language project facts for this
+        // symbol's file (labelled `(label, detail)` pairs) so non-Rust build
+        // signals surface in `symbol_context` instead of being Rust-only.
+        for (label, detail) in graph.language_facts_for_file(&symbol.file_id) {
+            diagnostics.push(json!({
+                "level": "info",
+                "label": label,
+                "message": detail,
+                "path": symbol.file_id.0,
+                "source": "language_project_facts",
+            }));
+        }
         if !diagnostics.is_empty() {
             object.insert("diagnostics".to_string(), json!(diagnostics));
         }
