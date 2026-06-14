@@ -149,8 +149,8 @@ use specs::{
     mcp_tool_spec, notebook_edit_spec, notes_recall_spec, notes_remember_spec, observations_spec,
     plan_patch_spec, prepare_path_arguments, read_file_spec, read_slice_spec,
     read_tool_output_spec, reference_search_spec, refresh_compiler_facts_spec, repo_map_spec,
-    shell_spec, symbol_context_spec, upstream_flow_spec, verify_spec, webfetch_spec,
-    websearch_spec, write_file_spec,
+    shell_spec, symbol_at_spec, symbol_context_spec, upstream_flow_spec, verify_spec,
+    webfetch_spec, websearch_spec, write_file_spec,
 };
 pub use squeezy_graph::LanguageReport;
 
@@ -1725,6 +1725,33 @@ impl ToolRegistry {
         }
     }
 
+    /// Whether a code graph is present (or pending a successful background
+    /// open) for spec-gating purposes. Used by [`Self::build_specs`] to decide
+    /// whether to advertise graph-only tools such as `symbol_at`. True when the
+    /// graph slot is already populated (synchronous construction, or the
+    /// background open already finished) OR the slot is still empty but the open
+    /// has not failed — the async construction path leaves the slot `None` until
+    /// a `spawn_blocking` task fills it, and `build_specs` is typically called
+    /// (and cached) before that task completes, so a strict `is_some()` check
+    /// would spuriously drop the tool in the real app. The tool is withheld only
+    /// when the open is known to have failed (`graph_open_error` is `Some`). All
+    /// locks are taken poison-resiliently to match the rest of this crate.
+    fn graph_available_for_specs(&self) -> bool {
+        let present = self
+            .graph
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false);
+        if present {
+            return true;
+        }
+        // Slot empty: available unless the background open errored out.
+        self.graph_open_error
+            .lock()
+            .map(|slot| slot.is_none())
+            .unwrap_or(false)
+    }
+
     /// Bug #7: the reason a `GraphManager` open *failed*, if it
     /// did. `Some(reason)` means the graph slot is `None` because the open
     /// errored (parser/crawl/store failure) — distinguishable from a workspace
@@ -2070,6 +2097,14 @@ impl ToolRegistry {
                 checkpoint_show_spec(),
                 checkpoint_undo_spec(),
             ]);
+        }
+        // `symbol_at` is a position->symbol resolver that is meaningless
+        // without a code graph, so gate it on graph availability the same
+        // way MCP resource tools gate on enabled servers and checkpoint
+        // tools gate on a configured store — never advertised as a user
+        // opt-in flag, never pushed unconditionally.
+        if self.graph_available_for_specs() {
+            specs.push(symbol_at_spec());
         }
         // First-party specs are statically defined inline above. Funnel them
         // through the compaction pipeline so the budget contract holds
