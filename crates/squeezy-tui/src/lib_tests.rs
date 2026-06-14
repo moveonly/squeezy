@@ -24744,6 +24744,39 @@ fn transcript_overlay_bare_mouse_release_does_not_redraw() {
 }
 
 #[test]
+fn transcript_overlay_drag_selection_paints_highlight() {
+    let mut app = test_app(SessionMode::Build);
+    app.copy_on_select = false;
+    app.push_transcript_item(TranscriptItem::assistant("selectable overlay text here"));
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
+    });
+
+    let buffer = render_full_to_buffer(&app, 80, 24);
+    let (x, y) =
+        find_text_cell(&buffer, "selectable overlay text here").expect("overlay text painted");
+
+    assert!(handle_mouse(&mut app, left_down(x, y, KeyModifiers::NONE)));
+    assert!(handle_mouse(&mut app, left_drag(x + 10, y)));
+    assert!(handle_mouse(&mut app, left_up(x + 10, y)));
+    assert_eq!(
+        app.selection.as_ref().map(|sel| sel.surface),
+        Some(selection::SelectionSurface::Overlay),
+        "dragging overlay text keeps an overlay-surface selection"
+    );
+
+    let selected = render_full_to_buffer(&app, 80, 24);
+    let highlighted = reversed_cells_on_row(&selected, y);
+    assert!(
+        highlighted.contains("selectable"),
+        "Ctrl+T should paint the same reversed selection highlight as the main transcript; \
+         highlighted cells on row {y:?}: {highlighted:?}"
+    );
+}
+
+#[test]
 fn input_batch_coalesces_transcript_scrollbar_drag_flood_before_key() {
     let mut app = test_app(SessionMode::Build);
     app.transcript_overlay = Some(TranscriptOverlayState {
