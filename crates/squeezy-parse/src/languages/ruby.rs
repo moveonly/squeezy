@@ -1039,7 +1039,8 @@ fn extract_ruby_alias_method_call(
     let Some(method_node) = node.child_by_field_name("method") else {
         return false;
     };
-    if node_text(method_node, ctx.source).unwrap_or_default().trim() != "alias_method" {
+    let method_name = node_text(method_node, ctx.source).unwrap_or_default();
+    if method_name.trim() != "alias_method" {
         return false;
     }
     let Some(args) = node.child_by_field_name("arguments") else {
@@ -1496,8 +1497,8 @@ fn ruby_apply_visibility_statement(
         // Bare `private` / `protected` / `public` (parsed as an identifier
         // statement) toggles the default for subsequent definitions.
         "identifier" => {
-            if let Some(v) = ruby_visibility_keyword(node_text(stmt, source).unwrap_or_default().trim())
-            {
+            let text = node_text(stmt, source).unwrap_or_default();
+            if let Some(v) = ruby_visibility_keyword(text.trim()) {
                 *current = v;
             }
         }
