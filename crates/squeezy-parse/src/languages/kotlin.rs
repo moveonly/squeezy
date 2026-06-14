@@ -203,6 +203,12 @@ pub(crate) fn visit_kotlin_node(
             extract_kotlin_user_type_reference(node, ctx, owner_symbol.clone());
             visit_kotlin_children(node, ctx, parent_symbol, owner_symbol);
         }
+        "callable_reference" => {
+            extract_kotlin_callable_reference(node, ctx, owner_symbol.clone());
+            // Recurse so a receiver type (`String` in `String::length`) still
+            // surfaces as its own Type reference via the `user_type` arm.
+            visit_kotlin_children(node, ctx, parent_symbol, owner_symbol);
+        }
         "annotation" => {
             extract_kotlin_annotation_reference(node, ctx, owner_symbol);
         }
@@ -1558,6 +1564,54 @@ pub(crate) fn extract_kotlin_user_type_reference(
         owner_id,
         text,
         kind: BodyHitKind::Type,
+        span: span_from_node(node),
+    });
+}
+
+/// kotlin spec §9: a receiverless callable reference (`::transform`,
+/// `foo(::standalone)`) or a typed one (`String::length`, `MyClass::new`)
+/// parses as `callable_reference` = `[receiver_type]? :: identifier`. We emit a
+/// `ParsedReference` (kind `Field`) for the trailing identifier so the
+/// referenced function/member is discoverable; the receiver `user_type`, if
+/// present, is captured separately by the recursing `user_type` arm. Treating
+/// `::` references as full `Calls` edges is a separate cross-language decision.
+pub(crate) fn extract_kotlin_callable_reference(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    // The member name is the *last* direct `identifier` child (the receiver
+    // type, when present, is a `user_type` / `nullable_type`, not a bare
+    // identifier). `X::class` uses an anonymous `class` token and therefore
+    // surfaces no named identifier — nothing to bind.
+    let mut cursor = node.walk();
+    let Some(name_node) = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "identifier")
+        .last()
+    else {
+        return;
+    };
+    let text = node_text(name_node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if text.is_empty() || is_kotlin_keyword(&text) {
+        return;
+    }
+    ctx.references.push(ParsedReference {
+        file_id: ctx.file.id.clone(),
+        owner_id: owner_id.clone(),
+        text: text.clone(),
+        kind: ReferenceKind::Field,
+        span: span_from_node(name_node),
+        provenance: Provenance::new("tree-sitter-kotlin", "callable reference"),
+    });
+    ctx.body_hits.push(BodyHit {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        text,
+        kind: BodyHitKind::Path,
         span: span_from_node(node),
     });
 }
