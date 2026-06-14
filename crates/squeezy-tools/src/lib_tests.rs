@@ -13503,7 +13503,12 @@ fn core_tool_prefix_stays_within_byte_baseline() {
     // `follow_symlinks` on `grep` and `glob`, and first-class `impact` /
     // `inheritance_hierarchy` specs. These additions expose implemented
     // behavior that providers with strict schemas could not otherwise call.
-    const PREFIX_BYTES_BASELINE: usize = 27_000;
+    // 27_000 -> 30_000: deliberate bump for the build/usage audit's tool-routing
+    // and freshness guidance — the symbol_id staleness caveat, the
+    // refresh_incomplete/stale_pending re-issue hint, the inheritance super/sub
+    // cross-links, the positive decl/definition routing line, and the new
+    // symbol_context `symbol_id` param.
+    const PREFIX_BYTES_BASELINE: usize = 30_000;
 
     // Every first-party spec advertised in the always-core path, paired
     // with the required params the model must still see to call it. Tools

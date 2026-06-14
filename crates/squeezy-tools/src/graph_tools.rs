@@ -14,6 +14,7 @@ use squeezy_core::{
 use squeezy_graph::{
     CallEdgeHit, CargoDiagnosticHit, CargoFactFreshness, CargoFactsSummary, DirtyAnnotation,
     DirtyRange, GraphEdge, GraphManager, GraphSymbol, HierarchyNode, ReferenceHit, SignatureQuery,
+    SourceCache,
 };
 use squeezy_vcs::{
     DiffFileStatus, DiffHunk, DiffMode, DiffOptions, DiffSnapshot, canonicalize_workspace_root,
@@ -33,6 +34,10 @@ use crate::{
 #[serde(deny_unknown_fields)]
 pub(crate) struct SymbolContextArgs {
     pub(crate) query: String,
+    /// Optional symbol id minted by a sibling tool (definition_search, flow,
+    /// etc.). When live, it resolves the target directly; a stale id falls
+    /// through to the `query` search.
+    symbol_id: Option<String>,
     path: Option<String>,
     diff_only: Option<bool>,
     mode: Option<DiffMode>,
@@ -1136,31 +1141,47 @@ pub(crate) fn graph_symbol_search(
     // whose names happen to share characters (e.g. `PQueue.add`
     // colliding with `QueueAddOptions`).
     let dotted_hits = query.and_then(|q| resolve_dotted_query(graph, q));
-    let candidates = if let Some(matches) = dotted_hits {
-        matches
-    } else if let Some(query) = query {
-        graph
-            .signature_search(&SignatureQuery {
-                text: query.to_string(),
-                kind: single_symbol_kind(kind_filter),
-                visibility: visibility.map(str::to_string),
-                attribute: attribute.map(str::to_string),
-            })
-            .into_iter()
-            .chain(graph.find_symbol_by_name(query))
-            .collect::<Vec<_>>()
+    // No query (and no dotted hits): leave `candidates` as `None` so the caller
+    // filters over borrowed values and clones only the survivors rather than
+    // cloning the whole symbol table up front.
+    let candidates: Option<Vec<GraphSymbol>> = if let Some(matches) = dotted_hits {
+        Some(matches)
     } else {
-        graph.symbols.values().cloned().collect::<Vec<_>>()
+        query.map(|query| {
+            graph
+                .signature_search(&SignatureQuery {
+                    text: query.to_string(),
+                    kind: single_symbol_kind(kind_filter),
+                    visibility: visibility.map(str::to_string),
+                    attribute: attribute.map(str::to_string),
+                })
+                .into_iter()
+                .chain(graph.find_symbol_by_name(query))
+                .collect::<Vec<_>>()
+        })
     };
-    let mut symbols = candidates
-        .into_iter()
-        .filter(|symbol| seen.insert(symbol.id.clone()))
-        .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
-        .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
-        .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
-        .filter(|symbol| symbol_matches_path_filter(symbol, path))
-        .filter(|symbol| language_matches(graph, symbol, language))
-        .collect::<Vec<_>>();
+    let mut symbols = match candidates {
+        Some(candidates) => candidates
+            .into_iter()
+            .filter(|symbol| seen.insert(symbol.id.clone()))
+            .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
+            .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
+            .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
+            .filter(|symbol| symbol_matches_path_filter(symbol, path))
+            .filter(|symbol| language_matches(graph, symbol, language))
+            .collect::<Vec<_>>(),
+        None => graph
+            .symbols
+            .values()
+            .filter(|symbol| seen.insert(symbol.id.clone()))
+            .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
+            .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
+            .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
+            .filter(|symbol| symbol_matches_path_filter(symbol, path))
+            .filter(|symbol| language_matches(graph, symbol, language))
+            .cloned()
+            .collect::<Vec<_>>(),
+    };
 
     // Fuzzy widening: when the trigram-anchored candidate pool is empty
     // but a query was provided, run a fuzzy subsequence scan over a
@@ -1361,7 +1382,7 @@ pub(crate) fn graph_transitive_subtype_closure(
     visibility: Option<&str>,
     seed_names: &[String],
     cap: usize,
-) -> Vec<GraphSymbol> {
+) -> (Vec<GraphSymbol>, bool) {
     let kind_filter = kind.and_then(parse_symbol_kind_filter);
     let query = query.map(str::trim).filter(|value| !value.is_empty());
 
@@ -1376,6 +1397,19 @@ pub(crate) fn graph_transitive_subtype_closure(
     let mut seen_ids: HashSet<SymbolId> = HashSet::new();
     let mut results: Vec<GraphSymbol> = Vec::new();
 
+    // Hoist a single borrowed snapshot scoped by the constant walk filters
+    // (`path`/`language`/`visibility`) once, instead of re-scanning and cloning
+    // the whole symbol table inside `graph_symbol_search` for every BFS node.
+    // Only the per-node attribute filter varies, so it's applied below over
+    // references and survivors are cloned.
+    let scope: Vec<&GraphSymbol> = graph
+        .symbols
+        .values()
+        .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
+        .filter(|symbol| symbol_matches_path_filter(symbol, path))
+        .filter(|symbol| language_matches(graph, symbol, language))
+        .collect();
+
     while let Some(name) = queue.pop_front() {
         let attribute = format!("base:{name}|mixin:{name}|iface:{name}");
         // Expand KIND-AGNOSTICALLY. The hierarchy must be walked through every
@@ -1384,16 +1418,12 @@ pub(crate) fn graph_transitive_subtype_closure(
         // ones) is never enqueued and its whole subtree is silently dropped
         // (`class C implements J` would be missed for a `kind=class base:I`
         // query). The requested `kind` is applied to *emitted* results below,
-        // not to the walk. `path`/`language`/`visibility` still scope the walk.
-        let matches = graph_symbol_search(
-            graph,
-            None,
-            None,
-            path,
-            language,
-            visibility,
-            Some(&attribute),
-        );
+        // not to the walk. `path`/`language`/`visibility` already scoped the
+        // hoisted snapshot above.
+        let matches = scope
+            .iter()
+            .copied()
+            .filter(|symbol| symbol_matches_attribute_filter(symbol, Some(&attribute)));
         for symbol in matches {
             let newly_seen = seen_ids.insert(symbol.id.clone());
             // Enqueue every newly-seen *name* so its subtypes are discovered too
@@ -1424,13 +1454,16 @@ pub(crate) fn graph_transitive_subtype_closure(
                 }
             }
             if results.len() >= cap {
-                return results;
+                // Closure hit the cap: signal that the subtype tree was
+                // truncated so callers can surface it distinctly.
+                return (results, true);
             }
-            results.push(symbol);
+            // Only survivors are cloned out of the borrowed snapshot.
+            results.push(symbol.clone());
         }
     }
 
-    results
+    (results, false)
 }
 
 /// Resolve a dotted-or-double-coloned query like `PQueue.add` or
@@ -1518,13 +1551,13 @@ pub(crate) fn resolve_definition_candidates(
     path: Option<&str>,
     language: Option<&str>,
 ) -> Vec<GraphSymbol> {
-    if let Some(symbol_id) = symbol_id {
-        return graph
-            .symbols
-            .get(&SymbolId::new(symbol_id))
-            .cloned()
-            .into_iter()
-            .collect();
+    // A supplied symbol_id is authoritative *only while it's live*: a stale id
+    // (graph re-indexed since it was minted) must fall through to the
+    // query/kind/path search rather than dead-ending on an empty result.
+    if let Some(symbol_id) = symbol_id
+        && let Some(symbol) = graph.symbols.get(&SymbolId::new(symbol_id))
+    {
+        return vec![symbol.clone()];
     }
     let Some(query) = query else {
         return Vec::new();
@@ -1675,12 +1708,30 @@ fn unsupported_file_samples(graph: &squeezy_graph::SemanticGraph, limit: usize) 
 /// knows how to do unprompted; the reason code is the load-bearing signal.
 fn graph_zero_hit_fallback(
     graph: &squeezy_graph::SemanticGraph,
+    symbol_id: Option<&str>,
     path: Option<&str>,
     _query: Option<&str>,
     packet_count: usize,
 ) -> Value {
     if packet_count > 0 {
         return Value::Null;
+    }
+    // A supplied-but-absent symbol_id is the most actionable zero-hit cause:
+    // the id was minted against an earlier graph and is now stale. Surface that
+    // distinctly so the caller re-resolves by name rather than rewording the
+    // query (the misdirection the path/query reasons would otherwise give).
+    if let Some(id) = symbol_id
+        && !graph.symbols.contains_key(&SymbolId::new(id))
+    {
+        let mut obj = serde_json::Map::new();
+        obj.insert("status".to_string(), json!("no_graph_evidence"));
+        obj.insert("reason".to_string(), json!("symbol_id_stale"));
+        obj.insert(
+            "hint".to_string(),
+            json!("re-resolve the symbol by name via definition_search; the supplied symbol_id is stale"),
+        );
+        obj.insert("symbol_id".to_string(), json!(id));
+        return Value::Object(obj);
     }
     // Normalize backslashes once so all branches see forward-slash paths.
     // This mirrors path_matches_filter's normalization and ensures the file
@@ -1860,14 +1911,18 @@ fn symbol_context_packet(
     graph: &squeezy_graph::SemanticGraph,
     symbol: &GraphSymbol,
     max_references: usize,
+    sources: &mut SourceCache,
 ) -> Value {
     let mut packet = symbol_packet(graph, symbol, "symbol_context", None);
     if let Some(object) = packet.as_object_mut() {
         // Insert each collection only when non-empty: the common case (a symbol
         // with no callers/callees/references/diagnostics) used to ship four
         // empty arrays per packet, paying tokens for nothing.
+        // Reuse a single shared `SourceCache` across every packet so a file
+        // referenced by multiple result symbols is read from disk only once
+        // per `symbol_context` call rather than once per symbol.
         let references = graph
-            .references_to_symbol(&symbol.id)
+            .references_to_symbol_with_cache(&symbol.id, sources)
             .into_iter()
             .take(max_references)
             .map(reference_json)
@@ -2488,6 +2543,10 @@ fn hierarchy_result(
     refresh: &squeezy_graph::RefreshReport,
     graph: &squeezy_graph::SemanticGraph,
     nodes: Vec<HierarchyNode>,
+    // Pre-cap count of roots. When `nodes` was already capped (e.g. via
+    // `hierarchy_capped`) this is the real total so truncation is still
+    // detectable; otherwise it equals `nodes.len()`.
+    total_roots: usize,
     max_depth: usize,
     max_results: Option<usize>,
     root: Option<GraphSymbol>,
@@ -2502,7 +2561,7 @@ fn hierarchy_result(
         .iter()
         .map(|node| hierarchy_node_count(node))
         .sum::<usize>();
-    let truncated = nodes.len() > max_results || serialized_nodes > max_results;
+    let truncated = total_roots > max_results || serialized_nodes > max_results;
     let hierarchy = selected
         .iter()
         .map(|node| hierarchy_node_json(graph, node))
@@ -2537,8 +2596,11 @@ fn resolve_single_symbol(
     graph: &squeezy_graph::SemanticGraph,
     args: &FlowArgs,
 ) -> Option<GraphSymbol> {
-    if let Some(symbol_id) = args.symbol_id.as_deref() {
-        return graph.symbols.get(&SymbolId::new(symbol_id)).cloned();
+    // A live symbol_id wins; a stale one falls through to the query search.
+    if let Some(symbol_id) = args.symbol_id.as_deref()
+        && let Some(symbol) = graph.symbols.get(&SymbolId::new(symbol_id))
+    {
+        return Some(symbol.clone());
     }
     let query = args.query.as_deref()?;
     graph_symbol_search(
@@ -2558,8 +2620,11 @@ fn resolve_flow_target(
     graph: &squeezy_graph::SemanticGraph,
     args: &FlowArgs,
 ) -> Option<GraphSymbol> {
-    if let Some(symbol_id) = args.target_symbol_id.as_deref() {
-        return graph.symbols.get(&SymbolId::new(symbol_id)).cloned();
+    // A live target symbol_id wins; a stale one falls through to the query.
+    if let Some(symbol_id) = args.target_symbol_id.as_deref()
+        && let Some(symbol) = graph.symbols.get(&SymbolId::new(symbol_id))
+    {
+        return Some(symbol.clone());
     }
     let query = args.target_query.as_deref()?;
     graph_symbol_search(graph, Some(query), None, None, None, None, None)
@@ -2627,8 +2692,11 @@ fn resolve_hierarchy_root(
     graph: &squeezy_graph::SemanticGraph,
     args: &HierarchyArgs,
 ) -> Option<GraphSymbol> {
-    if let Some(symbol_id) = args.symbol_id.as_deref() {
-        return graph.symbols.get(&SymbolId::new(symbol_id)).cloned();
+    // A live symbol_id wins; a stale one falls through to the query search.
+    if let Some(symbol_id) = args.symbol_id.as_deref()
+        && let Some(symbol) = graph.symbols.get(&SymbolId::new(symbol_id))
+    {
+        return Some(symbol.clone());
     }
     let query = args.query.as_deref()?;
     graph_symbol_search(
@@ -2681,6 +2749,17 @@ fn unresolved_hierarchy_result(
     payload.insert("symbol_id".to_string(), json!(args.symbol_id));
     payload.insert("query".to_string(), json!(args.query));
     payload.insert("packets".to_string(), json!(packets));
+    // Mirror the flow path's dead-end: point the caller at definition_search to
+    // resolve a unique symbol before re-asking, instead of leaving them with an
+    // unactionable empty result.
+    payload.insert(
+        "next_action".to_string(),
+        json!({
+            "tool": "definition_search",
+            "arguments": {"query": query},
+            "reason": "resolve a unique symbol with definition_search"
+        }),
+    );
     make_result(
         call,
         ToolStatus::Stale,
@@ -2727,7 +2806,12 @@ fn read_slice_target(
         let symbol = graph
             .symbols
             .get(&SymbolId::new(symbol_id))
-            .ok_or_else(|| format!("symbol_id not found: {symbol_id}"))?;
+            .ok_or_else(|| {
+                // A stale id (graph re-indexed since it was minted) is recoverable:
+                // tell the caller to re-resolve by name rather than reporting an
+                // opaque "not found".
+                format!("symbol_id stale; re-resolve via definition_search (stale id: {symbol_id})")
+            })?;
         let span = match args.span_kind.unwrap_or_default() {
             // Read only the declaration header when the extractor pinned a real
             // signature span; fall back to the full node for bodyless symbols
@@ -3031,18 +3115,10 @@ impl ToolRegistry {
         } else {
             self.wait_for_graph_ready(graph_ready_wait())
         };
-        let mut graph = match self.graph.lock() {
-            Ok(graph) => graph,
-            Err(_) => {
-                return make_result(
-                    call,
-                    ToolStatus::Error,
-                    json!({"error": "semantic graph lock poisoned"}),
-                    ToolCostHint::default(),
-                    None,
-                );
-            }
-        };
+        // A poisoned mutex used to brick every graph tool. Recover the guard
+        // instead so a panic in one handler doesn't permanently disable the
+        // rest of the semantic toolset.
+        let mut graph = self.graph.lock().unwrap_or_else(|e| e.into_inner());
         let Some(manager) = graph.as_mut() else {
             // Bug #1: a path-only `read_slice` (no `symbol_id`) reads bytes
             // straight off disk and never touches the graph. Don't strand it on
@@ -3152,8 +3228,11 @@ impl ToolRegistry {
         let graph = manager.graph();
         let max_depth = args.max_depth.unwrap_or(2).clamp(1, MAX_GRAPH_MAX_DEPTH);
         let max_files = args.max_files.unwrap_or(50).clamp(1, 200);
-        let nodes = graph.hierarchy(None, max_depth);
-        let selected = nodes.iter().take(max_files).collect::<Vec<_>>();
+        // Cap the roots before expansion instead of building the entire forest
+        // and discarding all but `max_files`; `total_roots` is the pre-cap count
+        // used for the truncation signal.
+        let (nodes, total_roots) = graph.hierarchy_capped(None, max_depth, max_files);
+        let selected = nodes.iter().collect::<Vec<_>>();
         // Count total serialized nodes (roots + recursively-emitted children),
         // not just the number of roots, so a single wide root that exceeds
         // `max_files` in the serialized output is reported as truncated.
@@ -3161,7 +3240,7 @@ impl ToolRegistry {
             .iter()
             .map(|node| hierarchy_node_count(node))
             .sum::<usize>();
-        let truncated = nodes.len() > max_files || serialized_nodes > max_files;
+        let truncated = total_roots > max_files || serialized_nodes > max_files;
         let hierarchy = selected
             .iter()
             .map(|node| hierarchy_node_json(graph, node))
@@ -3225,7 +3304,7 @@ impl ToolRegistry {
                 .filter(|attr| attribute_has_inheritance_prefix(attr))
                 .map(seed_type_names)
         });
-        let symbols = match transitive_seed {
+        let (symbols, closure_capped) = match transitive_seed {
             Some(Some(seed_names)) if !seed_names.is_empty() => graph_transitive_subtype_closure(
                 graph,
                 args.query.as_deref(),
@@ -3236,17 +3315,24 @@ impl ToolRegistry {
                 &seed_names,
                 TRANSITIVE_CLOSURE_CAP,
             ),
-            _ => graph_symbol_search(
-                graph,
-                args.query.as_deref(),
-                args.kind.as_deref(),
-                args.path.as_deref(),
-                args.language.as_deref(),
-                args.visibility.as_deref(),
-                args.attribute.as_deref(),
+            _ => (
+                graph_symbol_search(
+                    graph,
+                    args.query.as_deref(),
+                    args.kind.as_deref(),
+                    args.path.as_deref(),
+                    args.language.as_deref(),
+                    args.visibility.as_deref(),
+                    args.attribute.as_deref(),
+                ),
+                false,
             ),
         };
-        let truncated = symbols.len().saturating_sub(offset) > max_results;
+        // The closure cap is a distinct truncation source from the result-window
+        // cap: fold it into `truncated` so the page is flagged, and also surface
+        // it as a separate `closure_capped` signal so a caller can tell the
+        // subtype *tree* itself was clipped (and may re-scope the walk).
+        let truncated = closure_capped || symbols.len().saturating_sub(offset) > max_results;
         let selected = symbols
             .iter()
             .skip(offset)
@@ -3272,6 +3358,7 @@ impl ToolRegistry {
             "fallback".to_string(),
             graph_zero_hit_fallback(
                 graph,
+                None,
                 args.path.as_deref(),
                 args.query.as_deref(),
                 packet_count,
@@ -3286,6 +3373,7 @@ impl ToolRegistry {
         );
         payload.insert("counts_by_kind".to_string(), decl_counts_by_kind(&symbols));
         payload.insert("truncated".to_string(), json!(truncated));
+        payload.insert("closure_capped".to_string(), json!(closure_capped));
         make_result(
             call,
             ToolStatus::Success,
@@ -3336,6 +3424,7 @@ impl ToolRegistry {
             "fallback".to_string(),
             graph_zero_hit_fallback(
                 graph,
+                args.symbol_id.as_deref(),
                 args.path.as_deref(),
                 args.query.as_deref(),
                 packet_count,
@@ -3408,6 +3497,7 @@ impl ToolRegistry {
             "fallback".to_string(),
             graph_zero_hit_fallback(
                 graph,
+                args.symbol_id.as_deref(),
                 args.path.as_deref(),
                 query_text.as_deref(),
                 packet_count,
@@ -3521,10 +3611,10 @@ impl ToolRegistry {
         let mut overflowed = traversal.overflowed;
         packets.extend(traversal.packets);
         if packets.len() < max_results {
+            // Use the per-source edge index instead of scanning every edge in
+            // the graph; the kind filter stays the same.
             let outgoing = graph
-                .edges()
-                .iter()
-                .filter(|edge| edge.from == symbol.id)
+                .outgoing_edges(&symbol.id)
                 .filter(|edge| {
                     matches!(
                         edge.kind,
@@ -3576,18 +3666,28 @@ impl ToolRegistry {
         let max_results = graph_limit(args.max_results);
         let path_filter = args.path.as_deref();
         let diff_only = args.diff_only.unwrap_or(false);
+        // A live symbol_id from a sibling tool resolves the target directly;
+        // a stale id (graph re-indexed since it was minted) falls through to
+        // the name query so the call still lands on the right symbol.
+        let resolved_by_id = args
+            .symbol_id
+            .as_deref()
+            .and_then(|id| graph.symbols.get(&SymbolId::new(id)).cloned());
         // Count candidates BEFORE `take(max_results)` so the response can
         // report `truncated` honestly: emitting `truncated:false` while
         // dropping matches misleads the model into thinking it saw everything.
-        let candidates = graph_symbol_search(
-            graph,
-            Some(&args.query),
-            None,
-            path_filter,
-            None,
-            None,
-            None,
-        )
+        let candidates = match resolved_by_id {
+            Some(symbol) => vec![symbol],
+            None => graph_symbol_search(
+                graph,
+                Some(&args.query),
+                None,
+                path_filter,
+                None,
+                None,
+                None,
+            ),
+        }
         .into_iter()
         .filter(|symbol| {
             !diff_only || symbol.dirty.is_some() || dirty_paths.contains(&symbol.file_id.0)
@@ -3608,14 +3708,18 @@ impl ToolRegistry {
             symbols = fallback.into_iter().take(max_results).collect();
         }
         let truncated = pre_take_len > max_results;
+        // One cache shared across every result packet: a file referenced by
+        // several of the returned symbols is read from disk once, not per symbol.
+        let mut sources = SourceCache::default();
         let packets = symbols
             .iter()
-            .map(|symbol| symbol_context_packet(graph, symbol, max_references))
+            .map(|symbol| symbol_context_packet(graph, symbol, max_references, &mut sources))
             .collect::<Vec<_>>();
         let confidence_distribution =
             ToolCostHint::confidence_distribution_from(symbols.iter().map(|s| s.confidence));
         let mut payload = graph_payload("symbol_context", manager, refresh);
         payload.insert("query".to_string(), json!(args.query));
+        payload.insert("symbol_id".to_string(), json!(args.symbol_id));
         payload.insert(
             "mode".to_string(),
             json!(diff_mode_str(args.mode.unwrap_or_default())),
@@ -3625,7 +3729,13 @@ impl ToolRegistry {
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
             "fallback".to_string(),
-            graph_zero_hit_fallback(graph, path_filter, Some(&args.query), packet_count),
+            graph_zero_hit_fallback(
+                graph,
+                args.symbol_id.as_deref(),
+                path_filter,
+                Some(&args.query),
+                packet_count,
+            ),
         );
         payload.insert("truncated".to_string(), json!(truncated));
         make_result(
@@ -3634,6 +3744,7 @@ impl ToolRegistry {
             Value::Object(payload),
             ToolCostHint {
                 matches_returned: symbols.len() as u64,
+                truncated,
                 confidence_distribution,
                 ..ToolCostHint::default()
             },
@@ -3659,24 +3770,30 @@ impl ToolRegistry {
                 return unresolved_hierarchy_result(call, manager, refresh, &args);
             };
             let nodes = graph.hierarchy(Some(&root.id), max_depth);
+            let total_roots = nodes.len();
             return hierarchy_result(
                 call,
                 manager,
                 refresh,
                 graph,
                 nodes,
+                total_roots,
                 max_depth,
                 args.max_results,
                 Some(root),
             );
         }
-        let nodes = graph.hierarchy(None, max_depth);
+        // Rootless map: cap the forest roots before expansion instead of
+        // building the whole forest and discarding all but `max_results`.
+        let max_results = graph_limit(args.max_results);
+        let (nodes, total_roots) = graph.hierarchy_capped(None, max_depth, max_results);
         hierarchy_result(
             call,
             manager,
             refresh,
             graph,
             nodes,
+            total_roots,
             max_depth,
             args.max_results,
             None,
@@ -3694,9 +3811,13 @@ impl ToolRegistry {
         let max_results = graph_limit(args.max_results);
         let subtypes = args.subtypes.unwrap_or(false);
 
-        // Resolve the root symbol via id or text query.
-        let root = if let Some(id) = args.symbol_id.as_deref() {
-            graph.symbols.get(&SymbolId::new(id)).cloned()
+        // Resolve the root symbol via id or text query. A live symbol_id wins;
+        // a stale one (graph re-indexed) transparently falls through to the
+        // query so the caller isn't dead-ended on an empty result.
+        let root = if let Some(id) = args.symbol_id.as_deref()
+            && let Some(sym) = graph.symbols.get(&SymbolId::new(id))
+        {
+            Some(sym.clone())
         } else if let Some(q) = args.query.as_deref() {
             graph_symbol_search(graph, Some(q), None, None, None, None, None)
                 .into_iter()
@@ -3706,12 +3827,39 @@ impl ToolRegistry {
         };
 
         let Some(root_sym) = root else {
+            // Dead-end: surface candidate packets and a re-resolve next_action so
+            // the caller can pick a unique symbol, mirroring the flow/hierarchy
+            // unresolved paths instead of returning a bare error.
+            let query = args.query.as_deref().unwrap_or("");
+            let candidate_packets = if query.is_empty() {
+                Vec::new()
+            } else {
+                graph_symbol_search(graph, Some(query), None, None, None, None, None)
+                    .into_iter()
+                    .take(DEFAULT_GRAPH_MAX_RESULTS)
+                    .map(|symbol| {
+                        let rank_label = symbol_rank_label(&symbol, query);
+                        symbol_packet(graph, &symbol, "inheritance_hierarchy", Some(rank_label))
+                    })
+                    .collect::<Vec<_>>()
+            };
             let mut payload = graph_payload("inheritance_hierarchy", manager, refresh);
             payload.insert("error".to_string(), json!("symbol not found"));
-            payload.insert("packets".to_string(), json!([]));
+            payload.insert("resolved".to_string(), json!(false));
+            payload.insert("symbol_id".to_string(), json!(args.symbol_id));
+            payload.insert("query".to_string(), json!(args.query));
+            payload.insert("packets".to_string(), json!(candidate_packets));
+            payload.insert(
+                "next_action".to_string(),
+                json!({
+                    "tool": "definition_search",
+                    "arguments": {"query": query},
+                    "reason": "resolve a unique symbol with definition_search"
+                }),
+            );
             return make_result(
                 call,
-                ToolStatus::Success,
+                ToolStatus::Stale,
                 Value::Object(payload),
                 ToolCostHint::default(),
                 None,
@@ -3788,19 +3936,29 @@ impl ToolRegistry {
         {
             changed.insert(sym.file_id.clone());
         }
-        if let Some(path) = args.path.as_deref() {
+        // Resolve a path filter into changed file IDs. An empty/whitespace
+        // filter would otherwise match everything via the suffix/fuzzy fallback,
+        // so skip it. Try an exact (case-insensitive) lookup before scanning so
+        // a precise path resolves in O(1) without the boundary-aware fallback.
+        let mut resolve_path = |filter: &str| {
+            if filter.trim().is_empty() {
+                return;
+            }
+            if let Some(file) = graph.find_file_case_insensitive(filter) {
+                changed.insert(file.id.clone());
+                return;
+            }
             for file in graph.files.values() {
-                if file.relative_path == path || file.relative_path.ends_with(path) {
+                if path_matches_filter(&file.relative_path, filter) {
                     changed.insert(file.id.clone());
                 }
             }
+        };
+        if let Some(path) = args.path.as_deref() {
+            resolve_path(path);
         }
         for extra in &args.extra_paths {
-            for file in graph.files.values() {
-                if file.relative_path == *extra || file.relative_path.ends_with(extra.as_str()) {
-                    changed.insert(file.id.clone());
-                }
-            }
+            resolve_path(extra.as_str());
         }
 
         if changed.is_empty() {
@@ -4264,9 +4422,15 @@ impl ToolRegistry {
                 let total_changed_ranges = changed_ranges.len();
                 for range in changed_ranges.into_iter().take(max_ranges) {
                     let bytes = text.as_bytes();
-                    let capped_end = range.end.min(range.start.saturating_add(MAX_READ_LIMIT));
+                    let capped_end = range
+                        .end
+                        .min(range.start.saturating_add(MAX_READ_LIMIT))
+                        .min(bytes.len());
+                    // Clamp the start too: a malformed range whose start lands
+                    // past `capped_end` would otherwise panic the slice.
                     let content =
-                        String::from_utf8_lossy(&bytes[range.start..capped_end]).to_string();
+                        String::from_utf8_lossy(&bytes[range.start.min(capped_end)..capped_end])
+                            .to_string();
                     let range_truncated = capped_end < range.end;
                     truncated |= range_truncated;
                     let range_cost = ToolCostHint {
@@ -4514,9 +4678,15 @@ impl ToolRegistry {
         {
             let start = offset.saturating_add(range.start);
             let end_bytes = offset.saturating_add(range.end);
-            let capped_end = range.end.min(range.start.saturating_add(MAX_READ_LIMIT));
-            let content =
-                String::from_utf8_lossy(&current.as_bytes()[range.start..capped_end]).to_string();
+            let capped_end = range
+                .end
+                .min(range.start.saturating_add(MAX_READ_LIMIT))
+                .min(current.len());
+            // Clamp the start too so a malformed range can't panic the slice.
+            let content = String::from_utf8_lossy(
+                &current.as_bytes()[range.start.min(capped_end)..capped_end],
+            )
+            .to_string();
             let range_truncated = capped_end < range.end;
             let start_line = line_number_for_byte(&current, range.start)
                 .saturating_add(line_offset_before_window);
@@ -4601,10 +4771,8 @@ impl ToolRegistry {
         max_references: usize,
     ) -> Value {
         let graph_ready = self.wait_for_graph_ready(graph_ready_wait());
-        let mut graph = match self.graph.lock() {
-            Ok(graph) => graph,
-            Err(_) => return json!({"available": false, "error": "semantic graph lock poisoned"}),
-        };
+        // Recover a poisoned guard instead of permanently failing impact lookups.
+        let mut graph = self.graph.lock().unwrap_or_else(|e| e.into_inner());
         let Some(manager) = graph.as_mut() else {
             return if !graph_ready {
                 json!({

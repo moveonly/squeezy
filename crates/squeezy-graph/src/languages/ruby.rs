@@ -141,14 +141,57 @@ impl SemanticGraph {
                 return Some(symbol.id.clone());
             }
         }
-        // Else scan the workspace for a Class/Module by leaf name (cross-file).
-        single_symbol(
-            self.symbols_by_name_or_scan(&leaf)
-                .into_iter()
-                .filter_map(|id| self.symbols.get(&id))
-                .filter(|s| matches!(s.kind, SymbolKind::Class | SymbolKind::Module))
+        // No same-file declaration: prefer a class brought into scope by a
+        // matching `require`/`require_relative`/`autoload` in this file. This
+        // keeps `user.full_name` from binding `User` across an unrelated file
+        // that merely declares a same-named class. Among the global same-name
+        // class/module symbols, keep only the import-visible ones.
+        let global = self
+            .symbols_by_name_or_scan(&leaf)
+            .into_iter()
+            .filter_map(|id| self.symbols.get(&id))
+            .filter(|s| matches!(s.kind, SymbolKind::Class | SymbolKind::Module))
+            .collect::<Vec<_>>();
+        let in_scope = single_symbol(
+            global
+                .iter()
+                .filter(|s| self.ruby_class_is_in_scope(file_id, &leaf, s))
                 .map(|s| s.id.clone()),
-        )
+        );
+        if in_scope.is_some() {
+            return in_scope;
+        }
+        // No import-visible declaration: fall back to a global name match, but
+        // only when it is unambiguous so we never silently bind to one of
+        // several unrelated same-named classes (mirrors the Python/JS resolver).
+        single_symbol(global.into_iter().map(|s| s.id.clone()))
+    }
+
+    /// True when a `require`/`require_relative`/`load`/`autoload` import visible
+    /// in `file_id` brings `symbol` into scope under `name`. Mirrors
+    /// `python_class_is_in_scope`. An `autoload(:Name, "path")` names the
+    /// constant directly via its alias; the path-based directives
+    /// (`require_relative "models/user"`, bare `require "user"`) are matched by
+    /// resolving the import's path against the file that declares `symbol`:
+    /// `require_relative` paths are already resolved to a workspace-relative
+    /// `.rb` path, while a bare `require "user"` matches any `.../user.rb`.
+    fn ruby_class_is_in_scope(&self, file_id: &FileId, name: &str, symbol: &GraphSymbol) -> bool {
+        let Some(symbol_file) = self.files.get(&symbol.file_id) else {
+            return false;
+        };
+        self.imports_for_file(file_id)
+            .filter(|import| !is_package_marker(import))
+            .any(|import| {
+                // `autoload(:Name, "path")` binds the constant by alias.
+                if import.alias.as_deref() == Some(name) {
+                    return true;
+                }
+                let suffix = strip_source_extension(import.path.trim_start_matches("./"));
+                if suffix.is_empty() {
+                    return false;
+                }
+                file_path_matches_import_suffix(&symbol_file.relative_path, suffix)
+            })
     }
 
     /// Walk `class -> mixin:prepend:* -> class itself -> mixin:include:* ->

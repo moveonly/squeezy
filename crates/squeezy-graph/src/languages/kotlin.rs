@@ -177,6 +177,134 @@ impl SemanticGraph {
         single_symbol(matches)
     }
 
+    /// Resolve `receiver.method()` where `receiver` is a property of the
+    /// caller's enclosing class with a declared type, binding to an instance
+    /// method declared on that type or one of its supertype ancestors.
+    ///
+    /// This is the Kotlin analogue of `java_receiver_field_method`: it infers
+    /// the receiver's type from the field's `type:T` attribute, resolves `T`
+    /// to a class in the caller's file scope, and looks up the method on that
+    /// class or its `base:` ancestors so inherited methods resolve.
+    pub(crate) fn kotlin_receiver_field_method(
+        &self,
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        let receiver = call.receiver.as_deref()?;
+        if matches!(receiver, "this" | "super") || receiver.contains(' ') || receiver.contains('(')
+        {
+            return None;
+        }
+        let caller = self.symbols.get(caller_id)?;
+        let caller_file = self.files.get(&caller.file_id)?;
+        if caller_file.language != LanguageKind::Kotlin {
+            return None;
+        }
+        let type_name = self.kotlin_receiver_type_name(caller_id, receiver)?;
+        let class_id = self
+            .kotlin_class_candidates_for_name_in_file(&caller.file_id, &type_name)
+            .first()?
+            .clone();
+        self.kotlin_method_on_class_or_ancestors(&class_id, &call.name)
+    }
+
+    /// Class/object symbols named `name` that are visible from `file_id`
+    /// (same file, same package, or imported). Mirrors
+    /// `java_class_candidates_for_name_in_file` for the Kotlin family.
+    fn kotlin_class_candidates_for_name_in_file(
+        &self,
+        file_id: &FileId,
+        name: &str,
+    ) -> Vec<SymbolId> {
+        let direct_name = last_path_segment(name);
+        let mut class_ids = self
+            .symbols_by_name_or_scan(&direct_name)
+            .into_iter()
+            .filter_map(|id| self.symbols.get(&id))
+            .filter(|symbol| {
+                matches!(
+                    symbol.kind,
+                    SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Trait
+                )
+            })
+            .filter(|symbol| {
+                symbol.file_id == *file_id
+                    || self.kotlin_package_for_file(&symbol.file_id)
+                        == self.kotlin_package_for_file(file_id)
+                    || self
+                        .imports_for_file(file_id)
+                        .any(|import| self.kotlin_import_matches_symbol(import, symbol))
+            })
+            .map(|symbol| symbol.id.clone())
+            .collect::<Vec<_>>();
+        class_ids.sort_by(|left, right| left.0.cmp(&right.0));
+        class_ids.dedup();
+        class_ids
+    }
+
+    /// Single method named `method_name` declared directly on `class_id`.
+    fn kotlin_method_on_class(&self, class_id: &SymbolId, method_name: &str) -> Option<SymbolId> {
+        single_symbol(
+            self.children_by_parent
+                .get(class_id)?
+                .iter()
+                .filter_map(|child_id| self.symbols.get(child_id))
+                .filter(|symbol| symbol.kind == SymbolKind::Method && symbol.name == method_name)
+                .map(|symbol| symbol.id.clone()),
+        )
+    }
+
+    /// Look up `method_name` on `class_id`, falling back to its `base:`
+    /// supertype ancestors. Kotlin records inheritance as `base:<name>`
+    /// attributes (no `Extends`/`Implements` graph edges), so we resolve each
+    /// base name to a class in the same file scope and recurse, with a
+    /// visited-set bounding cyclic / diamond hierarchies.
+    fn kotlin_method_on_class_or_ancestors(
+        &self,
+        class_id: &SymbolId,
+        method_name: &str,
+    ) -> Option<SymbolId> {
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(class_id.clone());
+        self.kotlin_method_on_class_or_ancestors_visited(class_id, method_name, &mut visited)
+    }
+
+    fn kotlin_method_on_class_or_ancestors_visited(
+        &self,
+        class_id: &SymbolId,
+        method_name: &str,
+        visited: &mut std::collections::HashSet<SymbolId>,
+    ) -> Option<SymbolId> {
+        if let Some(method) = self.kotlin_method_on_class(class_id, method_name) {
+            return Some(method);
+        }
+        let class = self.symbols.get(class_id)?;
+        let class_file_id = class.file_id.clone();
+        let base_names = class
+            .attributes
+            .iter()
+            .filter_map(|attribute| attribute.strip_prefix("base:"))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        for base_name in base_names {
+            for ancestor_id in
+                self.kotlin_class_candidates_for_name_in_file(&class_file_id, &base_name)
+            {
+                if !visited.insert(ancestor_id.clone()) {
+                    continue;
+                }
+                if let Some(method) = self.kotlin_method_on_class_or_ancestors_visited(
+                    &ancestor_id,
+                    method_name,
+                    visited,
+                ) {
+                    return Some(method);
+                }
+            }
+        }
+        None
+    }
+
     /// Resolve `Host.member()` against companion-object members that the
     /// Kotlin extractor re-parents to the host class. The receiver text
     /// must equal the host class name as seen from the caller (after

@@ -173,6 +173,13 @@ pub(crate) fn go_function_symbol(
     if kind == SymbolKind::Test {
         attributes.push("go:test".to_string());
     }
+    // Stamp `go-local:<name>:<Type>` for body locals whose static type is
+    // syntactically obvious (`var x T`, `x := T{...}`, `x := &T{...}`). The
+    // graph resolver reads these to bind `x.Method(...)` calls to the methods
+    // reparented under type `T`.
+    if let Some(body) = body {
+        go_collect_local_type_attributes(body, ctx.source, &mut attributes);
+    }
     attributes.sort();
     attributes.dedup();
 
@@ -765,6 +772,133 @@ pub(crate) fn go_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
         .trim();
     let name = last_path_segment(last);
     is_go_identifier(&name).then_some(name)
+}
+
+/// Walk a Go function/method body and emit `go-local:<name>:<Type>` attributes
+/// for body-local variables whose static type is syntactically determinable.
+/// Recognised shapes:
+///   * `var x T` / `var x *T` (explicit type)
+///   * `x := T{...}` / `x := &T{...}` (composite-literal construction)
+///   * `x := T(v)` (type conversion to a named type)
+///
+/// `<Type>` is always the leaf type name (pointer `*` and `pkg.` qualifiers
+/// stripped) so the resolver can match it against same-package type symbols.
+/// We deliberately do not descend into nested `func_literal` bodies so their
+/// locals don't leak onto the enclosing function's attribute set.
+pub(crate) fn go_collect_local_type_attributes(
+    body: Node<'_>,
+    source: &str,
+    attributes: &mut Vec<String>,
+) {
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "short_var_declaration" => {
+                go_collect_short_var_locals(node, source, attributes);
+                continue;
+            }
+            "var_spec" => {
+                go_collect_var_spec_locals(node, source, attributes);
+                continue;
+            }
+            // Nested closures introduce their own scope; their locals must not
+            // attach to the enclosing symbol.
+            "func_literal" if node.id() != body.id() => continue,
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+}
+
+/// Handle `x := <expr>` and `x, y := <expr>, <expr>`: pair each left-hand
+/// identifier with the inferred type of the matching right-hand expression.
+fn go_collect_short_var_locals(node: Node<'_>, source: &str, attributes: &mut Vec<String>) {
+    let Some(left) = node.child_by_field_name("left") else {
+        return;
+    };
+    let Some(right) = node.child_by_field_name("right") else {
+        return;
+    };
+    let mut left_cursor = left.walk();
+    let names: Vec<Node<'_>> = left
+        .named_children(&mut left_cursor)
+        .filter(|child| child.kind() == "identifier")
+        .collect();
+    let mut right_cursor = right.walk();
+    let values: Vec<Node<'_>> = right.named_children(&mut right_cursor).collect();
+    // Only zip name->value when the assignment is positional (counts line up);
+    // a single multi-value call (`a, b := f()`) gives no per-name type, so skip.
+    if names.len() != values.len() {
+        return;
+    }
+    for (name_node, value_node) in names.into_iter().zip(values) {
+        let Some(name) = node_text(name_node, source)
+            .ok()
+            .map(str::trim)
+            .filter(|text| *text != "_" && is_go_identifier(text))
+        else {
+            continue;
+        };
+        if let Some(ty) = go_infer_expression_type(value_node, source) {
+            attributes.push(format!("go-local:{name}:{ty}"));
+        }
+    }
+}
+
+/// Handle `var x T` / `var x, y T`: every named identifier shares the spec's
+/// declared type.
+fn go_collect_var_spec_locals(node: Node<'_>, source: &str, attributes: &mut Vec<String>) {
+    let Some(ty) = node
+        .child_by_field_name("type")
+        .and_then(|type_node| go_leaf_type_name(type_node, source))
+    else {
+        return;
+    };
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "identifier" {
+            continue;
+        }
+        if let Some(name) = node_text(child, source)
+            .ok()
+            .map(str::trim)
+            .filter(|text| *text != "_" && is_go_identifier(text))
+        {
+            attributes.push(format!("go-local:{name}:{ty}"));
+        }
+    }
+}
+
+/// Best-effort leaf type name for a simple Go RHS expression: composite
+/// literals (`T{...}`), address-of composite literals (`&T{...}`), and
+/// named-type conversions (`T(v)`).
+fn go_infer_expression_type(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "composite_literal" => node
+            .child_by_field_name("type")
+            .and_then(|type_node| go_leaf_type_name(type_node, source)),
+        // `&T{...}` is a `unary_expression` with the `&` operator wrapping a
+        // composite literal; the value still has type `T` (pointer to it).
+        "unary_expression" => node
+            .child_by_field_name("operand")
+            .and_then(|operand| go_infer_expression_type(operand, source)),
+        // `T(v)` named-type conversion; the grammar models this either as a
+        // dedicated `type_conversion_expression` or as a `call_expression`
+        // whose `function` field is a bare `type_identifier`.
+        "type_conversion_expression" => node
+            .child_by_field_name("type")
+            .and_then(|type_node| go_leaf_type_name(type_node, source)),
+        "call_expression" => {
+            let function = node.child_by_field_name("function")?;
+            (function.kind() == "type_identifier")
+                .then(|| go_leaf_type_name(function, source))
+                .flatten()
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn find_go_type_parent_id(ctx: &ExtractContext<'_>, name: &str) -> Option<SymbolId> {

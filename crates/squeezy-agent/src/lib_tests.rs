@@ -3699,8 +3699,12 @@ async fn doc_help_subagent_gets_its_own_output_budget_not_summary_cap() {
     config.subagents.max_summary_tokens = 800;
     let agent = Agent::new(config, provider.clone());
 
+    // Use a help question that matches NO curated topic (by id or fuzzy alias)
+    // so it actually escalates to the DocHelp subagent. A phrase like "changing
+    // the model" would now resolve locally via the `model` alias of the
+    // `providers` topic and never reach the subagent.
     let mut rx = agent.start_turn(
-        "/help changing the model".to_string(),
+        "/help wuxyzzy plover xyzzy".to_string(),
         CancellationToken::new(),
     );
     while rx.recv().await.is_some() {}

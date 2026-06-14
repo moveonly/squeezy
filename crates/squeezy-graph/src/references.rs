@@ -7,7 +7,7 @@ use crate::*;
 /// O(distinct files). The cache lives for a single query, so it never serves
 /// stale bytes across queries.
 #[derive(Default)]
-pub(crate) struct SourceCache {
+pub struct SourceCache {
     files: HashMap<FileId, Option<String>>,
     reads: usize,
 }
@@ -307,8 +307,8 @@ impl SemanticGraph {
         }
         let mut same_crate_callable_count = 0u32;
         let mut symbol_seen = false;
-        for id in self.symbols_by_name_or_scan(&symbol.name) {
-            let Some(candidate) = self.symbols.get(&id) else {
+        for id in self.symbols_by_name(&symbol.name) {
+            let Some(candidate) = self.symbols.get(id) else {
                 continue;
             };
             if !matches!(
@@ -426,8 +426,8 @@ impl SemanticGraph {
         let symbol_crate_key = package_key(&symbol_file.relative_path);
         let mut candidates_in_symbol_crate = 0u32;
         let mut symbol_seen = false;
-        for id in self.symbols_by_name_or_scan(&symbol.name) {
-            let Some(candidate) = self.symbols.get(&id) else {
+        for id in self.symbols_by_name(&symbol.name) {
+            let Some(candidate) = self.symbols.get(id) else {
                 continue;
             };
             if !matches!(
@@ -527,8 +527,8 @@ impl SemanticGraph {
         // Symbol must be the unique callable by name within its package.
         let mut count = 0u32;
         let mut symbol_seen = false;
-        for id in self.symbols_by_name_or_scan(&symbol.name) {
-            let Some(candidate) = self.symbols.get(&id) else {
+        for id in self.symbols_by_name(&symbol.name) {
+            let Some(candidate) = self.symbols.get(id) else {
                 continue;
             };
             if !matches!(
@@ -631,8 +631,8 @@ impl SemanticGraph {
         // candidate of its name living under the same namespace tail.
         let mut count = 0u32;
         let mut symbol_seen = false;
-        for id in self.symbols_by_name_or_scan(&symbol.name) {
-            let Some(candidate) = self.symbols.get(&id) else {
+        for id in self.symbols_by_name(&symbol.name) {
+            let Some(candidate) = self.symbols.get(id) else {
                 continue;
             };
             if !matches!(
@@ -1440,7 +1440,7 @@ impl SemanticGraph {
         if !reference_kind_can_bind_symbol(reference, symbol) {
             return false;
         }
-        let candidates = self.symbols_by_name_or_scan(&symbol.name);
+        let candidates = self.symbols_by_name(&symbol.name);
         let mut same_file_candidates = candidates
             .iter()
             .filter_map(|id| self.symbols.get(id))

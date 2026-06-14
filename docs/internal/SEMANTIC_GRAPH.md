@@ -159,9 +159,16 @@ query surface. Before graph tool calls, callers should invoke
 
 Defaults:
 
-- debounce: 500 ms
+- pending-event debounce: 500 ms
 - idle refresh interval: 15 seconds
 - per-tool refresh budget: 250 ms
+- file-watcher debounce window: 10 seconds (`watcher::DEFAULT_DEBOUNCE_MS`) —
+  the `notify-debouncer-full` window the `FileWatcher` waits after the last
+  filesystem event before delivering one coalesced changed-path batch into the
+  pending set. Tuned long enough that an editor "save all" or branch switch
+  merges into a single batch, short enough that the next query still sees the
+  change without a perceptible wait. Distinct from the 500 ms pending-event
+  debounce above, which gates how soon a query acts on already-queued paths.
 
 Refresh is pending-event-first when callers provide authoritative changed
 paths, with a bounded recrawl fallback otherwise. Callers that know paths
@@ -281,7 +288,7 @@ The in-memory graph supports:
 
 The agent-facing graph tool surface is:
 
-- `repo_map` for compact architecture maps, language counts, coverage, and
+- `repo_map` for compact architecture maps, language counts, and
   unsupported-file samples
 - `decl_search` and `definition_search` for declaration lookup and
   disambiguation

@@ -713,12 +713,22 @@ pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> St
         || snapshot.metrics.routing_judge_usd_micros > 0
         || snapshot.metrics.routing_estimated_net_savings_usd_micros != 0
     {
+        let m = &snapshot.metrics;
         out.push_str(&format!(
-            "  routing routed_turns={} escalated={} judge=${:.6} net_savings=${:.6}\n",
-            snapshot.metrics.routed_to_cheap_turns,
-            snapshot.metrics.escalated_to_parent_turns,
-            snapshot.metrics.routing_judge_usd_micros as f64 / 1_000_000.0,
-            snapshot.metrics.routing_estimated_net_savings_usd_micros as f64 / 1_000_000.0,
+            "  routing routed_turns={} escalated={} judge=${:.6}\n",
+            m.routed_to_cheap_turns,
+            m.escalated_to_parent_turns,
+            m.routing_judge_usd_micros as f64 / 1_000_000.0,
+        ));
+        // Honest savings: the actual cheap-tier work vs the "always-strong"
+        // baseline (the same tokens re-priced at the parent model). `net`
+        // subtracts judge + escalation overhead from `gross`. (The cached vs
+        // uncached input split lives in the `/cost` "Cache ROI" section.)
+        out.push_str(&format!(
+            "  savings net=${:.6} gross=${:.6} vs always-strong ~${:.6}\n",
+            m.routing_estimated_net_savings_usd_micros as f64 / 1_000_000.0,
+            m.routing_estimated_savings_usd_micros as f64 / 1_000_000.0,
+            m.routing_strong_baseline_usd_micros as f64 / 1_000_000.0,
         ));
     }
 

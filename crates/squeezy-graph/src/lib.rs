@@ -10,6 +10,7 @@ pub mod backend;
 pub mod cross_file;
 mod languages;
 mod references;
+pub use references::SourceCache;
 mod resolution;
 pub mod resolver_cache;
 pub mod watcher;
@@ -25,8 +26,9 @@ use squeezy_parse::{
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
 use squeezy_workspace::{
-    CrawlOptions, FileRecord, IndexCoverage, IndexingDecision, PathConflict, PriorFileMeta,
-    PriorFileMetadata, VCS_AND_CACHE_DIR_NAMES, WorkspaceCrawler, filesystem_paths_match,
+    CompiledIndexingPolicy, CrawlOptions, FileRecord, IndexCoverage, IndexingDecision,
+    PathConflict, PriorFileMeta, PriorFileMetadata, VCS_AND_CACHE_DIR_NAMES, WorkspaceCrawler,
+    filesystem_paths_match,
 };
 use tracing::{error, warn};
 
@@ -419,6 +421,13 @@ pub struct SemanticGraph {
     body_hit_text_lower: Vec<String>,
     body_hit_trigram_index: HashMap<[u8; 3], Vec<usize>>,
     body_hit_trigram_indexed: bool,
+    /// Fingerprint of the `body_hits` text used to build the current
+    /// `body_hit_text_lower` / `body_hit_trigram_index`. `rebuild_indexes`
+    /// recomputes this from `body_hits` and, when it matches, skips the
+    /// per-hit `to_lowercase()` re-allocation and the trigram rebuild — the
+    /// dominant index-rebuild cost on body-hit-heavy repos when a refresh did
+    /// not actually change any body hit. `None` forces a rebuild.
+    body_hits_fingerprint: Option<u64>,
     references_by_text: HashMap<String, Vec<usize>>,
     children_by_parent: HashMap<SymbolId, Vec<SymbolId>>,
     edges_by_from: HashMap<SymbolId, Vec<usize>>,
@@ -443,6 +452,11 @@ pub struct SemanticGraph {
     /// hash lookup. Glob aliased imports (whose leaf would be `*`) live in
     /// `wildcard_aliased_imports` instead.
     imports_by_alias_target: HashMap<String, Vec<usize>>,
+    /// Aliased imports grouped by their **local alias** (the in-file binding
+    /// name), the dual of [`Self::imports_by_alias_target`]. `reference_search`
+    /// uses this to answer "which imports bind the local name `text`?" without
+    /// scanning every import in the workspace.
+    imports_by_alias: HashMap<String, Vec<usize>>,
     /// Aliased imports whose path leaf is a wildcard (e.g. JS/TS
     /// `import * as M from 'mod'`). These do not bucket by target name, so
     /// they are scanned alongside the by-target hit list.
@@ -545,6 +559,7 @@ impl SemanticGraph {
             body_hit_text_lower: Vec::new(),
             body_hit_trigram_index: HashMap::new(),
             body_hit_trigram_indexed: true,
+            body_hits_fingerprint: None,
             references_by_text: HashMap::new(),
             children_by_parent: HashMap::new(),
             edges_by_from: HashMap::new(),
@@ -552,6 +567,7 @@ impl SemanticGraph {
             ancestor_edges_by_from: HashMap::new(),
             imports_by_file: HashMap::new(),
             imports_by_alias_target: HashMap::new(),
+            imports_by_alias: HashMap::new(),
             wildcard_aliased_imports: Vec::new(),
             java_package_by_file: HashMap::new(),
             kotlin_package_by_file: HashMap::new(),
@@ -618,8 +634,14 @@ impl SemanticGraph {
     }
 
     pub fn replace_files(&mut self, files: Vec<ParsedFile>) {
+        // Batch the per-file purge into a single pass. The previous loop called
+        // `remove_file_data` once per file, and each call did its own full
+        // retain over symbols/imports/calls/references/body_hits/facts plus a
+        // full edge retain — O(files_changed × total_rows). Collecting the
+        // changed ids once and retaining a single time makes it O(total_rows).
+        let changed: HashSet<FileId> = files.iter().map(|file| file.file.id.clone()).collect();
+        self.remove_files_data(&changed);
         for file in files {
-            self.remove_file_data(&file.file.id);
             self.insert_parsed_file(file);
         }
         self.rebuild_java_project_facts();
@@ -627,6 +649,54 @@ impl SemanticGraph {
         self.rebuild_kotlin_project_facts();
         self.rebuild_semantic_edges();
         self.rebuild_indexes();
+    }
+
+    /// Purge all derived data for every file in `file_ids` in a single retain
+    /// pass per collection. Semantically equivalent to calling
+    /// [`Self::remove_file_data`] once per id, but it scans each row vector
+    /// once instead of once per file.
+    fn remove_files_data(&mut self, file_ids: &HashSet<FileId>) {
+        if file_ids.is_empty() {
+            return;
+        }
+        self.files.retain(|id, _| !file_ids.contains(id));
+        self.packages.retain(|id, _| !file_ids.contains(id));
+        self.symbols
+            .retain(|_, symbol| !file_ids.contains(&symbol.file_id));
+        self.imports
+            .retain(|import| !file_ids.contains(&import.file_id));
+        self.calls.retain(|call| !file_ids.contains(&call.file_id));
+        self.references
+            .retain(|reference| !file_ids.contains(&reference.file_id));
+        // Keep `body_hit_text_lower` aligned with `body_hits` (same parallel
+        // vectors as in `remove_file_data`).
+        if self.body_hit_text_lower.len() == self.body_hits.len() {
+            let mut keep = self
+                .body_hits
+                .iter()
+                .map(|hit| !file_ids.contains(&hit.file_id));
+            self.body_hit_text_lower
+                .retain(|_| keep.next().unwrap_or(true));
+        }
+        self.body_hits
+            .retain(|hit| !file_ids.contains(&hit.file_id));
+        self.java_project_facts
+            .retain(|fact| !file_ids.contains(&fact.source_file));
+        self.dotnet_project_facts
+            .retain(|fact| !file_ids.contains(&fact.source_file));
+        self.kotlin_project_facts
+            .retain(|fact| !file_ids.contains(&fact.source_file));
+        // Edges survive only when both endpoints still have a symbol. The
+        // symbol retain above already dropped every removed file's symbols, so
+        // checking membership in the now-current `self.symbols` is correct.
+        self.edges.retain(|edge| {
+            self.symbols.contains_key(&edge.from)
+                && edge
+                    .to
+                    .as_ref()
+                    .map(|to| self.symbols.contains_key(to))
+                    .unwrap_or(true)
+        });
     }
 
     pub fn remove_file(&mut self, file_id: &FileId) {
@@ -667,6 +737,18 @@ impl SemanticGraph {
         self.calls.retain(|call| &call.file_id != file_id);
         self.references
             .retain(|reference| &reference.file_id != file_id);
+        // `body_hits` and `body_hit_text_lower` are parallel vectors addressed
+        // by the same index from `body_hit_trigram_index`. Drop the lowercase
+        // shadow in lockstep so the index does not point past the truncated
+        // `body_hits` (a later rebuild repopulates both, but read paths between
+        // here and that rebuild must still see aligned vectors). The lengths
+        // can legitimately differ before the first `rebuild_indexes`, so guard
+        // on equal length and otherwise leave the shadow for the rebuild.
+        if self.body_hit_text_lower.len() == self.body_hits.len() {
+            let mut keep = self.body_hits.iter().map(|hit| &hit.file_id != file_id);
+            self.body_hit_text_lower
+                .retain(|_| keep.next().unwrap_or(true));
+        }
         self.body_hits.retain(|hit| &hit.file_id != file_id);
         self.java_project_facts
             .retain(|fact| &fact.source_file != file_id);
@@ -896,6 +978,51 @@ impl SemanticGraph {
         nodes
     }
 
+    /// Capped variant of [`Self::hierarchy`] that selects the roots to expand
+    /// **before** building any subtree, so a rootless repo map on a huge
+    /// workspace never materialises the full containment forest just to throw
+    /// most of it away.
+    ///
+    /// When `root` is `Some`, behaves like `hierarchy(Some(root), max_depth)`
+    /// and the returned count is the number of resolved roots (0 or 1). When
+    /// `root` is `None`, every `File` symbol is a candidate root: candidates are
+    /// sorted by name, the first `max_roots` are expanded to `max_depth`, and
+    /// the returned `usize` is the **total** candidate-root count (before the
+    /// `max_roots` cap) so callers can report "showing N of M".
+    pub fn hierarchy_capped(
+        &self,
+        root: Option<&SymbolId>,
+        max_depth: usize,
+        max_roots: usize,
+    ) -> (Vec<HierarchyNode>, usize) {
+        if let Some(root) = root {
+            let nodes = self
+                .hierarchy_node(root, max_depth)
+                .into_iter()
+                .collect::<Vec<_>>();
+            let total = nodes.len();
+            return (nodes, total);
+        }
+
+        // Collect file roots and sort by name first; expansion of each subtree
+        // is the expensive part, so only the selected prefix is expanded.
+        let mut file_roots = self
+            .symbols
+            .values()
+            .filter(|symbol| symbol.kind == SymbolKind::File)
+            .map(|symbol| (symbol.name.clone(), symbol.id.clone()))
+            .collect::<Vec<_>>();
+        file_roots.sort_by(|left, right| left.0.cmp(&right.0));
+        let total_roots = file_roots.len();
+
+        let nodes = file_roots
+            .into_iter()
+            .take(max_roots)
+            .filter_map(|(_, id)| self.hierarchy_node(&id, max_depth))
+            .collect::<Vec<_>>();
+        (nodes, total_roots)
+    }
+
     pub fn signature_search(&self, query: &SignatureQuery) -> Vec<GraphSymbol> {
         let needle = query.text.to_lowercase();
         let visibility = query.visibility.as_deref();
@@ -982,10 +1109,13 @@ impl SemanticGraph {
         // `references_to_symbol` — already does this via
         // `reference_candidate_indexes_for_symbol`; this is the symmetric
         // forward path.
-        for import in &self.imports {
-            if import.alias.as_deref() != Some(text) {
-                continue;
-            }
+        for import in self
+            .imports_by_alias
+            .get(text)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.imports.get(*index))
+        {
             let leaf = last_path_segment(&import.path);
             if leaf.is_empty() || leaf == "*" || leaf == text {
                 continue;
@@ -1019,7 +1149,7 @@ impl SemanticGraph {
         self.references_to_symbol_with_cache(symbol_id, &mut sources)
     }
 
-    pub(crate) fn references_to_symbol_with_cache(
+    pub fn references_to_symbol_with_cache(
         &self,
         symbol_id: &SymbolId,
         sources: &mut references::SourceCache,
@@ -1087,6 +1217,19 @@ impl SemanticGraph {
         symbols
     }
 
+    /// Iterate the graph edges whose source is `from`, in index order, using
+    /// the `edges_by_from` index instead of scanning the full edge vector.
+    /// Callers that only need a subset (a particular [`EdgeKind`], say) can
+    /// filter the returned iterator without materialising an intermediate
+    /// `Vec`.
+    pub fn outgoing_edges(&self, from: &SymbolId) -> impl Iterator<Item = &GraphEdge> + '_ {
+        self.edges_by_from
+            .get(from)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.edges.get(*index))
+    }
+
     pub fn callees(&self, caller: &SymbolId) -> Vec<CallEdgeHit> {
         self.edges_by_from
             .get(caller)
@@ -1152,6 +1295,18 @@ impl SemanticGraph {
             .filter_map(|id| self.symbols.get(id))
             .cloned()
             .collect()
+    }
+
+    /// Borrow the `SymbolId`s indexed under `name` without allocating. Returns
+    /// an empty slice when no symbol carries that name. Read-only callers that
+    /// only iterate the ids (and look each up via [`Self::symbols`]) should
+    /// prefer this over [`Self::symbols_by_name_or_scan`], which clones the
+    /// whole vector on every call.
+    pub fn symbols_by_name(&self, name: &str) -> &[SymbolId] {
+        self.symbols_by_name
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Return all inheritance-style ancestors of `start` (i.e. symbols
@@ -1730,8 +1885,6 @@ impl SemanticGraph {
         self.symbols_by_name.clear();
         self.symbol_signature_lower.clear();
         self.signature_trigram_index.clear();
-        self.body_hit_text_lower.clear();
-        self.body_hit_trigram_index.clear();
         self.references_by_text.clear();
         self.children_by_parent.clear();
         self.edges_by_from.clear();
@@ -1740,6 +1893,19 @@ impl SemanticGraph {
         self.files_by_normalized_id.clear();
         self.case_collisions.clear();
         self.rebuild_import_indexes();
+
+        // Decide up front whether the body-hit lowercase shadow + trigram index
+        // can be reused. They are a pure function of the ordered `body_hits`
+        // text, so an unchanged fingerprint (and a still-aligned shadow vector)
+        // means the existing index is exact and the costly per-hit lowercasing
+        // can be skipped entirely. Only clear them when we will actually rebuild.
+        let body_fingerprint = body_hits_fingerprint(&self.body_hits);
+        let body_hits_unchanged = self.body_hits_fingerprint == Some(body_fingerprint)
+            && self.body_hit_text_lower.len() == self.body_hits.len();
+        if !body_hits_unchanged {
+            self.body_hit_text_lower.clear();
+            self.body_hit_trigram_index.clear();
+        }
 
         // Build a lowercase path → FileId index for O(1) case-insensitive
         // lookups and detect case collisions that indicate Windows casing drift.
@@ -1758,7 +1924,6 @@ impl SemanticGraph {
 
         self.symbols_by_name.reserve(self.symbols.len());
         self.symbol_signature_lower.reserve(self.symbols.len());
-        self.body_hit_text_lower.reserve(self.body_hits.len());
         self.references_by_text.reserve(self.references.len());
         self.children_by_parent.reserve(self.symbols.len());
         self.edges_by_from.reserve(self.edges.len());
@@ -1790,22 +1955,28 @@ impl SemanticGraph {
         // Body hits can dominate huge Java/Go repositories. Build the trigram
         // index only when total hit volume is small enough; otherwise
         // body_search falls back to a direct scan so cold graph builds stay
-        // cheap on million-hit corpora.
-        self.body_hit_text_lower = self
-            .body_hits
-            .iter()
-            .map(|hit| hit.text.to_lowercase())
-            .collect();
-        self.body_hit_trigram_indexed = self.body_hits.len() <= BODY_HIT_TRIGRAM_INDEX_MAX_HITS;
-        if self.body_hit_trigram_indexed {
-            for (index, lower) in self.body_hit_text_lower.iter().enumerate() {
-                for trigram in unique_trigrams(lower) {
-                    self.body_hit_trigram_index
-                        .entry(trigram)
-                        .or_default()
-                        .push(index);
+        // cheap on million-hit corpora. Skip the whole section when the body
+        // hits are byte-identical to the last rebuild (the common no-op /
+        // metadata-only refresh): the existing shadow vector and trigram index
+        // are already exact.
+        if !body_hits_unchanged {
+            self.body_hit_text_lower = self
+                .body_hits
+                .iter()
+                .map(|hit| hit.text.to_lowercase())
+                .collect();
+            self.body_hit_trigram_indexed = self.body_hits.len() <= BODY_HIT_TRIGRAM_INDEX_MAX_HITS;
+            if self.body_hit_trigram_indexed {
+                for (index, lower) in self.body_hit_text_lower.iter().enumerate() {
+                    for trigram in unique_trigrams(lower) {
+                        self.body_hit_trigram_index
+                            .entry(trigram)
+                            .or_default()
+                            .push(index);
+                    }
                 }
             }
+            self.body_hits_fingerprint = Some(body_fingerprint);
         }
 
         for (index, reference) in self.references.iter().enumerate() {
@@ -2079,17 +2250,32 @@ impl SemanticGraph {
     fn rebuild_import_indexes(&mut self) {
         self.imports_by_file.clear();
         self.imports_by_alias_target.clear();
+        self.imports_by_alias.clear();
         self.wildcard_aliased_imports.clear();
         self.java_package_by_file.clear();
         self.kotlin_package_by_file.clear();
         self.scala_package_by_file.clear();
         self.imports_by_file.reserve(self.imports.len());
         self.imports_by_alias_target.reserve(self.imports.len());
+        self.imports_by_alias.reserve(self.imports.len());
         for (index, import) in self.imports.iter().enumerate() {
             self.imports_by_file
                 .entry(import.file_id.clone())
                 .or_default()
                 .push(index);
+            // Index every aliased import by its local alias so the forward
+            // alias-aware `reference_search` can look up "imports binding `x`"
+            // directly. Package markers are skipped: their alias is an internal
+            // sentinel (`__java_package__`, etc.) that a real reference text
+            // can never equal, so indexing them would only add dead entries.
+            if !crate::is_package_marker_alias(import.alias.as_deref())
+                && let Some(alias) = import.alias.as_deref()
+            {
+                self.imports_by_alias
+                    .entry(alias.to_string())
+                    .or_default()
+                    .push(index);
+            }
             if crate::is_package_marker_alias(import.alias.as_deref()) {
                 let segments = path_segments(&import.path);
                 if !segments.is_empty() {
@@ -2226,6 +2412,21 @@ fn unique_trigrams(text: &str) -> BTreeSet<[u8; 3]> {
         .windows(3)
         .map(|window| [window[0], window[1], window[2]])
         .collect()
+}
+
+/// Fingerprint the ordered `body_hits` text so `rebuild_indexes` can detect a
+/// no-op refresh and reuse the existing lowercase shadow + trigram index. The
+/// fingerprint covers only what those indexes derive from: the hit count and
+/// each hit's text in order. Used only for within-process equality, so the
+/// non-deterministic `DefaultHasher` seed is fine.
+fn body_hits_fingerprint(body_hits: &[BodyHit]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body_hits.len().hash(&mut hasher);
+    for hit in body_hits {
+        hit.text.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[derive(Debug, Clone)]
@@ -2536,10 +2737,11 @@ impl GraphManager {
         let watcher_config = watcher_config.with_default_root(manager.root.clone());
         let handle = Arc::clone(&manager.pending_changed_paths);
         let watched_root = manager.root.clone();
+        let policy = Arc::clone(manager.crawler.policy());
         let native_result = watcher::FileWatcher::start(watcher_config.clone(), move |batch| {
             if let Ok(mut paths) = handle.lock() {
                 for path in batch.modified.into_iter().chain(batch.removed) {
-                    if watcher_path_should_enqueue(&watched_root, &path) {
+                    if watcher_path_should_enqueue(&watched_root, &policy, &path) {
                         paths.insert(path);
                     }
                 }
@@ -2548,10 +2750,11 @@ impl GraphManager {
         let polling_start = || {
             let handle = Arc::clone(&manager.pending_changed_paths);
             let watched_root = manager.root.clone();
+            let policy = Arc::clone(manager.crawler.policy());
             watcher::FileWatcher::start_polling(watcher_config, move |batch| {
                 if let Ok(mut paths) = handle.lock() {
                     for path in batch.modified.into_iter().chain(batch.removed) {
-                        if watcher_path_should_enqueue(&watched_root, &path) {
+                        if watcher_path_should_enqueue(&watched_root, &policy, &path) {
                             paths.insert(path);
                         }
                     }
@@ -2665,7 +2868,7 @@ impl GraphManager {
             // best-effort batch so an encoding or write failure here cannot
             // poison the freshly-built graph.
             let mut batch = GraphWriteBatch::new();
-            manager.extend_resolver_cache_batch(&mut batch);
+            manager.extend_resolver_cache_batch(&mut batch, ResolverCacheScope::Full);
             if !batch.is_empty() {
                 let _ = store.apply_graph_batch(&batch);
             }
@@ -2756,10 +2959,21 @@ impl GraphManager {
     /// commit covers metadata, partitions, and resolver cache in one
     /// fsync. Deletion of stale rows for removed files is handled by
     /// the caller via [`GraphWriteBatch::remove_resolver_entry`].
-    fn extend_resolver_cache_batch(&self, batch: &mut GraphWriteBatch) {
-        for (file_id, file) in &self.graph.files {
+    ///
+    /// `scope` controls how much is re-encoded:
+    ///  - [`ResolverCacheScope::Full`] re-encodes every file entry and always
+    ///    rewrites the import-graph blob (cold build / first persist).
+    ///  - [`ResolverCacheScope::Incremental`] re-encodes only the changed
+    ///    files' entries and rewrites the import-graph blob only when an import
+    ///    edge actually changed — so a one-file refresh no longer pays the cost
+    ///    of re-encoding every resolver row plus the whole adjacency blob.
+    fn extend_resolver_cache_batch(&self, batch: &mut GraphWriteBatch, scope: ResolverCacheScope) {
+        let upsert_entry = |file_id: &FileId, batch: &mut GraphWriteBatch| {
+            let Some(file) = self.graph.files.get(file_id) else {
+                return;
+            };
             let Some(slot) = self.graph.resolver_slots.get(file_id) else {
-                continue;
+                return;
             };
             let entry = resolver_cache::ResolverFileEntry {
                 fingerprint: resolver_cache::FileFingerprint {
@@ -2771,18 +2985,37 @@ impl GraphManager {
                 supertypes: slot.supertypes.clone(),
                 builder_snapshot: resolver_cache::BuilderSnapshot::default(),
             };
-            if batch.upsert_resolver_entry(file_id, &entry).is_err() {
-                // Encoding failure: skip this file; warm-start will recompute.
-                continue;
+            // Encoding failure: skip this file; warm-start will recompute.
+            let _ = batch.upsert_resolver_entry(file_id, &entry);
+        };
+
+        let rewrite_import_graph = match scope {
+            ResolverCacheScope::Full => {
+                for file_id in self.graph.files.keys() {
+                    upsert_entry(file_id, batch);
+                }
+                true
             }
-        }
-        let mut snapshot = resolver_cache::ResolverSnapshot::new();
-        for (target, importers) in &self.graph.importers_by_file {
-            for importer in importers {
-                snapshot.record_edge(importer, target);
+            ResolverCacheScope::Incremental {
+                changed,
+                import_edges_changed,
+            } => {
+                for file_id in changed {
+                    upsert_entry(file_id, batch);
+                }
+                import_edges_changed
             }
+        };
+
+        if rewrite_import_graph {
+            let mut snapshot = resolver_cache::ResolverSnapshot::new();
+            for (target, importers) in &self.graph.importers_by_file {
+                for importer in importers {
+                    snapshot.record_edge(importer, target);
+                }
+            }
+            let _ = batch.set_import_graph(&snapshot);
         }
-        let _ = batch.set_import_graph(&snapshot);
     }
 
     pub fn refresh_before_query(&mut self) -> Result<RefreshReport> {
@@ -2850,8 +3083,26 @@ impl GraphManager {
         // fingerprints in so unchanged files are stat-checked instead of fully
         // re-read+hashed, keeping refresh cost proportional to the change set
         // rather than the workspace size.
-        let prior_fingerprints =
+        let mut prior_fingerprints =
             load_prior_fingerprints(self.store.as_deref(), self.store_metadata.as_ref());
+        // A path the watcher flagged as changed must be re-read+hashed even if
+        // its size and mtime look unchanged: editors can rewrite a file with
+        // identical length and a clamped/preserved mtime, and some filesystems
+        // round mtime coarsely enough that a fast edit lands in the same tick.
+        // Dropping these paths' prior fingerprints before the crawl forces the
+        // size+mtime fast-path to fall through to a content hash for exactly
+        // the flagged paths, without changing the crawler.
+        let pending_before_crawl = self
+            .pending_changed_paths
+            .lock()
+            .map(|paths| paths.clone())
+            .unwrap_or_default();
+        if !prior_fingerprints.is_empty() && !pending_before_crawl.is_empty() {
+            let pending_relative_keys = relative_keys_for_paths(&self.root, &pending_before_crawl);
+            if !pending_relative_keys.is_empty() {
+                prior_fingerprints.retain(|key, _| !pending_relative_keys.contains(key));
+            }
+        }
         let snapshot = self
             .crawler
             .crawl_with_prior(&self.root, &prior_metadata_view(&prior_fingerprints))?;
@@ -2913,8 +3164,12 @@ impl GraphManager {
             .unwrap_or_default();
         // Pre-compute canonical forms for all pending event paths once so the
         // matching loops below do not repeatedly call canonicalize on the same
-        // event path.
-        let pending_canonicals = PendingCanonicals::from_paths(&pending_changed_paths);
+        // event path. Policy-pruned paths skip canonicalization entirely.
+        let pending_canonicals = PendingCanonicals::from_paths(
+            &self.root,
+            self.crawler.policy(),
+            &pending_changed_paths,
+        );
         let mut supported_changed_records = current
             .values()
             .filter(|record| record.language != LanguageKind::Unsupported)
@@ -3041,26 +3296,50 @@ impl GraphManager {
             // on a previous run) the row would otherwise leak.
             graph_batch.remove_resolver_entry(file_id);
         }
+        // Track whether a supported->Unsupported flip purged derived data via
+        // `remove_file_data`. When that is the only change in a refresh (no
+        // reparsed files, no metadata change, no removals) the index rebuild
+        // below would otherwise be skipped, leaving `edges_by_from`/
+        // `symbols_by_name`/etc. pointing at the just-purged symbols.
+        let mut unsupported_purged = false;
         for record in unsupported_changed_records {
             // A file that flipped from a supported language to unsupported
             // still has its old symbols/edges/calls/references/packages/facts
             // in the graph. Purge all derived data for the file before
             // recording the unsupported placeholder, otherwise the stale rows
             // remain queryable and poison every downstream tool.
+            let was_supported = self
+                .graph
+                .files
+                .get(&record.id)
+                .map(|old| old.language != LanguageKind::Unsupported)
+                .unwrap_or(false);
             self.graph.remove_file_data(&record.id);
             self.graph.files.insert(record.id.clone(), record.clone());
+            if was_supported {
+                unsupported_purged = true;
+            }
         }
 
-        let mut parsed_files = Vec::new();
-        for record in supported_changed_records {
+        // Reparse changed records in budget-bounded chunks. `supported_changed_records`
+        // is already sorted by relative path, so chunking preserves a
+        // deterministic processing order. Each chunk goes through
+        // `parse_records`, which fans the work across worker threads once the
+        // chunk is large enough — far cheaper than the previous one-record-at-a-
+        // time loop on a multi-file save or branch switch. The budget is
+        // re-checked between chunks so a long refresh still yields, just at
+        // chunk granularity instead of per file.
+        const REPARSE_CHUNK_SIZE: usize = 64;
+        let mut parsed_files = Vec::with_capacity(supported_changed_records.len());
+        for chunk in supported_changed_records.chunks(REPARSE_CHUNK_SIZE) {
             if started.elapsed() > self.config.per_tool_refresh_budget {
                 budget_exhausted = true;
                 break;
             }
-            bytes_reparsed += record.size_bytes;
-            let parsed = self.parser.parse_record(&record)?;
-            parsed_files.push(parsed);
-            reparsed_files += 1;
+            let (mut parsed_chunk, _summary) = self.parser.parse_records(chunk)?;
+            bytes_reparsed += chunk.iter().map(|record| record.size_bytes).sum::<u64>();
+            reparsed_files += parsed_chunk.len();
+            parsed_files.append(&mut parsed_chunk);
         }
         if !parsed_files.is_empty() {
             if self.store.is_some() {
@@ -3078,7 +3357,7 @@ impl GraphManager {
                 }
             }
             self.graph.replace_files(parsed_files);
-        } else if metadata_refresh_needed || !removed_files.is_empty() {
+        } else if metadata_refresh_needed || !removed_files.is_empty() || unsupported_purged {
             self.graph.rebuild_java_project_facts();
             self.graph.rebuild_dotnet_project_facts();
             self.graph.rebuild_kotlin_project_facts();
@@ -3093,7 +3372,23 @@ impl GraphManager {
         // the in-memory graph update; the warm-start path will fall back
         // to a full rebuild when it cannot find an entry.
         if let Some(store) = self.store.as_deref() {
-            self.extend_resolver_cache_batch(&mut graph_batch);
+            // Only re-encode the resolver rows for files this refresh touched.
+            // The import-graph blob is regenerated from `importers_by_file`,
+            // which only changes when the semantic edges were rebuilt (a reparse,
+            // a removal, or a metadata/unsupported-flip change), so gate the
+            // blob rewrite on exactly those conditions.
+            let changed_set: HashSet<FileId> = changed_files.iter().cloned().collect();
+            let import_edges_changed = reparsed_files > 0
+                || !removed_files.is_empty()
+                || metadata_refresh_needed
+                || unsupported_purged;
+            self.extend_resolver_cache_batch(
+                &mut graph_batch,
+                ResolverCacheScope::Incremental {
+                    changed: &changed_set,
+                    import_edges_changed,
+                },
+            );
             if !graph_batch.is_empty() {
                 let _ = store.apply_graph_batch(&graph_batch);
             }
@@ -3107,11 +3402,26 @@ impl GraphManager {
         // Leave the pending paths queued (already-parsed ones become cheap
         // no-ops on the next pass) and leave `last_refresh` untouched so the
         // next `refresh_before_query` still picks them up immediately.
+        //
+        // Drain by set-difference, not a blanket `clear()`: the watcher runs on
+        // a background thread and can push new paths into the set while this
+        // refresh crawls/parses. Those concurrent events arrived *after* the
+        // snapshot we processed, so clearing everything would silently swallow
+        // them. Remove only the paths we observed at the start of this refresh
+        // and leave anything newer queued for the next pass.
         if !budget_exhausted {
+            let mut live_set_remaining = false;
             if let Ok(mut paths) = self.pending_changed_paths.lock() {
-                paths.clear();
+                paths.retain(|p| !pending_before_crawl.contains(p));
+                live_set_remaining = !paths.is_empty();
             }
-            self.last_refresh = Instant::now();
+            // Advancing `last_refresh` gates both the idle-interval skip and the
+            // debounce skip. Only advance when no concurrent events remain;
+            // otherwise the next `refresh_now` would be debounce-suppressed even
+            // though there is fresh work waiting in the live set.
+            if !live_set_remaining {
+                self.last_refresh = Instant::now();
+            }
         }
         self.build_report.path_conflicts = path_conflicts.clone();
         Ok(RefreshReport {
@@ -3139,14 +3449,12 @@ impl GraphManager {
     }
 }
 
-fn watcher_path_should_enqueue(root: &Path, path: &Path) -> bool {
+fn watcher_path_should_enqueue(root: &Path, policy: &CompiledIndexingPolicy, path: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
-    // Conservative filter: drop only VCS metadata and Squeezy's own cache
-    // (`VCS_AND_CACHE_DIR_NAMES`) so persisting the graph cannot self-trigger
-    // a refresh loop. Heavy-churn build dirs like `target/` and
-    // `node_modules/` stay visible because an `include` glob may re-enable
-    // a subset of them; the crawler does the policy-aware filtering.
-    !relative.components().any(|component| {
+    // Hard guard: always drop VCS metadata and Squeezy's own cache
+    // (`VCS_AND_CACHE_DIR_NAMES`) regardless of policy so persisting the graph
+    // can never self-trigger a refresh loop.
+    if relative.components().any(|component| {
         let std::path::Component::Normal(name) = component else {
             return false;
         };
@@ -3154,7 +3462,40 @@ fn watcher_path_should_enqueue(root: &Path, path: &Path) -> bool {
             return false;
         };
         VCS_AND_CACHE_DIR_NAMES.contains(&name)
-    })
+    }) {
+        return false;
+    }
+    // Policy-aware prune: a watcher event under a default-pruned dir
+    // (`target/`, `node_modules/`, `dist/`, …) is high-churn noise that the
+    // crawl would skip anyway, so enqueuing it just burns refresh budget. Reuse
+    // the crawler's keep/prune decision (`path_reason`) instead of a bare dir-
+    // name check so an `include` glob that re-enables a subset is honoured: when
+    // the policy would still index this path, `path_reason` returns `None` and
+    // we keep it.
+    let relative_str = relative.to_string_lossy();
+    let relative_str = if relative_str.contains('\\') {
+        relative_str.replace('\\', "/")
+    } else {
+        relative_str.into_owned()
+    };
+    if relative_str.is_empty() {
+        return true;
+    }
+    policy.path_reason(&relative_str, false).is_none()
+}
+
+/// Scope for [`GraphManager::extend_resolver_cache_batch`]: how many
+/// resolver-cache rows to re-encode and whether to rewrite the import-graph
+/// blob.
+enum ResolverCacheScope<'a> {
+    /// Re-encode every file entry and rewrite the import-graph blob.
+    Full,
+    /// Re-encode only `changed` files' entries; rewrite the import-graph blob
+    /// only when `import_edges_changed`.
+    Incremental {
+        changed: &'a HashSet<FileId>,
+        import_edges_changed: bool,
+    },
 }
 
 struct LoadedPartitions {
@@ -3289,6 +3630,45 @@ struct PersistedFingerprintFile {
 /// Owned prior-crawl fingerprints, keyed by relative path. Borrowed as a
 /// [`PriorFileMetadata`] when handed to the crawl.
 type PriorFingerprints = HashMap<String, (u64, u128, ContentHash)>;
+
+/// Compute the set of crawl-relative path keys (forward-slash separated,
+/// matching the workspace crawler's `relative_path` spelling) for a set of
+/// absolute paths, relative to `root`. Each path is matched against both the
+/// raw `root` and its canonical form so a `root` spelled differently from the
+/// watcher's canonicalised paths (e.g. `/var` vs `/private/var` on macOS) still
+/// produces a usable key. Paths that fall outside `root` are skipped.
+fn relative_keys_for_paths(root: &Path, paths: &HashSet<PathBuf>) -> HashSet<String> {
+    let canonical_root = root.canonicalize().ok();
+    let to_key = |relative: &Path| -> String {
+        let relative = relative.to_string_lossy();
+        if relative.contains('\\') {
+            relative.replace('\\', "/")
+        } else {
+            relative.into_owned()
+        }
+    };
+    let mut keys = HashSet::with_capacity(paths.len());
+    for path in paths {
+        if let Ok(relative) = path.strip_prefix(root) {
+            keys.insert(to_key(relative));
+            continue;
+        }
+        // Fall back to matching against the canonical root, and to the
+        // canonical form of the path itself, so symlinked roots still resolve.
+        if let Some(canonical_root) = &canonical_root {
+            if let Ok(relative) = path.strip_prefix(canonical_root) {
+                keys.insert(to_key(relative));
+                continue;
+            }
+            if let Ok(canonical_path) = path.canonicalize()
+                && let Ok(relative) = canonical_path.strip_prefix(canonical_root)
+            {
+                keys.insert(to_key(relative));
+            }
+        }
+    }
+    keys
+}
 
 /// Load the prior crawl's per-file fingerprints so the next crawl can skip the
 /// full read+hash of unchanged files (see
@@ -4370,10 +4750,23 @@ struct PendingCanonicals {
 }
 
 impl PendingCanonicals {
-    fn from_paths(paths: &HashSet<PathBuf>) -> Self {
+    /// Build the canonical-path cache, but skip the `canonicalize` (a stat +
+    /// readlink syscall) for any path the indexing policy would prune: those
+    /// paths can never match a kept crawl record, so their canonical form is
+    /// dead weight. Skipping them keeps the syscall count proportional to the
+    /// paths that can actually match instead of to every churny build-dir event
+    /// that slipped into the pending set.
+    fn from_paths(root: &Path, policy: &CompiledIndexingPolicy, paths: &HashSet<PathBuf>) -> Self {
         let entries = paths
             .iter()
-            .map(|p| (p.clone(), std::fs::canonicalize(p).ok()))
+            .map(|p| {
+                let canonical = if watcher_path_should_enqueue(root, policy, p) {
+                    std::fs::canonicalize(p).ok()
+                } else {
+                    None
+                };
+                (p.clone(), canonical)
+            })
             .collect();
         Self { entries }
     }
@@ -4432,6 +4825,37 @@ fn impl_header_implements_trait(header: &str, trait_name: &str) -> bool {
         .unwrap_or_default()
         .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != ':');
     last_path_segment(trait_part) == trait_name
+}
+
+/// Extract the implementing-type leaf name from a trimmed Rust impl header.
+/// `Trait for Concrete` -> `Concrete`, `Concrete<T>` -> `Concrete`. Returns an
+/// empty string when no usable identifier can be parsed (e.g. a bare `impl`
+/// header that survived trimming oddly). Mirrors the parsing in
+/// [`impl_header_matches_type`].
+fn impl_header_type_name(header: &str) -> String {
+    let own_type = header
+        .split_once(" for ")
+        .map(|(_, target)| target)
+        .unwrap_or(header)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != ':');
+    last_path_segment(own_type)
+}
+
+/// Extract the trait leaf name from a trimmed Rust impl header, or `None` for
+/// an inherent `impl Concrete` block with no trait. `Trait for Concrete` ->
+/// `Some("Trait")`. Mirrors the parsing in [`impl_header_implements_trait`].
+fn impl_header_trait_name(header: &str) -> Option<String> {
+    let (trait_part, _) = header.split_once(" for ")?;
+    let trait_part = trait_part
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != ':');
+    let leaf = last_path_segment(trait_part);
+    if leaf.is_empty() { None } else { Some(leaf) }
 }
 
 fn attribute_text_is_cfg(text: &str) -> bool {

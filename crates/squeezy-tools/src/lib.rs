@@ -1802,6 +1802,22 @@ impl ToolRegistry {
         }
     }
 
+    /// Record paths that were just mutated on disk into the semantic graph's
+    /// pending-changed set so the next `refresh_before_query` reparses them
+    /// instead of waiting for the (possibly absent) filesystem watcher. Paths
+    /// should be absolute; the graph canonicalizes them during refresh. No-op
+    /// when the graph manager has not finished opening yet. The lock is taken
+    /// poison-resiliently to match the rest of this crate.
+    pub(crate) fn record_graph_changed_paths<I>(&self, paths: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let mut guard = self.graph.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(manager) = guard.as_mut() {
+            manager.record_changed_paths(paths);
+        }
+    }
+
     pub(crate) async fn prepare_shell_sandbox(
         &self,
         command: &str,
@@ -4941,6 +4957,7 @@ impl ToolRegistry {
             return tool_error(call, err);
         }
         self.invalidate_diff_cache();
+        self.record_graph_changed_paths([path.clone()]);
 
         let cost = ToolCostHint {
             bytes_read: before.as_ref().map_or(0, |bytes| bytes.len() as u64),
@@ -5126,6 +5143,7 @@ impl ToolRegistry {
             return tool_error(call, err);
         }
         self.invalidate_diff_cache();
+        self.record_graph_changed_paths([path.clone()]);
         let after_sha256 = sha256_hex(&buf);
         let cost = ToolCostHint {
             bytes_read: before.len() as u64,
@@ -6087,6 +6105,27 @@ impl StagedApply {
             })
             .sum();
         from_files + from_ops
+    }
+
+    /// Absolute filesystem paths touched by the op at `op_index`, so callers
+    /// can feed them into the semantic graph's pending-changed set. Returns
+    /// both sides of a move (the removed source and the created destination)
+    /// so the graph drops the stale entry and reparses the new one. Empty when
+    /// the index is out of range.
+    pub(crate) fn op_changed_abs_paths(&self, op_index: usize) -> Vec<PathBuf> {
+        match self.ops.get(op_index) {
+            Some(StagedOp::SearchReplace { file_index, .. }) => self
+                .files
+                .get(*file_index)
+                .map(|state| vec![state.path.clone()])
+                .unwrap_or_default(),
+            Some(StagedOp::CreateFile { abs_path, .. }) => vec![abs_path.clone()],
+            Some(StagedOp::DeleteFile { abs_path, .. }) => vec![abs_path.clone()],
+            Some(StagedOp::MoveFile {
+                abs_from, abs_to, ..
+            }) => vec![abs_from.clone(), abs_to.clone()],
+            None => Vec::new(),
+        }
     }
 
     pub(crate) fn changed_files_json(&self) -> Vec<Value> {

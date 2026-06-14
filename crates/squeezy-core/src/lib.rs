@@ -14864,6 +14864,11 @@ pub struct SessionMetrics {
     /// show tiny net-negative routed turns.
     #[serde(default)]
     pub routing_estimated_net_savings_usd_micros: i64,
+    /// Cumulative "always-strong" baseline: what the routed turns' cheap-tier
+    /// work would have cost on the parent model. The cost meter pairs this with
+    /// the actual spend for an honest savings headline.
+    #[serde(default)]
+    pub routing_strong_baseline_usd_micros: u64,
 }
 
 impl SessionMetrics {
@@ -14913,6 +14918,9 @@ impl SessionMetrics {
         self.routing_estimated_net_savings_usd_micros = self
             .routing_estimated_net_savings_usd_micros
             .saturating_add(turn.routing_estimated_net_savings_usd_micros);
+        self.routing_strong_baseline_usd_micros = self
+            .routing_strong_baseline_usd_micros
+            .saturating_add(turn.routing_strong_baseline_usd_micros);
     }
 }
 
@@ -14982,6 +14990,13 @@ pub struct TurnMetrics {
     /// means judge/cheap overhead exceeded the estimated parent cost.
     #[serde(default)]
     pub routing_estimated_net_savings_usd_micros: i64,
+    /// The "always-strong" baseline: what the cheap-tier work would have cost
+    /// if this routed turn had run on the parent model instead — the cheap-main
+    /// token counts re-priced at the parent's per-Mtok rate. Zero when the turn
+    /// was not routed or pricing is missing. Lets the cost meter show an honest
+    /// "you spent $X; always-strong would have been ~$Y".
+    #[serde(default)]
+    pub routing_strong_baseline_usd_micros: u64,
     /// Normalized stop reason token for the most recent LLM completion in this
     /// turn (e.g. `"end_turn"`, `"max_tokens"`, `"refusal"`). `None` when the
     /// turn did not complete normally or no event was received.

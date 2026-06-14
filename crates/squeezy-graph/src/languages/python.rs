@@ -50,6 +50,146 @@ impl SemanticGraph {
         self.python_method_on_class(&class.id, &call.name)
     }
 
+    /// ORM manager dispatch (Django / SQLAlchemy-style): resolve a call whose
+    /// receiver is a model class's manager attribute back to a method on that
+    /// model class. For `User.objects.filter(...)` tree-sitter records the call
+    /// as `name=filter`, `receiver="User.objects"`; we strip the allow-listed
+    /// manager segment (`objects` / `query`), resolve the leading `User` to a
+    /// model class in scope, and look the method up on that class (or its
+    /// bases). Precision is kept high by the manager allow-list and by reusing
+    /// the scope-aware class resolver — we never bind to an arbitrary same-named
+    /// method, and decline outright when the receiver is not a recognised
+    /// `<Class>.<manager>` chain or the head does not resolve to a class.
+    pub(crate) fn python_manager_dispatch_call(
+        &self,
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        if !self.caller_is_python(caller_id) {
+            return None;
+        }
+        let receiver = call.receiver.as_deref()?;
+        // Split the receiver into `<head>.<manager>` and require the trailing
+        // segment to be an allow-listed manager attribute. A bare `objects`
+        // with no class head (`objects.filter()`) is too ambiguous to bind.
+        let (head, manager) = receiver.rsplit_once('.')?;
+        if !is_python_manager_attribute(manager) {
+            return None;
+        }
+        let head = head.trim();
+        if head.is_empty() {
+            return None;
+        }
+        let class_name = last_path_segment(head);
+        let caller = self.symbols.get(caller_id)?;
+
+        // Resolve `<head>` to a model class. `self`/`cls` managers point at the
+        // enclosing class; an imported/aliased name resolves through the same
+        // scope-aware path the rest of the Python resolver uses; otherwise fall
+        // back to a same-file (or unambiguous workspace) class declaration.
+        let class_id = if matches!(head, "self" | "cls") {
+            self.python_class_for_caller(caller_id)?
+        } else if let Some(class) =
+            self.python_class_for_alias(caller, &class_name, Some(call.span.start_byte))
+        {
+            class.id
+        } else {
+            single_symbol(
+                self.python_class_candidates_for_name_in_file(&caller.file_id, &class_name)
+                    .into_iter(),
+            )?
+        };
+
+        self.python_method_on_class_or_bases(&class_id, &call.name)
+    }
+
+    /// Framework route / registry decorator dispatch.
+    ///
+    /// A handler decorated with an allow-listed registry decorator
+    /// (`@app.route`, `@router.get`, `@blueprint.post`, …) is invoked by the
+    /// framework, never by name, so the call graph would otherwise show the
+    /// handler as an unreferenced leaf. The decorator's call-site is the
+    /// registrar (`app` / `router` / a registry class). We resolve that
+    /// registrar to a workspace symbol and return it as the edge source so the
+    /// orchestrator can record a `registrar -> handler` edge.
+    ///
+    /// Precision is held high by two gates:
+    ///   * the handler must carry the parser's `framework:web-route` marker (or
+    ///     a `route:` attribute), i.e. the decorator already matched the
+    ///     parser's framework allow-list; and
+    ///   * the registrar must resolve to a *single* workspace symbol — a
+    ///     registry class brought into scope (`@MyRouter.get`, where `MyRouter`
+    ///     is a class), or, for a bare decorator (`@register`), a unique
+    ///     workspace function/class of that name.
+    ///
+    /// We deliberately decline the common instance-registrar case
+    /// (`router = APIRouter()` then `@router.get(...)`): the parser records no
+    /// symbol for the `router` variable, so there is no resolvable call-site and
+    /// inventing one would be a guess. Returning `None` keeps the heuristic
+    /// allow-list-driven and bounded.
+    pub(crate) fn python_route_decorator_registrar(
+        &self,
+        handler_id: &SymbolId,
+    ) -> Option<SymbolId> {
+        let handler = self.symbols.get(handler_id)?;
+        if !matches!(handler.kind, SymbolKind::Function | SymbolKind::Method) {
+            return None;
+        }
+        if !self.caller_is_python(handler_id) {
+            return None;
+        }
+        // Gate on the parser's framework marker so we only act on decorators the
+        // parser already classified as a web route via its own allow-list.
+        let is_route = handler
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "framework:web-route" || attribute.starts_with("route:"));
+        if !is_route {
+            return None;
+        }
+
+        // Find the raw decorator attribute (the verbatim `@…` text the parser
+        // preserves) whose leaf is an allow-listed route/registry verb.
+        let target = handler
+            .attributes
+            .iter()
+            .filter_map(|attribute| python_decorator_target(attribute))
+            .find(|target| is_python_route_decorator_leaf(last_path_segment(target)))?;
+
+        match target.rsplit_once('.') {
+            // `@Receiver.verb` — only resolvable when `Receiver` is a registry
+            // *class* in scope. Dispatch the verb to a method on that class so
+            // the edge points at real, workspace-defined code.
+            Some((receiver, verb)) => {
+                let receiver = receiver.trim();
+                if receiver.is_empty() || matches!(receiver, "self" | "cls") {
+                    return None;
+                }
+                let receiver_name = last_path_segment(receiver);
+                let class_id = single_symbol(
+                    self.python_class_candidates_for_name_in_file(&handler.file_id, &receiver_name)
+                        .into_iter(),
+                )?;
+                self.python_method_on_class_or_bases(&class_id, verb)
+            }
+            // Bare `@register` — resolve to a unique workspace function/class.
+            None => {
+                let name = target.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                single_symbol(self.symbols_by_name_or_scan(name).into_iter().filter(|id| {
+                    self.symbols
+                        .get(id)
+                        .map(|symbol| {
+                            matches!(symbol.kind, SymbolKind::Function | SymbolKind::Class)
+                        })
+                        .unwrap_or(false)
+                }))
+            }
+        }
+    }
+
     pub(crate) fn python_module_qualified_call(
         &self,
         candidates: &[SymbolId],
@@ -365,6 +505,57 @@ impl SemanticGraph {
             .map(|method_id| method_id == symbol.id)
             .unwrap_or(false)
     }
+}
+
+/// Allow-listed ORM "manager" attributes that stand in front of a model class
+/// in a query expression (`Model.objects.filter(...)`,
+/// `Model.query.get(...)`). Kept deliberately small so the manager-dispatch
+/// heuristic only fires on the well-known Django (`objects`) and
+/// Flask-SQLAlchemy (`query`) idioms and never on an arbitrary attribute
+/// access that happens to be followed by a method call.
+pub(crate) fn is_python_manager_attribute(attribute: &str) -> bool {
+    matches!(attribute.trim(), "objects" | "query")
+}
+
+/// Extract the dotted callee path from a raw Python decorator attribute, or
+/// `None` when the attribute is not a verbatim `@…` decorator (the parser also
+/// stores derived markers like `route:GET` / `framework:web-route` in the same
+/// list). `@router.get("/x")` -> `router.get`; `@register` -> `register`.
+pub(crate) fn python_decorator_target(attribute: &str) -> Option<String> {
+    let trimmed = attribute.trim();
+    let body = trimmed.strip_prefix('@')?;
+    let callee = body
+        .split('(')
+        .next()
+        .unwrap_or(body)
+        .trim()
+        .trim_end_matches('.');
+    if callee.is_empty() {
+        return None;
+    }
+    Some(callee.to_string())
+}
+
+/// Allow-listed route/registry decorator verbs. Matches the HTTP-method and
+/// `route`/`add_*_route` decorators recognised by the parser's framework
+/// heuristic (Flask `@app.route`, FastAPI/Starlette `@router.get`, etc.) plus a
+/// small set of registry verbs, so this resolver only fires on the same idioms.
+pub(crate) fn is_python_route_decorator_leaf(leaf: impl AsRef<str>) -> bool {
+    matches!(
+        leaf.as_ref(),
+        "route"
+            | "get"
+            | "post"
+            | "put"
+            | "patch"
+            | "delete"
+            | "options"
+            | "head"
+            | "websocket"
+            | "register"
+            | "add_url_rule"
+            | "add_api_route"
+    )
 }
 
 pub(crate) fn python_path_segments(path: &str) -> Vec<String> {
