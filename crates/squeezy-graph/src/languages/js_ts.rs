@@ -235,6 +235,203 @@ impl SemanticGraph {
         ids.dedup();
         ids
     }
+
+    /// LANGUAGE-ROI #8: resolve a TS `obj.method()` call by reading the
+    /// TypeScript type annotation on the receiver `obj` (a typed parameter,
+    /// typed body local, or class field) and scoping the lookup to the
+    /// annotated class/interface and its `extends`/`implements` ancestors.
+    ///
+    /// This complements [`Self::inherited_js_ts_method`] (which only handles
+    /// the `this`/`super` receivers): any *named* receiver with a static type
+    /// in source is now bound to the concrete method instead of decaying to a
+    /// `CandidateSet`. We deliberately stay conservative — only a single,
+    /// unambiguous class/interface declaration for the annotated type name is
+    /// accepted (via [`single_symbol`]), so a same-named type in another module
+    /// can never hijack the edge.
+    ///
+    /// Decline conditions:
+    /// * caller is not a JS/TS file,
+    /// * the receiver is `this`/`super`/`self` (handled elsewhere), is not a
+    ///   plain identifier (chained / call / index receivers carry no usable
+    ///   annotation), or has no recoverable TS type annotation,
+    /// * the annotated type name resolves to a built-in/primitive,
+    /// * the type name resolves to zero or more-than-one in-scope
+    ///   class/interface declaration (ambiguous), or
+    /// * neither the class nor its ancestor chain declares `call.name`.
+    pub(crate) fn ts_receiver_typed_method(
+        &self,
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        if !self.caller_is_js_ts(caller_id) {
+            return None;
+        }
+        let receiver = call.receiver.as_deref()?;
+        if matches!(receiver, "this" | "super" | "self") || !is_simple_js_ts_identifier(receiver) {
+            return None;
+        }
+        let type_name = self.ts_receiver_annotated_type(caller_id, receiver)?;
+        let caller = self.symbols.get(caller_id)?;
+        // Require exactly one in-scope class/interface for the annotated type:
+        // a same-named type in another module would otherwise forge a wrong
+        // edge, so decline on ambiguity rather than guess.
+        let candidates =
+            self.js_ts_class_candidates_for_name_in_file(&caller.file_id, &type_name);
+        let class_id = single_symbol(candidates.into_iter())?;
+        if let Some(method) = self.js_ts_method_on_class(&class_id, &call.name) {
+            return Some(method);
+        }
+        self.js_ts_method_in_ancestors(&class_id, &call.name, 0)
+    }
+
+    /// Best-effort static type name of a named receiver inside a JS/TS caller,
+    /// derived from TypeScript type annotations only (no inference).
+    ///
+    /// Resolution order, narrowest scope first:
+    /// 1. the caller's own signature header — a typed parameter
+    ///    (`method(obj: Foo)`) or a typed local visible in the header,
+    /// 2. a typed body local of the caller (`const obj: Foo = ...`), recorded
+    ///    as a child `Const`/`Field`/`Static` symbol whose `signature` carries
+    ///    the annotation,
+    /// 3. a field on the caller's enclosing class (`private obj: Foo;`).
+    ///
+    /// Returns the bare (capitalised, non-builtin) type name, or `None` when no
+    /// usable annotation is found.
+    fn ts_receiver_annotated_type(&self, caller_id: &SymbolId, receiver: &str) -> Option<String> {
+        let caller = self.symbols.get(caller_id)?;
+        // 1. Typed parameter / header-visible local on the caller itself.
+        if let Some(ty) = js_ts_annotated_type_in_signature(&caller.signature, receiver) {
+            return Some(ty);
+        }
+        // 2. Typed body local declared inside the caller.
+        if let Some(ty) = self
+            .children_by_parent
+            .get(caller_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|child_id| self.symbols.get(child_id))
+            .filter(|symbol| {
+                matches!(
+                    symbol.kind,
+                    SymbolKind::Const | SymbolKind::Field | SymbolKind::Static
+                ) && symbol.name == receiver
+            })
+            .find_map(|symbol| js_ts_annotated_type_in_signature(&symbol.signature, receiver))
+        {
+            return Some(ty);
+        }
+        // 3. A field on the caller's enclosing class.
+        let class_id = self.js_ts_class_for_caller(caller_id)?;
+        self.children_by_parent
+            .get(&class_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|child_id| self.symbols.get(child_id))
+            .filter(|symbol| symbol.kind == SymbolKind::Field && symbol.name == receiver)
+            .find_map(|symbol| js_ts_annotated_type_in_signature(&symbol.signature, receiver))
+    }
+}
+
+/// `true` when `text` is a single bare JS/TS identifier (no member access,
+/// call, index, whitespace, or other expression syntax). Chained or
+/// computed receivers carry no usable single annotation, so they decline.
+fn is_simple_js_ts_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first == '$' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
+}
+
+/// Find the TypeScript type annotation attached to `name` inside a declaration
+/// header/signature, e.g. the `Foo` in `method(name: Foo)`, `name?: Foo`, or
+/// `const name: Foo = ...`. Returns the bare capitalised, non-builtin type
+/// name, declining unions/intersections (ambiguous) and primitives.
+fn js_ts_annotated_type_in_signature(signature: &str, name: &str) -> Option<String> {
+    let mut search_from = 0;
+    while let Some(rel) = signature[search_from..].find(name) {
+        let start = search_from + rel;
+        let end = start + name.len();
+        search_from = end;
+        // Whole-identifier match only (so `userName` does not match `user`).
+        let before = signature[..start].chars().next_back();
+        let after_ident = signature[end..].chars();
+        let bounded_before = before
+            .map(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'))
+            .unwrap_or(true);
+        if !bounded_before {
+            continue;
+        }
+        // After the identifier allow an optional `?`, then whitespace, then the
+        // `:` that introduces the annotation. Anything else (`,`, `)`, `=`, a
+        // `.` for member access) means this occurrence is not a binding site.
+        let mut rest = after_ident.as_str().trim_start();
+        rest = rest.strip_prefix('?').map(str::trim_start).unwrap_or(rest);
+        let Some(annotation) = rest.strip_prefix(':') else {
+            continue;
+        };
+        // Reject union / intersection types: the receiver could be any member,
+        // so binding to one is unsound — leave it for the candidate set.
+        let head = annotation
+            .split(['=', ';', ',', ')', '{', '\n'])
+            .next()
+            .unwrap_or(annotation);
+        if head.contains('|') || head.contains('&') {
+            return None;
+        }
+        if let Some(type_name) = js_ts_type_name_from_annotation_str(head) {
+            return Some(type_name);
+        }
+    }
+    None
+}
+
+/// Extract a bare class/interface type name from a TS annotation fragment
+/// (e.g. `Foo`, ` Foo<T>`, `ns.Foo`), returning `None` for primitives,
+/// lowercase-leading names, and non-identifiers. Mirrors the parser's
+/// `js_ts_type_name_from_annotation` so resolver and extractor agree on which
+/// annotations are bindable.
+fn js_ts_type_name_from_annotation_str(annotation: &str) -> Option<String> {
+    let text = annotation
+        .split(['=', ';', ',', ')', '(', '[', ']', '{', '}', '<', '|', '&'])
+        .next()
+        .unwrap_or(annotation)
+        .trim()
+        .trim_start_matches("readonly ")
+        .trim();
+    if text.is_empty()
+        || matches!(
+            text,
+            "any" | "bigint"
+                | "boolean"
+                | "false"
+                | "never"
+                | "null"
+                | "number"
+                | "object"
+                | "string"
+                | "symbol"
+                | "true"
+                | "undefined"
+                | "unknown"
+                | "void"
+        )
+    {
+        return None;
+    }
+    let name = last_path_segment(text);
+    if is_simple_js_ts_identifier(&name)
+        && name
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_uppercase())
+            .unwrap_or(false)
+    {
+        Some(name)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn is_js_ts_language(language: LanguageKind) -> bool {
