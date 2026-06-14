@@ -146,6 +146,23 @@ struct ImpactArgs {
     max_results: Option<usize>,
 }
 
+/// Arguments for the `symbol_at` graph tool: resolve a source position
+/// (line, or byte offset) inside a file to the smallest enclosing symbol.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SymbolAtArgs {
+    /// File path to resolve the position inside.
+    path: String,
+    /// 1-based line number. Used when `byte` is absent.
+    line: Option<u32>,
+    /// Column (currently advisory; the line span already pins the symbol).
+    /// Accepted so editor cursors can pass a full position without an error.
+    #[allow(dead_code)]
+    column: Option<u32>,
+    /// Byte offset into the file. When set, takes precedence over `line`.
+    byte: Option<u32>,
+}
+
 /// Arguments for the `inheritance_hierarchy` graph tool.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3313,6 +3330,10 @@ impl ToolRegistry {
                 Ok(args) => self.execute_impact_blocking(call, args, manager, &refresh),
                 Err(err) => tool_arg_error(call, err),
             },
+            "symbol_at" => match serde_json::from_value::<SymbolAtArgs>(call.arguments.clone()) {
+                Ok(args) => self.execute_symbol_at_blocking(call, args, manager, &refresh),
+                Err(err) => tool_arg_error(call, err),
+            },
             "read_slice" => match serde_json::from_value::<ReadSliceArgs>(call.arguments.clone()) {
                 Ok(args) => self.execute_read_slice_blocking(call, args, Some(graph)),
                 Err(err) => tool_arg_error(call, err),
@@ -4302,6 +4323,110 @@ impl ToolRegistry {
             },
             None,
         )
+    }
+
+    /// Resolve a source position (byte offset or 1-based line) inside a file to
+    /// the smallest enclosing symbol. `byte` wins over `line` when both are
+    /// present. On a hit, returns the standard symbol packet so the caller can
+    /// chain straight into `symbol_context`/`read_slice`; on a miss, returns a
+    /// `symbol: null` body with a `read_slice` next_action so the model can still
+    /// read the requested slice.
+    fn execute_symbol_at_blocking(
+        &self,
+        call: &ToolCall,
+        args: SymbolAtArgs,
+        manager: &GraphManager,
+        refresh: &squeezy_graph::RefreshReport,
+    ) -> ToolResult {
+        let graph = manager.graph();
+        // Resolve the path to an indexed file (case-insensitive exact first,
+        // then the directory-aware fallback) and derive its FileId.
+        let file = graph.find_file_case_insensitive(&args.path).or_else(|| {
+            graph
+                .files
+                .values()
+                .find(|file| path_matches_filter(&file.relative_path, &args.path))
+        });
+        let Some(file) = file else {
+            let mut payload = graph_payload("symbol_at", manager, refresh);
+            payload.insert(
+                "fallback".to_string(),
+                graph_zero_hit_fallback(graph, None, Some(&args.path), None, 0),
+            );
+            payload.insert("symbol".to_string(), Value::Null);
+            payload.insert("packets".to_string(), json!([]));
+            return make_result(
+                call,
+                ToolStatus::Success,
+                Value::Object(payload),
+                ToolCostHint::default(),
+                None,
+            );
+        };
+        let file_id = file.id.clone();
+        let rel_path = file.relative_path.clone();
+
+        let symbol = if let Some(byte) = args.byte {
+            graph.symbol_at_byte(&file_id, byte)
+        } else {
+            // Default the line to 1 when neither byte nor line was supplied so a
+            // bare `{path}` resolves the file's first enclosing symbol instead
+            // of erroring.
+            graph.symbol_at_line(&file_id, args.line.unwrap_or(1))
+        };
+
+        let mut payload = graph_payload("symbol_at", manager, refresh);
+        payload.insert("path".to_string(), json!(rel_path));
+        if let Some(byte) = args.byte {
+            payload.insert("byte".to_string(), json!(byte));
+        } else {
+            payload.insert("line".to_string(), json!(args.line.unwrap_or(1)));
+        }
+        match symbol {
+            Some(symbol) => {
+                let packet = symbol_packet(graph, &symbol, "symbol_at", None);
+                let confidence_distribution =
+                    ToolCostHint::confidence_distribution_from(std::iter::once(symbol.confidence));
+                payload.insert("symbol".to_string(), symbol_json(graph, &symbol));
+                payload.insert("packets".to_string(), json!([packet]));
+                make_result(
+                    call,
+                    ToolStatus::Success,
+                    Value::Object(payload),
+                    ToolCostHint {
+                        matches_returned: 1,
+                        confidence_distribution,
+                        ..ToolCostHint::default()
+                    },
+                    None,
+                )
+            }
+            None => {
+                payload.insert("symbol".to_string(), Value::Null);
+                payload.insert("packets".to_string(), json!([]));
+                payload.insert("reason".to_string(), json!("no_enclosing_symbol"));
+                // Steer the model to read the requested slice anyway. Anchor on
+                // the line when one is known so `read_slice` lands at the cursor.
+                let start_line = args.line.unwrap_or(1);
+                payload.insert(
+                    "next_action".to_string(),
+                    json!({
+                        "tool": "read_slice",
+                        "arguments": {
+                            "path": rel_path,
+                            "start_line": start_line,
+                        },
+                    }),
+                );
+                make_result(
+                    call,
+                    ToolStatus::Success,
+                    Value::Object(payload),
+                    ToolCostHint::default(),
+                    None,
+                )
+            }
+        }
     }
 
     fn execute_read_slice_blocking(
