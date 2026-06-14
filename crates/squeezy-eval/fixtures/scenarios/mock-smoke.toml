@@ -6,7 +6,7 @@ testing scenario authoring, or running in CI without provider keys.
 """
 
 [workspace]
-local = "."
+ephemeral = true
 
 [squeezy]
 provider = "mock"

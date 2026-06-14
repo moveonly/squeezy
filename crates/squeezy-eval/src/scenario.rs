@@ -55,6 +55,13 @@ pub struct Scenario {
     /// MCP discovery + call paths offline.
     #[serde(default)]
     pub mcp: McpScenarioConfig,
+    /// When false, the scenario needs external setup that a clean checkout
+    /// does not have (e.g. a locally-installed MCP server) and is excluded
+    /// from `check --hermetic`. Defaults to true. Only meaningful for
+    /// `provider = "mock"` scenarios, since `--hermetic` already restricts to
+    /// those (everything else needs a provider key).
+    #[serde(default = "default_true")]
+    pub hermetic: bool,
 }
 
 /// Per-scenario MCP overrides. Servers declared here are merged into

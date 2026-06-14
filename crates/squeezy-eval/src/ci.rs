@@ -58,6 +58,10 @@ pub struct CheckOptions {
     /// Optional input-token regression gate. Inert when `baseline_path` is
     /// `None` (the default), so existing `check` invocations are unaffected.
     pub input_regression: InputRegression,
+    /// When true, run only scenarios that need no provider key or external
+    /// setup: `provider = "mock"` and `hermetic = true`. Everything else is
+    /// skipped (and logged). Used by the offline CI job.
+    pub hermetic_only: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -245,6 +249,7 @@ impl Default for CheckOptions {
             junit_path: None,
             parallelism: None,
             input_regression: InputRegression::default(),
+            hermetic_only: false,
         }
     }
 }
@@ -279,6 +284,46 @@ impl CheckReport {
 pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
     let mut entries = collect_scenario_paths(&opts.dir)?;
     entries.sort();
+
+    // Hermetic mode (CI): keep only scenarios that run with no provider key
+    // or external setup — `provider = "mock"` and `hermetic = true`. Skips are
+    // logged, never silent, so a shrinking suite can't masquerade as green.
+    if opts.hermetic_only {
+        let total = entries.len();
+        let mut kept = Vec::with_capacity(entries.len());
+        let mut skipped: Vec<String> = Vec::new();
+        for path in entries {
+            match scenario::load(&path) {
+                Ok(s) => {
+                    let is_mock = s.squeezy.provider.as_deref() == Some("mock");
+                    if is_mock && s.hermetic {
+                        kept.push(path);
+                    } else {
+                        let reason = if is_mock {
+                            "hermetic = false"
+                        } else {
+                            "non-mock provider"
+                        };
+                        skipped.push(format!("{} ({reason})", path.display()));
+                    }
+                }
+                // Let the normal run path surface a parse error rather than
+                // hiding it behind a skip.
+                Err(_) => kept.push(path),
+            }
+        }
+        if !skipped.is_empty() {
+            eprintln!(
+                "check --hermetic: running {} of {total} scenarios; skipped {}:",
+                kept.len(),
+                skipped.len()
+            );
+            for s in &skipped {
+                eprintln!("  - skip {s}");
+            }
+        }
+        entries = kept;
+    }
 
     // Phase 7: parallel runner. `parallelism = None | Some(1)` means
     // serial (back-compat); higher values run scenarios concurrently

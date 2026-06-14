@@ -434,6 +434,55 @@ jobs:
         working-directory: crates/squeezy-tui/tools/termsim/xtermcheck
         run: npm test
 
+  eval-mock-scenarios:
+    name: Eval mock scenarios (offline)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.inputs.checkout_ref || github.ref }}
+
+      - name: Show Rust toolchain
+        run: rustup show
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # The mock eval scenarios drive the real agent/harness end-to-end with a
+      # scripted mock provider — no API key, no network — so they catch harness
+      # regressions (crashes, command-dispatch breakage) the unit tests cannot.
+      # `--bins` also builds the sibling `squeezy-fake-mcp` server the MCP
+      # scenarios spawn.
+      - name: Build eval harness
+        run: cargo build -p squeezy-eval --bins
+
+      # `--hermetic` runs only `provider = "mock"` scenarios with
+      # `hermetic = true`; non-mock (need a key) and `hermetic = false` (need
+      # external setup, e.g. mcp-everything-real) scenarios are skipped and
+      # logged. Settings are pinned to an empty file so an ambient user config
+      # can't leak in.
+      - name: Run hermetic mock scenarios
+        env:
+          SQUEEZY_SETTINGS_PATH: ${{ runner.temp }}/empty-settings.toml
+        run: |
+          : > "$SQUEEZY_SETTINGS_PATH"
+          ./target/debug/squeezy-eval check \
+            crates/squeezy-eval/fixtures/scenarios \
+            --hermetic \
+            --parallelism 4 \
+            --out "${{ runner.temp }}/eval-out" \
+            --junit "${{ runner.temp }}/eval-mock-junit.xml"
+
+      - name: Upload JUnit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: eval-mock-junit
+          path: ${{ runner.temp }}/eval-mock-junit.xml
+          if-no-files-found: warn
+
   coverage-summary:
     name: Coverage summary (${{ matrix.platform }})
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
