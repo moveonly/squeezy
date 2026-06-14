@@ -9604,6 +9604,14 @@ impl TurnRuntime {
             &self.config.model,
             &metrics.routing_cheap_main_provider,
         );
+        // The "always-strong" baseline: the cheap-tier work re-priced at the
+        // parent model's rate. Pairs with the actual spend for an honest meter.
+        metrics.routing_strong_baseline_usd_micros = estimate_cost(
+            self.provider.name(),
+            &self.config.model,
+            &metrics.routing_cheap_main_provider,
+        )
+        .unwrap_or(0);
     }
 
     async fn persist_turn_state(&self, input: TurnPersistInput<'_>) {

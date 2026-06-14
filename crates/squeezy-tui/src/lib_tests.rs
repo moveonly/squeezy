@@ -6367,6 +6367,83 @@ fn format_cost_command_renders_active_buckets() {
 }
 
 #[test]
+fn format_context_command_renders_routing_savings_meter() {
+    use squeezy_agent::{
+        AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
+        SessionAccountingSnapshot, SkillsAccounting, TranscriptShape,
+    };
+    use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
+    use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
+
+    let estimate = RequestTokenEstimate {
+        input_tokens: 1_000,
+        context_window_tokens: Some(200_000),
+        effective_context_window_tokens: None,
+        headroom_tokens: None,
+        max_output_tokens: None,
+        input_budget_tokens: None,
+        remaining_input_tokens: None,
+        used_input_percent_x100: None,
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        estimated: true,
+        limit_source: squeezy_llm::LimitSource::CuratedBundle,
+        limit_confidence: squeezy_llm::LimitConfidence::High,
+        observed_ceiling_tokens: None,
+        models_dev_window_tokens: None,
+        effective_context_window_percent: 95,
+        baseline_reserve_tokens: 12_000,
+    };
+
+    let metrics = SessionMetrics {
+        routed_to_cheap_turns: 3,
+        escalated_to_parent_turns: 1,
+        routing_judge_usd_micros: 1_200,
+        routing_estimated_savings_usd_micros: 50_000,
+        routing_estimated_net_savings_usd_micros: 48_800,
+        routing_strong_baseline_usd_micros: 90_000,
+        ..SessionMetrics::default()
+    };
+
+    let snapshot = SessionAccountingSnapshot {
+        session_id: Some("sess-routing".to_string()),
+        provider: "anthropic",
+        model: "claude-opus-4-8".to_string(),
+        mode: SessionMode::Build,
+        store_responses: false,
+        previous_response_id: None,
+        cost: CostSnapshot {
+            input_tokens: Some(1_000),
+            output_tokens: Some(200),
+            cached_input_tokens: Some(600),
+            cache_write_input_tokens: Some(100),
+            estimated_usd_micros: Some(123_456),
+            ..CostSnapshot::default()
+        },
+        metrics,
+        redactions: 0,
+        transcript: TranscriptShape::default(),
+        conversation: ConversationShape::default(),
+        attachments: AttachmentShape::default(),
+        transmitted_request: estimate,
+        full_history_request: estimate,
+        skills: SkillsAccounting::default(),
+        mcp: McpAccounting::default(),
+        calibration_source: squeezy_agent::CalibrationSource::GlobalFile,
+        budget_policy: BudgetPolicySnapshot::default(),
+    };
+
+    let output = strip_ansi_escape_sequences(&commands::format_context_command(&snapshot));
+    assert!(
+        output.contains("routing routed_turns=3 escalated=1"),
+        "{output}"
+    );
+    assert!(
+        output.contains("savings net=$0.048800 gross=$0.050000 vs always-strong ~$0.090000"),
+        "{output}"
+    );
+}
+
+#[test]
 fn format_cost_command_renders_by_model_drill() {
     use squeezy_agent::{
         AttachmentShape, BudgetPolicySnapshot, ConversationShape, McpAccounting,
