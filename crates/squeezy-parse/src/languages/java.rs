@@ -80,7 +80,33 @@ pub(crate) fn visit_java_node(
         }
         "object_creation_expression" => {
             extract_java_object_creation(node, ctx, owner_symbol.clone());
-            visit_java_children(node, ctx, parent_symbol, owner_symbol);
+            if let Some(body) = java_first_child_of_kind(node, "class_body") {
+                // Anonymous class (`new T(){ ... }`): promote it to a synthetic
+                // Partial Class so the type, its base/interface relationship, and
+                // its overridden members are visible and reparent correctly.
+                let symbol = java_anonymous_class_symbol(node, ctx, parent_symbol.as_ref());
+                let next_parent = Some((symbol.id.clone(), symbol.kind));
+                let next_owner = Some(symbol.id.clone());
+                ctx.symbols.push(symbol);
+                // Recurse the constructor arguments under the outer owner, but
+                // the class body under the synthetic anonymous class so its
+                // members reparent there.
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if child.id() == body.id() {
+                        visit_java_children(
+                            child,
+                            ctx,
+                            next_parent.clone(),
+                            next_owner.clone(),
+                        );
+                    } else {
+                        visit_java_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
+                    }
+                }
+            } else {
+                visit_java_children(node, ctx, parent_symbol, owner_symbol);
+            }
         }
         "method_reference" => {
             extract_java_method_reference(node, ctx, owner_symbol.clone());
@@ -687,6 +713,69 @@ pub(crate) fn extract_java_annotation_reference(
         kind: BodyHitKind::Attribute,
         span,
     });
+}
+
+pub(crate) fn java_first_child_of_kind<'tree>(
+    node: Node<'tree>,
+    kind: &str,
+) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+/// Synthesize a `Partial` Class symbol for an anonymous-class object creation
+/// (`new Runnable(){ ... }`). Without it the anonymous type is invisible, its
+/// supertype relationship is lost, and its overridden methods reparent to the
+/// wrong owner. The supertype named after `new` is recorded as `base:<Name>`;
+/// the shared inheritance-edge pass later classifies it as `Extends` (the base
+/// is a class) or `Implements` (the base is an interface) from the resolved
+/// target's kind, so we need not decide here.
+pub(crate) fn java_anonymous_class_symbol(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> ParsedSymbol {
+    let span = span_from_node(node);
+    let name = format!(
+        "__anonymous_class_{}_{}",
+        span.start.line, span.start.column
+    );
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let body = java_first_child_of_kind(node, "class_body");
+    let body_span = body.map(span_from_node);
+    let signature_span = signature_span_from_nodes(node, body);
+    let signature = signature_text(node, body, ctx.source);
+    let id = symbol_id(&ctx.file, parent_id.as_ref(), SymbolKind::Class, &name, span);
+    let mut attributes = vec!["java:anonymous-class".to_string()];
+    if let Some(type_node) = node.child_by_field_name("type")
+        && let Ok(text) = node_text(type_node, ctx.source)
+        && let Some(base) = java_type_name_from_text(text)
+    {
+        attributes.push(format!("base:{base}"));
+    }
+    attributes.sort();
+    attributes.dedup();
+
+    ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name,
+        kind: SymbolKind::Class,
+        language_identity: None,
+        span,
+        body_span,
+        signature_span,
+        signature,
+        visibility: None,
+        docs: Vec::new(),
+        attributes,
+        provenance: Provenance::new("tree-sitter-java", "anonymous class"),
+        confidence: Confidence::Partial,
+        freshness: Freshness::Fresh,
+        arity: None,
+    }
 }
 
 pub(crate) fn java_first_name_descendant(node: Node<'_>) -> Option<Node<'_>> {
