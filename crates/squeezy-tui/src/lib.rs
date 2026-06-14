@@ -216,20 +216,21 @@ pub mod testing;
 pub(crate) use events::apply_mcp_status_update;
 pub(crate) use events::{
     drain_agent_events, drain_job_events, drain_pending_diff, drain_pending_mention_walk,
-    drain_plan_housekeeping, drain_repo_status,
+    drain_plan_housekeeping, drain_repo_pr, drain_repo_status,
 };
 #[cfg(test)]
 pub(crate) use input::set_input;
 pub(crate) use input::{HistoryDirection, SLASH_COMMANDS, SelectionDirection, SlashCommand};
 use input::{
     clear_input, complete_selected_slash_command, delete_at_cursor, delete_before_cursor,
-    delete_next_word, delete_previous_word, delete_to_line_end, delete_to_line_start,
-    handle_mention_popup_key, handle_overlay_key, handle_request_user_input_key, input_cursor,
-    insert_input_char, insert_input_text, move_input_cursor_down, move_input_cursor_left,
-    move_input_cursor_line_end, move_input_cursor_line_start, move_input_cursor_right,
-    move_input_cursor_up, move_input_cursor_word_left, move_input_cursor_word_right,
-    move_slash_menu_selection, push_input_history, recall_prompt_history,
-    reject_unknown_slash_command,
+    delete_buffer_at_cursor, delete_buffer_before_cursor, delete_next_word, delete_previous_word,
+    delete_to_line_end, delete_to_line_start, handle_mention_popup_key, handle_overlay_key,
+    handle_request_user_input_key, input_cursor, insert_buffer_char, insert_input_char,
+    insert_input_text, move_buffer_cursor_left, move_buffer_cursor_right, move_input_cursor_down,
+    move_input_cursor_left, move_input_cursor_line_end, move_input_cursor_line_start,
+    move_input_cursor_right, move_input_cursor_up, move_input_cursor_word_left,
+    move_input_cursor_word_right, move_slash_menu_selection, push_input_history,
+    recall_prompt_history, reject_unknown_slash_command,
 };
 
 use notification::DesktopNotifier;
@@ -1007,11 +1008,28 @@ async fn run_inner_with_terminal(
     // largest contributor to time-to-interactive; nothing on the input
     // path depends on the result, so the status bar fills in once it lands.
     let (repo_status_tx, repo_status_rx) = oneshot::channel::<RepoStatus>();
+    let (repo_pr_tx, repo_pr_rx) = oneshot::channel::<Option<u64>>();
     let repo_status_root = config.workspace_root.clone();
     tokio::task::spawn_blocking(move || {
-        let _ = repo_status_tx.send(RepoStatus::detect_at(&repo_status_root));
+        // Publish the local git status (branch + changed files + branch
+        // delta) first so the status bar fills in immediately, then run the
+        // network `gh pr view` probe on its own channel where a slow or
+        // hung `gh` can only delay the PR number, never the local status.
+        let local = RepoStatus::detect_local_at(&repo_status_root);
+        let branch = local.branch.clone();
+        let available = local.available;
+        let _ = repo_status_tx.send(local);
+        let pull_request = if available {
+            branch
+                .as_deref()
+                .and_then(|b| probe_pull_request(&repo_status_root, b))
+        } else {
+            None
+        };
+        let _ = repo_pr_tx.send(pull_request);
     });
     app.repo_status_rx = Some(repo_status_rx);
+    app.repo_pr_rx = Some(repo_pr_rx);
     // Per-Workspace UI Profile (§12.7.4): restore the UI preferences remembered
     // for this workspace path (density, transcript detail, minimap pane, theme)
     // before the first paint, so the session opens exactly as the user left it
@@ -1025,6 +1043,19 @@ async fn run_inner_with_terminal(
     // session that never picked one keeps the built-in Unicode default; a malformed
     // value is ignored.
     restore_glyph_mode(&mut app);
+    // Per-Terminal Profiles (§12.7.3): pin the saved profile override and reflect
+    // its glyph fidelity into the live glyph mode before the first paint. The
+    // mouse + colour legs of the same profile were already applied at terminal
+    // entry (they must precede mouse-capture arming and the palette's first
+    // resolution); this covers the override pin and the glyph leg. Runs after
+    // `restore_glyph_mode` so a dedicated `[tui].glyph_mode` key still wins.
+    restore_terminal_profile(&mut app);
+    // Gesture Settings (§12.7.5): load the saved gesture/input accommodations
+    // (wheel step, Shift-wheel pan, hover dwell, double-click routing, drag-select)
+    // before the first event so the live input path honours them without the user
+    // re-opening the editor. A session that never customized gestures keeps the
+    // built-in default.
+    restore_gesture_settings(&mut app);
     // Adaptive Density (§12.4.1): restore the density override the user pinned in
     // a prior session from the user-scope config before the first paint, so a
     // session opens at the chosen density (or `Auto`, the default) without
@@ -1134,6 +1165,7 @@ async fn run_inner_with_terminal(
         // therefore coalesces into a single frame.
         drain_plan_housekeeping(&mut app);
         drain_repo_status(&mut app);
+        drain_repo_pr(&mut app);
         drain_job_events(&mut app);
         drain_agent_events(&mut app).await;
         if app.auto_drain_queue {
@@ -1661,28 +1693,34 @@ async fn apply_plan_choice(
         PlanChoiceAction::Refine => {
             app.status = "stay in Plan; describe the refinement".into();
         }
-        PlanChoiceAction::Discard => match std::fs::remove_file(&pending.plan_path) {
-            Ok(()) => {
-                app.push_log(format!(
-                    "plan {} discarded ({} deleted)",
-                    pending.plan_id,
-                    compact_path(&pending.plan_path)
-                ));
-                if app.current_plan_id.as_deref() == Some(pending.plan_id.as_str()) {
-                    app.current_plan_id = None;
+        PlanChoiceAction::Discard => {
+            let sid = app.plan_session_id().to_string();
+            // Route through `delete_plan` so the on-disk `current` pointer is
+            // cleared when it named this plan; a direct `remove_file` would leave
+            // the pointer aimed at a now-deleted plan id.
+            match proposed_plan::delete_plan(&app.workspace_root, &sid, &pending.plan_id) {
+                Ok(removed) => {
+                    app.push_log(format!(
+                        "plan {} discarded ({} deleted)",
+                        pending.plan_id,
+                        compact_path(&removed)
+                    ));
+                    if app.current_plan_id.as_deref() == Some(pending.plan_id.as_str()) {
+                        app.current_plan_id = None;
+                    }
+                    if app.pending_plan_handoff.as_deref() == Some(pending.plan_path.as_path()) {
+                        app.pending_plan_handoff = None;
+                        app.plan_handoff_turns_seen = 0;
+                    }
                 }
-                if app.pending_plan_handoff.as_deref() == Some(pending.plan_path.as_path()) {
-                    app.pending_plan_handoff = None;
-                    app.plan_handoff_turns_seen = 0;
+                Err(err) => {
+                    app.push_log(format!(
+                        "could not delete plan file {}: {err}",
+                        compact_path(&pending.plan_path)
+                    ));
                 }
             }
-            Err(err) => {
-                app.push_log(format!(
-                    "could not delete plan file {}: {err}",
-                    compact_path(&pending.plan_path)
-                ));
-            }
-        },
+        }
     }
 }
 
@@ -1731,7 +1769,13 @@ fn apply_mcp_action(
                 snapshot_active_scope_for_undo(app);
                 if let Err(err) = persist_mcp_toggle(app, &server, enabled) {
                     pop_undo_snapshot(app);
-                    feedback.push(format!("mcp toggle persist failed: {err}"), Severity::Error);
+                    feedback.push(
+                        format!(
+                            "mcp toggle applied for this session only \
+                             (reverts on restart) — settings.toml write failed: {err}"
+                        ),
+                        Severity::Warn,
+                    );
                 }
             }
             agent.set_mcp_server_enabled_in_background(server, enabled);
@@ -1748,7 +1792,13 @@ fn apply_mcp_action(
                 snapshot_active_scope_for_undo(app);
                 if let Err(err) = persist_mcp_add(app, &name, &server) {
                     pop_undo_snapshot(app);
-                    feedback.push(format!("mcp add persist failed: {err}"), Severity::Error);
+                    feedback.push(
+                        format!(
+                            "mcp add applied for this session only \
+                             (reverts on restart) — settings.toml write failed: {err}"
+                        ),
+                        Severity::Warn,
+                    );
                 }
             }
             let mut next = app
@@ -1808,7 +1858,13 @@ fn apply_mcp_action(
                         // Drop the unused undo entry — the write
                         // failed so there is nothing to revert.
                         pop_undo_snapshot(app);
-                        feedback.push(format!("mcp remove persist failed: {err}"), Severity::Error);
+                        feedback.push(
+                            format!(
+                                "mcp remove applied for this session only \
+                                 (reverts on restart) — settings.toml write failed: {err}"
+                            ),
+                            Severity::Warn,
+                        );
                     }
                 }
             }
@@ -2079,6 +2135,7 @@ async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: 
         || app.pending_approval.is_some()
         || app.pending_mcp_elicitation.is_some()
         || app.pending_plan_choice.is_some()
+        || app.pending_request_user_input.is_some()
         || app.pending_feedback.is_some()
         || app.config_screen.is_some()
         || app.status_line_setup.is_some()
@@ -3877,6 +3934,11 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
             let now = std::time::Instant::now();
             let hit = app.click_target_at(mouse.column, mouse.row);
             let previewable = hit.filter(|(key, _)| hover_preview::policy_for(*key).hover_preview);
+            // Honour the configured hover dwell (§12.7.5) on the live recognizer
+            // before it classifies this Move, so a tuned `hover_dwell_ms` drives
+            // the arm threshold instead of the built-in default.
+            app.gestures
+                .set_dwell_ms(u128::from(app.effective_gesture_settings().hover_dwell_ms));
             // ONE recognizer Move drives BOTH the Hover Preview popover (§12.1.4)
             // and the Mouse Hover Intent affordance (§12.1.3): the same debounced
             // `HoverEnter`/`HoverLeave` gesture, so they can never disagree about
@@ -4050,7 +4112,14 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // through the cell→`Pos` mapping AND the word/row snapping below, so a
     // single press (which both maps the cell and may snap a word/row) rebuilds
     // the transcript row list once instead of two or three times.
-    if app.transcript_overlay.is_none() && app.config_screen.is_none() {
+    if app.transcript_overlay.is_none()
+        && app.config_screen.is_none()
+        // §12.7.5 `drag_select`: a press only arms a main-text selection when the
+        // user has left drag-select on (the default). With it off the press falls
+        // through (a header click still focuses above), and the Drag/Up arms below
+        // no-op because no main selection is ever live to extend or release.
+        && app.effective_gesture_settings().drag_select
+    {
         match mouse.kind {
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 let rows = main_surface_rows(app);
@@ -4245,6 +4314,7 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // wrapped view. Shift+ScrollUp pans left (toward column 0), Shift+ScrollDown
     // pans right (toward the line end), mirroring the vertical-wheel direction.
     if mouse.modifiers.contains(KeyModifiers::SHIFT)
+        && app.effective_gesture_settings().shift_wheel_pan
         && app.transcript_overlay.is_none()
         && app.config_screen.is_none()
         && app.status_line_setup.is_none()
@@ -4268,22 +4338,23 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // their own offset), not always main's, so wheeling a selected subagent
     // transcript still reports the change and triggers a redraw.
     //
-    // Each wheel notch moves a fixed 3 lines; a burst of N notches sums to N
-    // steps because each event scrolls independently.
-    const WHEEL_STEP_LINES: usize = 3;
+    // Each wheel notch moves the configured number of lines (§12.7.5
+    // `scroll_lines`, default 3); a burst of N notches sums to N steps because
+    // each event scrolls independently.
+    let wheel_step_lines = app.effective_gesture_settings().scroll_lines as usize;
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             // A wheel scroll is the pointer sweeping content, not dwelling on a
             // target: §12.1.3 says it must suppress (and hide) any hover reveal.
             hover_suppress_scroll(app);
             let before = active_transcript_scroll(app);
-            scroll_transcript_up(app, WHEEL_STEP_LINES);
+            scroll_transcript_up(app, wheel_step_lines);
             active_transcript_scroll(app) != before
         }
         MouseEventKind::ScrollDown => {
             hover_suppress_scroll(app);
             let before = active_transcript_scroll(app);
-            scroll_transcript_down(app, WHEEL_STEP_LINES);
+            scroll_transcript_down(app, wheel_step_lines);
             active_transcript_scroll(app) != before
         }
         _ => false,
@@ -4370,17 +4441,22 @@ fn main_scrollbar_from_bottom_from_mouse(app: &TuiApp, column: u16, row: u16) ->
 /// The painted wrapped rows of the MAIN transcript surface this frame — the
 /// exact `Vec<Line>` `render_transcript` drew, so a `selection::Pos` row indexes
 /// them faithfully. Rebuilt from the cached width + startup-card flag.
-fn main_surface_rows(app: &TuiApp) -> Vec<Line<'static>> {
-    let cache = app.main_text_area_cache.get();
-    // Rebuild the SAME row list the frame painted: wrapped to the text column when
-    // soft-wrap was on, unwrapped (one row per logical line) when off (§11G.4).
-    // Threading the cached `soft_wrap` keeps selection/copy row indices aligned
-    // with the painted rows in both modes.
-    let (build_width, include_card) = match cache {
+/// The `(build_width, include_startup_card)` the main surface's painted rows were
+/// built with this frame: wrapped to the text column when soft-wrap was on,
+/// unwrapped (one row per logical line) when off (§11G.4). Threading the cached
+/// `soft_wrap` keeps selection/copy/search row indices aligned with the painted
+/// rows in both modes. Shared by `main_surface_rows` and the search row-kind path
+/// so the rows and their kinds are always derived from the SAME inputs.
+fn main_surface_render_params(app: &TuiApp) -> (Option<u16>, bool) {
+    match app.main_text_area_cache.get() {
         Some(c) if c.soft_wrap => (Some(c.text_area.width.max(1)), c.include_startup_card),
         Some(c) => (None, c.include_startup_card),
         None => (Some(main_text_width(app).max(1)), false),
-    };
+    }
+}
+
+fn main_surface_rows(app: &TuiApp) -> Vec<Line<'static>> {
+    let (build_width, include_card) = main_surface_render_params(app);
     transcript_lines_for_render(app, build_width, include_card)
 }
 
@@ -4808,14 +4884,25 @@ fn copy_active_selection(app: &mut TuiApp) -> bool {
 /// Copy whichever app-level selection is active so every copy chord (`⌘C`,
 /// `Ctrl+Shift+C`, `Ctrl+C`) shares one funnel. A live COMPOSER selection wins
 /// over the transcript selection — the user is selecting in the prompt box, so
-/// the chord copies that substring verbatim. Returns `true` when something was
-/// copied. Does NOT clear the selection — callers decide (explicit copy chords
-/// clear via [`clear_all_text_selections`], copy-on-release keeps the highlight
-/// for quote/add-to-set follow-ups).
+/// the chord copies that substring verbatim. When the disjoint multi-select set
+/// holds committed ranges the chord copies the whole set (plus any live
+/// transcript range), so the standard copy never silently drops the highlighted
+/// committed ranges. Returns `true` when something was copied. Does NOT clear the
+/// selection — callers decide (explicit copy chords clear via
+/// [`clear_all_text_selections`], copy-on-release keeps the highlight for
+/// quote/add-to-set follow-ups).
 fn copy_any_active_selection(app: &mut TuiApp) -> bool {
     // Precedence matches the mutually-exclusive arming order: a live screen
-    // (chrome) selection, else the composer, else the transcript.
-    copy_screen_selection(app) || copy_input_selection(app) || copy_active_selection(app)
+    // (chrome) selection, else the composer, else the transcript. The transcript
+    // tier copies the committed multi-select set (combined with any live range)
+    // when it is non-empty, so the highlighted set is never silently dropped.
+    copy_screen_selection(app)
+        || copy_input_selection(app)
+        || if app.selection_set.is_empty() {
+            copy_active_selection(app)
+        } else {
+            copy_multi_selection(app)
+        }
 }
 
 /// Copy the live screen-buffer (chrome) selection by reading the painted glyphs
@@ -6492,20 +6579,7 @@ fn read_persisted_terminal_profile(
     app: &TuiApp,
     caps: terminal_profile::TerminalCapabilities,
 ) -> Option<terminal_profile::TerminalProfile> {
-    let fallback = terminal_profile::TerminalProfile::resolve(caps);
-    let kind = caps.kind.as_str();
-    let text = std::fs::read_to_string(app.user_settings_path()).ok()?;
-    let doc = text.parse::<toml::Table>().ok()?;
-    let table = doc
-        .get("tui")?
-        .as_table()?
-        .get("terminal_profiles")?
-        .as_table()?
-        .get(kind)?
-        .as_table()?;
-    terminal_profile::TerminalProfile::from_config_lookup(fallback, |key| {
-        table.get(key).and_then(|v| v.as_str()).map(str::to_string)
-    })
+    read_startup_terminal_profile(&app.user_settings_path(), caps)
 }
 
 /// The status line shown while the Per-Terminal Profiles overlay is open: the
@@ -6872,6 +6946,40 @@ fn read_persisted_glyph_mode(app: &TuiApp) -> Option<glyph_mode::GlyphMode> {
 fn restore_glyph_mode(app: &mut TuiApp) {
     if let Some(mode) = read_persisted_glyph_mode(app) {
         app.glyph_mode = mode;
+    }
+}
+
+/// Per-Terminal Profiles (§12.7.3): load the persisted profile for the detected
+/// terminal into the live `terminal_profile_override` before the first event, and
+/// reflect its glyph fidelity into `app.glyph_mode` so a saved ASCII profile draws
+/// ASCII chrome. The mouse + colour legs are applied earlier, at terminal entry
+/// (they must land before the first paint and before mouse capture is armed); this
+/// covers the override pin and the glyph leg, which live on the `TuiApp`. The
+/// dedicated `[tui].glyph_mode` key wins when set (the user picked a glyph mode
+/// explicitly), so this only maps the profile's `ascii` glyphs onto the glyph mode
+/// when no separate glyph-mode override is persisted.
+fn restore_terminal_profile(app: &mut TuiApp) {
+    let caps = terminal_profile::TerminalCapabilities::detect();
+    let Some(profile) = read_persisted_terminal_profile(app, caps) else {
+        return;
+    };
+    app.terminal_profile_override = Some(profile);
+    if profile.glyphs == terminal_profile::GlyphSet::Ascii
+        && read_persisted_glyph_mode(app).is_none()
+    {
+        app.glyph_mode = glyph_mode::GlyphMode::Ascii;
+    }
+}
+
+/// Gesture Settings (§12.7.5): load the persisted `[tui.gestures]` override into
+/// the live `gesture_settings_override` before the first event, so the input path
+/// (wheel step, Shift-wheel pan, hover dwell, double-click routing, drag-select)
+/// honours the user's saved accommodations without re-opening the editor. A
+/// session that never customized gestures keeps `None` (the built-in default); a
+/// malformed table collapses to `None`.
+fn restore_gesture_settings(app: &mut TuiApp) {
+    if let Some(settings) = read_persisted_gesture_settings(app) {
+        app.gesture_settings_override = Some(settings);
     }
 }
 
@@ -8210,6 +8318,9 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         // the text clipboard empty. Only when the composer owns the surface (no
         // modal/overlay that runs its own paste routing): `handle_paste` already
         // gates those for text, but the image path bypasses it, so guard here.
+        // The platform-helper fallbacks run on the blocking pool with a bounded
+        // wait so a wedged clipboard helper never freezes the event loop; a
+        // timeout falls through to the same unavailable handling as no helper.
         if app.config_screen.is_none()
             && app.theme_editor.is_none()
             && !app.scratchpad_open
@@ -8218,24 +8329,44 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
             && app.paste_preview.is_none()
             && app.paste_transform.is_none()
             && app.editor_handoff.is_none()
-            && let Some((bytes, media_type)) = app
-                .clipboard
-                .read_image()
-                .or_else(clipboard::read_system_clipboard_image)
         {
-            let media_type = detect_image_mime(&bytes)
-                .map(str::to_string)
-                .unwrap_or(media_type);
-            let placeholder =
-                insert_prompt_image_token(app, "[Image clipboard]".to_string(), media_type, bytes);
-            app.status = format!("inserted {placeholder}");
-            app.needs_redraw = true;
-            return Ok(false);
+            let image = match app.clipboard.read_image() {
+                Some(image) => Some(image),
+                None => match clipboard::read_system_clipboard_image_bounded().await {
+                    Ok(image) => image,
+                    Err(()) => {
+                        app.status = "clipboard read timed out".to_string();
+                        app.needs_redraw = true;
+                        return Ok(false);
+                    }
+                },
+            };
+            if let Some((bytes, media_type)) = image {
+                let media_type = detect_image_mime(&bytes)
+                    .map(str::to_string)
+                    .unwrap_or(media_type);
+                let placeholder = insert_prompt_image_token(
+                    app,
+                    "[Image clipboard]".to_string(),
+                    media_type,
+                    bytes,
+                );
+                app.status = format!("inserted {placeholder}");
+                app.needs_redraw = true;
+                return Ok(false);
+            }
         }
-        let pasted = app
-            .clipboard
-            .read_text()
-            .or_else(clipboard::read_system_clipboard);
+        let pasted = match app.clipboard.read_text() {
+            Some(text) => Some(text),
+            None => match clipboard::read_system_clipboard_bounded().await {
+                Ok(text) => text,
+                Err(()) => {
+                    app.status = "clipboard read timed out".to_string();
+                    app.needs_redraw = true;
+                    return Ok(false);
+                }
+            },
+        };
         match pasted {
             Some(text) if !text.is_empty() => {
                 handle_paste(app, agent, text).await?;
@@ -10011,6 +10142,20 @@ fn dispatch_keymap_action_inner(
         && action != keymap::Action::ToggleLatencyOverlay
         && action != keymap::Action::ToggleDogfoodMetrics
         && action != keymap::Action::ToggleLayoutFallbackDiag
+    {
+        return false;
+    }
+    // A pending question/approval modal owns the surface. Its keys are routed by
+    // the dedicated handlers (handle_request_user_input_key, handle_plan_choice_key,
+    // handle_approval_key, handle_mcp_elicitation_key, handle_feedback_prompt_key)
+    // which run after this dispatch; each consumes raw key codes, not keymap
+    // actions. Blocking every keymap action here keeps an overlay-opening chord
+    // (e.g. ToggleSnippets) from firing on top of the modal.
+    if app.pending_request_user_input.is_some()
+        || app.pending_plan_choice.is_some()
+        || app.pending_approval.is_some()
+        || app.pending_mcp_elicitation.is_some()
+        || app.pending_feedback.is_some()
     {
         return false;
     }
@@ -14001,11 +14146,15 @@ fn jump_to_subagent_index(app: &mut TuiApp, index: usize) -> bool {
         return false;
     }
     // Capture the return anchor BEFORE mutating the active source, so a back
-    // command restores exactly where the user was.
-    let prior_was_main = matches!(app.subagent_pane.active, ConversationSource::Main);
+    // command restores exactly where the user was — the prior source (main or a
+    // subagent, since a jump can chain from one subagent to another) and that
+    // source's scroll position.
+    let prior_source = app.subagent_pane.active;
+    let prior_scroll = active_transcript_scroll(app);
     app.subagent_return_anchor = Some(subagent_preview::SubagentReturnAnchor::new(
         app.subagent_pane.selected,
-        prior_was_main,
+        prior_source,
+        prior_scroll,
     ));
     // Pin the cursor + active source onto the jumped-to subagent, then surface its
     // transcript via the same full-screen overlay the Enter path uses.
@@ -14025,18 +14174,30 @@ fn jump_to_subagent_index(app: &mut TuiApp, index: usize) -> bool {
 
 /// Restore the conversation the user was on before a subagent jump (§12.8.2),
 /// consuming the return anchor. Returns `true` when an anchor was outstanding (so
-/// the caller knows the back command did something). Re-pins the prior pane
-/// selection and active source; a stale anchor (the prior subagent pruned away)
-/// degrades gracefully to the main conversation.
+/// the caller knows the back command did something). Restores the prior active
+/// source and that source's scroll position; a stale anchor (the prior subagent
+/// pruned away) degrades gracefully to the main conversation.
 fn restore_subagent_return_anchor(app: &mut TuiApp) -> bool {
     let Some(anchor) = app.subagent_return_anchor.take() else {
         return false;
     };
-    app.subagent_pane.active = ConversationSource::Main;
+    // Restore the prior source, healing to main when the prior subagent record is
+    // gone, so a return never strands the user on a vanished conversation.
+    let restored_source = match anchor.prior_source {
+        ConversationSource::Subagent(id)
+            if app.subagent_pane.records.iter().any(|r| r.id == id) =>
+        {
+            ConversationSource::Subagent(id)
+        }
+        _ => ConversationSource::Main,
+    };
+    app.subagent_pane.active = restored_source;
     app.subagent_pane.focused = false;
     app.subagent_pane.selected = anchor.prior_selected.min(app.subagent_pane.records.len());
-    let _ = anchor.prior_was_main;
-    active_transcript_scroll_mut(app).pin_to_bottom();
+    // Re-apply the prior scroll onto the now-active source (the accessor routes to
+    // main's transcript or the active subagent's record), so a scrolled-up reader
+    // resumes there and a follower keeps following the tail.
+    *active_transcript_scroll_mut(app) = anchor.prior_scroll;
     app.clamp_subagent_selection();
     app.status = "returned from subagent".to_string();
     app.needs_redraw = true;
@@ -14095,8 +14256,9 @@ fn promote_subagent_at_index(app: &mut TuiApp, index: usize) -> bool {
     };
     let prompt = source.project();
     // Idle fills the composer (editable draft the user reviews); an active turn
-    // queues the prompt behind it. Either way the user still submits/drains it —
-    // the spec is explicit that a promote never auto-submits.
+    // queues the prompt behind it. A promote never auto-submits, so a queued
+    // promote is stamped Manual: it stays in place until the user runs it by
+    // hand rather than auto-draining when the running turn completes.
     let destination = subagent_promote::PromoteDestination::for_turn(app.turn_rx.is_some());
     match destination {
         subagent_promote::PromoteDestination::Composer => {
@@ -14105,6 +14267,10 @@ fn promote_subagent_at_index(app: &mut TuiApp, index: usize) -> bool {
         subagent_promote::PromoteDestination::Queue => {
             app.prompt_queue.push_back(prompt);
             enqueue_queue_id(app);
+            if let Some(id) = app.prompt_queue_ids.back().copied() {
+                app.prompt_queue_conditions
+                    .set(id, queue_conditions::QueueCondition::Manual);
+            }
         }
     }
     app.status = match destination {
@@ -14114,10 +14280,9 @@ fn promote_subagent_at_index(app: &mut TuiApp, index: usize) -> bool {
             destination.verb(),
         ),
         subagent_promote::PromoteDestination::Queue => format!(
-            "promoted {} \u{2014} {} ({} in queue)",
+            "promoted {} \u{2014} {} (manual, run when ready)",
             source.name,
             destination.verb(),
-            app.prompt_queue.len(),
         ),
     };
     app.needs_redraw = true;
@@ -14629,7 +14794,6 @@ fn toggle_command_palette(app: &mut TuiApp) {
     } else {
         let palette = command_palette::CommandPalette::build(
             &app.keymap,
-            app.turn_rx.is_some(),
             input::SlashMenuVisibility {
                 checkpoints_enabled: app.checkpoints_enabled,
                 reviewer_enabled: app.reviewer_enabled,
@@ -17397,20 +17561,28 @@ fn subagent_timeline_status(
 /// (§12.8.1) consumes. Pure data extraction: each row carries the subagent's id,
 /// role label, lifecycle status, latest activity line, elapsed seconds (computed
 /// from the record's monotonic `started` instant via a *saturating* duration — no
-/// back-dated subtraction that could underflow a fresh clock), tool count, and
-/// the child-reported cost in USD micros (the subagent provider's spend, falling
-/// back to the main provider's). A cap-rejected record has no start time and so
-/// reports `None` elapsed/cost — the spec's "accurate cost depends on child
-/// metrics" / cap-rejection cases, rendered honestly downstream.
+/// back-dated subtraction that could underflow a fresh clock — and frozen at the
+/// record's `ended` instant once it finishes, so a completed/failed subagent's
+/// run time stops climbing instead of drifting up forever), tool count, and the
+/// child-reported cost in USD micros (the subagent provider's spend, falling back
+/// to the main provider's). A cap-rejected record has no start time and so reports
+/// `None` elapsed/cost — the spec's "accurate cost depends on child metrics" /
+/// cap-rejection cases, rendered honestly downstream.
 fn build_subagent_timeline_sources(app: &TuiApp) -> Vec<subagent_timeline::SubagentTimelineSource> {
     let now = std::time::Instant::now();
     app.subagent_pane
         .records
         .iter()
         .map(|record| {
-            let elapsed_secs = record
-                .started
-                .map(|started| now.saturating_duration_since(started).as_secs());
+            // A finished record freezes at `ended - started`; a running one
+            // still counts up from `started` against `now`.
+            let elapsed_secs = record.started.map(|started| {
+                record
+                    .ended
+                    .unwrap_or(now)
+                    .saturating_duration_since(started)
+                    .as_secs()
+            });
             let (tool_count, cost_micros) = match record.metrics.as_ref() {
                 Some(metrics) => {
                     let tools = metrics.subagent_tool_calls.max(metrics.tool_calls);
@@ -17767,8 +17939,16 @@ const QUEUE_UNDO_CAP: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum QueueMutation {
     /// An item was deleted. Undo re-inserts `text` at `index` (clamped) with
-    /// its original `id` so its hit-target identity is restored too.
-    Deleted { index: usize, id: u64, text: String },
+    /// its original `id` so its hit-target identity is restored too, and
+    /// reattaches `condition` so a restored conditional prompt (e.g. an
+    /// `IfPrevFailed` recovery prompt) does not silently come back unconditional
+    /// and auto-run on the next drain.
+    Deleted {
+        index: usize,
+        id: u64,
+        text: String,
+        condition: queue_conditions::QueueCondition,
+    },
     /// An item was moved. Recorded by *stable id*, not absolute index, so a
     /// front-drain between the move and its undo cannot stale the record:
     /// `id` is the moved item; `prev` is the id that sat immediately before
@@ -17899,6 +18079,7 @@ fn queue_delete_by_id(app: &mut TuiApp, id: u64) -> bool {
     let Some(index) = queue_index_for_id(app, id) else {
         return false;
     };
+    let condition = app.prompt_queue_conditions.get(id);
     let text = app
         .prompt_queue
         .remove(index)
@@ -17912,6 +18093,7 @@ fn queue_delete_by_id(app: &mut TuiApp, id: u64) -> bool {
             index,
             id,
             text: text.clone(),
+            condition,
         },
     );
     clamp_queue_focus(app);
@@ -17958,11 +18140,19 @@ fn queue_undo(app: &mut TuiApp) -> bool {
         return false;
     };
     match &mutation {
-        QueueMutation::Deleted { index, id, text } => {
+        QueueMutation::Deleted {
+            index,
+            id,
+            text,
+            condition,
+        } => {
             let at = (*index).min(app.prompt_queue.len());
             app.prompt_queue.insert(at, text.clone());
             app.prompt_queue_ids.insert(at, *id);
             app.next_queue_id = app.next_queue_id.max(id + 1);
+            // Reattach the run-condition the delete pruned, so the restored item
+            // keeps its gate instead of defaulting to `Always`.
+            app.prompt_queue_conditions.set(*id, *condition);
             app.status = "undid delete".to_string();
         }
         QueueMutation::Reordered { id, prev } => {
@@ -18525,6 +18715,11 @@ fn queue_run_selected_next(app: &mut TuiApp) -> bool {
     if let Some(id) = app.prompt_queue_ids.get(plan.from).copied() {
         app.prompt_queue_conditions
             .set(id, queue_conditions::QueueCondition::Always);
+        // A paused group parks every member before its condition is even
+        // consulted, so the cleared condition alone won't let the chosen prompt
+        // run. Pull just this prompt out of its group so it drains, leaving the
+        // rest of the batch parked.
+        app.prompt_queue_groups.remove_member(id);
     }
     let mut changed = false;
     if plan.moves {
@@ -18657,7 +18852,9 @@ fn begin_queue_edit(app: &mut TuiApp, id: u64) -> bool {
     app.input_cursor = app.input.len();
     app.editing_queue_id = Some(pick.id);
     // Pulling the prompt into the composer closes the overlay and abandons any
-    // in-flight reorder; the queue keeps draining normally meanwhile.
+    // in-flight reorder. While `editing_queue_id` is set the drain pump is
+    // parked (`prompt_queue_drain_blocked`), so the stale text can't run before
+    // the user saves or abandons the edit.
     app.prompt_queue_overlay = None;
     app.prompt_queue_drag = None;
     app.status = "editing queued prompt — Enter saves the change".to_string();
@@ -19336,6 +19533,16 @@ fn dispatch_card_gesture(app: &mut TuiApp, gesture: interaction::Gesture) -> Car
             action: Some(interaction::Action::ToggleEntryCollapsed(id)),
             ..
         } => {
+            // §12.7.5 `double_click` picks what the double-click does. `None`
+            // leaves it inert (treated as two single clicks — the caret's single-
+            // click toggle already ran on the first press, so falling through is a
+            // no-op for the second). `Expand` keeps the established default: expand
+            // a collapsed card, else open it in detail. `OpenDetail` always opens
+            // the entry in the Ctrl+T detail overlay regardless of collapsed state.
+            let double_click = app.effective_gesture_settings().double_click;
+            if matches!(double_click, gesture_settings::DoubleClickAction::None) {
+                return CardPress::Ignored;
+            }
             // A live preview is dismissed the moment a gesture activates.
             dismiss_hover_preview(app);
             let collapsed = active_transcript_entries(app)
@@ -19343,7 +19550,9 @@ fn dispatch_card_gesture(app: &mut TuiApp, gesture: interaction::Gesture) -> Car
                 .find(|entry| entry.id == id.0)
                 .is_some_and(|entry| entry.collapsed);
             let policy = hover_preview::policy_for(interaction::TargetKey::Entry(id));
-            if collapsed {
+            let expand_first =
+                matches!(double_click, gesture_settings::DoubleClickAction::Expand) && collapsed;
+            if expand_first {
                 dispatch_click_action(app, interaction::Action::ExpandEntry(id));
             } else if policy.activates_on_double_click()
                 && let Some(action) = policy.primary_activate
@@ -19493,6 +19702,23 @@ fn diff_detail_pane_entry_present(app: &TuiApp) -> bool {
     active_transcript_entries(app)
         .iter()
         .any(|entry| entry.id == pane.entry_id)
+}
+
+/// Whether the overlay is currently wide enough to actually paint the detail
+/// pane (`split_overlay_content` succeeds at the live terminal size). A pinned
+/// pane is invisible below [`diff_detail_pane::MIN_SPLIT_WIDTH`], so the scroll
+/// controls must be no-ops there rather than scrolling a pane nobody can see.
+fn diff_detail_pane_splittable(app: &TuiApp) -> bool {
+    let (width, height) = app.off_frame_terminal_size();
+    let full_area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let (content_area, _) = transcript_overlay_content_and_status_areas(full_area);
+    let inner = transcript_overlay_inner(content_area);
+    diff_detail_pane::split_overlay_content(inner).is_some()
 }
 
 /// `(total_rows, viewport_h)` for the detail pane. Prefers the LAST PAINTED text
@@ -20235,7 +20461,6 @@ fn request_turn_interrupt(app: &mut TuiApp) -> bool {
     }
     if let Some(pending) = app.pending_mcp_elicitation.take() {
         let _ = pending.response_tx.send(McpElicitationResponse::cancel());
-        clear_mcp_elicitation_seeded_input(app);
         interrupted = true;
     }
     if interrupted {
@@ -21795,10 +22020,14 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
             }
             Err(error) => set_status_notice(app, format!("session export failed: {error}")),
         },
-        DispatchCommand::SessionExportHtml { id, path } => {
-            let target = path
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(format!("squeezy-session-{id}.html")));
+        DispatchCommand::SessionExportHtml { id, path, force } => {
+            let target = match path {
+                Some(path) => resolve_workspace_path(&app.workspace_root, &path),
+                None => resolve_workspace_path(
+                    &app.workspace_root,
+                    &format!("squeezy-session-{id}.html"),
+                ),
+            };
             match agent.show_session(&id).and_then(|record| {
                 squeezy_agent::export_session_to_html(
                     &record,
@@ -21807,19 +22036,29 @@ async fn apply_dispatch_command(app: &mut TuiApp, agent: &mut Agent, cmd: Dispat
                 .map_err(|err| {
                     squeezy_core::SqueezyError::Tool(format!("failed to render html: {err}"))
                 })
-                .and_then(|html| {
-                    std::fs::write(&target, &html).map_err(squeezy_core::SqueezyError::from)?;
-                    Ok(html.len())
-                })
             }) {
-                Ok(len) => {
-                    app.status = format!("wrote {} ({} bytes)", target.display(), len);
-                    app.push_transcript_item(TranscriptItem::system(format!(
-                        "Wrote session export HTML to {} ({} bytes).",
-                        target.display(),
-                        len
-                    )));
-                }
+                Ok(html) => match write_export_atomically(&target, &html, force) {
+                    Ok(()) => {
+                        let len = html.len();
+                        app.status = format!("wrote {} ({} bytes)", target.display(), len);
+                        app.push_transcript_item(TranscriptItem::system(format!(
+                            "Wrote session export HTML to {} ({} bytes).",
+                            target.display(),
+                            len
+                        )));
+                    }
+                    Err(error) => {
+                        let message = if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            format!(
+                                "session export html failed: {} already exists (append `!` to overwrite)",
+                                target.display(),
+                            )
+                        } else {
+                            format!("session export html failed: {error}")
+                        };
+                        set_status_notice(app, message);
+                    }
+                },
                 Err(error) => {
                     set_status_notice(app, format!("session export html failed: {error}"))
                 }
@@ -23053,11 +23292,18 @@ fn export_to_file(
 /// file under `<workspace>/<name>/`. The `dir` name is already validated
 /// (workspace-relative, no traversal) by `parse_export_request`, so this only
 /// composes the final path.
+/// Unix timestamp in milliseconds for export/bundle filenames. Millisecond
+/// granularity keeps two writes in the same wall-clock second from resolving
+/// to the same path and silently clobbering one another. Takes `now` so the
+/// builders stay unit-testable with distinct instants.
+fn export_timestamp_millis(now: std::time::SystemTime) -> u128 {
+    now.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 fn configured_dir_export_path(app: &TuiApp, dir: &str, format: copy::CopyFormat) -> PathBuf {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let ts = export_timestamp_millis(std::time::SystemTime::now());
     app.workspace_root
         .join(dir)
         .join(format!("transcript-{ts}.{}", format.file_extension()))
@@ -23071,10 +23317,7 @@ fn default_export_path(app: &TuiApp, agent: &Agent, format: copy::CopyFormat) ->
         .session_id()
         .or_else(|| app.session_id.clone())
         .unwrap_or_else(|| "default".to_string());
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let ts = export_timestamp_millis(std::time::SystemTime::now());
     app.workspace_root
         .join(".squeezy")
         .join("exports")
@@ -23105,8 +23348,8 @@ fn export_tmp_path(target: &Path) -> PathBuf {
 /// When `force` is `false` an already-existing `target` is refused with
 /// [`std::io::ErrorKind::AlreadyExists`] *before* any tmp file is written, so a
 /// `/export md notes.md` can never silently clobber a workspace source. The
-/// timestamped destinations (and `/bundle`) pass `force = true` because their
-/// paths are collision-free by construction.
+/// millisecond-stamped destinations (and `/bundle`) pass `force = true`
+/// because their paths embed a millisecond timestamp keyed by session id.
 fn write_export_atomically(target: &Path, content: &str, force: bool) -> std::io::Result<()> {
     if !force && target.exists() {
         return Err(std::io::Error::new(
@@ -23171,8 +23414,9 @@ fn handle_bundle_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
     );
 
     let target = bundle_export_path(app, &meta, request.format);
-    // The bundle path is timestamped and collision-free, so overwrite-guarding it
-    // would only ever produce a false positive; write with `force = true`.
+    // The bundle path embeds a millisecond timestamp keyed by session id, so
+    // overwrite-guarding it would only ever produce a false positive; write
+    // with `force = true`.
     match write_export_atomically(&target, &bundle.artifact, true) {
         Ok(()) => {
             app.status = format!(
@@ -23265,15 +23509,15 @@ fn bundle_export_path(
     meta: &session_bundle::BundleMeta,
     format: session_bundle::BundleFormat,
 ) -> PathBuf {
+    // The manifest keeps `generated_at_unix` in seconds for human reading, but
+    // the file name needs millisecond granularity so two `/bundle` calls in the
+    // same second land on distinct paths instead of clobbering each other.
+    let ts = export_timestamp_millis(std::time::SystemTime::now());
     app.workspace_root
         .join(".squeezy")
         .join("bundles")
         .join(&meta.session_id)
-        .join(format!(
-            "session-bundle-{}.{}",
-            meta.generated_at_unix,
-            format.file_extension()
-        ))
+        .join(format!("session-bundle-{}.{}", ts, format.file_extension()))
 }
 
 /// Build a compact terminal diagnostic string for the `/terminal` command.
@@ -23719,7 +23963,13 @@ fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     // keys move the PANE while the plain keys keep moving the transcript — so
     // the transcript context the spec wants preserved stays reachable. Matched
     // before the plain scroll arms (which ignore Shift) so the modifier wins.
-    if app.diff_detail_pane.is_some() && key.modifiers.contains(KeyModifiers::SHIFT) {
+    // Gated on the pane actually being splittable: below the min width the pane
+    // is invisible, so Shift+scroll falls through to the transcript instead of
+    // scrolling a pane nobody can see.
+    if app.diff_detail_pane.is_some()
+        && diff_detail_pane_splittable(app)
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+    {
         match key.code {
             KeyCode::Up => {
                 scroll_diff_detail_pane(app, VerticalScrollDir::Up, 1);
@@ -24152,12 +24402,14 @@ fn reconcile_queue_after_dispatch(
             .remove(index)
             .or(cursor.id)
             .unwrap_or(next_id);
+        let condition = app.prompt_queue_conditions.get(id);
         push_queue_undo(
             app,
             QueueMutation::Deleted {
                 index,
                 id,
                 text: before[index].clone(),
+                condition,
             },
         );
         app.auto_drain_queue = false;
@@ -24475,11 +24727,13 @@ pub(crate) async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Age
     while app.turn_rx.is_none() && !prompt_queue_drain_blocked(app) {
         // Keep the id sidecar aligned before consulting the group/condition models
         // so a front-drain since the last tick can't stale the pause / condition
-        // lookup. Prune conditions for any drained id too, so the gate never reads
-        // a phantom condition.
+        // lookup. Prune conditions and group membership for any drained id too, so
+        // the gate never reads a phantom condition and the closed-overlay queue
+        // strip never shows a stale member count or an emptied group.
         sync_queue_ids(app);
         let live_ids = queue_live_ids(app);
         app.prompt_queue_conditions.retain_live(&live_ids);
+        app.prompt_queue_groups.retain_live(&live_ids);
         match queue_drain_action(app) {
             queue_conditions::DrainAction::Run(index) => {
                 let Some(next) = app.prompt_queue.remove(index) else {
@@ -24524,7 +24778,16 @@ pub(crate) async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Age
                     // delete) — QueueUndo can then recover an `IfPrevFailed`
                     // recovery prompt that was dropped after a success, etc.
                     if let Some(id) = skipped_id {
-                        push_queue_undo(app, QueueMutation::Deleted { index, id, text });
+                        let condition = app.prompt_queue_conditions.get(id);
+                        push_queue_undo(
+                            app,
+                            QueueMutation::Deleted {
+                                index,
+                                id,
+                                text,
+                                condition,
+                            },
+                        );
                     }
                 }
                 // Same as the Run arm: the queue shrank under an open overlay, so
@@ -24553,6 +24816,7 @@ fn prompt_queue_drain_blocked(app: &TuiApp) -> bool {
         || app.pending_request_user_input.is_some()
         || app.pending_plan_choice.is_some()
         || app.pending_feedback.is_some()
+        || app.editing_queue_id.is_some()
 }
 
 async fn submit_queued_input(app: &mut TuiApp, agent: &mut Agent, raw_input: String) {
@@ -24846,7 +25110,7 @@ fn switch_mode(
 }
 
 fn handle_mcp_elicitation_key(app: &mut TuiApp, key: KeyEvent) -> bool {
-    let Some(pending) = app.pending_mcp_elicitation.take() else {
+    let Some(mut pending) = app.pending_mcp_elicitation.take() else {
         return false;
     };
     let is_form = pending.request.kind == McpElicitationKind::Form;
@@ -24855,7 +25119,7 @@ fn handle_mcp_elicitation_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && (key.code == KeyCode::Char('j') || key.code == KeyCode::Enter)
     {
-        insert_input_char(app, '\n');
+        insert_buffer_char(&mut pending.answer, &mut pending.answer_cursor, '\n');
         keep_mcp_elicitation_pending(app, pending);
         return true;
     }
@@ -24888,39 +25152,39 @@ fn handle_mcp_elicitation_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             send_mcp_elicitation_response(app, pending, McpElicitationChoice::Decline)
         }
         KeyCode::Backspace if is_form => {
-            delete_before_cursor(app);
+            delete_buffer_before_cursor(&mut pending.answer, &mut pending.answer_cursor);
             keep_mcp_elicitation_pending(app, pending);
             true
         }
         KeyCode::Delete if is_form => {
-            delete_at_cursor(app);
+            delete_buffer_at_cursor(&mut pending.answer, &mut pending.answer_cursor);
             keep_mcp_elicitation_pending(app, pending);
             true
         }
         KeyCode::Left if is_form => {
-            move_input_cursor_left(app);
+            move_buffer_cursor_left(&pending.answer, &mut pending.answer_cursor);
             keep_mcp_elicitation_pending(app, pending);
             true
         }
         KeyCode::Right if is_form => {
-            move_input_cursor_right(app);
+            move_buffer_cursor_right(&pending.answer, &mut pending.answer_cursor);
             keep_mcp_elicitation_pending(app, pending);
             true
         }
         KeyCode::Home if is_form => {
-            app.input_cursor = 0;
+            pending.answer_cursor = 0;
             keep_mcp_elicitation_pending(app, pending);
             true
         }
         KeyCode::End if is_form => {
-            app.input_cursor = app.input.len();
+            pending.answer_cursor = pending.answer.len();
             keep_mcp_elicitation_pending(app, pending);
             true
         }
         KeyCode::Char(ch)
             if is_form && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
         {
-            insert_input_char(app, ch);
+            insert_buffer_char(&mut pending.answer, &mut pending.answer_cursor, ch);
             keep_mcp_elicitation_pending(app, pending);
             true
         }
@@ -24944,7 +25208,7 @@ fn send_mcp_elicitation_response(
     match choice {
         McpElicitationChoice::Accept => {
             let content = if pending.request.kind == McpElicitationKind::Form {
-                match parse_mcp_elicitation_form_content(&app.input) {
+                match parse_mcp_elicitation_form_content(&pending.answer) {
                     Ok(content) => Some(content),
                     Err(error) => {
                         app.status = error;
@@ -24959,15 +25223,12 @@ fn send_mcp_elicitation_response(
             let _ = pending
                 .response_tx
                 .send(McpElicitationResponse::accept(content));
-            clear_input(app);
-            app.mcp_elicitation_seeded_input = None;
             app.status = format!("accepted mcp request from {server}");
             true
         }
         McpElicitationChoice::Decline => {
             let server = pending.request.server.clone();
             let _ = pending.response_tx.send(McpElicitationResponse::decline());
-            clear_mcp_elicitation_seeded_input(app);
             app.status = format!("declined mcp request from {server}");
             true
         }
@@ -24977,7 +25238,6 @@ fn send_mcp_elicitation_response(
 fn send_mcp_elicitation_cancel(app: &mut TuiApp, pending: PendingMcpElicitation) -> bool {
     let server = pending.request.server.clone();
     let _ = pending.response_tx.send(McpElicitationResponse::cancel());
-    clear_mcp_elicitation_seeded_input(app);
     app.status = format!("cancelled mcp request from {server}");
     true
 }
@@ -25026,23 +25286,11 @@ fn mcp_elicitation_options() -> &'static [McpElicitationOption] {
     &[MCP_ELICITATION_ACCEPT, MCP_ELICITATION_DECLINE]
 }
 
-pub(crate) fn seed_mcp_elicitation_form_input(app: &mut TuiApp, request: &McpElicitationRequest) {
-    app.mcp_elicitation_seeded_input = None;
-    if request.kind != McpElicitationKind::Form || !app.input.trim().is_empty() {
-        return;
+pub(crate) fn seed_mcp_elicitation_form_answer(request: &McpElicitationRequest) -> String {
+    if request.kind != McpElicitationKind::Form {
+        return String::new();
     }
-    let template = mcp_elicitation_form_template(request.schema.as_ref());
-    app.input = template.clone();
-    app.input_cursor = app.input.len();
-    app.mcp_elicitation_seeded_input = Some(template);
-}
-
-pub(crate) fn clear_mcp_elicitation_seeded_input(app: &mut TuiApp) {
-    if let Some(seeded) = app.mcp_elicitation_seeded_input.take()
-        && app.input == seeded
-    {
-        clear_input(app);
-    }
+    mcp_elicitation_form_template(request.schema.as_ref())
 }
 
 fn mcp_elicitation_form_template(schema: Option<&serde_json::Value>) -> String {
@@ -25135,8 +25383,19 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
                 .unwrap_or_else(approval_once);
             send_approval_decision(app, pending, project)
         }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') | KeyCode::Char('D') => {
+        KeyCode::Char('n') | KeyCode::Char('N') => {
             send_approval_decision(app, pending, approval_deny())
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            // The capability-scoped persistent deny ("never allow … in this
+            // repo"), mirroring `a`'s persistent allow. Falls back to a one-shot
+            // deny when the request has no project-deny option to persist.
+            let deny_project = options
+                .iter()
+                .find(|opt| opt.choice == ApprovalChoice::DenyProject)
+                .cloned()
+                .unwrap_or_else(approval_deny);
+            send_approval_decision(app, pending, deny_project)
         }
         KeyCode::Esc => {
             // The footer advertises "Esc cancel"; honor it by denying this run.
@@ -25158,11 +25417,16 @@ fn send_approval_decision(
     option: ApprovalOption,
 ) -> bool {
     let tool_name = pending.request.tool_name.clone();
+    let persistable = approval::project_allow_is_persistable(&pending.request.permission);
     let _ = pending.decision_tx.send(option.decision);
     app.status = match option.choice {
         ApprovalChoice::Approve => format!("approved {tool_name}"),
-        ApprovalChoice::ApproveProject => format!("saved repo approval for {tool_name}"),
+        ApprovalChoice::ApproveProject if persistable => {
+            format!("saved repo approval for {tool_name}")
+        }
+        ApprovalChoice::ApproveProject => format!("approved {tool_name} (session only)"),
         ApprovalChoice::Deny => format!("denied {tool_name}"),
+        ApprovalChoice::DenyProject => format!("saved repo deny for {tool_name}"),
     };
     true
 }
@@ -25172,6 +25436,7 @@ enum ApprovalChoice {
     Approve,
     ApproveProject,
     Deny,
+    DenyProject,
 }
 
 #[derive(Debug, Clone)]
@@ -25216,31 +25481,55 @@ fn approval_deny() -> ApprovalOption {
     )
 }
 
+fn approval_deny_project(request: &ToolApprovalRequest) -> ApprovalOption {
+    let (label, hint) = capability_project_deny_label(request);
+    ApprovalOption {
+        choice: ApprovalChoice::DenyProject,
+        label,
+        hint,
+        decision: ToolApprovalDecision::DenyRuleProject,
+    }
+}
+
 /// Build the per-capability allow/deny menu for a pending approval. The
 /// menu keeps the obvious one-shot decision first, then offers one
 /// project-scoped allow rule for users who want to persist the decision.
 fn approval_options_for(request: &ToolApprovalRequest) -> Vec<ApprovalOption> {
-    let (project_label, project_hint) = capability_project_label(request);
+    let persistable = approval::project_allow_is_persistable(&request.permission);
+    let (project_label, project_hint) = if persistable {
+        capability_project_label(request)
+    } else {
+        // The backend's persistence guard refuses to save an Allow rule on the
+        // destructive capability or with a wildcard target and resolves the
+        // call as approve-once; label the option for that reach so the prompt
+        // does not promise a durable project rule that will not be written.
+        (
+            std::borrow::Cow::Borrowed("Always allow (session only)"),
+            std::borrow::Cow::Borrowed("cannot be saved to squeezy.toml"),
+        )
+    };
     let project = ApprovalOption {
         choice: ApprovalChoice::ApproveProject,
         label: project_label,
         hint: project_hint,
         decision: ToolApprovalDecision::AllowRuleProject,
     };
-    vec![approval_once(), project, approval_deny()]
+    vec![
+        approval_once(),
+        project,
+        approval_deny(),
+        approval_deny_project(request),
+    ]
 }
 
-/// Returns `(project_label, project_hint)` for the persistent allow option.
-/// Each label names the capability-specific target (binary, host, MCP
-/// server/tool, write root) so the prompt makes the persisted rule shape
-/// visible without forcing the user to read the rule-preview line.
-fn capability_project_label(
+/// Extract the capability-specific scope name (binary, host, MCP server/tool,
+/// write/read path) together with its `(kind, hint_kind)` label words for this
+/// request, or `None` when no concrete scope is available (so the caller falls
+/// back to a generic label). Shared by the allow and deny project-rule labels
+/// so the two never drift in how they name a target.
+fn capability_scope_and_kind(
     request: &ToolApprovalRequest,
-) -> (
-    std::borrow::Cow<'static, str>,
-    std::borrow::Cow<'static, str>,
-) {
-    use std::borrow::Cow;
+) -> Option<(String, &'static str, &'static str)> {
     let permission = &request.permission;
     let scope_name: Option<String> = match permission.capability {
         PermissionCapability::Shell => permission
@@ -25277,20 +25566,14 @@ fn capability_project_label(
         | PermissionCapability::Compiler
         | PermissionCapability::Destructive => None,
     };
-    let Some(scope) = scope_name.and_then(|s| {
+    let scope = scope_name.and_then(|s| {
         let trimmed = s.trim().to_string();
         if trimmed.is_empty() || trimmed == "*" {
             None
         } else {
             Some(trimmed)
         }
-    }) else {
-        return (
-            Cow::Borrowed("Always approve this command in this repo"),
-            Cow::Borrowed("save a project rule"),
-        );
-    };
-    let scope_display = compact_text(&scope, 60);
+    })?;
     let (kind, hint_kind) = match permission.capability {
         PermissionCapability::Shell => ("command", "command"),
         PermissionCapability::Network => ("host", "host"),
@@ -25305,6 +25588,51 @@ fn capability_project_label(
         | PermissionCapability::Compiler
         | PermissionCapability::Destructive => ("command", "command"),
     };
+    Some((scope, kind, hint_kind))
+}
+
+/// Returns `(deny_label, deny_hint)` for the persistent project-deny option,
+/// naming the same capability scope as the allow option so the two read as a
+/// matched pair.
+fn capability_project_deny_label(
+    request: &ToolApprovalRequest,
+) -> (
+    std::borrow::Cow<'static, str>,
+    std::borrow::Cow<'static, str>,
+) {
+    use std::borrow::Cow;
+    let Some((scope, kind, hint_kind)) = capability_scope_and_kind(request) else {
+        return (
+            Cow::Borrowed("Never allow this command in this repo"),
+            Cow::Borrowed("save a project deny rule"),
+        );
+    };
+    let scope_display = compact_text(&scope, 60);
+    (
+        Cow::Owned(format!("Never allow {kind} {scope_display} in this repo")),
+        Cow::Owned(format!("save a project {hint_kind} deny rule")),
+    )
+}
+
+/// Returns `(project_label, project_hint)` for the persistent allow option.
+/// Each label names the capability-specific target (binary, host, MCP
+/// server/tool, write root) so the prompt makes the persisted rule shape
+/// visible without forcing the user to read the rule-preview line.
+fn capability_project_label(
+    request: &ToolApprovalRequest,
+) -> (
+    std::borrow::Cow<'static, str>,
+    std::borrow::Cow<'static, str>,
+) {
+    use std::borrow::Cow;
+    let permission = &request.permission;
+    let Some((scope, kind, hint_kind)) = capability_scope_and_kind(request) else {
+        return (
+            Cow::Borrowed("Always approve this command in this repo"),
+            Cow::Borrowed("save a project rule"),
+        );
+    };
+    let scope_display = compact_text(&scope, 60);
     // On Windows, warn when the shell prefix being persisted is broad
     // (covers all commands run via pwsh, cmd, etc.) because the lower sandbox
     // tiers leave approval as the boundary for reads and/or network.
@@ -25758,14 +26086,16 @@ fn format_request_user_input_menu_lines(
 
 /// The dedicated shortcut key shown as each option's `[k]` tag. These mirror
 /// the keys the approval handler binds (`y` approve once, `a` always allow,
-/// `n` deny) so the menu is self-documenting — every option carries the letter
-/// that activates it, the way the plan-choice menu shows `[e]`/`[r]`/…. Aliases
-/// (`Enter`, `p`, `d`) still work but the canonical letter is the one we print.
+/// `n` deny once, `d` save a repo deny rule) so the menu is self-documenting —
+/// every option carries the letter that activates it, the way the plan-choice
+/// menu shows `[e]`/`[r]`/…. The `Enter` and `p` aliases still work but the
+/// canonical letter is the one we print.
 fn approval_choice_key(choice: ApprovalChoice) -> char {
     match choice {
         ApprovalChoice::Approve => 'y',
         ApprovalChoice::ApproveProject => 'a',
         ApprovalChoice::Deny => 'n',
+        ApprovalChoice::DenyProject => 'd',
     }
 }
 
@@ -26898,7 +27228,7 @@ fn dock_panel_body_lines(
 /// A single docked-panel body line, clipped to `avail` columns so a wide line
 /// never paints past the panel border.
 fn dock_text_line(text: &str, avail: usize) -> Line<'static> {
-    let clipped: String = text.chars().take(avail).collect();
+    let clipped = truncate_label_to_cells(text, avail);
     Line::from(Span::styled(
         clipped,
         Style::default().fg(crate::render::theme::foreground()),
@@ -27157,7 +27487,7 @@ fn render_clipboard_history_surface(frame: &mut Frame<'_>, area: Rect, app: &Tui
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 100, 24, title);
+    let inner = modal::surface(frame, area, 100, 24, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -27387,7 +27717,7 @@ fn render_keybinding_editor_surface(frame: &mut Frame<'_>, area: Rect, app: &Tui
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 100, 28, title);
+    let inner = modal::surface(frame, area, 100, 28, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -27616,7 +27946,7 @@ fn render_snippets_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 100, 24, title);
+    let inner = modal::surface(frame, area, 100, 24, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -27865,7 +28195,7 @@ fn render_templates_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 100, 24, title);
+    let inner = modal::surface(frame, area, 100, 24, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -28637,7 +28967,7 @@ fn render_theme_editor_surface(
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 78, 22, title);
+    let inner = modal::surface(frame, area, 78, 22, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -28865,7 +29195,7 @@ fn render_workspace_profile_surface(
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 72, 16, title);
+    let inner = modal::surface(frame, area, 72, 16, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -29000,7 +29330,7 @@ fn render_session_checkpoint_surface(
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 64, 14, title);
+    let inner = modal::surface(frame, area, 64, 14, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -29227,7 +29557,7 @@ fn render_terminal_profile_surface(
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 72, 16, title);
+    let inner = modal::surface(frame, area, 72, 16, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -29397,7 +29727,7 @@ fn render_gesture_settings_surface(
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 74, 18, title);
+    let inner = modal::surface(frame, area, 74, 18, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -29550,7 +29880,7 @@ fn render_glyph_mode_surface(
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 72, 14, title);
+    let inner = modal::surface(frame, area, 72, 14, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -29703,7 +30033,7 @@ fn render_smart_split_surface(
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 72, 16, title);
+    let inner = modal::surface(frame, area, 72, 16, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         app.smart_split_rect_cache.set(None);
         return;
@@ -29974,7 +30304,7 @@ fn render_transcript_index_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 72, 18, title);
+    let inner = modal::surface(frame, area, 72, 18, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -30075,7 +30405,7 @@ fn render_related_links_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 72, 18, title);
+    let inner = modal::surface(frame, area, 72, 18, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -30220,7 +30550,7 @@ fn render_duplicate_folds_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 72, 18, title);
+    let inner = modal::surface(frame, area, 72, 18, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -30337,7 +30667,7 @@ fn render_error_lens_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 88, 20, title);
+    let inner = modal::surface(frame, area, 88, 20, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -30470,7 +30800,7 @@ fn render_health_markers_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 88, 20, title);
+    let inner = modal::surface(frame, area, 88, 20, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -30592,7 +30922,7 @@ fn render_turn_outline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 88, 24, title);
+    let inner = modal::surface(frame, area, 88, 24, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -30754,7 +31084,7 @@ fn render_session_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 92, 26, title);
+    let inner = modal::surface(frame, area, 92, 26, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -30922,7 +31252,7 @@ fn render_review_board_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 100, 28, title);
+    let inner = modal::surface(frame, area, 100, 28, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -30982,91 +31312,130 @@ fn render_review_board_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
     }
 
     // Lay the lanes out top-to-bottom: a bold lane header, then its worker rows,
-    // then a blank spacer. The cursor row gets a caret + emphasis. Every row is
-    // clamped to the inner rect so a tall fan-out never paints past the box.
+    // then a blank spacer. Build the flat visual-row sequence first so a scroll
+    // window can be derived around the cursor card — a tall fan-out can push the
+    // selected card below the fixed-height modal otherwise.
+    enum VisualRow<'a> {
+        LaneHeader(review_board::ReviewLane),
+        Card(&'a review_board::ReviewCard),
+        Spacer,
+    }
+    let mut rows: Vec<VisualRow> = Vec::new();
+    let mut cursor_row: Option<usize> = None;
+    for lane in app.review_board.present_lanes() {
+        rows.push(VisualRow::LaneHeader(lane));
+        for card in app.review_board.cards_in(lane) {
+            if Some(card.id) == cursor_id {
+                cursor_row = Some(rows.len());
+            }
+            rows.push(VisualRow::Card(card));
+        }
+        rows.push(VisualRow::Spacer);
+    }
+
     let list_top = inner.y.saturating_add(2);
     let list_bottom = inner.y.saturating_add(inner.height);
-    let mut y = list_top;
-    'lanes: for lane in app.review_board.present_lanes() {
+    let visible_height = list_bottom.saturating_sub(list_top) as usize;
+    if visible_height == 0 {
+        return;
+    }
+
+    // Scroll offset (in visual rows) so the cursor card stays inside the
+    // window. Derived each frame from the cursor position, so no persistent
+    // scroll state is needed.
+    let mut offset = 0usize;
+    if let Some(cursor_row) = cursor_row {
+        if cursor_row >= visible_height {
+            offset = cursor_row + 1 - visible_height;
+        }
+        if cursor_row < offset {
+            offset = cursor_row;
+        }
+    }
+
+    for (idx, row) in rows.iter().enumerate() {
+        if idx < offset {
+            continue;
+        }
+        let y = list_top + (idx - offset) as u16;
         if y >= list_bottom {
             break;
         }
-        // Lane header: "Running (2)" — color *and* the title text + count.
-        let count = app.review_board.count_in(lane);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!("{} ({count})", lane.title()),
-                review_lane_style(lane).add_modifier(Modifier::BOLD),
-            ))),
-            Rect {
-                x: inner.x,
-                y,
-                width: inner.width,
-                height: 1,
-            },
-        );
-        y = y.saturating_add(1);
-
-        for card in app.review_board.cards_in(lane) {
-            if y >= list_bottom {
-                break 'lanes;
+        match row {
+            VisualRow::Spacer => {}
+            VisualRow::LaneHeader(lane) => {
+                // Lane header: "Running (2)" — color *and* the title text + count.
+                let count = app.review_board.count_in(*lane);
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!("{} ({count})", lane.title()),
+                        review_lane_style(*lane).add_modifier(Modifier::BOLD),
+                    ))),
+                    Rect {
+                        x: inner.x,
+                        y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                );
             }
-            let is_selected = Some(card.id) == cursor_id;
-            let row_rect = Rect {
-                x: inner.x,
-                y,
-                width: inner.width,
-                height: 1,
-            };
-            let caret = if is_selected { "  \u{203a} " } else { "    " };
-            let label_style = if is_selected {
-                Style::default()
-                    .fg(crate::render::theme::secondary())
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(crate::render::theme::foreground())
-            };
-            let line = Line::from(vec![
-                Span::styled(
-                    caret,
-                    Style::default().fg(if is_selected {
-                        crate::render::theme::secondary()
-                    } else {
-                        crate::render::theme::quiet()
-                    }),
-                ),
-                Span::styled(
-                    format!("{:<16} ", format!("{} #{}", card.agent, card.ordinal)),
-                    label_style,
-                ),
-                Span::styled(
-                    format!("{:>6} ", card.elapsed_clock()),
-                    Style::default().fg(crate::render::theme::quiet()),
-                ),
-                Span::styled(
-                    format!("{:<9} ", format!("tools {}", card.tool_count)),
-                    Style::default().fg(crate::render::theme::quiet()),
-                ),
-                Span::styled(
-                    format!("{:<13} ", card.cost_label()),
-                    Style::default().fg(crate::render::theme::quiet()),
-                ),
-                Span::styled(card.latest.clone(), label_style),
-            ]);
-            frame.render_widget(Paragraph::new(line), row_rect);
+            VisualRow::Card(card) => {
+                let is_selected = Some(card.id) == cursor_id;
+                let row_rect = Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                };
+                let caret = if is_selected { "  \u{203a} " } else { "    " };
+                let label_style = if is_selected {
+                    Style::default()
+                        .fg(crate::render::theme::secondary())
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(crate::render::theme::foreground())
+                };
+                let line = Line::from(vec![
+                    Span::styled(
+                        caret,
+                        Style::default().fg(if is_selected {
+                            crate::render::theme::secondary()
+                        } else {
+                            crate::render::theme::quiet()
+                        }),
+                    ),
+                    Span::styled(
+                        format!("{:<16} ", format!("{} #{}", card.agent, card.ordinal)),
+                        label_style,
+                    ),
+                    Span::styled(
+                        format!("{:>6} ", card.elapsed_clock()),
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ),
+                    Span::styled(
+                        format!("{:<9} ", format!("tools {}", card.tool_count)),
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ),
+                    Span::styled(
+                        format!("{:<13} ", card.cost_label()),
+                        Style::default().fg(crate::render::theme::quiet()),
+                    ),
+                    Span::styled(card.latest.clone(), label_style),
+                ]);
+                frame.render_widget(Paragraph::new(line), row_rect);
 
-            // Register the whole row as a click target keyed by the worker's STABLE
-            // id (not a flattened index) so a click selects + opens exactly that
-            // worker even as lanes change between frames.
-            app.register_click(
-                row_rect,
-                interaction::TargetKey::Chrome(interaction::ChromeKey::ReviewBoardCard(card.id)),
-                interaction::Action::ReviewBoardSelectJump(card.id),
-            );
-            y = y.saturating_add(1);
+                // Register the whole row as a click target keyed by the worker's STABLE
+                // id (not a flattened index) so a click selects + opens exactly that
+                // worker even as lanes change between frames.
+                app.register_click(
+                    row_rect,
+                    interaction::TargetKey::Chrome(interaction::ChromeKey::ReviewBoardCard(
+                        card.id,
+                    )),
+                    interaction::Action::ReviewBoardSelectJump(card.id),
+                );
+            }
         }
-        // Blank spacer between lanes (when there is room).
-        y = y.saturating_add(1);
     }
 }
 
@@ -31118,7 +31487,7 @@ fn render_subagent_timeline_surface(frame: &mut Frame<'_>, area: Rect, app: &Tui
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 96, 26, title);
+    let inner = modal::surface(frame, area, 96, 26, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -31372,7 +31741,7 @@ fn render_subagent_compare_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiA
     ]);
     // Paint the modal box and clear behind it, then split the SAME inner rect the
     // off-frame geometry probe uses.
-    let _ = modal::surface(frame, area, 200, 60, title);
+    let _ = modal::surface(frame, area, 200, 60, title, app.glyph_mode);
     let inner = subagent_compare_inner(area);
     if inner.width == 0 || inner.height == 0 {
         app.subagent_compare_rect_cache.set(None);
@@ -31537,7 +31906,7 @@ fn render_changes_since_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp)
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 92, 26, title);
+    let inner = modal::surface(frame, area, 92, 26, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -31700,7 +32069,7 @@ fn render_action_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 56, 16, title);
+    let inner = modal::surface(frame, area, 56, 16, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -31828,7 +32197,7 @@ fn render_tool_actions_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 88, 20, title);
+    let inner = modal::surface(frame, area, 88, 20, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -31901,6 +32270,14 @@ fn render_tool_actions_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             .map(|a| a.label())
             .collect::<Vec<_>>()
             .join("/");
+        let suffix = format!("  ({affordances})");
+        // Reserve the marker (2) + kind tag (9 padded + trailing space) and the
+        // affordance suffix so the row's copy/jump hint never clips off-screen;
+        // the display label absorbs whatever width remains. The clipboard still
+        // gets the full slice via the item's `copy_text`.
+        let reserved = 2 + 10 + UnicodeWidthStr::width(suffix.as_str());
+        let budget = (inner.width as usize).saturating_sub(reserved).max(8);
+        let label = truncate_label_to_cells(&item.text, budget);
         let line = Line::from(vec![
             Span::styled(
                 marker,
@@ -31914,11 +32291,8 @@ fn render_tool_actions_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
                 format!("{:<9} ", format!("[{}]", item.kind.label())),
                 Style::default().fg(kind_color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(item.text.clone(), text_style),
-            Span::styled(
-                format!("  ({affordances})"),
-                Style::default().fg(crate::render::theme::quiet()),
-            ),
+            Span::styled(label, text_style),
+            Span::styled(suffix, Style::default().fg(crate::render::theme::quiet())),
         ]);
         frame.render_widget(Paragraph::new(line), row_rect);
 
@@ -32191,7 +32565,7 @@ fn render_lane_fold_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 88, 24, title);
+    let inner = modal::surface(frame, area, 88, 24, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -32254,18 +32628,19 @@ fn render_lane_fold_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         }
         let body_shown = lane.body_visible();
         let caret = if is_selected { "\u{203a} " } else { "  " };
-        // The disclosure glyph (▼ expanded / ▶ collapsed) doubles with the
-        // textual "(hidden)" tag below so the fold state never relies on the glyph
-        // (or its color) alone. Both glyphs are in the accessibility chrome-glyph
-        // allow-list.
+        // The disclosure glyph (▼ expanded / ▶ collapsed) routes through the glyph
+        // tokens (§12.7.6), so an ASCII opt-in paints `v`/`>` instead of triangle
+        // tofu. It doubles with the textual "(hidden)" tag below so the fold state
+        // never relies on the glyph (or its color) alone.
+        let tokens = app.glyph_mode.tokens();
         let disclosure = if body_shown {
             Span::styled(
-                "\u{25bc} ",
+                format!("{} ", tokens.collapse),
                 Style::default().fg(crate::render::theme::secondary()),
             )
         } else {
             Span::styled(
-                "\u{25b6} ",
+                format!("{} ", tokens.expand),
                 Style::default().fg(crate::render::theme::quiet()),
             )
         };
@@ -32358,7 +32733,7 @@ fn render_bookmarks_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 88, 24, title);
+    let inner = modal::surface(frame, area, 88, 24, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -32510,7 +32885,7 @@ fn render_command_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 92, 26, title);
+    let inner = modal::surface(frame, area, 92, 26, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -32622,7 +32997,7 @@ fn render_command_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
                 )
             }
         };
-        let line = Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 caret,
                 Style::default().fg(if is_selected {
@@ -32633,7 +33008,26 @@ fn render_command_palette_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiAp
             ),
             Span::styled(format!("{:<32} ", entry.label), label_style),
             detail_span,
-        ]);
+        ];
+        // A slash row does not run on Enter — it fills the composer (the spec's
+        // "second step"), so the user presses Enter again to send. Mark it so the
+        // header's "Enter run" is honest per row: a keymap action runs at once, a
+        // slash command lands in the composer (with a trailing space for one that
+        // still needs arguments).
+        if let command_palette::PaletteRun::Slash { has_parameter, .. } = entry.run
+            && !disabled
+        {
+            let hint = if has_parameter {
+                " \u{00b7} fills composer +args"
+            } else {
+                " \u{00b7} fills composer"
+            };
+            spans.push(Span::styled(
+                hint,
+                Style::default().fg(crate::render::theme::quiet()),
+            ));
+        }
+        let line = Line::from(spans);
         frame.render_widget(Paragraph::new(line), row_rect);
 
         // Register the whole row as a click target keyed by its VISIBLE index so a
@@ -32668,7 +33062,7 @@ fn render_annotations_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 88, 24, title);
+    let inner = modal::surface(frame, area, 88, 24, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -32691,6 +33085,19 @@ fn render_annotations_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         } else {
             Style::default().fg(crate::render::theme::quiet())
         };
+        let counter = format!("  ({used}/{})", annotations::ANNOTATION_TEXT_LIMIT);
+        let hints = "  \u{00b7} Enter save \u{00b7} Esc cancel";
+        // Budget the editable region so the caret, counter, and key hints stay
+        // on-screen even at the full character limit: the verb, counter, and
+        // hints all reserve their painted width, and the buffer is shown as a
+        // tail slice ending at the caret so the user always sees what they are
+        // typing. One column is held for the caret block itself.
+        let reserved = UnicodeWidthStr::width(verb)
+            + UnicodeWidthStr::width(counter.as_str())
+            + UnicodeWidthStr::width(hints)
+            + 1;
+        let buf_budget = (inner.width as usize).saturating_sub(reserved);
+        let shown = truncate_label_to_cells_tail(buf, buf_budget);
         Line::from(vec![
             Span::styled(
                 verb,
@@ -32699,17 +33106,11 @@ fn render_annotations_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{buf}\u{2588}"),
+                format!("{shown}\u{2588}"),
                 Style::default().fg(crate::render::theme::foreground()),
             ),
-            Span::styled(
-                format!("  ({used}/{})", annotations::ANNOTATION_TEXT_LIMIT),
-                counter_style,
-            ),
-            Span::styled(
-                "  \u{00b7} Enter save \u{00b7} Esc cancel",
-                Style::default().fg(crate::render::theme::quiet()),
-            ),
+            Span::styled(counter, counter_style),
+            Span::styled(hints, Style::default().fg(crate::render::theme::quiet())),
         ])
     } else if count == 0 {
         Line::from(Span::styled(
@@ -32839,7 +33240,7 @@ fn render_editor_handoff_surface(frame: &mut Frame<'_>, area: Rect, app: &TuiApp
             Style::default().fg(crate::render::theme::quiet()),
         ),
     ]);
-    let inner = modal::surface(frame, area, 90, 22, title);
+    let inner = modal::surface(frame, area, 90, 22, title, app.glyph_mode);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -33545,6 +33946,14 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
     None
 }
 
+/// True when the only active work is the blocking `/diff` git snapshot — no
+/// model turn is running. This snapshot runs on `spawn_blocking` with no
+/// cancellation token, so Esc cannot interrupt it; the working line must not
+/// advertise an interrupt affordance in this state.
+fn diff_only_active(app: &TuiApp) -> bool {
+    app.pending_diff.is_some() && app.turn_rx.is_none() && app.cancel.is_none()
+}
+
 fn turn_in_progress(app: &TuiApp) -> bool {
     app.turn_rx.is_some()
         || app.cancel.is_some()
@@ -33622,11 +34031,14 @@ fn working_line(app: &TuiApp) -> Line<'static> {
     } else {
         working_word_spans(app)
     });
+    let duration = format_turn_duration(current_turn_duration(app));
+    let progress = if diff_only_active(app) {
+        format!(" ({duration})")
+    } else {
+        format!(" ({duration} • esc to interrupt)")
+    };
     spans.push(Span::styled(
-        format!(
-            " ({} • esc to interrupt)",
-            format_turn_duration(current_turn_duration(app))
-        ),
+        progress,
         Style::default().fg(crate::render::theme::quiet()),
     ));
     if let Some(call) = app
@@ -33859,7 +34271,7 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
             &format_mcp_elicitation_menu_lines(
                 &pending.request,
                 app.mcp_elicitation_selection_index,
-                &app.input,
+                &pending.answer,
             ),
             width,
         )
@@ -33919,7 +34331,7 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
         format_mcp_elicitation_menu_lines(
             &pending.request,
             app.mcp_elicitation_selection_index,
-            &app.input,
+            &pending.answer,
         )
     } else if let Some(pending) = app.pending_request_user_input.as_ref() {
         format_request_user_input_menu_lines(
@@ -34007,57 +34419,57 @@ fn rows_with_search_highlight(
 
 /// Build a `Vec<search::RowKind>` parallel to the painted rows of `surface`, so
 /// the search find pass can honour the include-tool-output / include-reasoning
-/// toggles. Classification reuses the shared row model
-/// ([`transcript_surface::build_transcript_rows`]) which carries each row's
-/// owning entry kind; rows the model classifies as a tool result map to
-/// [`search::RowKind::ToolOutput`] and reasoning rows to
-/// [`search::RowKind::Reasoning`], everything else (and chrome) to `Normal`.
+/// toggles. Rows owned by a tool-result entry map to [`search::RowKind::ToolOutput`]
+/// and reasoning rows to [`search::RowKind::Reasoning`]; everything else (and
+/// chrome) is `Normal`.
 ///
-/// The shared row model only faithfully mirrors the OVERLAY surface today (see
-/// `transcript_surface`'s module doc); for the main surface its row count can
-/// diverge from the painted rows, so a length mismatch falls back to an
-/// all-`Normal` slice (every row searched). That is the correct default: when
-/// both toggles are on — the common case — classification is irrelevant anyway,
-/// and an over-broad search is the safe failure mode.
+/// Each surface derives its kinds from the SAME pipeline that paints its rows:
+///
+/// - The MAIN surface reads the row-kind tags the main render produces alongside
+///   its wrapped rows ([`transcript_row_kinds`]), built at the same
+///   `(build_width, include_startup_card)` `main_surface_rows` paints with — so
+///   the startup card, settle-fold heights, and the main semantic filter are all
+///   reflected and the kinds are length-locked to the painted rows by
+///   construction.
+/// - The OVERLAY surface reads the attributed overlay row model
+///   ([`transcript_surface::build_transcript_rows_filtered`]), which already
+///   mirrors the painted overlay rows.
+///
+/// A length mismatch still falls back to an all-`Normal` slice (every row
+/// searched) as a defensive degrade, but the main pipeline keeps the lengths
+/// equal in every state, so the fallback no longer silently fires in the common
+/// startup-card / settle-fold / semantic-filter states.
 fn search_row_kinds(
     app: &TuiApp,
     surface: selection::SelectionSurface,
     painted_len: usize,
 ) -> Vec<search::RowKind> {
-    // Wrap at the width the surface is actually painted at: the overlay text
-    // split for the overlay surface (deep-review #16), the main cache width for
-    // the main surface.
-    let width = match surface {
-        selection::SelectionSurface::Overlay => overlay_text_width(app),
-        selection::SelectionSurface::Main => app
-            .main_text_area_cache
-            .get()
-            .map(|c| c.text_area.width)
-            .unwrap_or_else(|| main_text_width(app))
-            .max(1),
+    let kinds = match surface {
+        selection::SelectionSurface::Main => {
+            let (build_width, include_card) = main_surface_render_params(app);
+            transcript_row_kinds(app, build_width, include_card)
+        }
+        selection::SelectionSurface::Overlay => {
+            // Wrap at the overlay text split the overlay paints at (deep-review #16).
+            let width = overlay_text_width(app);
+            let detail = transcript_surface::DetailPolicy::from(overlay_detail(app));
+            let filter = overlay_filter(app);
+            let model =
+                transcript_surface::build_transcript_rows_filtered(app, width, detail, filter);
+            model
+                .iter()
+                .map(|row| match row.entry_kind {
+                    Some(transcript_surface::RowKind::ToolResult) => search::RowKind::ToolOutput,
+                    Some(transcript_surface::RowKind::Reasoning) => search::RowKind::Reasoning,
+                    _ => search::RowKind::Normal,
+                })
+                .collect()
+        }
     };
-    let (detail, filter) = match surface {
-        selection::SelectionSurface::Overlay => (
-            transcript_surface::DetailPolicy::from(overlay_detail(app)),
-            overlay_filter(app),
-        ),
-        selection::SelectionSurface::Main => (
-            transcript_surface::DetailPolicy::Collapsed,
-            OverlayFilter::All,
-        ),
-    };
-    let model = transcript_surface::build_transcript_rows_filtered(app, width, detail, filter);
-    if model.len() != painted_len {
+    if kinds.len() != painted_len {
         return vec![search::RowKind::Normal; painted_len];
     }
-    model
-        .iter()
-        .map(|row| match row.entry_kind {
-            Some(transcript_surface::RowKind::ToolResult) => search::RowKind::ToolOutput,
-            Some(transcript_surface::RowKind::Reasoning) => search::RowKind::Reasoning,
-            _ => search::RowKind::Normal,
-        })
-        .collect()
+    kinds
 }
 
 /// Re-run the search find pass against the live painted rows of `state.surface`
@@ -35426,18 +35838,30 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             format!("· filter: {} (f) ", other.label(&tool_names))
         }
     };
+    let full_inner = transcript_overlay_inner(area);
     // The detail-pane hint only appears when an entry is focused (so `d` is
-    // actionable) or the pane is already open. A stale pinned id that has fallen
-    // out of the transcript is healed to a closed pane right here, so the render
-    // never paints an empty pane or a dangling hint.
-    let pane_open = app.diff_detail_pane.is_some() && diff_detail_pane_entry_present(app);
+    // actionable) or the pane is already open AND the overlay is wide enough to
+    // actually split. A stale pinned id that has fallen out of the transcript is
+    // healed to a closed pane right here, so the render never paints an empty
+    // pane or a dangling hint.
+    let pane_pinned = app.diff_detail_pane.is_some() && diff_detail_pane_entry_present(app);
+    let can_split = diff_detail_pane::split_overlay_content(full_inner).is_some();
+    let pane_open = pane_pinned && can_split;
     // The Pinned Compare View (§12.2.3) takes over the whole inner area when open,
     // so its hint takes precedence over the detail-pane hint.
     let compare_open = app.pinned_compare.is_some() && pinned_compare_entries_present(app);
+    let pane_hidden_notice = format!(
+        "· detail pane hidden — widen to {}+ columns ",
+        diff_detail_pane::MIN_SPLIT_WIDTH
+    );
     let detail_suffix = if compare_open {
         "· compare: Tab focus · x diff · Alt+t/Esc close "
     } else if pane_open {
         "· detail pane: d/Esc close · Shift+↑/↓ scroll "
+    } else if pane_pinned {
+        // The pane is pinned but the terminal is too narrow to split: say so
+        // instead of advertising scroll/close controls for an invisible pane.
+        pane_hidden_notice.as_str()
     } else if active_selected_entry(app).is_some() {
         "· d: detail pane · Alt+t: compare "
     } else {
@@ -35460,7 +35884,6 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 .add_modifier(Modifier::BOLD),
         ));
     frame.render_widget(block, area);
-    let full_inner = transcript_overlay_inner(area);
     // The Pinned Compare View (§12.2.3) owns the whole inner area when open: it
     // shows two equal panes (pinned vs. live, or two pinned entries) instead of
     // the single scrolling transcript. Render it and return — the detail pane and
@@ -37351,6 +37774,20 @@ fn transcript_entry_offsets(
     cached_main_rows(app, width, include_startup_card).1.clone()
 }
 
+/// Per-row [`search::RowKind`] tags for the cached main render, in lock-step with
+/// the wrapped rows `transcript_lines_for_render` returns for the same
+/// `(width, include_startup_card)`. The incremental-search find pass reads this so
+/// its tool-output / reasoning toggles classify the EXACT rows that were painted
+/// on the main surface, length-locked by construction. Clones only the cheap
+/// `Vec<RowKind>` out of the shared `Arc`, leaving the rows behind it.
+fn transcript_row_kinds(
+    app: &TuiApp,
+    width: Option<u16>,
+    include_startup_card: bool,
+) -> Vec<search::RowKind> {
+    cached_main_rows(app, width, include_startup_card).2.clone()
+}
+
 /// Shared cache front door returning the `Arc<(rows, offsets)>` without cloning
 /// either inner `Vec`. The rows-consuming and offsets-only accessors clone only
 /// the part they actually need out of the returned `Arc`.
@@ -37491,7 +37928,7 @@ fn transcript_lines_and_entry_offsets_uncached(
     app: &TuiApp,
     width: Option<u16>,
     include_startup_card: bool,
-) -> (Vec<Line<'static>>, Vec<usize>) {
+) -> (Vec<Line<'static>>, Vec<usize>, Vec<search::RowKind>) {
     let mut lines = Vec::new();
     // Logical-line index at which each entry's block starts. Filled lazily —
     // `entry_line_starts[i]` is set to `lines.len()` the first time entry `i`
@@ -37684,6 +38121,12 @@ fn transcript_lines_and_entry_offsets_uncached(
             turn_divider_width,
         );
     }
+    // Logical-line index one past the last entry-owned line: everything pushed
+    // from here on (the closing turn divider, pending reasoning, the streaming
+    // assistant tail) is chrome owned by no transcript entry, so it classifies as
+    // `RowKind::Normal` for search. Captured before those pushes so the row-kind
+    // map does not over-claim the tail as the last entry's kind.
+    let entry_region_end = lines.len();
     maybe_push_overlay_turn_divider(
         &mut lines,
         turn_divider,
@@ -37734,6 +38177,13 @@ fn transcript_lines_and_entry_offsets_uncached(
         let w = usize::from(width.max(1));
         let mut rows: Vec<Line<'static>> = Vec::with_capacity(lines.len());
         let mut entry_offsets: Vec<usize> = vec![0; entry_line_starts.len()];
+        // Search classification parallel to `rows` (deep-search row-kinds): every
+        // entry's wrapped rows carry that entry's kind, while head chrome and the
+        // streaming tail are `Normal`. Length-locked to `rows` by construction so
+        // the Ctrl+O / Ctrl+R toggles exclude tool-output / reasoning rows against
+        // the SAME rows that are painted, instead of an independently-rebuilt model
+        // whose length could diverge.
+        let mut row_kinds: Vec<search::RowKind> = Vec::with_capacity(lines.len());
         let palette_generation = render::palette::palette_generation();
         let n = lines.len();
         let mut cursor = 0usize;
@@ -37750,6 +38200,7 @@ fn transcript_lines_and_entry_offsets_uncached(
             if seg_lo > cursor {
                 for line in &lines[cursor..seg_lo] {
                     wrap_transcript_overlay_line(line, w, &mut rows);
+                    row_kinds.resize(rows.len(), search::RowKind::Normal);
                 }
                 cursor = seg_lo;
             }
@@ -37779,15 +38230,41 @@ fn transcript_lines_and_entry_offsets_uncached(
                 },
             );
             rows.extend(wrapped.iter().cloned());
+            // Tag this entry's wrapped rows with its kind. The last entry's
+            // segment additionally absorbs the closing turn divider and the
+            // streaming tail (they have no entry id and fall past
+            // `entry_region_end`); those are chrome and must stay `Normal`, so
+            // split the tag at the entry-owned/tail row boundary. For every other
+            // entry the whole block is entry-owned (no extra work).
+            let kind = main_search_row_kind(&entry.kind);
+            if seg_hi > entry_region_end {
+                // Count the wrapped rows produced by just the entry-owned logical
+                // lines (the chrome/tail suffix wraps separately into `Normal`).
+                // Per-line wrapping is additive, so the prefix's row count is the
+                // sum of each owned line's wrapped rows.
+                let owned_hi = entry_region_end.max(cursor).min(seg_hi);
+                let mut scratch: Vec<Line<'static>> = Vec::new();
+                for line in &lines[cursor..owned_hi] {
+                    wrap_transcript_overlay_line(line, w, &mut scratch);
+                }
+                let owned_rows = scratch.len().min(wrapped.len());
+                row_kinds.resize(row_kinds.len() + owned_rows, kind);
+                row_kinds.resize(rows.len(), search::RowKind::Normal);
+            } else {
+                row_kinds.resize(rows.len(), kind);
+            }
+            debug_assert_eq!(row_kinds.len(), rows.len());
             cursor = seg_hi;
         }
         // Trailing tail (pending reasoning + assistant stream) after the last
-        // entry's segment. No stable entry id → wrap directly.
+        // entry's segment. No stable entry id → wrap directly, classified Normal.
         if cursor < n {
             for line in &lines[cursor..n] {
                 wrap_transcript_overlay_line(line, w, &mut rows);
+                row_kinds.resize(rows.len(), search::RowKind::Normal);
             }
         }
+        debug_assert_eq!(row_kinds.len(), rows.len());
         // An entry whose logical start fell past the line list (e.g. a fully
         // suppressed trailing run) anchors at the end of the wrapped rows,
         // matching the prior `row_starts.get(logical).unwrap_or(rows.len())`.
@@ -37796,10 +38273,62 @@ fn transcript_lines_and_entry_offsets_uncached(
                 entry_offsets[index] = rows.len();
             }
         }
-        (rows, entry_offsets)
+        (rows, entry_offsets, row_kinds)
     } else {
-        (lines, entry_line_starts)
+        // Unwrapped (logical-line) path: per-logical-line classification. Lines
+        // owned by an entry carry its kind; head chrome and the tail are `Normal`.
+        let line_kinds =
+            main_logical_line_kinds(entries, &entry_line_starts, entry_region_end, &lines);
+        (lines, entry_line_starts, line_kinds)
     }
+}
+
+/// Map a transcript entry's kind to the coarse [`search::RowKind`] the find pass
+/// keys its include/exclude toggles on. Routed through the overlay row model's
+/// [`transcript_surface::RowKind`] (and its exhaustive `From` drift guard) so the
+/// main and overlay surfaces classify identically: a tool-result entry's rows are
+/// tool output, a reasoning entry's rows are reasoning, everything else is normal.
+fn main_search_row_kind(kind: &TranscriptEntryKind) -> search::RowKind {
+    match transcript_surface::RowKind::from(kind) {
+        transcript_surface::RowKind::ToolResult => search::RowKind::ToolOutput,
+        transcript_surface::RowKind::Reasoning => search::RowKind::Reasoning,
+        _ => search::RowKind::Normal,
+    }
+}
+
+/// Per-logical-line search classification for the unwrapped (`width == None`)
+/// render: `kinds[i]` matches `lines[i]`. A logical line owned by entry `e`
+/// (in the half-open range `[entry_line_starts[e], next_start)` and before
+/// `entry_region_end`) carries that entry's kind; head chrome and the streaming
+/// tail are `Normal`. The wrapped path tags at the visual-row granularity in the
+/// wrap loop; this is the logical-line analogue for off-frame copy/export, which
+/// is the only consumer of the unwrapped path.
+fn main_logical_line_kinds(
+    entries: &[TranscriptEntry],
+    entry_line_starts: &[usize],
+    entry_region_end: usize,
+    lines: &[Line<'static>],
+) -> Vec<search::RowKind> {
+    let n = lines.len();
+    let mut kinds = vec![search::RowKind::Normal; n];
+    for (index, &start) in entry_line_starts.iter().enumerate() {
+        let lo = start.min(n);
+        let hi = entry_line_starts
+            .get(index + 1)
+            .copied()
+            .unwrap_or(n)
+            .min(entry_region_end)
+            .min(n)
+            .max(lo);
+        if lo >= hi {
+            continue;
+        }
+        let kind = main_search_row_kind(&entries[index].kind);
+        for slot in &mut kinds[lo..hi] {
+            *slot = kind;
+        }
+    }
+    kinds
 }
 
 /// Content fingerprint of one entry's wrapped-segment logical lines: every
@@ -37925,7 +38454,27 @@ fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     // the startup card lives in scrollback and cannot be rewritten, so
     // repeating fields such as directory/model/languages here makes the
     // first frame stale and visually redundant.
-    vec![startup_phase_strip(width as usize, app.version)]
+    let mut lines = vec![startup_phase_strip(width as usize, app.version)];
+    // Compact density suppresses the status detail line, which is the only
+    // place provider:model is shown, so the empty first frame would carry no
+    // model at all. Record a single dim badge on the startup card to keep the
+    // active provider:model visible. Presentation Mode deliberately withholds
+    // metadata from a screen-share, so it is left out there.
+    if !app.effective_density().shows_status_detail()
+        && !app.presentation.suppresses_metadata()
+        && let Some(badge) =
+            status::resolve_status_item(app, status::StatusLineItem::ProviderAndModel)
+    {
+        let pad = (width as usize).saturating_sub(badge.chars().count()) / 2;
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(pad)),
+            Span::styled(
+                badge,
+                Style::default().fg(crate::render::theme::secondary()),
+            ),
+        ]));
+    }
+    lines
 }
 
 fn startup_phase_strip(card_width: usize, version: &str) -> Line<'static> {
@@ -44515,6 +45064,37 @@ fn truncate_label_to_cells(label: &str, cells: usize) -> String {
     out
 }
 
+/// Keep the rightmost `cells` display columns of `label`, prepending an ellipsis
+/// when the head was cut (the ellipsis costs one cell, so the result is never
+/// wider than `cells`). The mirror of [`truncate_label_to_cells`] for an input
+/// field whose caret lives at the end: the tail of what was typed stays in view
+/// while a fixed counter/hint suffix to its right is guaranteed room.
+fn truncate_label_to_cells_tail(label: &str, cells: usize) -> String {
+    if cells == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(label) <= cells {
+        return label.to_string();
+    }
+    if cells == 1 {
+        return "\u{2026}".to_string();
+    }
+    let budget = cells - 1;
+    let mut tail: Vec<char> = Vec::new();
+    let mut running = 0usize;
+    for ch in label.chars().rev() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if running + w > budget {
+            break;
+        }
+        tail.push(ch);
+        running += w;
+    }
+    let mut out = String::from("\u{2026}");
+    out.extend(tail.into_iter().rev());
+    out
+}
+
 /// Paint the Clickable Breadcrumbs strip (§12.1.5) on a single `row` and register
 /// one [`interaction::ChromeKey::BreadcrumbCrumb`] click target per crumb. The
 /// trail is BUILT FRESH from the current model here (never cached), so it always
@@ -44587,10 +45167,38 @@ fn render_breadcrumbs_strip(frame: &mut Frame<'_>, row: Rect, app: &TuiApp) {
     } else {
         // Root … deepest. Always show the first and last crumb; collapse the
         // middle to a single ellipsis so the trail still orients on a narrow row.
-        // The deepest crumb is then truncated to whatever columns remain so it —
-        // the user's current location — is never clipped off the right edge.
+        // The first crumb is budgeted so it can never consume the whole row, and
+        // the deepest crumb is then truncated to whatever columns remain — so it,
+        // the user's current location, is never starved off the right edge.
+        let sep_width = UnicodeWidthStr::width(breadcrumbs::SEPARATOR);
+        let last = count - 1;
+        // Columns the chrome after the root consumes before the deepest crumb: the
+        // root→deepest separator plus, when interior crumbs collapse, the middle
+        // " ▸ …". Nothing follows a lone root.
+        let fixed = if count > 1 {
+            sep_width + if count > 2 { sep_width + 1 } else { 0 }
+        } else {
+            0
+        };
+        // When a deeper crumb follows, reserve room for it before painting the
+        // root, so the current location always lands. Half the row keeps the root
+        // meaningful. A lone root keeps the whole width (Paragraph clips the edge).
+        let reserve = if count > 1 {
+            model
+                .get(last)
+                .map(|c| {
+                    UnicodeWidthStr::width(c.label.as_str())
+                        .min(width / 2)
+                        .max(1)
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
         if let Some(first) = model.get(0) {
-            push_crumb(&mut spans, &mut crumb_rects, &mut col, 0, &first.label);
+            let first_budget = width.saturating_sub(fixed + reserve);
+            let label = truncate_label_to_cells(&first.label, first_budget);
+            push_crumb(&mut spans, &mut crumb_rects, &mut col, 0, &label);
         }
         if count > 2 {
             push_sep(&mut spans, &mut col);
@@ -44598,9 +45206,8 @@ fn render_breadcrumbs_strip(frame: &mut Frame<'_>, row: Rect, app: &TuiApp) {
             col += 1;
         }
         if count > 1 {
-            let used = col + UnicodeWidthStr::width(breadcrumbs::SEPARATOR);
+            let used = col + sep_width;
             let avail = width.saturating_sub(used);
-            let last = count - 1;
             if avail > 0
                 && let Some(crumb) = model.get(last)
             {
@@ -45614,10 +46221,14 @@ struct RepoStatus {
 }
 
 impl RepoStatus {
-    /// Run the repo-status probes against `workspace_root`. Spawns git/`gh`
-    /// subprocesses, so callers must keep this off the latency-critical
-    /// startup path (see the deferral in `run_inner_with_terminal`).
-    fn detect_at(workspace_root: &std::path::Path) -> Self {
+    /// Run the local-only repo-status probes against `workspace_root`. Spawns
+    /// git subprocesses (snapshot + branch diff) but never the network `gh`
+    /// probe, so the branch / changed-files / branch-delta fields publish
+    /// immediately and a slow `gh pr view` can't hold them hostage. The PR
+    /// number lands separately via [`probe_pull_request`]. Keep this off the
+    /// latency-critical startup path (see the deferral in
+    /// `run_inner_with_terminal`).
+    fn detect_local_at(workspace_root: &std::path::Path) -> Self {
         let Ok(vcs) = GitVcs::open(workspace_root) else {
             return Self::none();
         };
@@ -45625,20 +46236,26 @@ impl RepoStatus {
         if snapshot.vcs.kind != VcsKind::Git {
             return Self::none();
         }
+        // Reuse the snapshot's fallback-aware default branch (origin/HEAD ->
+        // init.defaultBranch -> origin/main -> origin/master -> main ->
+        // master) so the branch delta still resolves in local-only repos or
+        // ones missing origin/HEAD, instead of re-deriving it from a single
+        // origin/HEAD lookup.
+        let branch_changes = snapshot
+            .vcs
+            .default_branch
+            .as_deref()
+            .and_then(|default_branch| probe_branch_changes(workspace_root, default_branch));
         let branch = snapshot
             .vcs
             .branch
             .or_else(|| snapshot.vcs.head.map(|head| short_commit(&head)));
-        let pull_request = branch
-            .as_deref()
-            .and_then(|b| probe_pull_request(workspace_root, b));
-        let branch_changes = probe_branch_changes(workspace_root);
         Self {
             branch,
             changed_files: snapshot.summary.files_changed,
             operation: snapshot.vcs.operation_state,
             available: true,
-            pull_request,
+            pull_request: None,
             branch_changes,
             pending: false,
         }
@@ -45691,12 +46308,18 @@ fn short_commit(head: &str) -> String {
     head.chars().take(7).collect()
 }
 
+/// Bound on the `gh pr view` probe. A missing/unauthenticated/hung `gh`
+/// must never wedge the status bar's PR field, so the probe is killed past
+/// this deadline and the field stays `None`.
+const PULL_REQUEST_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Look up the open pull-request number for `branch` via the `gh` CLI.
-/// Returns `None` if `gh` is missing, unauthenticated, or no open PR exists.
-/// Runs at startup; users see the result update across TUI restarts.
+/// Returns `None` if `gh` is missing, unauthenticated, no open PR exists, or
+/// the probe exceeds [`PULL_REQUEST_PROBE_TIMEOUT`]. Runs off the boot path
+/// on its own channel so local git status never waits on it.
 fn probe_pull_request(workspace_root: &std::path::Path, branch: &str) -> Option<u64> {
-    use std::process::Command;
-    let output = Command::new("gh")
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("gh")
         .arg("pr")
         .arg("view")
         .arg(branch)
@@ -45705,29 +46328,45 @@ fn probe_pull_request(workspace_root: &std::path::Path, branch: &str) -> Option<
         .arg("-q")
         .arg(".number")
         .current_dir(workspace_root)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
+    let deadline = Instant::now() + PULL_REQUEST_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => return None,
+        }
     }
-    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut stdout = String::new();
+    use std::io::Read;
+    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
     stdout.trim().parse::<u64>().ok()
 }
 
-/// Parse `git diff --shortstat <default>...HEAD` into `(added, removed)`.
-/// Returns `None` if not in a git repo, the default branch can't be
-/// determined, or git fails for any reason.
-fn probe_branch_changes(workspace_root: &std::path::Path) -> Option<(u32, u32)> {
+/// Parse `git diff --shortstat <default_branch>...HEAD` into
+/// `(added, removed)`. `default_branch` comes from the snapshot's
+/// fallback-aware resolution; returns `None` if git fails for any reason.
+fn probe_branch_changes(
+    workspace_root: &std::path::Path,
+    default_branch: &str,
+) -> Option<(u32, u32)> {
     use std::process::Command;
-    let default_branch = Command::new("git")
-        .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-        .current_dir(workspace_root)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())?;
     let output = Command::new("git")
         .args(["diff", "--shortstat"])
         .arg(format!("{default_branch}...HEAD"))
@@ -45992,6 +46631,12 @@ struct SubagentRecord {
     /// that could underflow a fresh monotonic clock). A cap-rejected record sets
     /// `None`: it never ran, so it has no honest elapsed time.
     started: Option<std::time::Instant>,
+    /// When this subagent reached a terminal lifecycle (completed or failed),
+    /// stamped once at that transition. While `None` the timeline reads elapsed
+    /// as `now - started` (a live counter); once set, elapsed freezes at
+    /// `ended - started` so a finished subagent's run time stops drifting and an
+    /// all-finished session's timeline fingerprint stabilises.
+    ended: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -46524,11 +47169,15 @@ pub(crate) struct TuiApp {
     /// subprocesses dominate time-to-interactive, so they run off the boot
     /// path and the status bar shows a neutral placeholder until this lands.
     pub(crate) repo_status_rx: Option<oneshot::Receiver<RepoStatus>>,
+    /// Receives the open pull-request number from the deferred `gh pr view`
+    /// probe. Separate from `repo_status_rx` so the network probe lands on
+    /// its own channel and a slow/hung `gh` only delays the PR number, never
+    /// the local branch / changed-files status.
+    pub(crate) repo_pr_rx: Option<oneshot::Receiver<Option<u64>>>,
     pub(crate) cancel: Option<CancellationToken>,
     pub(crate) pending_approval: Option<PendingApproval>,
     pub(crate) approval_selection_index: usize,
     pub(crate) pending_mcp_elicitation: Option<PendingMcpElicitation>,
-    pub(crate) mcp_elicitation_seeded_input: Option<String>,
     pub(crate) pending_request_user_input: Option<PendingRequestUserInput>,
     /// Prompt that was in flight when the most recent turn was cancelled
     /// or failed. Surfaced via Ctrl+R so the user can recover from a
@@ -47881,11 +48530,11 @@ impl TuiApp {
             notifications: VecDeque::new(),
             plan_housekeeping_rx: None,
             repo_status_rx: None,
+            repo_pr_rx: None,
             cancel: None,
             pending_approval: None,
             approval_selection_index: 0,
             pending_mcp_elicitation: None,
-            mcp_elicitation_seeded_input: None,
             pending_request_user_input: None,
             cancelled_prompt: None,
             last_turn_had_edits: false,
@@ -48021,7 +48670,16 @@ impl TuiApp {
             clickables: std::cell::RefCell::new(interaction::Registry::new()),
             gestures: interaction::Recognizer::new(),
             hover_intent: hover_intent::HoverIntentState::default(),
-            first_run_hints: first_run_hints::HintEngine::default(),
+            first_run_hints: if cfg!(test) {
+                // Tests must not read or write the real `~/.squeezy/first_run_hints`;
+                // keep the engine purely in-memory while still honoring the flag.
+                first_run_hints::HintEngine::new(config.tui.first_run_hints)
+            } else {
+                first_run_hints::HintEngine::with_persistence(
+                    config.tui.first_run_hints,
+                    squeezy_core::default_first_run_hints_state_path(),
+                )
+            },
             degraded_suggestion: degraded_mode::DegradedModeSuggestor::default(),
             prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
             preserve_input_after_slash_command: false,
@@ -48095,6 +48753,16 @@ impl TuiApp {
         self.settings_path_override
             .clone()
             .unwrap_or_else(squeezy_core::default_settings_path)
+    }
+
+    /// The gesture settings the live input path should honour (§12.7.5): the
+    /// persisted/in-session override when one is set, else the built-in default.
+    /// Always clamped so a stale value can never push a consumer (wheel step,
+    /// hover dwell) out of range.
+    pub(crate) fn effective_gesture_settings(&self) -> gesture_settings::GestureSettings {
+        self.gesture_settings_override
+            .unwrap_or(gesture_settings::GestureSettings::DEFAULT)
+            .clamped()
     }
 
     /// Pin the user-scope settings path. Used by the eval harness so
@@ -48522,8 +49190,10 @@ impl TuiApp {
             record.metrics = None;
             record.transcript = transcript;
             // Re-arm the clock for a restarted subagent so the timeline's
-            // elapsed column counts from this fresh run, not the prior one.
+            // elapsed column counts from this fresh run, not the prior one, and
+            // clear any frozen end so the live counter resumes.
             record.started = Some(std::time::Instant::now());
+            record.ended = None;
         } else {
             self.subagent_pane.records.push(SubagentRecord {
                 id,
@@ -48534,6 +49204,7 @@ impl TuiApp {
                 scroll: scroll::ScrollState::pinned(),
                 metrics: None,
                 started: Some(std::time::Instant::now()),
+                ended: None,
                 transcript,
             });
         }
@@ -48541,6 +49212,11 @@ impl TuiApp {
         self.clamp_subagent_selection();
     }
 
+    /// Append a free-form activity line to a subagent's record (updating its
+    /// `latest` and stored transcript). Live nested status now flows through
+    /// `note_subagent_tool_result`; this remains the fixture the subagent-pane
+    /// tests use to seed a record's activity.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn note_subagent_activity(
         &mut self,
         id: SubagentId,
@@ -48627,6 +49303,7 @@ impl TuiApp {
             record.lifecycle = SubagentLifecycle::Completed;
             record.latest = compact_text(&summary, 140);
             record.metrics = Some(metrics);
+            record.ended = Some(std::time::Instant::now());
             record.transcript.push(entry);
         }
     }
@@ -48650,6 +49327,7 @@ impl TuiApp {
             record.lifecycle = SubagentLifecycle::Failed;
             record.latest = compact_text(&error, 140);
             record.metrics = Some(metrics);
+            record.ended = Some(std::time::Instant::now());
             record.transcript.push(entry);
         }
     }
@@ -48688,6 +49366,7 @@ impl TuiApp {
             // A cap-rejected subagent never ran, so it has no honest start time:
             // the timeline renders its elapsed column as "-".
             started: None,
+            ended: None,
         });
         self.prune_subagent_records();
         self.clamp_subagent_selection();
@@ -49410,6 +50089,13 @@ pub(crate) struct PendingApproval {
 pub(crate) struct PendingMcpElicitation {
     pub(crate) request: McpElicitationRequest,
     pub(crate) response_tx: oneshot::Sender<McpElicitationResponse>,
+    /// Form answer typed inside the modal. Kept separate from
+    /// `TuiApp::input` so the user's pending next-prompt draft is not
+    /// hijacked by the elicitation form, mirroring
+    /// `PendingRequestUserInput`.
+    pub(crate) answer: String,
+    /// Byte cursor into `answer`.
+    pub(crate) answer_cursor: usize,
 }
 
 pub(crate) struct PendingRequestUserInput {
@@ -49505,6 +50191,85 @@ where
     env_get("SQUEEZY_MOUSE_CAPTURE")
         .map(|v| v != "0")
         .unwrap_or(true)
+}
+
+/// Read the resolved per-terminal profile (§12.7.3) for the *detected* terminal
+/// from the user-scope settings file, before the `TuiApp` exists. Returns the
+/// profile layered onto the built-in default table, or `None` when nothing is
+/// persisted (or the file is absent / unreadable). Used at startup to apply the
+/// saved mouse / colour / glyph policy before the first paint. `caps` is injected
+/// so the precedence/no-profile behaviour is unit-testable without a real TTY.
+pub(crate) fn read_startup_terminal_profile(
+    settings_path: &Path,
+    caps: terminal_profile::TerminalCapabilities,
+) -> Option<terminal_profile::TerminalProfile> {
+    let fallback = terminal_profile::TerminalProfile::resolve(caps);
+    let kind = caps.kind.as_str();
+    let text = std::fs::read_to_string(settings_path).ok()?;
+    let doc = text.parse::<toml::Table>().ok()?;
+    let table = doc
+        .get("tui")?
+        .as_table()?
+        .get("terminal_profiles")?
+        .as_table()?
+        .get(kind)?
+        .as_table()?;
+    terminal_profile::TerminalProfile::from_config_lookup(fallback, |key| {
+        table.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    })
+}
+
+/// Resolve the effective mouse-capture policy at startup (§12.7.3): the env opt-out
+/// `SQUEEZY_MOUSE_CAPTURE` is the highest-precedence signal and always wins; with
+/// no env override a persisted terminal profile that disables the mouse suppresses
+/// capture; otherwise capture defaults ON. `profile` is the resolved startup
+/// profile (or `None` when none is persisted). Injected `env_get` keeps it
+/// testable without mutating real process env.
+pub(crate) fn resolve_mouse_capture_with_profile<F>(
+    env_get: F,
+    profile: Option<terminal_profile::TerminalProfile>,
+) -> bool
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    if let Some(value) = env_get("SQUEEZY_MOUSE_CAPTURE") {
+        return value != "0";
+    }
+    match profile {
+        Some(p) => matches!(p.mouse, terminal_profile::MouseMode::Enabled),
+        None => true,
+    }
+}
+
+/// Map a persisted terminal-profile [`ColorDepth`](terminal_profile::ColorDepth)
+/// onto the renderer's [`ColorLevel`](render::palette::ColorLevel).
+pub(crate) fn profile_color_level(
+    depth: terminal_profile::ColorDepth,
+) -> render::palette::ColorLevel {
+    match depth {
+        terminal_profile::ColorDepth::TrueColor => render::palette::ColorLevel::TrueColor,
+        terminal_profile::ColorDepth::Indexed256 => render::palette::ColorLevel::Ansi256,
+        terminal_profile::ColorDepth::Ansi16 => render::palette::ColorLevel::Ansi16,
+        terminal_profile::ColorDepth::Monochrome => render::palette::ColorLevel::NoColor,
+    }
+}
+
+/// Apply the persisted terminal profile's mouse + colour policy at startup, before
+/// the first paint, and return the resolved mouse-capture decision. Reads the
+/// profile from the user-scope settings file for the detected terminal, pins the
+/// colour-depth override into the palette (env `$NO_COLOR` still wins inside
+/// [`render::palette::color_level`]), and resolves mouse capture with env taking
+/// precedence over the profile. Glyph fidelity is applied separately from the
+/// `TuiApp` restore block (it lives on `app.glyph_mode`, which does not exist
+/// here). Best-effort: an absent / unreadable profile leaves the autodetected
+/// defaults in place.
+pub(crate) fn apply_startup_terminal_profile() -> bool {
+    let caps = terminal_profile::TerminalCapabilities::detect();
+    let profile = read_startup_terminal_profile(&squeezy_core::default_settings_path(), caps);
+    if let Some(p) = profile {
+        render::palette::set_color_override(profile_color_level(p.color));
+    }
+    resolve_mouse_capture_with_profile(|key| std::env::var_os(key), profile)
 }
 
 /// Resolve the initial state of the hidden render-budget HUD from the

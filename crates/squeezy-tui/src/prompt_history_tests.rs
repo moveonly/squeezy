@@ -170,3 +170,55 @@ fn persistence_creates_missing_parent_directory_on_first_push() {
     let on_disk = fs::read_to_string(&path).expect("history file");
     assert_eq!(on_disk, "alpha\n");
 }
+
+#[cfg(unix)]
+#[test]
+fn persistence_file_is_user_only_readable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let assert_0o600 = |path: &PathBuf| {
+        let mode = fs::metadata(path)
+            .expect("history file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "history file must be user-only");
+    };
+
+    // Create-new path: first push appends to a fresh file.
+    let path = temp_history_path("perms_create");
+    {
+        let mut history = PromptHistory::with_persistence(10, path.clone());
+        history.push("first".to_string());
+    }
+    assert_0o600(&path);
+
+    // Append-to-existing path: subsequent pushes append in place.
+    {
+        let mut history = PromptHistory::with_persistence(10, path.clone());
+        history.push("second".to_string());
+    }
+    assert_0o600(&path);
+
+    // Rewrite path: capacity eviction rewrites the whole file.
+    let rewrite = temp_history_path("perms_rewrite");
+    {
+        let mut history = PromptHistory::with_persistence(2, rewrite.clone());
+        history.push("one".to_string());
+        history.push("two".to_string());
+        history.push("three".to_string());
+    }
+    assert_0o600(&rewrite);
+
+    // Pre-existing world-readable file is hardened on the next write.
+    let preexisting = temp_history_path("perms_preexisting");
+    {
+        let mut file = fs::File::create(&preexisting).expect("create");
+        writeln!(file, "old").unwrap();
+    }
+    fs::set_permissions(&preexisting, fs::Permissions::from_mode(0o644)).expect("chmod");
+    {
+        let mut history = PromptHistory::with_persistence(10, preexisting.clone());
+        history.push("new".to_string());
+    }
+    assert_0o600(&preexisting);
+}

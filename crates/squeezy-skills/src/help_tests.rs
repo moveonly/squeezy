@@ -499,6 +499,68 @@ fn slash_command_help_table_has_no_duplicate_names() {
 }
 
 #[test]
+fn slash_command_help_reports_turn_blocking_and_capabilities() {
+    // The help metadata duplicates the slash registry's availability/capability
+    // facts across a crate boundary, so it can silently drift. Pin the corrected
+    // facts: /tool-verbosity cannot run mid-turn and needs edit; /compact needs
+    // net; /effort needs edit — each surfaced through the rendered body.
+    let help = SqueezyHelp::new("");
+
+    let tool_verbosity = help
+        .answer_for_input("/help /tool-verbosity")
+        .expect("answer for /tool-verbosity")
+        .render_markdown();
+    assert!(
+        tool_verbosity.contains("Cannot run while a turn is in progress"),
+        "/tool-verbosity must report it cannot run mid-turn: {tool_verbosity}"
+    );
+    assert!(
+        tool_verbosity.contains("**Capability:**") && tool_verbosity.contains("[edit]"),
+        "/tool-verbosity must report the edit capability: {tool_verbosity}"
+    );
+
+    let compact = help
+        .answer_for_input("/help /compact")
+        .expect("answer for /compact")
+        .render_markdown();
+    assert!(
+        compact.contains("**Capability:**") && compact.contains("[net]"),
+        "/compact must report the net capability: {compact}"
+    );
+
+    let effort = help
+        .answer_for_input("/help /effort")
+        .expect("answer for /effort")
+        .render_markdown();
+    assert!(
+        effort.contains("**Capability:**") && effort.contains("[edit]"),
+        "/effort must report the edit capability: {effort}"
+    );
+}
+
+#[test]
+fn tui_topic_summary_does_not_advertise_unregistered_commands() {
+    // The `tui` topic summary hand-lists the slash vocabulary and cannot import
+    // the live registry across crates, so it drifts. Guard the two failure modes:
+    // it must not name commands the registry never had (or hides from the menu),
+    // and it must name commands that have since been added.
+    let help = SqueezyHelp::new("");
+    let body = help.answer_topic("tui").render_markdown();
+    for phantom in ["/attachments", "/detach", "/skill"] {
+        assert!(
+            !body.contains(phantom),
+            "tui summary must not advertise {phantom}, which is not in the slash menu: {body}"
+        );
+    }
+    for present in ["/bundle", "/export", "/statusline", "/mcp", "/terminal"] {
+        assert!(
+            body.contains(present),
+            "tui summary must list the registered command {present}: {body}"
+        );
+    }
+}
+
+#[test]
 fn squeezy_help_doc_citations_are_bundled_paths() {
     let bundled = bundled_doc_paths().into_iter().collect::<BTreeSet<_>>();
     let topics = [
@@ -622,4 +684,71 @@ fn extract_doc_intro_does_not_panic_on_multibyte_boundary() {
 fn extract_doc_intro_returns_short_paragraph_unchanged() {
     let content = "# Heading\n\nshort intro\n\nmore text";
     assert_eq!(extract_doc_intro(content, 400), "short intro");
+}
+
+#[test]
+fn revert_turn_help_shows_required_turn_id() {
+    // The dispatch parser requires `<turn_id>` (require_id) and errors on a bare
+    // `/revert-turn`; the help syntax must teach the argument so the documented
+    // form does not immediately fail.
+    let help = SqueezyHelp::new("");
+    let answer = help
+        .answer_for_input("/help /revert-turn")
+        .expect("revert-turn answer");
+    let body = answer.render_markdown();
+    assert!(
+        body.contains("<turn_id>"),
+        "/revert-turn help must show the required <turn_id>: {body}"
+    );
+}
+
+#[test]
+fn providers_topic_names_gateway_presets_not_just_first_party() {
+    // The supported surface is far wider than the curated first-party vendors;
+    // the summary must surface at least one OpenAI-compatible gateway so a
+    // reader of `/help providers` learns presets like OpenRouter are supported.
+    let help = SqueezyHelp::new("");
+    let body = help.answer_topic("providers").body;
+    assert!(
+        body.contains("OpenRouter"),
+        "providers summary must mention a gateway preset such as OpenRouter: {body}"
+    );
+}
+
+#[test]
+fn bundled_skill_docs_do_not_advertise_nonexistent_slash_skill() {
+    // There is no `/skill` user command in the dispatch parser; skills activate
+    // via triggers, the model's `load_skill` tool, or implicit shell use. The
+    // bundled docs must not teach a `/skill` invocation that immediately falls
+    // through as a literal prompt.
+    let targets = [
+        "docs/external/SKILLS.md",
+        "docs/external/PROMPT_TEMPLATES.md",
+    ];
+    for doc in bundled_docs() {
+        if targets.contains(&doc.path) {
+            assert!(
+                !doc.content.contains("/skill "),
+                "{} must not advertise a `/skill` command",
+                doc.path
+            );
+        }
+    }
+}
+
+#[test]
+fn prompt_templates_topic_describes_real_slash_activation() {
+    let help = SqueezyHelp::new("");
+    let body = help.answer_topic("prompt-templates").body;
+    // Templates are invoked as `/<template-name>`, not via a non-existent
+    // `/prompt-template` command. The help text must teach the form the
+    // dispatch/catalog actually parses.
+    assert!(
+        !body.contains("/prompt-template"),
+        "prompt-templates summary must not advertise the non-command `/prompt-template`: {body}"
+    );
+    assert!(
+        body.contains("/review"),
+        "prompt-templates summary must show the real `/<name>` slash form: {body}"
+    );
 }

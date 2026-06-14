@@ -998,6 +998,17 @@ impl SessionStore {
         Ok(())
     }
 
+    /// True when `session_id` lives only under the `archived/` subtree —
+    /// i.e. there is no live-root directory for it but an archived one
+    /// exists. The resolver and metadata reader resolve through
+    /// `locate_session_dir` (live + archived), but the writer and
+    /// `SessionHandle::dir` use the live root only, so resume must revive
+    /// an archived session before opening it.
+    pub fn is_archived(&self, session_id: &str) -> bool {
+        !self.session_dir(session_id).exists()
+            && self.root.join(ARCHIVED_SUBDIR).join(session_id).exists()
+    }
+
     pub fn show(&self, session_id: &str) -> Result<SessionRecord> {
         self.read_session_record(session_id, true)
     }

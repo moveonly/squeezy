@@ -188,9 +188,12 @@ pub(crate) fn find(
         // expansion). That keeps the char-for-char 1:1 mapping the column math
         // needs WHILE preserving Unicode case-insensitivity (e.g. "É" still
         // matches "é"), rather than the old ASCII-only downgrade that silently
-        // dropped non-ASCII folding for the whole line. The needle is folded
-        // the same way so hay/needle stay comparable.
-        let (hay, needle) = if hay.len() == cleaned.chars().count() {
+        // dropped non-ASCII folding for the whole line. The decision is symmetric
+        // in haystack and needle: an expanding char on EITHER side desyncs the
+        // pair, so both are routed through `simple_lower` together to stay
+        // comparable and offset-stable regardless of which side expands.
+        let needle_offset_stable = needle.len() == query.chars().count();
+        let (hay, needle) = if hay.len() == cleaned.chars().count() && needle_offset_stable {
             (hay, needle.clone())
         } else {
             (

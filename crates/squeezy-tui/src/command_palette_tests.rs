@@ -1,7 +1,7 @@
 //! Unit tests for the Universal Command Palette (§12.1.1) model: entry sourcing
 //! from the keymap action registry + the slash-command help table, fuzzy
 //! filtering and score ordering, cursor movement over the visible list, the query
-//! buffer, disabled reasons by context, and the visible-index lookup the click
+//! buffer, feature-gated visibility, and the visible-index lookup the click
 //! path uses. Pure over the model — no terminal, no `TuiApp`. The end-to-end
 //! keyboard / mouse / render coverage lives in `lib_tests.rs`.
 
@@ -23,9 +23,9 @@ fn all_visible() -> crate::input::SlashMenuVisibility {
     }
 }
 
-/// Build the palette with no running turn (the common idle case).
+/// Build the palette with every feature gate on (the common case).
 fn idle_palette() -> CommandPalette {
-    CommandPalette::build(&resolver(), false, all_visible())
+    CommandPalette::build(&resolver(), all_visible())
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn palette_hides_gated_commands_until_their_feature_is_enabled() {
         checkpoints_enabled: false,
         reviewer_enabled: false,
     };
-    let gated_off = CommandPalette::build(&resolver(), false, all_off);
+    let gated_off = CommandPalette::build(&resolver(), all_off);
     let off_names = slash_names(&gated_off);
     for hidden in [
         "/reviewer",
@@ -98,7 +98,7 @@ fn palette_hides_gated_commands_until_their_feature_is_enabled() {
     // Ungated commands are unaffected.
     assert!(off_names.contains(&"/cost".to_string()));
 
-    let gated_on = CommandPalette::build(&resolver(), false, all_visible());
+    let gated_on = CommandPalette::build(&resolver(), all_visible());
     let on_names = slash_names(&gated_on);
     for shown in ["/reviewer", "/checkpoints", "/undo", "/revert-turn"] {
         assert!(
@@ -129,11 +129,7 @@ fn action_entries_carry_humanized_label_and_current_binding() {
 fn binding_column_reflects_user_override() {
     let mut overrides = BTreeMap::new();
     overrides.insert("toggle_session_timeline".to_string(), "Ctrl+G".to_string());
-    let palette = CommandPalette::build(
-        &KeymapResolver::from_overrides(&overrides),
-        false,
-        all_visible(),
-    );
+    let palette = CommandPalette::build(&KeymapResolver::from_overrides(&overrides), all_visible());
     let entry = palette
         .visible()
         .iter()
@@ -164,14 +160,12 @@ fn fuzzy_query_filters_and_orders_by_score() {
     }
     let visible = palette.visible();
     assert!(!visible.is_empty(), "‘timeline’ should match something");
-    // Every surviving entry is a genuine fuzzy match of the query.
+    // Every surviving entry is a genuine fuzzy match of the query against the same
+    // haystack the production filter scores (label + description + binding + the
+    // hidden search_extra tokens).
     for entry in &visible {
         assert!(
-            crate::fuzzy::score(
-                &format!("{} {} {}", entry.label, entry.description, entry.binding),
-                "timeline"
-            )
-            .is_some(),
+            crate::fuzzy::score(&entry.haystack(), "timeline").is_some(),
             "{:?} should fuzzy-match the query",
             entry.label
         );
@@ -200,6 +194,43 @@ fn query_can_match_the_binding_chord() {
             .iter()
             .any(|e| e.run == PaletteRun::Action(Action::ToggleSessionTimeline)),
         "searching the chord ‘alt+9’ should surface its command"
+    );
+}
+
+#[test]
+fn query_can_match_a_parameter_hint_token() {
+    // A parameter-syntax token that lives only in a command's argument hint — never
+    // in its label or description — must still be searchable.
+    let surfaces = |needle: &str, name: &str| {
+        let mut palette = idle_palette();
+        for ch in needle.chars() {
+            palette.push_char(ch);
+        }
+        palette.visible().iter().any(|e| e.label == name)
+    };
+    // `high-contrast` appears only in /theme's parameter hint.
+    assert!(
+        surfaces("high-contrast", "/theme"),
+        "/theme should be findable by its `high-contrast` argument value"
+    );
+    // `json` appears only in /export's parameter hint, not its description.
+    assert!(
+        surfaces("json", "/export"),
+        "/export should be findable by its `json` argument value"
+    );
+}
+
+#[test]
+fn query_can_match_a_capability_badge() {
+    // Searching a capability slug surfaces the commands that carry that badge, even
+    // when the slug appears nowhere in their label or description.
+    let mut palette = idle_palette();
+    for ch in "edit".chars() {
+        palette.push_char(ch);
+    }
+    assert!(
+        palette.visible().iter().any(|e| e.label == "/config"),
+        "an edit-capability command should surface when searching `edit`"
     );
 }
 
@@ -316,16 +347,19 @@ fn entry_at_resolves_the_visible_index_for_the_click_path() {
 }
 
 #[test]
-fn slash_commands_are_disabled_during_a_task_with_an_honest_reason() {
-    // A command that is NOT available during a task must carry a disabled reason
-    // when the palette is built while a turn is running, and be runnable when idle.
+fn task_blocked_slash_commands_are_runnable_so_they_queue_like_the_typed_path() {
+    // A command that is NOT available during a task must still be listed and
+    // runnable from the palette: selecting it seeds the composer, and Enter during
+    // a turn queues it behind the running turn — the same policy the typed path
+    // applies. The palette must not hard-disable it, or the two discovery surfaces
+    // diverge for the same command.
     let blocked = crate::input::SLASH_COMMANDS
         .iter()
         .find(|c| !c.available_during_task)
         .expect("at least one command is task-blocked");
 
-    let during_task = CommandPalette::build(&resolver(), true, all_visible());
-    let entry = during_task
+    let palette = idle_palette();
+    let entry = palette
         .visible()
         .iter()
         .find(|e| {
@@ -336,28 +370,10 @@ fn slash_commands_are_disabled_during_a_task_with_an_honest_reason() {
                 }
         })
         .copied()
-        .expect("task-blocked command still listed during a task");
+        .expect("task-blocked command listed");
     assert!(
-        entry.disabled_reason.is_some(),
-        "a task-blocked command must show a disabled reason during a task"
-    );
-
-    let idle = idle_palette();
-    let idle_entry = idle
-        .visible()
-        .iter()
-        .find(|e| {
-            e.run
-                == PaletteRun::Slash {
-                    name: blocked.name,
-                    has_parameter: blocked.parameter_hint.is_some(),
-                }
-        })
-        .copied()
-        .expect("task-blocked command listed when idle");
-    assert!(
-        idle_entry.disabled_reason.is_none(),
-        "the same command must be runnable when no turn is running"
+        entry.disabled_reason.is_none(),
+        "a task-blocked command must stay runnable so the palette seeds it and Enter queues it"
     );
 }
 

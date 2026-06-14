@@ -1719,6 +1719,14 @@ impl Agent {
         telemetry: TelemetryClient,
     ) -> squeezy_core::Result<(Self, Vec<HydratedTranscriptItem>)> {
         let store = SessionStore::open(&config);
+        // The resolver and metadata reader see archived sessions, but the
+        // writer and `SessionHandle::dir` use the live root only. Revive an
+        // archived session back into the live tree before opening it so
+        // resume reads/writes a real directory instead of a phantom live
+        // path and failing with a misleading "not resumable" error.
+        if store.is_archived(session_id) {
+            store.unarchive_session(session_id)?;
+        }
         let handle = store.open_session(session_id.to_string());
         // Prefer the durable snapshot, but fall back to replaying
         // events.jsonl when:
@@ -8624,10 +8632,10 @@ impl TurnRuntime {
                 let visible_assistant_text = merge_retried_visible_assistant_text(
                     &mut deferred_retry_visible_assistant,
                     &raw_assistant_text,
+                    load_session_mode(&self.session_mode) == SessionMode::Plan,
                 );
-                let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
-                    &visible_assistant_text,
-                ));
+                let message =
+                    TranscriptItem::assistant(self.display_assistant_text(&visible_assistant_text));
                 self.stamp_routing_savings(&mut broker.metrics);
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
@@ -8743,6 +8751,7 @@ impl TurnRuntime {
                         merge_retried_visible_assistant_text(
                             &mut deferred_retry_visible_assistant,
                             &raw_assistant_text,
+                            load_session_mode(&self.session_mode) == SessionMode::Plan,
                         ),
                         raw_assistant_text,
                         &mut conversation,
@@ -8789,6 +8798,7 @@ impl TurnRuntime {
                         merge_retried_visible_assistant_text(
                             &mut deferred_retry_visible_assistant,
                             &raw_assistant_text,
+                            load_session_mode(&self.session_mode) == SessionMode::Plan,
                         ),
                         raw_assistant_text,
                         &mut conversation,
@@ -8835,6 +8845,7 @@ impl TurnRuntime {
                         merge_retried_visible_assistant_text(
                             &mut deferred_retry_visible_assistant,
                             &raw_assistant_text,
+                            load_session_mode(&self.session_mode) == SessionMode::Plan,
                         ),
                         raw_assistant_text,
                         &mut conversation,
@@ -8951,6 +8962,7 @@ impl TurnRuntime {
                     let preserved_visible_chars = append_deferred_visible_assistant_text(
                         &mut deferred_retry_visible_assistant,
                         &raw_assistant_text,
+                        load_session_mode(&self.session_mode) == SessionMode::Plan,
                     );
                     if !raw_assistant_text.trim().is_empty() {
                         conversation.push(redact_input_item(
@@ -9075,6 +9087,7 @@ impl TurnRuntime {
                         append_deferred_visible_assistant_text(
                             &mut deferred_retry_visible_assistant,
                             &raw_assistant_text,
+                            load_session_mode(&self.session_mode) == SessionMode::Plan,
                         )
                     } else {
                         0
@@ -9170,10 +9183,10 @@ impl TurnRuntime {
                 let visible_assistant_text = merge_retried_visible_assistant_text(
                     &mut deferred_retry_visible_assistant,
                     &raw_assistant_text,
+                    load_session_mode(&self.session_mode) == SessionMode::Plan,
                 );
-                let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
-                    &visible_assistant_text,
-                ));
+                let message =
+                    TranscriptItem::assistant(self.display_assistant_text(&visible_assistant_text));
                 self.stamp_routing_savings(&mut broker.metrics);
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
@@ -9286,6 +9299,7 @@ impl TurnRuntime {
                 let visible_assistant_text = merge_retried_visible_assistant_text(
                     &mut deferred_retry_visible_assistant,
                     &raw_assistant_text,
+                    load_session_mode(&self.session_mode) == SessionMode::Plan,
                 );
                 self.finish_soft_completion(
                     reason,
@@ -9514,6 +9528,7 @@ impl TurnRuntime {
         let visible_assistant_text = merge_retried_visible_assistant_text(
             &mut deferred_retry_visible_assistant,
             &raw_assistant_text,
+            load_session_mode(&self.session_mode) == SessionMode::Plan,
         );
         self.finish_soft_completion(
             format!("stopped after {MAX_TOOL_ROUNDS} tool rounds{suffix}"),
@@ -10050,6 +10065,18 @@ impl TurnRuntime {
             .await;
     }
 
+    /// Assistant text as it should appear in the persisted/displayed
+    /// transcript. The structured Plan card owns proposed-plan rendering, so a
+    /// `<proposed_plan>` block is stripped while the turn ran in Plan mode.
+    /// Outside Plan mode the tag is ordinary prose and survives verbatim.
+    fn display_assistant_text(&self, visible: &str) -> String {
+        if load_session_mode(&self.session_mode) == SessionMode::Plan {
+            plan_mode::strip_proposed_plan_blocks(visible)
+        } else {
+            visible.to_string()
+        }
+    }
+
     /// Fail soft instead of emitting a zero-character answer.
     ///
     /// The repeated-tool-failure guard and the round-budget exhaustion path
@@ -10097,7 +10124,7 @@ impl TurnRuntime {
                 &self.redactor,
             ));
         }
-        let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(&answer));
+        let message = TranscriptItem::assistant(self.display_assistant_text(&answer));
         self.stamp_routing_savings(metrics);
         // Surface the partial-finish as Completed, not Failed: the user got
         // an answer, just an abbreviated one.
@@ -10170,7 +10197,7 @@ impl TurnRuntime {
         state.conversation = conversation.clone();
         state.transcript.push(user_transcript);
         state.transcript.push(TranscriptItem::assistant(
-            plan_mode::strip_proposed_plan_blocks(&visible_assistant_text),
+            self.display_assistant_text(&visible_assistant_text),
         ));
         let mut merged_compaction = context_compaction;
         merge_concurrent_pins(&mut merged_compaction, &state.context_compaction.pinned);
@@ -10205,9 +10232,9 @@ impl TurnRuntime {
                 &self.redactor,
             ));
         }
-        let assistant = TranscriptItem::assistant_cancelled(plan_mode::strip_proposed_plan_blocks(
-            &partial_assistant_text,
-        ));
+        let assistant = TranscriptItem::assistant_cancelled(
+            self.display_assistant_text(&partial_assistant_text),
+        );
         if !active_turn_is_current(&self.active_turn, self.turn_id) {
             return;
         }
@@ -10772,22 +10799,28 @@ async fn handle_request_user_input_call(
         );
     }
 
+    let choices: Vec<RequestUserInputChoice> = args
+        .choices
+        .into_iter()
+        .map(|c| RequestUserInputChoice {
+            label: c.label,
+            value: c.value,
+        })
+        .collect();
+
+    // The schema advertises an empty/omitted choices array as a request for
+    // free-form input. Honour that contract so a model following it does not
+    // strand the user in a modal with neither choice rows nor an answer box.
+    let allow_freeform = args.allow_freeform || choices.is_empty();
+
     let request = RequestUserInputRequest {
         question,
-        choices: args
-            .choices
-            .into_iter()
-            .map(|c| RequestUserInputChoice {
-                label: c.label,
-                value: c.value,
-            })
-            .collect(),
-        allow_freeform: args.allow_freeform,
+        choices,
+        allow_freeform,
     };
     // Capture the question contract for post-response validation; the request
     // itself is moved into the event below.
     let offered_values: Vec<String> = request.choices.iter().map(|c| c.value.clone()).collect();
-    let allow_freeform = request.allow_freeform;
 
     let (response_tx, response_rx) = oneshot::channel::<RequestUserInputResponse>();
     if context
@@ -13494,8 +13527,16 @@ fn is_control_tool_name(name: &str) -> bool {
     )
 }
 
-fn append_deferred_visible_assistant_text(deferred: &mut String, text: &str) -> usize {
-    let display_text = plan_mode::strip_proposed_plan_blocks(text);
+fn append_deferred_visible_assistant_text(
+    deferred: &mut String,
+    text: &str,
+    strip_plan: bool,
+) -> usize {
+    let display_text = if strip_plan {
+        plan_mode::strip_proposed_plan_blocks(text)
+    } else {
+        text.to_string()
+    };
     if display_text.trim().is_empty() {
         return 0;
     }
@@ -13507,9 +13548,17 @@ fn append_deferred_visible_assistant_text(deferred: &mut String, text: &str) -> 
     visible.chars().count()
 }
 
-fn merge_retried_visible_assistant_text(deferred: &mut String, final_text: &str) -> String {
+fn merge_retried_visible_assistant_text(
+    deferred: &mut String,
+    final_text: &str,
+    strip_plan: bool,
+) -> String {
     let prior = std::mem::take(deferred);
-    let final_display = plan_mode::strip_proposed_plan_blocks(final_text);
+    let final_display = if strip_plan {
+        plan_mode::strip_proposed_plan_blocks(final_text)
+    } else {
+        final_text.to_string()
+    };
     if prior.trim().is_empty() {
         return final_display;
     }
@@ -18761,15 +18810,9 @@ pub enum AgentEvent {
         agent: String,
         prompt: String,
     },
-    SubagentActivity {
-        turn_id: TurnId,
-        id: SubagentId,
-        agent: String,
-        message: String,
-    },
     /// A subagent's completed tool result, forwarded with its full structure so
     /// the parent can render it as a rail card in the subagent's transcript
-    /// view (rather than the flat `completed X` line `SubagentActivity` carried).
+    /// view rather than a flat `completed X` status line.
     SubagentToolResult {
         turn_id: TurnId,
         id: SubagentId,

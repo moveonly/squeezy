@@ -2303,8 +2303,9 @@ impl ToolRegistry {
             "write_file" | "notebook_edit" => PermissionScope::Edit,
             "shell" | "verify" | "refresh_compiler_facts" => PermissionScope::Shell,
             "webfetch" | "websearch" => PermissionScope::Web,
-            "mcp_read_resource" => PermissionScope::Mcp,
-            "mcp_list_resources" | "mcp_list_resource_templates" => PermissionScope::Read,
+            "mcp_read_resource" | "mcp_list_resources" | "mcp_list_resource_templates" => {
+                PermissionScope::Mcp
+            }
             "glob" if tool_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
             "grep" if grep_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
             "read_file" if self.read_file_targets_ignored_policy(&call.arguments) => {
@@ -2394,7 +2395,11 @@ impl ToolRegistry {
                     if paths.is_empty() {
                         "*".to_string()
                     } else {
-                        paths.join(", ")
+                        // Newline-delimited so a filename containing a comma
+                        // (legal on every platform) round-trips intact through
+                        // the approval renderer, which splits this value back
+                        // into a path list. Filenames cannot contain newlines.
+                        paths.join("\n")
                     },
                 );
                 if let Some(diff) = args.as_ref().and_then(render_apply_patch_diff) {
@@ -2503,6 +2508,23 @@ impl ToolRegistry {
                 metadata.insert("command".to_string(), command.to_string());
                 metadata.insert("cwd".to_string(), workdir.to_string());
                 metadata.insert("shell_prefix".to_string(), analysis.rule_target.clone());
+                // A network shell command encodes its host in the rule target
+                // (`shell:{cmd}:{host}`). Lift the concrete host into its own
+                // metadata key so the approval renderer's host-aware paths (the
+                // `host …` line and the "Always allow host …" project label)
+                // light up instead of treating the colon-encoded target as an
+                // opaque command prefix.
+                if analysis.network
+                    && analysis.capability == PermissionCapability::Network
+                    && let Some(host) = analysis
+                        .rule_target
+                        .strip_prefix("shell:")
+                        .and_then(|rest| rest.rsplit_once(':'))
+                        .map(|(_, host)| host)
+                        .filter(|host| !host.is_empty() && *host != "*")
+                {
+                    metadata.insert("host".to_string(), host.to_string());
+                }
                 metadata.insert("env".to_string(), "allowlist (values redacted)".to_string());
                 metadata.insert(
                     "network".to_string(),
@@ -2815,6 +2837,27 @@ impl ToolRegistry {
                     PermissionRisk::Medium,
                 )
             }
+            "mcp_list_resources" | "mcp_list_resource_templates" => {
+                let server = call
+                    .arguments
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .unwrap_or("*")
+                    .to_string();
+                metadata.insert("server".to_string(), server.clone());
+                suggested_rules.push(PermissionRule::new(
+                    "mcp",
+                    format!("{server}/resources"),
+                    PermissionMode::Allow,
+                    PermissionRuleSource::Session,
+                    Some("approved MCP resource listing".to_string()),
+                ));
+                (
+                    PermissionCapability::Mcp,
+                    format!("{server}/resources"),
+                    PermissionRisk::Low,
+                )
+            }
             "glob" if tool_include_ignored(&call.arguments) => (
                 PermissionCapability::Search,
                 "ignored:*".to_string(),
@@ -2835,23 +2878,10 @@ impl ToolRegistry {
                 "workspace:*".to_string(),
                 PermissionRisk::Low,
             ),
-            "checkpoint_check"
-            | "checkpoint_doctor"
-            | "checkpoint_list"
-            | "checkpoint_show"
-            | "diff_context"
-            | "downstream_flow"
-            | "hierarchy"
-            | "plan_patch"
-            | "read_slice"
-            | "read_tool_output"
-            | "repo_map"
-            | "symbol_context"
-            | "upstream_flow"
-            | "list_skills"
-            | "load_skill"
-            | "mcp_list_resources"
-            | "mcp_list_resource_templates" => (
+            "checkpoint_check" | "checkpoint_doctor" | "checkpoint_list" | "checkpoint_show"
+            | "diff_context" | "downstream_flow" | "hierarchy" | "plan_patch" | "read_slice"
+            | "read_tool_output" | "repo_map" | "symbol_context" | "upstream_flow"
+            | "list_skills" | "load_skill" => (
                 PermissionCapability::Read,
                 "workspace:*".to_string(),
                 PermissionRisk::Low,

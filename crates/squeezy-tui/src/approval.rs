@@ -7,7 +7,9 @@
 //! Decision keys: `Y` / `Enter` approve once, `A` / `P` always allow
 //! for the project, `N` / `D` deny. The hint row leads with the primary
 //! verbs (`Enter` approve once, `A` always allow, `N` deny); `Y`, `P` and
-//! `D` stay bound as silent aliases for muscle-memory compatibility.
+//! `D` stay bound as silent aliases for muscle-memory compatibility. A
+//! persistent project-deny ("Never allow … in this repo") sits last in the
+//! menu, reachable with the arrow keys + `Enter`.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -65,6 +67,12 @@ pub(crate) fn render_preview_parts(request: &ToolApprovalRequest) -> PreviewPart
             ),
         ]));
     }
+    // The permission engine's own verdict rationale (e.g. "pre-classifier
+    // requires approval: …" or the AI reviewer's note) is distinct from the
+    // assistant's `Why:` transcript snippet; surface it on its own labeled,
+    // dimmed row so a real policy reason is visible even when the transcript
+    // snippet is empty.
+    append_policy_reason(&mut context, &request.reason);
     let mut subject = Vec::new();
     match permission.capability {
         PermissionCapability::Shell => append_shell(&mut subject, permission),
@@ -135,6 +143,44 @@ fn append_context(lines: &mut Vec<Line<'static>>, context: &str) -> bool {
         ]));
     }
     true
+}
+
+/// Append a dimmed `Policy: <reason>` block carrying the permission engine's
+/// verdict rationale. No-op when the reason is empty/whitespace so a request
+/// without a policy note adds no spurious row. Wrapped at the same width as the
+/// `Why:` block and labeled distinctly so it never reads as the assistant's own
+/// rationale.
+fn append_policy_reason(lines: &mut Vec<Line<'static>>, reason: &str) {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let wrapped = wrap_words(&trimmed.replace('\n', " "), APPROVAL_CONTEXT_WRAP);
+    let Some((first, rest)) = wrapped.split_first() else {
+        return;
+    };
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "Policy: ",
+            Style::default()
+                .fg(crate::render::theme::quiet())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            first.to_string(),
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]));
+    for line in rest {
+        lines.push(Line::from(vec![
+            Span::raw("          "),
+            Span::styled(
+                line.to_string(),
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+        ]));
+    }
 }
 
 fn header_line(request: &ToolApprovalRequest) -> Line<'static> {
@@ -276,8 +322,10 @@ fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
         .cloned()
         .or_else(|| permission.metadata.get("path").cloned())
         .unwrap_or_else(|| permission.target.clone());
+    // Paths arrive newline-delimited so a comma inside a filename is not
+    // mistaken for a separator. Filenames cannot contain newlines.
     let path_list: Vec<&str> = paths
-        .split(['\n', ','])
+        .split('\n')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
@@ -331,21 +379,31 @@ fn append_read(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
 }
 
 fn append_network(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
-    let url = permission
-        .metadata
-        .get("url")
-        .cloned()
-        .unwrap_or_else(|| permission.target.clone());
-    let method = permission
-        .metadata
-        .get("method")
-        .cloned()
-        .unwrap_or_else(|| "GET".to_string());
-    lines.push(plain_white(format!(
-        "🌐 {} {}",
-        method,
-        compact_text(&url, 160)
-    )));
+    // A network *shell* command (e.g. `curl https://…`) carries the literal
+    // command rather than a structured URL/method; show that instead of
+    // rendering the colon-encoded rule target as if it were a URL.
+    if let Some(command) = permission.metadata.get("command") {
+        lines.push(plain_white(format!(
+            "🌐 $ {}",
+            middle_truncate(&command.replace('\n', " "), 160)
+        )));
+    } else {
+        let url = permission
+            .metadata
+            .get("url")
+            .cloned()
+            .unwrap_or_else(|| permission.target.clone());
+        let method = permission
+            .metadata
+            .get("method")
+            .cloned()
+            .unwrap_or_else(|| "GET".to_string());
+        lines.push(plain_white(format!(
+            "🌐 {} {}",
+            method,
+            compact_text(&url, 160)
+        )));
+    }
     if let Some(host) = permission.metadata.get("host") {
         lines.push(dim(format!("host {host}")));
     }
@@ -372,6 +430,33 @@ fn append_generic(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest
     lines.push(plain_white(compact_text(&permission.target, 160)));
 }
 
+/// True when an "Always allow" decision for this request would actually be
+/// written to `squeezy.toml`. Mirrors the backend's persistence guard
+/// (`permission_rule_for_persistence`): the backend refuses to persist an
+/// `Allow` rule on the destructive capability or with an effectively-wildcard
+/// target, resolving the call as approve-once instead. The TUI must agree so
+/// the project-allow option and its caption never promise a durable rule the
+/// backend will silently drop.
+pub(crate) fn project_allow_is_persistable(permission: &PermissionRequest) -> bool {
+    if permission.capability == PermissionCapability::Destructive {
+        return false;
+    }
+    let rule_capability = permission
+        .suggested_rules
+        .first()
+        .map(|rule| rule.capability.as_str())
+        .unwrap_or_else(|| permission.capability.as_str());
+    if rule_capability == "destructive" {
+        return false;
+    }
+    let rule_target = permission
+        .suggested_rules
+        .first()
+        .map(|rule| rule.target.as_str())
+        .unwrap_or(permission.target.as_str());
+    !squeezy_core::target_is_effectively_wildcard(rule_target)
+}
+
 fn append_rule_preview(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
     let rule = permission
         .suggested_rules
@@ -391,16 +476,26 @@ fn append_rule_preview(lines: &mut Vec<Line<'static>>, permission: &PermissionRe
             Style::default().fg(crate::render::theme::foreground()),
         ),
     ]));
-    // "Always allow" persists this rule to the project settings file (every
-    // approval prompt offers the project-scope option), so name the durable,
-    // project-wide reach rather than letting the scope only surface later in
-    // squeezy.toml. Indented under `Rule:` and dimmed so it reads as a caveat.
-    lines.push(dim(
-        "(saved to squeezy.toml — applies to all matching requests in this project)".to_string(),
-    ));
+    // Name the actual reach of "Always allow": a persistable rule is written to
+    // the project settings file and applies to every future matching request;
+    // a non-persistable one (destructive capability or wildcard target) the
+    // backend can only honour for this session. Indented under `Rule:` and
+    // dimmed so it reads as a caveat.
+    let caption = if project_allow_is_persistable(permission) {
+        "(saved to squeezy.toml — applies to all matching requests in this project)"
+    } else {
+        "(session only — this rule cannot be saved to squeezy.toml)"
+    };
+    lines.push(dim(caption.to_string()));
 }
 
 fn format_rule(permission: &PermissionRequest, rule: &PermissionRule) -> String {
+    // A network shell command (e.g. `curl https://…`) persists a host-scoped
+    // rule; name the host rather than the colon-encoded `shell:cmd:host` target
+    // so the rule reads the same way as a web-fetch rule.
+    if let Some(label) = network_host_rule_label(permission) {
+        return label;
+    }
     if permission.tool_name == "shell" || permission.metadata.contains_key("shell_prefix") {
         format!("command prefix {}", rule.target)
     } else {
@@ -409,11 +504,28 @@ fn format_rule(permission: &PermissionRequest, rule: &PermissionRule) -> String 
 }
 
 fn format_rule_target(permission: &PermissionRequest) -> String {
+    if let Some(label) = network_host_rule_label(permission) {
+        return label;
+    }
     if permission.tool_name == "shell" || permission.metadata.contains_key("shell_prefix") {
         format!("command prefix {}", permission.target)
     } else {
         format!("{} {}", permission.capability.as_str(), permission.target)
     }
+}
+
+/// `network host <host>` for a network-capability request that carries a
+/// concrete host, otherwise `None`. Covers both web-fetch and the
+/// `shell:cmd:host` shell-network shape so the rule line names the host scope
+/// rather than the opaque colon-encoded command target.
+fn network_host_rule_label(permission: &PermissionRequest) -> Option<String> {
+    if permission.capability != PermissionCapability::Network {
+        return None;
+    }
+    permission
+        .metadata
+        .get("host")
+        .map(|host| format!("network host {host}"))
 }
 
 fn plain_white(text: String) -> Line<'static> {

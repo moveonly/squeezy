@@ -188,16 +188,121 @@ fn rule_preview_names_project_wide_persistence() {
 }
 
 #[test]
+fn rule_preview_warns_when_persistence_is_refused() {
+    // The backend refuses to persist an Allow rule on the destructive
+    // capability, resolving the call as approve-once. The preview must not
+    // promise a durable project rule that will never be written.
+    let req = request_with(
+        "shell",
+        PermissionCapability::Destructive,
+        "rm -rf build",
+        &[("command", "rm -rf build")],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("session only — this rule cannot be saved to squeezy.toml"),
+        "non-persistable request must warn the rule is session only: {out}"
+    );
+    assert!(
+        !out.contains("saved to squeezy.toml — applies to all matching requests"),
+        "non-persistable request must not promise durable persistence: {out}"
+    );
+}
+
+#[test]
+fn rule_preview_warns_when_target_is_wildcard() {
+    let mut req = request_with(
+        "webfetch",
+        PermissionCapability::Network,
+        "domain:example.com",
+        &[("host", "example.com")],
+    );
+    req.permission.suggested_rules.push(PermissionRule::new(
+        "network",
+        "*",
+        PermissionMode::Allow,
+        PermissionRuleSource::Session,
+        None,
+    ));
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("session only — this rule cannot be saved to squeezy.toml"),
+        "wildcard-target rule must warn it is session only: {out}"
+    );
+}
+
+#[test]
+fn rule_preview_keeps_durable_caption_for_persistable_request() {
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo test",
+        &[("command", "cargo test")],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("saved to squeezy.toml — applies to all matching requests"),
+        "persistable request must keep the durable caption: {out}"
+    );
+    assert!(
+        !out.contains("cannot be saved to squeezy.toml"),
+        "persistable request must not show the session-only caveat: {out}"
+    );
+}
+
+#[test]
+fn approval_menu_marks_session_only_when_persistence_refused() {
+    // The project-allow option for a destructive request is relabeled so the
+    // menu does not offer "Always allow … in this repo" for a call the backend
+    // will only honour once.
+    let req = request_with(
+        "shell",
+        PermissionCapability::Destructive,
+        "rm -rf build",
+        &[("command", "rm -rf build")],
+    );
+    let menu = format_approval_prompt(&req);
+    assert!(
+        menu.contains("Always allow (session only)"),
+        "destructive request should relabel the project-allow option: {menu}"
+    );
+    assert!(
+        !menu.contains("approve this command in this repo"),
+        "destructive request must not offer a durable repo allow rule: {menu}"
+    );
+}
+
+#[test]
 fn edit_preview_lists_paths() {
     let req = request_with(
         "edit",
         PermissionCapability::Edit,
         "crates/squeezy-tui/src/lib.rs",
-        &[("paths", "crates/foo/a.rs,crates/foo/b.rs")],
+        &[("paths", "crates/foo/a.rs\ncrates/foo/b.rs")],
     );
     let out = flatten(&render_preview(&req));
     assert!(out.contains("✎ crates/foo/a.rs"), "{out}");
     assert!(out.contains("✎ crates/foo/b.rs"), "{out}");
+}
+
+#[test]
+fn edit_preview_keeps_comma_in_filename_as_one_path() {
+    // A comma is a legal filename character; the newline-delimited `paths`
+    // value must not be split on the comma into two phantom entries.
+    let req = request_with(
+        "edit",
+        PermissionCapability::Edit,
+        "a,b.txt",
+        &[("paths", "a,b.txt\nc.txt")],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(out.contains("✎ a,b.txt"), "comma-bearing path split: {out}");
+    assert!(out.contains("✎ c.txt"), "{out}");
+    assert_eq!(
+        out.matches('✎').count(),
+        2,
+        "expected exactly two paths: {out}"
+    );
 }
 
 #[test]
@@ -206,7 +311,7 @@ fn edit_preview_surfaces_hidden_paths_over_cap() {
         "edit",
         PermissionCapability::Edit,
         "a.rs",
-        &[("paths", "a.rs,b.rs,c.rs,d.rs,e.rs,f.rs")],
+        &[("paths", "a.rs\nb.rs\nc.rs\nd.rs\ne.rs\nf.rs")],
     );
     let out = flatten(&render_preview(&req));
     // The first four targets render; the rest are summarised, never silently
@@ -228,6 +333,47 @@ fn network_preview_shows_method_and_url() {
     let out = flatten(&render_preview(&req));
     assert!(out.contains("POST"), "{out}");
     assert!(out.contains("https://example.com/api"), "{out}");
+}
+
+#[test]
+fn network_shell_command_renders_host_aware() {
+    // A `curl`/`git clone` shell command is classified Network with its host
+    // encoded in the colon target. The renderer must surface the host line,
+    // a host-scoped Rule, and a host-scoped project-allow option rather than
+    // treating the colon-encoded target as a URL or opaque command prefix.
+    let mut req = request_with(
+        "shell",
+        PermissionCapability::Network,
+        "shell:curl:example.com",
+        &[
+            ("command", "curl https://example.com"),
+            ("shell_prefix", "shell:curl:example.com"),
+            ("host", "example.com"),
+        ],
+    );
+    req.permission.suggested_rules.push(PermissionRule::new(
+        "network",
+        "shell:curl:example.com",
+        PermissionMode::Allow,
+        PermissionRuleSource::Session,
+        None,
+    ));
+    let out = flatten(&render_preview(&req));
+    assert!(out.contains("host example.com"), "host line missing: {out}");
+    assert!(
+        out.contains("Rule: network host example.com"),
+        "rule line should be host-aware, not a command prefix: {out}"
+    );
+    assert!(
+        !out.contains("command prefix shell:curl:example.com"),
+        "colon-encoded command-prefix label leaked: {out}"
+    );
+
+    let menu = format_approval_prompt(&req);
+    assert!(
+        menu.contains("Always allow host example.com"),
+        "project-allow option should name the host: {menu}"
+    );
 }
 
 #[test]
@@ -302,6 +448,65 @@ fn whitespace_context_emits_no_rationale_placeholder() {
     assert!(
         out.contains("(no rationale provided)"),
         "whitespace context should fall back to the placeholder: {out}"
+    );
+}
+
+#[test]
+fn policy_reason_renders_when_transcript_snippet_is_absent() {
+    // When the assistant transcript snippet is empty but the permission engine
+    // had a real reason for asking, the user must still see that policy
+    // rationale rather than only "(no rationale provided)".
+    let mut req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "curl https://example.com",
+        &[("command", "curl https://example.com")],
+    );
+    req.context = None;
+    req.reason = "pre-classifier requires approval: network egress".to_string();
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("Policy: ") && out.contains("network egress"),
+        "policy reason missing: {out}"
+    );
+    assert!(
+        out.contains("(no rationale provided)"),
+        "transcript Why row should still state its absence: {out}"
+    );
+}
+
+#[test]
+fn policy_reason_and_transcript_render_as_distinct_rows() {
+    let mut req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "grep -r ERROR",
+        &[("command", "grep -r ERROR logs/")],
+    );
+    req.context = Some("You asked me to inspect logs.".to_string());
+    req.reason = "ai reviewer flagged broad search".to_string();
+    let out = flatten(&render_preview(&req));
+    assert!(out.contains("Why: "), "transcript row missing: {out}");
+    assert!(out.contains("You asked me to inspect logs."), "{out}");
+    assert!(
+        out.contains("Policy: ") && out.contains("ai reviewer flagged broad search"),
+        "policy reason row missing: {out}"
+    );
+}
+
+#[test]
+fn empty_policy_reason_emits_no_row() {
+    let mut req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "ls",
+        &[("command", "ls")],
+    );
+    req.reason = "   ".to_string();
+    let out = flatten(&render_preview(&req));
+    assert!(
+        !out.contains("Policy:"),
+        "whitespace-only reason must not emit a Policy row: {out}"
     );
 }
 

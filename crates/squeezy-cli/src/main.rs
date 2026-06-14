@@ -4163,6 +4163,18 @@ fn env_var_is_nonempty(name: &str) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+/// Mirror the runtime's credential resolution for startup "configured"
+/// detection. The layered resolver consults inline `[providers.<name>]
+/// api_key`, the credentials file, the named env var, its fallback env
+/// alias, and `SQUEEZY_CREDENTIALS_JSON` in one pass, so the picker's
+/// `requires_key_setup` state matches the key the session will actually
+/// load instead of seeing only the named env var.
+fn provider_key_is_configured(inline: Option<&str>, api_key_env: &str) -> bool {
+    squeezy_llm::resolve_api_key_with_inline_optional(inline, api_key_env)
+        .map(|resolved| !resolved.value.trim().is_empty())
+        .unwrap_or(false)
+}
+
 fn current_model_selection_state(
     workspace_root: &Path,
 ) -> squeezy_core::Result<ModelSelectionState> {
@@ -4312,35 +4324,56 @@ async fn run_startup_model_selector(
     save_startup_model_selection(&settings_path, &selection)?;
     Ok(Some(StartupSetupSelection {
         question_count,
-        open_config_section: if picked.open_theme_config {
-            Some(squeezy_core::config_schema::SectionId::Themes)
-        } else {
-            picked
-                .open_model_config
-                .then_some(squeezy_core::config_schema::SectionId::Models)
-        },
+        open_config_section: startup_follow_up_section(
+            picked.open_model_config,
+            picked.open_theme_config,
+        ),
     }))
 }
 
-async fn detect_provider_choices(_config: &AppConfig) -> Vec<ProviderChoice> {
+/// Resolve which single config section a finished startup picker should open
+/// next. Only one section can be opened, so the model/key step the picker
+/// promised takes precedence over the cosmetic theme step: a provider that
+/// still needs a key must never be silently skipped in favor of theming.
+fn startup_follow_up_section(
+    open_model_config: bool,
+    open_theme_config: bool,
+) -> Option<squeezy_core::config_schema::SectionId> {
+    if open_model_config {
+        Some(squeezy_core::config_schema::SectionId::Models)
+    } else {
+        open_theme_config.then_some(squeezy_core::config_schema::SectionId::Themes)
+    }
+}
+
+async fn detect_provider_choices(config: &AppConfig) -> Vec<ProviderChoice> {
+    let inline_key = |provider: &str| -> Option<String> {
+        config
+            .providers
+            .get(provider)
+            .and_then(|settings| settings.api_key.clone())
+    };
     let mut choices = vec![
         hosted_provider_choice(
             "openai",
             "OpenAI",
             preferred_env_name("OPENAI_API_KEY_ENV", &["OPENAI_API_KEY"]),
             None,
+            inline_key("openai"),
         ),
         hosted_provider_choice(
             "anthropic",
             "Anthropic",
             preferred_env_name("ANTHROPIC_API_KEY_ENV", &["ANTHROPIC_API_KEY"]),
             None,
+            inline_key("anthropic"),
         ),
         hosted_provider_choice(
             "google",
             "Gemini",
             preferred_env_name("GOOGLE_API_KEY_ENV", &["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
             None,
+            inline_key("google"),
         ),
         hosted_provider_choice(
             "azure_openai",
@@ -4349,6 +4382,7 @@ async fn detect_provider_choices(_config: &AppConfig) -> Vec<ProviderChoice> {
             env::var("AZURE_OPENAI_BASE_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
+            inline_key("azure_openai").or_else(|| inline_key("azure")),
         ),
     ];
 
@@ -4371,6 +4405,7 @@ async fn detect_provider_choices(_config: &AppConfig) -> Vec<ProviderChoice> {
             preset,
             env_var.to_string(),
             base_url,
+            inline_key(preset.as_str()),
         ));
     }
 
@@ -4410,6 +4445,7 @@ fn compatible_provider_choice(
     preset: OpenAiCompatiblePreset,
     api_key_env: String,
     base_url: String,
+    api_key_inline: Option<String>,
 ) -> ProviderChoice {
     let mut curated: Vec<String> = models_for_provider(preset.as_str())
         .map(model_choice_label)
@@ -4431,7 +4467,7 @@ fn compatible_provider_choice(
             curated.push(discovered_model_label(model));
         }
     }
-    let configured = env_var_is_nonempty(&api_key_env);
+    let configured = provider_key_is_configured(api_key_inline.as_deref(), &api_key_env);
     if configured && needs_refresh {
         spawn_background_refresh(
             preset.as_str().to_string(),
@@ -4526,8 +4562,9 @@ fn hosted_provider_choice(
     label: &str,
     api_key_env: String,
     base_url: Option<String>,
+    api_key_inline: Option<String>,
 ) -> ProviderChoice {
-    let configured = env_var_is_nonempty(&api_key_env);
+    let configured = provider_key_is_configured(api_key_inline.as_deref(), &api_key_env);
     ProviderChoice {
         provider,
         label: format!("{label} ({})", credential_label(&api_key_env, configured)),

@@ -148,6 +148,18 @@ fn copy_is_hidden_from_slash_menu() {
 }
 
 #[test]
+fn terminal_reset_is_registered_and_available_during_a_turn() {
+    // The Terminal Restore Command's slash twin must be discoverable in the menu /
+    // palette, and available mid-turn — a wedged terminal is most likely while a
+    // turn is running, so a recovery verb that vanished during a task would be
+    // useless exactly when it is needed.
+    let cmd = find_command("/terminal-reset");
+    assert!(cmd.available_during_task);
+    assert!(cmd.parameter_hint.is_none());
+    assert!(cmd.capabilities.is_empty());
+}
+
+#[test]
 fn checkpoint_commands_hidden_until_checkpointing_enabled() {
     // Checkpointing is off by default, so its commands must not be offered
     // (browse or fuzzy) until the user enables it — a newcomer should never see

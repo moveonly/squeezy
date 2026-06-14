@@ -512,16 +512,15 @@ async fn cancel_preserves_partial_assistant_text_in_conversation_state() {
 
     // Transcript: the display/persistence side carries the partial text
     // tagged `cancelled = true` so renderers can append a `(cancelled)`
-    // marker and `/undo`/`/diff` can find the cut-off turn. The transcript
-    // path trims a trailing newline (renderers append `(cancelled)` after
-    // the body) while the conversation slice keeps the raw stream — both
-    // are correct for their consumer.
+    // marker and `/undo`/`/diff` can find the cut-off turn. Outside Plan
+    // mode the partial is preserved verbatim, matching the raw stream the
+    // conversation slice keeps.
     let cancelled_assistant = state
         .transcript
         .iter()
         .find(|item| item.role == squeezy_core::Role::Assistant)
         .expect("transcript must record the cancelled assistant turn");
-    assert_eq!(cancelled_assistant.content, partial.trim_end_matches('\n'));
+    assert_eq!(cancelled_assistant.content, partial);
     assert!(
         cancelled_assistant.cancelled,
         "cancelled assistant transcript item must carry the `cancelled` flag so renderers \
@@ -9217,6 +9216,160 @@ async fn plan_mode_request_user_input_rejects_freeform_when_disallowed() {
 }
 
 #[tokio::test]
+async fn plan_mode_request_user_input_empty_choices_enables_freeform() {
+    use super::{REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputResponse};
+
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "ask_1".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                // No choices and allow_freeform omitted: the schema advertises
+                // this as a free-form question, so the request must arrive with
+                // allow_freeform forced on rather than as an unanswerable modal.
+                arguments: json!({
+                    "question": "What should the new module be called?"
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        session_mode: SessionMode::Plan,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("plan it".to_string(), CancellationToken::new());
+    let mut saw_freeform_request = false;
+    let mut completed = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::RequestUserInputRequested {
+                request,
+                response_tx,
+                ..
+            } => {
+                assert!(
+                    request.choices.is_empty(),
+                    "request carried choices it was not given"
+                );
+                assert!(
+                    request.allow_freeform,
+                    "an empty-choices question must enable freeform input"
+                );
+                saw_freeform_request = true;
+                let _ = response_tx.send(RequestUserInputResponse::freeform("widgets"));
+            }
+            AgentEvent::Completed { .. } => {
+                completed = true;
+                break;
+            }
+            AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(
+        saw_freeform_request,
+        "agent must emit a request_user_input event for the empty-choices question"
+    );
+    assert!(
+        completed,
+        "turn must complete once the free-form answer is provided"
+    );
+}
+
+#[tokio::test]
+async fn build_mode_keeps_proposed_plan_tag_in_transcript() {
+    // Outside Plan mode the structured Plan card is not in play, so a literal
+    // <proposed_plan> tag is ordinary prose and must survive in the persisted
+    // transcript verbatim rather than being silently stripped.
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(
+            "before <proposed_plan>\nstep 1\n</proposed_plan> after".to_string(),
+        )),
+        Ok(LlmEvent::Completed {
+            response_id: None,
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    // AppConfig::default() runs in Build mode.
+    let agent = Agent::new(AppConfig::default(), provider);
+
+    let mut rx = agent.start_turn("explain it".to_string(), CancellationToken::new());
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Completed { message, .. } => completed = Some(message.content),
+            AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        completed.as_deref(),
+        Some("before <proposed_plan>\nstep 1\n</proposed_plan> after"),
+        "Build-mode transcript must keep the proposed_plan tag verbatim"
+    );
+}
+
+#[tokio::test]
+async fn plan_mode_strips_proposed_plan_tag_from_transcript() {
+    // In Plan mode the Plan card owns proposed-plan rendering, so the block is
+    // stripped from the persisted transcript (surrounding narration survives).
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(
+            "before <proposed_plan>\nstep 1\n</proposed_plan> after".to_string(),
+        )),
+        Ok(LlmEvent::Completed {
+            response_id: None,
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let config = AppConfig {
+        session_mode: SessionMode::Plan,
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("plan it".to_string(), CancellationToken::new());
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Completed { message, .. } => completed = Some(message.content),
+            AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+            _ => {}
+        }
+    }
+    let content = completed.expect("turn must complete");
+    assert!(
+        !content.contains("<proposed_plan>") && !content.contains("step 1"),
+        "Plan-mode transcript must strip the proposed_plan block: {content:?}"
+    );
+}
+
+#[tokio::test]
 async fn build_mode_refuses_request_user_input_call() {
     use super::REQUEST_USER_INPUT_TOOL_NAME;
 
@@ -10708,8 +10861,9 @@ fn merge_retried_keeps_prior_answer_when_retry_confirms_done() {
     append_deferred_visible_assistant_text(
         &mut deferred,
         "The function `needle` is defined once in src/lib.rs at line 12.",
+        true,
     );
-    let merged = merge_retried_visible_assistant_text(&mut deferred, "DONE");
+    let merged = merge_retried_visible_assistant_text(&mut deferred, "DONE", true);
     assert_eq!(
         merged,
         "The function `needle` is defined once in src/lib.rs at line 12."
@@ -10721,9 +10875,12 @@ fn merge_retried_appends_real_continuation() {
     // A genuine stall recovery: the retry produced new substantive text,
     // appended after the prior visible text — nothing is dropped.
     let mut deferred = String::new();
-    append_deferred_visible_assistant_text(&mut deferred, "I scanned the tree.");
-    let merged =
-        merge_retried_visible_assistant_text(&mut deferred, "The entrypoint is `main` in cli.rs.");
+    append_deferred_visible_assistant_text(&mut deferred, "I scanned the tree.", true);
+    let merged = merge_retried_visible_assistant_text(
+        &mut deferred,
+        "The entrypoint is `main` in cli.rs.",
+        true,
+    );
     assert_eq!(
         merged,
         "I scanned the tree.\n\nThe entrypoint is `main` in cli.rs."
@@ -10736,9 +10893,9 @@ fn merge_retried_appends_continuation_that_references_the_prior() {
     // negates it and delivers the missing content. It is a real
     // continuation and must be APPENDED, not discarded as an ack.
     let mut deferred = String::new();
-    append_deferred_visible_assistant_text(&mut deferred, "I summarized the config.");
+    append_deferred_visible_assistant_text(&mut deferred, "I summarized the config.", true);
     let continuation = "The previous response is incomplete; the missing file is src/foo.rs.";
-    let merged = merge_retried_visible_assistant_text(&mut deferred, continuation);
+    let merged = merge_retried_visible_assistant_text(&mut deferred, continuation, true);
     assert_eq!(
         merged,
         format!("I summarized the config.\n\n{continuation}"),
@@ -10993,6 +11150,7 @@ async fn dispatch_command_tui_only_for_renderer_owned_commands() {
             DispatchCommand::SessionExportHtml {
                 id: "s".to_string(),
                 path: None,
+                force: false,
             },
             "session-export-html",
         ),

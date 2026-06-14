@@ -2428,20 +2428,6 @@ impl Driver {
                         },
                     )?;
                 }
-                AgentEvent::SubagentActivity {
-                    turn_id,
-                    id,
-                    agent,
-                    message,
-                } => {
-                    let turn_str = format!("{turn_id:?}");
-                    self.capture.record(
-                        Some(turn_str),
-                        EvalEventKind::SubagentEvent {
-                            event: json!({"kind": "activity", "id": id, "agent": agent, "message": message}),
-                        },
-                    )?;
-                }
                 AgentEvent::SubagentToolResult {
                     turn_id,
                     id,

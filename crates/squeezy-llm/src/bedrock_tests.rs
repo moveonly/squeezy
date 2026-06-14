@@ -22,7 +22,7 @@ use super::{
     classify_stream_sdk_error, compute_thinking_extra_fields, conversation_messages,
     current_bearer_token, extract_echoed_model, extract_url_host, handle_bedrock_event, hex_decode,
     hex_encode, inference_configuration, json_to_document, region_prefix,
-    sanitize_bedrock_document_name, system_blocks, tool_configuration,
+    sanitize_bedrock_document_name, sdk_error_to_squeezy, system_blocks, tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{CacheRetention, LlmInputItem, LlmRequest, LlmToolSpec};
@@ -1759,6 +1759,81 @@ fn classify_stream_sdk_error_routes_transient_classes_to_provider_stream() {
         assert!(
             message.contains(label),
             "error must mention the SDK variant {label}: {message}",
+        );
+    }
+}
+
+/// The initial `converse_stream().send()` failure must carry the same
+/// retryability verdict as the mid-stream classifier: deterministic 4xx
+/// (validation / access-denied / not-found) gets the non-retryable
+/// marker so the status line / turn-failed banner does not invite a
+/// retry that fails identically.
+#[test]
+fn sdk_error_to_squeezy_marks_deterministic_4xx_non_retryable() {
+    use aws_sdk_bedrockruntime::error::SdkError;
+    use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+    use aws_sdk_bedrockruntime::types::error::{
+        AccessDeniedException, ResourceNotFoundException, ValidationException,
+    };
+    use aws_smithy_types::event_stream::RawMessage;
+
+    let cases = [
+        ConverseStreamError::ValidationException(
+            ValidationException::builder().message("bad schema").build(),
+        ),
+        ConverseStreamError::AccessDeniedException(
+            AccessDeniedException::builder()
+                .message("no access")
+                .build(),
+        ),
+        ConverseStreamError::ResourceNotFoundException(
+            ResourceNotFoundException::builder()
+                .message("unknown model")
+                .build(),
+        ),
+    ];
+    for inner in cases {
+        let err = sdk_error_to_squeezy(SdkError::service_error(inner, RawMessage::invalid(None)));
+        let SqueezyError::ProviderRequest(message) = &err else {
+            panic!("expected ProviderRequest, got {err:?}");
+        };
+        assert!(
+            message.starts_with(crate::anthropic_error::NON_RETRYABLE_MARKER),
+            "deterministic 4xx must be marked non-retryable: {message}",
+        );
+    }
+}
+
+#[test]
+fn sdk_error_to_squeezy_leaves_transient_classes_unmarked() {
+    use aws_sdk_bedrockruntime::error::SdkError;
+    use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+    use aws_sdk_bedrockruntime::types::error::{
+        InternalServerException, ServiceUnavailableException, ThrottlingException,
+    };
+    use aws_smithy_types::event_stream::RawMessage;
+
+    let cases = [
+        ConverseStreamError::ThrottlingException(
+            ThrottlingException::builder().message("slow down").build(),
+        ),
+        ConverseStreamError::InternalServerException(
+            InternalServerException::builder().message("borked").build(),
+        ),
+        ConverseStreamError::ServiceUnavailableException(
+            ServiceUnavailableException::builder()
+                .message("later")
+                .build(),
+        ),
+    ];
+    for inner in cases {
+        let err = sdk_error_to_squeezy(SdkError::service_error(inner, RawMessage::invalid(None)));
+        let SqueezyError::ProviderRequest(message) = &err else {
+            panic!("expected ProviderRequest, got {err:?}");
+        };
+        assert!(
+            !message.starts_with(crate::anthropic_error::NON_RETRYABLE_MARKER),
+            "transient classes must stay retryable: {message}",
         );
     }
 }

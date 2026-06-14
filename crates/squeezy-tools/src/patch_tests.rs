@@ -126,6 +126,33 @@ fn render_search_replace_keeps_in_place_headers() {
 }
 
 #[test]
+fn render_multi_search_replace_preserves_per_file_markers() {
+    let args = args_from(json!({
+        "operations": [
+            {"kind": "search_replace", "path": "a.rs", "search": "foo", "replace": "bar"},
+            {"kind": "search_replace", "path": "b.rs", "search": "baz", "replace": "qux"}
+        ]
+    }));
+    let diff =
+        render_apply_patch_diff(&args).expect("multi-op search/replace produces a preview blob");
+    // Like create / delete / move, each in-place edit must carry a textual
+    // `@@ edit a/<path> @@` marker so its body does not render under a
+    // pathless `⋮` divider once the renderer strips the `--- ` / `+++ ` lines.
+    assert!(
+        diff.contains("@@ edit a/a.rs @@\n"),
+        "missing first-file marker in multi-op search/replace preview:\n{diff}",
+    );
+    assert!(
+        diff.contains("@@ edit a/b.rs @@\n"),
+        "missing second-file marker in multi-op search/replace preview:\n{diff}",
+    );
+    assert!(diff.contains("-foo\n"));
+    assert!(diff.contains("+bar\n"));
+    assert!(diff.contains("-baz\n"));
+    assert!(diff.contains("+qux\n"));
+}
+
+#[test]
 fn render_returns_none_when_no_ops_or_patches() {
     let args = args_from(json!({}));
     assert!(render_apply_patch_diff(&args).is_none());

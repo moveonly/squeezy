@@ -367,7 +367,7 @@ const TOPICS: &[TopicDefinition] = &[
             "/fork",
             "/cheap",
         ],
-        summary: "The Squeezy TUI has a full-width composer at the bottom, a transcript pane above it, and a status footer. Key bindings: Esc or Ctrl+C cancel an in-flight turn or tool approval; Enter submits; Ctrl+J inserts a newline; Ctrl+T shows the full transcript overlay; Ctrl+P shows the task-state overlay; Ctrl+Y copies the last assistant message; Ctrl+R restores the last prompt; Shift+Tab toggles plan/build mode; Up/Down navigate input history or the slash menu. Slash commands: `/help`, `/plan`, `/build`, `/router`, `/model`, `/permissions`, `/config`, `/cost`, `/context`, `/compact`, `/pin`, `/unpin`, `/pins`, `/attach`, `/attachments`, `/detach`, `/sessions`, `/session`, `/resume`, `/clear`, `/feedback`, `/report`, `/tool-verbosity`, `/tasks`, `/task`, `/task-cancel`, `/skill`, `/theme`, `/reviewer`, `/diff`, `/plans`, `/fork`, `/keymap`, `/effort`, `/cheap`, `/checkpoints`, `/undo`, `/revert-turn`. Use `/theme <name>` to switch the color theme; built-ins are `default`, `bright`, `fun`, and `starlight`. Use `/router on|off` to toggle cheap-model turn routing. Use `/keymap` to view the active key bindings. Typing any `/` opens the slash suggestion menu; arrow keys navigate it.",
+        summary: "The Squeezy TUI has a full-width composer at the bottom, a transcript pane above it, and a status footer. Key bindings: Esc or Ctrl+C cancel an in-flight turn or tool approval; Enter submits; Ctrl+J inserts a newline; Ctrl+T shows the full transcript overlay; Ctrl+P shows the task-state overlay; Ctrl+Y copies the last assistant message; Ctrl+R restores the last prompt; Shift+Tab toggles plan/build mode; Up/Down navigate input history or the slash menu. Slash commands: `/help`, `/config`, `/model`, `/permissions`, `/mcp`, `/plan`, `/build`, `/plans`, `/cost`, `/context`, `/reviewer`, `/attach`, `/compact`, `/clear`, `/diff`, `/tasks`, `/task`, `/task-cancel`, `/pin`, `/pins`, `/unpin`, `/feedback`, `/report`, `/sessions`, `/session`, `/resume`, `/fork`, `/session-export`, `/session-export-html`, `/checkpoints`, `/checkpoint`, `/undo`, `/revert-turn`, `/effort`, `/cheap`, `/parent`, `/router`, `/tool-verbosity`, `/statusline`, `/theme`, `/keymap`, `/export`, `/bundle`, `/terminal`, `/terminal-reset`. Type `/` to browse the live, categorized menu, or `/help /<command>` for one command's details. Use `/theme <name>` to switch the color theme; built-ins are `default`, `bright`, `fun`, and `starlight`. Use `/router on|off` to toggle cheap-model turn routing. Use `/keymap` to view the active key bindings. Typing any `/` opens the slash suggestion menu; arrow keys navigate it.",
         docs: &["docs/external/AGENT_APPROACH.md", "docs/external/TOOLS.md"],
         config: &["tui", "session"],
     },
@@ -443,7 +443,7 @@ const TOPICS: &[TopicDefinition] = &[
             "api key",
             "api-key",
         ],
-        summary: "Provider selection is configuration-driven. Squeezy supports built-in OpenAI, Anthropic, Google Gemini, Azure OpenAI, Ollama, and Bedrock provider metadata. API key settings name environment variables; `config inspect` redacts secret-looking values and provider key names where appropriate.",
+        summary: "Provider selection is configuration-driven. Squeezy ships first-party metadata for OpenAI, OpenAI Codex, GitHub Copilot, Anthropic, Google Gemini, Azure OpenAI, Bedrock, and Vertex AI, plus OpenAI-compatible presets and gateways — OpenRouter, Vercel AI Gateway, PortKey, Groq, xAI, DeepSeek, Mistral, Together, Fireworks, Cerebras, DeepInfra, Baseten, Cloudflare, local Ollama/LM Studio/vLLM/llama.cpp, and a generic `openai_compatible` preset (see PROVIDERS.md for the full list). API key settings name environment variables; `config inspect` redacts secret-looking values and provider key names where appropriate.",
         docs: &[
             "docs/external/PROVIDERS.md",
             "docs/external/CONFIGURATION.md",
@@ -741,7 +741,7 @@ const TOPICS: &[TopicDefinition] = &[
             "custom prompt",
             "reusable prompt",
         ],
-        summary: "Prompt templates are reusable `.md` files stored in `~/.squeezy/prompts/` (user scope) or `<workspace>/.squeezy/prompts/` (project scope). Each file's name (without `.md`) becomes the template name. Activate with `/prompt-template <name>` in the composer. Project templates shadow user templates with the same name.",
+        summary: "Prompt templates are reusable `.md` files stored in `~/.squeezy/prompts/` (user scope) or `<workspace>/.squeezy/prompts/` (project scope). Each file's name (without `.md`) becomes a slash command: a `review.md` template runs as `/review [args]` in the composer. Project templates shadow user templates with the same name.",
         docs: &[
             "docs/external/PROMPT_TEMPLATES.md",
             "docs/external/SKILLS.md",
@@ -1094,6 +1094,15 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         related: &["tui", "doctor"],
     },
     SlashCommandHelp {
+        name: "/terminal-reset",
+        what: "Force-reset a wedged terminal: leave the alt-screen, reset terminal modes, show the cursor, and re-enter the fullscreen surface. The typeable twin of the Ctrl+Alt+, restore chord, for when the chord itself is swallowed by a corrupted terminal.",
+        syntax: "/terminal-reset",
+        examples: &["/terminal-reset  — recover a garbled or stuck terminal"],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["terminal", "tui", "keymap"],
+    },
+    SlashCommandHelp {
         name: "/attach",
         what: "Insert a file or directory token in the prompt editor as attached context.",
         syntax: "/attach <path>",
@@ -1115,7 +1124,7 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
             "/compact history  — show compaction timeline for this session",
         ],
         available_during_turn: false,
-        capability_note: None,
+        capability_note: Some("Requires: [net]"),
         related: &["cost", "sessions"],
     },
     SlashCommandHelp {
@@ -1130,7 +1139,7 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
             "/effort auto   — clear manual effort; model/provider decides",
         ],
         available_during_turn: false,
-        capability_note: None,
+        capability_note: Some("Requires: [edit]"),
         related: &["providers", "config"],
     },
     SlashCommandHelp {
@@ -1178,8 +1187,8 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
             "/tool-verbosity normal   — standard preview (default)",
             "/tool-verbosity verbose  — full tool output in transcript",
         ],
-        available_during_turn: true,
-        capability_note: None,
+        available_during_turn: false,
+        capability_note: Some("Requires: [edit]"),
         related: &["tui"],
     },
     SlashCommandHelp {
@@ -1398,9 +1407,11 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
     },
     SlashCommandHelp {
         name: "/revert-turn",
-        what: "Revert the files changed during the most recent turn checkpoint.",
-        syntax: "/revert-turn",
-        examples: &["/revert-turn  — undo all file changes made in the last turn"],
+        what: "Revert the files changed during a turn checkpoint. Run /checkpoints to list turn ids.",
+        syntax: "/revert-turn <turn_id>",
+        examples: &[
+            "/revert-turn abc123  — undo the file changes from that turn (run /checkpoints for ids)",
+        ],
         available_during_turn: false,
         capability_note: Some("Requires: [edit, destructive]"),
         related: &["checkpoints"],

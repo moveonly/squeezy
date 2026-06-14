@@ -415,7 +415,14 @@ fn google_stream_attempt(
                 .text()
                 .await
                 .unwrap_or_else(|_| "failed to read error response".to_string());
-            Err(SqueezyError::ProviderRequest(format!("{status}: {message}")))?;
+            let prefix = if crate::anthropic_error::status_is_retryable(status) {
+                ""
+            } else {
+                crate::anthropic_error::NON_RETRYABLE_MARKER
+            };
+            Err(SqueezyError::ProviderRequest(format!(
+                "{prefix}{status}: {message}"
+            )))?;
             unreachable!("provider error returned above");
         };
 

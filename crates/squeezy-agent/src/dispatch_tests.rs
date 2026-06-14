@@ -323,6 +323,7 @@ fn parse_session_family() {
         DispatchCommand::SessionExportHtml {
             id: "sess-4".to_string(),
             path: None,
+            force: false,
         }
     );
     assert_eq!(
@@ -330,6 +331,23 @@ fn parse_session_family() {
         DispatchCommand::SessionExportHtml {
             id: "sess-4".to_string(),
             path: Some("/tmp/x.html".to_string()),
+            force: false,
+        }
+    );
+    assert_eq!(
+        parse("/session-export-html sess-4 /my docs/out.html").unwrap(),
+        DispatchCommand::SessionExportHtml {
+            id: "sess-4".to_string(),
+            path: Some("/my docs/out.html".to_string()),
+            force: false,
+        }
+    );
+    assert_eq!(
+        parse("/session-export-html sess-4 /my docs/out.html !").unwrap(),
+        DispatchCommand::SessionExportHtml {
+            id: "sess-4".to_string(),
+            path: Some("/my docs/out.html".to_string()),
+            force: true,
         }
     );
 }
@@ -455,6 +473,7 @@ fn slash_name_matches_input_command() {
             DispatchCommand::SessionExportHtml {
                 id: "x".into(),
                 path: None,
+                force: false,
             },
         ),
         (

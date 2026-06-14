@@ -41,6 +41,9 @@
 //! [`active_hint`]: HintEngine::active_hint
 
 use std::cell::Cell;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The three first-run interactions the engine teaches, in *priority order* (the
@@ -73,16 +76,21 @@ impl HintId {
     /// across the engine) means a re-prioritization is a one-line edit.
     const ALL: [HintId; 3] = [HintId::PaletteChord, HintId::Hover, HintId::Jump];
 
-    /// A short, stable, ASCII-only slug for the hint — used by tests and any future
-    /// persisted seen-set so the on-disk key never depends on the `Debug` spelling.
-    /// `cfg(test)`-only today: production renders the hint by id, never by slug.
-    #[cfg(test)]
+    /// A short, stable, ASCII-only slug for the hint — the on-disk key for the
+    /// persisted seen-set, so it never depends on the `Debug` spelling. Stable
+    /// across releases: changing a slug silently resurrects a learned hint.
     pub(crate) const fn slug(self) -> &'static str {
         match self {
             HintId::PaletteChord => "palette_chord",
             HintId::Hover => "hover",
             HintId::Jump => "jump",
         }
+    }
+
+    /// Parse a persisted [`slug`](HintId::slug) back into its id. Unknown slugs
+    /// (an older/newer build, a hand-edited file) yield `None` and are ignored.
+    fn from_slug(slug: &str) -> Option<HintId> {
+        HintId::ALL.into_iter().find(|id| id.slug() == slug)
     }
 
     /// The hint body, with `{chord}` substituted for the live key binding the
@@ -146,22 +154,111 @@ pub(crate) struct HintEngine {
     /// dismiss) / [`note_used`](HintEngine::note_used) know whether to ask for an
     /// erase repaint) while holding only `&self`.
     showing: Cell<Option<HintId>>,
+    /// File the seen-set is mirrored to so a learned hint stays learned across
+    /// sessions. `None` keeps the engine purely in-memory (tests, and the
+    /// disabled feature). Writes are best-effort: an I/O failure is logged and
+    /// the in-memory latch keeps working.
+    persist_path: Option<PathBuf>,
 }
 
 impl Default for HintEngine {
     fn default() -> Self {
+        // In-memory only: tests and any caller that wants the historical
+        // behaviour without touching disk. Enabled by default — the hints are
+        // restrained and fade the instant the user learns the interaction.
         Self {
-            // Enabled by default: the hints are restrained (a single dim line that
-            // fades the instant the user learns the interaction) and only ever show
-            // three times total across the whole life of a session.
             enabled: true,
             states: Default::default(),
             showing: Cell::new(None),
+            persist_path: None,
         }
     }
 }
 
 impl HintEngine {
+    /// In-memory engine with the feature `enabled` flag set explicitly and no
+    /// disk mirror. Used when the seen-set should not be persisted (the feature
+    /// is disabled, or no state path is available).
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            states: Default::default(),
+            showing: Cell::new(None),
+            persist_path: None,
+        }
+    }
+
+    /// Disk-backed engine: pre-seeds the seen-set from `path` (so a hint learned
+    /// in a prior session stays learned) and mirrors every newly-latched hint
+    /// back to it. When `enabled` is `false` the feature is silent regardless of
+    /// what is on disk, but the path is still honored so a later re-enable keeps
+    /// the persisted seen-set.
+    pub(crate) fn with_persistence(enabled: bool, path: PathBuf) -> Self {
+        let mut engine = Self {
+            enabled,
+            states: Default::default(),
+            showing: Cell::new(None),
+            persist_path: Some(path),
+        };
+        engine.load_seen_from_disk();
+        engine
+    }
+
+    /// Mark every hint whose slug appears in `slugs` as already seen. Unknown
+    /// slugs are ignored. Used by [`load_seen_from_disk`](HintEngine::
+    /// load_seen_from_disk) and the seeding unit tests.
+    fn seed_seen(&mut self, slugs: impl IntoIterator<Item = String>) {
+        for slug in slugs {
+            if let Some(id) = HintId::from_slug(slug.trim()) {
+                self.states[Self::index(id)].seen = true;
+            }
+        }
+    }
+
+    /// The slugs of every hint currently latched seen, in priority order — the
+    /// on-disk representation of the seen-set.
+    fn seen_slugs(&self) -> Vec<&'static str> {
+        HintId::ALL
+            .into_iter()
+            .filter(|&id| self.states[Self::index(id)].seen)
+            .map(HintId::slug)
+            .collect()
+    }
+
+    fn load_seen_from_disk(&mut self) {
+        let Some(path) = self.persist_path.clone() else {
+            return;
+        };
+        match read_slugs(&path) {
+            Ok(slugs) => self.seed_seen(slugs),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(
+                    target: "squeezy_tui::first_run_hints",
+                    error = %err,
+                    path = %path.display(),
+                    "failed to load first-run hint state",
+                );
+            }
+        }
+    }
+
+    /// Best-effort write of the current seen-set to disk. A failure is logged
+    /// and otherwise ignored so a borked state file never breaks the session.
+    fn persist_seen(&self) {
+        let Some(path) = self.persist_path.as_deref() else {
+            return;
+        };
+        if let Err(err) = write_slugs(path, &self.seen_slugs()) {
+            tracing::warn!(
+                target: "squeezy_tui::first_run_hints",
+                error = %err,
+                path = %path.display(),
+                "failed to persist first-run hint state",
+            );
+        }
+    }
+
     /// The stable array index for a hint id (its position in [`HintId::ALL`],
     /// which is also its priority). Total over the closed variant set.
     fn index(id: HintId) -> usize {
@@ -221,6 +318,9 @@ impl HintEngine {
         if was_visible {
             self.showing.set(None);
         }
+        if newly_seen {
+            self.persist_seen();
+        }
         // A redraw is only needed if a line was actually painted for this hint.
         was_visible && newly_seen
     }
@@ -231,7 +331,12 @@ impl HintEngine {
     /// can name it in a status line) or `None` when nothing was showing.
     pub(crate) fn dismiss(&mut self) -> Option<HintId> {
         let id = self.showing.take()?;
-        self.states[Self::index(id)].seen = true;
+        let idx = Self::index(id);
+        let newly_seen = !self.states[idx].seen;
+        self.states[idx].seen = true;
+        if newly_seen {
+            self.persist_seen();
+        }
         Some(id)
     }
 
@@ -352,6 +457,36 @@ impl HintEngine {
             }
         }
     }
+}
+
+/// Read the persisted seen-set: one slug per line, blank lines ignored. A
+/// missing file surfaces as `io::ErrorKind::NotFound` so the caller can treat a
+/// first run as "nothing seen yet".
+fn read_slugs(path: &Path) -> io::Result<Vec<String>> {
+    let contents = fs::read_to_string(path)?;
+    Ok(contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Rewrite the seen-set file with `slugs`, one per line, creating the parent
+/// directory if needed. A whole rewrite (not append) keeps the tiny file
+/// canonical and free of stale/duplicate entries.
+fn write_slugs(path: &Path, slugs: &[&str]) -> io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let mut body = String::new();
+    for slug in slugs {
+        body.push_str(slug);
+        body.push('\n');
+    }
+    fs::write(path, body)
 }
 
 #[cfg(test)]

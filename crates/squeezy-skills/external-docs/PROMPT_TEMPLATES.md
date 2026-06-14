@@ -103,5 +103,6 @@ project-specific workflows without changing the user's global files.
 ## Related
 
 - [SKILLS.md](SKILLS.md) — for more powerful per-skill instruction injection.
-- Use `/skill <name>` to activate a full skill with structured instructions;
-  use a template slash name such as `/review` for lightweight prompt expansion.
+- Skills activate from trigger phrases or the model's `load_skill` tool for
+  structured instructions; use a template slash name such as `/review` for
+  lightweight prompt expansion.

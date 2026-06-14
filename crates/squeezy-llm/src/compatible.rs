@@ -28,7 +28,7 @@ use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmHostedTool, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
     ReasoningKind, ReasoningPayload,
-    anthropic_error::NON_RETRYABLE_MARKER,
+    anthropic_error::{NON_RETRYABLE_MARKER, status_is_retryable},
     cache_policy::{CacheRetention, ephemeral_marker, json_markers, last_stable_tool_index},
     credentials::{
         ApiKeySource, resolve_api_key_with_inline, resolve_api_key_with_inline_optional,
@@ -828,8 +828,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 } else {
                     local_jit_load_hint(preset, status, &message)
                 };
+                let prefix = if status_is_retryable(status) {
+                    ""
+                } else {
+                    NON_RETRYABLE_MARKER
+                };
                 Err(SqueezyError::ProviderRequest(format!(
-                    "{provider_label} {status}: {message}{hint}"
+                    "{prefix}{provider_label} {status}: {message}{hint}"
                 )))?;
                 unreachable!("provider error returned above");
             };

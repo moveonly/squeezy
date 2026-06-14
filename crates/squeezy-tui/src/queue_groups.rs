@@ -176,6 +176,13 @@ impl QueueGroups {
         self.groups.retain(|g| !g.members.is_empty());
     }
 
+    /// Pull queue item `id` out of its group (no-op if loose), dropping a group
+    /// emptied that way. Used by run-selected-next so the chosen prompt escapes a
+    /// paused group's drain gate while the rest of the batch stays parked.
+    pub(crate) fn remove_member(&mut self, id: u64) {
+        self.remove_member_everywhere(id);
+    }
+
     /// Remove queue item `id` from whatever group owns it (no-op if loose),
     /// dropping a group emptied that way. Used by [`create_group`] to keep the
     /// one-group-per-item invariant.

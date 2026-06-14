@@ -18,11 +18,14 @@
 //! ## What is measured
 //!
 //! The render time the tracker records is the *app-side* `draw_app` wall time
-//! already measured by Phase 8 — event receipt → dispatch → state mutation →
-//! ratatui render → crossterm write+flush, all of which happen inside the single
-//! `draw_app` chokepoint. PTY / terminal flush jitter past the process boundary
-//! is deliberately excluded: the spec calls that out as noisy and report-only,
-//! so the budgets here gate the part Squeezy actually controls.
+//! already measured by Phase 8 — the render-and-emit window only: ratatui render
+//! → crossterm write+flush, bracketed by the timer that starts at the top of
+//! `draw_app` and is read at frame end. Event dispatch and state mutation run
+//! earlier, in the event loop (`handle_input_event` → `handle_key`), *before*
+//! `draw_app` is called, so they are NOT included in this sample. PTY / terminal
+//! flush jitter past the process boundary is also deliberately excluded: the
+//! spec calls that out as noisy and report-only, so the budgets here gate the
+//! render-and-emit part Squeezy actually controls inside `draw_app`.
 //!
 //! ## Idle-redraw contract
 //!

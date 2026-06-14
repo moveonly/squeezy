@@ -192,6 +192,18 @@ fn next_step_hint(error_type: &str, message: &str) -> Option<String> {
     None
 }
 
+/// Classify an HTTP status as retryable based on the status alone,
+/// for provider error paths that carry no parseable error envelope.
+/// Only 5xx and 429 are transient; every other status (the 4xx
+/// invalid-request / auth / permission / not-found family) is
+/// deterministic and fails identically on resend.
+///
+/// Mirrors the status tiebreaker in [`is_retryable`] for callers that
+/// have an HTTP status but no Anthropic-shaped body to inspect.
+pub fn status_is_retryable(status: StatusCode) -> bool {
+    status.is_server_error() || status.as_u16() == 429
+}
+
 /// If `message` carries the [`NON_RETRYABLE_MARKER`] prefix, return
 /// `(true, stripped_message)`; otherwise return `(false, message)`.
 /// Lets the TUI render the human prose without the on-wire sentinel

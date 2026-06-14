@@ -576,6 +576,29 @@ fn render_mcp_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenSta
                 Span::styled(endpoint.to_string(), row_style),
             ]));
         }
+
+        // Detail panel for the focused row. The status column is
+        // hard-capped, so a long PATH / auth / crash error collapses to
+        // `failed: ...`; surface the untruncated text here so it stays
+        // readable without widening the table.
+        if let Some(name) = names.get(state.field_index)
+            && let Some(server) = state.mcp_servers.get(name)
+            && let Some(status) = state.mcp_status.per_server.get(name)
+            && mcp_status_has_detail(status)
+        {
+            let detail = format_mcp_row_status_for_server(server, status);
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![Span::styled(
+                format!("{name} detail"),
+                Style::default()
+                    .fg(crate::render::theme::quiet())
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(detail, Style::default().fg(crate::render::theme::red())),
+            ]));
+        }
     }
 
     // Trailing "(add new)" row.
@@ -655,6 +678,17 @@ pub(crate) fn mcp_status_icon(
             ('○', crate::render::theme::quiet())
         }
     }
+}
+
+/// Whether a status warrants the untruncated detail panel beneath the
+/// table: the failure/stale variants carry an error string that the
+/// fixed-width status column clips, so they get an expanded view.
+fn mcp_status_has_detail(status: &squeezy_tools::McpServerStatus) -> bool {
+    use squeezy_tools::McpServerStatus;
+    matches!(
+        status,
+        McpServerStatus::Failed { .. } | McpServerStatus::Stale { .. } | McpServerStatus::Cancelled
+    )
 }
 
 fn format_mcp_row_status_for_server(

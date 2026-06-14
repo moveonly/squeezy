@@ -169,7 +169,7 @@ pub(crate) const APPROVAL_DIFF_MAX_LINES: usize = 40;
 /// edits:
 ///
 /// * `search_replace` → `--- a/<path>` / `+++ b/<path>` / `@@ -1 +1 @@` +
-///   `-old` / `+new` body lines.
+///   a marker line naming the edited path + `-old` / `+new` body lines.
 /// * `create_file`    → `--- /dev/null` / `+++ b/<path>` /
 ///   `@@ -0,0 +1,N @@` + `+new` body lines (N = total file line count;
 ///   the body may be truncated for display by [`APPROVAL_DIFF_MAX_LINES`]).
@@ -346,6 +346,10 @@ fn append_search_replace_hunk(
     remaining: &mut usize,
 ) {
     let _ = write!(out, "--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n");
+    if *remaining > 0 {
+        let _ = writeln!(out, "@@ edit a/{path} @@");
+        *remaining -= 1;
+    }
     for line in search.lines() {
         if *remaining == 0 {
             return;

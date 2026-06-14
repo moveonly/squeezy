@@ -636,6 +636,45 @@ pub(crate) fn read_system_clipboard_image() -> Option<(Vec<u8>, String)> {
     None
 }
 
+/// Upper bound on how long the paste chord waits for a platform clipboard
+/// helper before treating it as unavailable. The helpers (`pbpaste`, `xclip`,
+/// `wl-paste`, PowerShell, `osascript`) normally return in single-digit
+/// milliseconds; a read that takes longer is a wedged helper (e.g. one holding
+/// the X selection), and stalling the UI event loop on it would freeze the
+/// composer. The cap is generous enough not to drop a slow-but-live helper.
+const PASTE_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Run a blocking clipboard `read` on the blocking pool with a bounded wait.
+/// `Ok(value)` on completion (where `None` means no helper produced anything),
+/// and `Err(())` when the read exceeded `timeout`. A panic in the blocking task
+/// is mapped to `Ok(None)` so a misbehaving helper reads as "unavailable"
+/// rather than propagating.
+async fn bounded_read<T, F>(timeout: std::time::Duration, read: F) -> Result<Option<T>, ()>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Option<T> + Send + 'static,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(read)).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_join_err)) => Ok(None),
+        Err(_elapsed) => Err(()),
+    }
+}
+
+/// Read clipboard text via [`read_system_clipboard`] on the blocking pool with
+/// a bounded wait, so the async UI task is never stalled by a hung helper.
+/// `Ok(Some(_))` on a successful read, `Ok(None)` when no helper produced text,
+/// and `Err(())` when the read exceeded [`PASTE_HELPER_TIMEOUT`].
+pub(crate) async fn read_system_clipboard_bounded() -> Result<Option<String>, ()> {
+    bounded_read(PASTE_HELPER_TIMEOUT, read_system_clipboard).await
+}
+
+/// Read a clipboard IMAGE via [`read_system_clipboard_image`] on the blocking
+/// pool with the same bounded wait as [`read_system_clipboard_bounded`].
+pub(crate) async fn read_system_clipboard_image_bounded() -> Result<Option<(Vec<u8>, String)>, ()> {
+    bounded_read(PASTE_HELPER_TIMEOUT, read_system_clipboard_image).await
+}
+
 // ---------------------------------------------------------------------------
 // Providers + chain
 // ---------------------------------------------------------------------------

@@ -1,53 +1,25 @@
 id = "mcp-elicitation-form"
 title = "MCP Form elicitation modal — styling + multiline input + Esc cancel"
 description = """
-HARNESS LIMITATION (regression guard, not a working repro).
+Drives a live MCP `Form` elicitation through the TUI via the
+`inject_mcp_elicitation` harness action, which synthesizes a request
+straight into `pending_mcp_elicitation` (bypassing the MCP transport)
+so the modal layer can be exercised offline.
 
-This scenario is the placeholder coverage entry for the
-`mcp-elicitation-form` row of `docs/internal/EVAL_COVERAGE_PLAN.md`.
-Its probe statement is:
+Probe:
 
-    Drive an MCP server `Form` elicitation through the live TUI;
-    confirm the question/message renders in violet+bold (post-#154),
-    that the response entry box accepts long input via repeated
-    `send_key` actions, and that `Esc` cancels without leaking the
-    elicitation through to the model.
+  1. Inject a `Form` elicitation; confirm the modal opens
+     (`mcp_elicitation`) and the question renders in the frame
+     alongside the `MCP request` header and Accept/Decline options.
+  2. Type into the modal's answer field via `send_key`; confirm the
+     modal stays up and accepts input without leaking to the composer.
+  3. `Esc` cancels the elicitation without sending it to the model —
+     the modal closes and the question text leaves the frame.
 
-That probe **cannot be driven from `squeezy-eval` today.** Why:
-
-  - The TUI's MCP modal (`format_mcp_elicitation_menu_lines`,
-    `pending_mcp_elicitation` in `crates/squeezy-tui/src/lib.rs`) is
-    only ever populated when an MCP server calls
-    `set_elicitation_handler`'s registered callback while servicing a
-    real MCP `tools/call` (see `install_mcp_elicitation_handler` in
-    `crates/squeezy-agent/src/lib.rs` and the `elicitation_handler`
-    plumbing in `crates/squeezy-mcp/src/lib.rs`).
-  - The scenario schema has no `[mcp.servers]` / `mock_mcp` section
-    (see `crates/squeezy-eval/src/scenario.rs`). The mock provider
-    can issue tool calls by name but cannot stand up an in-process
-    MCP server, and there is no in-tree fake MCP server that the
-    harness could spin up.
-  - The harness already ships `Action::RespondElicitation`
-    (`crates/squeezy-eval/src/scenario.rs` ~line 232) and a matching
-    driver handler (`decide_elicitation` in
-    `crates/squeezy-eval/src/driver.rs` ~line 1928) — the REPLY side
-    is wired, but there is no way to make a `McpElicitationRequested`
-    event fire offline, so the wiring is exercised only by the
-    auto-cancel fall-through.
-
-Until a `mock_mcp` scenario knob (or a `tests/fixtures/fake-mcp`
-binary the scenario can launch) lands, this scenario:
-
-  1. Stands the TUI capture stack up so future runs against this
-     row at least produce a frame snapshot at startup.
-  2. Queues a `respond_elicitation` Accept action so a future MCP
-     mock driver will find a matching scripted reply waiting. The
-     action will never fire today; the eval driver's auto-cancel
-     fall-back is what runs.
-  3. Documents (via this `description` block + the matching
-     `docs/internal/eval-findings/mcp-elicitation-form.md`) exactly
-     which file:line the future `mock_mcp` driver should hook so
-     the next agent does not re-derive the gap.
+Suspect surfaces:
+  * format_mcp_elicitation_menu_lines    @ crates/squeezy-tui/src/lib.rs
+  * handle_mcp_elicitation_key           @ crates/squeezy-tui/src/lib.rs
+  * inject_mcp_elicitation_into_harness  @ crates/squeezy-eval/src/driver.rs
 
 Run with:
 
@@ -65,63 +37,95 @@ provider = "mock"
 mode = "build"
 # Keep `permission_mode = "ask"` so the elicitation policy gate
 # (`McpClientRegistry::set_elicitation_policy`, default `Ask`) is the
-# code path a real run would hit. The harness `permission_mode` field
-# applies to edit/shell/web/mcp uniformly per the eval docs; we want
-# the conservative path here.
+# code path a real run would hit.
 permission_mode = "ask"
 max_output_tokens = 256
 
-# Render the TUI even though there's no live elicitation today; a
-# startup-frame snapshot still lets `view`/`diff` notice if the modal
-# code path regresses at the rendering layer.
 [tui_capture]
 enabled = true
 drive_tui = true
 width = 160
 height = 48
 
-[[steps]]
-kind = "prompt"
-text = "Acknowledge that no MCP server is configured for this run."
-wait_for = "turn_completed"
-
-# Queue a scripted Accept reply that a future `mock_mcp` driver would
-# consume. With no live MCP elicitation today this slot sits idle and
-# the eval `RespondElicitation`-unmatched path is the only thing
-# exercised. Once a `mock_mcp` knob exists, replacing the wait below
-# with the actual elicitation trigger should let this scenario become
-# a real repro without further edits.
+# Inject a live Form elicitation directly into the harness modal slot.
 [[steps]]
 kind = "action"
-action = "respond_elicitation"
-[steps.match]
+action = "inject_mcp_elicitation"
+[steps.request]
+server = "docs"
 kind = "form"
-[steps.decision]
-action = "accept"
-content = { answer = "scripted-by-eval" }
+message = "Provide the documentation API key to continue"
+schema = { type = "object", required = ["api_key"], properties = { api_key = { type = "string" } } }
 
-# Soft assertions that still make sense without a live elicitation:
-# the TUI frame must at least have rendered (status text is
-# populated) so a wholesale rendering regression at startup is caught
-# even by this gap-mode scenario.
+# The modal must be the foreground surface.
 [[steps]]
 kind = "action"
 action = "assert"
 [steps.check]
-kind = "tui_status_contains"
-text = ""
+kind = "modal_active"
+name = "mcp_elicitation"
+
+# The header, the violet+bold question, and the Accept option render.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "MCP request"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Provide the documentation API key to continue"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "Accept"
+
+# Type into the modal's answer field. The modal must stay up.
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["End", "x"]
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "modal_active"
+name = "mcp_elicitation"
+
+# Esc cancels the elicitation without sending it to the model.
+[[steps]]
+kind = "action"
+action = "send_key"
+key = "Esc"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "modal_active"
+name = "none"
+
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_does_not_contain"
+text = "Provide the documentation API key to continue"
 
 [expect]
 max_wall_clock_seconds = 60
 no_tool_errors = true
 
 [triage]
-enabled = false
+enabled = true
 
 [mock]
 default_text = "(mock fallback — no scripted turn matched this prompt)"
-
-[[mock.turns]]
-text = "Acknowledged — no MCP server is configured in this scenario, so no Form elicitation will fire end-to-end. This run only exercises the eval action queue + TUI capture surfaces; the user-facing modal style/input/Esc behavior must be covered by either (a) a TUI unit test against `format_mcp_elicitation_menu_lines` directly, or (b) a future `mock_mcp` harness knob."
-input_tokens = 64
-output_tokens = 96

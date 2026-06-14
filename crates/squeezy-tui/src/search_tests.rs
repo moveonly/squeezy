@@ -140,6 +140,36 @@ fn non_1to1_lowercasing_char_is_itself_matchable() {
     assert_eq!(found, vec![m(0, 0..1), m(0, 6..7)]);
 }
 
+#[test]
+fn expanding_query_is_offset_stable_regardless_of_row_expansion() {
+    // The fold decision is symmetric in needle and haystack. The query "İ"
+    // (U+0130) expands 1:N under `to_lowercase`, so it must route through the
+    // offset-stable `simple_lower` fold whether or not the row's own chars
+    // expand. Row A's chars are all 1:1 lowercasing (only the query expands);
+    // row B has a leading "İ" that also expands the haystack — the case that
+    // previously flipped the path and rebuilt the needle differently. In both,
+    // "İ" folds to a single "i" and matches at every "i"-folding char with an
+    // offset-stable, single-char span.
+    let only_query_expands = rows(&["abci\u{307}xyz"]);
+    let row_also_expands = rows(&["İabci\u{307}xyz"]);
+    let a = find(&only_query_expands, &[], "İ", true, true);
+    let b = find(&row_also_expands, &[], "İ", true, true);
+    // Row A: a b c i ̇ x y z — the bare "i" at char index 3 folds-matches.
+    assert_eq!(a, vec![m(0, 3..4)]);
+    // Row B: İ a b c i ̇ x y z — the folded "İ" at 0 and the bare "i" at 4.
+    assert_eq!(b, vec![m(0, 0..1), m(0, 4..5)]);
+}
+
+#[test]
+fn expanding_query_span_is_single_char() {
+    // "İ" folds (via `simple_lower`) to exactly one "i", so its needle is one
+    // char. It matches the "i" char only — never silently widening or dropping
+    // part of an expansion into a stray multi-char span.
+    let r = rows(&["xi\u{307}y"]);
+    let found = find(&r, &[], "İ", true, true);
+    assert_eq!(found, vec![m(0, 1..2)]);
+}
+
 // ---- find: multi-span projection ------------------------------------------
 
 #[test]

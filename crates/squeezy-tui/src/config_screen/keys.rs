@@ -1703,6 +1703,14 @@ fn handle_mcp_add_form_key(
                     form.error = Some("stdio transport needs a command".to_string());
                     return KeyOutcome::KeepOpen;
                 }
+                McpAddTransport::Stdio if command.contains(char::is_whitespace) => {
+                    form.error = Some(
+                        "stdio command must be a single executable; \
+                         add flags/args via `squeezy mcp add --arg`"
+                            .to_string(),
+                    );
+                    return KeyOutcome::KeepOpen;
+                }
                 McpAddTransport::Http | McpAddTransport::Sse if url.is_empty() => {
                     form.error = Some(format!("{} transport needs a url", transport.as_str()));
                     return KeyOutcome::KeepOpen;

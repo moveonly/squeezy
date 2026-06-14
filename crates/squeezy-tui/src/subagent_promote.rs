@@ -34,16 +34,17 @@
 
 /// Where a promoted subagent result lands. The spec's two cases: an **idle**
 /// session fills the composer (the result becomes editable draft text the user
-/// reviews before submitting); an **active** turn queues the prompt (it drains
-/// after the running turn, still never auto-submitted because the queue is a
-/// user-drained backlog).
+/// reviews before submitting); an **active** turn queues the prompt, stamped
+/// `Manual` so it is held in place and never auto-submitted — the user runs it
+/// by hand once the running turn is done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum PromoteDestination {
     /// Fill the composer with the projected prompt as editable draft text. The
     /// idle destination — the user reviews/edits it and submits when ready.
     Composer,
     /// Queue the projected prompt behind the running turn. The active-turn
-    /// destination — it drains after the current turn, still user-gated.
+    /// destination — held `Manual` so the user runs it by hand once the current
+    /// turn is done, never auto-submitted.
     Queue,
 }
 

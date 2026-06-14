@@ -635,7 +635,16 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     ]);
     // Most of the terminal so long session labels have room, capped so the
     // overlay stays scannable (and centered) on ultra-wide monitors.
-    let inner = modal::surface(frame, full, 160, 32, title);
+    // The resume picker paints before the persisted glyph mode is restored, so
+    // it draws with the built-in Unicode chrome.
+    let inner = modal::surface(
+        frame,
+        full,
+        160,
+        32,
+        title,
+        crate::glyph_mode::GlyphMode::DEFAULT,
+    );
 
     let layout = Layout::default()
         .direction(Direction::Vertical)

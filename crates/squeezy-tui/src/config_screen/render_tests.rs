@@ -261,3 +261,57 @@ fn mcp_status_cell_keeps_actionable_error_prefix() {
         "stale: connection refused (2 cached)"
     );
 }
+
+#[test]
+fn mcp_detail_panel_surfaces_untruncated_error_for_failed_rows() {
+    use squeezy_tools::McpServerStatus;
+
+    let server = squeezy_core::McpServerConfig {
+        enabled: true,
+        transport: squeezy_core::McpTransport::Stdio,
+        command: Some("docs-mcp".to_string()),
+        args: Vec::new(),
+        url: None,
+        timeout_ms: None,
+        discovery_timeout_ms: None,
+        tool_call_timeout_ms: None,
+        enabled_tools: None,
+        disabled_tools: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        permissions: squeezy_core::McpPermissionConfig::default(),
+        bearer_token_env_var: None,
+        http_headers: std::collections::BTreeMap::new(),
+        env_http_headers: std::collections::BTreeMap::new(),
+        cwd: None,
+    };
+    let long_error = "command docs-mcp not found on PATH after restart; check the install";
+    let failed = McpServerStatus::Failed {
+        error: long_error.to_string(),
+    };
+
+    // Failed / Stale / Cancelled qualify for the detail panel; the
+    // healthy states do not.
+    assert!(mcp_status_has_detail(&failed));
+    assert!(mcp_status_has_detail(&McpServerStatus::Cancelled));
+    assert!(mcp_status_has_detail(&McpServerStatus::Stale {
+        tools_count: 1,
+        outcome: squeezy_tools::McpStaleOutcome::Cancelled,
+    }));
+    assert!(!mcp_status_has_detail(&McpServerStatus::Starting));
+    assert!(!mcp_status_has_detail(&McpServerStatus::Ready {
+        tools_count: 3,
+        cached: false,
+    }));
+
+    // The detail panel renders the full, untruncated text — the same
+    // string the fixed-width status column clips to `failed: ...`.
+    let detail = format_mcp_row_status_for_server(&server, &failed);
+    assert!(
+        detail.contains(long_error),
+        "detail must be untruncated: {detail}"
+    );
+    assert!(
+        detail.chars().count() > MCP_STATUS_COLUMN_WIDTH,
+        "this error must be long enough that the status cell would clip it"
+    );
+}

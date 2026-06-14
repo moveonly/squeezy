@@ -91,3 +91,14 @@ If the TUI looks wrong on your terminal, try `/theme default` or `/theme bright`
 to switch to a different built-in theme. Custom themes require valid 6-digit hex
 color values. `[tui.tick_rate_ms]` controls the TUI poll interval; raise it on
 slow terminals.
+
+If the terminal is wedged or garbled (leftover alt-screen, stuck mouse capture,
+a corrupted cursor or color state), run `/terminal-reset` — or press the
+`Ctrl+Alt+,` chord — to forcibly restore a sane terminal state without losing
+the session. Run `/terminal` to print a compact diagnostic table (TTY status,
+`$TERM`, `$COLORTERM`, tmux/screen presence, synchronized-output policy, mouse
+capture, clipboard method, notification method, and the effective shell) so you
+can see what the TUI detected. On a limited terminal squeezy proactively offers
+a degraded-mode suggestion that drops to minimal-glyph, compact, mouse-off
+chrome; accept it with `Ctrl+Alt+;` (or click the banner) and dismiss it with
+`Ctrl+Alt+'`.

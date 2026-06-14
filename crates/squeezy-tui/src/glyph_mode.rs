@@ -16,13 +16,16 @@
 //! * the **terminal / OS title bar** (the working spinner + notification dot,
 //!   via [`GlyphTokens::downgrade`]),
 //! * the **main transcript scrollbar** (thumb / track),
-//! * the **transcript rail** separator, and
+//! * the **transcript rail** separator,
+//! * the **shared modal surface** border (via [`GlyphMode::border_set`] — every
+//!   centered overlay block routes through it),
+//! * the **subagent-lane disclosure** marker (fold collapsed / expanded), and
 //! * the editor overlay's own **live preview** strip.
 //!
-//! The remaining named tokens — card borders, fold/disclosure markers, status
-//! dots, queue bullets, drag handles, and search markers — are a planned
-//! follow-up: they are defined and previewed here but not yet spliced into their
-//! paint sites, so toggling the mode does not move them yet.
+//! The remaining named tokens — status dots, queue bullets, drag handles, and
+//! search markers — are a planned follow-up: they are defined and previewed here
+//! but not yet spliced into their paint sites, so toggling the mode does not move
+//! them yet.
 //!
 //! ## Three sets, not a switch
 //!
@@ -143,6 +146,30 @@ impl GlyphMode {
     /// docs for the current wired set).
     pub(crate) fn tokens(self) -> GlyphTokens {
         GlyphTokens::resolve(self)
+    }
+
+    /// The ratatui border [`Set`](ratatui::symbols::border::Set) a bordered
+    /// surface (modal blocks, cards) should draw with for this mode. `Unicode`
+    /// and `Compact` keep the rounded box-drawing border (both render single-cell
+    /// box-drawing cleanly); `Ascii` swaps to the `+-|` token set so an explicit
+    /// ASCII opt-in on a limited terminal never paints box-drawing tofu.
+    pub(crate) fn border_set(self) -> ratatui::symbols::border::Set<'static> {
+        match self {
+            GlyphMode::Unicode | GlyphMode::Compact => ratatui::symbols::border::ROUNDED,
+            GlyphMode::Ascii => {
+                let t = self.tokens();
+                ratatui::symbols::border::Set {
+                    top_left: t.corner_top_left,
+                    top_right: t.corner_top_left,
+                    bottom_left: t.corner_top_left,
+                    bottom_right: t.corner_bottom_right,
+                    vertical_left: t.border_vertical,
+                    vertical_right: t.border_vertical,
+                    horizontal_top: t.border_horizontal,
+                    horizontal_bottom: t.border_horizontal,
+                }
+            }
+        }
     }
 }
 

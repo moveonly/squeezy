@@ -123,7 +123,7 @@ pub(crate) struct GestureSettings {
     /// [`GestureSettings::SCROLL_MIN`]..=[`GestureSettings::SCROLL_MAX`].
     pub(crate) scroll_lines: u8,
     /// Whether Shift+wheel pans the view horizontally (vs. the default vertical
-    /// scroll). Off by default; horizontal pan is only useful for wide blocks.
+    /// scroll). On by default; horizontal pan is only useful for wide blocks.
     pub(crate) shift_wheel_pan: bool,
     /// Hover dwell in milliseconds — how long the pointer must rest on a target
     /// before hover affordances reveal. Seeded from
@@ -155,11 +155,11 @@ impl GestureSettings {
     /// [`crate::interaction::HOVER_INTENT_MS`] so the settings surface and the
     /// live hover-intent delay can never disagree at rest. The scroll speed is a
     /// conservative 3 lines; pan and the double-click default match the
-    /// card-affordance recognizer's existing behaviour (Shift-pan off,
-    /// double-click expands, drag selects).
+    /// card-affordance recognizer's existing behaviour (Shift-pan on for the
+    /// no-wrap view, double-click expands, drag selects).
     pub(crate) const DEFAULT: GestureSettings = GestureSettings {
         scroll_lines: 3,
-        shift_wheel_pan: false,
+        shift_wheel_pan: true,
         // `HOVER_INTENT_MS` is a `u128` constant well under `u16::MAX`; the
         // `const` clamp keeps the seed honest even if the source constant ever
         // grows past the dwell ceiling.

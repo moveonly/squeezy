@@ -45,8 +45,12 @@ fn key_at(session: u64, width: u16) -> MainRenderKey {
     }
 }
 
-fn value(tag: &str) -> (Vec<Line<'static>>, Vec<usize>) {
-    (vec![Line::from(tag.to_string())], vec![0])
+fn value(tag: &str) -> (Vec<Line<'static>>, Vec<usize>, Vec<crate::search::RowKind>) {
+    (
+        vec![Line::from(tag.to_string())],
+        vec![0],
+        vec![crate::search::RowKind::Normal],
+    )
 }
 
 fn line_text(line: &Line<'static>) -> String {

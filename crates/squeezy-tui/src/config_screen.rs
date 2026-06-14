@@ -237,6 +237,11 @@ pub(crate) struct ConfigScreenState {
     /// `Ctrl+Z` pops the last entry and rewrites the file to its
     /// pre-write contents.
     pub undo_stack: Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
+    /// Bytes this screen last wrote to each tier path. Undo / Discard
+    /// compare the current on-disk bytes against this expectation and
+    /// refuse to overwrite a file an external process changed since our
+    /// last write, so a restore never clobbers an outside edit.
+    pub session_writes: std::collections::HashMap<std::path::PathBuf, Option<Vec<u8>>>,
     pub telemetry_undo_markers: Vec<usize>,
     pub telemetry_changes: Vec<ConfigTelemetryChange>,
     /// Snapshot of the live MCP server map. Mirrors what
@@ -702,6 +707,7 @@ impl ConfigScreenState {
             dirty: false,
             baseline,
             undo_stack: Vec::new(),
+            session_writes: std::collections::HashMap::new(),
             telemetry_undo_markers: Vec::new(),
             telemetry_changes: Vec::new(),
             mcp_servers,
@@ -777,6 +783,28 @@ impl ConfigScreenState {
         self.undo_stack.push((path, pre_write_bytes));
         self.telemetry_undo_markers
             .push(self.telemetry_changes.len());
+    }
+
+    /// Record the on-disk bytes of a tier file immediately after this
+    /// screen wrote it, so a later undo / discard can tell whether the
+    /// file is still the one we last wrote (safe to restore) or was
+    /// changed by an external process (must not be clobbered).
+    pub(crate) fn note_session_write(&mut self, path: &std::path::Path) {
+        let on_disk = std::fs::read(path).ok();
+        self.session_writes.insert(path.to_path_buf(), on_disk);
+    }
+
+    /// Whether restoring `path` would overwrite an external edit: the
+    /// current on-disk bytes differ from what this screen last wrote
+    /// there. Returns `false` when we never wrote the path this session
+    /// (then `baseline`/`pre_write_bytes` is still the source of truth)
+    /// or when the file is unchanged since our write.
+    pub(crate) fn restore_would_clobber_external_edit(&self, path: &std::path::Path) -> bool {
+        let Some(expected) = self.session_writes.get(path) else {
+            return false;
+        };
+        let current = std::fs::read(path).ok();
+        current.as_deref() != expected.as_deref()
     }
 
     pub(crate) fn pop_undo_snapshot(

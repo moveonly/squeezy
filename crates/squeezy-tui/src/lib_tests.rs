@@ -20,6 +20,18 @@ use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus};
 use super::*;
 
 #[test]
+fn export_timestamp_millis_distinguishes_subsecond_instants() {
+    let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let a = export_timestamp_millis(base);
+    let b = export_timestamp_millis(base + Duration::from_millis(1));
+    assert_eq!(a, 1_700_000_000_000);
+    assert_ne!(
+        a, b,
+        "two instants 1ms apart must produce distinct export timestamps"
+    );
+}
+
+#[test]
 fn app_starts_ready_with_empty_transcript() {
     let config = test_config(SessionMode::Build);
     let app = TuiApp::new_with_clipboard(
@@ -692,7 +704,7 @@ async fn keyboard_jump_opens_overlay_and_esc_restores_return_anchor() {
         .subagent_return_anchor
         .expect("a return anchor is stored");
     assert_eq!(anchor.prior_selected, 2);
-    assert!(anchor.prior_was_main);
+    assert!(anchor.prior_was_main());
 
     // Esc closes the overlay AND restores the return state (active source back to
     // main), so the jump never strands the user.
@@ -1430,6 +1442,63 @@ async fn freeform_modal_keeps_typing_out_of_main_composer() {
     assert_eq!(
         app.input, "draft next prompt",
         "modal typing must not touch the main composer",
+    );
+}
+
+#[tokio::test]
+async fn plan_choice_modal_blocks_overlay_opening_keymap_action() {
+    let mut agent = test_agent(SessionMode::Plan);
+    let mut app = test_app(SessionMode::Plan);
+    app.pending_plan_choice = Some(PendingPlanChoice {
+        plan_id: "plan-abc".to_string(),
+        plan_path: app.workspace_root.join("plan-abc.md"),
+        selection_index: 0,
+    });
+    assert!(!app.snippets_open, "starts closed");
+
+    handle_key(&mut app, &mut agent, toggle_snippets_key())
+        .await
+        .expect("handle key");
+
+    assert!(
+        !app.snippets_open,
+        "the snippets overlay must not open over a pending plan-choice modal"
+    );
+    assert!(
+        app.pending_plan_choice.is_some(),
+        "the plan-choice modal must stay up"
+    );
+}
+
+#[tokio::test]
+async fn request_user_input_modal_blocks_session_quick_switch() {
+    let mut agent = test_agent(SessionMode::Plan);
+    let mut app = test_app(SessionMode::Plan);
+    let request = RequestUserInputRequest {
+        question: "Which file?".to_string(),
+        choices: Vec::new(),
+        allow_freeform: true,
+    };
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 0,
+        answer: String::new(),
+        answer_cursor: 0,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("handle key");
+
+    assert!(
+        app.pending_request_user_input.is_some(),
+        "Alt+1 must not switch sessions while a request_user_input modal is up"
     );
 }
 
@@ -2610,6 +2679,62 @@ async fn detail_pane_scrolls_with_shift_down_and_clamps_at_the_end() {
     );
 }
 
+#[test]
+fn detail_pane_hint_hidden_when_too_narrow_to_split() {
+    let mut app = app_with_focused_tool_entry();
+    // Pin the focused entry directly to simulate the pane being open when the
+    // terminal is then shrunk below the split width.
+    let focused_id = app.transcript[app.selected_entry.unwrap()].id;
+    app.diff_detail_pane = Some(diff_detail_pane::DiffDetailPaneState::new(focused_id));
+
+    // Too narrow to split: the scroll/close hint must NOT advertise an invisible
+    // pane, and no detail-pane hit-test rect is registered.
+    let narrow = render_to_string(&app, 50, 24);
+    assert!(
+        !narrow.contains("Shift+↑/↓"),
+        "the scroll hint is suppressed below the split width:\n{narrow}"
+    );
+    assert!(
+        app.diff_detail_pane_rect_cache.get().is_none(),
+        "no detail-pane rect is registered while hidden"
+    );
+
+    // Wide enough to split: the pane paints and the scroll/close hint returns.
+    let wide = render_to_string(&app, 160, 40);
+    assert!(
+        wide.contains("Shift+↑/↓"),
+        "the scroll hint returns once the pane can split:\n{wide}"
+    );
+    assert!(
+        wide.contains("Tool: shell"),
+        "the pane paints at a wide width:\n{wide}"
+    );
+}
+
+#[tokio::test]
+async fn detail_pane_shift_scroll_is_noop_when_too_narrow() {
+    let mut app = app_with_focused_tool_entry();
+    let mut agent = test_agent(SessionMode::Build);
+    let focused_id = app.transcript[app.selected_entry.unwrap()].id;
+    app.diff_detail_pane = Some(diff_detail_pane::DiffDetailPaneState::new(focused_id));
+    // Drive the off-frame geometry against a too-narrow viewport.
+    app.set_test_frame_size(50, 24);
+
+    let before = app.diff_detail_pane.expect("pane").scroll;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+    )
+    .await
+    .expect("shift+down at narrow width");
+    assert_eq!(
+        app.diff_detail_pane.expect("pane").scroll,
+        before,
+        "Shift+Down must not scroll an invisible pane"
+    );
+}
+
 #[tokio::test]
 async fn detail_pane_wheel_over_pane_scrolls_the_pane_not_the_transcript() {
     let mut app = app_with_focused_tool_entry();
@@ -3299,6 +3424,114 @@ async fn cancelled_turn_auto_drains_next_queued_prompt() {
 }
 
 #[tokio::test]
+async fn cancelled_turn_settles_live_partial_into_transcript() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    tx.send(AgentEvent::AssistantDelta {
+        turn_id: TurnId::new(1),
+        delta: "partial answer".to_string(),
+    })
+    .await
+    .expect("send delta");
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        session_cost: None,
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let last_message = app
+        .transcript
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Message(item) => Some(item),
+            _ => None,
+        })
+        .expect("cancel must settle the partial as a transcript message");
+    assert_eq!(last_message.role, Role::Assistant);
+    assert_eq!(last_message.content, "partial answer");
+    assert!(
+        last_message.cancelled,
+        "settled partial must be flagged cancelled",
+    );
+    assert!(
+        app.pending_assistant.trim_is_empty(),
+        "pending_assistant must be cleared after cancel",
+    );
+}
+
+#[tokio::test]
+async fn cancelled_turn_with_no_partial_adds_no_assistant_item() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        session_cost: None,
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let assistant_items = app
+        .transcript
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.kind, TranscriptEntryKind::Message(item) if item.role == Role::Assistant)
+        })
+        .count();
+    assert_eq!(
+        assistant_items, 0,
+        "an empty partial must not produce an assistant transcript item",
+    );
+}
+
+#[test]
+fn working_line_omits_interrupt_hint_during_diff_only() {
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = tokio::sync::oneshot::channel::<PendingDiffResult>();
+    app.pending_diff = Some(rx);
+    app.pending_diff_started_at = Some(Instant::now());
+
+    let text: String = working_line(&app)
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(
+        !text.contains("esc to interrupt"),
+        "the uninterruptible diff snapshot must not advertise an interrupt: {text:?}",
+    );
+}
+
+#[test]
+fn working_line_shows_interrupt_hint_during_model_turn() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new());
+
+    let text: String = working_line(&app)
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert!(
+        text.contains("esc to interrupt"),
+        "a live model turn must still advertise the interrupt affordance: {text:?}",
+    );
+}
+
+#[tokio::test]
 async fn status_line_cost_ticks_live_and_survives_cancel() {
     let mut app = test_app(SessionMode::Build);
     assert_eq!(
@@ -3393,6 +3626,81 @@ async fn completed_turn_with_cost_does_not_append_cost_footer() {
     assert!(
         !log_text.contains("turn:") && !log_text.contains("$0."),
         "completed turn must not append a cost footer: {log_text}"
+    );
+}
+
+#[tokio::test]
+async fn priced_completed_turn_clears_cap_unenforceable_without_a_tool_stride() {
+    let mut app = test_app(SessionMode::Build);
+    app.cap_unenforceable = true;
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+
+    // A short, no-tool turn never crosses the CostUpdate tool stride, so the
+    // only clear path is the terminal Completed handler. Positive provider
+    // spend proves the active model is priced.
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics {
+            provider: CostSnapshot {
+                estimated_usd_micros: Some(123),
+                ..CostSnapshot::default()
+            },
+            ..TurnMetrics::default()
+        },
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+        session_cost: None,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert!(
+        !app.cap_unenforceable,
+        "a priced completed turn must clear the inert-cap marker even with zero tool calls"
+    );
+}
+
+#[tokio::test]
+async fn unpriced_completed_turn_keeps_cap_unenforceable() {
+    let mut app = test_app(SessionMode::Build);
+    app.cap_unenforceable = true;
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+
+    // No provider USD means the active model is still unpriced; the inert-cap
+    // badge must survive turn completion.
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics {
+            provider: CostSnapshot {
+                estimated_usd_micros: None,
+                ..CostSnapshot::default()
+            },
+            ..TurnMetrics::default()
+        },
+        context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+        session_cost: None,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert!(
+        app.cap_unenforceable,
+        "an unpriced completed turn must keep the inert-cap marker"
     );
 }
 
@@ -3931,6 +4239,44 @@ async fn proposed_plan_block_opens_post_plan_choice_prompt() {
 }
 
 #[tokio::test]
+async fn build_mode_proposed_plan_tag_passes_through_untouched() {
+    // Outside Plan mode a literal <proposed_plan> tag is ordinary prose: it
+    // must stream verbatim with no plan card, no plan-choice modal, and no
+    // stripping of the surrounding narration.
+    let root = temp_workspace("build_plan_passthrough");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::AssistantDelta {
+        turn_id: TurnId::new(1),
+        delta: "before <proposed_plan>\nstep 1\n</proposed_plan> after".to_string(),
+    })
+    .await
+    .expect("send delta");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        app.pending_assistant.text(),
+        "before <proposed_plan>\nstep 1\n</proposed_plan> after",
+        "Build-mode delta must stream through verbatim"
+    );
+    assert!(
+        app.pending_plan_choice.is_none(),
+        "Build mode must not open a plan-choice modal"
+    );
+    let plan_cards = app
+        .transcript
+        .iter()
+        .filter(|entry| matches!(entry.kind, TranscriptEntryKind::PlanCard(_)))
+        .count();
+    assert_eq!(plan_cards, 0, "Build mode must not push a plan card");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn completed_transcript_is_plan_free_after_stream_extraction() {
     let root = temp_workspace("completed_plan_free");
     let config = test_config_with_root(SessionMode::Plan, root.clone());
@@ -4166,6 +4512,16 @@ async fn plan_choice_discard_deletes_file_and_clears_handoff() {
     let plan_path = plans_dir.join(format!("{plan_id}.md"));
     fs::write(&plan_path, "step 1\n").expect("write plan");
 
+    // Point the on-disk `current` pointer at the plan so the discard path is
+    // exercised against a live pointer it must clean up.
+    proposed_plan::set_active_plan(&root, proposed_plan::FALLBACK_SESSION_ID, &plan_id)
+        .expect("set active plan");
+    assert_eq!(
+        proposed_plan::read_current_plan_id(&root, proposed_plan::FALLBACK_SESSION_ID).as_deref(),
+        Some(plan_id.as_str()),
+        "pointer is live before discard"
+    );
+
     let config = test_config_with_root(SessionMode::Plan, root.clone());
     let mut agent = test_agent_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Plan);
@@ -4189,6 +4545,10 @@ async fn plan_choice_discard_deletes_file_and_clears_handoff() {
     assert!(app.pending_plan_choice.is_none());
     assert!(app.current_plan_id.is_none());
     assert!(app.pending_plan_handoff.is_none());
+    assert!(
+        proposed_plan::read_current_plan_id(&root, proposed_plan::FALLBACK_SESSION_ID).is_none(),
+        "discard must clear the on-disk current pointer for the deleted plan"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -6509,6 +6869,19 @@ fn format_cost_command_renders_by_model_drill() {
             ..CostSnapshot::default()
         },
     );
+    // Permission-gate (AI reviewer) spend attributed to the active model so the
+    // drill must surface a reviewer row that reconciles with the Σ total.
+    model_ledger.record(
+        "anthropic",
+        "claude-opus-4-8",
+        CostOrigin::AiReviewer,
+        &CostSnapshot {
+            input_tokens: Some(12_000),
+            output_tokens: Some(300),
+            estimated_usd_micros: Some(50_000),
+            ..CostSnapshot::default()
+        },
+    );
 
     let metrics = SessionMetrics {
         subagent_calls: 1,
@@ -6554,11 +6927,13 @@ fn format_cost_command_renders_by_model_drill() {
     assert!(output.contains("anthropic:claude-haiku-4-5"), "{output}");
     assert!(output.contains("main usd="), "{output}");
     assert!(output.contains("subagent usd="), "{output}");
+    assert!(output.contains("reviewer usd="), "{output}");
     assert!(output.contains("cache_read=210000"), "{output}");
     assert!(output.contains("cache_write=90000"), "{output}");
-    // Σ total == cost.estimated_usd (910000) + subagent_provider (48000) == 958000
-    // == sum of every ledger bucket. This invariant keeps the drill honest.
-    assert!(output.contains("total usd=$0.958000"), "{output}");
+    // Σ total == main aggregate (910000) + subagent (48000) + reviewer (50000)
+    // == 1008000 == sum of every ledger bucket and origin. This invariant keeps
+    // the drill honest: the visible per-origin rows reconcile with the total.
+    assert!(output.contains("total usd=$1.008000"), "{output}");
 }
 
 #[tokio::test]
@@ -10140,6 +10515,62 @@ async fn approval_menu_esc_denies_the_run() {
         ToolApprovalDecision::DenyOnce
     );
     assert!(app.pending_approval.is_none());
+}
+
+#[test]
+fn approval_menu_offers_scope_aware_persistent_deny() {
+    let mut request = sample_approval_request();
+    request.permission.capability = PermissionCapability::Shell;
+    request.tool_name = "shell".to_string();
+    request
+        .permission
+        .metadata
+        .insert("binary".to_string(), "curl".to_string());
+
+    let options = approval_options_for(&request);
+    let deny_project = options
+        .iter()
+        .find(|opt| opt.decision == ToolApprovalDecision::DenyRuleProject)
+        .expect("persistent project-deny option missing");
+    assert_eq!(deny_project.choice, ApprovalChoice::DenyProject);
+    assert!(
+        deny_project
+            .label
+            .contains("Never allow command curl in this repo"),
+        "deny label should name the scope: {}",
+        deny_project.label
+    );
+}
+
+#[tokio::test]
+async fn approval_menu_sends_persistent_deny_from_last_option() {
+    let mut app = test_app(SessionMode::Build);
+    let request = sample_approval_request();
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    app.pending_approval = Some(PendingApproval {
+        request,
+        decision_tx,
+    });
+
+    // Walk to the final (persistent-deny) menu entry, then confirm.
+    for _ in 0..3 {
+        assert!(handle_approval_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        ));
+    }
+    assert_eq!(app.approval_selection_index, 3);
+    assert!(handle_approval_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    ));
+
+    assert_eq!(
+        decision_rx.await.expect("approval decision"),
+        ToolApprovalDecision::DenyRuleProject
+    );
+    assert!(app.pending_approval.is_none());
+    assert!(app.status.contains("saved repo deny"), "{}", app.status);
 }
 
 #[test]
@@ -15614,6 +16045,106 @@ async fn alt_c_copies_focused_entry_through_row_model() {
     assert!(app.status.contains("copied entry"), "{}", app.status);
 }
 
+/// Build a whole-row MAIN-surface selection over the painted transcript row
+/// whose text contains `needle`. Mirrors the row-resolution other selection
+/// tests use so the range is independent of inter-row chrome geometry.
+fn whole_row_main_selection(app: &TuiApp, needle: &str, width: u16) -> selection::Selection {
+    let rows = main_surface_rows(app);
+    let row = rows
+        .iter()
+        .position(|line| crate::transcript_surface::plain_text_of_line(line).contains(needle))
+        .expect("needle row present");
+    let len = crate::transcript_surface::plain_text_of_line(&rows[row])
+        .chars()
+        .count();
+    let mut sel = selection::Selection::at(
+        selection::SelectionSurface::Main,
+        selection::Pos::new(row, 0),
+        selection::SelectionMode::Row,
+        width,
+    );
+    sel.cursor = selection::Pos::new(row, len);
+    sel
+}
+
+#[test]
+fn standard_copy_chord_copies_the_committed_multi_select_set() {
+    // A set-only selection (committed disjoint ranges, no live range) must be
+    // copied by the standard copy funnel, not reported as "nothing selected".
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::assistant("alpha line"));
+    app.push_transcript_item(TranscriptItem::assistant("beta line"));
+    let _ = render_transcript_to_buffer(&app, 40, 12);
+
+    assert!(
+        app.selection_set
+            .add(whole_row_main_selection(&app, "alpha line", 40))
+    );
+    assert!(
+        app.selection_set
+            .add(whole_row_main_selection(&app, "beta line", 40))
+    );
+    app.selection = None;
+
+    assert!(
+        copy_any_active_selection(&mut app),
+        "the standard copy funnel copies the committed set"
+    );
+    let copied = writes.lock().unwrap().clone();
+    assert_eq!(copied.len(), 1, "exactly one clipboard write");
+    assert!(
+        copied[0].contains("alpha line") && copied[0].contains("beta line"),
+        "both committed ranges were copied: {:?}",
+        copied[0]
+    );
+    assert_ne!(
+        app.status, "nothing selected — drag with the mouse to select text",
+        "a set-only copy must not fall through to the empty-selection status"
+    );
+}
+
+#[test]
+fn standard_copy_chord_combines_the_set_with_a_live_range() {
+    // With BOTH a live transcript selection and a non-empty set, the standard
+    // chord copies all ranges (set + live), not just the live one.
+    let writes = Arc::new(StdMutex::new(Vec::new()));
+    let mut app = test_app_with_clipboard(
+        SessionMode::Build,
+        Box::new(RecordingClipboard {
+            writes: writes.clone(),
+            error: None,
+        }),
+    );
+    app.push_transcript_item(TranscriptItem::assistant("alpha line"));
+    app.push_transcript_item(TranscriptItem::assistant("beta line"));
+    let _ = render_transcript_to_buffer(&app, 40, 12);
+
+    assert!(
+        app.selection_set
+            .add(whole_row_main_selection(&app, "alpha line", 40))
+    );
+    app.selection = Some(whole_row_main_selection(&app, "beta line", 40));
+
+    assert!(
+        copy_any_active_selection(&mut app),
+        "the combined copy lands"
+    );
+    let copied = writes.lock().unwrap().clone();
+    assert_eq!(copied.len(), 1, "exactly one clipboard write");
+    assert!(
+        copied[0].contains("alpha line") && copied[0].contains("beta line"),
+        "the set and the live range were both copied: {:?}",
+        copied[0]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Code-Aware Copy/Export (§12.5.5)
 // ---------------------------------------------------------------------------
@@ -18859,6 +19390,51 @@ fn repo_status_starts_pending_then_drains_from_background() {
 }
 
 #[test]
+fn repo_status_publishes_local_before_pull_request() {
+    let config = test_config(SessionMode::Build);
+    let mut app = TuiApp::new_with_clipboard(
+        "openai",
+        &config,
+        SessionMode::Build,
+        None,
+        Box::new(NoopClipboard),
+    );
+
+    // Local git status lands first on `repo_status_rx`, carrying no PR
+    // number; the branch / changed-files show immediately even before the
+    // network `gh pr view` probe has resolved.
+    let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+    status_tx
+        .send(RepoStatus {
+            branch: Some("feature".to_string()),
+            changed_files: 2,
+            operation: None,
+            available: true,
+            pull_request: None,
+            branch_changes: None,
+            pending: false,
+        })
+        .unwrap();
+    app.repo_status_rx = Some(status_rx);
+    drain_repo_status(&mut app);
+
+    assert!(!app.repo.pending);
+    assert_eq!(app.repo.branch.as_deref(), Some("feature"));
+    assert_eq!(app.repo.pull_request, None);
+
+    // The deferred PR probe then lands on its own channel and merges in
+    // without disturbing the already-published local status.
+    let (pr_tx, pr_rx) = tokio::sync::oneshot::channel();
+    pr_tx.send(Some(42u64)).unwrap();
+    app.repo_pr_rx = Some(pr_rx);
+    drain_repo_pr(&mut app);
+
+    assert_eq!(app.repo.branch.as_deref(), Some("feature"));
+    assert_eq!(app.repo.changed_files, 2);
+    assert_eq!(app.repo.pull_request, Some(42));
+}
+
+#[test]
 fn repo_status_handles_non_git_roots() {
     let config = AppConfig {
         workspace_root: std::env::temp_dir(),
@@ -18866,7 +19442,7 @@ fn repo_status_handles_non_git_roots() {
     };
 
     assert_eq!(
-        RepoStatus::detect_at(&config.workspace_root).compact(),
+        RepoStatus::detect_local_at(&config.workspace_root).compact(),
         "repo=none"
     );
 }
@@ -22192,7 +22768,28 @@ fn mcp_form_menu_renders_full_pretty_schema() {
 }
 
 #[test]
-fn mcp_form_input_is_seeded_without_overwriting_user_text() {
+fn mcp_form_answer_is_seeded_into_its_own_buffer_not_the_composer() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "required": ["name"],
+        "properties": { "name": { "type": "string" } }
+    });
+    let request = McpElicitationRequest {
+        server: "docs".to_string(),
+        request_id: "r1".to_string(),
+        kind: McpElicitationKind::Form,
+        message: "fill this".to_string(),
+        schema: Some(schema),
+        url: None,
+        elicitation_id: None,
+    };
+
+    let answer = seed_mcp_elicitation_form_answer(&request);
+    assert!(answer.contains("\"name\""), "{answer}");
+}
+
+#[test]
+fn mcp_form_elicitation_preserves_pending_composer_draft() {
     let schema = serde_json::json!({
         "type": "object",
         "required": ["name"],
@@ -22208,19 +22805,49 @@ fn mcp_form_input_is_seeded_without_overwriting_user_text() {
         elicitation_id: None,
     };
     let mut app = test_app(SessionMode::Build);
-
-    seed_mcp_elicitation_form_input(&mut app, &request);
-    assert!(app.input.contains("\"name\""), "{}", app.input);
-    assert_eq!(app.input_cursor, app.input.len());
-
-    app.input = "{\"custom\": true}".to_string();
+    app.input = "draft prompt".to_string();
     app.input_cursor = app.input.len();
-    seed_mcp_elicitation_form_input(&mut app, &request);
-    assert_eq!(app.input, "{\"custom\": true}");
+
+    let answer = seed_mcp_elicitation_form_answer(&request);
+    let answer_cursor = answer.len();
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+    app.pending_mcp_elicitation = Some(PendingMcpElicitation {
+        request,
+        response_tx,
+        answer,
+        answer_cursor,
+    });
+
+    // Seeding the form must not touch the composer draft, and the
+    // template must land in the modal's own answer buffer.
+    assert_eq!(app.input, "draft prompt");
+    assert!(
+        app.pending_mcp_elicitation
+            .as_ref()
+            .is_some_and(|p| p.answer.contains("\"name\"")),
+        "template must seed the modal answer buffer"
+    );
+
+    // Typing into the modal edits the answer, not the composer.
+    assert!(handle_mcp_elicitation_key(
+        &mut app,
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE)
+    ));
+    assert!(handle_mcp_elicitation_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+    ));
+    assert_eq!(app.input, "draft prompt");
+    assert!(
+        app.pending_mcp_elicitation
+            .as_ref()
+            .is_some_and(|p| p.answer.ends_with('x')),
+        "typed char must land in the modal answer buffer"
+    );
 }
 
 #[test]
-fn mcp_form_decline_clears_untouched_seeded_input() {
+fn mcp_form_decline_preserves_composer_draft() {
     let request = McpElicitationRequest {
         server: "docs".to_string(),
         request_id: "r1".to_string(),
@@ -22235,12 +22862,15 @@ fn mcp_form_decline_clears_untouched_seeded_input() {
         elicitation_id: None,
     };
     let mut app = test_app(SessionMode::Build);
-    seed_mcp_elicitation_form_input(&mut app, &request);
-    assert!(app.input.contains("\"name\""), "{}", app.input);
+    app.input = "draft prompt".to_string();
+    let answer = seed_mcp_elicitation_form_answer(&request);
+    let answer_cursor = answer.len();
     let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
     let pending = PendingMcpElicitation {
         request,
         response_tx,
+        answer,
+        answer_cursor,
     };
 
     assert!(send_mcp_elicitation_response(
@@ -22249,8 +22879,7 @@ fn mcp_form_decline_clears_untouched_seeded_input() {
         McpElicitationChoice::Decline
     ));
 
-    assert_eq!(app.input, "");
-    assert!(app.mcp_elicitation_seeded_input.is_none());
+    assert_eq!(app.input, "draft prompt");
     let response = response_rx.try_recv().expect("decline response");
     assert_eq!(
         response.action,
@@ -22259,7 +22888,7 @@ fn mcp_form_decline_clears_untouched_seeded_input() {
 }
 
 #[test]
-fn mcp_form_cancel_preserves_user_modified_seeded_input() {
+fn mcp_form_cancel_preserves_composer_draft() {
     let request = McpElicitationRequest {
         server: "docs".to_string(),
         request_id: "r1".to_string(),
@@ -22274,19 +22903,20 @@ fn mcp_form_cancel_preserves_user_modified_seeded_input() {
         elicitation_id: None,
     };
     let mut app = test_app(SessionMode::Build);
-    seed_mcp_elicitation_form_input(&mut app, &request);
-    app.input = "{\"name\":\"edited\"}".to_string();
-    app.input_cursor = app.input.len();
+    app.input = "draft prompt".to_string();
+    let answer = "{\"name\":\"edited\"}".to_string();
+    let answer_cursor = answer.len();
     let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
     let pending = PendingMcpElicitation {
         request,
         response_tx,
+        answer,
+        answer_cursor,
     };
 
     assert!(send_mcp_elicitation_cancel(&mut app, pending));
 
-    assert_eq!(app.input, "{\"name\":\"edited\"}");
-    assert!(app.mcp_elicitation_seeded_input.is_none());
+    assert_eq!(app.input, "draft prompt");
     let response = response_rx.try_recv().expect("cancel response");
     assert_eq!(response.action, squeezy_tools::McpElicitationAction::Cancel);
 }
@@ -30677,6 +31307,158 @@ async fn terminal_profile_field_navigation_and_reset() {
     );
 }
 
+#[test]
+fn resolve_mouse_capture_with_profile_precedence() {
+    use crate::terminal_profile::{ColorDepth, GlyphSet, MouseMode, TerminalProfile};
+    let off = TerminalProfile {
+        glyphs: GlyphSet::Unicode,
+        mouse: MouseMode::Disabled,
+        color: ColorDepth::TrueColor,
+    };
+    let on = TerminalProfile {
+        mouse: MouseMode::Enabled,
+        ..off
+    };
+    // No env override: the profile decides.
+    assert!(
+        !resolve_mouse_capture_with_profile(|_| None, Some(off)),
+        "a profile that disables the mouse suppresses capture"
+    );
+    assert!(
+        resolve_mouse_capture_with_profile(|_| None, Some(on)),
+        "a profile that enables the mouse keeps capture on"
+    );
+    // No profile at all: capture defaults on.
+    assert!(
+        resolve_mouse_capture_with_profile(|_| None, None),
+        "no profile keeps the on-by-default capture"
+    );
+    // Env is the highest-precedence signal and wins over the profile both ways.
+    assert!(
+        !resolve_mouse_capture_with_profile(
+            |k| (k == "SQUEEZY_MOUSE_CAPTURE").then(|| std::ffi::OsString::from("0")),
+            Some(on),
+        ),
+        "SQUEEZY_MOUSE_CAPTURE=0 disables capture even when the profile enables it"
+    );
+    assert!(
+        resolve_mouse_capture_with_profile(
+            |k| (k == "SQUEEZY_MOUSE_CAPTURE").then(|| std::ffi::OsString::from("1")),
+            Some(off),
+        ),
+        "a non-zero SQUEEZY_MOUSE_CAPTURE enables capture even when the profile disables it"
+    );
+}
+
+#[test]
+fn profile_color_level_maps_every_depth() {
+    use crate::render::palette::ColorLevel;
+    use crate::terminal_profile::ColorDepth;
+    assert_eq!(
+        profile_color_level(ColorDepth::TrueColor),
+        ColorLevel::TrueColor
+    );
+    assert_eq!(
+        profile_color_level(ColorDepth::Indexed256),
+        ColorLevel::Ansi256
+    );
+    assert_eq!(profile_color_level(ColorDepth::Ansi16), ColorLevel::Ansi16);
+    assert_eq!(
+        profile_color_level(ColorDepth::Monochrome),
+        ColorLevel::NoColor
+    );
+}
+
+#[test]
+fn restore_terminal_profile_pins_override_and_applies_ascii_glyphs() {
+    // Write an ASCII profile for the *detected* terminal kind (so the read keys on
+    // the same table regardless of the CI terminal), then restore: the override is
+    // pinned and the glyph fidelity reflects into the live glyph mode.
+    let dir = temp_workspace("restore_terminal_profile");
+    let settings_path = dir.join("settings.toml");
+    let kind = crate::terminal_profile::TerminalCapabilities::detect()
+        .kind
+        .as_str();
+    std::fs::write(
+        &settings_path,
+        format!(
+            "[tui.terminal_profiles.{kind}]\nglyphs = \"ascii\"\nmouse = \"off\"\ncolor = \"mono\"\n"
+        ),
+    )
+    .expect("write scratch settings");
+
+    let mut app = test_app(SessionMode::Build);
+    app.set_settings_path_override(Some(settings_path.clone()));
+    assert_eq!(
+        app.glyph_mode,
+        glyph_mode::GlyphMode::Unicode,
+        "a fresh app starts on the default glyph mode"
+    );
+    assert!(
+        app.terminal_profile_override.is_none(),
+        "no override pinned before restore"
+    );
+
+    restore_terminal_profile(&mut app);
+
+    assert!(
+        app.terminal_profile_override.is_some(),
+        "restore pins the persisted profile override"
+    );
+    let pinned = app.terminal_profile_override.unwrap();
+    assert_eq!(
+        pinned.glyphs,
+        crate::terminal_profile::GlyphSet::Ascii,
+        "the saved ASCII glyph set was read back"
+    );
+    assert_eq!(
+        pinned.mouse,
+        crate::terminal_profile::MouseMode::Disabled,
+        "the saved mouse-off policy was read back"
+    );
+    assert_eq!(
+        pinned.color,
+        crate::terminal_profile::ColorDepth::Monochrome,
+        "the saved monochrome colour was read back"
+    );
+    assert_eq!(
+        app.glyph_mode,
+        glyph_mode::GlyphMode::Ascii,
+        "an ASCII profile maps onto the live glyph mode when no [tui].glyph_mode key is set"
+    );
+}
+
+#[test]
+fn restore_terminal_profile_defers_to_explicit_glyph_mode_key() {
+    // A dedicated [tui].glyph_mode key is the user's explicit glyph choice and must
+    // win over the profile's glyph fidelity. Mirror the production restore order
+    // (`restore_glyph_mode` then `restore_terminal_profile`): a Compact key plus an
+    // ASCII profile must settle on Compact, proving the profile deferred.
+    let dir = temp_workspace("restore_terminal_profile_glyph_key");
+    let settings_path = dir.join("settings.toml");
+    let kind = crate::terminal_profile::TerminalCapabilities::detect()
+        .kind
+        .as_str();
+    std::fs::write(
+        &settings_path,
+        format!(
+            "[tui]\nglyph_mode = \"compact\"\n\n[tui.terminal_profiles.{kind}]\nglyphs = \"ascii\"\n"
+        ),
+    )
+    .expect("write scratch settings");
+
+    let mut app = test_app(SessionMode::Build);
+    app.set_settings_path_override(Some(settings_path.clone()));
+    restore_glyph_mode(&mut app);
+    restore_terminal_profile(&mut app);
+
+    assert_eq!(
+        app.glyph_mode,
+        glyph_mode::GlyphMode::Compact,
+        "the explicit [tui].glyph_mode key wins over the profile's ASCII glyphs"
+    );
+}
+
 #[tokio::test]
 async fn terminal_profile_clicking_a_field_row_cycles_it() {
     // Mouse parity: a left click on a painted field row focuses that field and
@@ -34126,6 +34908,54 @@ async fn drain_pump_drops_skip_bound_prompt_without_running_a_turn() {
     );
 }
 
+#[test]
+fn editing_a_queued_prompt_parks_the_drain_pump() {
+    // While a queued prompt is being edited in the composer (`editing_queue_id`
+    // is set) the drain pump must stay parked so the stale, pre-edit text can't
+    // run before the user saves.
+    let mut app = queue_app(&["foo", "bar"]);
+    assert!(!prompt_queue_drain_blocked(&app));
+    let id_front = queue_id_at(&app, 0);
+    assert!(begin_queue_edit(&mut app, id_front), "edit begins");
+    assert_eq!(app.editing_queue_id, Some(id_front));
+    assert!(
+        prompt_queue_drain_blocked(&app),
+        "drain is parked while an edit is in flight"
+    );
+    // Saving the edit clears the edit state and releases the pump again.
+    assert!(save_queue_edit(&mut app, "foo-edited".to_string()));
+    assert_eq!(app.editing_queue_id, None);
+    assert!(!prompt_queue_drain_blocked(&app));
+    assert_eq!(
+        queue_texts(&app),
+        vec!["foo-edited".to_string(), "bar".to_string()],
+        "the edited text replaced the queued item in place"
+    );
+}
+
+#[tokio::test]
+async fn drain_does_not_run_a_prompt_being_edited() {
+    // End-to-end: with an outcome that would otherwise satisfy the front prompt,
+    // beginning an edit on it keeps the pump from spawning a turn for the stale
+    // text. The item stays queued until the edit is saved.
+    let mut app = queue_app(&["foo", "bar"]);
+    let mut agent = test_agent(SessionMode::Build);
+    app.prompt_queue_overlay = None;
+    app.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+        succeeded: true,
+        had_edits: false,
+    });
+    let id_front = queue_id_at(&app, 0);
+    assert!(begin_queue_edit(&mut app, id_front), "edit begins");
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+    assert!(app.turn_rx.is_none(), "no turn spawned while editing");
+    assert_eq!(
+        queue_texts(&app),
+        vec!["foo".to_string(), "bar".to_string()],
+        "the unedited prompt is still queued"
+    );
+}
+
 #[tokio::test]
 async fn manual_condition_blocks_drain_until_run_next() {
     // A `Manual` prompt is never auto-drained — it blocks the pump even with a
@@ -34218,6 +35048,118 @@ async fn run_selected_next_bypasses_manual_condition_and_runs_the_chosen_prompt(
 }
 
 #[tokio::test]
+async fn run_selected_next_escapes_a_paused_group_and_runs_the_chosen_prompt() {
+    // Run-Selected-Next on a prompt inside a PAUSED group must run it: a paused
+    // group parks every member before its condition is even consulted, so the
+    // chosen prompt has to be pulled out of the group to drain. The rest of the
+    // batch stays parked.
+    let mut app = queue_app(&["batch-a", "batch-b", "loose"]);
+    let mut agent = test_agent(SessionMode::Build);
+    let id_a = queue_id_at(&app, 0);
+    let id_b = queue_id_at(&app, 1);
+    app.prompt_queue_groups
+        .create_group(&[id_a, id_b])
+        .expect("group the first two");
+    let gid = app
+        .prompt_queue_groups
+        .group_id_of_item(id_b)
+        .expect("group id");
+    app.prompt_queue_groups.toggle_paused(gid);
+    assert!(app.prompt_queue_groups.is_item_paused(id_b));
+    // Focus the second member and run it next while idle.
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 1;
+    }
+    assert!(
+        queue_run_selected_next(&mut app),
+        "run-selected-next on a paused-group member should act"
+    );
+    // The chosen prompt is promoted to the front, escapes the paused gate, and
+    // the other batch member stays parked.
+    assert_eq!(
+        queue_id_at(&app, 0),
+        id_b,
+        "chosen prompt promoted to front"
+    );
+    assert!(
+        !app.prompt_queue_groups.is_item_paused(id_b),
+        "the chosen prompt left the paused group"
+    );
+    assert!(
+        app.prompt_queue_groups.is_item_paused(id_a),
+        "the rest of the batch stays parked"
+    );
+    assert!(app.auto_drain_queue, "idle run-selected-next arms the pump");
+    // Drive the real pump: the chosen prompt is dispatched, not parked.
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+    assert!(app.turn_rx.is_some(), "the chosen prompt started a turn");
+    assert_eq!(
+        queue_texts(&app),
+        vec!["batch-a".to_string(), "loose".to_string()],
+        "only the chosen prompt drained; the parked batch member remains"
+    );
+}
+
+#[tokio::test]
+async fn drain_prunes_group_membership_so_the_closed_strip_count_stays_truthful() {
+    // The queue strip renders the group summary even with the overlay closed, so
+    // the drain pump must prune a group's drained members as it goes — otherwise
+    // the strip shows a stale count (or a fully-drained ghost group) until the
+    // user next opens the overlay.
+    let mut app = queue_app(&["skip-me", "stay-grouped"]);
+    let mut agent = test_agent(SessionMode::Build);
+    let id0 = queue_id_at(&app, 0);
+    let id1 = queue_id_at(&app, 1);
+    app.prompt_queue_groups
+        .create_group(&[id0, id1])
+        .expect("group both prompts");
+    assert_eq!(app.prompt_queue_groups.groups()[0].members.len(), 2);
+    // Front prompt: skip-bound after a success. Second: Manual so the pump parks
+    // at it after the drop without spawning a turn.
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    for _ in 0..2 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("cycle front to if-failed");
+    }
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 1;
+    }
+    for _ in 0..5 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("cycle second to manual");
+    }
+    app.prompt_queue_overlay = None;
+    app.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+        succeeded: true,
+        had_edits: false,
+    });
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+    assert!(app.turn_rx.is_none(), "no turn spawned by the skip-drop");
+    // The dropped member was pruned from the group: the strip count is now 1.
+    assert_eq!(
+        app.prompt_queue_groups.groups()[0].members.len(),
+        1,
+        "the drained member is pruned from the group"
+    );
+    assert!(
+        app.prompt_queue_groups.group_of_item(id1).is_some(),
+        "the surviving member still belongs to the group"
+    );
+}
+
+#[tokio::test]
 async fn condition_skip_drop_is_recoverable_via_queue_undo() {
     // A condition-skip drop (an `IfPrevFailed` prompt after a SUCCEEDED turn)
     // silently removes a prompt the user wrote. The drain pump must record it on
@@ -34283,6 +35225,92 @@ async fn condition_skip_drop_is_recoverable_via_queue_undo() {
         queue_texts(&app),
         vec!["recover-on-failure".to_string(), "park-me".to_string()],
         "undo brings the silently-skipped prompt back",
+    );
+}
+
+#[tokio::test]
+async fn undo_of_a_condition_skip_restores_the_run_condition() {
+    // Undoing a condition-skip drop must bring the prompt back WITH its
+    // condition. Without the condition the restored prompt would default to
+    // `Always` and auto-run on the next drain — exactly what its `IfPrevFailed`
+    // gate was meant to prevent.
+    let mut app = queue_app(&["recover-on-failure", "park-me"]);
+    let mut agent = test_agent(SessionMode::Build);
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 0;
+    }
+    for _ in 0..2 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("cycle front to if-failed");
+    }
+    let id_front = queue_id_at(&app, 0);
+    // Make the second prompt Manual so the pump parks after the drop.
+    if let Some(state) = app.prompt_queue_overlay.as_mut() {
+        state.selected = 1;
+    }
+    for _ in 0..5 {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("cycle second to manual");
+    }
+    app.prompt_queue_overlay = None;
+    app.last_turn_outcome = Some(queue_conditions::TurnOutcome {
+        succeeded: true,
+        had_edits: false,
+    });
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+    // The skip-drop pruned the condition entry.
+    assert!(app.prompt_queue_conditions.get(id_front).is_always());
+    // Undo restores the prompt AND its condition.
+    assert!(queue_undo(&mut app), "the dropped prompt is undoable");
+    let id_restored = queue_id_at(&app, 0);
+    assert_eq!(id_restored, id_front, "restored with its original id");
+    assert_eq!(
+        app.prompt_queue_conditions.get(id_restored),
+        queue_conditions::QueueCondition::IfPrevFailed,
+        "the restored prompt keeps its run-condition rather than defaulting to Always"
+    );
+    // A re-drain with the same success outcome skips it again instead of running.
+    drain_prompt_queue_if_idle(&mut app, &mut agent).await;
+    assert!(
+        app.turn_rx.is_none(),
+        "the restored conditional prompt is skipped again, not auto-run"
+    );
+}
+
+#[test]
+fn undo_of_a_manual_delete_restores_the_run_condition() {
+    // The manual-delete path is condition-lossy on undo the same way: once the
+    // deleted id's orphaned condition entry is pruned (the drain pump does this),
+    // undoing must still bring the condition back rather than defaulting it to
+    // `Always`.
+    let mut app = queue_app(&["conditional", "other"]);
+    let id0 = queue_id_at(&app, 0);
+    app.prompt_queue_conditions
+        .set(id0, queue_conditions::QueueCondition::IfPrevFailed);
+    assert!(queue_delete_by_id(&mut app, id0), "the prompt is deleted");
+    // Prune orphaned condition entries the way a drain tick would, so the map no
+    // longer holds the deleted id.
+    let live = queue_live_ids(&app);
+    app.prompt_queue_conditions.retain_live(&live);
+    assert!(
+        app.prompt_queue_conditions.get(id0).is_always(),
+        "the deleted id's condition entry was pruned"
+    );
+    assert!(queue_undo(&mut app), "the delete is undoable");
+    assert_eq!(
+        app.prompt_queue_conditions.get(id0),
+        queue_conditions::QueueCondition::IfPrevFailed,
+        "undo reattaches the deleted prompt's condition"
     );
 }
 
@@ -35528,6 +36556,53 @@ fn main_render_cached_matches_uncached_byte_for_byte() {
             }
         }
     }
+}
+
+#[test]
+fn main_surface_search_row_kinds_align_and_classify() {
+    // Regression for the row-kinds drift on the MAIN surface: the search row-kind
+    // map must come from the SAME pipeline that paints the main rows, so it is
+    // length-locked to them AND faithfully classifies tool-result / reasoning
+    // rows (rather than tripping the all-`Normal` fallback that silently no-ops
+    // the Ctrl+O / Ctrl+R toggles). `main_render_app_rich` carries both a
+    // reasoning entry and a tool-result run.
+    let _theme = lock_main_render_theme();
+    let app = main_render_app_rich();
+    let rows = main_surface_rows(&app);
+    let kinds = search_row_kinds(&app, selection::SelectionSurface::Main, rows.len());
+    assert_eq!(
+        kinds.len(),
+        rows.len(),
+        "main-surface row kinds are length-locked to the painted rows"
+    );
+    assert!(
+        kinds.contains(&crate::search::RowKind::ToolOutput),
+        "tool-result rows classify as ToolOutput, not all-Normal"
+    );
+    assert!(
+        kinds.contains(&crate::search::RowKind::Reasoning),
+        "reasoning rows classify as Reasoning, not all-Normal"
+    );
+}
+
+#[test]
+fn main_surface_search_row_kinds_align_with_startup_card() {
+    // The startup card prepends head chrome to the painted main rows; the kinds
+    // map must still align with — and classify within — those rows. Drive the
+    // card-on path explicitly via the text-area cache (the source
+    // `main_surface_render_params` reads), then assert alignment + classification
+    // hold exactly as without the card.
+    let _theme = lock_main_render_theme();
+    let app = main_render_app_rich();
+    // Paint the main surface so `main_text_area_cache` records the real wrap
+    // width, soft-wrap mode, and startup-card flag the kinds path reads. Height
+    // >= 16 enables the startup card.
+    let _ = render_transcript_to_buffer(&app, 80, 40);
+    let rows = main_surface_rows(&app);
+    let kinds = search_row_kinds(&app, selection::SelectionSurface::Main, rows.len());
+    assert_eq!(kinds.len(), rows.len());
+    assert!(kinds.contains(&crate::search::RowKind::ToolOutput));
+    assert!(kinds.contains(&crate::search::RowKind::Reasoning));
 }
 
 #[test]
@@ -41587,6 +42662,57 @@ async fn review_board_ctrl_alt_o_opens_and_groups_workers_into_lanes() {
     assert!(out.contains('-'), "dash for missing metrics:\n{out}");
 }
 
+/// A fan-out large enough to overflow the fixed-height board modal keeps the
+/// selected card on screen: the cursor card's caret paints and a card far above
+/// it is scrolled out of the window.
+#[test]
+fn review_board_scrolls_to_keep_cursor_visible() {
+    let mut app = TuiApp::new_with_clipboard(
+        "openai",
+        &test_config(SessionMode::Build),
+        SessionMode::Build,
+        None,
+        Box::new(NoopClipboard),
+    );
+
+    let sources: Vec<subagent_timeline::SubagentTimelineSource> = (0..40)
+        .map(|i| subagent_timeline::SubagentTimelineSource {
+            id: 1000 + i,
+            agent: format!("worker{i:02}"),
+            status: subagent_timeline::SubagentTimelineStatus::Running,
+            latest: "working".to_string(),
+            elapsed_secs: Some(10),
+            tool_count: 1,
+            cost_micros: None,
+        })
+        .collect();
+    let fingerprint = review_board::ReviewBoard::fingerprint_of(sources.iter());
+    app.review_board.rebuild_if_stale(fingerprint, &sources);
+    app.review_board_open = true;
+
+    // Park the cursor on the last card — far past the bottom of a 28-row modal.
+    let last_id = app
+        .review_board
+        .card_at(app.review_board.len() - 1)
+        .map(|card| card.id)
+        .expect("last card");
+    app.review_board_cursor = Some(last_id);
+
+    let out = render_to_string(&app, 100, 28);
+
+    // The selected card scrolled into view, caret and all.
+    assert!(out.contains('\u{203a}'), "selected caret paints:\n{out}");
+    assert!(
+        out.contains("worker39"),
+        "last (selected) worker is visible:\n{out}"
+    );
+    // The first worker is far above the window and must be scrolled out.
+    assert!(
+        !out.contains("worker00"),
+        "first worker is scrolled out of view:\n{out}"
+    );
+}
+
 /// The keyboard path: ↑↓ walk the cursor across the lanes by stable id, and Enter
 /// opens the selected worker's conversation (overlay), leaving a return anchor.
 #[tokio::test]
@@ -42948,6 +44074,104 @@ async fn command_palette_enter_runs_a_slash_command_into_the_composer() {
         "a parameter slash command is seeded into the composer with a trailing space",
     );
     assert_eq!(app.input_cursor, app.input.len());
+}
+
+#[tokio::test]
+async fn command_palette_marks_slash_rows_as_filling_the_composer() {
+    // Enter does two different things by row type: a keymap action runs at once,
+    // but a slash row only fills the composer (the user presses Enter again to
+    // send). The global "Enter run" header would misrepresent the slash path, so
+    // each slash row carries an honest per-row marker — with "+args" for one that
+    // still needs an argument — while keymap-action rows carry none.
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Inspect the single rendered row whose label column carries `name`.
+    let row_for = |rendered: &str, name: &str| -> String {
+        rendered
+            .lines()
+            .find(|line| line.contains(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("row for {name} not found:\n{rendered}"))
+            .to_string()
+    };
+
+    open_command_palette(&mut app, &mut agent).await;
+    for ch in "/cost".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type query");
+    }
+    let parameterless = render_to_string(&app, 100, 30);
+    let cost_row = row_for(&parameterless, "/cost");
+    assert!(
+        cost_row.contains("fills composer"),
+        "a parameterless slash row is marked as filling the composer: {cost_row:?}"
+    );
+    assert!(
+        !cost_row.contains("+args"),
+        "a parameterless slash row carries no +args marker: {cost_row:?}"
+    );
+
+    // Re-filter to a parameterized slash command: the marker gains "+args".
+    for _ in 0.."/cost".len() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .await
+        .expect("clear query");
+    }
+    for ch in "/task".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type query");
+    }
+    let parameterized = render_to_string(&app, 100, 30);
+    let task_row = row_for(&parameterized, "/task");
+    assert!(
+        task_row.contains("fills composer +args"),
+        "a parameterized slash row is marked as filling the composer with args: {task_row:?}"
+    );
+
+    // A keymap-action row never claims it fills the composer — Enter runs it.
+    for _ in 0.."/task".len() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .await
+        .expect("clear query");
+    }
+    for ch in "timeline".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("type query");
+    }
+    let action_only = render_to_string(&app, 100, 30);
+    assert!(
+        action_only.contains("Toggle session timeline"),
+        "the keymap action row is listed:\n{action_only}"
+    );
+    let timeline_row = row_for(&action_only, "Toggle session timeline");
+    assert!(
+        !timeline_row.contains("fills composer"),
+        "a keymap-action row must not claim it fills the composer: {timeline_row:?}"
+    );
 }
 
 #[tokio::test]
@@ -49794,6 +51018,366 @@ fn entry_preview_meta_shows_turn_size_and_cost() {
     assert!(
         answer_meta.contains("2 lines"),
         "the answer shows its size: {answer_meta}",
+    );
+}
+
+#[test]
+fn promote_during_active_turn_queues_manual_never_auto_drains() {
+    let mut app = test_app(SessionMode::Build);
+    // A subagent that finished while a turn is in flight.
+    app.note_subagent_started(1, "delegate".to_string(), "do the thing".to_string());
+    app.note_subagent_completed(
+        1,
+        "delegate".to_string(),
+        "found the bug in foo.rs".to_string(),
+        TurnMetrics::default(),
+    );
+    // Model an active turn so promote takes the Queue destination.
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    assert!(
+        promote_subagent_at_index(&mut app, 0),
+        "a completed record promotes",
+    );
+
+    assert_eq!(app.prompt_queue.len(), 1, "the promote lands on the queue");
+    let id = *app
+        .prompt_queue_ids
+        .back()
+        .expect("the queued promote has a stable id");
+    assert_eq!(
+        app.prompt_queue_conditions.get(id),
+        queue_conditions::QueueCondition::Manual,
+        "an active-turn promote is held Manual, never auto-submitted",
+    );
+
+    // Even after a clean turn outcome the manual item is held in place, not drained.
+    app.record_turn_outcome(true);
+    sync_queue_ids(&mut app);
+    assert_eq!(
+        queue_drain_action(&app),
+        queue_conditions::DrainAction::Stop,
+        "a Manual promote does not auto-drain when the turn completes",
+    );
+}
+
+#[test]
+fn promote_while_idle_fills_composer_unchanged() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "do the thing".to_string());
+    app.note_subagent_completed(
+        1,
+        "delegate".to_string(),
+        "found the bug in foo.rs".to_string(),
+        TurnMetrics::default(),
+    );
+    // Idle (no turn_rx): promote fills the composer, not the queue.
+    assert!(app.turn_rx.is_none());
+
+    assert!(promote_subagent_at_index(&mut app, 0));
+    assert!(
+        app.prompt_queue.is_empty(),
+        "an idle promote never touches the queue",
+    );
+    assert!(
+        !app.input.is_empty(),
+        "an idle promote fills the composer with editable draft text",
+    );
+}
+
+#[test]
+fn finished_subagent_elapsed_freezes_at_ended() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "work".to_string());
+    app.note_subagent_completed(
+        1,
+        "delegate".to_string(),
+        "done".to_string(),
+        TurnMetrics::default(),
+    );
+    // Pin a deterministic run window of exactly 5 s on the finished record.
+    let started = Instant::now() - Duration::from_secs(60);
+    let record = app
+        .subagent_pane
+        .records
+        .iter_mut()
+        .find(|r| r.id == 1)
+        .expect("record exists");
+    record.started = Some(started);
+    record.ended = Some(started + Duration::from_secs(5));
+
+    let first = build_subagent_timeline_sources(&app)[0].elapsed_secs;
+    assert_eq!(first, Some(5), "a finished subagent reads ended - started");
+    // A second build at a later wall-clock instant must not move it.
+    let second = build_subagent_timeline_sources(&app)[0].elapsed_secs;
+    assert_eq!(
+        second, first,
+        "a frozen elapsed does not drift across builds"
+    );
+}
+
+#[test]
+fn running_subagent_elapsed_still_advances() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_started(1, "delegate".to_string(), "work".to_string());
+    // Still Running (no completion): no `ended`, so elapsed counts up from start.
+    let record = app
+        .subagent_pane
+        .records
+        .iter_mut()
+        .find(|r| r.id == 1)
+        .expect("record exists");
+    assert!(record.ended.is_none(), "a running record has no end stamp");
+    record.started = Some(Instant::now() - Duration::from_secs(3));
+
+    let elapsed = build_subagent_timeline_sources(&app)[0].elapsed_secs;
+    assert!(
+        elapsed.is_some_and(|secs| secs >= 3),
+        "a running subagent's elapsed counts up from started: {elapsed:?}",
+    );
+}
+
+#[test]
+fn rejected_subagent_reports_no_elapsed() {
+    let mut app = test_app(SessionMode::Build);
+    app.note_subagent_rejected("delegate".to_string(), "concurrency cap".to_string(), 3, 3);
+    let elapsed = build_subagent_timeline_sources(&app)[0].elapsed_secs;
+    assert_eq!(
+        elapsed, None,
+        "a cap-rejected subagent has no honest elapsed"
+    );
+}
+
+#[test]
+fn jump_return_restores_main_scroll_not_tail() {
+    let mut app = app_with_two_subagents();
+    // The user is reading the main conversation scrolled up by 4 lines.
+    app.subagent_pane.active = ConversationSource::Main;
+    app.transcript_scroll = scroll::ScrollState::scrolled_up(4);
+
+    assert!(
+        jump_to_subagent_index(&mut app, 1),
+        "jump opens the subagent"
+    );
+    assert!(matches!(
+        app.subagent_pane.active,
+        ConversationSource::Subagent(2)
+    ));
+
+    assert!(restore_subagent_return_anchor(&mut app));
+    assert!(matches!(app.subagent_pane.active, ConversationSource::Main));
+    assert_eq!(
+        app.transcript_scroll.from_bottom(),
+        4,
+        "return restores the prior main scroll, not the tail",
+    );
+    assert!(!app.transcript_scroll.is_following());
+}
+
+#[test]
+fn jump_return_from_subagent_restores_prior_subagent_and_scroll() {
+    let mut app = app_with_two_subagents();
+    // The user is already viewing subagent #1, scrolled up by 2 lines.
+    app.subagent_pane.active = ConversationSource::Subagent(1);
+    let idx_a = app
+        .subagent_pane
+        .records
+        .iter()
+        .position(|r| r.id == 1)
+        .unwrap();
+    app.subagent_pane.records[idx_a].scroll = scroll::ScrollState::scrolled_up(2);
+
+    // Jump to subagent #2 (record index 1).
+    assert!(jump_to_subagent_index(&mut app, 1));
+    assert!(matches!(
+        app.subagent_pane.active,
+        ConversationSource::Subagent(2)
+    ));
+
+    // Return lands back on subagent #1 with its scroll, not on main or the tail.
+    assert!(restore_subagent_return_anchor(&mut app));
+    assert!(matches!(
+        app.subagent_pane.active,
+        ConversationSource::Subagent(1)
+    ));
+    let idx_a = app
+        .subagent_pane
+        .records
+        .iter()
+        .position(|r| r.id == 1)
+        .unwrap();
+    assert_eq!(
+        app.subagent_pane.records[idx_a].scroll.from_bottom(),
+        2,
+        "return restores the prior subagent's scroll",
+    );
+}
+
+#[test]
+fn jump_return_heals_to_main_when_prior_subagent_pruned() {
+    let mut app = app_with_two_subagents();
+    app.subagent_pane.active = ConversationSource::Subagent(1);
+
+    assert!(jump_to_subagent_index(&mut app, 1));
+    // The prior subagent (#1) is pruned before the user returns.
+    app.subagent_pane.records.retain(|r| r.id != 1);
+
+    // Restore must not panic and degrades gracefully to the main conversation.
+    assert!(restore_subagent_return_anchor(&mut app));
+    assert!(matches!(app.subagent_pane.active, ConversationSource::Main));
+}
+#[test]
+fn tool_actions_label_budget_reserves_room_for_affordance_suffix() {
+    // Mirror render_tool_actions_surface's budget math: an 88-wide modal yields
+    // inner.width 86, the marker (2) + kind tag (10) + affordance suffix are
+    // reserved, and a long path label must be truncated to fit the remainder so
+    // the trailing "(copy/jump)" hint stays on-screen.
+    let inner_width: usize = 86;
+    let suffix = "  (copy/jump)";
+    let reserved = 2 + 10 + UnicodeWidthStr::width(suffix);
+    let budget = inner_width.saturating_sub(reserved).max(8);
+
+    let long_label = "src/".to_string() + &"abcdefghij/".repeat(15) + "module.rs";
+    assert!(
+        UnicodeWidthStr::width(long_label.as_str()) > budget,
+        "fixture must overflow the budget to exercise truncation",
+    );
+
+    let truncated = truncate_label_to_cells(&long_label, budget);
+    assert!(
+        UnicodeWidthStr::width(truncated.as_str()) <= budget,
+        "truncated label {truncated:?} exceeds budget {budget}",
+    );
+    assert!(
+        truncated.ends_with('\u{2026}'),
+        "an overflowing label should carry an ellipsis: {truncated:?}",
+    );
+
+    // The reserved suffix plus the marker/tag plus the budgeted label never
+    // exceed the row width, so the affordance hint cannot be clipped.
+    let painted =
+        2 + 10 + UnicodeWidthStr::width(truncated.as_str()) + UnicodeWidthStr::width(suffix);
+    assert!(
+        painted <= inner_width,
+        "painted width {painted} exceeds inner width {inner_width}",
+    );
+}
+
+#[test]
+fn annotation_editor_tail_keeps_caret_counter_and_hints_visible() {
+    // Reproduce the editor header budget at the full annotation limit on an
+    // 88-wide modal (inner.width 86): the verb, counter, hints, and caret are
+    // reserved, and the buffer is shown as a tail slice. The caret, counter,
+    // and hints must all still fit on the single header row.
+    let inner_width: usize = 86;
+    let verb = "note: ";
+    let buf = "x".repeat(annotations::ANNOTATION_TEXT_LIMIT);
+    let used = buf.chars().count();
+    let counter = format!("  ({used}/{})", annotations::ANNOTATION_TEXT_LIMIT);
+    let hints = "  \u{00b7} Enter save \u{00b7} Esc cancel";
+
+    let reserved = UnicodeWidthStr::width(verb)
+        + UnicodeWidthStr::width(counter.as_str())
+        + UnicodeWidthStr::width(hints)
+        + 1;
+    let buf_budget = inner_width.saturating_sub(reserved);
+    assert!(
+        buf_budget > 0,
+        "the buffer must keep some room on an 86-col row"
+    );
+
+    let shown = truncate_label_to_cells_tail(&buf, buf_budget);
+    assert!(
+        UnicodeWidthStr::width(shown.as_str()) <= buf_budget,
+        "tail slice {shown:?} exceeds its budget {buf_budget}",
+    );
+    assert!(
+        shown.starts_with('\u{2026}'),
+        "an overflowing buffer should lead with an ellipsis: {shown:?}",
+    );
+
+    // verb + tail + caret(1) + counter + hints must fit the row, so none of the
+    // trailing affordances are clipped off-screen.
+    let painted = UnicodeWidthStr::width(verb)
+        + UnicodeWidthStr::width(shown.as_str())
+        + 1
+        + UnicodeWidthStr::width(counter.as_str())
+        + UnicodeWidthStr::width(hints);
+    assert!(
+        painted <= inner_width,
+        "painted header width {painted} exceeds inner width {inner_width}",
+    );
+}
+
+#[test]
+fn dock_text_line_clips_by_display_cells_not_chars() {
+    let cell_width = |line: &Line<'static>| -> usize {
+        line.spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum()
+    };
+
+    // Four wide CJK glyphs occupy eight cells; in a four-cell budget the painted
+    // width must stay within the panel, never the eight cells chars().take(4) keeps.
+    let wide = dock_text_line("\u{4f60}\u{597d}\u{4f60}\u{597d}", 4);
+    assert!(
+        cell_width(&wide) <= 4,
+        "wide-glyph dock body must fit the cell budget: {} cells",
+        cell_width(&wide),
+    );
+
+    // Mixed ASCII + wide content is likewise bounded by cells.
+    let mixed = dock_text_line("ab\u{4f60}\u{597d}cd", 4);
+    assert!(
+        cell_width(&mixed) <= 4,
+        "mixed-width dock body must fit the cell budget: {} cells",
+        cell_width(&mixed),
+    );
+
+    // Content that already fits is left intact (no spurious ellipsis).
+    let fits = dock_text_line("abcd", 4);
+    assert_eq!(fits.spans[0].content.as_ref(), "abcd");
+}
+
+#[test]
+fn breadcrumbs_strip_keeps_deepest_crumb_on_a_narrow_row() {
+    let mut app = test_app(SessionMode::Build);
+    // Root tail is the last 8 chars of the session id (8 display cells); a live
+    // search adds the deepest `search:loc` crumb — the user's current location.
+    app.session_id = Some("xxxxxxxxabcdefgh".to_string());
+    let mut search = search::SearchState::open(selection::SelectionSurface::Main, 11);
+    search.query = "loc".to_string();
+    app.search = Some(search);
+
+    // Width 11: the root + separator alone (8 + 3) would consume the whole row, so
+    // the unbudgeted first crumb used to starve the deepest crumb to zero columns.
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 11,
+        height: 1,
+    };
+    let backend = TestBackend::new(area.width, area.height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| render_breadcrumbs_strip(frame, area, &app))
+        .expect("draw breadcrumbs strip");
+
+    let model = breadcrumbs::BreadcrumbModel::build(&build_breadcrumb_context(&app));
+    let last = model.len() - 1;
+    let rect = app
+        .registered_rect_for(interaction::TargetKey::Chrome(
+            interaction::ChromeKey::BreadcrumbCrumb(last),
+        ))
+        .expect("the deepest crumb still registers a click target on a narrow row");
+
+    // The deepest crumb's rect must be on-surface (inside the row).
+    assert!(rect.width > 0, "the deepest crumb gets at least one column");
+    assert!(
+        rect.x >= area.x && rect.x.saturating_add(rect.width) <= area.x + area.width,
+        "the deepest crumb's hit rect stays within the row: {rect:?}",
     );
 }
 

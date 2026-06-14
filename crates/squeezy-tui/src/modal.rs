@@ -26,9 +26,10 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::Style,
     text::Line,
-    widgets::{Block, BorderType, Borders, Clear},
+    widgets::{Block, Borders, Clear},
 };
 
+use crate::glyph_mode::GlyphMode;
 use crate::render::theme;
 
 /// Center a `max_width` x `max_height` area inside `full`, shrinking to fit
@@ -48,23 +49,26 @@ pub(crate) fn centered(full: Rect, max_width: u16, max_height: u16) -> Rect {
     }
 }
 
-/// Render the shared modal surface: clear `full`, draw a centered
-/// rounded-border accent block sized by `max_width` x `max_height` with the
-/// supplied `title` (left-aligned), and return the block's inner rect so the
-/// caller can lay its own content into it.
+/// Render the shared modal surface: clear `full`, draw a centered accent block
+/// sized by `max_width` x `max_height` with the supplied `title` (left-aligned),
+/// and return the block's inner rect so the caller can lay its own content into
+/// it. The border follows `glyph_mode` (§12.7.6): rounded box-drawing on
+/// Unicode/Compact, ASCII `+-|` when the user opted into Minimal Glyph Mode so a
+/// limited terminal never paints box-drawing tofu.
 pub(crate) fn surface(
     frame: &mut Frame<'_>,
     full: Rect,
     max_width: u16,
     max_height: u16,
     title: Line<'_>,
+    glyph_mode: GlyphMode,
 ) -> Rect {
     frame.render_widget(Clear, full);
 
     let area = centered(full, max_width, max_height);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_set(glyph_mode.border_set())
         .border_style(Style::default().fg(theme::accent()))
         .title(title)
         .title_alignment(Alignment::Left);

@@ -127,8 +127,8 @@ the next subagent can start.
 
 Subagent tool events are drained on a hidden channel so high fanout cannot fill
 the parent event buffer. The parent receives explicit lifecycle events:
-`SubagentStarted`, `SubagentActivity`, `SubagentToolResult`,
-`SubagentCompleted`, `SubagentFailed`, and `SubagentRejected`. The TUI uses
+`SubagentStarted`, `SubagentToolResult`, `SubagentCompleted`,
+`SubagentFailed`, and `SubagentRejected`. The TUI uses
 those events for the first-class subagent pane below the status line and for
 the selected subagent transcript view. `ToolProgress` heartbeats are forwarded
 so a long-running subagent keeps the parent turn and eval harness visibly

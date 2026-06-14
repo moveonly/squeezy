@@ -240,6 +240,29 @@ fn branch_mode_snapshot_reports_files_changed_since_default_branch() {
 }
 
 #[test]
+fn default_branch_resolves_without_remote() {
+    // A local-only repo (no origin/HEAD) still resolves the default branch
+    // via the fallback chain, so the snapshot field consumers rely on stays
+    // populated and a branch delta can be computed against it.
+    let root = temp_repo("default_branch_no_remote");
+    init_repo(&root);
+    fs::write(root.join("base.txt"), "base\n").expect("write base");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "initial"]);
+    git(&root, &["checkout", "-b", "feature"]);
+    fs::write(root.join("feature.txt"), "feature\n").expect("write feature");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feature work"]);
+
+    let vcs = GitVcs::open(&root).expect("open vcs");
+    let snapshot = vcs.snapshot(DiffMode::Worktree, DiffOptions::default());
+
+    assert_eq!(snapshot.vcs.default_branch.as_deref(), Some("main"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn branch_base_mode_matches_branch_merge_base_diff() {
     let root = temp_repo("branch_base_mode");
     init_repo(&root);

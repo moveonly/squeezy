@@ -82,28 +82,46 @@ pub(crate) enum SubagentActivationTarget {
 }
 
 /// The return state captured the instant a jump opens a subagent's transcript, so
-/// a back command can restore the user's prior reading position. Stored as a
-/// pure-data triple (the prior selected row, whether the prior active source was
-/// the main conversation, and the prior main-view scroll offset) so this module
-/// needn't depend on `lib.rs`'s `ConversationSource`/`ScrollState`. The caller
-/// re-applies it through its own setters on return.
+/// a back command can restore the user's prior reading position. Carries the prior
+/// selected row, the full prior *active* conversation source (main or a specific
+/// subagent), and that source's scroll position — so a jump made while already
+/// viewing a subagent returns to that subagent (not always main) and a scrolled-up
+/// reader lands back where they were rather than snapped to the tail. The caller
+/// re-applies it through its own setters on return, healing to main when the prior
+/// source no longer exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SubagentReturnAnchor {
     /// The pane row that was selected before the jump (0 = `main`), so a return
     /// re-seats the cursor where it was.
     pub(crate) prior_selected: usize,
-    /// Whether the prior *active* conversation source was the main conversation
-    /// (vs. some subagent). On return the caller restores the main source when
-    /// this is `true`.
-    pub(crate) prior_was_main: bool,
+    /// The *active* conversation source before the jump (main or a subagent). On
+    /// return the caller restores this source, falling back to main when the
+    /// referenced subagent record has since been pruned.
+    pub(crate) prior_source: crate::ConversationSource,
+    /// The prior source's scroll position, re-applied on return so a reader who
+    /// had scrolled up resumes there and a follower keeps following the tail.
+    pub(crate) prior_scroll: crate::scroll::ScrollState,
 }
 
 impl SubagentReturnAnchor {
-    pub(crate) fn new(prior_selected: usize, prior_was_main: bool) -> Self {
+    pub(crate) fn new(
+        prior_selected: usize,
+        prior_source: crate::ConversationSource,
+        prior_scroll: crate::scroll::ScrollState,
+    ) -> Self {
         Self {
             prior_selected,
-            prior_was_main,
+            prior_source,
+            prior_scroll,
         }
+    }
+
+    /// Whether the prior active source was the main conversation (vs. a subagent).
+    /// The restore path matches on `prior_source` directly; this reads the same
+    /// fact for the unit suite.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn prior_was_main(&self) -> bool {
+        matches!(self.prior_source, crate::ConversationSource::Main)
     }
 }
 

@@ -2283,3 +2283,142 @@ fn resolve_resume_session_continue_matches_with_directory_case() {
         "directory-component case must not prevent --continue from finding the session"
     );
 }
+
+// Serialize the credential-detection tests: they remove the named env vars to
+// prove the inline/fallback chain is consulted, so they must not race the rest
+// of the env-mutating tests in this module.
+static PROVIDER_KEY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Clear every layer the credential resolver consults except the named env
+/// var, and point the credentials-file lookup at a path that does not exist,
+/// so a test can assert that a specific layer (inline TOML or the fallback env
+/// alias) is what makes a provider read as configured. Restores the prior
+/// process environment when the returned guard drops.
+struct ProviderKeyEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl ProviderKeyEnvGuard {
+    fn install(extra_set: &[(&'static str, &str)]) -> Self {
+        let lock = PROVIDER_KEY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let managed = [
+            "OPENAI_API_KEY",
+            "SQUEEZY_OPENAI_KEY",
+            "OPENAI_API_KEY_ENV",
+            "SQUEEZY_CREDENTIALS_JSON",
+            "SQUEEZY_CREDENTIALS_FILE",
+        ];
+        let saved = managed
+            .iter()
+            .map(|key| (*key, env::var_os(key)))
+            .collect::<Vec<_>>();
+        // SAFETY: PROVIDER_KEY_ENV_LOCK serializes all env mutations here.
+        unsafe {
+            for key in managed {
+                env::remove_var(key);
+            }
+            // A directory that cannot exist forces the credentials-file layer
+            // to resolve to nothing without touching the dev's real file.
+            env::set_var(
+                "SQUEEZY_CREDENTIALS_FILE",
+                "/nonexistent/squeezy-test/credentials.json",
+            );
+            for (key, value) in extra_set {
+                env::set_var(key, value);
+            }
+        }
+        Self { _lock: lock, saved }
+    }
+}
+
+impl Drop for ProviderKeyEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: the lock held in `_lock` keeps these mutations serialized.
+        unsafe {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn hosted_provider_choice_treats_inline_key_as_configured() {
+    let _guard = ProviderKeyEnvGuard::install(&[]);
+    let choice = hosted_provider_choice(
+        "openai",
+        "OpenAI",
+        "OPENAI_API_KEY".to_string(),
+        None,
+        Some("sk-inline".to_string()),
+    );
+    assert!(
+        !choice.requires_key_setup,
+        "inline [providers.openai] api_key must satisfy startup credential detection"
+    );
+    assert!(
+        choice.label.contains("key from"),
+        "configured providers label `key from ...`, got {:?}",
+        choice.label
+    );
+}
+
+#[test]
+fn hosted_provider_choice_treats_fallback_env_alias_as_configured() {
+    // Selector env is the squeezy-namespaced name; the vendor alias is what is
+    // actually exported. The layered resolver must still read it as configured.
+    let _guard = ProviderKeyEnvGuard::install(&[("OPENAI_API_KEY", "sk-vendor")]);
+    let choice = hosted_provider_choice(
+        "openai",
+        "OpenAI",
+        "SQUEEZY_OPENAI_KEY".to_string(),
+        None,
+        None,
+    );
+    assert!(
+        !choice.requires_key_setup,
+        "fallback env alias OPENAI_API_KEY must satisfy startup credential detection"
+    );
+}
+
+#[test]
+fn hosted_provider_choice_requires_setup_when_no_key_anywhere() {
+    let _guard = ProviderKeyEnvGuard::install(&[]);
+    let choice =
+        hosted_provider_choice("openai", "OpenAI", "OPENAI_API_KEY".to_string(), None, None);
+    assert!(
+        choice.requires_key_setup,
+        "with no inline/env/file key the provider must still ask for setup"
+    );
+    assert!(
+        choice.label.contains("add OPENAI_API_KEY in /config"),
+        "unconfigured providers prompt for the key, got {:?}",
+        choice.label
+    );
+}
+
+#[test]
+fn startup_follow_up_section_prefers_model_config_over_theme() {
+    use squeezy_core::config_schema::SectionId;
+    assert_eq!(
+        startup_follow_up_section(true, true),
+        Some(SectionId::Models),
+        "the key/model step must win when both follow-ups are requested"
+    );
+    assert_eq!(
+        startup_follow_up_section(true, false),
+        Some(SectionId::Models)
+    );
+    assert_eq!(
+        startup_follow_up_section(false, true),
+        Some(SectionId::Themes),
+        "the theme step still opens when no model config is needed"
+    );
+    assert_eq!(startup_follow_up_section(false, false), None);
+}

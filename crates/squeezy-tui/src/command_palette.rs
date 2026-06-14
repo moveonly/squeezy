@@ -59,16 +59,26 @@ pub(crate) struct CommandEntry {
     /// `Some(reason)` when the command cannot run in the current context; the row
     /// is shown dimmed and Enter/click report the reason instead of running it.
     pub(crate) disabled_reason: Option<String>,
+    /// Extra tokens folded into the fuzzy haystack but not shown on the row: a
+    /// slash command's parameter hint (so a query for `high-contrast` or `json`
+    /// finds the command whose only mention of that token is its argument syntax)
+    /// and its capability badge slugs (so `edit` / `net` surface the commands that
+    /// carry that badge). Empty for keymap-action entries.
+    search_extra: String,
     /// What running this entry does.
     pub(crate) run: PaletteRun,
 }
 
 impl CommandEntry {
-    /// The text the fuzzy filter scores against: label + description + binding, so
-    /// a query can match the human label ("timeline"), the slug ("session_timeline"),
-    /// or the chord ("alt+9").
+    /// The text the fuzzy filter scores against: label + description + binding +
+    /// the hidden `search_extra` tokens, so a query can match the human label
+    /// ("timeline"), the slug ("session_timeline"), the chord ("alt+9"), a
+    /// parameter-syntax token ("high-contrast"), or a capability badge ("edit").
     fn haystack(&self) -> String {
-        format!("{} {} {}", self.label, self.description, self.binding)
+        format!(
+            "{} {} {} {}",
+            self.label, self.description, self.binding, self.search_extra
+        )
     }
 }
 
@@ -88,16 +98,14 @@ impl CommandPalette {
     /// compiled-in action / slash registries. The order is stable: keymap actions
     /// first (in [`Action::ALL`] order), then slash commands (in
     /// [`SLASH_COMMANDS`] order), so an empty query always lists the same set in
-    /// the same order. `during_task` gates a slash command's availability the same
-    /// way the composer menu does, surfacing a disabled reason rather than hiding it.
-    /// `visibility` applies the same feature gates as the slash menu (e.g. checkpoint
-    /// commands when checkpointing is off, `/reviewer` when Auto-review is off), so a
-    /// gated command stays out of this parallel discovery surface too.
-    pub(crate) fn build(
-        keymap: &KeymapResolver,
-        during_task: bool,
-        visibility: SlashMenuVisibility,
-    ) -> Self {
+    /// the same order. A task-blocked slash command is listed and runnable like any
+    /// other: selecting it seeds the composer, and pressing Enter during a turn
+    /// queues it behind the running turn — exactly as typing it directly does — so
+    /// the palette and the typed path can never apply different policy to the same
+    /// command. `visibility` applies the same feature gates as the slash menu (e.g.
+    /// checkpoint commands when checkpointing is off, `/reviewer` when Auto-review is
+    /// off), so a gated command stays out of this parallel discovery surface too.
+    pub(crate) fn build(keymap: &KeymapResolver, visibility: SlashMenuVisibility) -> Self {
         let mut entries: Vec<CommandEntry> = Vec::new();
         for action in Action::ALL.iter().copied() {
             // Never list the palette's own toggle inside the palette — running it
@@ -110,6 +118,7 @@ impl CommandPalette {
                 description: action.slug().to_string(),
                 binding: keymap.binding(action).display(),
                 disabled_reason: None,
+                search_extra: String::new(),
                 run: PaletteRun::Action(action),
             });
         }
@@ -120,16 +129,20 @@ impl CommandPalette {
             if !command.visible(visibility) {
                 continue;
             }
-            // A command that is not available during a task is disabled while a turn
-            // is running (`during_task`); the row stays listed with an honest reason
-            // rather than vanishing, matching the spec's "disabled reasons".
-            let disabled_reason = (during_task && !command.available_during_task)
-                .then(|| "unavailable while a turn is running".to_string());
+            // Fold the parameter hint and capability badges into the hidden search
+            // tokens so a query for an argument value or a capability finds the
+            // command even when neither appears in its label or description.
+            let mut search_extra = command.parameter_hint.unwrap_or_default().to_string();
+            for badge in command.capability_badges() {
+                search_extra.push(' ');
+                search_extra.push_str(badge);
+            }
             entries.push(CommandEntry {
                 label: command.name.to_string(),
                 description: command.description.to_string(),
                 binding: String::new(),
-                disabled_reason,
+                disabled_reason: None,
+                search_extra,
                 run: PaletteRun::Slash {
                     name: command.name,
                     has_parameter: command.parameter_hint.is_some(),

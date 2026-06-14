@@ -181,6 +181,45 @@ fn session_store_index_tracks_archive_and_purge() {
 }
 
 #[test]
+fn is_archived_tracks_archive_and_unarchive_round_trip() {
+    let root = temp_root("is-archived-round-trip");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session_eager(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let session_id = handle.session_id().to_string();
+
+    assert!(
+        !store.is_archived(&session_id),
+        "a live session must not report as archived"
+    );
+
+    store.archive_session(&session_id).expect("archive session");
+    assert!(
+        store.is_archived(&session_id),
+        "a session under archived/ with no live dir must report as archived"
+    );
+    assert!(!store.session_dir(&session_id).exists());
+
+    store
+        .unarchive_session(&session_id)
+        .expect("unarchive session");
+    assert!(
+        !store.is_archived(&session_id),
+        "an unarchived session must be back under the live root"
+    );
+    assert!(store.session_dir(&session_id).exists());
+}
+
+#[test]
 fn fork_creates_child_with_parent_id() {
     let root = temp_root("fork-creates-child");
     let config = AppConfig {

@@ -158,3 +158,14 @@ fn strip_marker_handles_clean_messages_unchanged() {
     assert!(!non_retryable);
     assert_eq!(stripped, "plain message");
 }
+
+#[test]
+fn status_is_retryable_only_for_5xx_and_429() {
+    assert!(status_is_retryable(StatusCode::INTERNAL_SERVER_ERROR));
+    assert!(status_is_retryable(StatusCode::SERVICE_UNAVAILABLE));
+    assert!(status_is_retryable(StatusCode::TOO_MANY_REQUESTS));
+    assert!(!status_is_retryable(StatusCode::BAD_REQUEST));
+    assert!(!status_is_retryable(StatusCode::UNAUTHORIZED));
+    assert!(!status_is_retryable(StatusCode::FORBIDDEN));
+    assert!(!status_is_retryable(StatusCode::NOT_FOUND));
+}

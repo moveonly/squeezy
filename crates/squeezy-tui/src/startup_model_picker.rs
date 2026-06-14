@@ -410,7 +410,16 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &StartupModelPickerState
         Span::styled("first run setup", Style::default().fg(theme::foreground())),
         Span::raw(" "),
     ]);
-    let inner = modal::surface(frame, full, 98, 20, title);
+    // The startup picker paints before the persisted glyph mode is restored, so
+    // it draws with the built-in Unicode chrome.
+    let inner = modal::surface(
+        frame,
+        full,
+        98,
+        20,
+        title,
+        crate::glyph_mode::GlyphMode::DEFAULT,
+    );
 
     let layout = Layout::default()
         .direction(Direction::Vertical)

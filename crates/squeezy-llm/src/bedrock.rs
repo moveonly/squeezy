@@ -1724,14 +1724,49 @@ pub(crate) fn bedrock_request_metadata_map(
     )
 }
 
-fn sdk_error_to_squeezy<E: std::fmt::Display, R>(error: SdkError<E, R>) -> SqueezyError {
-    match &error {
-        SdkError::ServiceError(_) => SqueezyError::ProviderRequest(error.to_string()),
-        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) => {
-            SqueezyError::ProviderStream(error.to_string())
-        }
-        _ => SqueezyError::ProviderRequest(error.to_string()),
+/// Classify the initial `converse_stream().send()` failure into the
+/// cross-provider `SqueezyError` envelope, stamping deterministic 4xx
+/// service errors with [`crate::anthropic_error::NON_RETRYABLE_MARKER`]
+/// so the status line / turn-failed banner does not invite a retry that
+/// will fail identically. Transport-level failures (timeout, dispatch)
+/// stay on `ProviderStream`, which the retry harness treats as
+/// retryable. Mirrors the variant classification in
+/// [`classify_stream_sdk_error`].
+fn sdk_error_to_squeezy<R>(
+    error: SdkError<aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError, R>,
+) -> SqueezyError
+where
+    R: std::fmt::Debug + Send + Sync + 'static,
+{
+    use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
+    if !matches!(error, SdkError::ServiceError(_)) {
+        return match &error {
+            SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) => {
+                SqueezyError::ProviderStream(error.to_string())
+            }
+            _ => SqueezyError::ProviderRequest(error.to_string()),
+        };
     }
+    let inner = error.into_service_error();
+    // `ValidationException` (bad schema / oversized payload),
+    // `AccessDeniedException` (401/403) and `ResourceNotFoundException`
+    // (404, unknown model id) are deterministic: the same request fails
+    // identically on resend, so mark them non-retryable. Everything
+    // else (throttling, internal/service-unavailable, model
+    // timeout/not-ready/error, unhandled) is a transient class the
+    // retry harness should keep retrying.
+    let deterministic = matches!(
+        inner,
+        ConverseStreamError::ValidationException(_)
+            | ConverseStreamError::AccessDeniedException(_)
+            | ConverseStreamError::ResourceNotFoundException(_)
+    );
+    let prefix = if deterministic {
+        crate::anthropic_error::NON_RETRYABLE_MARKER
+    } else {
+        ""
+    };
+    SqueezyError::ProviderRequest(format!("{prefix}{inner}"))
 }
 
 #[cfg(test)]

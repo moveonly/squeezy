@@ -326,6 +326,49 @@ fn bottom_dock_stacks_panel_below_main() {
 }
 
 #[test]
+fn side_dock_on_a_narrow_tall_terminal_reports_its_realized_bottom_edge() {
+    // Width 50 < MIN_SIDE_WIDTH (64) so the side split fails; height 30 stacks.
+    // The panel is painted BELOW the transcript, so the placement must report the
+    // realized Bottom edge — not the requested Right — or the header would title a
+    // stacked panel "right".
+    let dock = DockState::from_slug("scratchpad:right").unwrap();
+    let placed = dock.placement(content(50, 30));
+    let main = placed.main();
+    let panel = placed
+        .panel()
+        .expect("a narrow/tall terminal stacks the panel");
+    assert!(placed.is_docked());
+    assert_eq!(
+        placed.edge(),
+        DockEdge::Bottom,
+        "a side dock that the solver stacked reports the realized bottom edge",
+    );
+    // Geometry is genuinely stacked: full width, panel below main.
+    assert_eq!(main.width, panel.width, "a stacked panel keeps full width");
+    assert!(panel.y > main.y + main.height, "panel sits below main");
+}
+
+#[test]
+fn bottom_dock_on_a_wide_short_terminal_reports_its_realized_side_edge() {
+    // Height 5 < MIN_STACK_HEIGHT (7) so the stacked split fails; width 120
+    // side-splits. The panel is painted to the side, so the placement must report
+    // a side edge — not the requested Bottom.
+    let dock = DockState::from_slug("subagents:bottom").unwrap();
+    let placed = dock.placement(content(120, 5));
+    let main = placed.main();
+    let panel = placed.panel().expect("a wide/short terminal side-splits");
+    assert!(placed.is_docked());
+    assert_eq!(
+        placed.edge(),
+        DockEdge::Right,
+        "a bottom dock that the solver side-split reports the realized side edge",
+    );
+    // Geometry is genuinely side-by-side: full height, panel right of main.
+    assert_eq!(main.height, panel.height, "a side panel keeps full height");
+    assert!(panel.x > main.x + main.width, "panel sits right of main");
+}
+
+#[test]
 fn tiny_terminal_degrades_to_single_column_gracefully() {
     // Far too small for any split — the solver returns single column, so the dock
     // hands the whole content to main and paints no panel.

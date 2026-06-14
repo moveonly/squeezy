@@ -888,3 +888,28 @@ fn real_sink_write_temp_file_is_mode_0600() {
         "clipboard temp file must be 0o600, got {mode:o}"
     );
 }
+
+/// A clipboard read that completes within the bound returns its value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_read_returns_value_when_fast() {
+    let got = bounded_read(std::time::Duration::from_secs(5), || {
+        Some("clip".to_string())
+    })
+    .await;
+    assert_eq!(got, Ok(Some("clip".to_string())));
+
+    let none = bounded_read(std::time::Duration::from_secs(5), || None::<String>).await;
+    assert_eq!(none, Ok(None));
+}
+
+/// A read that outlives the bound yields `Err(())` (the timed-out path) instead
+/// of blocking, so a wedged helper never stalls the event loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_read_times_out_on_slow_helper() {
+    let got = bounded_read(std::time::Duration::from_millis(20), || {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        Some("never".to_string())
+    })
+    .await;
+    assert_eq!(got, Err(()));
+}

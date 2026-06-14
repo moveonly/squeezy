@@ -11,11 +11,11 @@ use tokio::sync::broadcast;
 
 use crate::{
     PendingApproval, PendingMcpElicitation, PendingPlanChoice, PendingRequestUserInput,
-    TranscriptItem, TuiApp, TurnVisualState, compaction_status_line, context_window_pct,
-    current_turn_of, dedupe_assistant_repeated_tool_output, format_approval_status_line,
-    format_error_status, format_mcp_elicitation_status_line, format_mcp_status_snapshot, input,
-    is_control_tool_name, proposed_plan, refresh_search, render, strip_plan_handoff_prefix,
-    tool_call_label, tool_result_status_text, turn_metrics_priced,
+    TranscriptItem, TuiApp, TurnVisualState, active_subagent_record, compaction_status_line,
+    context_window_pct, current_turn_of, dedupe_assistant_repeated_tool_output,
+    format_approval_status_line, format_error_status, format_mcp_elicitation_status_line,
+    format_mcp_status_snapshot, input, is_control_tool_name, proposed_plan, refresh_search, render,
+    strip_plan_handoff_prefix, tool_call_label, tool_result_status_text, turn_metrics_priced,
 };
 
 pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
@@ -80,6 +80,14 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     }
                 }
                 AgentEvent::AssistantDelta { delta, .. } => {
+                    // Proposed-plan extraction is a Plan-mode contract. In Build
+                    // mode a literal <proposed_plan> tag is ordinary prose (an
+                    // example, an explanation) and must pass through untouched —
+                    // never stripped or turned into a plan card.
+                    if app.mode != SessionMode::Plan {
+                        app.pending_assistant.push_delta(&delta);
+                        continue;
+                    }
                     let extracted = app.proposed_plan.feed(&delta);
                     if !extracted.passthrough.is_empty() {
                         app.pending_assistant.push_delta(&extracted.passthrough);
@@ -240,11 +248,6 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         crate::compact_text(&prompt, 140)
                     ));
                 }
-                AgentEvent::SubagentActivity {
-                    id, agent, message, ..
-                } => {
-                    app.note_subagent_activity(id, agent, message);
-                }
                 AgentEvent::SubagentToolResult {
                     id, agent, result, ..
                 } => {
@@ -337,19 +340,21 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 } => {
                     if let Some(previous) = app.pending_mcp_elicitation.take() {
                         let _ = previous.response_tx.send(McpElicitationResponse::cancel());
-                        crate::clear_mcp_elicitation_seeded_input(app);
                     }
                     app.status = format_mcp_elicitation_status_line(&request);
                     app.mcp_elicitation_selection_index = 0;
-                    crate::seed_mcp_elicitation_form_input(app, &request);
+                    let answer = crate::seed_mcp_elicitation_form_answer(&request);
+                    let answer_cursor = answer.len();
                     app.pending_mcp_elicitation = Some(PendingMcpElicitation {
                         request,
                         response_tx,
+                        answer,
+                        answer_cursor,
                     });
                     break;
                 }
                 AgentEvent::RequestUserInputRequested {
-                    request,
+                    mut request,
                     response_tx,
                     ..
                 } => {
@@ -357,6 +362,12 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         let _ = previous
                             .response_tx
                             .send(RequestUserInputResponse::cancelled());
+                    }
+                    // A choices-less question is only answerable as free-form; force
+                    // it on so the modal always offers an answer box rather than an
+                    // unanswerable surface with no rows and no input.
+                    if request.choices.is_empty() {
+                        request.allow_freeform = true;
                     }
                     app.status = format!("plan-mode question: {}", request.question);
                     app.pending_request_user_input = Some(PendingRequestUserInput {
@@ -406,6 +417,14 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.cost = session_cost;
                     }
                     app.metrics = metrics;
+                    // A turn that completed with positive provider spend proves
+                    // the active model is priced, so the unpriced-cap marker is
+                    // stale even on short turns that never crossed a CostUpdate
+                    // stride. Mirror the CostUpdate `> 0` gate so genuinely
+                    // unpriced models keep the inert badge.
+                    if app.metrics.provider.estimated_usd_micros.unwrap_or(0) > 0 {
+                        app.cap_unenforceable = false;
+                    }
                     // Record this turn's priced cost into the per-turn ledger so a
                     // settled prompt/answer can show its turn's spend on hover,
                     // keyed by the same turn ordinal the session timeline uses. Only
@@ -418,7 +437,6 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     app.turn_visual = TurnVisualState::Succeeded;
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
-                    crate::clear_mcp_elicitation_seeded_input(app);
                     cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     // Preserve the user's scroll position; if they paged up
@@ -553,12 +571,21 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.push_log(edit_recovery_hint(app).to_string());
                         app.last_turn_had_edits = false;
                     }
+                    // Settle the live streamed partial into the transcript as a
+                    // cancelled assistant item so it survives the clear below,
+                    // mirroring the Completed arm. A subagent's partial belongs to
+                    // its own record, not the main transcript, so skip those.
+                    if active_subagent_record(app).is_none()
+                        && !app.pending_assistant.trim_is_empty()
+                    {
+                        let partial = app.pending_assistant.text();
+                        app.push_transcript_item(TranscriptItem::assistant_cancelled(partial));
+                    }
                     app.pending_assistant.clear();
                     app.pending_reasoning.clear();
                     finalize_proposed_plan(app);
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
-                    crate::clear_mcp_elicitation_seeded_input(app);
                     cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     app.cancel = None;
@@ -613,7 +640,6 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     finalize_proposed_plan(app);
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
-                    crate::clear_mcp_elicitation_seeded_input(app);
                     cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     app.cancel = None;
@@ -695,7 +721,13 @@ pub(crate) fn apply_mcp_status_update(app: &mut TuiApp, snapshot: McpStatusSnaps
         .as_ref()
         .is_some_and(|prior| !prior.per_server.is_empty());
     let now_has_servers = !snapshot.per_server.is_empty();
-    app.mcp_status = Some(snapshot);
+    app.mcp_status = Some(snapshot.clone());
+    // Mirror the live snapshot into an open /mcp config page so a
+    // background discovery / restart result lands on the row as soon as
+    // the event arrives, not only on the next animation-tick refresh.
+    if let Some(state) = app.config_screen.as_mut() {
+        state.mcp_status = snapshot;
+    }
     app.status = format!("mcp {summary}");
     let changed = prior_summary.as_deref() != Some(&summary);
     if changed && (now_has_servers || prior_had_servers) {
@@ -862,11 +894,39 @@ pub(crate) fn drain_repo_status(app: &mut TuiApp) {
     };
     match rx.try_recv() {
         Ok(status) => {
+            // The local-only probe lands first and never carries a PR
+            // number; the deferred `gh pr view` result arrives separately on
+            // `repo_pr_rx`. Preserve a PR number that already landed (if the
+            // probes raced) rather than clobbering it back to `None`.
+            let pull_request = status.pull_request.or(app.repo.pull_request);
             app.repo = status;
+            app.repo.pull_request = pull_request;
             app.needs_redraw = true;
         }
         Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
             app.repo_status_rx = Some(rx);
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+    }
+}
+
+/// Merge the deferred `gh pr view` result into the status bar once the
+/// network probe lands. Runs on its own channel so a slow/hung `gh` only
+/// delays the PR number, never the local branch / changed-files status that
+/// `drain_repo_status` already published.
+pub(crate) fn drain_repo_pr(app: &mut TuiApp) {
+    let Some(mut rx) = app.repo_pr_rx.take() else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(pull_request) => {
+            if app.repo.pull_request != pull_request {
+                app.repo.pull_request = pull_request;
+                app.needs_redraw = true;
+            }
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+            app.repo_pr_rx = Some(rx);
         }
         Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
     }

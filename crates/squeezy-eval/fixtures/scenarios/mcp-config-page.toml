@@ -117,6 +117,28 @@ action = "assert"
 kind = "tui_frame_contains"
 text = "restarting bench"
 
+# Give the background re-handshake against the bundled fake-mcp time
+# to complete, then pump the harness (a focus nudge that stages no
+# action) so the arriving McpStatusUpdated event lands on the page.
+[[steps]]
+kind = "action"
+action = "wait_seconds"
+seconds = 3
+
+[[steps]]
+kind = "action"
+action = "send_keys"
+keys = ["Down", "Up"]
+
+# Fulfils step 3 of the probe: the row returns to `ready` after the
+# restart, not merely "restarting".
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_frame_contains"
+text = "ready"
+
 [expect]
 max_wall_clock_seconds = 60
 no_tool_errors = true

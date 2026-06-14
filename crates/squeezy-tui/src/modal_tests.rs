@@ -51,7 +51,14 @@ fn surface_returns_inner_rect_inside_the_centered_block() {
     terminal
         .draw(|frame| {
             let full = frame.area();
-            inner = surface(frame, full, 60, 20, title.clone());
+            inner = surface(
+                frame,
+                full,
+                60,
+                20,
+                title.clone(),
+                crate::glyph_mode::GlyphMode::Unicode,
+            );
         })
         .expect("draw");
 
@@ -72,7 +79,14 @@ fn surface_draws_a_border_and_title() {
     terminal
         .draw(|frame| {
             let full = frame.area();
-            surface(frame, full, 60, 20, title.clone());
+            surface(
+                frame,
+                full,
+                60,
+                20,
+                title.clone(),
+                crate::glyph_mode::GlyphMode::Unicode,
+            );
         })
         .expect("draw");
 
@@ -80,6 +94,39 @@ fn surface_draws_a_border_and_title() {
     // The rounded-border corner and the supplied title both render.
     assert!(text.contains('╭'), "expected a rounded border corner");
     assert!(text.contains("hello-modal"), "expected the title to render");
+}
+
+#[test]
+fn surface_in_ascii_mode_draws_no_box_drawing_glyphs() {
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    let title = Line::from(Span::raw("ascii-modal"));
+    terminal
+        .draw(|frame| {
+            let full = frame.area();
+            surface(
+                frame,
+                full,
+                60,
+                20,
+                title.clone(),
+                crate::glyph_mode::GlyphMode::Ascii,
+            );
+        })
+        .expect("draw");
+
+    let text = buffer_text(&terminal, 120, 40);
+    // An explicit ASCII opt-in must emit no rounded-corner (or any box-drawing)
+    // code points — only the `+-|` token set — so a limited terminal never paints
+    // tofu.
+    for tofu in ['╭', '╮', '╯', '╰', '─', '│'] {
+        assert!(
+            !text.contains(tofu),
+            "ASCII modal must not emit the box-drawing glyph {tofu:?}"
+        );
+    }
+    assert!(text.contains('+'), "expected an ASCII corner");
+    assert!(text.contains("ascii-modal"), "expected the title to render");
 }
 
 #[test]
@@ -108,7 +155,14 @@ fn clear_after_close_runs_against_the_crossterm_backend_terminal() {
     terminal
         .draw(|frame| {
             let full = frame.area();
-            surface(frame, full, 30, 6, Line::from(Span::raw("ghost-title")));
+            surface(
+                frame,
+                full,
+                30,
+                6,
+                Line::from(Span::raw("ghost-title")),
+                crate::glyph_mode::GlyphMode::Unicode,
+            );
         })
         .expect("draw");
     let painted = String::from_utf8_lossy(&sink.lock().unwrap()).into_owned();

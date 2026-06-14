@@ -29,7 +29,9 @@
 
 use ratatui::layout::Rect;
 
-use crate::smart_split::{LayoutSolver, Orientation, PaneKind, SEPARATOR, SplitRatio};
+use crate::smart_split::{
+    LayoutSolver, Orientation, PaneKind, PanePlacement, SEPARATOR, SplitRatio,
+};
 
 /// Which auxiliary panel is the dock target (§12.4.4). The spec calls out the
 /// scratchpad, the subagent timeline, and the focused-entry detail as the
@@ -340,14 +342,33 @@ impl DockState {
             edge.orientation(),
             SplitRatio::NEUTRAL,
         );
+        // The solver falls back to the opposite orientation when the requested one
+        // doesn't fit (a Right dock on a narrow/tall terminal stacks; a Bottom dock
+        // on a wide/short one side-splits). Report the edge the panel was ACTUALLY
+        // placed on so the header label and body orientation match the geometry,
+        // never the requested edge the solver overrode. A side edge that came back
+        // stacked is reported as Bottom; a bottom edge that came back side-by-side
+        // is reported as Right (the natural transcript-left side split). A single
+        // column keeps the requested edge — nothing is painted.
+        let realized_edge = match placement {
+            PanePlacement::Side { .. } if edge.orientation() == Orientation::Stacked => {
+                DockEdge::Right
+            }
+            PanePlacement::Stacked { .. } if edge.orientation() == Orientation::Side => {
+                DockEdge::Bottom
+            }
+            _ => edge,
+        };
         // The solver always returns the transcript first (left column / top band)
-        // with the larger share. A `Left` dock mirrors that geometry — not the
-        // rect *assignments* — so the small pane keeps its share on the leading
-        // edge: reflect the pane/main/separator x-positions about the content,
-        // keeping each rect's solver-chosen width. The single-column fallback
-        // (no pane) carries the solver placement through unchanged.
+        // with the larger share. A `Left` dock that actually side-splits mirrors
+        // that geometry — not the rect *assignments* — so the small pane keeps its
+        // share on the leading edge: reflect the pane/main/separator x-positions
+        // about the content, keeping each rect's solver-chosen width. The
+        // single-column fallback (no pane) carries the solver placement through
+        // unchanged, as does any orientation the solver flipped (its geometry
+        // already matches `realized_edge`).
         let (main, panel, separator) = match (placement.main(), placement.pane()) {
-            (transcript, Some(pane)) if edge.panel_first() => {
+            (transcript, Some(pane)) if realized_edge.panel_first() => {
                 let panel = Rect {
                     x: area.x,
                     width: pane.width,
@@ -371,7 +392,7 @@ impl DockState {
             main,
             panel,
             separator,
-            edge,
+            edge: realized_edge,
         }
     }
 

@@ -76,6 +76,7 @@ pub(crate) fn save_inline_provider_api_key(
             return;
         }
     };
+    state.note_session_write(&outcome.path);
 
     // Update the in-memory effective config so the pre-fill on a reopen of
     // the secret entry sees what we just wrote, and so the provider
@@ -165,6 +166,7 @@ pub(crate) fn save_theme_selection(
         }
     };
 
+    state.note_session_write(&outcome.path);
     state.effective.tui.theme = theme.clone();
     finish_theme_save(state, agent, notifications);
     notifications.push(
@@ -215,6 +217,7 @@ pub(crate) fn save_theme_snapshot(
         }
     };
 
+    state.note_session_write(&outcome.path);
     state.effective.tui.themes.insert(
         theme.clone(),
         TuiThemeSettings {
@@ -261,6 +264,7 @@ pub(crate) fn save_theme_color(
         }
     };
 
+    state.note_session_write(&outcome.path);
     state
         .effective
         .tui
@@ -336,6 +340,7 @@ pub(crate) fn save_theme_rename(
         }
     };
 
+    state.note_session_write(&outcome.path);
     state.effective.tui.themes.remove(&old_theme);
     state
         .effective
@@ -400,6 +405,7 @@ pub(crate) fn save_theme_delete(
         }
     };
 
+    state.note_session_write(&outcome.path);
     state.effective.tui.themes.remove(&theme);
     if active {
         state.effective.tui.theme = squeezy_core::DEFAULT_TUI_THEME_NAME.to_string();
@@ -449,6 +455,7 @@ pub(crate) fn unset_theme_color(
         );
         return;
     }
+    state.note_session_write(&outcome.path);
 
     if let Some(settings) = state.effective.tui.themes.get_mut(&theme) {
         settings.colors.remove(&token);
@@ -662,6 +669,7 @@ fn save_field_inner(
             return;
         }
     };
+    state.note_session_write(&outcome.path);
 
     // Refresh the inheritance map by reloading separated sources. If this
     // fails (e.g. some other tier's file became unreadable), we surface the
@@ -1030,6 +1038,18 @@ pub(crate) fn undo_last_write(
         notifications.push("Nothing to undo this session.", NotifySeverity::Info);
         return;
     };
+    if state.restore_would_clobber_external_edit(&path) {
+        notifications.push(
+            format!(
+                "{} changed on disk since this session wrote it — undo skipped to avoid \
+                 clobbering an external edit.",
+                path.display()
+            ),
+            NotifySeverity::Warn,
+        );
+        state.truncate_telemetry_to(marker);
+        return;
+    }
     if let Err(err) = restore_path(&path, pre_bytes.as_deref()) {
         notifications.push(
             format!("Undo failed for {}: {err}", path.display()),
@@ -1063,7 +1083,23 @@ pub(crate) fn discard_all_session_writes(
     }
     let mut restored = 0usize;
     let mut failed: Vec<String> = Vec::new();
-    for (path, baseline_bytes) in &state.baseline {
+    let mut skipped: Vec<String> = Vec::new();
+    let plan: Vec<(std::path::PathBuf, Option<Vec<u8>>, bool)> = state
+        .baseline
+        .iter()
+        .map(|(path, baseline_bytes)| {
+            (
+                path.clone(),
+                baseline_bytes.clone(),
+                state.restore_would_clobber_external_edit(path),
+            )
+        })
+        .collect();
+    for (path, baseline_bytes, would_clobber) in &plan {
+        if *would_clobber {
+            skipped.push(path.display().to_string());
+            continue;
+        }
         if let Err(err) = restore_path(path, baseline_bytes.as_deref()) {
             failed.push(format!("{}: {err}", path.display()));
         } else {
@@ -1074,6 +1110,15 @@ pub(crate) fn discard_all_session_writes(
     state.telemetry_undo_markers.clear();
     state.telemetry_changes.clear();
     reload_sources_and_agent(state, agent, notifications);
+    if !skipped.is_empty() {
+        notifications.push(
+            format!(
+                "kept external edits to {} (changed on disk since this session opened)",
+                skipped.join(", ")
+            ),
+            NotifySeverity::Warn,
+        );
+    }
     if failed.is_empty() {
         notifications.push(
             format!("✓ discarded all session writes ({restored} files restored)"),
@@ -1208,6 +1253,7 @@ pub(crate) fn clear_scope_override_silent(
     match apply_edits(&scope_target, &edits) {
         Ok(outcome) => {
             if outcome.edits_applied > 0 {
+                state.note_session_write(&path);
                 record_field_telemetry_change(
                     state,
                     field,
@@ -1251,6 +1297,7 @@ pub(crate) fn clear_scope_override(
     state.push_undo_snapshot(path.clone(), pre);
     match apply_edits(&scope_target, &edits) {
         Ok(outcome) if outcome.edits_applied > 0 => {
+            state.note_session_write(&path);
             record_field_telemetry_change(
                 state,
                 field,
@@ -1312,6 +1359,7 @@ pub(crate) fn perform_reset(
     state.push_undo_snapshot(path.clone(), pre.clone());
     match restore_path(&path, None) {
         Ok(()) => {
+            state.note_session_write(&path);
             reload_sources_and_agent(state, agent, notifications);
             if pre.is_some() {
                 state.telemetry_changes.push(ConfigTelemetryChange {

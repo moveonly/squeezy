@@ -21,7 +21,7 @@ fn scenario_slugs_are_unique_and_stable() {
     slugs.sort_unstable();
     slugs.dedup();
     assert_eq!(slugs.len(), count, "scenario slugs must be unique");
-    assert_eq!(count, 5);
+    assert_eq!(count, 8);
 }
 
 #[test]
@@ -358,10 +358,14 @@ fn every_scenario_renders_cleanly_across_a_resize_sweep() {
         for &size in SIZES {
             let grid = FrameGrid::capture(scenario, size, "default");
             let caret = count_caret(&grid);
+            // A fullscreen overlay surface (diff overlay / review board) takes
+            // over the screen and paints no main-view composer; the main-view
+            // scenarios must paint exactly one.
+            let expected = if scenario.is_overlay() { 0 } else { 1 };
             assert_eq!(
                 caret,
-                1,
-                "{} at {}x{} must paint exactly one composer caret, got {caret}",
+                expected,
+                "{} at {}x{} must paint {expected} composer caret(s), got {caret}",
                 scenario.slug(),
                 size.width,
                 size.height
@@ -420,6 +424,85 @@ fn dashboard_html_is_well_formed_and_lists_every_scenario() {
     assert!(html.contains("<figcaption>baseline</figcaption>"));
     assert!(html.contains("<figcaption>current</figcaption>"));
     assert!(html.contains("<figcaption>diff</figcaption>"));
+}
+
+// ---------------------------------------------------------------------------
+// VCS surfaces — diff overlay / review board / diff detail pane
+// ---------------------------------------------------------------------------
+
+#[test]
+fn vcs_scenarios_are_swept_by_default_reports() {
+    let reports = default_reports(GridSize::new(120, 40));
+    let captured: Vec<VisualScenario> = reports.iter().map(|r| r.current.scenario).collect();
+    for scenario in [
+        VisualScenario::DiffOverlay,
+        VisualScenario::ReviewBoard,
+        VisualScenario::DiffDetailPane,
+    ] {
+        assert!(
+            captured.contains(&scenario),
+            "default_reports must sweep the {} VCS scenario",
+            scenario.slug()
+        );
+    }
+}
+
+#[test]
+fn diff_overlay_scenario_paints_the_diff_body() {
+    let grid = FrameGrid::capture(
+        VisualScenario::DiffOverlay,
+        GridSize::new(120, 40),
+        "default",
+    );
+    assert_eq!(grid.cells.len(), 120 * 40, "the grid fills the viewport");
+    let text = grid.plain_text();
+    assert!(
+        text.contains("Diff"),
+        "the diff card header paints:\n{text}"
+    );
+    assert!(
+        text.contains('+') && text.contains('-'),
+        "the +/- diff body paints:\n{text}"
+    );
+}
+
+#[test]
+fn review_board_scenario_paints_lanes_and_caret() {
+    let grid = FrameGrid::capture(
+        VisualScenario::ReviewBoard,
+        GridSize::new(120, 40),
+        "default",
+    );
+    let text = grid.plain_text();
+    assert!(
+        text.contains("review board"),
+        "the review-board header paints:\n{text}"
+    );
+    assert!(
+        text.contains('\u{203a}'),
+        "the selected-card caret paints:\n{text}"
+    );
+    assert!(text.contains("Running"), "a lane header paints:\n{text}");
+}
+
+#[test]
+fn diff_detail_pane_scenario_paints_the_split() {
+    // Wide enough to split: the pane separator and the pinned diff body paint
+    // beside the transcript.
+    let grid = FrameGrid::capture(
+        VisualScenario::DiffDetailPane,
+        GridSize::new(120, 40),
+        "default",
+    );
+    let text = grid.plain_text();
+    assert!(
+        text.contains("Diff"),
+        "the pinned diff entry paints in the split:\n{text}"
+    );
+    assert!(
+        text.contains('+') && text.contains('-'),
+        "the detail body's +/- lines paint:\n{text}"
+    );
 }
 
 #[test]

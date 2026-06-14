@@ -136,10 +136,13 @@ fn new_clamps_each_line_to_one_bounded_line() {
 
 #[test]
 fn return_anchor_records_prior_position() {
-    let anchor = SubagentReturnAnchor::new(3, true);
+    let scroll = crate::scroll::ScrollState::pinned();
+    let anchor = SubagentReturnAnchor::new(3, crate::ConversationSource::Main, scroll);
     assert_eq!(anchor.prior_selected, 3);
-    assert!(anchor.prior_was_main);
-    let anchor2 = SubagentReturnAnchor::new(0, false);
+    assert!(anchor.prior_was_main());
+    assert_eq!(anchor.prior_scroll, scroll);
+    let anchor2 = SubagentReturnAnchor::new(0, crate::ConversationSource::Subagent(7), scroll);
     assert_eq!(anchor2.prior_selected, 0);
-    assert!(!anchor2.prior_was_main);
+    assert!(!anchor2.prior_was_main());
+    assert_eq!(anchor2.prior_source, crate::ConversationSource::Subagent(7));
 }

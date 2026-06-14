@@ -89,9 +89,8 @@ An example skill ships in `crates/squeezy-skills/tests/artifacts/skills/rust-cod
 
 ## Activation
 
-Skills can activate in four ways:
+Skills can activate in three ways:
 
-- Explicit user command: `/skill rust-code-navigation inspect this symbol` (a tab between `/skill` and the skill name also works)
 - Trigger match: a configured trigger appears in the user task as a word-boundary substring, case-insensitively. For example, the trigger `rust` matches `Rust here` but not `trust this`.
 - Model request: the model calls `list_skills`, then `load_skill`
 - Implicit shell use: running a script under `<skill>/scripts/` or reading that skill's `SKILL.md` with ordinary shell readers can activate the skill for the next model request in the same turn.
@@ -102,7 +101,7 @@ Loading a skill only injects instructions. It does not grant tools, bypass appro
 
 Triggers are intentional Squeezy behavior: they let project skills activate from ordinary task phrasing without requiring users to remember exact skill names. Future mention syntax, if added, should be additive and must not replace `triggers:`.
 
-If two discovered skills with the same name have the same precedence, Squeezy logs a warning and skips trigger activation for that name. The same is true when two distinct skills declare the same trigger phrase — auto-activation is skipped for that ambiguous trigger. Use `/skill <name> ...` or `load_skill` to select the exposed skill explicitly.
+If two discovered skills with the same name have the same precedence, Squeezy logs a warning and skips trigger activation for that name. The same is true when two distinct skills declare the same trigger phrase — auto-activation is skipped for that ambiguous trigger. The model can still select the exposed skill explicitly with the `load_skill` tool, and `[[skills.config]]` entries let you disable the conflicting catalog so a single skill wins.
 
 ## Fork-mode skills
 

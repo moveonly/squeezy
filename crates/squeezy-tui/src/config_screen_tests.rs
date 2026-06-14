@@ -70,6 +70,88 @@ fn opens_at_models_when_no_focus() {
     assert_eq!(state.current_section().id, SectionId::Models);
 }
 
+#[tokio::test]
+async fn discard_all_skips_tier_files_changed_externally() {
+    let nonce = TEMP_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("squeezy_discard_conflict_{nonce}"));
+    std::fs::create_dir_all(&root).expect("create temp config dir");
+    let user = root.join("user-settings.toml");
+    // Baseline = the file's bytes when the screen opened.
+    std::fs::write(&user, b"baseline = true\n").expect("seed baseline");
+
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    state.sources.user_path_default = user.clone();
+    state.sources.project_path_default = root.join("repo-settings.toml");
+    state.sources.repo_path_default = root.join("local-settings.toml");
+    state.baseline = vec![
+        (user.clone(), Some(b"baseline = true\n".to_vec())),
+        (state.sources.project_path_default.clone(), None),
+        (state.sources.repo_path_default.clone(), None),
+    ];
+
+    // Simulate this session having written the file, then an external
+    // editor changing it afterwards.
+    state.push_undo_snapshot(user.clone(), Some(b"baseline = true\n".to_vec()));
+    std::fs::write(&user, b"session = true\n").expect("session write");
+    state.note_session_write(&user);
+    std::fs::write(&user, b"edited-by-an-outside-process = true\n").expect("external edit");
+
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    discard_all_session_writes(&mut state, &mut agent, &mut q);
+
+    // The external edit must survive — discard must not clobber it back
+    // to baseline.
+    assert_eq!(
+        std::fs::read(&user).expect("read after discard"),
+        b"edited-by-an-outside-process = true\n",
+        "an externally-edited tier file must not be reverted by discard"
+    );
+    let messages: Vec<_> = q.drain().map(|e| e.message).collect();
+    assert!(
+        messages.iter().any(|m| m.contains("kept external edits")),
+        "discard must warn that it skipped the externally-changed file: {messages:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn discard_all_restores_files_unchanged_since_session_write() {
+    let nonce = TEMP_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("squeezy_discard_clean_{nonce}"));
+    std::fs::create_dir_all(&root).expect("create temp config dir");
+    let user = root.join("user-settings.toml");
+    std::fs::write(&user, b"baseline = true\n").expect("seed baseline");
+
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    state.sources.user_path_default = user.clone();
+    state.sources.project_path_default = root.join("repo-settings.toml");
+    state.sources.repo_path_default = root.join("local-settings.toml");
+    state.baseline = vec![
+        (user.clone(), Some(b"baseline = true\n".to_vec())),
+        (state.sources.project_path_default.clone(), None),
+        (state.sources.repo_path_default.clone(), None),
+    ];
+
+    // This session wrote the file and nothing external touched it after.
+    state.push_undo_snapshot(user.clone(), Some(b"baseline = true\n".to_vec()));
+    std::fs::write(&user, b"session = true\n").expect("session write");
+    state.note_session_write(&user);
+
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    discard_all_session_writes(&mut state, &mut agent, &mut q);
+
+    assert_eq!(
+        std::fs::read(&user).expect("read after discard"),
+        b"baseline = true\n",
+        "an unchanged file must be restored to its baseline by discard"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn tab_cycles_through_three_scopes() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
@@ -176,6 +258,51 @@ fn mcp_section_absorbs_keys_that_would_otherwise_panic_current_field() {
         state.mcp_pending_actions.len(),
         pending_before,
         "Unbound `/mcp` keys must be absorbed without staging an action or panicking"
+    );
+}
+
+#[test]
+fn mcp_add_form_rejects_stdio_command_with_spaces() {
+    use crate::config_screen::{McpAction, McpAddForm, McpAddTransport};
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::McpServers));
+    state.mcp_add = Some(McpAddForm {
+        name: "docs".to_string(),
+        transport: McpAddTransport::Stdio,
+        command: "npx -y @scope/server".to_string(),
+        ..McpAddForm::default()
+    });
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    let pending_before = state.mcp_pending_actions.len();
+
+    let outcome = handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+
+    assert!(
+        matches!(outcome, KeyOutcome::KeepOpen),
+        "a multi-token stdio command must keep the form open"
+    );
+    let form = state.mcp_add.as_ref().expect("form stays open on error");
+    let err = form.error.as_deref().unwrap_or_default();
+    assert!(
+        err.contains("single executable"),
+        "error should explain the single-executable rule, got {err:?}"
+    );
+    assert_eq!(
+        state.mcp_pending_actions.len(),
+        pending_before,
+        "no Add action may be staged for an invalid stdio command"
+    );
+    assert!(
+        !state
+            .mcp_pending_actions
+            .iter()
+            .any(|a| matches!(a, McpAction::Add { .. })),
+        "no McpAction::Add must be queued"
     );
 }
 

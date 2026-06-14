@@ -14,10 +14,12 @@ import DocsLayout from "../../layouts/DocsLayout.astro";
     <div class="doc-prose">
       <h2>Ask Squeezy first</h2>
       <p>
-        Type <code>/help</code> or ask a plain question about Squeezy. These are
-        answered from the documentation bundled in the binary and your redacted
-        configuration, before any provider call. It is the fastest way to learn
-        a command or setting.
+        Type <code>/help</code> or <code>/help &lt;topic&gt;</code> for instant
+        local answers drawn from the documentation bundled in the binary and
+        your redacted configuration, with no provider call. Plain questions
+        about Squeezy are also answered locally when they match a known topic;
+        otherwise they go to the model like any other prompt. It is the fastest
+        way to learn a command or setting.
       </p>
     </div>
   </section>

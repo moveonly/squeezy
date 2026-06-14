@@ -446,6 +446,9 @@ fn shell_permission_metadata_detects_network_commands() {
     assert_eq!(request.metadata["timeout_ms"], "1000");
     assert_eq!(request.metadata["output_byte_cap"], "2048");
     assert!(request.metadata["env"].contains("allowlist"));
+    // The concrete host is lifted out of the colon-encoded rule target so the
+    // approval renderer can show it host-aware.
+    assert_eq!(request.metadata["host"], "example.com");
 
     let git_clone = registry.permission_request(&ToolCall {
         call_id: "git".to_string(),
@@ -457,6 +460,7 @@ fn shell_permission_metadata_detects_network_commands() {
     });
     assert_eq!(git_clone.capability, PermissionCapability::Network);
     assert_eq!(git_clone.target, "shell:git clone:example.com");
+    assert_eq!(git_clone.metadata["host"], "example.com");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -850,14 +854,14 @@ fn apply_patch_summary_and_metadata_walk_operations_shape() {
     let request = registry.permission_request(&call);
     assert_eq!(
         request.metadata["paths"],
-        "crates/squeezy-eval/OLD.md, \
-         crates/squeezy-eval/README-PROBE.md, \
-         crates/squeezy-eval/README-PROBE2.md, \
-         crates/squeezy-eval/lib.rs, \
-         src/new_name.rs, \
+        "crates/squeezy-eval/OLD.md\n\
+         crates/squeezy-eval/README-PROBE.md\n\
+         crates/squeezy-eval/README-PROBE2.md\n\
+         crates/squeezy-eval/lib.rs\n\
+         src/new_name.rs\n\
          src/old_name.rs",
-        "approval metadata `paths` must mirror the summary so the audit \
-         line and the metadata stay in sync",
+        "approval metadata `paths` is newline-delimited so a comma in a \
+         filename survives the round-trip through the approval renderer",
     );
     // Multi-path operations land on the generic workspace target rather
     // than collapsing to a single file path.
@@ -1318,6 +1322,35 @@ async fn read_file_reports_policy_ignored_reason_and_permission_scope() {
     assert_eq!(result.content["ignored"], true);
     assert_eq!(result.content["ignored_reason"], "vendor");
     assert_eq!(result.content["path"], "vendor/lib/generated.rs");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn mcp_resource_listing_tools_are_scoped_to_mcp_capability() {
+    let root = temp_workspace("mcp_resource_listing_scope");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    for name in ["mcp_list_resources", "mcp_list_resource_templates"] {
+        let call = ToolCall {
+            call_id: format!("{name}_call"),
+            name: name.to_string(),
+            arguments: json!({ "server": "docs" }),
+        };
+        assert_eq!(
+            registry.permission_scope(&call),
+            PermissionScope::Mcp,
+            "{name} must gate under the MCP scope, not generic Read"
+        );
+
+        let request = registry.permission_request(&call);
+        assert_eq!(request.capability, PermissionCapability::Mcp);
+        assert!(
+            request.target.contains("docs"),
+            "{name} target should name the server, got {}",
+            request.target
+        );
+    }
 
     let _ = fs::remove_dir_all(root);
 }

@@ -214,13 +214,33 @@ fn read_entries(path: &Path) -> io::Result<Vec<String>> {
     Ok(out)
 }
 
+/// Open `path` through `opts` and, on Unix, force the file to user-only
+/// (0o600). Prompt history records every prompt the user typed, so it must
+/// not be world-readable. `OpenOptions::mode` only takes effect when the file
+/// is created, so a pre-existing file (e.g. one written before hardening, or
+/// the append target) is additionally chmod'd back to 0o600 after open.
+fn open_private(opts: &mut OpenOptions, path: &Path) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
 fn append_disk(path: &Path, prompt: &str) -> io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = open_private(OpenOptions::new().create(true).append(true), path)?;
     writeln!(file, "{}", encode(prompt))?;
     Ok(())
 }
@@ -231,11 +251,10 @@ fn rewrite_disk(path: &Path, entries: &VecDeque<String>) -> io::Result<()> {
     {
         fs::create_dir_all(parent)?;
     }
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)?;
+    let file = open_private(
+        OpenOptions::new().create(true).truncate(true).write(true),
+        path,
+    )?;
     let mut writer = BufWriter::new(file);
     for entry in entries {
         writeln!(writer, "{}", encode(entry))?;

@@ -10508,6 +10508,11 @@ pub struct TuiConfig {
     /// Whether `git diff`-style output from shell tools stays under the
     /// collapsed-card head/tail preview cap (default) or renders in full.
     pub shell_diff_inline: ShellDiffInline,
+    /// Whether the gentle first-run interaction hints (palette chord, hover,
+    /// turn jump) are shown. `true` (default) shows each hint at most once and
+    /// fades it the instant the user performs or dismisses it; the seen-set is
+    /// persisted across sessions. `false` silences the feature entirely.
+    pub first_run_hints: bool,
 }
 
 impl TuiConfig {
@@ -10549,6 +10554,7 @@ impl TuiConfig {
             shell_diff_inline: settings
                 .shell_diff_inline
                 .unwrap_or(ShellDiffInline::Folded),
+            first_run_hints: settings.first_run_hints.unwrap_or(true),
         }
     }
 }
@@ -10579,6 +10585,7 @@ pub struct TuiSettings {
     pub copy_on_select: Option<bool>,
     pub keymap: Option<BTreeMap<String, String>>,
     pub shell_diff_inline: Option<ShellDiffInline>,
+    pub first_run_hints: Option<bool>,
 }
 
 impl TuiSettings {
@@ -10604,6 +10611,7 @@ impl TuiSettings {
                 "copy_on_select",
                 "keymap",
                 "shell_diff_inline",
+                "first_run_hints",
             ],
             source,
             path,
@@ -10692,6 +10700,12 @@ impl TuiSettings {
                 source,
                 &field(path, "shell_diff_inline"),
             )?,
+            first_run_hints: bool_value(
+                table,
+                "first_run_hints",
+                source,
+                &field(path, "first_run_hints"),
+            )?,
         })
     }
 
@@ -10718,6 +10732,7 @@ impl TuiSettings {
         replace_if_some(&mut self.copy_on_select, next.copy_on_select);
         replace_if_some(&mut self.keymap, next.keymap);
         replace_if_some(&mut self.shell_diff_inline, next.shell_diff_inline);
+        replace_if_some(&mut self.first_run_hints, next.first_run_hints);
     }
 }
 
@@ -10755,6 +10770,24 @@ pub fn default_prompt_history_path() -> PathBuf {
         return data.join("squeezy").join("prompt_history");
     }
     PathBuf::from(".squeezy/prompt_history")
+}
+
+/// File that records which first-run interaction hints the user has already
+/// seen, so a learned hint stays learned across sessions. Default
+/// `~/.squeezy/first_run_hints`, with the same XDG-compatible
+/// `$XDG_DATA_HOME/squeezy/first_run_hints` fallback as the prompt history.
+/// `SQUEEZY_FIRST_RUN_HINTS_PATH` overrides it for tests and unusual layouts.
+pub fn default_first_run_hints_state_path() -> PathBuf {
+    if let Some(custom) = env::var_os("SQUEEZY_FIRST_RUN_HINTS_PATH") {
+        return PathBuf::from(custom);
+    }
+    if let Some(home) = home_squeezy_subpath("first_run_hints") {
+        return home;
+    }
+    if let Some(data) = dirs::data_dir() {
+        return data.join("squeezy").join("first_run_hints");
+    }
+    PathBuf::from(".squeezy/first_run_hints")
 }
 
 pub fn default_projects_dir() -> PathBuf {
@@ -14857,10 +14890,10 @@ impl ModelLedger {
         self.0.values()
     }
 
-    /// Combined cost across every bucket and both origins (main + subagent).
-    /// Used for the `/cost` "By model" Σ total row; equals the session's
-    /// `provider` + `subagent_provider` aggregate by construction, so the
-    /// drill's total matches the headline.
+    /// Combined cost across every bucket and all origins (main + subagent +
+    /// reviewer). Used for the `/cost` "By model" Σ total row; equals the
+    /// session's `provider` + `subagent_provider` aggregate by construction, so
+    /// the drill's total matches the headline.
     pub fn totals(&self) -> CostSnapshot {
         let mut total = CostSnapshot::default();
         for bucket in self.0.values() {
