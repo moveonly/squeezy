@@ -1499,6 +1499,236 @@ fn extract_dart_symbol_facts(node: Node<'_>, symbol: &ParsedSymbol, ctx: &mut Ex
             });
         }
     }
+    if symbol.attributes.iter().any(|attr| attr == "dart:constructor") {
+        extract_dart_constructor_delegation(node, symbol, ctx);
+    }
+}
+
+/// Emit constructor-delegation call edges for `super(...)`/`super.named(...)`,
+/// generative redirection (`: this(...)` / `: this.named(...)`) and redirecting
+/// factories (`factory Foo() = Bar.named;`). Without these the delegation target
+/// is invisible to flow/impact (the redirecting-factory target previously leaked
+/// only a generic `Type` reference).
+fn extract_dart_constructor_delegation(
+    node: Node<'_>,
+    symbol: &ParsedSymbol,
+    ctx: &mut ExtractContext<'_>,
+) {
+    // The host class name is the leading segment of the constructor symbol name
+    // (`Foo` for `Foo`/`Foo.named`). Used to bind `this`-redirection like an
+    // ordinary `new Foo.named()` so the existing constructor resolution applies.
+    let class_name = symbol
+        .name
+        .split('.')
+        .next()
+        .unwrap_or(symbol.name.as_str())
+        .trim()
+        .to_string();
+    let owner_id = Some(symbol.id.clone());
+    // Gather the delegation-bearing nodes. Initializers/redirection live as
+    // siblings of the body inside the signature wrapper (method_signature) or
+    // directly under a body-less `declaration`; a redirecting factory carries
+    // its target on the signature node itself. Scan the signature subtree but
+    // never the constructor body (a nested `super()`/`this()` call there would
+    // be a real object creation, not delegation).
+    let signature = node.child_by_field_name("signature");
+    let scan_roots: Vec<Node<'_>> = signature.into_iter().chain(std::iter::once(node)).collect();
+    let mut seen = std::collections::HashSet::new();
+    for root in scan_roots {
+        let mut cursor = root.walk();
+        for child in root.named_children(&mut cursor) {
+            if !seen.insert(child.id()) {
+                continue;
+            }
+            match child.kind() {
+                "initializers" => {
+                    let mut inner = child.walk();
+                    for entry in child.named_children(&mut inner) {
+                        if entry.kind() == "initializer_list_entry" {
+                            dart_emit_initializer_delegation(
+                                entry,
+                                &class_name,
+                                owner_id.clone(),
+                                ctx,
+                            );
+                        }
+                    }
+                }
+                "redirection" => {
+                    dart_emit_redirection_delegation(child, &class_name, owner_id.clone(), ctx);
+                }
+                "redirecting_factory_constructor_signature" => {
+                    dart_emit_redirecting_factory_delegation(child, owner_id.clone(), ctx);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// `: super(...)` / `: super.named(...)` / `: this.named(...)` initializer entry.
+fn dart_emit_initializer_delegation(
+    entry: Node<'_>,
+    class_name: &str,
+    owner_id: Option<SymbolId>,
+    ctx: &mut ExtractContext<'_>,
+) {
+    // `field_initializer` (`this.x = v`) and `assertion` are also wrapped in an
+    // `initializer_list_entry` and the former starts with a nested `this` token;
+    // they are not super/this delegation, so skip them.
+    let mut named_cursor = entry.walk();
+    if entry
+        .named_children(&mut named_cursor)
+        .any(|c| matches!(c.kind(), "field_initializer" | "assertion"))
+    {
+        return;
+    }
+    let mut cursor = entry.walk();
+    let children: Vec<Node<'_>> = entry.children(&mut cursor).collect();
+    // First top-level token is `super` / `this`; an optional trailing identifier
+    // is the named-constructor selector.
+    let keyword = children
+        .iter()
+        .find_map(|c| match c.kind() {
+            "super" | "this" => Some(c.kind()),
+            _ => None,
+        });
+    let Some(keyword) = keyword else { return };
+    let selector = entry
+        .named_children(&mut entry.walk())
+        .find(|c| c.kind() == "identifier")
+        .and_then(|c| node_text(c, ctx.source).ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let arguments = entry
+        .named_children(&mut entry.walk())
+        .find(|c| c.kind() == "arguments");
+    let arity = arguments.map(dart_arg_count).unwrap_or(0);
+    let span = span_from_node(entry);
+
+    match keyword {
+        // `this.named(...)` redirects to a constructor on the *same* class; bind
+        // it like `new ClassName.named(...)`.
+        "this" => {
+            if class_name.is_empty() {
+                return;
+            }
+            let (name, target_text, receiver) = match &selector {
+                Some(sel) => (sel.clone(), format!("{class_name}.{sel}"), Some(class_name.to_string())),
+                None => (class_name.to_string(), class_name.to_string(), None),
+            };
+            push_dart_delegation_call(ctx, owner_id, name, target_text, receiver, arity, span);
+        }
+        // `super(...)` / `super.named(...)` targets the superclass constructor.
+        // The superclass name isn't available on this node, so the receiver is
+        // `super`; binding to the parent constructor is left to the resolver.
+        _ => {
+            let name = selector.clone().unwrap_or_else(|| "super".to_string());
+            let target_text = match &selector {
+                Some(sel) => format!("super.{sel}"),
+                None => "super".to_string(),
+            };
+            push_dart_delegation_call(
+                ctx,
+                owner_id,
+                name,
+                target_text,
+                Some("super".to_string()),
+                arity,
+                span,
+            );
+        }
+    }
+}
+
+/// `: this(...)` / `: this.named(...)` generative redirection on a body-less
+/// constructor. Bound like an object creation of the same class.
+fn dart_emit_redirection_delegation(
+    node: Node<'_>,
+    class_name: &str,
+    owner_id: Option<SymbolId>,
+    ctx: &mut ExtractContext<'_>,
+) {
+    if class_name.is_empty() {
+        return;
+    }
+    let selector = node
+        .named_children(&mut node.walk())
+        .find(|c| c.kind() == "identifier")
+        .and_then(|c| node_text(c, ctx.source).ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let arity = node
+        .named_children(&mut node.walk())
+        .find(|c| c.kind() == "arguments")
+        .map(dart_arg_count)
+        .unwrap_or(0);
+    let span = span_from_node(node);
+    let (name, target_text, receiver) = match &selector {
+        Some(sel) => (sel.clone(), format!("{class_name}.{sel}"), Some(class_name.to_string())),
+        None => (class_name.to_string(), class_name.to_string(), None),
+    };
+    push_dart_delegation_call(ctx, owner_id, name, target_text, receiver, arity, span);
+}
+
+/// `factory Foo() = Bar.named;` — bind the redirect target like `new Bar.named()`
+/// so the factory's actual implementation is reachable (previously only a Type
+/// reference to `Bar` survived).
+fn dart_emit_redirecting_factory_delegation(
+    node: Node<'_>,
+    owner_id: Option<SymbolId>,
+    ctx: &mut ExtractContext<'_>,
+) {
+    let Some(target) = node
+        .child_by_field_name("target")
+        .and_then(|t| node_text(t, ctx.source).ok())
+        .map(|t| dart_strip_type_args(t.trim()).to_string())
+        .map(|t| t.trim_end_matches('?').trim().to_string())
+        .filter(|t| !t.is_empty())
+    else {
+        return;
+    };
+    let target_ctor = node
+        .child_by_field_name("target_constructor")
+        .and_then(|c| node_text(c, ctx.source).ok())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let span = span_from_node(node);
+    let (name, target_text, receiver) = match &target_ctor {
+        Some(ctor) => (ctor.clone(), format!("{target}.{ctor}"), Some(target.clone())),
+        None => (target.clone(), target.clone(), None),
+    };
+    push_dart_delegation_call(ctx, owner_id, name, target_text, receiver, 0, span);
+}
+
+/// Push a constructor-delegation `ParsedCall`. Emitted as `Direct` with the
+/// owning/target class as the receiver, mirroring exactly how
+/// `extract_dart_object_creation` records `new Foo.named(...)` so the same
+/// constructor candidate-set resolution applies.
+fn push_dart_delegation_call(
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+    name: String,
+    target_text: String,
+    receiver: Option<String>,
+    arity: usize,
+    span: SourceSpan,
+) {
+    if name.is_empty() {
+        return;
+    }
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id,
+        name,
+        target_text,
+        receiver,
+        arity,
+        kind: ParsedCallKind::Direct,
+        span,
+        provenance: Provenance::new("tree-sitter-dart", "constructor delegation"),
+        confidence: Confidence::Heuristic,
+    });
 }
 
 fn extract_dart_library_directive(node: Node<'_>, ctx: &mut ExtractContext<'_>) {
