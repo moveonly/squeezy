@@ -378,7 +378,7 @@ fn csharp_symbol_from_node(
             "tree-sitter-c-sharp",
             format!("{} declaration", node.kind()),
         ),
-        confidence: Confidence::ExactSyntax,
+        confidence: csharp_conditional_confidence(node, Confidence::ExactSyntax),
         freshness: Freshness::Fresh,
         arity,
     })
@@ -894,7 +894,7 @@ pub(crate) fn extract_csharp_call(
         kind,
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-c-sharp", "invocation_expression"),
-        confidence: Confidence::Heuristic,
+        confidence: csharp_conditional_confidence(node, Confidence::Heuristic),
     });
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
 }
@@ -981,7 +981,7 @@ pub(crate) fn extract_csharp_object_creation(
         kind: ParsedCallKind::Direct,
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-c-sharp", "object_creation_expression"),
-        confidence: Confidence::Heuristic,
+        confidence: csharp_conditional_confidence(node, Confidence::Heuristic),
     });
     ctx.references.push(ParsedReference {
         file_id: ctx.file.id.clone(),
@@ -1135,7 +1135,7 @@ fn extract_csharp_field_symbols(
                 docs: Vec::new(),
                 attributes,
                 provenance: Provenance::new("tree-sitter-c-sharp", "field declaration"),
-                confidence: Confidence::ExactSyntax,
+                confidence: csharp_conditional_confidence(node, Confidence::ExactSyntax),
                 freshness: Freshness::Fresh,
                 arity: None,
             });
@@ -1377,7 +1377,7 @@ fn csharp_emit_primary_constructor_fields(
                 "tree-sitter-c-sharp",
                 "primary constructor parameter",
             ),
-            confidence: Confidence::ExactSyntax,
+            confidence: csharp_conditional_confidence(parameter, Confidence::ExactSyntax),
             freshness: Freshness::Fresh,
             arity: None,
         });
@@ -1530,6 +1530,33 @@ pub(crate) fn csharp_identifier_is_member_access_name(node: Node<'_>) -> bool {
         .child_by_field_name("name")
         .map(|name_node| name_node.id() == node.id())
         .unwrap_or(false)
+}
+
+/// True when `node` sits inside a `#if`/`#elif`/`#else` preprocessor branch.
+/// tree-sitter-c-sharp nests the conditional body as children of the
+/// `preproc_if`/`preproc_elif`/`preproc_else` node, so a single ancestor walk
+/// detects it. `#region`/`#pragma`/`#nullable` are *not* conditional — they
+/// never gate code out — so they are deliberately ignored, mirroring the
+/// C/C++ extractor's `ConditionalUnknown` downgrade.
+pub(crate) fn csharp_node_in_conditional(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "preproc_if" | "preproc_elif" | "preproc_else") {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+/// Downgrade a base confidence to `ConditionalUnknown` when the node lives in a
+/// preprocessor-gated branch whose activation we cannot evaluate.
+pub(crate) fn csharp_conditional_confidence(node: Node<'_>, base: Confidence) -> Confidence {
+    if csharp_node_in_conditional(node) {
+        Confidence::ConditionalUnknown
+    } else {
+        base
+    }
 }
 
 pub(crate) fn is_csharp_literal(kind: &str) -> bool {
