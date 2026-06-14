@@ -193,32 +193,6 @@ fn set_alt_screen_active_flag_round_trips() {
     super::set_alt_screen_active(saved);
 }
 
-/// Unix-only: the crash path has to restore the stdout file-status flags that
-/// `TerminalGuard::enter` changes when it makes fd 1 nonblocking. Pin the shared
-/// restore slot without emitting terminal teardown bytes.
-#[cfg(unix)]
-#[test]
-fn stdout_restore_flags_are_restored_and_cleared() {
-    use std::os::fd::AsRawFd;
-    use std::sync::atomic::Ordering;
-
-    let saved_slot = super::STDOUT_RESTORE_FLAGS.load(Ordering::SeqCst);
-    let fd = std::io::stdout().as_raw_fd();
-    // SAFETY: fcntl only reads fd 1's current file-status flags.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    assert!(flags >= 0, "stdout flags should be readable");
-
-    super::set_stdout_restore_flags(Some(flags));
-    super::restore_stdout_status_flags();
-    assert_eq!(
-        super::STDOUT_RESTORE_FLAGS.load(Ordering::SeqCst),
-        -1,
-        "restoring must clear the emergency stdout restore slot"
-    );
-
-    super::STDOUT_RESTORE_FLAGS.store(saved_slot, Ordering::SeqCst);
-}
-
 /// Unix-only: registering the SIGTERM/SIGHUP/SIGTSTP handlers inside a tokio
 /// runtime must not panic and must not block (the listeners are spawned, no
 /// signal is sent).

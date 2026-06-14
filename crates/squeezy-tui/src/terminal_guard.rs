@@ -8,8 +8,6 @@
 
 use std::env;
 use std::io::{self, IsTerminal, Write};
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -79,10 +77,6 @@ pub(crate) struct TerminalGuard {
     /// writer bumps it on every write; `draw_app` resets it at frame begin and
     /// reads the delta at frame end into [`metrics::RenderMetrics::bytes_emitted`].
     byte_counter: metrics::ByteCounter,
-    /// Original stdout file-status flags before the TUI made fd 1 nonblocking.
-    /// Restored on every guard drop so the parent shell inherits its normal fd.
-    #[cfg(unix)]
-    stdout_flags: Option<i32>,
 }
 
 impl TerminalGuard {
@@ -100,31 +94,6 @@ impl TerminalGuard {
 pub(crate) enum DrawStatus {
     Committed,
     Backpressured,
-}
-
-#[cfg(unix)]
-fn make_stdout_nonblocking() -> Option<i32> {
-    let fd = io::stdout().as_raw_fd();
-    // SAFETY: fcntl only inspects/modifies the file-status flags for fd 1.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || flags & libc::O_NONBLOCK != 0 {
-        return None;
-    }
-    // SAFETY: same fd, preserving all existing flags and adding O_NONBLOCK.
-    let set = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    if set < 0 { None } else { Some(flags) }
-}
-
-#[cfg(unix)]
-fn restore_stdout_flags(flags: Option<i32>) {
-    let Some(flags) = flags else {
-        signal_teardown::set_stdout_restore_flags(None);
-        return;
-    };
-    let fd = io::stdout().as_raw_fd();
-    // SAFETY: best-effort restoration of the file-status flags captured at enter.
-    let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
-    signal_teardown::set_stdout_restore_flags(None);
 }
 
 fn terminal_io_error(err: io::Error) -> SqueezyError {
@@ -157,10 +126,9 @@ impl TerminalGuard {
         }
         let synchronized_output = resolve_synchronized_output(synchronized_output);
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        #[cfg(unix)]
-        let stdout_flags = make_stdout_nonblocking();
-        #[cfg(unix)]
-        signal_teardown::set_stdout_restore_flags(stdout_flags);
+        // Keep stdout blocking. ANSI command streams are not retry-safe after a
+        // partial fd write: a half-emitted cursor/style escape can surface as
+        // visible fragments on the next redraw.
         // Wrap stdout in the env-gated debug-tap writer so every
         // subsequent ANSI sequence — startup setup, draw bytes, and
         // teardown — is mirrored to the log when
@@ -184,11 +152,7 @@ impl TerminalGuard {
         // entry, bracketed paste / focus, mouse capture) through the shared free
         // helper so a test can drive the exact same bytes into a `Capture`
         // writer with no real TTY.
-        if let Err(err) = emit_terminal_enter_setup(&mut writer, mouse_capture) {
-            #[cfg(unix)]
-            restore_stdout_flags(stdout_flags);
-            return Err(terminal_io_error(err));
-        }
+        emit_terminal_enter_setup(&mut writer, mouse_capture).map_err(terminal_io_error)?;
         // Crash safety (Phase 9): install the panic hook now that the terminal is
         // in raw mode / the alternate screen, and publish the alt-screen state so
         // the hook (and the Unix signal handlers) leave it exactly once. Both are
@@ -216,8 +180,6 @@ impl TerminalGuard {
             synchronized_output,
             size_source: Box::new(crate::size_source::RealSize),
             byte_counter,
-            #[cfg(unix)]
-            stdout_flags,
         })
     }
 
@@ -258,8 +220,6 @@ impl TerminalGuard {
             synchronized_output: false,
             size_source: Box::new(crate::size_source::FixedSize(w, h)),
             byte_counter,
-            #[cfg(unix)]
-            stdout_flags: None,
         };
         (guard, sink)
     }
@@ -293,8 +253,6 @@ impl TerminalGuard {
             synchronized_output: false,
             size_source: Box::new(crate::size_source::FixedSize(w, h)),
             byte_counter,
-            #[cfg(unix)]
-            stdout_flags: None,
         };
         (guard, sink)
     }
@@ -317,8 +275,6 @@ impl TerminalGuard {
             synchronized_output: false,
             size_source: Box::new(crate::size_source::FixedSize(w, h)),
             byte_counter,
-            #[cfg(unix)]
-            stdout_flags: None,
         }
     }
 
@@ -1111,8 +1067,6 @@ fn sanitize_osc_text(title: &str) -> String {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        let stdout_flags = self.stdout_flags.take();
         // Emergency-only teardown: restore the terminal modes and (if still
         // active) leave the alternate screen, but write NO user-facing content
         // and run NO render/mirror. The clean exit + transcript mirror is owned
@@ -1121,8 +1075,6 @@ impl Drop for TerminalGuard {
         // both paths run.
         let _ = disable_raw_mode();
         let Some(terminal) = self.terminal.as_mut() else {
-            #[cfg(unix)]
-            restore_stdout_flags(stdout_flags);
             return;
         };
         {
@@ -1168,8 +1120,6 @@ impl Drop for TerminalGuard {
         // keeping the second-TUI / non-TUI contract intact. Idempotent via the
         // `HOOKS_INSTALLED` swap, so it is a no-op if a clean exit already restored.
         signal_teardown::restore_previous_panic_hook();
-        #[cfg(unix)]
-        restore_stdout_flags(stdout_flags);
     }
 }
 
