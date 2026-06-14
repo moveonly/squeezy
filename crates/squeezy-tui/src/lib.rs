@@ -4299,14 +4299,11 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
                 // add-to-set / save-snippet verbs still have a live range;
                 // the explicit copy chords (Ctrl+C, ⌘C, Ctrl+Shift+C) remain
                 // the clear-on-copy paths.
-                if let Some(sel) = app.selection.as_ref()
-                    && sel.surface == selection::SelectionSurface::Main
-                {
-                    if sel.is_empty() {
-                        app.selection = None;
-                    } else if app.copy_on_select {
-                        let _ = copy_any_active_selection(app);
-                    }
+                if finish_surface_selection_release(
+                    app,
+                    selection::SelectionSurface::Main,
+                    app.copy_on_select,
+                ) {
                     return true;
                 }
             }
@@ -4605,6 +4602,109 @@ fn selection_surface_rows(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TranscriptTextSurfaceGeometry {
+    text_area: Rect,
+    total_rows: usize,
+    viewport_h: usize,
+    top_row: usize,
+    h_offset: usize,
+}
+
+impl TranscriptTextSurfaceGeometry {
+    fn row_count_and_viewport(self) -> (usize, usize) {
+        (self.total_rows, self.viewport_h)
+    }
+}
+
+fn transcript_text_surface_geometry(
+    app: &TuiApp,
+    surface: selection::SelectionSurface,
+    row_count: usize,
+) -> Option<TranscriptTextSurfaceGeometry> {
+    match surface {
+        selection::SelectionSurface::Main => {
+            let cache = app.main_text_area_cache.get()?;
+            let viewport_h = usize::from(cache.viewport_h);
+            let top_row = cache
+                .total_rows
+                .saturating_sub(viewport_h)
+                .saturating_sub(cache.from_bottom);
+            Some(TranscriptTextSurfaceGeometry {
+                text_area: cache.text_area,
+                total_rows: cache.total_rows,
+                viewport_h,
+                top_row,
+                h_offset: usize::from(cache.h_offset),
+            })
+        }
+        selection::SelectionSurface::Overlay => {
+            app.transcript_overlay.as_ref()?;
+            let (width, height) = app.off_frame_terminal_size();
+            let full_area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            let (area, _) = transcript_overlay_content_and_status_areas(full_area);
+            let inner = transcript_overlay_inner(area);
+            let (text_area, _) = transcript_overlay_text_and_scrollbar_areas(inner)?;
+            Some(TranscriptTextSurfaceGeometry {
+                text_area,
+                total_rows: row_count,
+                viewport_h: usize::from(text_area.height),
+                top_row: resolved_transcript_overlay_scroll(app),
+                h_offset: 0,
+            })
+        }
+    }
+}
+
+fn point_from_transcript_text_surface(
+    geometry: TranscriptTextSurfaceGeometry,
+    rows: &[Line<'static>],
+    column: u16,
+    row: u16,
+    clamp: bool,
+) -> Option<selection::Pos> {
+    let area = geometry.text_area;
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let (col, r) = if clamp {
+        (
+            column.clamp(area.x, area.x + area.width - 1),
+            row.clamp(area.y, area.y + area.height - 1),
+        )
+    } else if column < area.x
+        || column >= area.x.saturating_add(area.width)
+        || row < area.y
+        || row >= area.y.saturating_add(area.height)
+    {
+        return None;
+    } else {
+        (column, row)
+    };
+
+    let local_row = usize::from(r.saturating_sub(area.y));
+    let last = rows.len().saturating_sub(1);
+    let row_idx = geometry.top_row.saturating_add(local_row).min(last);
+    let display_col = geometry
+        .h_offset
+        .saturating_add(usize::from(col.saturating_sub(area.x)));
+    let char_col = rows
+        .get(row_idx)
+        .map(|line| {
+            selection::char_offset_for_display_col(
+                &transcript_surface::plain_text_of_line(line),
+                display_col,
+            )
+        })
+        .unwrap_or(0);
+    Some(selection::Pos::new(row_idx, char_col))
+}
+
 /// Map an absolute `(column, row)` mouse cell onto a surface-local
 /// `selection::Pos` for the MAIN text area, using the per-frame
 /// `main_text_area_cache`. `None` when the cell is outside the text rectangle.
@@ -4618,16 +4718,9 @@ fn main_point_from_mouse(
     column: u16,
     row: u16,
 ) -> Option<selection::Pos> {
-    let cache = app.main_text_area_cache.get()?;
-    let area = cache.text_area;
-    if column < area.x
-        || column >= area.x.saturating_add(area.width)
-        || row < area.y
-        || row >= area.y.saturating_add(area.height)
-    {
-        return None;
-    }
-    Some(main_pos_for_cell(&cache, rows, column, row))
+    let geometry =
+        transcript_text_surface_geometry(app, selection::SelectionSurface::Main, rows.len())?;
+    point_from_transcript_text_surface(geometry, rows, column, row, false)
 }
 
 /// Like [`main_point_from_mouse`] but clamps an out-of-bounds pointer onto the
@@ -4640,60 +4733,19 @@ fn main_point_from_mouse_clamped(
     column: u16,
     row: u16,
 ) -> Option<selection::Pos> {
-    let cache = app.main_text_area_cache.get()?;
-    let area = cache.text_area;
-    if area.width == 0 || area.height == 0 {
-        return None;
-    }
-    let col = column.clamp(area.x, area.x + area.width - 1);
-    let r = row.clamp(area.y, area.y + area.height - 1);
-    Some(main_pos_for_cell(&cache, rows, col, r))
-}
-
-/// Shared cell→`Pos` math: resolve the wrapped-row index from the painted scroll
-/// window, then the wide-glyph-aware char column within that row's plain text.
-///
-/// `rows` is the painted main-surface row list (the same `Vec<Line>` the caller
-/// derived for the gesture), indexed by the resolved wrapped-row index.
-fn main_pos_for_cell(
-    cache: &MainTextAreaCache,
-    rows: &[Line<'static>],
-    column: u16,
-    row: u16,
-) -> selection::Pos {
-    let total_rows = cache.total_rows;
-    let last = total_rows.saturating_sub(1);
-    let local_row = usize::from(row.saturating_sub(cache.text_area.y));
-    // First visible row: tail-anchored window, `from_bottom` up from the end.
-    let top_row = total_rows
-        .saturating_sub(usize::from(cache.viewport_h))
-        .saturating_sub(cache.from_bottom);
-    let row_idx = (top_row + local_row).min(last);
-
-    // In no-wrap mode the viewport is panned right by `h_offset` columns, so the
-    // cell's display column maps to `h_offset + (column - x)` within the unwrapped
-    // line. `h_offset` is `0` while wrapping, so this is a no-op there (§11G.4).
-    let display_col =
-        usize::from(cache.h_offset) + usize::from(column.saturating_sub(cache.text_area.x));
-    let col = rows
-        .get(row_idx)
-        .map(|line| {
-            selection::char_offset_for_display_col(
-                &transcript_surface::plain_text_of_line(line),
-                display_col,
-            )
-        })
-        .unwrap_or(0);
-    selection::Pos::new(row_idx, col)
+    let geometry =
+        transcript_text_surface_geometry(app, selection::SelectionSurface::Main, rows.len())?;
+    point_from_transcript_text_surface(geometry, rows, column, row, true)
 }
 
 /// Map an absolute `(column, row)` mouse cell onto a surface-local
 /// `selection::Pos` for the Ctrl+T overlay text area. The overlay scroll model is
 /// a top-anchored offset (`resolved_transcript_overlay_scroll`), unlike the main
-/// view's tail-anchored window, so the row math differs from
-/// [`main_pos_for_cell`]. `clamp` extends an out-of-bounds pointer onto the
-/// nearest edge cell (used while dragging) rather than returning `None`. `rows`
-/// is the painted overlay row list (see [`selection_surface_rows`]).
+/// view's tail-anchored window; both are normalized through
+/// [`transcript_text_surface_geometry`]. `clamp` extends an out-of-bounds
+/// pointer onto the nearest edge cell (used while dragging) rather than
+/// returning `None`. `rows` is the painted overlay row list (see
+/// [`selection_surface_rows`]).
 fn overlay_point_from_mouse(
     app: &TuiApp,
     rows: &[Line<'static>],
@@ -4701,48 +4753,9 @@ fn overlay_point_from_mouse(
     row: u16,
     clamp: bool,
 ) -> Option<selection::Pos> {
-    let (width, height) = app.off_frame_terminal_size();
-    let full_area = Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    };
-    let (area, _) = transcript_overlay_content_and_status_areas(full_area);
-    let inner = transcript_overlay_inner(area);
-    let (text_area, _) = transcript_overlay_text_and_scrollbar_areas(inner)?;
-    if text_area.width == 0 || text_area.height == 0 {
-        return None;
-    }
-    let (col, r) = if clamp {
-        (
-            column.clamp(text_area.x, text_area.x + text_area.width - 1),
-            row.clamp(text_area.y, text_area.y + text_area.height - 1),
-        )
-    } else if column < text_area.x
-        || column >= text_area.x.saturating_add(text_area.width)
-        || row < text_area.y
-        || row >= text_area.y.saturating_add(text_area.height)
-    {
-        return None;
-    } else {
-        (column, row)
-    };
-    let scroll = resolved_transcript_overlay_scroll(app);
-    let local_row = usize::from(r.saturating_sub(text_area.y));
-    let last = rows.len().saturating_sub(1);
-    let row_idx = (scroll + local_row).min(last);
-    let display_col = usize::from(col.saturating_sub(text_area.x));
-    let char_col = rows
-        .get(row_idx)
-        .map(|line| {
-            selection::char_offset_for_display_col(
-                &transcript_surface::plain_text_of_line(line),
-                display_col,
-            )
-        })
-        .unwrap_or(0);
-    Some(selection::Pos::new(row_idx, char_col))
+    let geometry =
+        transcript_text_surface_geometry(app, selection::SelectionSurface::Overlay, rows.len())?;
+    point_from_transcript_text_surface(geometry, rows, column, row, clamp)
 }
 
 /// The surface a fresh incremental search opens on: the overlay when it is open,
@@ -4760,13 +4773,13 @@ fn active_selection_surface(app: &TuiApp) -> selection::SelectionSurface {
 /// extends + auto-scroll, from the cached painted geometry. Selection is
 /// main-view only, so there is no overlay branch here.
 fn selection_surface_geometry(app: &TuiApp) -> (usize, usize) {
-    let cache = app.main_text_area_cache.get();
-    match cache {
-        Some(c) => (c.total_rows, usize::from(c.viewport_h)),
-        None => {
-            let (rows, vh) = active_transcript_geometry(app);
-            (rows, vh)
-        }
+    if let Some(geometry) =
+        transcript_text_surface_geometry(app, selection::SelectionSurface::Main, 0)
+    {
+        geometry.row_count_and_viewport()
+    } else {
+        let (rows, vh) = active_transcript_geometry(app);
+        (rows, vh)
     }
 }
 
@@ -4802,6 +4815,25 @@ fn set_selection_cursor(app: &mut TuiApp, pos: selection::Pos) {
     }
 }
 
+fn finish_surface_selection_release(
+    app: &mut TuiApp,
+    surface: selection::SelectionSurface,
+    copy_on_select: bool,
+) -> bool {
+    let Some(sel) = app.selection.as_ref() else {
+        return false;
+    };
+    if sel.surface != surface {
+        return false;
+    }
+    if sel.is_empty() {
+        app.selection = None;
+    } else if copy_on_select {
+        let _ = copy_any_active_selection(app);
+    }
+    true
+}
+
 /// Seed a selection at the main view's tail when none exists, then drive a
 /// keyboard extend (`mv`) over the main rows, auto-scrolling to keep the cursor
 /// visible. Keyboard selection is MAIN-view only — every caller is gated to
@@ -4822,11 +4854,7 @@ fn extend_selection(app: &mut TuiApp, mv: SelectionMove) {
             .map(|c| c.from_bottom)
             .unwrap_or(0);
         let seed_row = last.saturating_sub(from_bottom);
-        let width = app
-            .main_text_area_cache
-            .get()
-            .map(|c| c.text_area.width)
-            .unwrap_or_else(|| main_text_width(app));
+        let width = selection_width_for_surface(app, surface);
         app.selection = Some(selection::Selection::at(
             surface,
             selection::Pos::new(seed_row, 0),
@@ -8129,21 +8157,11 @@ fn handle_transcript_overlay_mouse(
             if app.scrollbar_drag == Some(ScrollbarDragSurface::Overlay) {
                 app.scrollbar_drag = None;
             }
-            if let Some(sel) = app.selection.as_ref()
-                && sel.surface == selection::SelectionSurface::Overlay
-            {
-                if sel.is_empty() {
-                    // A bare click leaves no highlight, matching the main view.
-                    app.selection = None;
-                } else {
-                    // Overlay selection exists only to copy (no quote/snippet
-                    // verbs here), so a real drag-release copies it — restoring the
-                    // copy reach the removed native-selection mode provided. The
-                    // highlight is kept so the user sees what was copied.
-                    copy_any_active_selection(app);
-                }
-                changed = true;
-            }
+            // Overlay selection exists only to copy (no quote/snippet verbs
+            // here), so a real drag-release copies it. Empty releases clear the
+            // collapsed click highlight, matching the main view.
+            changed |=
+                finish_surface_selection_release(app, selection::SelectionSurface::Overlay, true);
             changed
         }
         _ => false,
@@ -35376,7 +35394,8 @@ fn scroll_search_match_into_view(app: &mut TuiApp) {
                 return;
             }
             // `top_row = total_rows - viewport_h - from_bottom` (the same relation
-            // `main_pos_for_cell` / `scroll_offset_for_from_bottom` encode).
+            // `transcript_text_surface_geometry` / `scroll_offset_for_from_bottom`
+            // encode).
             let max_from_bottom = total_rows.saturating_sub(viewport_h);
             let current_from_bottom =
                 active_transcript_scroll(app).offset_from_bottom(total_rows, viewport_h);
@@ -35485,8 +35504,8 @@ fn register_transcript_card_targets(
     }
     // The painted window: `top_row` is the first wrapped row drawn at the top
     // of the text area (tail-anchored, `from_bottom` up from the end). Mirrors
-    // `main_pos_for_cell`'s window math so the screen `y` we compute matches
-    // where the row is actually painted.
+    // the shared transcript text-surface geometry so the screen `y` we compute
+    // matches where the row is actually painted.
     let top_row = total_rows
         .saturating_sub(viewport_h)
         .saturating_sub(from_bottom);
@@ -37572,8 +37591,9 @@ pub(crate) struct MainTextAreaCache {
     /// `main_surface_rows`.
     soft_wrap: bool,
     /// The horizontal pan offset the no-wrap frame painted with. `0` while
-    /// wrapping. Added to the mouse display column in `main_pos_for_cell` so a
-    /// click on a horizontally-scrolled line lands on the right character.
+    /// wrapping. Added to the mouse display column by the shared transcript
+    /// text-surface mapper so a click on a horizontally-scrolled line lands on
+    /// the right character.
     h_offset: u16,
 }
 
