@@ -85,7 +85,7 @@ enabled = true
 
 `[[skills.config]]` entries enable or disable a skill by exact `name` or by skill directory / `SKILL.md` `path`. Use exactly one selector per entry. Entries are applied in order after discovery, so later matches win.
 
-An example skill ships in `crates/squeezy-skills/tests/artifacts/skills/rust-code-navigation/SKILL.md`.
+An example skill fixture ships in `crates/squeezy-skills/tests/artifacts/skills/rust-code-navigation/SKILL.md`; the skills crate validates it as a public `SKILL.md` example.
 
 ## Activation
 
