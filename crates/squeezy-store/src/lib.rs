@@ -10,10 +10,12 @@
 //! * `state.redb` - receipt metadata, read snapshots (keyed by
 //!   `(path, start_byte, end_byte)` so distinct windows of the same file do not
 //!   overwrite each other), observations, and small session-side cache state.
-//! * `graph.redb` - semantic graph partitions and resolver-cache snapshots.
+//! * `graph/v3` - sharded semantic graph partitions and resolver-cache
+//!   snapshots. Legacy `graph.redb` is treated as a best-effort warm-start
+//!   source only.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -25,7 +27,8 @@ use redb::{
     TableDefinition,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use squeezy_core::{FileId, Result, SqueezyError, repo_settings_id};
+use sha2::{Digest, Sha256};
+use squeezy_core::{FileId, LanguageKind, Result, SqueezyError, repo_settings_id};
 
 mod fs_util;
 pub mod memory;
@@ -45,8 +48,15 @@ pub use sessions::*;
 pub const CRATE_NAME: &str = "squeezy-store";
 pub const SCHEMA_VERSION: u64 = 3;
 pub const GRAPH_SCHEMA_VERSION: u64 = 1;
+pub const GRAPH_V3_SCHEMA_VERSION: u64 = 3;
 pub const STATE_FILE_NAME: &str = "state.redb";
 pub const GRAPH_FILE_NAME: &str = "graph.redb";
+pub const GRAPH_DIR_NAME: &str = "graph";
+pub const GRAPH_V3_DIR_NAME: &str = "v3";
+pub const GRAPH_MANIFEST_FILE_NAME: &str = "manifest.redb";
+pub const GRAPH_GLOBAL_FILE_NAME: &str = "global.redb";
+pub const GRAPH_SHARDS_DIR_NAME: &str = "shards";
+pub const GRAPH_SHARD_COUNT: u8 = 64;
 
 const OVERSIZED_STATE_FAST_ROTATE_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -58,6 +68,8 @@ pub(crate) static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 mod tests;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+const GRAPH_MANIFEST: TableDefinition<&str, &[u8]> = TableDefinition::new("graph_manifest");
+const GRAPH_FILE_SHARDS: TableDefinition<&str, &[u8]> = TableDefinition::new("graph_file_shards");
 const GRAPH_PARTITIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("graph_partitions");
 const TOOL_RECEIPTS: TableDefinition<&str, &[u8]> = TableDefinition::new("tool_receipts");
 const READ_SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("read_snapshots");
@@ -99,13 +111,269 @@ pub struct SqueezyStore {
 #[derive(Debug)]
 pub struct GraphStore {
     path: PathBuf,
-    database: Database,
+    backend: GraphStoreBackend,
+}
+
+#[derive(Debug)]
+enum GraphStoreBackend {
+    V3(GraphStoreV3),
+}
+
+#[derive(Debug)]
+struct GraphStoreV3 {
+    root: PathBuf,
+    legacy_path: PathBuf,
+    manifest: Database,
+    global: Database,
+    shards: Mutex<BTreeMap<GraphShardKey, Arc<Database>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphStoreProbe {
     pub path: PathBuf,
     pub schema_version: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct WorkspaceStores {
+    workspace_root: PathBuf,
+    cache_root: Option<PathBuf>,
+    state: Mutex<Option<Arc<SqueezyStore>>>,
+    graph: Mutex<Option<Arc<GraphStore>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreOpenFailureKind {
+    Locked,
+    PermissionDenied,
+    DiskFull,
+    Corrupt,
+    UnsupportedFs,
+    Other,
+}
+
+impl StoreOpenFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Locked => "locked",
+            Self::PermissionDenied => "permission_denied",
+            Self::DiskFull => "disk_full",
+            Self::Corrupt => "corrupt",
+            Self::UnsupportedFs => "unsupported_fs",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Locked => "likely lock contention",
+            Self::PermissionDenied => "likely permission problem",
+            Self::DiskFull => "likely disk full",
+            Self::Corrupt => "possible redb corruption",
+            Self::UnsupportedFs => "possible unsupported filesystem behavior",
+            Self::Other => "storage open failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreOpenFailure {
+    pub path: PathBuf,
+    pub kind: StoreOpenFailureKind,
+    pub message: String,
+}
+
+impl StoreOpenFailure {
+    pub fn new(
+        path: impl Into<PathBuf>,
+        error: &SqueezyError,
+        access_denied_may_be_lock: bool,
+    ) -> Self {
+        let message = error.to_string();
+        Self {
+            path: path.into(),
+            kind: classify_store_open_message(&message, access_denied_may_be_lock),
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for StoreOpenFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} ({}) at {}",
+            self.message,
+            self.kind.hint(),
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for StoreOpenFailure {}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct GraphShardKey {
+    language: String,
+    bucket: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GraphManifest {
+    schema_version: u64,
+    graph_format_version: u64,
+    active_generation: u64,
+    shard_count: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GraphShardPlacement {
+    language: String,
+    bucket: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct VersionedGraphPayload {
+    generation: u64,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct GraphPartitionWrite {
+    file_id: FileId,
+    language: LanguageKind,
+    encoded: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct GraphResolverWrite {
+    file_id: FileId,
+    language: LanguageKind,
+    encoded: Vec<u8>,
+}
+
+impl WorkspaceStores {
+    pub fn new(workspace_root: impl Into<PathBuf>, cache_root: Option<PathBuf>) -> Self {
+        Self {
+            workspace_root: workspace_root.into(),
+            cache_root,
+            state: Mutex::new(None),
+            graph: Mutex::new(None),
+        }
+    }
+
+    pub fn state(&self) -> std::result::Result<Arc<SqueezyStore>, StoreOpenFailure> {
+        {
+            let cached = self
+                .state
+                .lock()
+                .map_err(|_| self.poisoned_failure(self.state_path(), "state store lock"))?;
+            if let Some(store) = cached.as_ref() {
+                return Ok(Arc::clone(store));
+            }
+        }
+        let store = SqueezyStore::open(&self.workspace_root, self.cache_root.as_deref())
+            .map(Arc::new)
+            .map_err(|error| StoreOpenFailure::new(self.state_path(), &error, false))?;
+        let mut cached = self
+            .state
+            .lock()
+            .map_err(|_| self.poisoned_failure(self.state_path(), "state store lock"))?;
+        if let Some(existing) = cached.as_ref() {
+            Ok(Arc::clone(existing))
+        } else {
+            *cached = Some(Arc::clone(&store));
+            Ok(store)
+        }
+    }
+
+    pub fn graph(&self) -> std::result::Result<Arc<GraphStore>, StoreOpenFailure> {
+        {
+            let cached = self.graph.lock().map_err(|_| {
+                self.poisoned_failure(self.graph_manifest_path(), "graph store lock")
+            })?;
+            if let Some(store) = cached.as_ref() {
+                return Ok(Arc::clone(store));
+            }
+        }
+        let store = GraphStore::open(&self.workspace_root, self.cache_root.as_deref())
+            .map(Arc::new)
+            .map_err(|error| StoreOpenFailure::new(self.graph_manifest_path(), &error, true))?;
+        let mut cached = self
+            .graph
+            .lock()
+            .map_err(|_| self.poisoned_failure(self.graph_manifest_path(), "graph store lock"))?;
+        if let Some(existing) = cached.as_ref() {
+            Ok(Arc::clone(existing))
+        } else {
+            *cached = Some(Arc::clone(&store));
+            Ok(store)
+        }
+    }
+
+    pub fn state_path(&self) -> PathBuf {
+        state_path(&self.workspace_root, self.cache_root.as_deref())
+    }
+
+    pub fn graph_manifest_path(&self) -> PathBuf {
+        graph_manifest_path(&self.workspace_root, self.cache_root.as_deref())
+    }
+
+    fn poisoned_failure(&self, path: PathBuf, label: &str) -> StoreOpenFailure {
+        let error = SqueezyError::Tool(format!("{label} poisoned"));
+        StoreOpenFailure::new(path, &error, false)
+    }
+}
+
+pub fn classify_store_open_error(
+    error: &SqueezyError,
+    access_denied_may_be_lock: bool,
+) -> StoreOpenFailureKind {
+    classify_store_open_message(&error.to_string(), access_denied_may_be_lock)
+}
+
+pub fn classify_store_open_message(
+    message: &str,
+    access_denied_may_be_lock: bool,
+) -> StoreOpenFailureKind {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("database already open")
+        || lower.contains("cannot acquire lock")
+        || lower.contains("lock")
+        || lower.contains("busy")
+        || lower.contains("would block")
+        || lower.contains("being used by another process")
+        || lower.contains("another process has locked")
+        || lower.contains("sharing violation")
+        || (access_denied_may_be_lock && lower.contains("access is denied"))
+    {
+        StoreOpenFailureKind::Locked
+    } else if lower.contains("permission denied")
+        || lower.contains("access denied")
+        || lower.contains("access is denied")
+    {
+        StoreOpenFailureKind::PermissionDenied
+    } else if lower.contains("no space") || lower.contains("enospc") {
+        StoreOpenFailureKind::DiskFull
+    } else if lower.contains("corrupt")
+        || lower.contains("checksum")
+        || lower.contains("invalid database")
+        || lower.contains("invalid magic")
+    {
+        StoreOpenFailureKind::Corrupt
+    } else if lower.contains("unsupported")
+        || lower.contains("operation not supported")
+        || lower.contains("not supported")
+    {
+        StoreOpenFailureKind::UnsupportedFs
+    } else {
+        StoreOpenFailureKind::Other
+    }
+}
+
+fn is_locked_store_error(error: &SqueezyError) -> bool {
+    classify_store_open_error(error, true) == StoreOpenFailureKind::Locked
 }
 
 impl SqueezyStore {
@@ -646,76 +914,32 @@ impl SqueezyStore {
 
 impl GraphStore {
     pub fn open(workspace_root: impl AsRef<Path>, cache_root: Option<&Path>) -> Result<Self> {
-        let path = graph_path(workspace_root.as_ref(), cache_root);
-        Self::open_path(path)
+        Self::open_path(graph_path(workspace_root.as_ref(), cache_root))
     }
 
     pub fn open_path(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let initial = open_database(&path)?;
-        let database = match current_schema_version(&initial)? {
-            Some(GRAPH_SCHEMA_VERSION) => initial,
-            Some(on_disk_version) => {
-                drop(initial);
-                let backup = backup_path(&path, on_disk_version);
-                match fs_util::rotate_file(&path, &backup) {
-                    Ok(()) => {
-                        sync_parent_dir(&backup)?;
-                        tracing::warn!(
-                            target: "squeezy::store",
-                            on_disk_version,
-                            schema_version = GRAPH_SCHEMA_VERSION,
-                            backup = %backup.display(),
-                            "graph.redb schema mismatch; existing graph cache backed up and reinitialised",
-                        );
-                    }
-                    Err(rotate_err) => {
-                        // Same extended-path retry as the state-store path:
-                        // try `replace_file` (MoveFileExW + `\\?\`) before
-                        // deleting, so paths past MAX_PATH still get the
-                        // friendly backup.
-                        match fs_util::replace_file(&path, &backup) {
-                            Ok(()) => {
-                                sync_parent_dir(&backup)?;
-                                tracing::warn!(
-                                    target: "squeezy::store",
-                                    on_disk_version,
-                                    schema_version = GRAPH_SCHEMA_VERSION,
-                                    backup = %backup.display(),
-                                    rotate_error = %rotate_err,
-                                    "graph.redb schema mismatch; rename rotation failed but extended-path replace succeeded; existing graph cache backed up and reinitialised",
-                                );
-                            }
-                            Err(replace_err) => {
-                                // Both rotation attempts blocked (e.g.
-                                // Windows file lock). Delete and reinitialise
-                                // fresh without the backup.
-                                let _ = fs::remove_file(&path);
-                                tracing::warn!(
-                                    target: "squeezy::store",
-                                    on_disk_version,
-                                    schema_version = GRAPH_SCHEMA_VERSION,
-                                    rotate_error = %rotate_err,
-                                    replace_error = %replace_err,
-                                    "graph.redb schema mismatch; rotation failed, existing graph cache deleted and reinitialised",
-                                );
-                            }
-                        }
-                    }
-                }
-                bootstrap_graph_store(&path)?;
-                open_database(&path)?
-            }
-            None => {
-                drop(initial);
-                bootstrap_graph_store(&path)?;
-                open_database(&path)?
-            }
-        };
-        Ok(Self { path, database })
+        let legacy_path = path.into();
+        let cache_dir = legacy_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let root = cache_dir.join(GRAPH_DIR_NAME).join(GRAPH_V3_DIR_NAME);
+        fs::create_dir_all(&root)?;
+        let manifest_path = root.join(GRAPH_MANIFEST_FILE_NAME);
+        let global_path = root.join(GRAPH_GLOBAL_FILE_NAME);
+        let manifest = open_graph_v3_database(&manifest_path)?;
+        ensure_graph_manifest(&manifest)?;
+        let global = open_graph_v3_database(&global_path)?;
+        Ok(Self {
+            path: manifest_path.clone(),
+            backend: GraphStoreBackend::V3(GraphStoreV3 {
+                root,
+                legacy_path,
+                manifest,
+                global,
+                shards: Mutex::new(BTreeMap::new()),
+            }),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -723,7 +947,9 @@ impl GraphStore {
     }
 
     pub fn probe_path_read_only(path: impl Into<PathBuf>) -> Result<GraphStoreProbe> {
-        let path = path.into();
+        let legacy_path = path.into();
+        let path = graph_manifest_path_from_legacy_path(&legacy_path);
+        let path = if path.exists() { path } else { legacy_path };
         let database = ReadOnlyDatabase::open(&path).map_err(store_error)?;
         let schema_version = current_schema_version(&database)?;
         Ok(GraphStoreProbe {
@@ -733,7 +959,8 @@ impl GraphStore {
     }
 
     pub fn set_graph_metadata(&self, metadata: &GraphStoreMetadata) -> Result<()> {
-        let write = self.begin_write()?;
+        let v3 = self.v3();
+        let write = v3.manifest.begin_write().map_err(store_error)?;
         {
             let mut meta = write.open_table(META).map_err(store_error)?;
             insert_json(&mut meta, "graph_metadata", metadata)?;
@@ -742,30 +969,39 @@ impl GraphStore {
     }
 
     pub fn graph_metadata(&self) -> Result<Option<GraphStoreMetadata>> {
-        let read = self.database.begin_read().map_err(store_error)?;
+        let v3 = self.v3();
+        let read = v3.manifest.begin_read().map_err(store_error)?;
         let table = match read.open_table(META) {
             Ok(table) => table,
-            Err(_) => return Ok(None),
+            Err(_) => return legacy_graph_metadata(&v3.legacy_path),
         };
-        read_table_json(&table, "graph_metadata")
+        match read_table_json(&table, "graph_metadata")? {
+            Some(metadata) => Ok(Some(metadata)),
+            None => legacy_graph_metadata(&v3.legacy_path),
+        }
     }
 
     pub fn put_graph_partition<T: Serialize>(&self, file_id: &FileId, partition: &T) -> Result<()> {
-        let write = self.begin_write()?;
-        {
-            let mut table = write.open_table(GRAPH_PARTITIONS).map_err(store_error)?;
-            insert_graph(&mut table, file_id.0.as_str(), partition)?;
-        }
-        write.commit().map_err(store_error)
+        let mut batch = GraphWriteBatch::new();
+        batch.upsert_partition(file_id, partition)?;
+        self.apply_graph_batch(&batch)
     }
 
     pub fn graph_partition<T: DeserializeOwned>(&self, file_id: &FileId) -> Result<Option<T>> {
-        let read = self.database.begin_read().map_err(store_error)?;
+        let v3 = self.v3();
+        let active_generation = v3.active_generation()?;
+        let Some(shard_key) = v3.placement_for_file(file_id)? else {
+            return legacy_graph_partition(&v3.legacy_path, file_id);
+        };
+        let Some(database) = v3.existing_shard_database(&shard_key)? else {
+            return legacy_graph_partition(&v3.legacy_path, file_id);
+        };
+        let read = database.begin_read().map_err(store_error)?;
         let table = match read.open_table(GRAPH_PARTITIONS) {
             Ok(table) => table,
             Err(_) => return Ok(None),
         };
-        read_graph(&table, file_id.0.as_str())
+        read_versioned_graph(&table, file_id.0.as_str(), active_generation)
     }
 
     /// Decode every stored graph partition into `T`, keyed by its `FileId`.
@@ -775,79 +1011,196 @@ impl GraphStore {
     /// file's persisted fingerprint without materialising the full parse
     /// result. Returns an empty vec if the table has never been written.
     pub fn graph_partition_entries<T: DeserializeOwned>(&self) -> Result<Vec<(FileId, T)>> {
-        let read = self.database.begin_read().map_err(store_error)?;
-        let table = match read.open_table(GRAPH_PARTITIONS) {
-            Ok(table) => table,
-            Err(_) => return Ok(Vec::new()),
-        };
+        let v3 = self.v3();
+        let placements = v3.file_placements()?;
+        if placements.is_empty() {
+            return legacy_graph_partition_entries(&v3.legacy_path);
+        }
+        let active_generation = v3.active_generation()?;
         let mut entries = Vec::new();
-        for entry in table.iter().map_err(store_error)? {
-            let (key, value) = entry.map_err(store_error)?;
-            let decoded: T = decode_graph(value.value())?;
-            entries.push((FileId(key.value().to_string()), decoded));
+        for (file_id, shard_key) in placements {
+            let Some(database) = v3.existing_shard_database(&shard_key)? else {
+                continue;
+            };
+            let read = database.begin_read().map_err(store_error)?;
+            let table = match read.open_table(GRAPH_PARTITIONS) {
+                Ok(table) => table,
+                Err(_) => continue,
+            };
+            if let Some(decoded) =
+                read_versioned_graph::<T, _>(&table, file_id.0.as_str(), active_generation)?
+            {
+                entries.push((file_id, decoded));
+            }
         }
         Ok(entries)
     }
 
     pub fn remove_graph_partition(&self, file_id: &FileId) -> Result<()> {
-        let write = self.begin_write()?;
-        {
-            let mut table = write.open_table(GRAPH_PARTITIONS).map_err(store_error)?;
-            table.remove(file_id.0.as_str()).map_err(store_error)?;
-        }
-        write.commit().map_err(store_error)
+        let mut batch = GraphWriteBatch::new();
+        batch.remove_partition(file_id);
+        self.apply_graph_batch(&batch)
     }
 
     pub fn clear_graph_partitions(&self) -> Result<()> {
-        let write = self.begin_write()?;
-        {
-            clear_table(&write, GRAPH_PARTITIONS)?;
+        let v3 = self.v3();
+        for shard_key in v3.shard_keys()? {
+            if let Some(database) = v3.existing_shard_database(&shard_key)? {
+                let write = database.begin_write().map_err(store_error)?;
+                clear_table(&write, GRAPH_PARTITIONS)?;
+                write.commit().map_err(store_error)?;
+            }
         }
-        write.commit().map_err(store_error)
+        Ok(())
     }
 
     pub fn apply_graph_batch(&self, batch: &GraphWriteBatch) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
-        let write = self.begin_write()?;
+        let v3 = self.v3();
+        let next_generation = v3.active_generation()?.saturating_add(1);
+        let mut touched_shards: BTreeMap<GraphShardKey, Vec<&GraphPartitionWrite>> =
+            BTreeMap::new();
+        let mut touched_resolvers: BTreeMap<GraphShardKey, Vec<&GraphResolverWrite>> =
+            BTreeMap::new();
+        for upsert in &batch.upserts {
+            touched_shards
+                .entry(GraphShardKey::for_file(&upsert.file_id, upsert.language))
+                .or_default()
+                .push(upsert);
+        }
+        for upsert in &batch.resolver_upserts {
+            touched_resolvers
+                .entry(GraphShardKey::for_file(&upsert.file_id, upsert.language))
+                .or_default()
+                .push(upsert);
+        }
+
+        for (shard_key, upserts) in &touched_shards {
+            let database = match v3.shard_database(shard_key) {
+                Ok(database) => database,
+                Err(error) if is_locked_store_error(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let write = database.begin_write().map_err(store_error)?;
+            {
+                let mut table = write.open_table(GRAPH_PARTITIONS).map_err(store_error)?;
+                for upsert in upserts {
+                    let value = encode_versioned_graph_payload(next_generation, &upsert.encoded)?;
+                    table
+                        .insert(upsert.file_id.0.as_str(), value.as_slice())
+                        .map_err(store_error)?;
+                }
+            }
+            write.commit().map_err(store_error)?;
+        }
+
+        for (shard_key, upserts) in &touched_resolvers {
+            let database = match v3.shard_database(shard_key) {
+                Ok(database) => database,
+                Err(error) if is_locked_store_error(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let write = database.begin_write().map_err(store_error)?;
+            {
+                let mut table = write
+                    .open_table(RESOLVER_SNAPSHOT_PER_FILE)
+                    .map_err(store_error)?;
+                for upsert in upserts {
+                    let value = encode_versioned_graph_payload(next_generation, &upsert.encoded)?;
+                    table
+                        .insert(upsert.file_id.0.as_str(), value.as_slice())
+                        .map_err(store_error)?;
+                }
+            }
+            write.commit().map_err(store_error)?;
+        }
+
+        for key in batch.removals.iter().chain(batch.resolver_removals.iter()) {
+            let file_id = FileId::new(key.clone());
+            let Some(shard_key) = v3.placement_for_file(&file_id)? else {
+                continue;
+            };
+            if let Some(database) = v3.existing_shard_database(&shard_key)? {
+                let write = database.begin_write().map_err(store_error)?;
+                {
+                    if batch.removals.iter().any(|removed| removed == key)
+                        && let Ok(mut table) = write.open_table(GRAPH_PARTITIONS)
+                    {
+                        table.remove(key.as_str()).map_err(store_error)?;
+                    }
+                    if batch.resolver_removals.iter().any(|removed| removed == key)
+                        && let Ok(mut table) = write.open_table(RESOLVER_SNAPSHOT_PER_FILE)
+                    {
+                        table.remove(key.as_str()).map_err(store_error)?;
+                    }
+                }
+                write.commit().map_err(store_error)?;
+            }
+        }
+
+        if let Some(blob) = &batch.import_graph {
+            match v3.global.begin_write().map_err(store_error) {
+                Ok(write) => {
+                    {
+                        let mut table = write
+                            .open_table(RESOLVER_IMPORT_GRAPH)
+                            .map_err(store_error)?;
+                        let value = encode_versioned_graph_payload(next_generation, blob)?;
+                        table
+                            .insert("resolver_import_graph", value.as_slice())
+                            .map_err(store_error)?;
+                    }
+                    write.commit().map_err(store_error)?;
+                }
+                Err(error) if is_locked_store_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let manifest_write = v3.manifest.begin_write().map_err(store_error)?;
+        {
+            let mut manifest = v3.manifest_record()?;
+            manifest.active_generation = next_generation;
+            let mut table = manifest_write
+                .open_table(GRAPH_MANIFEST)
+                .map_err(store_error)?;
+            insert_json(&mut table, "manifest", &manifest)?;
+        }
         if let Some(metadata) = &batch.metadata {
-            let mut meta = write.open_table(META).map_err(store_error)?;
+            let mut meta = manifest_write.open_table(META).map_err(store_error)?;
             insert_json(&mut meta, "graph_metadata", metadata)?;
         }
-        if !batch.upserts.is_empty() || !batch.removals.is_empty() {
-            let mut table = write.open_table(GRAPH_PARTITIONS).map_err(store_error)?;
-            for (key, value) in &batch.upserts {
-                table
-                    .insert(key.as_str(), value.as_slice())
-                    .map_err(store_error)?;
+        {
+            let mut table = manifest_write
+                .open_table(GRAPH_FILE_SHARDS)
+                .map_err(store_error)?;
+            for (shard_key, upserts) in &touched_shards {
+                for upsert in upserts {
+                    insert_json(
+                        &mut table,
+                        upsert.file_id.0.as_str(),
+                        &GraphShardPlacement::from(shard_key),
+                    )?;
+                }
+            }
+            for (shard_key, upserts) in &touched_resolvers {
+                for upsert in upserts {
+                    insert_json(
+                        &mut table,
+                        upsert.file_id.0.as_str(),
+                        &GraphShardPlacement::from(shard_key),
+                    )?;
+                }
             }
             for key in &batch.removals {
-                table.remove(key.as_str()).map_err(store_error)?;
+                if batch.resolver_removals.iter().any(|removed| removed == key) {
+                    table.remove(key.as_str()).map_err(store_error)?;
+                }
             }
         }
-        if !batch.resolver_upserts.is_empty() || !batch.resolver_removals.is_empty() {
-            let mut table = write
-                .open_table(RESOLVER_SNAPSHOT_PER_FILE)
-                .map_err(store_error)?;
-            for (key, value) in &batch.resolver_upserts {
-                table
-                    .insert(key.as_str(), value.as_slice())
-                    .map_err(store_error)?;
-            }
-            for key in &batch.resolver_removals {
-                table.remove(key.as_str()).map_err(store_error)?;
-            }
-        }
-        if let Some(blob) = &batch.import_graph {
-            let mut table = write
-                .open_table(RESOLVER_IMPORT_GRAPH)
-                .map_err(store_error)?;
-            table
-                .insert("resolver_import_graph", blob.as_slice())
-                .map_err(store_error)?;
-        }
-        write.commit().map_err(store_error)
+        manifest_write.commit().map_err(store_error)
     }
 
     pub fn put_resolver_entry<T: Serialize>(&self, file_id: &FileId, entry: &T) -> Result<()> {
@@ -857,26 +1210,35 @@ impl GraphStore {
     }
 
     pub fn resolver_entry<T: DeserializeOwned>(&self, file_id: &FileId) -> Result<Option<T>> {
-        let read = self.database.begin_read().map_err(store_error)?;
-        let table = match read.open_table(RESOLVER_SNAPSHOT_PER_FILE) {
-            Ok(table) => table,
-            Err(_) => return Ok(None),
-        };
-        read_graph(&table, file_id.0.as_str())
+        let mut entries = self.resolver_entries_for(std::slice::from_ref(file_id))?;
+        Ok(entries.pop().map(|(_, entry)| entry))
     }
 
     pub fn resolver_entries_for<T: DeserializeOwned>(
         &self,
         file_ids: &[FileId],
     ) -> Result<Vec<(FileId, T)>> {
-        let read = self.database.begin_read().map_err(store_error)?;
-        let table = match read.open_table(RESOLVER_SNAPSHOT_PER_FILE) {
-            Ok(table) => table,
-            Err(_) => return Ok(Vec::new()),
-        };
+        let v3 = self.v3();
+        let active_generation = v3.active_generation()?;
         let mut out = Vec::with_capacity(file_ids.len());
         for file_id in file_ids {
-            if let Some(value) = read_graph(&table, file_id.0.as_str())? {
+            let Some(shard_key) = v3.placement_for_file(file_id)? else {
+                if let Some(value) = legacy_resolver_entry(&v3.legacy_path, file_id)? {
+                    out.push((file_id.clone(), value));
+                }
+                continue;
+            };
+            let Some(database) = v3.existing_shard_database(&shard_key)? else {
+                continue;
+            };
+            let read = database.begin_read().map_err(store_error)?;
+            let table = match read.open_table(RESOLVER_SNAPSHOT_PER_FILE) {
+                Ok(table) => table,
+                Err(_) => continue,
+            };
+            if let Some(value) =
+                read_versioned_graph::<T, _>(&table, file_id.0.as_str(), active_generation)?
+            {
                 out.push((file_id.clone(), value));
             }
         }
@@ -890,11 +1252,15 @@ impl GraphStore {
     }
 
     pub fn clear_resolver_entries(&self) -> Result<()> {
-        let write = self.begin_write()?;
-        {
-            clear_table(&write, RESOLVER_SNAPSHOT_PER_FILE)?;
+        let v3 = self.v3();
+        for shard_key in v3.shard_keys()? {
+            if let Some(database) = v3.existing_shard_database(&shard_key)? {
+                let write = database.begin_write().map_err(store_error)?;
+                clear_table(&write, RESOLVER_SNAPSHOT_PER_FILE)?;
+                write.commit().map_err(store_error)?;
+            }
         }
-        write.commit().map_err(store_error)
+        Ok(())
     }
 
     pub fn put_import_graph<T: Serialize>(&self, graph: &T) -> Result<()> {
@@ -904,16 +1270,149 @@ impl GraphStore {
     }
 
     pub fn import_graph<T: DeserializeOwned>(&self) -> Result<Option<T>> {
-        let read = self.database.begin_read().map_err(store_error)?;
+        let v3 = self.v3();
+        let active_generation = v3.active_generation()?;
+        let read = v3.global.begin_read().map_err(store_error)?;
         let table = match read.open_table(RESOLVER_IMPORT_GRAPH) {
+            Ok(table) => table,
+            Err(_) => return legacy_import_graph(&v3.legacy_path),
+        };
+        match read_versioned_graph(&table, "resolver_import_graph", active_generation)? {
+            Some(graph) => Ok(Some(graph)),
+            None => legacy_import_graph(&v3.legacy_path),
+        }
+    }
+
+    fn v3(&self) -> &GraphStoreV3 {
+        match &self.backend {
+            GraphStoreBackend::V3(store) => store,
+        }
+    }
+}
+
+impl GraphStoreV3 {
+    fn manifest_record(&self) -> Result<GraphManifest> {
+        let read = self.manifest.begin_read().map_err(store_error)?;
+        let table = match read.open_table(GRAPH_MANIFEST) {
+            Ok(table) => table,
+            Err(_) => return Ok(default_graph_manifest()),
+        };
+        Ok(read_table_json(&table, "manifest")?.unwrap_or_else(default_graph_manifest))
+    }
+
+    fn active_generation(&self) -> Result<u64> {
+        self.manifest_record()
+            .map(|manifest| manifest.active_generation)
+    }
+
+    fn shard_database(&self, key: &GraphShardKey) -> Result<Arc<Database>> {
+        {
+            let cached = self
+                .shards
+                .lock()
+                .map_err(|_| SqueezyError::Tool("graph shard map lock poisoned".to_string()))?;
+            if let Some(database) = cached.get(key) {
+                return Ok(Arc::clone(database));
+            }
+        }
+        let database = Arc::new(open_graph_v3_database(&self.shard_path(key))?);
+        let mut cached = self
+            .shards
+            .lock()
+            .map_err(|_| SqueezyError::Tool("graph shard map lock poisoned".to_string()))?;
+        if let Some(existing) = cached.get(key) {
+            Ok(Arc::clone(existing))
+        } else {
+            cached.insert(key.clone(), Arc::clone(&database));
+            Ok(database)
+        }
+    }
+
+    fn existing_shard_database(&self, key: &GraphShardKey) -> Result<Option<Arc<Database>>> {
+        if !self.shard_path(key).exists() {
+            return Ok(None);
+        }
+        match self.shard_database(key) {
+            Ok(database) => Ok(Some(database)),
+            Err(error) if is_locked_store_error(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn shard_path(&self, key: &GraphShardKey) -> PathBuf {
+        self.root
+            .join(GRAPH_SHARDS_DIR_NAME)
+            .join(key.language.as_str())
+            .join(format!("{:02}.redb", key.bucket))
+    }
+
+    fn placement_for_file(&self, file_id: &FileId) -> Result<Option<GraphShardKey>> {
+        let read = self.manifest.begin_read().map_err(store_error)?;
+        let table = match read.open_table(GRAPH_FILE_SHARDS) {
             Ok(table) => table,
             Err(_) => return Ok(None),
         };
-        read_graph(&table, "resolver_import_graph")
+        Ok(
+            read_table_json::<GraphShardPlacement, _>(&table, file_id.0.as_str())?
+                .map(GraphShardKey::from),
+        )
     }
 
-    fn begin_write(&self) -> Result<redb::WriteTransaction> {
-        self.database.begin_write().map_err(store_error)
+    fn file_placements(&self) -> Result<Vec<(FileId, GraphShardKey)>> {
+        let read = self.manifest.begin_read().map_err(store_error)?;
+        let table = match read.open_table(GRAPH_FILE_SHARDS) {
+            Ok(table) => table,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut placements = Vec::new();
+        for entry in table.iter().map_err(store_error)? {
+            let (key, value) = entry.map_err(store_error)?;
+            let placement: GraphShardPlacement = decode(value.value())?;
+            placements.push((
+                FileId::new(key.value().to_string()),
+                GraphShardKey::from(placement),
+            ));
+        }
+        Ok(placements)
+    }
+
+    fn shard_keys(&self) -> Result<Vec<GraphShardKey>> {
+        let mut keys = self
+            .file_placements()?
+            .into_iter()
+            .map(|(_, key)| key)
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
+    }
+}
+
+impl GraphShardKey {
+    fn for_file(file_id: &FileId, language: LanguageKind) -> Self {
+        let digest = Sha256::digest(file_id.0.as_bytes());
+        Self {
+            language: language_shard_name(language).to_string(),
+            bucket: digest[0] % GRAPH_SHARD_COUNT,
+        }
+    }
+}
+
+impl From<&GraphShardKey> for GraphShardPlacement {
+    fn from(key: &GraphShardKey) -> Self {
+        Self {
+            language: key.language.clone(),
+            bucket: key.bucket,
+        }
+    }
+}
+
+impl From<GraphShardPlacement> for GraphShardKey {
+    fn from(placement: GraphShardPlacement) -> Self {
+        Self {
+            language: placement.language,
+            bucket: placement.bucket,
+        }
     }
 }
 
@@ -932,9 +1431,9 @@ pub struct GraphStoreMetadata {
 #[derive(Debug, Default)]
 pub struct GraphWriteBatch {
     metadata: Option<GraphStoreMetadata>,
-    upserts: Vec<(String, Vec<u8>)>,
+    upserts: Vec<GraphPartitionWrite>,
     removals: Vec<String>,
-    resolver_upserts: Vec<(String, Vec<u8>)>,
+    resolver_upserts: Vec<GraphResolverWrite>,
     resolver_removals: Vec<String>,
     /// Encoded replacement for the single-blob `RESOLVER_IMPORT_GRAPH` entry.
     /// When `Some`, the batch writes this value in the same transaction as the
@@ -957,8 +1456,21 @@ impl GraphWriteBatch {
         file_id: &FileId,
         partition: &T,
     ) -> Result<()> {
+        self.upsert_partition_for_language(file_id, LanguageKind::Unknown, partition)
+    }
+
+    pub fn upsert_partition_for_language<T: Serialize>(
+        &mut self,
+        file_id: &FileId,
+        language: LanguageKind,
+        partition: &T,
+    ) -> Result<()> {
         let encoded = encode_graph(partition)?;
-        self.upserts.push((file_id.0.clone(), encoded));
+        self.upserts.push(GraphPartitionWrite {
+            file_id: file_id.clone(),
+            language,
+            encoded,
+        });
         Ok(())
     }
 
@@ -971,8 +1483,21 @@ impl GraphWriteBatch {
         file_id: &FileId,
         entry: &T,
     ) -> Result<()> {
+        self.upsert_resolver_entry_for_language(file_id, LanguageKind::Unknown, entry)
+    }
+
+    pub fn upsert_resolver_entry_for_language<T: Serialize>(
+        &mut self,
+        file_id: &FileId,
+        language: LanguageKind,
+        entry: &T,
+    ) -> Result<()> {
         let encoded = encode_graph(entry)?;
-        self.resolver_upserts.push((file_id.0.clone(), encoded));
+        self.resolver_upserts.push(GraphResolverWrite {
+            file_id: file_id.clone(),
+            language,
+            encoded,
+        });
         Ok(())
     }
 
@@ -1185,9 +1710,21 @@ pub fn cache_diagnostics_with_session_dir(
     let workspace_root = workspace_root.as_ref();
     let cache_dir = cache_dir_path(workspace_root, cache_root);
     let state = cache_file_report(state_path(workspace_root, cache_root));
-    let graph = cache_file_report(graph_path(workspace_root, cache_root));
+    let graph_v3 = graph_v3_dir_path(workspace_root, cache_root);
+    let legacy_graph = graph_path(workspace_root, cache_root);
+    let graph = if graph_v3.exists() {
+        cache_tree_report(graph_v3.clone())
+    } else {
+        cache_file_report(legacy_graph.clone())
+    };
     let state_stats = state.exists.then(|| state_cache_stats(&state.path));
-    let graph_stats = graph.exists.then(|| graph_cache_stats(&graph.path));
+    let graph_stats = graph.exists.then(|| {
+        if graph_v3.exists() {
+            graph_v3_cache_stats(&graph_v3)
+        } else {
+            graph_cache_stats(&legacy_graph)
+        }
+    });
     let backups = cache_backups(&cache_dir)?;
     let backup_total_bytes = backups.iter().map(|file| file.size_bytes).sum();
     let session_dir = session_dir_path(workspace_root, cache_root, session_log_dir);
@@ -1195,7 +1732,8 @@ pub fn cache_diagnostics_with_session_dir(
         ("cache", cache_dir.as_path()),
         ("sessions", session_dir.as_path()),
         ("state.redb", state.path.as_path()),
-        ("graph.redb", graph.path.as_path()),
+        ("graph.v3", graph_v3.as_path()),
+        ("legacy_graph.redb", legacy_graph.as_path()),
     ]);
     Ok(CacheDiagnostics {
         cache_dir,
@@ -1244,14 +1782,6 @@ fn bootstrap_store(workspace_root: &Path, cache_root: Option<&Path>) -> Result<(
     initialize_schema(&database)
 }
 
-fn bootstrap_graph_store(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let database = open_database(path)?;
-    initialize_graph_schema(&database)
-}
-
 fn state_cache_stats(path: &Path) -> StateCacheStats {
     match open_database(path) {
         Ok(database) => StateCacheStats {
@@ -1277,7 +1807,7 @@ fn state_cache_stats(path: &Path) -> StateCacheStats {
 }
 
 fn graph_cache_stats(path: &Path) -> GraphCacheStats {
-    match open_database(path) {
+    match ReadOnlyDatabase::open(path).map_err(store_error) {
         Ok(database) => GraphCacheStats {
             schema_version: current_schema_version(&database).ok().flatten(),
             graph_partitions: table_entry_count(&database, GRAPH_PARTITIONS).unwrap_or(0),
@@ -1300,8 +1830,82 @@ fn graph_cache_stats(path: &Path) -> GraphCacheStats {
     }
 }
 
+fn graph_v3_cache_stats(root: &Path) -> GraphCacheStats {
+    let manifest_path = root.join(GRAPH_MANIFEST_FILE_NAME);
+    let manifest = match ReadOnlyDatabase::open(&manifest_path).map_err(store_error) {
+        Ok(database) => database,
+        Err(error) => {
+            return GraphCacheStats {
+                schema_version: None,
+                graph_partitions: 0,
+                resolver_entries: 0,
+                import_graph_present: false,
+                error: Some(error.to_string()),
+            };
+        }
+    };
+    let schema_version = current_schema_version(&manifest).ok().flatten();
+    let placements = graph_v3_file_placements_for_stats(&manifest).unwrap_or_default();
+    let mut graph_partitions = 0usize;
+    let mut resolver_entries = 0usize;
+    let mut shard_keys = placements
+        .iter()
+        .map(|(_, key)| key.clone())
+        .collect::<Vec<_>>();
+    shard_keys.sort();
+    shard_keys.dedup();
+    for key in shard_keys {
+        let shard = root
+            .join(GRAPH_SHARDS_DIR_NAME)
+            .join(key.language.as_str())
+            .join(format!("{:02}.redb", key.bucket));
+        let Ok(database) = ReadOnlyDatabase::open(&shard).map_err(store_error) else {
+            continue;
+        };
+        graph_partitions = graph_partitions
+            .saturating_add(table_entry_count(&database, GRAPH_PARTITIONS).unwrap_or(0));
+        resolver_entries = resolver_entries
+            .saturating_add(table_entry_count(&database, RESOLVER_SNAPSHOT_PER_FILE).unwrap_or(0));
+    }
+    let global = root.join(GRAPH_GLOBAL_FILE_NAME);
+    let import_graph_present = ReadOnlyDatabase::open(&global)
+        .map_err(store_error)
+        .ok()
+        .and_then(|database| {
+            table_has_key(&database, RESOLVER_IMPORT_GRAPH, "resolver_import_graph").ok()
+        })
+        .unwrap_or(false);
+    GraphCacheStats {
+        schema_version,
+        graph_partitions,
+        resolver_entries,
+        import_graph_present,
+        error: None,
+    }
+}
+
+fn graph_v3_file_placements_for_stats(
+    manifest: &impl ReadableDatabase,
+) -> Result<Vec<(FileId, GraphShardKey)>> {
+    let read = manifest.begin_read().map_err(store_error)?;
+    let table = match read.open_table(GRAPH_FILE_SHARDS) {
+        Ok(table) => table,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut placements = Vec::new();
+    for entry in table.iter().map_err(store_error)? {
+        let (key, value) = entry.map_err(store_error)?;
+        let placement: GraphShardPlacement = decode(value.value())?;
+        placements.push((
+            FileId::new(key.value().to_string()),
+            GraphShardKey::from(placement),
+        ));
+    }
+    Ok(placements)
+}
+
 fn table_entry_count(
-    database: &Database,
+    database: &impl ReadableDatabase,
     definition: TableDefinition<&str, &[u8]>,
 ) -> Result<usize> {
     let read = database.begin_read().map_err(store_error)?;
@@ -1317,7 +1921,7 @@ fn table_entry_count(
 }
 
 fn table_has_key(
-    database: &Database,
+    database: &impl ReadableDatabase,
     definition: TableDefinition<&str, &[u8]>,
     key: &str,
 ) -> Result<bool> {
@@ -1363,8 +1967,84 @@ pub fn graph_path(workspace_root: &Path, cache_root: Option<&Path>) -> PathBuf {
     cache_dir_path(workspace_root, cache_root).join(GRAPH_FILE_NAME)
 }
 
+pub fn graph_v3_dir_path(workspace_root: &Path, cache_root: Option<&Path>) -> PathBuf {
+    cache_dir_path(workspace_root, cache_root)
+        .join(GRAPH_DIR_NAME)
+        .join(GRAPH_V3_DIR_NAME)
+}
+
+pub fn graph_manifest_path(workspace_root: &Path, cache_root: Option<&Path>) -> PathBuf {
+    graph_v3_dir_path(workspace_root, cache_root).join(GRAPH_MANIFEST_FILE_NAME)
+}
+
+pub fn graph_global_path(workspace_root: &Path, cache_root: Option<&Path>) -> PathBuf {
+    graph_v3_dir_path(workspace_root, cache_root).join(GRAPH_GLOBAL_FILE_NAME)
+}
+
+fn graph_manifest_path_from_legacy_path(legacy_path: &Path) -> PathBuf {
+    legacy_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(GRAPH_DIR_NAME)
+        .join(GRAPH_V3_DIR_NAME)
+        .join(GRAPH_MANIFEST_FILE_NAME)
+}
+
 pub(crate) fn open_database(path: &Path) -> Result<Database> {
     Database::create(path).map_err(store_error)
+}
+
+fn open_graph_v3_database(path: &Path) -> Result<Database> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let initial = open_database(path)?;
+    match current_schema_version(&initial)? {
+        Some(GRAPH_V3_SCHEMA_VERSION) => Ok(initial),
+        Some(on_disk_version) => {
+            drop(initial);
+            let backup = backup_path(path, on_disk_version);
+            match fs_util::rotate_file(path, &backup) {
+                Ok(()) => sync_parent_dir(&backup)?,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "squeezy::store",
+                        path = %path.display(),
+                        error = %error,
+                        "graph v3 database schema mismatch; rotation failed, replacing cache file",
+                    );
+                    let _ = fs::remove_file(path);
+                }
+            }
+            let database = open_database(path)?;
+            initialize_graph_v3_schema(&database)?;
+            Ok(database)
+        }
+        None => {
+            initialize_graph_v3_schema(&initial)?;
+            Ok(initial)
+        }
+    }
+}
+
+fn ensure_graph_manifest(database: &Database) -> Result<()> {
+    let write = database.begin_write().map_err(store_error)?;
+    {
+        let mut table = write.open_table(GRAPH_MANIFEST).map_err(store_error)?;
+        if read_table_json::<GraphManifest, _>(&table, "manifest")?.is_none() {
+            insert_json(&mut table, "manifest", &default_graph_manifest())?;
+        }
+    }
+    write.commit().map_err(store_error)
+}
+
+fn default_graph_manifest() -> GraphManifest {
+    GraphManifest {
+        schema_version: GRAPH_V3_SCHEMA_VERSION,
+        graph_format_version: GRAPH_V3_SCHEMA_VERSION,
+        active_generation: 0,
+        shard_count: GRAPH_SHARD_COUNT,
+    }
 }
 
 pub(crate) fn initialize_schema(database: &Database) -> Result<()> {
@@ -1384,12 +2064,14 @@ pub(crate) fn initialize_schema(database: &Database) -> Result<()> {
     write.commit().map_err(store_error)
 }
 
-pub(crate) fn initialize_graph_schema(database: &Database) -> Result<()> {
+fn initialize_graph_v3_schema(database: &Database) -> Result<()> {
     let write = database.begin_write().map_err(store_error)?;
     {
         let mut meta = write.open_table(META).map_err(store_error)?;
-        insert_json(&mut meta, "schema_version", &GRAPH_SCHEMA_VERSION)?;
+        insert_json(&mut meta, "schema_version", &GRAPH_V3_SCHEMA_VERSION)?;
     }
+    write.open_table(GRAPH_MANIFEST).map_err(store_error)?;
+    write.open_table(GRAPH_FILE_SHARDS).map_err(store_error)?;
     write.open_table(GRAPH_PARTITIONS).map_err(store_error)?;
     write
         .open_table(RESOLVER_SNAPSHOT_PER_FILE)
@@ -1467,6 +2149,36 @@ fn cache_file_report(path: PathBuf) -> CacheFileReport {
             modified_unix_ms: None,
         },
     }
+}
+
+fn cache_tree_report(path: PathBuf) -> CacheFileReport {
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => CacheFileReport {
+            size_bytes: dir_size_bytes(&path).unwrap_or(0),
+            modified_unix_ms: metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis()),
+            path,
+            exists: true,
+        },
+        _ => cache_file_report(path),
+    }
+}
+
+fn dir_size_bytes(path: &Path) -> io::Result<u64> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            total = total.saturating_add(dir_size_bytes(&entry.path())?);
+        } else {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
 }
 
 fn cache_backups(cache_dir: &Path) -> Result<Vec<CacheFileReport>> {
@@ -1887,16 +2599,6 @@ fn decode_graph<T: DeserializeOwned>(value: &[u8]) -> Result<T> {
         .map_err(|err| SqueezyError::Tool(format!("store graph decode failed: {err}")))
 }
 
-fn insert_graph<T: Serialize>(
-    table: &mut redb::Table<'_, &str, &[u8]>,
-    key: &str,
-    value: &T,
-) -> Result<()> {
-    let encoded = encode_graph(value)?;
-    table.insert(key, encoded.as_slice()).map_err(store_error)?;
-    Ok(())
-}
-
 fn read_graph<T: DeserializeOwned, K: AsRef<str>>(
     table: &impl ReadableTable<&'static str, &'static [u8]>,
     key: K,
@@ -1905,6 +2607,127 @@ fn read_graph<T: DeserializeOwned, K: AsRef<str>>(
         return Ok(None);
     };
     decode_graph(value.value()).map(Some)
+}
+
+fn encode_versioned_graph_payload(generation: u64, payload: &[u8]) -> Result<Vec<u8>> {
+    encode_graph(&VersionedGraphPayload {
+        generation,
+        payload: payload.to_vec(),
+    })
+}
+
+fn read_versioned_graph<T: DeserializeOwned, K: AsRef<str>>(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: K,
+    active_generation: u64,
+) -> Result<Option<T>> {
+    let Some(value) = table.get(key.as_ref()).map_err(store_error)? else {
+        return Ok(None);
+    };
+    match decode_graph::<VersionedGraphPayload>(value.value()) {
+        Ok(wrapper) if wrapper.generation <= active_generation => {
+            decode_graph(wrapper.payload.as_slice()).map(Some)
+        }
+        Ok(_) => Ok(None),
+        Err(_) => decode_graph(value.value()).map(Some),
+    }
+}
+
+fn legacy_database(path: &Path) -> Option<ReadOnlyDatabase> {
+    if !path.exists() {
+        return None;
+    }
+    ReadOnlyDatabase::open(path).ok()
+}
+
+fn legacy_graph_metadata(path: &Path) -> Result<Option<GraphStoreMetadata>> {
+    let Some(database) = legacy_database(path) else {
+        return Ok(None);
+    };
+    let read = database.begin_read().map_err(store_error)?;
+    let table = match read.open_table(META) {
+        Ok(table) => table,
+        Err(_) => return Ok(None),
+    };
+    read_table_json(&table, "graph_metadata")
+}
+
+fn legacy_graph_partition<T: DeserializeOwned>(path: &Path, file_id: &FileId) -> Result<Option<T>> {
+    let Some(database) = legacy_database(path) else {
+        return Ok(None);
+    };
+    let read = database.begin_read().map_err(store_error)?;
+    let table = match read.open_table(GRAPH_PARTITIONS) {
+        Ok(table) => table,
+        Err(_) => return Ok(None),
+    };
+    read_graph(&table, file_id.0.as_str())
+}
+
+fn legacy_graph_partition_entries<T: DeserializeOwned>(path: &Path) -> Result<Vec<(FileId, T)>> {
+    let Some(database) = legacy_database(path) else {
+        return Ok(Vec::new());
+    };
+    let read = database.begin_read().map_err(store_error)?;
+    let table = match read.open_table(GRAPH_PARTITIONS) {
+        Ok(table) => table,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut entries = Vec::new();
+    for entry in table.iter().map_err(store_error)? {
+        let (key, value) = entry.map_err(store_error)?;
+        let decoded: T = decode_graph(value.value())?;
+        entries.push((FileId::new(key.value().to_string()), decoded));
+    }
+    Ok(entries)
+}
+
+fn legacy_resolver_entry<T: DeserializeOwned>(path: &Path, file_id: &FileId) -> Result<Option<T>> {
+    let Some(database) = legacy_database(path) else {
+        return Ok(None);
+    };
+    let read = database.begin_read().map_err(store_error)?;
+    let table = match read.open_table(RESOLVER_SNAPSHOT_PER_FILE) {
+        Ok(table) => table,
+        Err(_) => return Ok(None),
+    };
+    read_graph(&table, file_id.0.as_str())
+}
+
+fn legacy_import_graph<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    let Some(database) = legacy_database(path) else {
+        return Ok(None);
+    };
+    let read = database.begin_read().map_err(store_error)?;
+    let table = match read.open_table(RESOLVER_IMPORT_GRAPH) {
+        Ok(table) => table,
+        Err(_) => return Ok(None),
+    };
+    read_graph(&table, "resolver_import_graph")
+}
+
+fn language_shard_name(language: LanguageKind) -> &'static str {
+    match language {
+        LanguageKind::C => "c",
+        LanguageKind::CSharp => "csharp",
+        LanguageKind::Cpp => "cpp",
+        LanguageKind::Dart => "dart",
+        LanguageKind::Go => "go",
+        LanguageKind::Java => "java",
+        LanguageKind::JavaScript => "javascript",
+        LanguageKind::Jsx => "jsx",
+        LanguageKind::Kotlin => "kotlin",
+        LanguageKind::Php => "php",
+        LanguageKind::Python => "python",
+        LanguageKind::Ruby => "ruby",
+        LanguageKind::Rust => "rust",
+        LanguageKind::Scala => "scala",
+        LanguageKind::Swift => "swift",
+        LanguageKind::TypeScript => "typescript",
+        LanguageKind::Tsx => "tsx",
+        LanguageKind::Unsupported => "unsupported",
+        LanguageKind::Unknown => "unknown",
+    }
 }
 
 fn store_error(error: impl std::fmt::Display) -> SqueezyError {

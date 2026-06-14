@@ -17,10 +17,11 @@ use squeezy_llm::{
 };
 use squeezy_parse::smoke_all_languages;
 use squeezy_store::{
-    GRAPH_SCHEMA_VERSION, GraphStore, STALE_RUNNING_SESSION_THRESHOLD_MS, SessionQuery,
-    SessionStatus, SessionStore, SqueezyStore, StoragePathReport,
-    cache_diagnostics_with_session_dir, ensure_repo_profile, graph_path, prune_cache_backups,
-    state_path, user_squeezy_dir_detail,
+    GRAPH_SCHEMA_VERSION, GRAPH_V3_SCHEMA_VERSION, GraphStore, STALE_RUNNING_SESSION_THRESHOLD_MS,
+    SessionQuery, SessionStatus, SessionStore, SqueezyStore, StoragePathReport,
+    StoreOpenFailureKind, cache_diagnostics_with_session_dir, classify_store_open_error,
+    classify_store_open_message, ensure_repo_profile, graph_manifest_path, graph_path,
+    prune_cache_backups, state_path, user_squeezy_dir_detail,
 };
 use squeezy_tools::{McpClientRegistry, McpServerStatus, McpStaleOutcome};
 use squeezy_workspace::{WorkspaceRootKind, WorkspaceRootProfile};
@@ -1114,17 +1115,31 @@ fn state_store_check(config: &AppConfig) -> Check {
 }
 
 fn graph_store_check(config: &AppConfig) -> Check {
-    let path = graph_path(&config.workspace_root, config.cache.root.as_deref());
-    if !path.exists() {
+    let manifest_path = graph_manifest_path(&config.workspace_root, config.cache.root.as_deref());
+    let legacy_path = graph_path(&config.workspace_root, config.cache.root.as_deref());
+    if !manifest_path.exists() && !legacy_path.exists() {
         return Check {
             name: "graph_store".to_string(),
             status: Status::Ok,
-            detail: format!("absent: {} (graph cache not created yet)", path.display()),
+            detail: format!(
+                "absent: {} (graph cache not created yet)",
+                manifest_path.display()
+            ),
             extra: None,
         };
     }
-    match GraphStore::probe_path_read_only(&path) {
-        Ok(probe) if probe.schema_version == Some(GRAPH_SCHEMA_VERSION) => Check {
+    let probe_path = if manifest_path.exists() {
+        manifest_path.as_path()
+    } else {
+        legacy_path.as_path()
+    };
+    let expected_schema = if manifest_path.exists() {
+        GRAPH_V3_SCHEMA_VERSION
+    } else {
+        GRAPH_SCHEMA_VERSION
+    };
+    match GraphStore::probe_path_read_only(probe_path) {
+        Ok(probe) if probe.schema_version == Some(expected_schema) => Check {
             name: "graph_store".to_string(),
             status: Status::Ok,
             detail: format!("readable: {}", probe.path.display()),
@@ -1136,7 +1151,7 @@ fn graph_store_check(config: &AppConfig) -> Check {
             detail: format!(
                 "readable with schema {:?}, expected {}; graph persistence will reinitialize on next write: {}",
                 probe.schema_version,
-                GRAPH_SCHEMA_VERSION,
+                expected_schema,
                 probe.path.display()
             ),
             extra: None,
@@ -1145,8 +1160,8 @@ fn graph_store_check(config: &AppConfig) -> Check {
             name: "graph_store".to_string(),
             status: Status::Warn,
             detail: format!(
-                "graph.redb is locked by another Squeezy process; close the other session or rerun after it exits: {}",
-                path.display()
+                "graph cache is locked by another Squeezy process; close the other session or rerun after it exits: {}",
+                probe_path.display()
             ),
             extra: None,
         },
@@ -1156,8 +1171,8 @@ fn graph_store_check(config: &AppConfig) -> Check {
                 name: "graph_store".to_string(),
                 status: Status::Warn,
                 detail: format!(
-                    "{text}; graph persistence will be disabled until graph.redb can be opened: {}",
-                    path.display()
+                    "{text}; graph persistence will be disabled until the graph cache can be opened: {}",
+                    probe_path.display()
                 ),
                 extra: None,
             }
@@ -1227,61 +1242,15 @@ fn workspace_looks_synced(path: &std::path::Path) -> bool {
 }
 
 fn storage_error_hint(message: &str) -> &'static str {
-    let lower = message.to_ascii_lowercase();
-    if is_redb_lock_contention_message(&lower) {
-        "likely lock contention"
-    } else if lower.contains("permission denied")
-        || lower.contains("access denied")
-        || lower.contains("access is denied")
-    {
-        "likely permission problem"
-    } else if lower.contains("no space") || lower.contains("enospc") {
-        "likely disk full"
-    } else if lower.contains("corrupt")
-        || lower.contains("checksum")
-        || lower.contains("invalid database")
-        || lower.contains("invalid magic")
-    {
-        "possible redb corruption"
-    } else if lower.contains("unsupported")
-        || lower.contains("operation not supported")
-        || lower.contains("not supported")
-    {
-        "possible unsupported filesystem behavior"
-    } else {
-        "storage open failed"
-    }
+    classify_store_open_message(message, false).hint()
 }
 
 fn is_redb_lock_contention_error(error: &SqueezyError, access_denied_may_be_lock: bool) -> bool {
-    let raw_os_locked = match error {
-        SqueezyError::Io(io_err) => {
-            matches!(io_err.raw_os_error(), Some(32 | 33))
-                || (access_denied_may_be_lock && io_err.raw_os_error() == Some(5))
-        }
-        _ => false,
-    };
-    if raw_os_locked {
-        return true;
-    }
-
-    let lower = error.to_string().to_ascii_lowercase();
-    is_redb_lock_contention_message(&lower)
-        || (access_denied_may_be_lock && lower.contains("access is denied"))
+    classify_store_open_error(error, access_denied_may_be_lock) == StoreOpenFailureKind::Locked
 }
 
 fn is_redb_lock_contention_message(lowercase_message: &str) -> bool {
-    lowercase_message.contains("database already open")
-        || lowercase_message.contains("cannot acquire lock")
-        || lowercase_message.contains("lock")
-        || lowercase_message.contains("busy")
-        || lowercase_message.contains("lock contention")
-        || lowercase_message.contains("database lock")
-        || lowercase_message.contains("would block")
-        || lowercase_message.contains("resource busy")
-        || lowercase_message.contains("being used by another process")
-        || lowercase_message.contains("another process has locked")
-        || lowercase_message.contains("sharing violation")
+    classify_store_open_message(lowercase_message, true) == StoreOpenFailureKind::Locked
 }
 
 fn cache_check(config: &AppConfig, prune: bool, storage: bool) -> Check {

@@ -39,7 +39,7 @@ use squeezy_skills::{
     LoadedSkill, SkillActivation, SkillCatalog, SkillDiscoverySummary, SkillPreambleRender,
     render::SkillActivationMetrics,
 };
-use squeezy_store::{GraphStore, Observation, ObservationKind, SqueezyStore};
+use squeezy_store::{GraphStore, Observation, ObservationKind, SqueezyStore, WorkspaceStores};
 use squeezy_telemetry::{
     ErrorKind as TelemetryErrorKind, GraphPerfReport, GraphSequenceScope, LanguageDistribution,
     OutcomeStatus, RefreshKind, TelemetryClient, TelemetryEvent,
@@ -246,6 +246,7 @@ const VERIFY_SHELL_TIMEOUT_MS: u64 = 600_000;
 pub(crate) const DEFAULT_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
 pub(crate) const MAX_SHELL_OUTPUT_BYTE_CAP: usize = 128_000;
 const DIFF_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
+const GRAPH_OPEN_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 /// Upper bound a graph tool waits for the deferred
 /// background graph-open task to finish before it
 /// falls back to `graph_unavailable_result`. The condvar fires the instant
@@ -303,14 +304,16 @@ pub(crate) const GRAPH_READ_SLICE_MAX_LINE_SCAN_BYTES: u64 = 5_000_000;
 /// place to look for that tool's settings.
 ///
 /// `state_store` carries an already-open [`SqueezyStore`] for session-side
-/// persistence. Graph persistence is opened lazily by the registry against
-/// `graph.redb`, so session startup does not synchronously touch the large
-/// graph cache file.
+/// persistence. `workspace_stores` owns the per-workspace redb handles used by
+/// lazy graph persistence so graph startup does not independently open the
+/// same cache files.
 #[derive(Debug, Clone, Default)]
 pub struct ToolRegistryRuntime {
-    /// Shared persistent state store. `None` disables graph persistence in
-    /// the registry's `GraphManager` (matches the pre-persistence default).
+    /// Shared persistent state store. `None` disables state-backed tool
+    /// receipts/read snapshots.
     pub state_store: Option<Arc<SqueezyStore>>,
+    /// Shared per-workspace store owner used for lazy graph persistence.
+    pub workspace_stores: Option<Arc<WorkspaceStores>>,
     /// Optional cache root forwarded to the lazy graph store open.
     pub graph_cache_root: Option<PathBuf>,
     /// Shared redactor used by tools that surface user-visible text.
@@ -332,10 +335,16 @@ impl ToolRegistryRuntime {
     ) -> Self {
         Self {
             state_store,
+            workspace_stores: None,
             graph_cache_root,
             redactor,
             telemetry: None,
         }
+    }
+
+    pub fn with_workspace_stores(mut self, stores: Arc<WorkspaceStores>) -> Self {
+        self.workspace_stores = Some(stores);
+        self
     }
 
     pub fn with_telemetry(mut self, telemetry: TelemetryClient) -> Self {
@@ -1585,6 +1594,7 @@ impl ToolRegistry {
     ) -> Result<Self> {
         let ToolRegistryRuntime {
             state_store,
+            workspace_stores,
             graph_cache_root,
             redactor,
             telemetry,
@@ -1599,9 +1609,9 @@ impl ToolRegistry {
         // Defer the graph open: opening the graph walks the
         // workspace, initialises every tree-sitter grammar, and hydrates
         // redb partitions — typically the single largest contributor to
-        // session startup. Hand that work to the blocking pool when a
-        // runtime is available so the registry (and the TUI it backs)
-        // becomes interactive immediately; graph tool calls wait on
+        // session startup. Hand that work to a named background thread with an
+        // explicit stack when a runtime is available so the registry (and the
+        // TUI it backs) becomes interactive immediately; graph tool calls wait on
         // `graph_ready` up to `GRAPH_READY_WAIT` before falling back to
         // `graph_unavailable_result`. Tests and other sync construction
         // contexts (no current runtime) keep the synchronous open so
@@ -1611,54 +1621,86 @@ impl ToolRegistry {
             Arc::new((StdMutex::new(false), Condvar::new()));
         // Bug #7: capture the open error rather than discarding it with `.ok()`.
         let graph_open_error: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let persist_graph_without_owner = workspace_stores.is_none() && state_store.is_some();
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
+            Ok(_) => {
                 let graph = Arc::clone(&graph);
                 let graph_ready = Arc::clone(&graph_ready);
                 let graph_open_error = Arc::clone(&graph_open_error);
+                let graph_ready_on_spawn_error = Arc::clone(&graph_ready);
+                let graph_open_error_on_spawn_error = Arc::clone(&graph_open_error);
                 let root_for_graph = root.clone();
                 let crawl_options_for_graph = crawl_options.clone();
                 let graph_cache_root_for_graph = graph_cache_root.clone();
-                let persist_graph = state_store.is_some();
+                let workspace_stores_for_graph = workspace_stores.clone();
+                let persist_graph_without_owner_for_graph = persist_graph_without_owner;
                 let telemetry_for_graph = telemetry.clone();
-                handle.spawn_blocking(move || {
-                    let graph_store = persist_graph
-                        .then(|| {
-                            GraphStore::open(&root_for_graph, graph_cache_root_for_graph.as_deref())
-                                .ok()
-                                .map(Arc::new)
-                        })
-                        .flatten();
-                    let opened_result =
-                        open_registry_graph(&root_for_graph, crawl_options_for_graph, graph_store);
-                    if let Some(telemetry) = telemetry_for_graph.as_ref() {
-                        emit_graph_build_telemetry(telemetry, &opened_result);
+                let spawned = std::thread::Builder::new()
+                    .name("squeezy-graph-open".to_string())
+                    .stack_size(GRAPH_OPEN_THREAD_STACK_BYTES)
+                    .spawn(move || {
+                        let graph_store = workspace_stores_for_graph
+                            .as_ref()
+                            .and_then(|stores| stores.graph().ok())
+                            .or_else(|| {
+                                persist_graph_without_owner_for_graph
+                                    .then(|| {
+                                        GraphStore::open(
+                                            &root_for_graph,
+                                            graph_cache_root_for_graph.as_deref(),
+                                        )
+                                        .ok()
+                                        .map(Arc::new)
+                                    })
+                                    .flatten()
+                            });
+                        let opened_result = open_registry_graph(
+                            &root_for_graph,
+                            crawl_options_for_graph,
+                            graph_store,
+                        );
+                        if let Some(telemetry) = telemetry_for_graph.as_ref() {
+                            emit_graph_build_telemetry(telemetry, &opened_result);
+                        }
+                        // Bug #7: preserve the open error so an errored graph is
+                        // distinguishable from a legitimately-absent one. On
+                        // failure the slot stays `None`; record the reason instead
+                        // of silently swallowing it via `.ok()`. (The error is also
+                        // emitted to telemetry above via `emit_graph_build_telemetry`.)
+                        let opened = record_graph_open(opened_result, &graph_open_error);
+                        if let Ok(mut slot) = graph.lock() {
+                            *slot = opened;
+                        }
+                        let (lock, cv) = &*graph_ready;
+                        if let Ok(mut ready) = lock.lock() {
+                            *ready = true;
+                            cv.notify_all();
+                        }
+                    });
+                if let Err(error) = spawned {
+                    if let Ok(mut slot) = graph_open_error_on_spawn_error.lock() {
+                        *slot = Some(format!("graph startup thread failed: {error}"));
                     }
-                    // Bug #7: preserve the open error so an errored graph is
-                    // distinguishable from a legitimately-absent one. On
-                    // failure the slot stays `None`; record the reason instead
-                    // of silently swallowing it via `.ok()`. (The error is also
-                    // emitted to telemetry above via `emit_graph_build_telemetry`.)
-                    let opened = record_graph_open(opened_result, &graph_open_error);
-                    if let Ok(mut slot) = graph.lock() {
-                        *slot = opened;
-                    }
-                    let (lock, cv) = &*graph_ready;
+                    let (lock, cv) = &*graph_ready_on_spawn_error;
                     if let Ok(mut ready) = lock.lock() {
                         *ready = true;
                         cv.notify_all();
                     }
-                });
+                }
             }
             Err(_) => {
-                let graph_store = state_store
-                    .is_some()
-                    .then(|| {
-                        GraphStore::open(&root, graph_cache_root.as_deref())
-                            .ok()
-                            .map(Arc::new)
-                    })
-                    .flatten();
+                let graph_store = workspace_stores
+                    .as_ref()
+                    .and_then(|stores| stores.graph().ok())
+                    .or_else(|| {
+                        persist_graph_without_owner
+                            .then(|| {
+                                GraphStore::open(&root, graph_cache_root.as_deref())
+                                    .ok()
+                                    .map(Arc::new)
+                            })
+                            .flatten()
+                    });
                 let opened_result = open_registry_graph(&root, crawl_options.clone(), graph_store);
                 if let Some(telemetry) = telemetry.as_ref() {
                     emit_graph_build_telemetry(telemetry, &opened_result);

@@ -3031,7 +3031,11 @@ impl GraphManager {
             let mut batch = GraphWriteBatch::new();
             batch.set_metadata(metadata.clone());
             for parsed in &parsed_missed {
-                batch.upsert_partition(&parsed.file.id, parsed)?;
+                batch.upsert_partition_for_language(
+                    &parsed.file.id,
+                    parsed.file.language,
+                    parsed,
+                )?;
             }
             store.apply_graph_batch(&batch)?;
         }
@@ -3209,7 +3213,7 @@ impl GraphManager {
                 builder_snapshot: resolver_cache::BuilderSnapshot::default(),
             };
             // Encoding failure: skip this file; warm-start will recompute.
-            let _ = batch.upsert_resolver_entry(file_id, &entry);
+            let _ = batch.upsert_resolver_entry_for_language(file_id, file.language, &entry);
         };
 
         let rewrite_import_graph = match scope {
@@ -3570,7 +3574,11 @@ impl GraphManager {
                     graph_batch.set_metadata(metadata.clone());
                 }
                 for parsed in &parsed_files {
-                    if let Err(err) = graph_batch.upsert_partition(&parsed.file.id, parsed) {
+                    if let Err(err) = graph_batch.upsert_partition_for_language(
+                        &parsed.file.id,
+                        parsed.file.language,
+                        parsed,
+                    ) {
                         // Encoding failure cannot poison the in-memory graph
                         // update; skip persistence for the offending file and
                         // keep going. The warm-start path will re-parse it

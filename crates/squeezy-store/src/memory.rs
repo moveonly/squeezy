@@ -188,8 +188,24 @@ impl Memory {
     pub fn delete(&self, name: &str) -> Result<bool> {
         let name = canonical_name(name)?;
         let mut removed = false;
+        let mut first_error = None;
         for (_, base) in self.search_bases() {
-            removed |= delete_in(base, &name)?;
+            match delete_in(base, &name) {
+                Ok(scope_removed) => {
+                    removed |= scope_removed;
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+        if removed {
+            return Ok(true);
+        }
+        if let Some(err) = first_error {
+            return Err(err);
         }
         Ok(removed)
     }
