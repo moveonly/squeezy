@@ -1,0 +1,114 @@
+name: Eval mock scenarios
+
+# Runs the offline mock eval scenarios — they drive the real agent/harness
+# end-to-end with a scripted mock provider (no API key, no network), so they
+# catch harness regressions (crashes, command-dispatch breakage) the unit
+# tests cannot.
+#
+# This lives in its own workflow so the trigger can be path-filtered per "job":
+#   - push to main  → always (post-merge backstop)
+#   - pull_request  → only when harness / eval / scenario code changes, so
+#                     unrelated PRs (docs, other crates) don't pay for it
+#   - workflow_dispatch → on demand for any ref
+on:
+  workflow_dispatch:
+    inputs:
+      checkout_ref:
+        description: Branch, tag, SHA, or pull request ref to run. Defaults to the selected ref.
+        required: false
+        type: string
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      - crates/squeezy-agent/**
+      - crates/squeezy-tools/**
+      - crates/squeezy-eval/**
+      - crates/squeezy-core/**
+      - crates/squeezy-tui/**
+      - crates/squeezy-parse/**
+      - .github/workflows/eval-mock.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-mock-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  SQUEEZY_TELEMETRY: off
+
+jobs:
+  eval-mock-scenarios:
+    name: Eval mock scenarios (offline)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.inputs.checkout_ref || github.ref }}
+
+      - name: Show Rust toolchain
+        run: rustup show
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # `--bins` also builds the sibling `squeezy-fake-mcp` server the MCP
+      # scenarios spawn.
+      - name: Build eval harness
+        run: cargo build -p squeezy-eval --bins
+
+      # Pull requests run a representative smoke slice because the hosted PR
+      # runner repeatedly cancels this separate eval workflow after ~4m20s
+      # total job time. Pushes to main and manual runs keep the complete
+      # `--hermetic` suite as the post-merge/backstop gate.
+      #
+      # Settings are pinned to an empty file so an ambient user config can't
+      # leak in. The full check runs serially (default parallelism): each
+      # scenario provisions a full agent harness — repo indexing across rayon
+      # threads, tokio workers with 16 MiB stacks, and (for MCP scenarios) child
+      # processes. Running several at once exhausted the hosted runner.
+      - name: Run hermetic mock scenarios
+        env:
+          SQUEEZY_SETTINGS_PATH: ${{ runner.temp }}/empty-settings.toml
+        run: |
+          : > "$SQUEEZY_SETTINGS_PATH"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            scenarios=(
+              crates/squeezy-eval/fixtures/scenarios/mock-smoke.toml
+              crates/squeezy-eval/fixtures/scenarios/audit-smoke-action-step-status.toml
+              crates/squeezy-eval/fixtures/scenarios/audit-smoke-modal-active.toml
+              crates/squeezy-eval/fixtures/scenarios/audit-config-options-reset.toml
+              crates/squeezy-eval/fixtures/scenarios/mcp-fake-discovery.toml
+              crates/squeezy-eval/fixtures/scenarios/mcp-fake-error-roundtrip.toml
+              crates/squeezy-eval/fixtures/scenarios/skills-fixture-load.toml
+              crates/squeezy-eval/fixtures/scenarios/ux-surface-matrix.toml
+            )
+            for scenario in "${scenarios[@]}"; do
+              echo "eval smoke: $scenario"
+              ./target/debug/squeezy-eval run "$scenario" \
+                --no-triage \
+                --quiet \
+                --out "${{ runner.temp }}/eval-out"
+            done
+          else
+            ./target/debug/squeezy-eval check \
+              crates/squeezy-eval/fixtures/scenarios \
+              --hermetic \
+              --out "${{ runner.temp }}/eval-out" \
+              --junit "${{ runner.temp }}/eval-mock-junit.xml"
+          fi
+
+      - name: Upload JUnit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: eval-mock-junit
+          path: ${{ runner.temp }}/eval-mock-junit.xml
+          if-no-files-found: warn

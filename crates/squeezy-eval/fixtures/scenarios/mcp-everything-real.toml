@@ -28,6 +28,11 @@ Then:
       --no-triage
 """
 
+# Needs a locally-installed npm MCP server (see prereq above), so it is not
+# runnable in a clean checkout — excluded from `check --hermetic` / the
+# offline CI job.
+hermetic = false
+
 [workspace]
 local = "."
 snapshot = true

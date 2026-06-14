@@ -58,6 +58,13 @@ pub struct CheckOptions {
     /// Optional input-token regression gate. Inert when `baseline_path` is
     /// `None` (the default), so existing `check` invocations are unaffected.
     pub input_regression: InputRegression,
+    /// When true, run only scenarios that need no provider key or external
+    /// setup: `provider = "mock"` and `hermetic = true`. Everything else is
+    /// skipped (and logged). Used by the offline CI job.
+    pub hermetic_only: bool,
+    /// Emit one line as each scenario completes. This keeps long CI runs from
+    /// looking wedged while preserving the final sorted report.
+    pub emit_progress: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -245,6 +252,8 @@ impl Default for CheckOptions {
             junit_path: None,
             parallelism: None,
             input_regression: InputRegression::default(),
+            hermetic_only: false,
+            emit_progress: false,
         }
     }
 }
@@ -279,6 +288,46 @@ impl CheckReport {
 pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
     let mut entries = collect_scenario_paths(&opts.dir)?;
     entries.sort();
+
+    // Hermetic mode (CI): keep only scenarios that run with no provider key
+    // or external setup — `provider = "mock"` and `hermetic = true`. Skips are
+    // logged, never silent, so a shrinking suite can't masquerade as green.
+    if opts.hermetic_only {
+        let total = entries.len();
+        let mut kept = Vec::with_capacity(entries.len());
+        let mut skipped: Vec<String> = Vec::new();
+        for path in entries {
+            match scenario::load(&path) {
+                Ok(s) => {
+                    let is_mock = s.squeezy.provider.as_deref() == Some("mock");
+                    if is_mock && s.hermetic {
+                        kept.push(path);
+                    } else {
+                        let reason = if is_mock {
+                            "hermetic = false"
+                        } else {
+                            "non-mock provider"
+                        };
+                        skipped.push(format!("{} ({reason})", path.display()));
+                    }
+                }
+                // Let the normal run path surface a parse error rather than
+                // hiding it behind a skip.
+                Err(_) => kept.push(path),
+            }
+        }
+        if !skipped.is_empty() {
+            eprintln!(
+                "check --hermetic: running {} of {total} scenarios; skipped {}:",
+                kept.len(),
+                skipped.len()
+            );
+            for s in &skipped {
+                eprintln!("  - skip {s}");
+            }
+        }
+        entries = kept;
+    }
 
     // Phase 7: parallel runner. `parallelism = None | Some(1)` means
     // serial (back-compat); higher values run scenarios concurrently
@@ -378,9 +427,14 @@ pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
     let mut report = CheckReport::default();
     for handle in handles {
         match handle.await {
-            Ok(result) => report.results.push(result),
+            Ok(result) => {
+                if opts.emit_progress {
+                    emit_progress(&result);
+                }
+                report.results.push(result);
+            }
             Err(err) => {
-                report.results.push(ScenarioResult {
+                let result = ScenarioResult {
                     name: "<panicked>".into(),
                     path: PathBuf::new(),
                     passed: !opts.fail_on.errors,
@@ -390,7 +444,11 @@ pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
                     elapsed_ms: 0,
                     input_tokens: None,
                     input_regression: None,
-                });
+                };
+                if opts.emit_progress {
+                    emit_progress(&result);
+                }
+                report.results.push(result);
             }
         }
     }
@@ -410,6 +468,14 @@ pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
         write_junit(junit_path, &report)?;
     }
     Ok(report)
+}
+
+fn emit_progress(result: &ScenarioResult) {
+    let status = if result.passed { "PASS" } else { "FAIL" };
+    eprintln!(
+        "check progress: {status} {:<40} {}ms",
+        result.name, result.elapsed_ms
+    );
 }
 
 /// Compare each run's input tokens against the stored baseline, annotate the

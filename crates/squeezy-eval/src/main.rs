@@ -119,6 +119,11 @@ enum Command {
         /// run can't silently move the goalposts.
         #[arg(long)]
         update_baseline: bool,
+        /// Run only scenarios that need no provider key or external setup
+        /// (`provider = "mock"` and `hermetic = true`). Skipped scenarios are
+        /// logged. Used by the offline CI job.
+        #[arg(long)]
+        hermetic: bool,
     },
 }
 
@@ -178,6 +183,7 @@ fn main() -> ExitCode {
                 input_baseline,
                 input_tolerance,
                 update_baseline,
+                hermetic,
             } => {
                 check_cmd(
                     dir,
@@ -188,6 +194,7 @@ fn main() -> ExitCode {
                     input_baseline,
                     input_tolerance,
                     update_baseline,
+                    hermetic,
                 )
                 .await
             }
@@ -283,6 +290,7 @@ async fn check_cmd(
     input_baseline: Option<PathBuf>,
     input_tolerance: Option<f64>,
     update_baseline: bool,
+    hermetic: bool,
 ) -> Result<(), squeezy_eval::driver::EvalError> {
     let opts = squeezy_eval::ci::CheckOptions {
         dir,
@@ -295,6 +303,8 @@ async fn check_cmd(
             tolerance: input_tolerance.unwrap_or(squeezy_eval::ci::DEFAULT_INPUT_TOLERANCE),
             update_baseline,
         },
+        hermetic_only: hermetic,
+        emit_progress: true,
     };
     let report = squeezy_eval::ci::run_check(opts).await?;
     let total = report.results.len();
