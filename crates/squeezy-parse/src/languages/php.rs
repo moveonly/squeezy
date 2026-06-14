@@ -143,7 +143,7 @@ fn visit_php_node(
     }
 
     if let Some(symbol) = php_symbol_from_node(node, ctx, parent_symbol.as_ref(), scope) {
-        extract_php_symbol_facts(node, &symbol, ctx);
+        extract_php_symbol_facts(node, &symbol, ctx, scope);
         let next_parent = Some((symbol.id.clone(), symbol.kind));
         let next_owner = if symbol.body_span.is_some() {
             Some(symbol.id.clone())
@@ -1386,7 +1386,12 @@ fn php_enum_backing_type(node: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
-fn extract_php_symbol_facts(node: Node<'_>, symbol: &ParsedSymbol, ctx: &mut ExtractContext<'_>) {
+fn extract_php_symbol_facts(
+    node: Node<'_>,
+    symbol: &ParsedSymbol,
+    ctx: &mut ExtractContext<'_>,
+    scope: &PhpScope,
+) {
     if matches!(
         node.kind(),
         "class_declaration" | "interface_declaration" | "enum_declaration"
@@ -1413,6 +1418,98 @@ fn extract_php_symbol_facts(node: Node<'_>, symbol: &ParsedSymbol, ctx: &mut Ext
         }
         if let Some(return_type) = node.child_by_field_name("return_type") {
             push_php_type_reference(return_type, symbol, ctx, "return type reference");
+        }
+    }
+    // Constructor property promotion (`public readonly Foo $bar` in
+    // `__construct`) mints class-parented Field symbols. Promoted properties
+    // are the dominant modern PHP/Symfony/Laravel state declaration, so they
+    // need to surface as real `Field` symbols rather than vanishing into a
+    // single constructor-owned parameter type reference.
+    if node.kind() == "method_declaration" && symbol.name == "__construct" {
+        extract_php_promoted_fields(node, symbol, ctx, scope);
+    }
+}
+
+fn extract_php_promoted_fields(
+    method_node: Node<'_>,
+    method_symbol: &ParsedSymbol,
+    ctx: &mut ExtractContext<'_>,
+    scope: &PhpScope,
+) {
+    // Promoted fields are parented to the enclosing class, which is the
+    // constructor's own parent. Without a class parent (e.g. a stray
+    // `__construct` at file scope) there is nothing to promote onto.
+    let Some(class_id) = method_symbol.parent_id.clone() else {
+        return;
+    };
+    let Some(parameters) = method_node.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter.kind() != "property_promotion_parameter" {
+            continue;
+        }
+        let Some(name_node) = parameter.child_by_field_name("name") else {
+            continue;
+        };
+        let Ok(raw_name) = node_text(name_node, ctx.source) else {
+            continue;
+        };
+        let name = raw_name.trim().trim_start_matches('$').to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let attributes_raw = php_attribute_strings(parameter, ctx.source);
+        let modifiers = php_modifier_strings(parameter, ctx.source);
+        let mut attributes = php_semantic_attributes(parameter, &attributes_raw, &modifiers);
+        attributes.push("php:field".to_string());
+        attributes.push("php:promoted".to_string());
+        let type_text = parameter
+            .child_by_field_name("type")
+            .and_then(|node| node_text(node, ctx.source).ok())
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        if let Some(type_text) = type_text.clone() {
+            attributes.push(format!("type:{}", last_path_segment(&type_text)));
+        }
+        attributes.sort();
+        attributes.dedup();
+        let span = span_from_node(parameter);
+        let id = symbol_id(&ctx.file, Some(&class_id), SymbolKind::Field, &name, span);
+        ctx.symbols.push(ParsedSymbol {
+            id,
+            file_id: ctx.file.id.clone(),
+            parent_id: Some(class_id.clone()),
+            name: name.clone(),
+            kind: SymbolKind::Field,
+            language_identity: php_language_identity(SymbolKind::Field, &name, scope),
+            span,
+            body_span: None,
+            signature_span: None,
+            signature: node_text(parameter, ctx.source)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            visibility: php_visibility(&modifiers),
+            docs: Vec::new(),
+            attributes,
+            provenance: Provenance::new(PROVENANCE, "constructor property promotion"),
+            confidence: Confidence::ExactSyntax,
+            freshness: Freshness::Fresh,
+            arity: None,
+        });
+        if let Some(type_text) = type_text {
+            for type_name in php_type_names_from_annotation(&type_text) {
+                ctx.references.push(ParsedReference {
+                    file_id: ctx.file.id.clone(),
+                    owner_id: Some(class_id.clone()),
+                    text: type_name,
+                    kind: ReferenceKind::Type,
+                    span,
+                    provenance: Provenance::new(PROVENANCE, "promoted property type reference"),
+                });
+            }
         }
     }
 }
