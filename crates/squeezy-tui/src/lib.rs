@@ -2148,66 +2148,15 @@ fn forward_config_feedback(app: &mut TuiApp, mut feedback: config_screen::Config
 /// outcome including "no session at this slot" so the user sees feedback.
 async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: usize) -> bool {
     if app.turn_rx.is_some()
-        || app.pending_approval.is_some()
-        || app.pending_mcp_elicitation.is_some()
         || app.pending_plan_choice.is_some()
-        || app.pending_request_user_input.is_some()
         || app.pending_feedback.is_some()
-        || app.config_screen.is_some()
-        || app.status_line_setup.is_some()
-        || app.overlay.is_some()
-        || app.paste_preview.is_some()
-        || app.paste_transform.is_some()
-        || app.clipboard_history_open
-        || app.snippets_open
-        || app.scratchpad_open
-        || app.templates_open
-        || app.transcript_index_open
-        || app.related_links_open
-        || app.duplicate_folds_open
-        || app.error_lens_open
-        || app.health_markers_open
-        || app.turn_outline_open
-        || app.lane_fold_open
-        || app.bookmarks_open
-        || app.session_timeline_open
-        || app.subagent_timeline_open
-        || app.review_board_open
-        || app.annotations_open
-        || app.changes_since_open
-        || app.action_palette.is_some()
-        || app.tool_actions.is_some()
-        || app.command_palette.is_some()
-        || app.editor_handoff.is_some()
-        || app.transcript_overlay.is_some()
-        // The Theme Editor overlay (§12.7.2) is modal: block a quick session
-        // switch while it owns the surface, like every other overlay above.
-        || app.theme_editor.is_some()
-        // The Per-Workspace UI Profile overlay (§12.7.4) is modal: block a quick
-        // session switch while it owns the surface, like every other overlay above.
-        || app.workspace_profile.is_some()
-        // The Session Auto-Save Checkpoints status overlay (§12.9.5) is modal:
-        // block the switch while it owns the surface, like every overlay above.
-        || app.session_checkpoint_overlay.is_some()
-        // The Per-Terminal Profiles overlay (§12.7.3) is modal: block the switch
-        // like every other overlay above.
-        || app.terminal_profile_editor.is_some()
-        // The Gesture Settings overlay (§12.7.5) is modal: block the switch like
-        // every other overlay above.
-        || app.gesture_settings_editor.is_some()
-        // The Minimal Glyph Mode overlay (§12.7.6) is modal: block the switch like
-        // every other overlay above.
-        || app.glyph_mode_editor.is_some()
-        // The Smart Split Panes inspector (§12.4.2) is modal: block the switch like
-        // every other overlay above.
-        || app.smart_split.is_some()
+        || modal::any_active_surface_matching(app, |surface| {
+            surface.blocks_session_quick_switch
+        })
         // While a macro is recording or replaying (§12.3.7) a quick session
         // switch would derail the in-flight workflow, so block it like every
         // other modal/overlay context above.
         || app.macro_recorder.is_active()
-        // The Keybinding Editor UI (§12.7.1) is a modal overlay; block the switch
-        // like every other overlay above.
-        || app.keybinding_editor.is_some()
     {
         return false;
     }
@@ -5239,36 +5188,11 @@ fn arm_screen_selection(app: &mut TuiApp, col: u16, row: u16) {
 /// and the Compare Subagent Outputs view — which route presses by cached
 /// geometry rather than click-targets and therefore own their entire pointer
 /// surface. The transcript overlay and status-line setup own their own
-/// text-selection / inputs and are likewise not here. Keep this list in sync with
-/// the `if app.<overlay> { …; return true }` arms in [`handle_mouse`].
+/// text-selection / inputs and are likewise not eligible. The concrete set lives
+/// in [`modal::SurfaceDescriptor::allows_screen_selection`] so input and render
+/// ownership stay documented in one place.
 fn overlay_allows_screen_selection(app: &TuiApp) -> bool {
-    app.clipboard_history_open
-        || app.snippets_open
-        || app.templates_open
-        || app.keybinding_editor.is_some()
-        || app.workspace_profile.is_some()
-        || app.session_checkpoint_overlay.is_some()
-        || app.theme_editor.is_some()
-        || app.terminal_profile_editor.is_some()
-        || app.gesture_settings_editor.is_some()
-        || app.glyph_mode_editor.is_some()
-        || app.transcript_index_open
-        || app.related_links_open
-        || app.duplicate_folds_open
-        || app.error_lens_open
-        || app.health_markers_open
-        || app.turn_outline_open
-        || app.lane_fold_open
-        || app.bookmarks_open
-        || app.session_timeline_open
-        || app.subagent_timeline_open
-        || app.review_board_open
-        || app.changes_since_open
-        || app.action_palette.is_some()
-        || app.tool_actions.is_some()
-        || app.annotations_open
-        || app.command_palette.is_some()
-        || app.editor_handoff.is_some()
+    modal::any_active_surface_matching(app, |surface| surface.allows_screen_selection)
 }
 
 /// True when `(col, row)` is on CHROME — outside both the transcript text area
@@ -6049,48 +5973,12 @@ fn pump_macro_replay(app: &mut TuiApp, agent: &mut Agent) {
 /// True when a modal overlay currently owns the keyboard, so a replayed macro step
 /// must be CONSUMED (dropped) rather than dispatched globally — mirroring how the
 /// front-of-loop modal guards in `handle_key` swallow every key before the global
-/// keymap dispatch (deep-review #32). Read-only over `app`. Lists the §12 picker /
-/// editor overlays whose key handlers return `true` for any key (i.e. fully modal);
-/// the transcript-overlay and prompt-queue-overlay cases are NOT listed here because
+/// keymap dispatch (deep-review #32). Read-only over `app`. The concrete set lives
+/// in [`modal::SurfaceDescriptor::consumes_macro_replay`]; the transcript-overlay
+/// and prompt-queue-overlay cases remain excluded because
 /// `dispatch_keymap_action_inner` already guards those internally.
 fn replay_step_consumed_by_modal(app: &TuiApp) -> bool {
-    app.config_screen.is_some()
-        || app.status_line_setup.is_some()
-        || app.paste_preview.is_some()
-        || app.paste_transform.is_some()
-        || app.clipboard_history_open
-        || app.keybinding_editor.is_some()
-        || app.snippets_open
-        || app.templates_open
-        || app.transcript_index_open
-        || app.related_links_open
-        || app.duplicate_folds_open
-        || app.error_lens_open
-        || app.health_markers_open
-        || app.turn_outline_open
-        || app.rename_edit.is_some()
-        || app.lane_fold_open
-        || app.bookmarks_open
-        || app.session_timeline_open
-        || app.subagent_timeline_open
-        || app.subagent_compare.is_some()
-        || app.review_board_open
-        || app.changes_since_open
-        || app.action_palette.is_some()
-        || app.tool_actions.is_some()
-        || app.scratchpad_open
-        || app.theme_editor.is_some()
-        || app.workspace_profile.is_some()
-        || app.session_checkpoint_overlay.is_some()
-        || app.annotations_open
-        || app.command_palette.is_some()
-        || app.terminal_profile_editor.is_some()
-        || app.gesture_settings_editor.is_some()
-        || app.glyph_mode_editor.is_some()
-        || app.smart_split.is_some()
-        || app.pending_approval.is_some()
-        || app.pending_mcp_elicitation.is_some()
-        || app.pending_request_user_input.is_some()
+    modal::any_active_surface_matching(app, |surface| surface.consumes_macro_replay)
 }
 
 // ===========================================================================
@@ -30868,7 +30756,7 @@ fn render_smart_split_surface(
         let shape =
             diagram_solver.solve(box_rect, state.kind(), state.orientation(), state.ratio());
         // Draw the main (transcript) region.
-        draw_split_region(
+        smart_split::draw_preview_region(
             frame,
             shape.main(),
             "transcript",
@@ -30900,7 +30788,7 @@ fn render_smart_split_surface(
         }
         // Draw the pane region (when the diagram split), labelled with the pane kind.
         if let Some(pane) = shape.pane() {
-            draw_split_region(
+            smart_split::draw_preview_region(
                 frame,
                 pane,
                 state.kind().label(),
@@ -30920,39 +30808,6 @@ fn render_smart_split_surface(
         // No room for the diagram: clear the cache so a stale rect never routes a
         // pointer to a pane that is not painted this frame.
         app.smart_split_rect_cache.set(None);
-    }
-}
-
-/// Draw one region of the Smart Split preview diagram: a rounded border block with
-/// a centered label, used for both the transcript and the pane sub-rects. A no-op
-/// for a region too small to hold a border (so a tiny diagram degrades cleanly).
-fn draw_split_region(frame: &mut Frame<'_>, rect: Rect, label: &str, color: ratatui::style::Color) {
-    if rect.width < 2 || rect.height < 2 {
-        return;
-    }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(color));
-    let body = block.inner(rect);
-    frame.render_widget(block, rect);
-    // Center the (truncated) label in the bordered body.
-    let inner = smart_split::pane_inner(rect);
-    if inner.width > 0 && inner.height > 0 {
-        let truncated: String = label.chars().take(inner.width as usize).collect();
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncated,
-                Style::default().fg(color),
-            )))
-            .alignment(ratatui::layout::Alignment::Center),
-            Rect {
-                x: body.x,
-                y: body.y + body.height / 2,
-                width: body.width,
-                height: 1,
-            },
-        );
     }
 }
 
