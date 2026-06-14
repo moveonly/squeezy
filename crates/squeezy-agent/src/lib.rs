@@ -5384,6 +5384,7 @@ async fn run_doc_help_web_fallback(
         )),
         thoroughness: None,
         system_override: None,
+        model_override: None,
     };
 
     // Toolless second pass — same ToolExecutionContext construction as
