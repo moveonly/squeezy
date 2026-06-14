@@ -153,11 +153,7 @@ pub(crate) fn java_symbol_from_node(
         kind,
         SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Interface
     ) {
-        attributes.extend(
-            java_type_inheritance_names(node, ctx.source)
-                .into_iter()
-                .map(|base| format!("base:{base}")),
-        );
+        attributes.extend(java_type_inheritance_attributes(node, ctx.source));
     }
     attributes.sort();
     attributes.dedup();
@@ -522,4 +518,31 @@ pub(crate) fn dedup_java_facts(ctx: &mut ExtractContext<'_>) {
     let mut body_hits: HashSet<(u32, BodyHitKind)> = HashSet::new();
     ctx.body_hits
         .retain(|hit| body_hits.insert((hit.span.start_byte, hit.kind)));
+}
+
+/// Lower a type declaration's supertypes into `base:`/`iface:` attributes.
+///
+/// The shared `add_generic_inheritance_edges` resolution pass lowers `base:`
+/// into `Extends`/`Implements` (keyed off the resolved target's kind) and
+/// `iface:` always into `Implements`. We therefore route the `implements`
+/// clause (the `interfaces` / `super_interfaces` field) to `iface:`, a class's
+/// `extends` clause (`superclass`) to `base:`, and an interface's own `extends`
+/// clause (`extends_interfaces`) to `base:` so interface-to-interface
+/// inheritance surfaces too. Previously both clauses were collapsed into
+/// `base:` and `extends_interfaces` was ignored entirely.
+pub(crate) fn java_type_inheritance_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut base = Vec::new();
+    for field in ["superclass", "extends_interfaces"] {
+        if let Some(child) = node.child_by_field_name(field) {
+            collect_java_type_names(child, source, &mut base);
+        }
+    }
+    let mut iface = Vec::new();
+    if let Some(child) = node.child_by_field_name("interfaces") {
+        collect_java_type_names(child, source, &mut iface);
+    }
+    let mut attributes = Vec::new();
+    attributes.extend(base.into_iter().map(|name| format!("base:{name}")));
+    attributes.extend(iface.into_iter().map(|name| format!("iface:{name}")));
+    attributes
 }
