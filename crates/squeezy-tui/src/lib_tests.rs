@@ -23906,8 +23906,24 @@ fn main_scrollbar_keeps_unicode_block_glyphs_in_unicode_mode() {
     }
 }
 
+fn assert_scrollbar_track_contrast(color: Color, label: &str) {
+    let fg = render::palette::rgb_components(color);
+    for profile in accessibility::TerminalProfile::ALL {
+        let bg = profile.reference_bg();
+        let ratio = accessibility::contrast_ratio(fg, bg);
+        assert!(
+            ratio >= accessibility::MIN_CONTRAST_RATIO,
+            "{label} must clear the a11y contrast floor on {}: fg {:?} on bg {:?} is {:.2}:1",
+            profile.slug(),
+            fg,
+            bg,
+            ratio
+        );
+    }
+}
+
 #[test]
-fn main_scrollbar_uses_terminal_gray_colors() {
+fn main_scrollbar_uses_accessible_terminal_gray_colors() {
     let cells = main_scrollbar_column_cells(glyph_mode::GlyphMode::Unicode);
     let mut saw_thumb = false;
     let mut saw_track = false;
@@ -23916,9 +23932,8 @@ fn main_scrollbar_uses_terminal_gray_colors() {
             "\u{2588}" => {
                 saw_thumb = true;
                 assert_eq!(
-                    fg,
-                    Color::Rgb(90, 90, 90),
-                    "main scrollbar thumb is soft dark gray"
+                    fg, TRANSCRIPT_SCROLLBAR_NEUTRAL_FG,
+                    "main scrollbar thumb is accessible neutral gray"
                 );
                 assert!(
                     modifier.contains(Modifier::BOLD),
@@ -23928,10 +23943,14 @@ fn main_scrollbar_uses_terminal_gray_colors() {
             "\u{2591}" => {
                 saw_track = true;
                 assert_eq!(
-                    fg,
-                    Color::Rgb(96, 96, 96),
-                    "main scrollbar track is subdued but accessible gray"
+                    fg, TRANSCRIPT_SCROLLBAR_NEUTRAL_FG,
+                    "main scrollbar track is accessible neutral gray"
                 );
+                assert!(
+                    !modifier.contains(Modifier::BOLD),
+                    "main scrollbar track stays visually quieter than the thumb"
+                );
+                assert_scrollbar_track_contrast(fg, "main scrollbar track");
             }
             other => panic!("unexpected main scrollbar symbol {other:?}"),
         }
@@ -26242,9 +26261,8 @@ fn transcript_overlay_scrollbar_hides_until_scroll() {
                 "█" => {
                     saw_thumb = true;
                     assert_eq!(
-                        cell.fg,
-                        Color::Rgb(90, 90, 90),
-                        "overlay scrollbar thumb is soft dark gray"
+                        cell.fg, TRANSCRIPT_SCROLLBAR_NEUTRAL_FG,
+                        "overlay scrollbar thumb is accessible neutral gray"
                     );
                     assert!(
                         cell.modifier.contains(Modifier::BOLD),
@@ -26254,10 +26272,14 @@ fn transcript_overlay_scrollbar_hides_until_scroll() {
                 "░" => {
                     saw_track = true;
                     assert_eq!(
-                        cell.fg,
-                        Color::Rgb(96, 96, 96),
-                        "overlay scrollbar track is subdued but accessible gray"
+                        cell.fg, TRANSCRIPT_SCROLLBAR_NEUTRAL_FG,
+                        "overlay scrollbar track is accessible neutral gray"
                     );
+                    assert!(
+                        !cell.modifier.contains(Modifier::BOLD),
+                        "overlay scrollbar track stays visually quieter than the thumb"
+                    );
+                    assert_scrollbar_track_contrast(cell.fg, "overlay scrollbar track");
                 }
                 _ => {}
             }

@@ -36629,14 +36629,16 @@ fn transcript_main_text_and_scrollbar_areas(area: Rect) -> (Rect, Option<Rect>) 
 /// Fixed scrollbar colors. Transcript scrollbars are positional chrome, not
 /// semantic emphasis, so keep them independent of the active theme while still
 /// clearing the accessibility contrast gate on dark backgrounds.
+const TRANSCRIPT_SCROLLBAR_NEUTRAL_FG: Color = Color::Rgb(96, 96, 96);
+
 fn transcript_scrollbar_thumb_style() -> Style {
     Style::default()
-        .fg(Color::Rgb(90, 90, 90))
+        .fg(TRANSCRIPT_SCROLLBAR_NEUTRAL_FG)
         .add_modifier(Modifier::BOLD)
 }
 
 fn transcript_scrollbar_track_style() -> Style {
-    Style::default().fg(Color::Rgb(96, 96, 96))
+    Style::default().fg(TRANSCRIPT_SCROLLBAR_NEUTRAL_FG)
 }
 
 /// Draw the main-view scrollbar thumb on a quiet track.
