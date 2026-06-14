@@ -9967,6 +9967,25 @@ fn insert_file_prompt_attachment(app: &mut TuiApp, path: &str) -> Result<String>
             insert_prompt_image_token(app, format!("[Image {label}]"), media_type, bytes);
         return Ok(format!("inserted {placeholder}"));
     }
+    if kind == ContextAttachmentKind::Document {
+        if bytes.len() > MAX_PROMPT_DOCUMENT_BYTES {
+            return Err(SqueezyError::Agent(format!(
+                "document {label} is {} bytes; exceeds the {MAX_PROMPT_DOCUMENT_BYTES} byte attachment limit. Split or compress it before attaching",
+                bytes.len(),
+            )));
+        }
+        let media_type = squeezy_core::detect_binary_document_media_type(Some(&label))
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let placeholder = insert_prompt_document_token(
+            app,
+            format!("[Document {label}]"),
+            media_type,
+            label,
+            bytes,
+        );
+        return Ok(format!("inserted {placeholder}"));
+    }
     if !kind.is_supported_text() {
         return Err(SqueezyError::Agent(format!(
             "unsupported file kind={}",
@@ -10124,6 +10143,26 @@ fn insert_prompt_image_token(
         placeholder: placeholder.clone(),
         payload: PromptAttachmentPayload::Image {
             media_type,
+            bytes: Arc::from(bytes.into_boxed_slice()),
+        },
+    });
+    placeholder
+}
+
+fn insert_prompt_document_token(
+    app: &mut TuiApp,
+    base_placeholder: String,
+    media_type: String,
+    name: String,
+    bytes: Vec<u8>,
+) -> String {
+    let placeholder = unique_prompt_placeholder(app, &base_placeholder);
+    insert_input_text(app, &placeholder);
+    app.prompt_attachments.push(PromptAttachment {
+        placeholder: placeholder.clone(),
+        payload: PromptAttachmentPayload::Document {
+            media_type,
+            name,
             bytes: Arc::from(bytes.into_boxed_slice()),
         },
     });
@@ -25295,6 +25334,17 @@ fn prepare_prompt_turn_input(app: &mut TuiApp, input: String) -> PreparedPromptT
             }
             PromptAttachmentPayload::Image { media_type, bytes } => {
                 transient_input_items.push(LlmInputItem::Image { media_type, bytes });
+            }
+            PromptAttachmentPayload::Document {
+                media_type,
+                name,
+                bytes,
+            } => {
+                transient_input_items.push(LlmInputItem::Document {
+                    media_type,
+                    name,
+                    bytes,
+                });
             }
         }
     }
@@ -46739,6 +46789,12 @@ struct Osc52Clipboard;
 /// quietly discarded the escape.
 pub(crate) const OSC52_MAX_PAYLOAD_BYTES: usize = 8 * 1024;
 
+/// Cap on document attachment bytes accepted via `/attach`. Matches the
+/// strictest provider document-block limit (Bedrock Converse, ~4.5 MiB)
+/// so an oversized PDF fails at attach time with an actionable message
+/// instead of being rejected later at the provider wire.
+pub(crate) const MAX_PROMPT_DOCUMENT_BYTES: usize = 4_718_592;
+
 impl Clipboard for Osc52Clipboard {
     fn copy_text(&mut self, text: &str) -> std::result::Result<(), String> {
         let sequence = build_osc52_sequence(text)?;
@@ -47164,6 +47220,11 @@ enum PromptAttachmentPayload {
     },
     Image {
         media_type: String,
+        bytes: Arc<[u8]>,
+    },
+    Document {
+        media_type: String,
+        name: String,
         bytes: Arc<[u8]>,
     },
 }

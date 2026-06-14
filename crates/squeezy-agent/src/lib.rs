@@ -4502,6 +4502,59 @@ impl Agent {
             });
         }
 
+        // Binary documents (PDF/DOCX/…) round-trip their raw bytes in the
+        // shared base64 slot so `start_turn` can fan them into a
+        // `LlmInputItem::Document`, mirroring the image path. The provider's
+        // document-capability gate runs before any HTTP traffic, so a
+        // provider without a document lowering surfaces a structured error
+        // on the next turn rather than failing the attach.
+        if kind.is_routable_document() {
+            use base64::Engine as _;
+            let media_type = squeezy_core::detect_binary_document_media_type(Some(&label))
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let preview = format!("[{media_type} document, {original_bytes} bytes]");
+            let preview_bytes = preview.len();
+            let attachment = ContextAttachment {
+                id,
+                source,
+                kind,
+                status: ContextAttachmentStatus::Attached,
+                label: redacted_label,
+                path: redacted_path,
+                original_sha256,
+                redacted_sha256: None,
+                original_bytes,
+                stored_bytes: original_bytes,
+                preview_bytes,
+                redactions: 0,
+                preview,
+                truncated: false,
+                image_media_type: Some(media_type),
+                image_data_base64: Some(encoded),
+            };
+            state.context_attachments.push(attachment.clone());
+            self.persist_context_attachments(&state)?;
+            if let Some(session) = &self.session_log {
+                let _ = session.write_context_attachment(&attachment, None);
+            }
+            drop(state);
+            log_session_event(
+                self.session_log.as_ref(),
+                &self.redactor,
+                "context_attached_document",
+                None,
+                Some(format!("attached document {}", attachment.id)),
+                json!({ "attachment": attachment.clone() }),
+            );
+            return Ok(ContextAttachmentUpdate {
+                attachment,
+                duplicate: false,
+                active: true,
+            });
+        }
+
         if !kind.is_supported_text() {
             let attachment = ContextAttachment {
                 id,
@@ -7459,6 +7512,7 @@ impl TurnRuntime {
         // `ensure_vision_support` call then surfaces a structured
         // `ProviderRequest` error if the active model lacks vision.
         let mut image_items = image_input_items_for_attachments(&active_attachments);
+        image_items.extend(document_input_items_for_attachments(&active_attachments));
         image_items.extend(std::mem::take(&mut self.transient_input_items));
         // Upgrade any legacy conversation items resumed from disk so the
         // invariant holds for the rest of this turn. Idempotent and
@@ -18605,6 +18659,39 @@ fn image_input_items_for_attachments(attachments: &[ContextAttachment]) -> Vec<L
         };
         items.push(LlmInputItem::Image {
             media_type: media_type.to_string(),
+            bytes: Arc::from(bytes.into_boxed_slice()),
+        });
+    }
+    items
+}
+
+/// Build the `LlmInputItem::Document` items for a turn from the agent's
+/// active context attachments. Mirrors
+/// [`image_input_items_for_attachments`]: only attachments with
+/// `kind.is_routable_document()` and a populated `image_data_base64`
+/// (the shared byte slot) participate, and entries missing a decodable
+/// payload are silently dropped so a stale persisted attachment never
+/// crashes the turn build. The human-facing `label` rides through as the
+/// document `name` so providers can echo it.
+fn document_input_items_for_attachments(attachments: &[ContextAttachment]) -> Vec<LlmInputItem> {
+    use base64::Engine as _;
+    let mut items = Vec::new();
+    for attachment in attachments {
+        if !attachment.kind.is_routable_document() {
+            continue;
+        }
+        let (Some(media_type), Some(encoded)) = (
+            attachment.image_media_type.as_deref(),
+            attachment.image_data_base64.as_deref(),
+        ) else {
+            continue;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded.as_bytes()) else {
+            continue;
+        };
+        items.push(LlmInputItem::Document {
+            media_type: media_type.to_string(),
+            name: attachment.label.clone(),
             bytes: Arc::from(bytes.into_boxed_slice()),
         });
     }

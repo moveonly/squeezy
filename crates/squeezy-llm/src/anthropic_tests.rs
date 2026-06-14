@@ -2328,3 +2328,69 @@ fn stable_anchor_breakpoints_use_matching_retention_shape() {
         }
     }
 }
+
+#[test]
+fn anthropic_messages_lowers_pdf_document_to_base64_document_block() {
+    let input = vec![LlmInputItem::Document {
+        media_type: "application/pdf".to_string(),
+        name: "report.pdf".to_string(),
+        bytes: Arc::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8]),
+    }];
+    let messages = anthropic_messages(
+        &input,
+        false,
+        false,
+        CachePolicy::AUTO,
+        crate::CacheRetention::None,
+    );
+    let block = &messages[0]["content"][0];
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(block["type"], "document");
+    assert_eq!(block["source"]["type"], "base64");
+    assert_eq!(block["source"]["media_type"], "application/pdf");
+    assert_eq!(block["source"]["data"], "AQIDBAUGBwg=");
+    assert_eq!(block["title"], "report.pdf");
+}
+
+#[test]
+fn anthropic_messages_lowers_text_document_to_text_source_block() {
+    let input = vec![LlmInputItem::Document {
+        media_type: "text/csv".to_string(),
+        name: "rows.csv".to_string(),
+        bytes: Arc::from(b"a,b\n1,2\n".as_slice()),
+    }];
+    let messages = anthropic_messages(
+        &input,
+        false,
+        false,
+        CachePolicy::AUTO,
+        crate::CacheRetention::None,
+    );
+    let block = &messages[0]["content"][0];
+    assert_eq!(block["type"], "document");
+    assert_eq!(block["source"]["type"], "text");
+    assert_eq!(block["source"]["media_type"], "text/plain");
+    assert_eq!(block["source"]["data"], "a,b\n1,2\n");
+    assert_eq!(block["title"], "rows.csv");
+}
+
+#[test]
+fn anthropic_messages_degrades_undecodable_document_to_text_block() {
+    let input = vec![LlmInputItem::Document {
+        media_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            .to_string(),
+        name: "memo.docx".to_string(),
+        bytes: Arc::from(vec![0x50, 0x4b, 0x03, 0x04, 0xff, 0xfe]),
+    }];
+    let messages = anthropic_messages(
+        &input,
+        false,
+        false,
+        CachePolicy::AUTO,
+        crate::CacheRetention::None,
+    );
+    let block = &messages[0]["content"][0];
+    assert_eq!(block["type"], "text");
+    let text = block["text"].as_str().expect("degraded text block");
+    assert!(text.contains("memo.docx"), "names the document: {text}");
+}

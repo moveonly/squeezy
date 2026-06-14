@@ -93,6 +93,57 @@ fn context_attachment_detection_routes_canonical_images_to_vision_kind() {
 }
 
 #[test]
+fn context_attachment_detection_routes_binary_documents_by_extension() {
+    // Binary office/PDF extensions route to the document pipeline so the
+    // bytes can fan into an `LlmInputItem::Document` instead of being
+    // dropped as `UnsupportedBinary`.
+    for label in [
+        "report.PDF",
+        "memo.docx",
+        "sheet.xlsx",
+        "legacy.doc",
+        "old.xls",
+    ] {
+        assert_eq!(
+            detect_context_attachment_kind(Some(label), b"%PDF binary", None),
+            ContextAttachmentKind::Document,
+            "{label} must route to the document kind"
+        );
+    }
+    assert!(ContextAttachmentKind::Document.is_routable_document());
+    assert!(!ContextAttachmentKind::Document.is_supported_text());
+    // Text-like document extensions deliberately fall through to the
+    // existing text classification (their readable content is embedded).
+    assert_eq!(
+        detect_context_attachment_kind(
+            Some("notes.md"),
+            b"# Notes\nbody\n",
+            Some("# Notes\nbody\n")
+        ),
+        ContextAttachmentKind::Text
+    );
+}
+
+#[test]
+fn detect_binary_document_media_type_maps_known_extensions() {
+    assert_eq!(
+        detect_binary_document_media_type(Some("report.pdf")),
+        Some("application/pdf")
+    );
+    assert_eq!(
+        detect_binary_document_media_type(Some("MEMO.DOCX")),
+        Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    );
+    assert_eq!(
+        detect_binary_document_media_type(Some("data.xlsx")),
+        Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    );
+    assert_eq!(detect_binary_document_media_type(Some("notes.md")), None);
+    assert_eq!(detect_binary_document_media_type(Some("noext")), None);
+    assert_eq!(detect_binary_document_media_type(None), None);
+}
+
+#[test]
 fn detect_image_mime_recognises_each_vision_format() {
     assert_eq!(
         detect_image_mime(b"\x89PNG\r\n\x1a\nrest"),

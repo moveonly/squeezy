@@ -609,16 +609,13 @@ fn anthropic_messages(
             }
             // Reasoning items from other providers are dropped when replaying to Anthropic.
             LlmInputItem::Reasoning(_) => {}
-            // Document attachments lower via Anthropic's `document`
-            // content block; per-provider implementation lands in
-            // Phase 4. Until then we skip with a debug log so the
-            // request still ships instead of erroring at the wire.
-            LlmInputItem::Document { name, .. } => {
-                tracing::debug!(
-                    target: "squeezy_llm::anthropic",
-                    name = name.as_str(),
-                    "anthropic document content block not yet implemented; skipping",
-                );
+            LlmInputItem::Document {
+                media_type,
+                name,
+                bytes,
+            } => {
+                let block = anthropic_document_block(media_type, name, bytes);
+                push_anthropic_message(&mut messages, "user", vec![block]);
             }
         }
     }
@@ -646,6 +643,60 @@ fn anthropic_messages(
     Value::Array(messages)
 }
 
+/// Lower an `LlmInputItem::Document` into an Anthropic user content block.
+///
+/// Anthropic's `document` content block natively accepts PDFs via a
+/// base64 source and plain text via a `text` source. PDFs map directly;
+/// text-representable formats (CSV, Markdown, HTML, plain text) lower to
+/// a `text`-source document block when their bytes are valid UTF-8.
+/// Anything else — an Office binary (`.docx`/`.xlsx`) or a non-UTF-8
+/// payload that Anthropic cannot ingest — degrades to a descriptive
+/// `text` block naming the attachment instead of being silently dropped
+/// or hard-rejected. Mirrors the structural intent of
+/// [`crate::bedrock::bedrock_document_block`].
+fn anthropic_document_block(media_type: &str, name: &str, bytes: &Arc<[u8]>) -> Value {
+    let lower = media_type.to_ascii_lowercase();
+    if matches!(lower.as_str(), "application/pdf" | "application/x-pdf") {
+        return json!({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": BASE64_STANDARD.encode(bytes.as_ref()),
+            },
+            "title": name,
+        });
+    }
+    let text_like = matches!(
+        lower.as_str(),
+        "text/plain"
+            | "text/csv"
+            | "application/csv"
+            | "text/markdown"
+            | "text/x-markdown"
+            | "text/html"
+            | "application/xhtml+xml"
+    );
+    if text_like && let Ok(text) = std::str::from_utf8(bytes.as_ref()) {
+        return json!({
+            "type": "document",
+            "source": {
+                "type": "text",
+                "media_type": "text/plain",
+                "data": text,
+            },
+            "title": name,
+        });
+    }
+    json!({
+        "type": "text",
+        "text": format!(
+            "[attached document `{name}` ({media_type}) could not be inlined for this model; \
+             ask for its text to be extracted before retrying]"
+        ),
+    })
+}
+
 fn push_anthropic_message(messages: &mut Vec<Value>, role: &str, mut blocks: Vec<Value>) {
     if let Some(last) = messages.last_mut() {
         let same_role = last.get("role").and_then(Value::as_str) == Some(role);
@@ -668,9 +719,6 @@ impl LlmProvider for AnthropicProvider {
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
         if let Err(err) = request.ensure_vision_support("anthropic") {
-            return Box::pin(futures_util::stream::once(async move { Err(err) }));
-        }
-        if let Err(err) = request.reject_unsupported_documents("anthropic") {
             return Box::pin(futures_util::stream::once(async move { Err(err) }));
         }
         let client = self.client.clone();

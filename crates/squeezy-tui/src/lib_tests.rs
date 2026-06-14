@@ -7737,6 +7737,36 @@ async fn slash_attach_routes_canonical_images_to_prompt_token() {
 }
 
 #[tokio::test]
+async fn slash_attach_routes_pdf_documents_to_prompt_token() {
+    let root = temp_workspace("tui_attach_pdf");
+    let pdf_bytes = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n".to_vec();
+    fs::write(root.join("report.pdf"), &pdf_bytes).expect("write pdf");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_without_session_log_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/attach report.pdf").await);
+    assert!(app.attachments.is_empty());
+    assert_eq!(app.input, "[Document report.pdf]");
+    let input = app.input.clone();
+    let prepared = prepare_prompt_turn_input(&mut app, input);
+    assert_eq!(prepared.transient_input_items.len(), 1);
+    let LlmInputItem::Document {
+        media_type,
+        name,
+        bytes,
+    } = &prepared.transient_input_items[0]
+    else {
+        panic!("expected document item");
+    };
+    assert_eq!(media_type, "application/pdf");
+    assert_eq!(name, "report.pdf");
+    assert_eq!(bytes.as_ref(), pdf_bytes.as_slice());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn slash_attach_surfaces_unsupported_label_only_images() {
     // Image-shaped labels whose bytes never trip the magic-byte sniff
     // (HEIC/BMP/TIFF and the long tail) stay `UnsupportedImage` — the

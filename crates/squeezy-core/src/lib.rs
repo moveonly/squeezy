@@ -14334,6 +14334,14 @@ pub enum ContextAttachmentKind {
     /// matching `LlmInputItem::Image` per turn when the active model
     /// advertises vision capability.
     Image,
+    /// Binary document payload (PDF/DOCX/XLSX/DOC/XLS) routed by file
+    /// extension. The raw bytes are retained on
+    /// [`ContextAttachment::image_data_base64`] (shared byte slot) so the
+    /// agent can emit a matching `LlmInputItem::Document` per turn when the
+    /// active provider advertises a document lowering. Text-like documents
+    /// (CSV/Markdown/HTML/plain text) keep their existing text-attachment
+    /// routing, which embeds the readable content directly.
+    Document,
 }
 
 impl ContextAttachmentKind {
@@ -14346,13 +14354,14 @@ impl ContextAttachmentKind {
             Self::UnsupportedBinary => "unsupported_binary",
             Self::UnsupportedImage => "unsupported_image",
             Self::Image => "image",
+            Self::Document => "document",
         }
     }
 
     pub fn is_supported_text(self) -> bool {
         !matches!(
             self,
-            Self::UnsupportedBinary | Self::UnsupportedImage | Self::Image
+            Self::UnsupportedBinary | Self::UnsupportedImage | Self::Image | Self::Document
         )
     }
 
@@ -14362,6 +14371,14 @@ impl ContextAttachmentKind {
     /// instead of being squashed into the user text reference block.
     pub fn is_routable_image(self) -> bool {
         matches!(self, Self::Image)
+    }
+
+    /// `true` for the [`Self::Document`] kind. Used at request-build time
+    /// to fan a single attachment out into a `LlmInputItem::Document` so
+    /// the bytes reach the provider's document content block verbatim
+    /// instead of being dropped as an unsupported binary.
+    pub fn is_routable_document(self) -> bool {
+        matches!(self, Self::Document)
     }
 }
 
@@ -14441,6 +14458,14 @@ pub fn detect_context_attachment_kind(
     if looks_like_image(label, bytes) {
         return ContextAttachmentKind::UnsupportedImage;
     }
+    // Binary document formats (PDF/DOCX/XLSX/…) are detected by extension
+    // and routed to the provider's document content block. Text-like
+    // documents (CSV/Markdown/HTML/plain text) deliberately fall through
+    // to the text-attachment classification below, which embeds their
+    // readable content directly rather than shipping opaque bytes.
+    if detect_binary_document_media_type(label).is_some() {
+        return ContextAttachmentKind::Document;
+    }
     let Some(text) = text else {
         return ContextAttachmentKind::UnsupportedBinary;
     };
@@ -14486,6 +14511,25 @@ pub fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
         return Some("image/webp");
     }
     None
+}
+
+/// Map a binary document file extension to its canonical MIME type. Only
+/// the formats that are unreadable as text — and would otherwise be
+/// dropped as `UnsupportedBinary` — are routed to the document pipeline:
+/// PDF, Word (`.doc`/`.docx`), and Excel (`.xls`/`.xlsx`). The returned
+/// MIME strings match the document-block media-type maps in the
+/// `squeezy-llm` providers. Returns `None` for unknown or text-like
+/// extensions so the caller can fall back to text classification.
+pub fn detect_binary_document_media_type(label: Option<&str>) -> Option<&'static str> {
+    let lower = label?.to_ascii_lowercase();
+    match lower.rsplit('.').next()? {
+        "pdf" => Some("application/pdf"),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "doc" => Some("application/msword"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "xls" => Some("application/vnd.ms-excel"),
+        _ => None,
+    }
 }
 
 pub fn context_attachment_preview(text: &str, max_bytes: usize) -> (String, bool) {
