@@ -404,10 +404,17 @@ pub(crate) fn repo_map_spec() -> ToolSpec {
     }
 }
 
+/// Shared routing line for the intra-graph lookup tools. Frames the choice
+/// positively — pick the right first tool for the task — instead of leaning on
+/// per-tool "do not also call X" prohibitions, and steers chaining through a
+/// resolved `symbol_id` rather than re-firing the same bare query against a
+/// sibling tool.
+const GRAPH_LOOKUP_ROUTING: &str = "Pick ONE first lookup: decl_search for lists/counts, definition_search for the defining site, symbol_context for relationships; chain only with a resolved symbol_id, not by re-firing the same bare query.";
+
 pub(crate) fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or Dart `with` mixers `mixin:<Type>`; prefix-free `attribute=\"<Type>\"` matches all three at once. Pipe-separate to match several (`base:A|base:B`). Pass as `attribute`, not `base:` in `query`. Set transitive=true with an inheritance attribute (base:/iface:/mixin:) to return the full transitive subtype closure, not just direct subtypes (for transitive supertypes/ancestors use inheritance_hierarchy). One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". Do not also call definition_search or symbol_context with the same query in one turn unless this result is ambiguous. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
+        description: format!("Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or Dart `with` mixers `mixin:<Type>`; prefix-free `attribute=\"<Type>\"` matches all three at once. Pipe-separate to match several (`base:A|base:B`). Pass as `attribute`, not `base:` in `query`. Set transitive=true with an inheritance attribute (base:/iface:/mixin:) to return the full transitive subtype closure, not just direct subtypes (for transitive supertypes/ancestors use inheritance_hierarchy). One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". {GRAPH_LOOKUP_ROUTING} If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness."),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -432,7 +439,7 @@ pub(crate) fn decl_search_spec() -> ToolSpec {
 pub(crate) fn definition_search_spec() -> ToolSpec {
     ToolSpec {
         name: "definition_search".to_string(),
-        description: "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?'. Use before flow tools when a name may be ambiguous; do not also call decl_search or symbol_context for the same query unless this result is insufficient. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
+        description: format!("Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?'. Use before flow tools when a name may be ambiguous. {GRAPH_LOOKUP_ROUTING} A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness."),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
