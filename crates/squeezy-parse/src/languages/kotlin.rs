@@ -101,11 +101,15 @@ pub(crate) fn visit_kotlin_node(
         for symbol in symbols {
             ctx.symbols.push(symbol);
         }
-        visit_kotlin_children(
+        visit_kotlin_property_children(
             node,
             ctx,
-            next_parent.or(parent_symbol),
-            next_owner.or(owner_symbol),
+            // The property is the parent/owner for non-accessor children
+            // (initializer expression, delegate). Accessor `getter`/`setter`
+            // children are re-parented to the property's host class instead.
+            next_parent.clone().or(parent_symbol.clone()),
+            next_owner.clone().or(owner_symbol.clone()),
+            parent_symbol,
         );
         return;
     }
@@ -244,6 +248,54 @@ pub(crate) fn visit_kotlin_children(
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         visit_kotlin_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
+    }
+}
+
+/// Walk a `property_declaration`'s children, routing `getter`/`setter`
+/// accessors to dedicated `Method` symbols owned by the property's host class
+/// (kotlin spec §2). Non-accessor children (the initializer expression, the
+/// delegate) keep the property as their parent/owner so initializer calls
+/// continue attributing to the property symbol. Accessor-body calls attribute
+/// to the synthesized accessor `Method` instead of the (non-callable) property.
+fn visit_kotlin_property_children(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    property_parent: Option<(SymbolId, SymbolKind)>,
+    property_owner: Option<SymbolId>,
+    host_symbol: Option<(SymbolId, SymbolKind)>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "getter" | "setter" => {
+                if let Some(symbol) =
+                    kotlin_accessor_symbol(child, ctx, host_symbol.as_ref(), node)
+                {
+                    let owner = Some(symbol.id.clone());
+                    ctx.symbols.push(symbol);
+                    // Recurse accessor children with the accessor as owner so
+                    // body calls attribute to it. The host class stays the
+                    // parent for any nested declarations (there shouldn't be
+                    // any, but keep the scope consistent).
+                    visit_kotlin_children(child, ctx, host_symbol.clone(), owner);
+                } else {
+                    // No host class (top-level property accessor) — fall back
+                    // to the property as owner so calls aren't dropped.
+                    visit_kotlin_node(
+                        child,
+                        ctx,
+                        property_parent.clone(),
+                        property_owner.clone(),
+                    );
+                }
+            }
+            _ => visit_kotlin_node(
+                child,
+                ctx,
+                property_parent.clone(),
+                property_owner.clone(),
+            ),
+        }
     }
 }
 
@@ -723,6 +775,109 @@ fn kotlin_anonymous_initializer_symbol(
         freshness: Freshness::Fresh,
         arity: None,
     })
+}
+
+/// kotlin spec §2: model a custom property accessor (`get() = ...` /
+/// `set(value) { ... }`) as a `Method` symbol owned by the property's host
+/// class. Naming follows `<get-foo>` / `<set-foo>` so a property `foo` with
+/// both accessors yields two distinctly-named methods. The accessor's
+/// `function_body` becomes `body_span`, so calls inside the accessor attribute
+/// to it (via the owner switch) rather than to the non-callable property.
+/// Returns `None` for accessors with no host class (e.g. top-level
+/// properties), letting the caller fall back to property-owned attribution.
+fn kotlin_accessor_symbol(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    host_symbol: Option<&(SymbolId, SymbolKind)>,
+    property_node: Node<'_>,
+) -> Option<ParsedSymbol> {
+    let host = host_symbol?;
+    if !matches!(
+        host.1,
+        SymbolKind::Class | SymbolKind::Trait | SymbolKind::Enum | SymbolKind::Struct,
+    ) {
+        return None;
+    }
+    let is_getter = node.kind() == "getter";
+    let prefix = if is_getter { "get" } else { "set" };
+    let property_name = kotlin_property_first_name(property_node, ctx.source)
+        .unwrap_or_else(|| "<property>".to_string());
+    let name = format!("<{prefix}-{property_name}>");
+    let span = span_from_node(node);
+    // A custom accessor may be an expression body (`get() = field`) or a block
+    // body (`get() { ... }`); both surface as `function_body`. An accessor
+    // with no body (`get`/`set` only, declaring custom visibility) is not a
+    // distinct callable, so skip it.
+    let body = kotlin_first_child_of_kind(node, "function_body")?;
+    let body_span = Some(span_from_node(body));
+    let signature_span = signature_span_from_nodes(node, Some(body));
+    let signature = signature_text(node, Some(body), ctx.source);
+    let id = symbol_id(&ctx.file, Some(&host.0), SymbolKind::Method, &name, span);
+    let mut attributes = vec![if is_getter {
+        "kotlin:getter".to_string()
+    } else {
+        "kotlin:setter".to_string()
+    }];
+    if let Some(vis) = kotlin_visibility_text(node, ctx.source) {
+        attributes.push(format!("kotlin:accessor-visibility:{vis}"));
+    }
+    attributes.sort();
+    attributes.dedup();
+
+    Some(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id: Some(host.0.clone()),
+        name,
+        kind: SymbolKind::Method,
+        language_identity: None,
+        span,
+        body_span,
+        signature_span,
+        signature,
+        visibility: kotlin_visibility_text(node, ctx.source),
+        docs: Vec::new(),
+        attributes,
+        provenance: Provenance::new("tree-sitter-kotlin", "property accessor"),
+        confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+        // A getter takes 0 args; a setter takes 1 (`set(value)`).
+        arity: Some(if is_getter { 0 } else { 1 }),
+    })
+}
+
+/// First declared binding name of a `property_declaration` (the property name
+/// for single bindings; the first name for destructuring bindings).
+fn kotlin_property_first_name(node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "variable_declaration" => {
+                if let Some(name) = kotlin_first_child_of_kind(child, "identifier")
+                    .and_then(|n| node_text(n, source).ok())
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty())
+                {
+                    return Some(name);
+                }
+            }
+            "multi_variable_declaration" => {
+                let mut inner = child.walk();
+                for grand in child.named_children(&mut inner) {
+                    if grand.kind() == "variable_declaration"
+                        && let Some(name) = kotlin_first_child_of_kind(grand, "identifier")
+                            .and_then(|n| node_text(n, source).ok())
+                            .map(|text| text.trim().to_string())
+                            .filter(|text| !text.is_empty())
+                    {
+                        return Some(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn kotlin_type_alias_symbol(
