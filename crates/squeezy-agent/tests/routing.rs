@@ -662,8 +662,11 @@ async fn tier_effort_runs_weak_rung_at_low_effort() {
 }
 
 #[tokio::test]
-async fn explicit_effort_pin_overrides_tier_effort() {
-    // A user /effort pin is a hard override on every rung.
+async fn effort_pin_does_not_deepen_a_routed_down_turn() {
+    // A high /effort pin must NOT be forced onto a turn squeezy routed DOWN to
+    // the cheap rung (running a deep thinking budget on the cheap model for a
+    // trivial turn defeats the routing). "checkout main" routes to the weak rung,
+    // which stays at its shallow `low` effort even though the user pinned `high`.
     let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("ok")]));
     let mut config = config_with_routing();
     config.reasoning_effort = Some(squeezy_core::ReasoningEffort::High);
@@ -675,8 +678,54 @@ async fn explicit_effort_pin_overrides_tier_effort() {
     let requests = provider.requests();
     assert_eq!(
         requests[0].reasoning_effort,
+        Some(squeezy_core::ReasoningEffort::Low),
+        "a routed-down rung keeps its shallow effort; the pin only governs the parent rung"
+    );
+}
+
+#[tokio::test]
+async fn effort_pin_governs_the_parent_rung() {
+    // On a turn that stays on the parent (judge votes "parent"), the user pin is
+    // honored exactly — the pin describes how hard the main model should think.
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        judge_reply("parent"),
+        end_turn_reply("on opus"),
+    ]));
+    let mut config = config_with_routing();
+    config.reasoning_effort = Some(squeezy_core::ReasoningEffort::High);
+    let agent = Agent::new(config, provider.clone());
+    let _ = drain_until_terminal(agent.start_turn(
+        "refactor the dispatch layer across crates".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+    let requests = provider.requests();
+    // requests[0] = judge (cheap), requests[1] = the parent turn.
+    assert_eq!(&*requests[1].model, PARENT_MODEL);
+    assert_eq!(
+        requests[1].reasoning_effort,
         Some(squeezy_core::ReasoningEffort::High),
-        "an explicit effort pin wins over the rung default"
+        "the pin governs the parent rung"
+    );
+}
+
+#[tokio::test]
+async fn effort_pin_can_lower_a_routed_down_turn() {
+    // A pin BELOW the rung default still applies as a ceiling: pin `low` keeps a
+    // routed turn at low (here the weak rung is already low, so this just
+    // confirms the pin never raises it).
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn_reply("ok")]));
+    let mut config = config_with_routing();
+    config.reasoning_effort = Some(squeezy_core::ReasoningEffort::Low);
+    let agent = Agent::new(config, provider.clone());
+    let _ = drain_until_terminal(
+        agent.start_turn("checkout main".to_string(), CancellationToken::new()),
+    )
+    .await;
+    let requests = provider.requests();
+    assert_eq!(
+        requests[0].reasoning_effort,
+        Some(squeezy_core::ReasoningEffort::Low),
     );
 }
 
