@@ -463,7 +463,7 @@ impl LanguageParser {
         // work-queue below this is a longest-processing-time schedule, which
         // keeps every worker busy until the very end instead of stalling on a
         // single static chunk that happens to contain a big file.
-        jobs.sort_by(|a, b| b.record.size_bytes.cmp(&a.record.size_bytes));
+        jobs.sort_by_key(|job| std::cmp::Reverse(job.record.size_bytes));
 
         // Shared work-queue: each idle worker pops the next pending job under a
         // short-lived lock, then parses outside the lock.  The lock is only held

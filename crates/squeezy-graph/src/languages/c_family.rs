@@ -343,7 +343,7 @@ fn cpp_field_type_from_signature(signature: &str, field_name: &str) -> Option<St
     // `:` so a scoped type (`ns::Foo m_obj`) survives; a `: bitfield` width is
     // rare and the trailing-identifier logic tolerates it.
     let head = signature
-        .split(|ch| ch == ';' || ch == '=' || ch == '{')
+        .split([';', '=', '{'])
         .next()
         .unwrap_or(signature)
         .trim();
@@ -361,8 +361,7 @@ fn cpp_clean_type(type_part: &str) -> Option<String> {
             !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' || ch == '<' || ch == '>')
         })
         .filter(|token| !token.is_empty())
-        .filter(|token| !cpp_type_modifier(token))
-        .next_back()?;
+        .rfind(|token| !cpp_type_modifier(token))?;
     // Strip a template argument list: `vector<Foo>` -> `vector`.
     let bare = last.split('<').next().unwrap_or(last);
     let name = bare.rsplit("::").next().unwrap_or(bare).trim();
@@ -461,10 +460,9 @@ fn cpp_base_list_names(base_list: &str) -> Vec<String> {
                 !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':' || ch == '<' || ch == '>')
             })
             .filter(|token| !token.is_empty())
-            .filter(|token| {
+            .rfind(|token| {
                 !matches!(*token, "public" | "private" | "protected" | "virtual")
-            })
-            .next_back();
+            });
         if let Some(token) = last {
             let bare = token.split('<').next().unwrap_or(token);
             let name = bare.rsplit("::").next().unwrap_or(bare).trim();

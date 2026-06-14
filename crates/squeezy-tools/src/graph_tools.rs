@@ -1141,10 +1141,13 @@ pub(crate) fn graph_symbol_search(
     // whose names happen to share characters (e.g. `PQueue.add`
     // colliding with `QueueAddOptions`).
     let dotted_hits = query.and_then(|q| resolve_dotted_query(graph, q));
+    // No query (and no dotted hits): leave `candidates` as `None` so the caller
+    // filters over borrowed values and clones only the survivors rather than
+    // cloning the whole symbol table up front.
     let candidates: Option<Vec<GraphSymbol>> = if let Some(matches) = dotted_hits {
         Some(matches)
-    } else if let Some(query) = query {
-        Some(
+    } else {
+        query.map(|query| {
             graph
                 .signature_search(&SignatureQuery {
                     text: query.to_string(),
@@ -1154,13 +1157,8 @@ pub(crate) fn graph_symbol_search(
                 })
                 .into_iter()
                 .chain(graph.find_symbol_by_name(query))
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        // No query: rather than cloning the entire symbol table and then
-        // dropping most of it, filter over borrowed values and clone only the
-        // survivors.
-        None
+                .collect::<Vec<_>>()
+        })
     };
     let mut symbols = match candidates {
         Some(candidates) => candidates
@@ -1723,7 +1721,7 @@ fn graph_zero_hit_fallback(
     // distinctly so the caller re-resolves by name rather than rewording the
     // query (the misdirection the path/query reasons would otherwise give).
     if let Some(id) = symbol_id
-        && graph.symbols.get(&SymbolId::new(id)).is_none()
+        && !graph.symbols.contains_key(&SymbolId::new(id))
     {
         let mut obj = serde_json::Map::new();
         obj.insert("status".to_string(), json!("no_graph_evidence"));
