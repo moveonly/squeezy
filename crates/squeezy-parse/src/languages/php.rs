@@ -946,6 +946,22 @@ fn extract_php_trait_use(
     }
 }
 
+/// PHP 8.1 first-class callable syntax — `strlen(...)` / `$obj->m(...)` /
+/// `Foo::bar(...)`. The lone `variadic_placeholder` named child means the call
+/// captures the callable rather than invoking it, so it must not be recorded
+/// as a real invocation with a bogus arity of 1 (that arity feeds
+/// `arity_unique_candidate` and would falsely resolve `foo(...)` to a 1-arg
+/// `foo`).
+fn php_is_first_class_callable(arguments: Option<Node<'_>>) -> bool {
+    let Some(arguments) = arguments else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    let mut children = arguments.named_children(&mut cursor);
+    matches!(children.next(), Some(first) if first.kind() == "variadic_placeholder")
+        && children.next().is_none()
+}
+
 fn extract_php_function_call(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
@@ -965,9 +981,26 @@ fn extract_php_function_call(
     if name.is_empty() {
         return;
     }
-    let arity = node
-        .child_by_field_name("arguments")
-        .map(|arguments| named_child_count(arguments))
+    let arguments = node.child_by_field_name("arguments");
+    // First-class callable: record a Partial Calls edge with arity 0 and no
+    // Call body-hit, so resolution does not treat it as a 1-arg invocation.
+    if php_is_first_class_callable(arguments) {
+        ctx.calls.push(ParsedCall {
+            file_id: ctx.file.id.clone(),
+            caller_id: owner_id,
+            name,
+            target_text: target_text.clone(),
+            receiver: receiver_from_direct_call(&target_text),
+            arity: 0,
+            kind: ParsedCallKind::Direct,
+            span: span_from_node(node),
+            provenance: Provenance::new(PROVENANCE, "function_call_expression first-class callable"),
+            confidence: Confidence::Partial,
+        });
+        return;
+    }
+    let arity = arguments
+        .map(named_child_count)
         .unwrap_or_default();
     let is_eval = name == "eval";
     let is_guard = matches!(
@@ -1027,10 +1060,7 @@ fn extract_php_member_call(
         .and_then(|receiver| node_text(receiver, ctx.source).ok())
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
-    let arity = node
-        .child_by_field_name("arguments")
-        .map(|arguments| named_child_count(arguments))
-        .unwrap_or_default();
+    let arguments = node.child_by_field_name("arguments");
     let target_text = node_text(node, ctx.source)
         .unwrap_or_default()
         .split('(')
@@ -1038,6 +1068,22 @@ fn extract_php_member_call(
         .unwrap_or_default()
         .trim()
         .to_string();
+    if php_is_first_class_callable(arguments) {
+        ctx.calls.push(ParsedCall {
+            file_id: ctx.file.id.clone(),
+            caller_id: owner_id,
+            name,
+            target_text,
+            receiver,
+            arity: 0,
+            kind: ParsedCallKind::Method,
+            span: span_from_node(node),
+            provenance: Provenance::new(PROVENANCE, "member_call_expression first-class callable"),
+            confidence: Confidence::Partial,
+        });
+        return;
+    }
+    let arity = arguments.map(named_child_count).unwrap_or_default();
     let mut confidence = Confidence::Heuristic;
     if is_php_implicit_dispatch_target(&name) {
         confidence = Confidence::Partial;
@@ -1077,10 +1123,13 @@ fn extract_php_scoped_call(
         .and_then(|scope| node_text(scope, ctx.source).ok())
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
-    let arity = node
-        .child_by_field_name("arguments")
-        .map(|arguments| named_child_count(arguments))
-        .unwrap_or_default();
+    let arguments = node.child_by_field_name("arguments");
+    let first_class = php_is_first_class_callable(arguments);
+    let arity = if first_class {
+        0
+    } else {
+        arguments.map(named_child_count).unwrap_or_default()
+    };
     let target_text = node_text(node, ctx.source)
         .unwrap_or_default()
         .split('(')
@@ -1088,10 +1137,16 @@ fn extract_php_scoped_call(
         .unwrap_or_default()
         .trim()
         .to_string();
-    let mut confidence = Confidence::Heuristic;
-    if is_php_implicit_dispatch_target(&name) {
-        confidence = Confidence::Partial;
-    }
+    let (confidence, reason) = if first_class {
+        (
+            Confidence::Partial,
+            "scoped_call_expression first-class callable",
+        )
+    } else if is_php_implicit_dispatch_target(&name) {
+        (Confidence::Partial, "scoped_call_expression")
+    } else {
+        (Confidence::Heuristic, "scoped_call_expression")
+    };
     ctx.calls.push(ParsedCall {
         file_id: ctx.file.id.clone(),
         caller_id: owner_id.clone(),
@@ -1101,7 +1156,7 @@ fn extract_php_scoped_call(
         arity,
         kind: ParsedCallKind::Method,
         span: span_from_node(node),
-        provenance: Provenance::new(PROVENANCE, "scoped_call_expression"),
+        provenance: Provenance::new(PROVENANCE, reason),
         confidence,
     });
     // Static call sites also stamp the receiver as a type reference so
@@ -1119,7 +1174,11 @@ fn extract_php_scoped_call(
             provenance: Provenance::new(PROVENANCE, "scoped call receiver"),
         });
     }
-    extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+    // First-class callables capture the method rather than invoking it, so no
+    // Call body-hit is recorded (matching the function/member call paths).
+    if !first_class {
+        extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+    }
 }
 
 fn extract_php_object_creation(
