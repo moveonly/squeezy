@@ -69,10 +69,10 @@ tree-sitter tree and returns a `ParsedFile`.
 Each extractor produces the same five products: `symbols`, `imports`,
 `calls`, `references`, and `body_hits` (literals, identifiers, type
 references seen inside bodies). The shape is in
-`crates/squeezy-parse/src/lib.rs:29-41`:
+`crates/squeezy-parse/src/lib.rs:57-69`:
 
 ```rust
-// crates/squeezy-parse/src/lib.rs:29-41
+// crates/squeezy-parse/src/lib.rs:57-69
 pub struct ParsedFile {
     pub file: FileRecord,
     pub package: Option<String>,
@@ -96,10 +96,10 @@ The two most important slice fields are `signature_span` and `body_span`. Every
 symbol carries one `span` (covering the entire declaration), a signature string,
 an optional `signature_span` for the declaration header, and an optional
 `body_span` (covering just the body). The structure is at
-`crates/squeezy-parse/src/lib.rs:64-88`:
+`crates/squeezy-parse/src/lib.rs:95-132`:
 
 ```rust
-// crates/squeezy-parse/src/lib.rs:64-88
+// crates/squeezy-parse/src/lib.rs:95-132
 pub struct ParsedSymbol {
     pub id: SymbolId,
     pub file_id: FileId,
@@ -109,6 +109,7 @@ pub struct ParsedSymbol {
     pub language_identity: Option<String>,
     pub span: SourceSpan,
     pub body_span: Option<SourceSpan>,
+    pub signature_span: Option<SourceSpan>,
     pub signature: String,
     pub visibility: Option<String>,
     pub docs: Vec<String>,
@@ -170,12 +171,12 @@ Display for Token` block becomes a navigable graph node.
 
 The graph is the central index built by
 `squeezy-graph::SemanticGraph`. After all `ParsedFile`s are merged
-through `insert_parsed_file` (`crates/squeezy-graph/src/lib.rs:935-972`),
+through `insert_parsed_file` (`crates/squeezy-graph/src/lib.rs:1302`),
 the graph holds a battery of cross-cutting indices defined at
-`crates/squeezy-graph/src/lib.rs:358-401`:
+`crates/squeezy-graph/src/lib.rs:416-468`:
 
 ```rust
-// crates/squeezy-graph/src/lib.rs:358-401
+// crates/squeezy-graph/src/lib.rs:416-468
 symbols_by_name: HashMap<String, Vec<SymbolId>>,
 symbol_signature_lower: HashMap<SymbolId, String>,
 signature_trigram_index: HashMap<[u8; 3], Vec<SymbolId>>,
@@ -244,10 +245,12 @@ them. It uses a layered ladder for one-word identifier queries and BM25
 for multi-word natural-language queries.
 
 The identifier ladder lives in
-`crates/squeezy-rank/src/symbol_rank.rs:22-57`:
+`crates/squeezy-rank/src/symbol_rank.rs:21-82`. `rank_symbol` builds a
+`SymbolQueryContext` and delegates to `rank_symbol_with_context`, which
+walks the tiers:
 
 ```rust
-// crates/squeezy-rank/src/symbol_rank.rs:21-57
+// crates/squeezy-rank/src/symbol_rank.rs:21-82
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RankTier {
     Exact = 0,
@@ -259,19 +262,28 @@ pub enum RankTier {
 }
 
 pub fn rank_symbol(symbol: GraphSymbolView<'_>, query: &str) -> (RankTier, i32) {
-    if symbol.name == query {
+    let context = SymbolQueryContext::new(query);
+    rank_symbol_with_context(symbol, &context)
+}
+
+fn rank_symbol_with_context(
+    symbol: GraphSymbolView<'_>,
+    context: &SymbolQueryContext<'_>,
+) -> (RankTier, i32) {
+    if symbol.name == context.raw {
         return (RankTier::Exact, 0);
     }
-    if symbol.name.eq_ignore_ascii_case(query) {
+    if symbol.name.eq_ignore_ascii_case(context.raw) {
         return (RankTier::CaseInsensitive, 0);
     }
-    if symbol.signature.contains(query) {
+    if symbol.signature.contains(context.raw) {
         return (RankTier::SignatureSubstring, 0);
     }
-    if token_bag_match(symbol.name, query) {
+    if token_bag_match_with_query_tokens(symbol.name, &context.token_bag_tokens) {
         return (RankTier::TokenBag, 0);
     }
-    if let Some(score) = fuzzy_score(symbol.name, query) {
+    if let Some(score) = fuzzy_score_with_lowercase_needle(symbol.name, &context.fuzzy_needle_lower)
+    {
         return (RankTier::Fuzzy, score);
     }
     (RankTier::NoMatch, i32::MAX)
@@ -290,10 +302,10 @@ The BM25 reranker handles multi-token queries like
 identifier. It runs only after the graph's trigram prefilter has cut
 the candidate set down, and only when the query has 2+ tokens. The
 constants and corpus shape are at
-`crates/squeezy-rank/src/bm25_rank.rs:11-49`:
+`crates/squeezy-rank/src/bm25_rank.rs:13-26`:
 
 ```rust
-// crates/squeezy-rank/src/bm25_rank.rs:11-23
+// crates/squeezy-rank/src/bm25_rank.rs:13-26
 const K1: f32 = 1.2;
 const B: f32 = 0.75;
 
@@ -317,25 +329,40 @@ the upstream `bm25` crate pulls in.
 A full reindex on every keystroke would be both wasteful and
 distracting. Squeezy caches each file's `(hash, tree)` and lets
 tree-sitter reuse subtrees that didn't change. The cache lives at
-`crates/squeezy-parse/src/lib.rs:219-224`:
+`crates/squeezy-parse/src/lib.rs:377-384`:
 
 ```rust
-// crates/squeezy-parse/src/lib.rs:218-224
-#[derive(Debug, Clone)]
+// crates/squeezy-parse/src/lib.rs:377-384
+#[derive(Debug)]
 struct CachedParsedFile {
     hash: ContentHash,
     language: LanguageKind,
     source: String,
     tree: Tree,
+    had_bom: bool,
 }
 ```
 
-The reuse path is at `crates/squeezy-parse/src/lib.rs:403-444`:
+The reuse path is at `crates/squeezy-parse/src/lib.rs:553-604`. The
+hash-unchanged case returns early before the `match`; the two-arm
+`match` then handles the changed-hash reparse and the no-cache cold
+parse:
 
 ```rust
-// crates/squeezy-parse/src/lib.rs:404-441
-let (tree, changed_ranges) = match old.filter(|cached| cached.language == record.language) {
-    Some(mut cached) if cached.hash != record.hash => {
+// crates/squeezy-parse/src/lib.rs:553-604
+if cached.language == record.language && cached.hash == record.hash {
+    let mut parsed = extract_language(record.clone(), &source, &cached.tree);
+    parsed.changed_ranges = Vec::new();
+    append_parse_diagnostics(&source, &cached.tree, cached.had_bom, &mut parsed.diagnostics);
+    return Ok(parsed);
+}
+
+let old = self
+    .cache
+    .remove(&record.id)
+    .filter(|cached| cached.language == record.language);
+let (tree, changed_ranges) = match old {
+    Some(mut cached) => {
         let edit = input_edit(&cached.source, &source);
         cached.tree.edit(&edit);
         let parser = self.parser_for_language(record.language)?;
@@ -351,12 +378,6 @@ let (tree, changed_ranges) = match old.filter(|cached| cached.language == record
             changed_ranges.push(span_from_edit(&edit));
         }
         (new_tree, changed_ranges)
-    }
-    Some(cached) => {
-        self.cache.insert(record.id.clone(), cached.clone());
-        let mut parsed = extract_language(record.clone(), &source, &cached.tree);
-        parsed.changed_ranges = Vec::new();
-        return Ok(parsed);
     }
     None => {
         let parser = self.parser_for_language(record.language)?;
@@ -388,12 +409,15 @@ the raw `InputEdit` range so callers still get a non-empty hint.
 
 ### Model-facing tools
 
-The agent never touches the graph directly. It sees four
+The agent never touches the graph directly. It sees eleven
 `crates/squeezy-tools/src/graph_tools.rs` entry points, dispatched at
-`:2165-2222`:
+`:3073-3142` (`repo_map`, `decl_search`, `definition_search`,
+`reference_search`, `upstream_flow`, `downstream_flow`,
+`symbol_context`, `hierarchy`, `inheritance_hierarchy`, `impact`,
+`read_slice`). The retrieval-critical ones:
 
 - `repo_map` — hierarchy of files/modules/classes/functions truncated
-  to `max_depth` (default 2, max 5) and `max_files` (default 50, max
+  to `max_depth` (default 2, max 8) and `max_files` (default 50, max
   200). Returns hierarchy nodes plus per-node evidence packets. Lines
   2225-2266.
 - `definition_search` — query by name (or `symbol_id`) and get
@@ -401,15 +425,15 @@ The agent never touches the graph directly. It sees four
   to `read_slice {span_kind: "signature"}` (line 2375-2383).
 - `symbol_context` — given a symbol, return its callers, callees,
   references, and Cargo diagnostics. The packet's next-action is
-  `read_slice {symbol_id, span_kind: "body"}` (lines 1233-1300).
+  `read_slice {symbol_id, span_kind: "body"}` (lines 3565-3643).
 - `read_slice` — universal slice fetcher.
 
-`ReadSliceArgs` at `crates/squeezy-tools/src/graph_tools.rs:108-152`
+`ReadSliceArgs` at `crates/squeezy-tools/src/graph_tools.rs:147-164`
 accepts either a `symbol_id` + `span_kind` (the graph-driven path) or
 explicit byte/line bounds. The `span_kind` enum is just two variants:
 
 ```rust
-// crates/squeezy-tools/src/graph_tools.rs:146-152
+// crates/squeezy-tools/src/graph_tools.rs:185-191
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ReadSliceSpanKind {
@@ -422,7 +446,7 @@ enum ReadSliceSpanKind {
 The span resolution lives in `read_slice_target`:
 
 ```rust
-// crates/squeezy-tools/src/graph_tools.rs:1962-1980
+// crates/squeezy-tools/src/graph_tools.rs:2724-2744
 if let Some(symbol_id) = args.symbol_id.as_deref() {
     let graph =
         graph.ok_or_else(|| "read_slice symbol_id requires an available graph".to_string())?;
@@ -479,7 +503,7 @@ Cost: roughly **50 tokens**. A naïve `Read auth/middleware.rs` is
 returns the symbol summary plus callers (`graph.callers`), callees
 (`graph.callees`), references (`graph.references_to_symbol`), and any
 Cargo diagnostics. Each entry is a one-line `(name, file, span, kind)`
-summary (see `graph_tools.rs:1233-1300`). Cost for three callers and a
+summary (see `graph_tools.rs:3565-3643`). Cost for three callers and a
 handful of references: **~300 tokens**. A naïve approach greps for
 `verify_token(`, reads each calling file in full — **~20,000 tokens**.
 
@@ -515,12 +539,12 @@ items, externally-declared functions in C headers, trait method
 declarations without a default impl, `abstract` methods in Java. For
 these, `body_span` is `None` and `read_slice {span_kind: "body"}`
 falls back to the full declaration span via
-`symbol.body_span.unwrap_or(symbol.span)` at `graph_tools.rs:1971`.
+`symbol.body_span.unwrap_or(symbol.span)` at `graph_tools.rs:2736`.
 
 **Incremental parse fallback.** The hash-cache-then-edit path
-(`lib.rs:404-423`) gracefully degrades: language changes drop the
+(`lib.rs:553-604`) gracefully degrades: language changes drop the
 cache and force a cold parse; empty `changed_ranges` falls back to the
-raw `InputEdit` range at line 421 so `annotate_dirty_ranges` still has
+raw `InputEdit` range at line 590 so `annotate_dirty_ranges` still has
 a hint. `parser.parse(..., Some(&cached.tree))` returning `None` is
 treated as a hard parse error but is effectively unreachable on
 well-formed input.

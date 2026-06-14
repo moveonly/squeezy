@@ -208,8 +208,10 @@ log_retention_days = 30
 ```
 
 `Shift+Tab` toggles modes in the TUI; `/plan` and `/build` force a mode.
-Plan mode advertises only read/search/navigation tools and refuses
-edit/shell/git/network/MCP/compiler before normal permission checks.
+Plan mode is mutation-gated: it refuses edits (unless plan-file write
+access is granted) and destructive actions, while still advertising
+read/search/shell/git/network/MCP/compiler tools so the model can run
+read-only probes and non-mutating builds through normal permission checks.
 
 ## Schema sections (high-level)
 

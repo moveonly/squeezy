@@ -16,12 +16,12 @@ fit:
 - `crates/squeezy-agent/tests/tool_loop.rs::run_high_stack_test` — 2
   worker threads, **32 MiB** thread stack. Used by the cancellation,
   parallel-read, multi-round, and turn-orchestration integration tests
-  that drive the full `TurnRuntime::run` path (see `:501`, `:644`,
-  `:757`, `:845`, `:940`, `:1328`, `:3980`).
+  that drive the full `TurnRuntime::run` path (see `:518`, `:661`,
+  `:774`, `:862`, `:957`, `:1345`, `:2317`, `:4025`).
 - `crates/squeezy-agent/src/lib_tests.rs::run_high_stack_async_test` — 2
   worker threads, **8 MiB** thread stack. Used by the smaller unit-test
   scenarios that still nest enough state-machine frames to overflow the
-  Windows debug default (`:1908`, `:2050`, `:2145`).
+  Windows debug default (`:1835`, `:1913`, `:2055`, `:2150`, `:12536`).
 
 Both helpers run the future on a `tokio::spawn`-ed task so the test runs
 on a worker thread (which uses `thread_stack_size`), not the runtime's
@@ -54,10 +54,9 @@ pass.
 
 - **Integration test in `tests/tool_loop.rs`** that drives `Agent::start_turn`
   end-to-end, with real `ScriptedProvider` traffic, real tool dispatch,
-  or any parallel-read batch: wrap in `run_high_stack_test`. Six
-  pre-existing tests in this file already use it; one was added in
-  PR #394 (`cancelled_turn_persists_partial_cost_and_metrics` at
-  `:3978`).
+  or any parallel-read batch: wrap in `run_high_stack_test`. Eight
+  tests in this file use it, including
+  `cancelled_turn_persists_partial_cost_and_metrics` at `:4024`.
 - **Crate-private unit test in `src/lib_tests.rs`** that touches the
   agent turn loop but doesn't need the full 32 MiB ceiling: wrap in
   `run_high_stack_async_test`. The 8 MiB ceiling is enough for the
@@ -91,9 +90,8 @@ without that follow-up.
 
 ## Future work
 
-The Category3.md design note (`design/squeezy.md`, `:40`) flags the
-17k-line `crates/squeezy-agent/src/lib.rs` orchestration file as the
-root cause of the stack-overflow surface. Splitting that file into
+The 18.6k-line `crates/squeezy-agent/src/lib.rs` orchestration file is
+the root cause of the stack-overflow surface. Splitting that file into
 focused modules around `TurnRuntime::run`, `execute_tool_calls`, and
 `flush_parallel_batch` is the long-term fix — at which point the
 `AgentEvent::Citation` and `AgentEvent::ControlToolTrace` variants can

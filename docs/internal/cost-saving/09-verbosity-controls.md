@@ -26,7 +26,7 @@ provider request bytes.
 All three enums live next to the rest of the TUI config:
 
 ```rust
-// crates/squeezy-core/src/lib.rs:6467-6483
+// crates/squeezy-core/src/lib.rs:9958-9974
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseVerbosity {
@@ -47,7 +47,7 @@ impl ResponseVerbosity {
 ```
 
 ```rust
-// crates/squeezy-core/src/lib.rs:6485-6501
+// crates/squeezy-core/src/lib.rs:9976-9992
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolOutputVerbosity {
@@ -58,7 +58,7 @@ pub enum ToolOutputVerbosity {
 ```
 
 ```rust
-// crates/squeezy-core/src/lib.rs:6503-6523
+// crates/squeezy-core/src/lib.rs:9994-10008
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellDiffInline {
@@ -87,7 +87,7 @@ parsed `TuiSettings` into the concrete config the agent reads every
 turn.
 
 ```rust
-// crates/squeezy-core/src/lib.rs:6728-6753
+// crates/squeezy-core/src/lib.rs:10287-10318
 response_verbosity: settings
     .response_verbosity
     .unwrap_or(ResponseVerbosity::Normal),
@@ -164,7 +164,7 @@ config. The TUI mirrors the live setting into an `AtomicU8` at startup
 and on every settings hot-reload.
 
 ```rust
-// crates/squeezy-tui/src/lib.rs:146-167
+// crates/squeezy-tui/src/lib.rs:268-281
 /// Process-wide override for `tui.shell_diff_inline`, pinned by the TuiApp
 /// at startup and re-applied on settings hot-reload. Encoded as `0 = Folded
 /// (default)`, `1 = Full`. A static lets the deeply-nested render path
@@ -264,23 +264,24 @@ much of a tool's stdout is rendered inline. The byte budgets per
 level:
 
 ```rust
-// crates/squeezy-tui/src/lib.rs:123-125
+// crates/squeezy-tui/src/lib.rs:242-244
 const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
 const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
 ```
 
-And the preview-line cap (with `usize::MAX` for the verbose escape
-hatch):
+And the per-verbosity packet-line cap (with `usize::MAX` for the
+verbose escape hatch), keyed on the `ToolDetailMode::Preview`
+variant:
 
 ```rust
-// crates/squeezy-tui/src/lib.rs:7981-7987
-fn tool_preview_line_cap(...) -> usize {
-    let packet_cap = match verbosity {
-        ToolOutputVerbosity::Compact => 3,
-        ToolOutputVerbosity::Normal => 5,
-        ToolOutputVerbosity::Verbose => usize::MAX,
-    };
+// crates/squeezy-tui/src/lib.rs:41124-41129
+let packet_cap = match mode {
+    ToolDetailMode::Full => usize::MAX,
+    ToolDetailMode::Preview(ToolOutputVerbosity::Compact) => 3,
+    ToolDetailMode::Preview(ToolOutputVerbosity::Normal) => 5,
+    ToolDetailMode::Preview(ToolOutputVerbosity::Verbose) => usize::MAX,
+};
 ```
 
 A 4 KiB stdout from `cargo test` collapses to ~300 bytes (Compact),
@@ -307,7 +308,7 @@ fn tool_bypasses_preview_cap_for_tool(tool: &ToolTranscript) -> bool {
 ## Worked example
 
 A user starts a session with the defaults — `Normal` / `Compact` /
-`Full` — and runs a long-form review of a fresh PR:
+`Folded` — and runs a long-form review of a fresh PR:
 
 ```
 /verbosity verbose

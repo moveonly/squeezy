@@ -6,12 +6,16 @@ For example, `~/.squeezy/prompts/review.md` is activated with `/review`.
 
 ## Discovery Locations
 
-Squeezy looks for templates in two places:
+Squeezy looks for templates in these places:
 
 | Scope | Location | Precedence |
 |-------|----------|------------|
 | User | `~/.squeezy/prompts/*.md` | Lower |
+| User | `$XDG_CONFIG_HOME/squeezy/prompts/*.md` (or `~/.config/squeezy/prompts/*.md`) | Lower |
 | Project | `<workspace>/.squeezy/prompts/*.md` | Higher |
+
+When the XDG location resolves to the same path as `~/.squeezy/prompts/`, it is
+not scanned twice.
 
 Project templates shadow user templates with the same name, so a team can
 ship workspace-specific templates that override personal defaults.

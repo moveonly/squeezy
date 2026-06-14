@@ -31,11 +31,14 @@ headline turn — with a robust mid-turn fallback for false positives.
 The router lives in `crates/squeezy-agent/src/turn_router.rs`. Each
 turn's first action (after the `PreTurn` hook and skill activation) is
 to call `classify_turn`, which returns a
-`TurnRoutingDecision::{ Cheap { reason, model } | Parent }`. The
+`TurnRoutingDecision::{ Cheap { reason, tier: ModelTier, model } | Parent }`.
+Routing climbs an ordered `TierLadder` of weak → medium → strong rungs
+(`crates/squeezy-core/src/lib.rs`): `Cheap` starts on the `Weak` or
+`Medium` rung, and `Parent` is the `Strong` (headline) rung. The
 decision is consumed once and threaded through every round of the
 turn loop as `current_model: Arc<str>` — the same handle that becomes
 `LlmRequest::model` at the dispatch site
-(`crates/squeezy-agent/src/lib.rs:5288`).
+(`crates/squeezy-agent/src/lib.rs:7871`).
 
 Layer 1 is a **strict heuristic prefilter**. It admits a prompt only
 when *all* of the following hold:
@@ -93,42 +96,59 @@ prefers the cheaper nano tier for routed turns.
 | OpenRouter / Vercel / Portkey  | The provider's small-fast tier       | The provider's small-fast tier       |
 | Ollama / local                 | No built-in judge tier               | Local default unless overridden      |
 
-The judge's system prompt is fixed (`turn_router.rs::JUDGE_INSTRUCTIONS`)
-and asks for a strict JSON reply `{"route":"cheap"|"parent","reason":"…"}`.
-The judge uses `max_output_tokens = 512`, leaves `reasoning_effort` unset, and
-prefers a provider-specific `judge_model` or configured routing judge before
-falling back to the provider's curated cheap tier. The
-classifier parses the JSON, optionally stripping a `\`\`\`json` fence,
-and treats any timeout (10 s), parse error, or non-`cheap`/`parent`
+The judge's system prompt is provider-specific:
+`judge_instructions_for(provider)` returns
+`squeezy_core::default_judge_prompt(provider)`, and a
+`[providers.<id>].judge_prompt` or `[routing].judge_prompt` override takes
+precedence at the call site. It asks for a strict JSON reply
+`{"route":"weak"|"medium"|"strong","reason":"…"}`; `parse_judge_reply`
+canonicalizes the verdict through `ModelTier::parse`, which also accepts the
+legacy `cheap`/`parent` vocabulary. The judge uses `max_output_tokens = 512`,
+leaves `reasoning_effort` unset, and prefers a provider-specific `judge_model`
+or configured routing judge before falling back to the provider's curated cheap
+tier. The classifier parses the JSON, optionally stripping a `\`\`\`json` fence,
+and treats any timeout (10 s), parse error, or unrecognized
 verdict as `Parent`. The judge **never** blocks a turn.
 
 ### Dispatch hook + mid-turn escalation
 
 The classifier runs once per turn, just before the round loop opens
-in `Agent::run` (`crates/squeezy-agent/src/lib.rs` at the top of the
-`for round in 0..MAX_TOOL_ROUNDS` loop). The decision sets
+(`crates/squeezy-agent/src/lib.rs`; the `for round in 0..MAX_TOOL_ROUNDS`
+loop opens at line 7573, with `MAX_TOOL_ROUNDS = 200`). The decision sets
 `current_model` and an `on_cheap_turn: bool` flag the loop carries
 across rounds.
 
 At the top of every round (before assembling the next `LlmRequest`),
 the loop calls `EscalationState::maybe_trigger` if `on_cheap_turn` is
-still true. The detector fires on any of:
+still true. `maybe_trigger` fires on any of:
 
 1. tool-call count for the turn exceeds
    `routing.resolved_cheap_escalation_tool_calls(max_tool_calls_per_turn)`
    — the default derives as `max_tool_calls_per_turn / 4` so the
    ceiling tracks the user's existing budget choices instead of
-   carrying its own magic number,
+   carrying its own magic number (`EscalationReason::ToolCallCeiling`),
 2. `tool_errors + budget_denials ≥ routing.cheap_escalation_error_threshold`
-   (default `2`),
-3. the buffered assistant text matches any low-confidence phrase
-   ("i'm not sure", "this is complex", "need more context", "i can't",
-   "i cannot", "unable to", "let me think").
+   (default `2`) (`EscalationReason::ErrorThreshold`),
+3. the buffered assistant text matches a `REFUSAL_PHRASES` entry —
+   "i'm not sure", "i am not sure", "i need more context",
+   "need more context", "i don't have enough context",
+   "i do not have enough context", "i cannot proceed", "i can't proceed"
+   (`EscalationReason::RefusalPhrase`).
 
-When the detector fires, the loop:
+Two further in-turn escalation triggers live directly in the round loop,
+outside `maybe_trigger`: `EscalationReason::ProviderError`
+(`crates/squeezy-agent/src/lib.rs:8410`, a routed-model provider error
+jumps straight to the parent) and `EscalationReason::ToolDiversity`
+(`crates/squeezy-agent/src/lib.rs:9193`, too many distinct tool targets
+steps up one rung).
 
-- swaps `current_model = parent_model` so the upcoming round and every
-  subsequent round dispatches on the headline model,
+When the detector fires (via `maybe_trigger` or the diversity trigger),
+the loop steps **up exactly one rung** via
+`routing_ladder.next_up(current_tier)` (weak → medium → strong) and:
+
+- sets `current_model` to the next rung's model, re-arming the detector
+  with a fresh per-rung budget via `rearm_for_next_rung`; `current_model`
+  becomes `parent_model` only when the next rung is `Strong`,
 - engages the **escalation-sticky window**: the next
   `routing.escalation_sticky_turns` user prompts skip the router and
   go straight to the parent model, so a follow-up clarification turn

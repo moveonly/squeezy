@@ -12,10 +12,9 @@ Each row is one language. Columns:
 | `lang` | language under test |
 | `sqz_wg_recall` | median recall % across with-graph reps (graded vs ground-truth) |
 | `sqz_wg_cost` | median USD cost across with-graph reps |
-| `baseline_cost` | median USD cost of the external baseline (CC or Codex) on the same scenario |
+| `cc_cost` / `codex_cost` | median USD cost of the external baseline (`cc_cost` in the Haiku CSV, `codex_cost` in the Mini CSV) on the same scenario |
 | `ratio` | `sqz_wg_cost / baseline_cost` (1.00 = parity, <1.00 = cheaper than baseline) |
-| `sqz_ng_recall` / `sqz_ng_cost` | same, for the no-graph half of squeezy |
-| `verdict` | **WIN** iff `sqz_wg_recall ≥ 95%` AND `sqz_wg_cost ≤ 0.95 × baseline_cost`; **TIE** if recall passes but cost within ±5% of baseline; **LOSS** otherwise; **N/A** if no baseline data |
+| `verdict` | **WIN** iff `sqz_wg_recall ≥ baseline recall` AND `ratio ≤ 0.95`; **LOSS** otherwise |
 
 ## Scenarios
 
@@ -58,7 +57,7 @@ for each `(variant ∈ {with-graph, no-graph}) × (rep ∈ {1,2,3})`.
 ## Baselines
 
 - **Claude Code (Haiku)**: `claude --print --model claude-haiku-4-5-20251001 --bare ...` with the same prompt against the same workspace. Per-run results in `/tmp/cc-baseline-realworld/_results.json`.
-- **Codex CLI (gpt-5.4-mini)**: `codex exec --model gpt-5.4-mini ...`. Per-run results in `/tmp/codex-runs/realworld/results.json`. C + TS not in baseline → `N/A` verdict.
+- **Codex CLI (gpt-5.4-mini)**: `codex exec --model gpt-5.4-mini ...`. Per-run results in `/tmp/codex-runs/realworld/results.json`.
 
 Baselines were captured against the same scenarios and treated as fixed
 references for the sweep. They use the same n=3 reps with the same
@@ -86,10 +85,8 @@ python3 docs/internal/eval-findings/realworld-harness/board_combined.py
 
 | | Haiku w/g vs CC | Mini w/g vs Codex |
 |---|---|---|
-| WIN | 13 | 15 |
-| TIE | 0 | 0 |
-| LOSS | 2 (c, go) | 0 |
-| N/A | 0 | 0 |
+| WIN | 15 | 15 |
+| LOSS | 0 | 0 |
 
 These counts come from the checked-in `haiku-vs-cc-realworld.csv` and
 `mini-vs-codex-realworld.csv`. Treat older runbooks in this directory as

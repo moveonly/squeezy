@@ -52,9 +52,9 @@ expensive ones only under real pressure.
    (default 10) verbatim, and is reversible via `/compact undo`. It runs
    **only** at the post-turn boundary (after the trim pre-pass) or via the
    forced-overflow path; it never fires mid-turn. It triggers at
-   `summarize_threshold()` — `summarize_at_percent` (default 95%) of the
-   effective window, held at least `DEFAULT_CONTEXT_OUTPUT_HEADROOM_TOKENS`
-   (16K) below the window so the next reply still fits.
+   `summarize_threshold()` — the full effective window, which is already held
+   `baseline_reserve_tokens` (default 12K) below the raw window so the next
+   reply still fits.
 4. **Forced overflow** — a reactive emergency summarize when the provider
    returns a context-window error mid-request
    (`try_provider_context_overflow_compaction`). This is the last resort, run
@@ -103,16 +103,20 @@ the trim gate, and the summarize gate agree on every model:
   knows it, otherwise `fallback_window_tokens` (default **128_000**). The
   fallback is *only* used for unknown windows — there is no flat token budget
   capping the trigger on known windows.
-- `effective_window()` is `min(resolve_window(), max_context_tokens)` when the
-  optional, opt-in `max_context_tokens` economy cap is set, otherwise just
-  `resolve_window()`. Capping the effective window keeps the trim → summarize
-  ladder ordered even under a low cap.
+- `effective_window()` is `resolve_window()` scaled to
+  `effective_context_window_percent` (default 95%) of itself, minus
+  `baseline_reserve_tokens` (default 12K) carved off for system framing, then
+  bounded by the optional, opt-in `max_context_tokens` economy cap when set,
+  and floored at 1. The 95% scaling and 12K reserve always apply; the cap only
+  lowers the result further. Capping the effective window keeps the trim →
+  summarize ladder ordered even under a low cap.
 - `trim_threshold()` = `trim_at_percent` (40) of the effective window.
 - `warn_threshold()` = `warn_at_percent` (85) of the effective window — drives
   the pre-summarize nudge.
-- `summarize_threshold()` = `summarize_at_percent` (95) of the effective
-  window, clamped so it never sits closer to the window than the 16K output
-  headroom and never below `trim_threshold() + 1`.
+- `summarize_threshold()` = the full effective window. Because trim and warn
+  are fractions of that same effective window, `trim < warn < summarize` holds
+  for every window size and economy cap, and the 12K reserve already baked into
+  the effective window is what keeps room for the next turn's reply.
 
 The token count the summarize gate compares is the conversation estimate
 **plus** the instruction + tool-schema overhead from the most recent request
@@ -123,13 +127,14 @@ conversation still summarizes proactively. The mid-turn trigger prefers the
 provider's reported `last_total_tokens` and falls back to the byte-derived
 estimator otherwise.
 
-Resolved trigger points for the defaults (trim 40 / warn 85 / summarize 95):
+Resolved trigger points for the defaults (effective window = raw × 95% − 12K;
+trim 40% / warn 85% / summarize 100% of that effective window):
 
-| window | trim | warn | summarize |
-|--------|------|------|-----------|
-| 128K (fallback) | 51.2K | 108.8K | 112K |
-| 270K | 108K | 229.5K | 256.5K |
-| 1M | 400K | 850K | 950K |
+| window | effective | trim | warn | summarize |
+|--------|-----------|------|------|-----------|
+| 128K (fallback) | 109.6K | 43.8K | 93.2K | 109.6K |
+| 270K | 244.5K | 97.8K | 207.8K | 244.5K |
+| 1M | 938K | 375.2K | 797.3K | 938K |
 
 The post-turn entry point delegates through `compact_conversation_with_strategy`
 to `compact_conversation` (`context_compaction.rs`), which holds the splitting
@@ -172,11 +177,11 @@ let recent = conversation[split..].to_vec();
 the conversation (each item being one of `UserText`, `AssistantText`,
 `FunctionCall`, `FunctionCallOutput`, `Reasoning`, or `Image`) are preserved
 verbatim. The split point is then snapped forward by
-`snap_compaction_split` (`context_compaction.rs:350-371`) so a
+`snap_compaction_split` (`context_compaction.rs:357-379`) so a
 `FunctionCallOutput` whose declaring `FunctionCall` is in the older slice
 gets absorbed into older — otherwise the OpenAI Responses API rejects a
 payload that references a `call_id` that isn't also present as a
-`function_call`. `drop_orphan_function_call_outputs` (`:377`) handles
+`function_call`. `drop_orphan_function_call_outputs` (`:385`) handles
 parallel-call shapes (`[FC(A), FC(B), FCO(A), FCO(B)]`) where snap can't
 fix the boundary alone.
 
@@ -187,7 +192,7 @@ URIs embedded in tool outputs are replaced with `[image]` / `[document]`
 markers:
 
 ```rust
-// crates/squeezy-agent/src/context_compaction.rs:248-256
+// crates/squeezy-agent/src/context_compaction.rs:255-263
 let older_for_summary = strip_media_for_compaction(&older);
 let summary = build_compaction_summary(
     generation,
@@ -210,11 +215,11 @@ per-token overhead on the common short-output case.
 
 ### Extractive summary structure
 
-`build_compaction_summary` (`context_compaction.rs:895-992`) is the
+`build_compaction_summary` (`context_compaction.rs:993`) is the
 deterministic backbone. It composes a multi-section prose document:
 
 ```rust
-// crates/squeezy-agent/src/context_compaction.rs:903-915
+// crates/squeezy-agent/src/context_compaction.rs:1001-1014
 let mut lines = Vec::new();
 lines.push(format!(
     "Squeezy compacted conversation context (generation {generation})."
@@ -238,13 +243,13 @@ Then, in order: pinned context (each pin truncated to
 unresolved questions (capped at `COMPACTION_UNRESOLVED_LINES_LIMIT = 8`),
 active attachments, tool-output receipts, and finally
 `<read-files>`/`<modified-files>` blocks from `file_lineage_blocks`
-(`:1018`) that carry forward file-touch history across compaction
+(`:1116`) that carry forward file-touch history across compaction
 generations by re-parsing the prior summary's XML tags.
 
 The final blob is bounded one more time by
 `context_attachment_preview(..., config.context_compaction.max_summary_bytes)`
-(`:991`), with `max_summary_bytes` defaulting to 12,000 bytes
-(`squeezy-core/src/lib.rs:293`).
+(`:1089`), with `max_summary_bytes` defaulting to 12,000 bytes
+(`squeezy-core/src/lib.rs:764`).
 
 ### Optional LLM-assisted rewrite
 
@@ -253,7 +258,7 @@ summary runs first, then a cheap model rewrites it into the four-slot
 template:
 
 ```rust
-// crates/squeezy-agent/src/context_compaction.rs:776-780
+// crates/squeezy-agent/src/context_compaction.rs:874
 pub(crate) const STRUCTURED_COMPACTION_SYSTEM_PROMPT: &str = "You compact conversation context into a structured checkpoint. \
 Update the existing summary in place — preserve every prior decision, \
 progress entry, and next-step. Never invent new facts. Output only the \
@@ -261,12 +266,12 @@ four required sections in this exact order: `## Goal`, `## Progress`, \
 `## Decisions`, `## Next`.";
 ```
 
-The prompt is built by `build_structured_compaction_prompt` (`:807-855`)
+The prompt is built by `build_structured_compaction_prompt` (`:905-953`)
 and surfaces the *prior* compaction's summary as a separate
 `<previous-summary>` block alongside the freshly extracted
 `<new-conversation>` block, so the model updates slots iteratively
 instead of re-truncating a chain on every round. The detection contract
-`is_structured_compaction_summary` (`:872-893`) accepts any markdown
+`is_structured_compaction_summary` (`:970-991`) accepts any markdown
 heading containing the slot keyword as a whole word — `### Goal`,
 `## Key Decisions`, `## Next Steps` all pass — but if any of the four
 slots is missing the output is rejected and the deterministic extractive
@@ -275,7 +280,7 @@ summary stays in place verbatim.
 The fallback path is hard-coded for cost safety: timeouts
 (`model_assisted_timeout_secs`, default 30s), empty responses, missing
 slots, and any provider error all log a `compaction_fallback` session
-event and return the extractive report unchanged (`:710-758`).
+event and return the extractive report unchanged (`:745-871`).
 `LayeredFallback` further restricts the LLM call to "big enough"
 dropouts — the dropped slice must exceed
 `layered_fallback_extractive_threshold_tokens` (default 4,000) for the
@@ -287,7 +292,7 @@ Every successful compaction appends a `ContextCompactionRecord` to
 `state.history`. The list is capped:
 
 ```rust
-// crates/squeezy-agent/src/context_compaction.rs:319-323
+// crates/squeezy-agent/src/context_compaction.rs:326-330
 state.history.push(record.clone());
 if state.history.len() > COMPACTION_MAX_HISTORY {
     let excess = state.history.len() - COMPACTION_MAX_HISTORY;
@@ -303,7 +308,7 @@ Each compaction also writes a redb checkpoint keyed by
 `ckpt-<generation>-<timestamp>`:
 
 ```rust
-// crates/squeezy-agent/src/context_compaction.rs:280-304
+// crates/squeezy-agent/src/context_compaction.rs:287-311
 let compacted_at_ms = unix_timestamp_millis();
 let replacement_id = store.and_then(|store| {
     if dropped.is_empty() {
@@ -337,7 +342,7 @@ aborting the compaction itself, because the cost saving from compacting is
 load-bearing — losing the summary just because undo is unavailable would
 be worse than losing undo.
 
-`Agent::compact_context_undo` (`crates/squeezy-agent/src/lib.rs:2875-2933`)
+`Agent::compact_context_undo` (`crates/squeezy-agent/src/lib.rs:4275-4349`)
 walks the linkage in reverse: read `state.context_compaction.last`, look up
 its `replacement_id` in the store, drop the synthetic summary at index 0,
 prepend the restored items, decrement `generation`, pop the last history
@@ -348,21 +353,22 @@ the restored conversation.
 
 Imagine a 30-turn debugging session against a 200K-token Claude model with
 defaults: `min_items=16`, `recent_items=10`, `micro_compaction_keep_recent=5`,
-`trim_at_percent=40`, `warn_at_percent=85`, `summarize_at_percent=95`,
-`model_context_window=200_000`, `max_summary_bytes=12_000`. The registry knows
-this window, so the thresholds resolve to trim at 80K, warn at 170K, and
-summarize at 184K (95% of 200K is 190K, clamped to 16K below the window).
+`trim_at_percent=40`, `warn_at_percent=85`, `effective_context_window_percent=95`,
+`baseline_reserve_tokens=12_000`, `model_context_window=200_000`,
+`max_summary_bytes=12_000`. The registry knows this window, so the effective
+window is 200K × 95% − 12K = 178K, and the thresholds resolve to trim at 71.2K,
+warn at 151.3K, and summarize at 178K (the full effective window).
 
 **Turns 1–10 (warm-up).** The user pastes a stack trace, the agent calls
 `grep` and `read_file` to triangulate. Conversation grows to 22 items
-(~35K tokens). Nothing fires: 35K sits below the 80K trim threshold, so neither
-the trim pre-pass nor the summarize gate engages.
+(~35K tokens). Nothing fires: 35K sits below the 71.2K trim threshold, so
+neither the trim pre-pass nor the summarize gate engages.
 
 **Turn 15 (trim fires).** Two `read_file` calls against ~15 KB sources push
-the conversation to 38 items / ~92K tokens, crossing the 80K trim point. The
+the conversation to 38 items / ~92K tokens, crossing the 71.2K trim point. The
 mid-turn trim pass clears the older bulky `FunctionCallOutput` bodies in place,
 keeping the newest five tool outputs verbatim and preserving every `call_id`
-pairing. The summarize gate stays shut — 92K is far below 184K — so no summary
+pairing. The summarize gate stays shut — 92K is far below 178K — so no summary
 head is produced. The cleared tool bytes drop the request size back toward
 ~45K while every turn and tool call still appears in order.
 
@@ -372,11 +378,11 @@ conversation keeps its full structure and the model never loses verbatim recall
 of *recent* work, because trim only touches outputs older than the kept tail.
 
 **Turn 29 (warn nudge, then summarize).** A burst of large `decl_search` and
-`read_file` results pushes usage to ~172K, inside the warn band. The TUI
+`read_file` results pushes usage to ~160K, inside the warn band. The TUI
 surfaces the pre-summarize nudge once (more items than `recent_items`, so a
 summarize would actually shrink), telling the user older turns are about to be
-summarized and that `/compact undo` reverses it. The next turn lands at ~186K,
-crossing the 184K summarize threshold. After the turn's assistant message
+summarized and that `/compact undo` reverses it. The next turn lands at ~180K,
+crossing the 178K summarize threshold. After the turn's assistant message
 lands, the post-turn trim pre-pass runs first, then `maybe_compact_conversation`
 evaluates: items ≥ `min_items` and tokens ≥ `summarize_threshold()`, so it
 calls `compact_conversation` with `force=false` and `trigger=Auto`.
@@ -386,7 +392,7 @@ generation 1, the "preserve these durable facts" pragma, a `notes_recall`
 block if applicable, durable facts mined from the older slice (up to 24 lines),
 attachment previews if any, and finally an alphabetised `<read-files>` /
 `<modified-files>` block listing every path touched in the dropped slice.
-Estimated tokens fall from ~186K to ~17K. The dropped items persist as
+Estimated tokens fall from ~180K to ~17K. The dropped items persist as
 `ckpt-1-<ms>`.
 
 **Forced overflow (alternative path).** Had a single oversized tool result
@@ -400,13 +406,13 @@ at all.
 **Turn 30 (user reverts via undo).** The user types `/compact undo`.
 `compact_context_undo` resolves `state.context_compaction.last`, pulls
 `ckpt-1-<ms>` from the store, asserts the conversation's head is currently a
-`UserText` summary (`lib.rs:2895`), drops that head, prepends the restored
+`UserText` summary (`lib.rs:4311`), drops that head, prepends the restored
 items, and decrements `generation`. The post-summarize messages stay attached
 on the tail. The next request ships the restored verbatim context plus the
 newer verbatim turns — the user gets back what the summary had compressed.
 
 **The prompt the summarizer receives.** When the strategy is
-model-assisted, the cheap model sees this system prompt (`context_compaction.rs:776`):
+model-assisted, the cheap model sees this system prompt (`context_compaction.rs:874`):
 
 ```
 You compact conversation context into a structured checkpoint.
@@ -417,7 +423,7 @@ four required sections in this exact order: `## Goal`, `## Progress`,
 ```
 
 Coupled with the user-role prompt assembled by
-`build_structured_compaction_prompt` (`:807-855`), the model sees: a
+`build_structured_compaction_prompt` (`:905-953`), the model sees: a
 `<new-conversation>` block (the extractive summary it must rewrite), an
 optional `<previous-summary>` block (the prior generation's output), a
 literal template showing each `##` heading, and a "Rules" section
@@ -429,19 +435,19 @@ function names, no invented facts, and a `<= max_output_tokens` budget
 
 **Never-summarized items.** `recent_items` (default 10) tail items pass
 through untouched. Pinned entries persist on
-`ContextCompactionState.pinned` (`squeezy-core/src/lib.rs:9642`) and are
+`ContextCompactionState.pinned` (`squeezy-core/src/lib.rs:14267`) and are
 re-emitted verbatim in every summary's "Pinned context:" block
-(`context_compaction.rs:917-927`). Pins are added through
-`Agent::pin_context_entry` (`lib.rs:2935`), live across compactions and
+(`context_compaction.rs:1015-1025`). Pins are added through
+`Agent::pin_context_entry` (`lib.rs:4351`), live across compactions and
 sessions via the resume-state write, and are sized by truncation
 (`label` → 80 chars, `summary` → 800 chars).
 
 **Media stripping.** Base64 image and PDF data URIs are replaced with
-`[image]` / `[document]` (`:430-432`) before the older slice reaches the
+`[image]` / `[document]` (`:438-440`) before the older slice reaches the
 summarizer, so a 300 KB inlined PNG cannot bloat the summary or push the
 LLM-assisted compaction call itself into prompt-too-long. Importantly,
 the stripping is local to the summary input — the persisted `dropped`
-checkpoint receives the unmodified `older` (`:248`, `:273-274`), so
+checkpoint receives the unmodified `older` (`:255`, `:280-281`), so
 `compact_context_undo` restores the original bytes.
 
 **Compaction history cap.** The in-memory `history` list is capped at
@@ -450,11 +456,11 @@ it bounds rendering of the timeline and the cost of cloning state, not
 disk persistence (per-checkpoint redb rows are governed by separate
 retention).
 
-**Tool-call/output integrity.** `snap_compaction_split` (`:350`) and
-`drop_orphan_function_call_outputs` (`:377`) together guarantee the
+**Tool-call/output integrity.** `snap_compaction_split` (`:357`) and
+`drop_orphan_function_call_outputs` (`:385`) together guarantee the
 post-compact conversation cannot reference a `call_id` whose declaring
 `FunctionCall` was dropped. The symmetric repair pass
-`repair_orphan_function_calls` (`:404`) injects a synthetic error output
+`repair_orphan_function_calls` (`:410`) injects a synthetic error output
 when a `FunctionCall` lacks its matching output (e.g. after a cancelled
 turn), because Anthropic's Messages API rejects any turn where a
 `tool_use` block lacks a `tool_result`.
@@ -468,8 +474,8 @@ post-compact checkpoint and forward-replays only strictly-newer events
 (`context_compaction.rs:127-136`).
 
 **Summarizer guardrails.** The structured prompt is explicit:
-*"Do NOT invent new facts. Do NOT omit prior decisions."* (`:850`).
-Detection at `is_structured_compaction_summary` (`:872-893`) catches the
+*"Do NOT invent new facts. Do NOT omit prior decisions."* (`:948`).
+Detection at `is_structured_compaction_summary` (`:970-991`) catches the
 single failure mode the template exists to prevent — a model output that
 silently drops one of the four slots. When detection fails the extractive
 summary stays verbatim and a `compaction_fallback` session event records
@@ -477,11 +483,11 @@ the reason: `model_assisted_timeout`, `model_assisted_error`,
 `model_assisted_empty`, or `model_assisted_missing_slots`.
 
 **File lineage caps.** Each of `<read-files>` and `<modified-files>` is
-capped at `COMPACTION_FILE_LINEAGE_LIMIT = 50` entries (`:111`, `:1070-1077`).
+capped at `COMPACTION_FILE_LINEAGE_LIMIT = 50` entries (`:111`, `:1164-1170`).
 When a list overflows the cap, the *chronologically oldest* paths are
 dropped first so the most recent file touches survive. Modification
 dominates: a file appearing in both read- and modify-class tool calls is
-reported only under `<modified-files>` (`:1066-1068`).
+reported only under `<modified-files>` (`:1162`).
 
 **Window re-derivation on model switch.** `model_context_window` is
 auto-derived from the model registry at `Agent::build`, and `resolve_window()`
@@ -518,10 +524,10 @@ Cumulative input across all 30 turns: ~2.25 MB ≈ 560K tokens.
 
 | Turn | Sent on this turn (approx) | Notes |
 |------|----------------------------|-------|
-| 10   | 50K                        | Below the 80K trim threshold — full transcript. |
-| 15   | 92K → trim → ~45K          | Crosses 40%-of-window trim; older tool bodies cleared in place, structure intact. |
-| 16–28 | ~45–80K, re-trimmed       | Each tool-heavy turn that re-crosses the trim point reclaims its older outputs. |
-| 29   | ~186K → summarize → 17K head + 5K next ≈ 22K | Crosses the summarize threshold; older slice folds into one summary item. |
+| 10   | 50K                        | Below the 71.2K trim threshold — full transcript. |
+| 15   | 92K → trim → ~45K          | Crosses 40%-of-effective-window trim; older tool bodies cleared in place, structure intact. |
+| 16–28 | ~45–71K, re-trimmed       | Each tool-heavy turn that re-crosses the trim point reclaims its older outputs. |
+| 29   | ~180K → summarize → 17K head + 5K next ≈ 22K | Crosses the summarize threshold; older slice folds into one summary item. |
 | 30   | ~22K                       | Steady-state per-turn input after the fold. |
 
 Trim alone keeps the per-turn bill well under the no-compaction trajectory for

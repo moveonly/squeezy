@@ -80,9 +80,11 @@ benchmarks/squeezy-graph-bench/src/oracles/<oracle>.rs
 benchmarks/squeezy-graph-bench/src/summary.rs
 ```
 
-Oracle modules are named after the validator (`rust_analyzer`, `clang`,
-`roslyn`, `javac`, `cpython_ast`, `go_types`, `tsc`) because one oracle can own
-multiple `LanguageKind` variants. Fixture and query-spec data lives outside the
+Oracle modules are named after the validator (`clang`, `common_scan`,
+`cpython_ast`, `dart_oracle`, `go_types`, `javac`, `kotlin_oracle`,
+`php_oracle`, `roslyn`, `ruby_oracle`, `rust_analyzer`, `scala_semanticdb`,
+`swift_sourcekit`, `tsc`) because one oracle can own multiple `LanguageKind`
+variants. Fixture and query-spec data lives outside the
 Rust crate under `benchmarks/fixtures/` and `benchmarks/specs/`; agent-driven
 graph/no-graph benchmark scenarios live under
 `crates/squeezy-eval/fixtures/scenarios/benchmarks/`.

@@ -83,8 +83,12 @@ providers, so each provider keeps its own settings and defaults):
   judge call.
 - `[routing].llm_judge` — for non-obvious turns, ask a cheap judge model whether
   to route.
-- `[providers.<name>].cheap_model` — the model easy turns are routed to;
-  defaults to the provider's "mini" tier.
+- `[providers.<name>].cheap_model` — the model easy turns are routed to (the
+  weak rung of the ladder); defaults to the provider's "mini" tier.
+- `[providers.<name>].medium_model` — the mid rung of the cost/capability
+  ladder: where moderate turns route, and the rung a weak turn escalates to
+  before the parent; defaults to the provider's "sonnet" tier (collapsing onto a
+  neighbouring rung when that provider has no distinct middle).
 - `[providers.<name>].judge_model` — the cheap model that classifies turns;
   defaults to the provider's "mini" tier (a notch above the cheapest tier
   judges more reliably).
