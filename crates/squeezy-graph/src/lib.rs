@@ -896,6 +896,51 @@ impl SemanticGraph {
         nodes
     }
 
+    /// Capped variant of [`Self::hierarchy`] that selects the roots to expand
+    /// **before** building any subtree, so a rootless repo map on a huge
+    /// workspace never materialises the full containment forest just to throw
+    /// most of it away.
+    ///
+    /// When `root` is `Some`, behaves like `hierarchy(Some(root), max_depth)`
+    /// and the returned count is the number of resolved roots (0 or 1). When
+    /// `root` is `None`, every `File` symbol is a candidate root: candidates are
+    /// sorted by name, the first `max_roots` are expanded to `max_depth`, and
+    /// the returned `usize` is the **total** candidate-root count (before the
+    /// `max_roots` cap) so callers can report "showing N of M".
+    pub fn hierarchy_capped(
+        &self,
+        root: Option<&SymbolId>,
+        max_depth: usize,
+        max_roots: usize,
+    ) -> (Vec<HierarchyNode>, usize) {
+        if let Some(root) = root {
+            let nodes = self
+                .hierarchy_node(root, max_depth)
+                .into_iter()
+                .collect::<Vec<_>>();
+            let total = nodes.len();
+            return (nodes, total);
+        }
+
+        // Collect file roots and sort by name first; expansion of each subtree
+        // is the expensive part, so only the selected prefix is expanded.
+        let mut file_roots = self
+            .symbols
+            .values()
+            .filter(|symbol| symbol.kind == SymbolKind::File)
+            .map(|symbol| (symbol.name.clone(), symbol.id.clone()))
+            .collect::<Vec<_>>();
+        file_roots.sort_by(|left, right| left.0.cmp(&right.0));
+        let total_roots = file_roots.len();
+
+        let nodes = file_roots
+            .into_iter()
+            .take(max_roots)
+            .filter_map(|(_, id)| self.hierarchy_node(&id, max_depth))
+            .collect::<Vec<_>>();
+        (nodes, total_roots)
+    }
+
     pub fn signature_search(&self, query: &SignatureQuery) -> Vec<GraphSymbol> {
         let needle = query.text.to_lowercase();
         let visibility = query.visibility.as_deref();
