@@ -71,6 +71,86 @@ fn opens_at_models_when_no_focus() {
 }
 
 #[test]
+fn discard_all_skips_tier_files_changed_externally() {
+    let nonce = TEMP_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("squeezy_discard_conflict_{nonce}"));
+    std::fs::create_dir_all(&root).expect("create temp config dir");
+    let user = root.join("user-settings.toml");
+    // Baseline = the file's bytes when the screen opened.
+    std::fs::write(&user, b"baseline = true\n").expect("seed baseline");
+
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    state.sources.user_path_default = user.clone();
+    state.sources.project_path_default = root.join("repo-settings.toml");
+    state.sources.repo_path_default = root.join("local-settings.toml");
+    state.baseline = vec![
+        (user.clone(), Some(b"baseline = true\n".to_vec())),
+        (state.sources.project_path_default.clone(), None),
+        (state.sources.repo_path_default.clone(), None),
+    ];
+
+    // Simulate this session having written the file, then an external
+    // editor changing it afterwards.
+    std::fs::write(&user, b"session = true\n").expect("session write");
+    state.note_session_write(&user);
+    std::fs::write(&user, b"edited-by-an-outside-process = true\n").expect("external edit");
+
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    discard_all_session_writes(&mut state, &mut agent, &mut q);
+
+    // The external edit must survive — discard must not clobber it back
+    // to baseline.
+    assert_eq!(
+        std::fs::read(&user).expect("read after discard"),
+        b"edited-by-an-outside-process = true\n",
+        "an externally-edited tier file must not be reverted by discard"
+    );
+    let messages: Vec<_> = q.drain().map(|e| e.message).collect();
+    assert!(
+        messages.iter().any(|m| m.contains("kept external edits")),
+        "discard must warn that it skipped the externally-changed file: {messages:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn discard_all_restores_files_unchanged_since_session_write() {
+    let nonce = TEMP_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("squeezy_discard_clean_{nonce}"));
+    std::fs::create_dir_all(&root).expect("create temp config dir");
+    let user = root.join("user-settings.toml");
+    std::fs::write(&user, b"baseline = true\n").expect("seed baseline");
+
+    let mut state = ConfigScreenState::new(AppConfig::default(), None);
+    state.sources.user_path_default = user.clone();
+    state.sources.project_path_default = root.join("repo-settings.toml");
+    state.sources.repo_path_default = root.join("local-settings.toml");
+    state.baseline = vec![
+        (user.clone(), Some(b"baseline = true\n".to_vec())),
+        (state.sources.project_path_default.clone(), None),
+        (state.sources.repo_path_default.clone(), None),
+    ];
+
+    // This session wrote the file and nothing external touched it after.
+    std::fs::write(&user, b"session = true\n").expect("session write");
+    state.note_session_write(&user);
+
+    let mut agent = make_agent();
+    let mut q = ConfigFeedback::new();
+    discard_all_session_writes(&mut state, &mut agent, &mut q);
+
+    assert_eq!(
+        std::fs::read(&user).expect("read after discard"),
+        b"baseline = true\n",
+        "an unchanged file must be restored to its baseline by discard"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn tab_cycles_through_three_scopes() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
