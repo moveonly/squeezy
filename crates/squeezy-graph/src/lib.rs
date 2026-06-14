@@ -3248,16 +3248,25 @@ impl GraphManager {
             }
         }
 
-        let mut parsed_files = Vec::new();
-        for record in supported_changed_records {
+        // Reparse changed records in budget-bounded chunks. `supported_changed_records`
+        // is already sorted by relative path, so chunking preserves a
+        // deterministic processing order. Each chunk goes through
+        // `parse_records`, which fans the work across worker threads once the
+        // chunk is large enough — far cheaper than the previous one-record-at-a-
+        // time loop on a multi-file save or branch switch. The budget is
+        // re-checked between chunks so a long refresh still yields, just at
+        // chunk granularity instead of per file.
+        const REPARSE_CHUNK_SIZE: usize = 64;
+        let mut parsed_files = Vec::with_capacity(supported_changed_records.len());
+        for chunk in supported_changed_records.chunks(REPARSE_CHUNK_SIZE) {
             if started.elapsed() > self.config.per_tool_refresh_budget {
                 budget_exhausted = true;
                 break;
             }
-            bytes_reparsed += record.size_bytes;
-            let parsed = self.parser.parse_record(&record)?;
-            parsed_files.push(parsed);
-            reparsed_files += 1;
+            let (mut parsed_chunk, _summary) = self.parser.parse_records(chunk)?;
+            bytes_reparsed += chunk.iter().map(|record| record.size_bytes).sum::<u64>();
+            reparsed_files += parsed_chunk.len();
+            parsed_files.append(&mut parsed_chunk);
         }
         if !parsed_files.is_empty() {
             if self.store.is_some() {
