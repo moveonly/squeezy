@@ -20,7 +20,7 @@ use squeezy_store::{
     GRAPH_SCHEMA_VERSION, GraphStore, STALE_RUNNING_SESSION_THRESHOLD_MS, SessionQuery,
     SessionStatus, SessionStore, SqueezyStore, StoragePathReport,
     cache_diagnostics_with_session_dir, ensure_repo_profile, graph_path, prune_cache_backups,
-    user_squeezy_dir_detail,
+    state_path, user_squeezy_dir_detail,
 };
 use squeezy_tools::{McpClientRegistry, McpServerStatus, McpStaleOutcome};
 use squeezy_workspace::{WorkspaceRootKind, WorkspaceRootProfile};
@@ -1092,12 +1092,24 @@ fn state_store_check(config: &AppConfig) -> Check {
                 extra: None,
             }
         }
-        Err(error) => Check {
+        Err(error) if is_redb_lock_contention_error(&error, false) => Check {
             name: "state_store".to_string(),
-            status: Status::Fail,
-            detail: format!("{} ({})", error, storage_error_hint(&error.to_string())),
+            status: Status::Warn,
+            detail: format!(
+                "state.redb is locked by another Squeezy process; close the other session or rerun after it exits: {}",
+                state_path(&config.workspace_root, config.cache.root.as_deref()).display()
+            ),
             extra: None,
         },
+        Err(error) => {
+            let text = error.to_string();
+            Check {
+                name: "state_store".to_string(),
+                status: Status::Fail,
+                detail: format!("{} ({})", text, storage_error_hint(&text)),
+                extra: None,
+            }
+        }
     }
 }
 
@@ -1129,49 +1141,25 @@ fn graph_store_check(config: &AppConfig) -> Check {
             ),
             extra: None,
         },
+        Err(error) if is_redb_lock_contention_error(&error, true) => Check {
+            name: "graph_store".to_string(),
+            status: Status::Warn,
+            detail: format!(
+                "graph.redb is locked by another Squeezy process; close the other session or rerun after it exits: {}",
+                path.display()
+            ),
+            extra: None,
+        },
         Err(error) => {
-            // On Windows, another agent process holding graph.redb open will
-            // fail this probe with ERROR_SHARING_VIOLATION (32) or
-            // ERROR_LOCK_VIOLATION (33); occasionally ERROR_ACCESS_DENIED (5).
-            // Distinguish that from a real open failure so the user isn't told
-            // persistence is broken when it's actually just another live
-            // Squeezy session. The literal Win32 messages for codes 32/33 do
-            // *not* contain the phrase "sharing violation", so we match by
-            // `raw_os_error()` first (when we can recover the underlying
-            // `io::Error`), and fall back to substring markers that *do*
-            // appear in those messages ("being used by another process",
-            // "another process has locked").
             let text = error.to_string();
-            let is_locked = match &error {
-                SqueezyError::Io(io_err) => matches!(io_err.raw_os_error(), Some(5 | 32 | 33)),
-                _ => false,
-            } || {
-                let lower = text.to_ascii_lowercase();
-                lower.contains("being used by another process")
-                    || lower.contains("another process has locked")
-                    || lower.contains("sharing violation")
-                    || lower.contains("access is denied")
-            };
-            if is_locked {
-                Check {
-                    name: "graph_store".to_string(),
-                    status: Status::Ok,
-                    detail: format!(
-                        "locked by another process (graph persistence is active): {}",
-                        path.display()
-                    ),
-                    extra: None,
-                }
-            } else {
-                Check {
-                    name: "graph_store".to_string(),
-                    status: Status::Warn,
-                    detail: format!(
-                        "{text}; graph persistence will be disabled until graph.redb can be opened: {}",
-                        path.display()
-                    ),
-                    extra: None,
-                }
+            Check {
+                name: "graph_store".to_string(),
+                status: Status::Warn,
+                detail: format!(
+                    "{text}; graph persistence will be disabled until graph.redb can be opened: {}",
+                    path.display()
+                ),
+                extra: None,
             }
         }
     }
@@ -1240,9 +1228,12 @@ fn workspace_looks_synced(path: &std::path::Path) -> bool {
 
 fn storage_error_hint(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("lock") || lower.contains("busy") || lower.contains("would block") {
+    if is_redb_lock_contention_message(&lower) {
         "likely lock contention"
-    } else if lower.contains("permission denied") || lower.contains("access denied") {
+    } else if lower.contains("permission denied")
+        || lower.contains("access denied")
+        || lower.contains("access is denied")
+    {
         "likely permission problem"
     } else if lower.contains("no space") || lower.contains("enospc") {
         "likely disk full"
@@ -1260,6 +1251,37 @@ fn storage_error_hint(message: &str) -> &'static str {
     } else {
         "storage open failed"
     }
+}
+
+fn is_redb_lock_contention_error(error: &SqueezyError, access_denied_may_be_lock: bool) -> bool {
+    let raw_os_locked = match error {
+        SqueezyError::Io(io_err) => {
+            matches!(io_err.raw_os_error(), Some(32 | 33))
+                || (access_denied_may_be_lock && io_err.raw_os_error() == Some(5))
+        }
+        _ => false,
+    };
+    if raw_os_locked {
+        return true;
+    }
+
+    let lower = error.to_string().to_ascii_lowercase();
+    is_redb_lock_contention_message(&lower)
+        || (access_denied_may_be_lock && lower.contains("access is denied"))
+}
+
+fn is_redb_lock_contention_message(lowercase_message: &str) -> bool {
+    lowercase_message.contains("database already open")
+        || lowercase_message.contains("cannot acquire lock")
+        || lowercase_message.contains("lock")
+        || lowercase_message.contains("busy")
+        || lowercase_message.contains("lock contention")
+        || lowercase_message.contains("database lock")
+        || lowercase_message.contains("would block")
+        || lowercase_message.contains("resource busy")
+        || lowercase_message.contains("being used by another process")
+        || lowercase_message.contains("another process has locked")
+        || lowercase_message.contains("sharing violation")
 }
 
 fn cache_check(config: &AppConfig, prune: bool, storage: bool) -> Check {
@@ -1289,7 +1311,7 @@ fn cache_check(config: &AppConfig, prune: bool, storage: bool) -> Check {
     );
     if let Some(stats) = diagnostics.state_stats.as_ref() {
         if let Some(error) = &stats.error {
-            detail.push_str(&format!("; state_stats_error={error}"));
+            detail.push_str(&format_cache_stats_error("state_stats", error, false));
         } else {
             detail.push_str(&format!(
                 "; state schema={} receipts={} reads={} mcp_tools={} observations={} checkpoints={}",
@@ -1307,7 +1329,7 @@ fn cache_check(config: &AppConfig, prune: bool, storage: bool) -> Check {
     }
     if let Some(stats) = diagnostics.graph_stats.as_ref() {
         if let Some(error) = &stats.error {
-            detail.push_str(&format!("; graph_stats_error={error}"));
+            detail.push_str(&format_cache_stats_error("graph_stats", error, true));
         } else {
             detail.push_str(&format!(
                 "; graph schema={} partitions={} resolver_entries={} import_graph={}",
@@ -1421,24 +1443,40 @@ fn cache_check(config: &AppConfig, prune: bool, storage: bool) -> Check {
     }
 }
 
+fn format_cache_stats_error(label: &str, error: &str, access_denied_may_be_lock: bool) -> String {
+    let lower = error.to_ascii_lowercase();
+    if is_redb_lock_contention_message(&lower)
+        || (access_denied_may_be_lock && lower.contains("access is denied"))
+    {
+        format!("; {label}=locked_by_another_squeezy_process")
+    } else {
+        format!("; {label}_error={error}")
+    }
+}
+
 fn format_storage_probes(config: &AppConfig) -> String {
     let state = match SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref()) {
         Ok(store) => format!("state.redb=open({})", store.path().display()),
-        Err(error) => format!(
-            "state.redb=fail:{}({})",
-            storage_error_hint(&error.to_string()),
-            error
-        ),
+        Err(error) => format_storage_probe_error("state.redb", &error, false),
     };
     let graph = match GraphStore::open(&config.workspace_root, config.cache.root.as_deref()) {
         Ok(store) => format!("graph.redb=open({})", store.path().display()),
-        Err(error) => format!(
-            "graph.redb=fail:{}({})",
-            storage_error_hint(&error.to_string()),
-            error
-        ),
+        Err(error) => format_storage_probe_error("graph.redb", &error, true),
     };
     format!("{state}, {graph}")
+}
+
+fn format_storage_probe_error(
+    label: &str,
+    error: &SqueezyError,
+    access_denied_may_be_lock: bool,
+) -> String {
+    if is_redb_lock_contention_error(error, access_denied_may_be_lock) {
+        format!("{label}=locked_by_another_squeezy_process")
+    } else {
+        let text = error.to_string();
+        format!("{label}=fail:{}({})", storage_error_hint(&text), text)
+    }
 }
 
 fn format_storage_reports(reports: &[StoragePathReport]) -> String {
