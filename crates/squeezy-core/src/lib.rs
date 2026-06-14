@@ -2416,12 +2416,8 @@ impl AppConfig {
 
         output.push_str("[hardening]\n");
         output.push_str(&format!(
-            "disable_core_dumps = {}\n",
+            "disable_core_dumps = {}\n\n",
             self.hardening.disable_core_dumps
-        ));
-        output.push_str(&format!(
-            "deny_debug_attach = {}\n\n",
-            self.hardening.deny_debug_attach
         ));
 
         output.push_str("[telemetry]\n");
@@ -4243,17 +4239,11 @@ impl SettingsFile {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct HardeningSettings {
     pub disable_core_dumps: Option<bool>,
-    pub deny_debug_attach: Option<bool>,
 }
 
 impl HardeningSettings {
     fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
-        reject_unknown_keys(
-            table,
-            &["disable_core_dumps", "deny_debug_attach"],
-            source,
-            path,
-        )?;
+        reject_unknown_keys(table, &["disable_core_dumps"], source, path)?;
         Ok(Self {
             disable_core_dumps: bool_value(
                 table,
@@ -4261,32 +4251,23 @@ impl HardeningSettings {
                 source,
                 &field(path, "disable_core_dumps"),
             )?,
-            deny_debug_attach: bool_value(
-                table,
-                "deny_debug_attach",
-                source,
-                &field(path, "deny_debug_attach"),
-            )?,
         })
     }
 
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.disable_core_dumps, next.disable_core_dumps);
-        replace_if_some(&mut self.deny_debug_attach, next.deny_debug_attach);
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HardeningConfig {
     pub disable_core_dumps: bool,
-    pub deny_debug_attach: bool,
 }
 
 impl Default for HardeningConfig {
     fn default() -> Self {
         Self {
             disable_core_dumps: true,
-            deny_debug_attach: true,
         }
     }
 }
@@ -4295,7 +4276,6 @@ impl HardeningConfig {
     fn from_settings(settings: HardeningSettings) -> Self {
         Self {
             disable_core_dumps: settings.disable_core_dumps.unwrap_or(true),
-            deny_debug_attach: settings.deny_debug_attach.unwrap_or(true),
         }
     }
 }
@@ -11271,7 +11251,6 @@ pub fn user_settings_template() -> &'static str {
 
 [hardening]
 # disable_core_dumps = true
-# deny_debug_attach = true
 
 [telemetry]
 # enabled = true
@@ -11467,7 +11446,6 @@ pub fn project_settings_template() -> &'static str {
 
 [hardening]
 # disable_core_dumps = true
-# deny_debug_attach = true
 
 # `[graph]` controls workspace indexing. `[mcp.servers.*]` configures
 # external MCP tools that are discovered before each agent turn.

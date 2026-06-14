@@ -195,7 +195,6 @@ fn config_without_env_uses_openai_provider_defaults() {
     );
     assert_eq!(config.session_mode, SessionMode::Build);
     assert!(config.hardening.disable_core_dumps);
-    assert!(config.hardening.deny_debug_attach);
     assert!(!config.store_responses);
     assert!(config.exploration_graph);
     assert_eq!(config.max_parallel_tools, DEFAULT_MAX_PARALLEL_TOOLS);
@@ -770,7 +769,6 @@ protected_metadata_names = [".git", ".meta"]
 
 [hardening]
 disable_core_dumps = false
-deny_debug_attach = false
 "#,
         "test",
     )
@@ -808,7 +806,6 @@ deny_debug_attach = false
         Some(Path::new("docs/approval.md"))
     );
     assert!(!config.hardening.disable_core_dumps);
-    assert!(!config.hardening.deny_debug_attach);
 
     let inspect = config.inspect_redacted();
     assert!(inspect.contains("[permissions.ai_reviewer]"));
@@ -6798,14 +6795,9 @@ fn early_hardening_config_honors_settings_and_falls_back_safely() {
     unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", path.to_str().unwrap()) };
 
     // Explicit toggles in the `[hardening]` table are honored.
-    std::fs::write(
-        &path,
-        b"[hardening]\ndisable_core_dumps = false\ndeny_debug_attach = false\n",
-    )
-    .unwrap();
+    std::fs::write(&path, b"[hardening]\ndisable_core_dumps = false\n").unwrap();
     let config = early_hardening_config();
     assert!(!config.disable_core_dumps);
-    assert!(!config.deny_debug_attach);
 
     // A file without a `[hardening]` section keeps the safe defaults.
     std::fs::write(&path, b"[model]\n").unwrap();
