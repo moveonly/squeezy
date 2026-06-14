@@ -82,6 +82,10 @@ pub(crate) fn visit_java_node(
             extract_java_object_creation(node, ctx, owner_symbol.clone());
             visit_java_children(node, ctx, parent_symbol, owner_symbol);
         }
+        "method_reference" => {
+            extract_java_method_reference(node, ctx, owner_symbol.clone());
+            visit_java_children(node, ctx, parent_symbol, owner_symbol);
+        }
         "identifier" => {}
         "type_identifier" | "scoped_type_identifier" => {
             extract_java_reference(node, ReferenceKind::Type, ctx, owner_symbol.clone())
@@ -435,6 +439,56 @@ pub(crate) fn extract_java_method_invocation(
         kind: ParsedCallKind::Method,
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-java", "method_invocation"),
+        confidence: Confidence::CandidateSet,
+    });
+    extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+}
+
+/// A method reference (`User::getName`, `Comparator::naturalOrder`,
+/// `String::new`) names a method without invoking it. The grammar shapes it as
+/// `<receiver> :: (type_arguments)? (identifier | new)`, where the receiver is
+/// the first named child (a type/primary/super) and the method name is the
+/// trailing token. Without this arm the name was dropped and only the receiver
+/// type leaked as a `Type` reference, so idiomatic stream code
+/// (`.map(User::getName)`) was missing from the call graph. Emit a `Method`
+/// `ParsedCall` (`CandidateSet`) so the resolver matches it like any call.
+pub(crate) fn extract_java_method_reference(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    // The method name is the last child token after `::`; it is `new` for a
+    // constructor reference and an anonymous `identifier` otherwise.
+    let mut cursor = node.walk();
+    let name = node
+        .children(&mut cursor)
+        .filter(|child| matches!(child.kind(), "identifier" | "new"))
+        .last()
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let Some(name) = name else {
+        return;
+    };
+    let receiver = node
+        .named_child(0)
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    let target_text = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name,
+        target_text,
+        receiver,
+        arity: 0,
+        kind: ParsedCallKind::Method,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-java", "method_reference"),
         confidence: Confidence::CandidateSet,
     });
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
