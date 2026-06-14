@@ -245,7 +245,7 @@ pub(crate) fn js_ts_symbol_from_node(
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
 ) -> Option<ParsedSymbol> {
     let mut kind = match node.kind() {
-        "class_declaration" => SymbolKind::Class,
+        "class_declaration" | "abstract_class_declaration" => SymbolKind::Class,
         "enum_declaration" => SymbolKind::Enum,
         "function"
         | "function_declaration"
@@ -259,7 +259,9 @@ pub(crate) fn js_ts_symbol_from_node(
         | "module"
         | "module_declaration"
         | "namespace_declaration" => SymbolKind::Module,
-        "method_definition" | "method_signature" => SymbolKind::Method,
+        "method_definition" | "method_signature" | "abstract_method_signature" => {
+            SymbolKind::Method
+        }
         "public_field_definition" | "field_definition" | "property_signature" => SymbolKind::Field,
         "type_alias_declaration" => SymbolKind::TypeAlias,
         "variable_declarator" => {
