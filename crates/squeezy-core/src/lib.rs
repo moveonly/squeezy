@@ -4371,6 +4371,37 @@ impl HardeningConfig {
     }
 }
 
+/// Resolve the effective `[hardening]` config before any heavy startup work.
+///
+/// `pre_main_hardening` runs at the very top of each binary's entry point, far
+/// earlier than the full config load, so this reads and parses *only* the
+/// `[hardening]` table from the resolved settings file (honoring
+/// `SQUEEZY_SETTINGS_PATH`, then the default path). Any failure — missing file,
+/// unparseable TOML, a malformed `[hardening]` section, or no section at all —
+/// falls back to the safe defaults (both toggles on) rather than weakening the
+/// process, matching the behavior of the full loader.
+pub fn early_hardening_config() -> HardeningConfig {
+    let path = default_settings_path();
+    let Ok(text) = fs::read_to_string(&path) else {
+        return HardeningConfig::default();
+    };
+    let Ok(table) = toml::from_str::<toml::value::Table>(&text) else {
+        return HardeningConfig::default();
+    };
+    let source = format!("hardening:{}", path.display());
+    let settings = match optional_table(&table, "hardening", &source) {
+        Ok(Some(hardening)) => {
+            HardeningSettings::from_table(hardening, &source, "hardening").unwrap_or_default()
+        }
+        _ => HardeningSettings::default(),
+    };
+    // `from_table` may have recorded unknown keys in the thread-local registry;
+    // drain them so they don't leak into the later full config load on this
+    // thread.
+    let _ = take_unknown_fields();
+    HardeningConfig::from_settings(settings)
+}
+
 // M-63: redaction lives on the serde `Serialize` path only (see
 // `redact_secret_opt` below). The derived `Debug` is NOT redacted — the
 // inline `api_key` prints verbatim under `{:?}`. Never `{:?}`-log a

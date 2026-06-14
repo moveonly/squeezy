@@ -786,7 +786,7 @@ fn run_blocking() -> squeezy_core::Result<()> {
 async fn run() -> squeezy_core::Result<()> {
     squeezy_core::startup_trace::init();
     squeezy_core::startup_trace::mark("main_start");
-    squeezy_core::pre_main_hardening(squeezy_core::HardeningConfig::default());
+    squeezy_core::pre_main_hardening(squeezy_core::early_hardening_config());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)

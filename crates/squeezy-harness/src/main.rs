@@ -47,7 +47,7 @@ fn main() -> squeezy_core::Result<()> {
 }
 
 async fn async_main() -> squeezy_core::Result<()> {
-    squeezy_core::pre_main_hardening(squeezy_core::HardeningConfig::default());
+    squeezy_core::pre_main_hardening(squeezy_core::early_hardening_config());
     let cli = Cli::parse();
     match cli.command {
         Command::List { tasks } => {

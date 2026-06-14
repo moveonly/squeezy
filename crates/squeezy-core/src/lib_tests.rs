@@ -6787,6 +6787,43 @@ fn check_settings_file_permissions_follows_symlink_target() {
     assert_eq!(issues[0].path, link);
 }
 
+#[test]
+fn early_hardening_config_honors_settings_and_falls_back_safely() {
+    let dir = std::env::temp_dir().join(format!("squeezy-early-harden-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("settings.toml");
+
+    let _env_guard = TEST_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", path.to_str().unwrap()) };
+
+    // Explicit toggles in the `[hardening]` table are honored.
+    std::fs::write(
+        &path,
+        b"[hardening]\ndisable_core_dumps = false\ndeny_debug_attach = false\n",
+    )
+    .unwrap();
+    let config = early_hardening_config();
+    assert!(!config.disable_core_dumps);
+    assert!(!config.deny_debug_attach);
+
+    // A file without a `[hardening]` section keeps the safe defaults.
+    std::fs::write(&path, b"[model]\n").unwrap();
+    let config = early_hardening_config();
+    assert_eq!(config, HardeningConfig::default());
+
+    // A missing file keeps the safe defaults.
+    std::fs::remove_file(&path).unwrap();
+    let config = early_hardening_config();
+    assert_eq!(config, HardeningConfig::default());
+
+    unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") };
+    drop(_env_guard);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(config, HardeningConfig::default());
+}
+
 /// Guard that PROVIDER_OPTIONS in the config schema covers every provider
 /// name accepted by the runtime resolver.  This prevents the TUI provider
 /// dropdown and templates from lagging behind new provider support.
