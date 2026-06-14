@@ -24785,6 +24785,48 @@ fn transcript_overlay_drag_selection_paints_highlight() {
 }
 
 #[test]
+fn transcript_overlay_click_on_wide_glyph_maps_to_the_correct_char_column() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::assistant("好A好B"));
+    app.transcript_overlay = Some(TranscriptOverlayState {
+        scroll: 0,
+        detail: OverlayDetail::Expanded,
+        filter: OverlayFilter::All,
+    });
+    let buffer = render_full_to_buffer(&app, 80, 24);
+
+    let (a_x, row) = find_text_cell(&buffer, "A").expect("the A marker painted");
+    let (b_x, b_row) = find_text_cell(&buffer, "B").expect("the B marker painted");
+    assert_eq!(row, b_row, "both markers share one visual row");
+    assert_eq!(b_x - a_x, 3, "好A occupies three display cells");
+
+    let press_col = |app: &mut TuiApp, x: u16| -> usize {
+        assert!(handle_mouse(app, left_down(x, row, KeyModifiers::NONE)));
+        let selection = app.selection.as_ref().expect("press arms a selection");
+        assert_eq!(selection.surface, selection::SelectionSurface::Overlay);
+        let col = selection.anchor.col;
+        handle_mouse(app, left_up(x, row));
+        app.selection = None;
+        col
+    };
+
+    let a_col = press_col(&mut app, a_x);
+    let b_col = press_col(&mut app, b_x);
+    assert_eq!(
+        b_col - a_col,
+        2,
+        "overlay click mapping must share the main transcript's wide-glyph char math"
+    );
+
+    let trailing_cell_col = press_col(&mut app, a_x - 1);
+    assert_eq!(
+        trailing_cell_col,
+        a_col - 1,
+        "the trailing cell of a wide glyph maps back to that glyph's char column"
+    );
+}
+
+#[test]
 fn input_batch_coalesces_transcript_scrollbar_drag_flood_before_key() {
     let mut app = test_app(SessionMode::Build);
     app.transcript_overlay = Some(TranscriptOverlayState {
