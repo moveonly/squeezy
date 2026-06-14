@@ -216,6 +216,13 @@ pub(crate) fn c_family_symbol_from_node(
         "enumerator" => SymbolKind::Variant,
         "function_definition" => SymbolKind::Function,
         "declaration" if c_declaration_is_function(node) => SymbolKind::Function,
+        "declaration" if c_family_is_global_value_declaration(node) => {
+            if c_family_declaration_is_const(node, ctx.source) {
+                SymbolKind::Const
+            } else {
+                SymbolKind::Static
+            }
+        }
         "field_declaration" if c_declaration_is_function(node) => SymbolKind::Function,
         "field_declaration" => SymbolKind::Field,
         "type_definition" | "alias_declaration" => SymbolKind::TypeAlias,
@@ -346,7 +353,12 @@ pub(crate) fn extract_c_family_symbol_facts(
 
     if matches!(
         symbol.kind,
-        SymbolKind::Function | SymbolKind::Method | SymbolKind::Field | SymbolKind::TypeAlias
+        SymbolKind::Function
+            | SymbolKind::Method
+            | SymbolKind::Field
+            | SymbolKind::TypeAlias
+            | SymbolKind::Const
+            | SymbolKind::Static
     ) {
         for type_name in c_family_type_names_from_signature(&symbol.signature) {
             ctx.references.push(ParsedReference {
@@ -657,6 +669,43 @@ pub(crate) fn c_declaration_is_function(node: Node<'_>) -> bool {
         .unwrap_or(false)
 }
 
+/// True when a non-function `declaration` is a file- or namespace-scope value
+/// (a global / static / const / extern variable) that deserves its own symbol.
+///
+/// Gated on the syntactic parent so locals inside function bodies, `for`-init
+/// clauses, parameters, and class-member declarations never leak in: only the
+/// translation unit, a namespace body (`declaration_list`), and an
+/// `extern "C"` block (`linkage_specification`) host real globals. A bare
+/// `declarator` is still required so forward type declarations (`struct Foo;`,
+/// which have a type but no declarator) are left to the type-symbol path.
+pub(crate) fn c_family_is_global_value_declaration(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if !matches!(
+        parent.kind(),
+        "translation_unit" | "declaration_list" | "linkage_specification"
+    ) {
+        return false;
+    }
+    node.child_by_field_name("declarator").is_some()
+}
+
+/// True when a declaration carries a `const`/`constexpr`/`consteval`/`constinit`
+/// qualifier, so a global value should be classified as `Const` rather than
+/// `Static`. tree-sitter surfaces `const`/`volatile` as `type_qualifier`
+/// children and the others as keyword tokens, so a whole-token scan over the
+/// pre-initializer head is the robust check.
+pub(crate) fn c_family_declaration_is_const(node: Node<'_>, source: &str) -> bool {
+    let Ok(text) = node_text(node, source) else {
+        return false;
+    };
+    let head = text.split('=').next().unwrap_or(&text);
+    ["const", "constexpr", "consteval", "constinit"]
+        .iter()
+        .any(|keyword| signature_has_keyword(head, keyword))
+}
+
 /// Returns true when the declarator describes a real function/method, not a
 /// function pointer field/variable.
 ///
@@ -816,7 +865,9 @@ pub(crate) fn c_family_symbol_name(
     match kind {
         SymbolKind::Macro => c_macro_definition_name(node, source),
         SymbolKind::TypeAlias => c_type_alias_name(node, source),
-        SymbolKind::Field => c_declarator_name(node, source),
+        SymbolKind::Field | SymbolKind::Const | SymbolKind::Static => {
+            c_declarator_name(node, source)
+        }
         SymbolKind::Function | SymbolKind::Method => node
             .child_by_field_name("declarator")
             .and_then(|declarator| c_declarator_name(declarator, source))
