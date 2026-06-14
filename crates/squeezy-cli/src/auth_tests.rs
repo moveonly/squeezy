@@ -602,7 +602,7 @@ mod section_round_trip_tests {
     // `auth_set_resolves_deepinfra_to_canonical_section_name` documents for
     // deepinfra; before the fix they fell through to "" and surfaced a
     // misleading "unknown provider" error from set/remove/status.
-    use super::{KNOWN_PROVIDERS, provider_section_for};
+    use super::super::{KNOWN_PROVIDERS, provider_section_for};
 
     #[test]
     fn provider_section_for_round_trips_registry_presets() {
