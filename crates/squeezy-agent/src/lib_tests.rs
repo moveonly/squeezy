@@ -9624,6 +9624,46 @@ fn replace_config_swaps_immediately() {
 }
 
 #[test]
+fn replace_config_preserves_derived_agents_md_instructions() {
+    let root = temp_workspace("agent_replace_preserves_agents_md");
+    fs::write(
+        root.join("AGENTS.md"),
+        "Always preserve project-specific instruction context.\n",
+    )
+    .expect("write AGENTS.md");
+    let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::named("anthropic", vec![]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let mut agent = Agent::new(config, provider);
+    let original = agent.config().instructions.clone();
+    assert!(
+        original.contains("Project conventions from AGENTS.md"),
+        "startup instructions should include AGENTS.md: {original}"
+    );
+
+    let mut next = agent.config_snapshot();
+    next.tui.response_verbosity = squeezy_core::ResponseVerbosity::Concise;
+    agent.replace_config(next);
+
+    let reloaded = agent.config().instructions.clone();
+    assert!(
+        reloaded.contains("Project conventions from AGENTS.md"),
+        "reload must preserve AGENTS.md-derived instructions: {reloaded}"
+    );
+    assert_eq!(
+        reloaded
+            .matches("Project conventions from AGENTS.md")
+            .count(),
+        1,
+        "reload must rebuild, not duplicate, derived instruction blocks"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn arm_then_drain_applies_swap_with_optional_provider() {
     let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(vec![]));
     let mut agent = Agent::new(AppConfig::default(), provider);
@@ -9658,20 +9698,14 @@ fn model_switch_re_derives_context_window() {
     };
     let mut agent = Agent::new(config, openai);
     assert_eq!(
-        agent
-            .config_snapshot()
-            .context_compaction
-            .model_context_window,
+        agent.config().context_compaction.model_context_window,
         Some(400_000)
     );
 
     let anthropic: Arc<dyn LlmProvider> = Arc::new(MockProvider::named("anthropic", vec![]));
     agent.replace_provider(anthropic, "claude-opus-4-7".to_string());
     assert_eq!(
-        agent
-            .config_snapshot()
-            .context_compaction
-            .model_context_window,
+        agent.config().context_compaction.model_context_window,
         Some(200_000)
     );
 }
@@ -9688,20 +9722,14 @@ fn explicit_context_window_survives_model_switch() {
     config.context_compaction.model_context_window = Some(123_456);
     let mut agent = Agent::new(config, openai);
     assert_eq!(
-        agent
-            .config_snapshot()
-            .context_compaction
-            .model_context_window,
+        agent.config().context_compaction.model_context_window,
         Some(123_456)
     );
 
     let anthropic: Arc<dyn LlmProvider> = Arc::new(MockProvider::named("anthropic", vec![]));
     agent.replace_provider(anthropic, "claude-opus-4-7".to_string());
     assert_eq!(
-        agent
-            .config_snapshot()
-            .context_compaction
-            .model_context_window,
+        agent.config().context_compaction.model_context_window,
         Some(123_456),
         "explicit window override must not be clobbered by re-derivation"
     );

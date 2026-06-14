@@ -27925,6 +27925,67 @@ fn consecutive_settings_reload_statuses_coalesce() {
     );
 }
 
+#[tokio::test]
+async fn external_settings_reload_ignores_agent_derived_context_window() {
+    let root = temp_workspace("settings_reload_context_window");
+    let settings_path = root.join("settings.toml");
+    fs::write(
+        &settings_path,
+        "[model]\nprovider = \"anthropic\"\nmodel = \"claude-sonnet-4-6\"\n",
+    )
+    .expect("write settings");
+    let _settings = ScopedSettingsPath::new(settings_path);
+    let config = AppConfig::from_env_and_settings().expect("load settings");
+    assert_eq!(
+        config.context_compaction.model_context_window, None,
+        "raw settings leave model_context_window unset"
+    );
+
+    let mut app = TuiApp::new_with_clipboard(
+        "anthropic",
+        &config,
+        SessionMode::Build,
+        None,
+        Box::new(NoopClipboard),
+    );
+    let mut agent = Agent::new_ephemeral(
+        config,
+        Arc::new(UnavailableProvider::new("anthropic", "test provider")),
+    );
+    assert!(
+        agent
+            .config()
+            .context_compaction
+            .model_context_window
+            .is_some(),
+        "agent derives a runtime context window from the model registry"
+    );
+    let before_tokens = agent
+        .session_accounting_snapshot()
+        .await
+        .transmitted_request
+        .input_tokens;
+
+    apply_external_settings_reload(&mut app, &mut agent);
+
+    assert!(
+        app.transcript.is_empty(),
+        "unchanged raw settings must not emit a reload status; got {:?}",
+        app.transcript
+    );
+    let after_tokens = agent
+        .session_accounting_snapshot()
+        .await
+        .transmitted_request
+        .input_tokens;
+    assert_eq!(
+        after_tokens, before_tokens,
+        "ignored reload must not change the zero-turn /context estimate"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn overlay_collapsed_folds_long_output_expanded_shows_all() {
     let mut app = test_app(SessionMode::Build);

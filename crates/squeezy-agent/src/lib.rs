@@ -1413,6 +1413,14 @@ pub struct ModeStateSnapshot {
 
 #[derive(Clone)]
 pub struct Agent {
+    /// Operator/session config in the same shape produced by settings loading.
+    /// This intentionally excludes runtime-derived instruction additions
+    /// (skills preamble, AGENTS.md, memory guidance) and registry-derived
+    /// context windows, so settings reload comparisons do not mistake derived
+    /// state for a disk edit.
+    source_config: AppConfig,
+    /// Runtime config used when assembling requests. This includes derived
+    /// instruction additions and the active model's derived context window.
     config: AppConfig,
     provider: Arc<dyn LlmProvider>,
     tools: ToolRegistry,
@@ -1945,6 +1953,7 @@ impl Agent {
         telemetry: TelemetryClient,
         prior_metrics: SessionMetrics,
     ) -> Self {
+        let source_config = config.clone();
         // Arm context compaction by default. The mid-turn micro-compaction
         // tier (and the full tier) early-returns when
         // `context_compaction.model_context_window` is `None`, and that field
@@ -2098,70 +2107,7 @@ impl Agent {
             )
             .expect("current directory must be a valid tool root")
         });
-        if let Some(preamble) = tools.skills_preamble() {
-            if preamble.omitted_count > 0 {
-                log_session_event(
-                    session_log.as_ref(),
-                    &redactor,
-                    "skills_preamble_truncated",
-                    None,
-                    Some(format!(
-                        "{} skill(s) omitted from available skills preamble",
-                        preamble.omitted_count
-                    )),
-                    json!({ "omitted_count": preamble.omitted_count }),
-                );
-            }
-            config.instructions = format!("{}\n\n{}", config.instructions, preamble.body);
-        }
-        if let Some(repo_doc) = ingest_agents_md(
-            &config.workspace_root,
-            config.context_compaction.repo_doc_max_bytes,
-        ) {
-            log_session_event(
-                session_log.as_ref(),
-                &redactor,
-                "agents_md_ingested",
-                None,
-                Some(format!("{} bytes ingested from AGENTS.md", repo_doc.len())),
-                json!({ "bytes": repo_doc.len() }),
-            );
-            config.instructions = format!(
-                "{}\n\nProject conventions from AGENTS.md:\n{}",
-                config.instructions, repo_doc
-            );
-        }
-        if config.context_compaction.user_memory_max_bytes > 0 {
-            // Surface the memory guidance whenever memory is enabled — even with
-            // an empty index — so a first-time user is bootstrapped into the
-            // save/recall loop instead of the feature lying dormant until they
-            // hand-author `~/.squeezy/MEMORY.md`. The index body is appended when
-            // present. Replay zeroes `user_memory_max_bytes`, so this whole block
-            // is omitted there and the cached prefix stays byte-stable.
-            let cap = config.context_compaction.user_memory_max_bytes;
-            let global_index = ingest_user_memory(cap);
-            let project_index = ingest_project_memory(&config.workspace_root, cap);
-            log_session_event(
-                session_log.as_ref(),
-                &redactor,
-                "user_memory_ingested",
-                None,
-                Some(format!(
-                    "memory enabled; global index {} bytes, project index {} bytes",
-                    global_index.as_deref().map(str::len).unwrap_or(0),
-                    project_index.as_deref().map(str::len).unwrap_or(0),
-                )),
-                json!({
-                    "global_index_bytes": global_index.as_deref().map(str::len).unwrap_or(0),
-                    "project_index_bytes": project_index.as_deref().map(str::len).unwrap_or(0),
-                }),
-            );
-            config.instructions = format!(
-                "{}\n\n{}",
-                config.instructions,
-                memory_prompt_block(global_index.as_deref(), project_index.as_deref())
-            );
-        }
+        append_session_instruction_blocks(&mut config, &tools, session_log.as_ref(), &redactor);
         let ambiguous_skills = tools.ambiguous_skill_names();
         if !ambiguous_skills.is_empty() {
             log_session_event(
@@ -2215,6 +2161,7 @@ impl Agent {
         // already considered in the prior session — only new turns are scanned.
         let initial_extracted_memory_len = conversation_state.transcript.len();
         let agent = Self {
+            source_config,
             telemetry,
             session_started_at: Instant::now(),
             prior_metrics,
@@ -2348,10 +2295,17 @@ impl Agent {
         self.subagents.clone()
     }
 
-    /// Clone the current effective config — used by the config screen to
-    /// initialize its editing buffer.
+    /// Clone the current operator/session config — used by the config screen to
+    /// initialize its editing buffer. This intentionally excludes runtime-only
+    /// instruction additions and registry-derived context windows.
     pub fn config_snapshot(&self) -> AppConfig {
-        self.config.clone()
+        self.source_config.clone()
+    }
+
+    /// Clone the current config in the same shape as settings loading produces,
+    /// for external reload comparisons.
+    pub fn settings_reload_config_snapshot(&self) -> AppConfig {
+        self.source_config.clone()
     }
 
     /// Replace the in-process config immediately. Use for Immediate-tier
@@ -2360,13 +2314,14 @@ impl Agent {
     /// build time (tools/MCP/redactor) are NOT rebuilt; pair this with the
     /// "restart required" badge in the UI for those.
     pub fn replace_config(&mut self, next: AppConfig) {
-        if next.telemetry != self.config.telemetry {
+        if next.telemetry != self.source_config.telemetry {
             self.telemetry = TelemetryClient::from_config(&next);
         }
-        let skills_changed = next.skills != self.config.skills;
-        let workspace_changed = next.workspace_root != self.config.workspace_root;
+        let skills_changed = next.skills != self.source_config.skills;
+        let workspace_changed = next.workspace_root != self.source_config.workspace_root;
         self.schedule_mcp_servers_reload_if_changed(&next);
-        self.config = next;
+        self.source_config = next;
+        self.config = self.source_config.clone();
         // A reloaded config carries the operator's explicit window (or None) —
         // it is not registry-derived (only `build()` derives). Refresh the
         // explicit baseline, then re-derive for the active model so the window
@@ -2383,6 +2338,12 @@ impl Agent {
             // firing against the user's stated intent.
             self.rebuild_hooks_registry();
         }
+        append_session_instruction_blocks(
+            &mut self.config,
+            &self.tools,
+            self.session_log.as_ref(),
+            &self.redactor,
+        );
     }
 
     /// Spawn a background `replace_mcp_servers` against the tool
@@ -2481,6 +2442,7 @@ impl Agent {
     /// pick up the new one.
     pub fn replace_provider(&mut self, next: Arc<dyn LlmProvider>, model: String) {
         self.provider = next;
+        self.source_config.model = model.clone();
         self.config.model = model;
         self.re_derive_model_context_window();
     }
@@ -2527,8 +2489,8 @@ impl Agent {
     /// config takes effect for the very next request.
     pub fn drain_pending_swap(&mut self) -> Option<PendingConfigSwap> {
         let swap = self.pending_swap.take()?;
-        let skills_changed = swap.config.skills != self.config.skills;
-        let workspace_changed = swap.config.workspace_root != self.config.workspace_root;
+        let skills_changed = swap.config.skills != self.source_config.skills;
+        let workspace_changed = swap.config.workspace_root != self.source_config.workspace_root;
         // Honour any `[mcp.servers]` drift bundled into the swap on
         // the same beat as the provider/config replacement. Without
         // this, a settings-watcher reload that *also* changes the
@@ -2537,7 +2499,8 @@ impl Agent {
         // silently fall out of sync with `AppConfig.mcp_servers` until
         // the next process restart.
         self.schedule_mcp_servers_reload_if_changed(&swap.config);
-        self.config = swap.config.clone();
+        self.source_config = swap.config.clone();
+        self.config = self.source_config.clone();
         if let Some(provider) = swap.provider.clone() {
             self.provider = provider;
         }
@@ -2551,6 +2514,12 @@ impl Agent {
             self.rebuild_skills_catalog();
             self.rebuild_hooks_registry();
         }
+        append_session_instruction_blocks(
+            &mut self.config,
+            &self.tools,
+            self.session_log.as_ref(),
+            &self.redactor,
+        );
         Some(swap)
     }
 
@@ -6972,13 +6941,79 @@ fn effective_tool_choice(configured: Option<&str>, round: usize) -> Option<Strin
     }
 }
 
-/// Appends a "Pinned context" block to the per-turn instructions.
-///
-/// Pins are user-curated durable facts. They must be visible to the
-/// model on every turn — not only after compaction lands the summary —
-/// otherwise `/pin` is purely UI until the conversation crosses the
-/// compaction threshold. Each pin contributes one line; long summaries
-/// are clipped via `compact_text` so the instructions stay bounded.
+/// Apply the same session-scoped instruction additions used at startup.
+fn append_session_instruction_blocks(
+    config: &mut AppConfig,
+    tools: &ToolRegistry,
+    session_log: Option<&SessionHandle>,
+    redactor: &Redactor,
+) {
+    if let Some(preamble) = tools.skills_preamble() {
+        if preamble.omitted_count > 0 {
+            log_session_event(
+                session_log,
+                redactor,
+                "skills_preamble_truncated",
+                None,
+                Some(format!(
+                    "{} skill(s) omitted from available skills preamble",
+                    preamble.omitted_count
+                )),
+                json!({ "omitted_count": preamble.omitted_count }),
+            );
+        }
+        config.instructions = format!("{}\n\n{}", config.instructions, preamble.body);
+    }
+    if let Some(repo_doc) = ingest_agents_md(
+        &config.workspace_root,
+        config.context_compaction.repo_doc_max_bytes,
+    ) {
+        log_session_event(
+            session_log,
+            redactor,
+            "agents_md_ingested",
+            None,
+            Some(format!("{} bytes ingested from AGENTS.md", repo_doc.len())),
+            json!({ "bytes": repo_doc.len() }),
+        );
+        config.instructions = format!(
+            "{}\n\nProject conventions from AGENTS.md:\n{}",
+            config.instructions, repo_doc
+        );
+    }
+    if config.context_compaction.user_memory_max_bytes > 0 {
+        // Surface the memory guidance whenever memory is enabled — even with
+        // an empty index — so a first-time user is bootstrapped into the
+        // save/recall loop instead of the feature lying dormant until they
+        // hand-author `~/.squeezy/MEMORY.md`. The index body is appended when
+        // present. Replay zeroes `user_memory_max_bytes`, so this whole block
+        // is omitted there and the cached prefix stays byte-stable.
+        let cap = config.context_compaction.user_memory_max_bytes;
+        let global_index = ingest_user_memory(cap);
+        let project_index = ingest_project_memory(&config.workspace_root, cap);
+        log_session_event(
+            session_log,
+            redactor,
+            "user_memory_ingested",
+            None,
+            Some(format!(
+                "memory enabled; global index {} bytes, project index {} bytes",
+                global_index.as_deref().map(str::len).unwrap_or(0),
+                project_index.as_deref().map(str::len).unwrap_or(0),
+            )),
+            json!({
+                "global_index_bytes": global_index.as_deref().map(str::len).unwrap_or(0),
+                "project_index_bytes": project_index.as_deref().map(str::len).unwrap_or(0),
+            }),
+        );
+        config.instructions = format!(
+            "{}\n\n{}",
+            config.instructions,
+            memory_prompt_block(global_index.as_deref(), project_index.as_deref())
+        );
+    }
+}
+
 /// Walk from `cwd` up to the nearest `.git` directory and concatenate every
 /// `AGENTS.md` found from root downward, capped at `max_bytes` of UTF-8.
 /// Returns `None` when ingestion is disabled (`max_bytes == 0`), no
