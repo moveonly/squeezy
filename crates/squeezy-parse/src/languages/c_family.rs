@@ -421,6 +421,20 @@ pub(crate) fn extract_c_include(
     let Some(path) = c_include_path(raw) else {
         return;
     };
+    // `<...>` includes resolve against the toolchain's system header search
+    // path, never the workspace, while `"..."` includes are local first.
+    // tree-sitter exposes the distinction as the `path` node kind
+    // (`system_lib_string` vs `string_literal`); a text-opener fallback keeps
+    // the classification working if the field is ever absent. The provenance
+    // reason carries the origin (both keep the `include directive` substring the
+    // resolver already filters on) so the include resolver can skip
+    // workspace path-matching for system headers without overloading
+    // `is_global` (which is reserved for C# global using).
+    let reason = if c_include_is_system(node, raw) {
+        "system include directive"
+    } else {
+        "include directive"
+    };
     // `#include "x.h"` exposes every declaration in `x.h` to the including
     // file the same way Rust's `use module::*;` does. Marking the import as
     // a glob lets `add_import_edges` and the call resolver consult the
@@ -434,11 +448,24 @@ pub(crate) fn extract_c_include(
         is_reexport: false,
         is_static: false,
         span: span_from_node(node),
-        provenance: Provenance::new(c_family_parser_name(ctx.file.language), "include directive"),
+        provenance: Provenance::new(c_family_parser_name(ctx.file.language), reason),
         kind: ImportKind::Wildcard,
         imported_name: None,
         is_global: false,
     });
+}
+
+/// True for a `<...>` system include. Prefers the `path` node kind
+/// (`system_lib_string`) and falls back to the raw opening delimiter.
+pub(crate) fn c_include_is_system(node: Node<'_>, raw: &str) -> bool {
+    if let Some(path) = node.child_by_field_name("path") {
+        return path.kind() == "system_lib_string";
+    }
+    let trimmed = raw.trim();
+    trimmed
+        .find(['"', '<'])
+        .map(|index| trimmed.as_bytes()[index] == b'<')
+        .unwrap_or(false)
 }
 
 pub(crate) fn c_include_path(raw: &str) -> Option<String> {
