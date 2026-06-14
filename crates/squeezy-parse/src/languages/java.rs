@@ -155,6 +155,7 @@ pub(crate) fn java_symbol_from_node(
     ) {
         attributes.extend(java_type_inheritance_attributes(node, ctx.source));
     }
+    attributes.extend(java_generic_constraint_attributes(node, ctx.source));
     attributes.sort();
     attributes.dedup();
 
@@ -570,4 +571,33 @@ pub(crate) fn java_type_inheritance_attributes(node: Node<'_>, source: &str) -> 
     attributes.extend(base.into_iter().map(|name| format!("base:{name}")));
     attributes.extend(iface.into_iter().map(|name| format!("iface:{name}")));
     attributes
+}
+
+/// Generic type-parameter bounds (`<T extends Comparable<T>>`) lowered to
+/// `base:<Leaf>` constraint attributes for both types and methods. The grammar
+/// nests each bound under `type_parameters → type_parameter → type_bound`,
+/// whose children are the bound types. Only the bound types are emitted; the
+/// parameter names (`T`, `U`) are intentionally dropped so they neither pollute
+/// reference search nor leak as undifferentiated `Type` references.
+pub(crate) fn java_generic_constraint_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(type_parameters) = node.child_by_field_name("type_parameters") else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    let mut params = type_parameters.walk();
+    for parameter in type_parameters.named_children(&mut params) {
+        if parameter.kind() != "type_parameter" {
+            continue;
+        }
+        let mut bounds = parameter.walk();
+        for bound in parameter.named_children(&mut bounds) {
+            if bound.kind() == "type_bound" {
+                collect_java_type_names(bound, source, &mut names);
+            }
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| format!("base:{name}"))
+        .collect()
 }
