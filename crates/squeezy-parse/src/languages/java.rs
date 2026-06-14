@@ -65,6 +65,10 @@ pub(crate) fn visit_java_node(
             owner_symbol.clone()
         };
         ctx.symbols.push(symbol);
+        if node.kind() == "record_declaration" {
+            let components = java_record_component_symbols(node, ctx, next_parent.as_ref());
+            ctx.symbols.extend(components);
+        }
         visit_java_children(node, ctx, next_parent, next_owner);
         return;
     }
@@ -234,6 +238,70 @@ pub(crate) fn java_field_symbols_from_node(
             docs: docs.clone(),
             attributes: attributes.clone(),
             provenance: Provenance::new("tree-sitter-java", "field_declaration declaration"),
+            confidence: Confidence::ExactSyntax,
+            freshness: Freshness::Fresh,
+            arity: None,
+        });
+    }
+    symbols
+}
+
+/// Positional record components (`record Point(int x, int y)`) are the
+/// synthesized init-only properties of a record. The grammar exposes them as
+/// `formal_parameter`s under the record's `parameters` field, but they are
+/// otherwise invisible to decl/reference search and leave the record looking
+/// empty. Emit a `Field` symbol per component (parented to the record, type
+/// recorded as a `type:` attribute) so the component resolves like any field.
+pub(crate) fn java_record_component_symbols(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Vec<ParsedSymbol> {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let mut symbols = Vec::new();
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter.kind() != "formal_parameter" {
+            continue;
+        }
+        let Some(name) = parameter
+            .child_by_field_name("name")
+            .and_then(|child| node_text(child, ctx.source).ok())
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let mut attributes = Vec::new();
+        if let Some(field_type) = java_field_type(parameter, ctx.source) {
+            attributes.push(format!("type:{field_type}"));
+        }
+        attributes.push("java:record-component".to_string());
+        attributes.sort();
+        attributes.dedup();
+        let span = span_from_node(parameter);
+        let id = symbol_id(&ctx.file, parent_id.as_ref(), SymbolKind::Field, &name, span);
+        symbols.push(ParsedSymbol {
+            id,
+            file_id: ctx.file.id.clone(),
+            parent_id: parent_id.clone(),
+            name,
+            kind: SymbolKind::Field,
+            language_identity: None,
+            span,
+            body_span: None,
+            signature_span: None,
+            signature: node_text(parameter, ctx.source)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            visibility: None,
+            docs: Vec::new(),
+            attributes,
+            provenance: Provenance::new("tree-sitter-java", "record component declaration"),
             confidence: Confidence::ExactSyntax,
             freshness: Freshness::Fresh,
             arity: None,
