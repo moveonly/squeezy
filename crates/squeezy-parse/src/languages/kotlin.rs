@@ -306,6 +306,17 @@ fn kotlin_class_declaration_symbol(
     if kotlin_class_modifier_present(node, "inner") {
         attributes.push("kotlin:inner".to_string());
     }
+    // `value class` / `value` modifier (inline value classes). `inline` is a
+    // function-only modifier in this grammar, so `value` is the SAM-free flag.
+    if kotlin_class_modifier_present(node, "value") {
+        attributes.push("kotlin:value".to_string());
+    }
+    // A functional interface (`fun interface Foo`) is a SAM type. The grammar
+    // emits `fun` and `interface` as anonymous tokens, so scan the unnamed
+    // children for the `fun` keyword preceding `interface`.
+    if kotlin_class_is_fun_interface(node) {
+        attributes.push("kotlin:fun-interface".to_string());
+    }
     attributes.sort();
     attributes.dedup();
 
@@ -1725,6 +1736,23 @@ fn kotlin_class_is_interface(node: Node<'_>) -> bool {
     let mut cursor = node.walk();
     node.children(&mut cursor)
         .any(|child| child.kind() == "interface")
+}
+
+/// True when the declaration is a `fun interface` (a Kotlin SAM / functional
+/// interface). The `fun` and `interface` keywords are anonymous tokens, so
+/// both must be present among the (unnamed) children.
+fn kotlin_class_is_fun_interface(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    let mut saw_fun = false;
+    let mut saw_interface = false;
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "fun" => saw_fun = true,
+            "interface" => saw_interface = true,
+            _ => {}
+        }
+    }
+    saw_fun && saw_interface
 }
 
 fn kotlin_class_is_enum(node: Node<'_>) -> bool {
