@@ -124,7 +124,7 @@ fn every_preview_kind_has_an_ascii_noun() {
     }
 }
 
-/// `HoverPreview::new` clamps the body to `PREVIEW_BODY_LINES`, caps each line at
+/// `HoverPreview::new` wraps the body to `PREVIEW_BODY_LINES`, caps each line at
 /// `PREVIEW_LINE_CAP`, and drops empty lines — so a careless caller can never blow
 /// the popover's fixed size.
 #[test]
@@ -154,12 +154,16 @@ fn preview_new_bounds_body_lines_and_widths() {
     );
     for line in &preview.body {
         assert!(
-            line.chars().count() <= PREVIEW_LINE_CAP + 1,
-            "each body line is capped (+1 for the ellipsis): {line:?}",
+            line.chars().count() <= PREVIEW_LINE_CAP,
+            "each body line is capped: {line:?}",
         );
         assert!(
             !line.trim().is_empty(),
             "empty lines are filtered: {line:?}"
+        );
+        assert!(
+            !line.contains('\u{2026}'),
+            "wrapping avoids ellipsis truncation: {line:?}"
         );
     }
     assert_eq!(
@@ -167,7 +171,10 @@ fn preview_new_bounds_body_lines_and_widths() {
         "the title is whitespace-collapsed",
     );
     assert!(preview.can_activate(), "an open-in-detail verb activates");
-    assert_eq!(preview.activate_hint(), "double-click / Ctrl+Enter to open");
+    assert_eq!(
+        preview.activate_hint(),
+        "double-click row / Ctrl+Enter to open"
+    );
 }
 
 /// A preview with no primary verb reports read-only and a click-to-select hint.
@@ -182,7 +189,7 @@ fn preview_without_primary_is_read_only() {
         PreviewSource::Hover,
     );
     assert!(!preview.can_activate());
-    assert_eq!(preview.activate_hint(), "click to select");
+    assert_eq!(preview.activate_hint(), "click row to select");
     assert!(
         !preview.is_keyboard(),
         "a hover-sourced preview is not keyboard"
@@ -203,19 +210,45 @@ fn keyboard_sourced_preview_is_flagged() {
     assert!(preview.is_keyboard());
 }
 
-/// `clamp_line` collapses whitespace, leaves short ASCII untouched, and truncates
-/// an over-long line with an ellipsis without panicking on multi-byte chars.
+/// `clamp_line` collapses whitespace, leaves short ASCII untouched, and caps an
+/// over-long line without adding an ellipsis.
 #[test]
-fn clamp_line_collapses_and_truncates() {
+fn clamp_line_collapses_and_caps_without_ellipsis() {
     assert_eq!(clamp_line("  hello   world  "), "hello world");
     let long = "é".repeat(PREVIEW_LINE_CAP + 5);
     let clamped = clamp_line(&long);
     assert_eq!(
         clamped.chars().count(),
-        PREVIEW_LINE_CAP + 1,
-        "truncated to the cap plus a single ellipsis char",
+        PREVIEW_LINE_CAP,
+        "capped to the preview width",
     );
-    assert!(clamped.ends_with('\u{2026}'), "ends with an ellipsis");
+    assert!(
+        !clamped.contains('\u{2026}'),
+        "no ellipsis truncation in preview text",
+    );
+}
+
+#[test]
+fn wrap_preview_text_wraps_words_without_ellipsis() {
+    let text = format!(
+        "alpha {} omega",
+        "x".repeat(PREVIEW_LINE_CAP.saturating_sub(10))
+    );
+    let wrapped = wrap_preview_text(&text, PREVIEW_BODY_LINES);
+    assert!(
+        wrapped.len() > 1,
+        "long preview prose wraps to multiple rows: {wrapped:?}",
+    );
+    assert!(
+        wrapped
+            .iter()
+            .all(|line| line.chars().count() <= PREVIEW_LINE_CAP),
+        "every wrapped row stays inside the preview width: {wrapped:?}",
+    );
+    assert!(
+        wrapped.iter().all(|line| !line.contains('\u{2026}')),
+        "wrapped rows do not use ellipsis truncation: {wrapped:?}",
+    );
 }
 
 // ---- popover geometry ----

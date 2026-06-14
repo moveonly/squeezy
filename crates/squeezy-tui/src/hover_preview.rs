@@ -218,9 +218,9 @@ pub(crate) struct HoverPreview {
 
 impl HoverPreview {
     /// Build a preview for a unit. `title` and `body` are already bounded by the
-    /// caller; this clamps the body to [`PREVIEW_BODY_LINES`] and each line to
-    /// [`PREVIEW_LINE_CAP`] as a defensive backstop so a careless caller can
-    /// never blow the popover's fixed size.
+    /// caller; this wraps the body to [`PREVIEW_LINE_CAP`] and keeps at most
+    /// [`PREVIEW_BODY_LINES`] body rows as a defensive backstop so a careless
+    /// caller can never blow the popover's fixed size.
     pub(crate) fn new(
         entry_id: u64,
         kind: PreviewKind,
@@ -229,18 +229,25 @@ impl HoverPreview {
         primary: Option<Action>,
         source: PreviewSource,
     ) -> Self {
-        let title = clamp_line(&title);
-        let body = body
-            .into_iter()
-            .take(PREVIEW_BODY_LINES)
-            .map(|line| clamp_line(&line))
-            .filter(|line| !line.is_empty())
-            .collect();
+        let mut title_lines = wrap_preview_text(&title, PREVIEW_BODY_LINES + 1);
+        let title = if title_lines.is_empty() {
+            String::new()
+        } else {
+            title_lines.remove(0)
+        };
+        let mut bounded_body = title_lines;
+        for line in body {
+            let remaining = PREVIEW_BODY_LINES.saturating_sub(bounded_body.len());
+            if remaining == 0 {
+                break;
+            }
+            bounded_body.extend(wrap_preview_text(&line, remaining));
+        }
         Self {
             entry_id,
             kind,
             title,
-            body,
+            body: bounded_body,
             meta: None,
             primary,
             source,
@@ -273,23 +280,85 @@ impl HoverPreview {
     /// honest about whether double-click/Enter does anything here.
     pub(crate) fn activate_hint(&self) -> &'static str {
         if self.primary.is_some() {
-            "double-click / Ctrl+Enter to open"
+            "double-click row / Ctrl+Enter to open"
         } else {
-            "click to select"
+            "click row to select"
         }
     }
 }
 
 /// Collapse `text` to a single trimmed line and cap it at [`PREVIEW_LINE_CAP`]
-/// characters (appending an ellipsis when truncated). Whitespace-collapsing
-/// keeps a multi-space or newline-laden source from blowing the popover width.
+/// characters. Whitespace-collapsing keeps a multi-space or newline-laden source
+/// from blowing the popover width.
 pub(crate) fn clamp_line(text: &str) -> String {
     let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= PREVIEW_LINE_CAP {
         return collapsed;
     }
-    let prefix: String = collapsed.chars().take(PREVIEW_LINE_CAP).collect();
-    format!("{prefix}\u{2026}")
+    collapsed.chars().take(PREVIEW_LINE_CAP).collect()
+}
+
+/// Collapse whitespace and wrap a preview field to bounded display rows. Long
+/// words split by character cells; ordinary prose wraps at word boundaries. No
+/// ellipsis is inserted: the preview remains bounded, and the footer/action
+/// affordances tell the user where to inspect the full entry.
+pub(crate) fn wrap_preview_text(text: &str, max_lines: usize) -> Vec<String> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in collapsed.split(' ') {
+        let word_len = word.chars().count();
+        if current.is_empty() {
+            push_word_wrapped(&mut lines, &mut current, word, word_len, max_lines);
+        } else if current.chars().count() + 1 + word_len <= PREVIEW_LINE_CAP {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            if lines.len() >= max_lines {
+                return lines;
+            }
+            push_word_wrapped(&mut lines, &mut current, word, word_len, max_lines);
+        }
+        if lines.len() >= max_lines {
+            return lines;
+        }
+    }
+    if !current.is_empty() && lines.len() < max_lines {
+        lines.push(current);
+    }
+    lines
+}
+
+fn push_word_wrapped(
+    lines: &mut Vec<String>,
+    current: &mut String,
+    word: &str,
+    word_len: usize,
+    max_lines: usize,
+) {
+    if word_len <= PREVIEW_LINE_CAP {
+        current.push_str(word);
+        return;
+    }
+    let mut chunk = String::new();
+    for ch in word.chars() {
+        if chunk.chars().count() >= PREVIEW_LINE_CAP {
+            lines.push(std::mem::take(&mut chunk));
+            if lines.len() >= max_lines {
+                return;
+            }
+        }
+        chunk.push(ch);
+    }
+    *current = chunk;
 }
 
 /// The fixed-size popover rect for a preview anchored near `anchor_row` inside

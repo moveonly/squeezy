@@ -74,11 +74,11 @@ fn can_jump_tracks_transcript_presence() {
 fn activate_hint_is_honest_about_jump() {
     assert_eq!(
         preview(SubagentStatus::Done, PreviewSource::Hover).activate_hint(),
-        "double-click / jump to open transcript"
+        "double-click row / jump to open transcript"
     );
     assert_eq!(
         preview(SubagentStatus::Capped, PreviewSource::Hover).activate_hint(),
-        "click to select"
+        "click row to select"
     );
 }
 
@@ -126,11 +126,12 @@ fn new_clamps_each_line_to_one_bounded_line() {
     );
     // The constructor collapses whitespace/newlines and caps width, so no field can
     // blow the popover's fixed size.
-    assert!(p.name.chars().count() <= crate::hover_preview::PREVIEW_LINE_CAP + 1);
+    assert!(p.name.chars().count() <= crate::hover_preview::PREVIEW_LINE_CAP);
     for line in p.body() {
-        assert!(line.chars().count() <= crate::hover_preview::PREVIEW_LINE_CAP + 1);
+        assert!(line.chars().count() <= crate::hover_preview::PREVIEW_LINE_CAP);
         // Newlines were collapsed into a single line.
         assert!(!line.contains('\n'));
+        assert!(!line.contains('\u{2026}'));
     }
 }
 

@@ -889,6 +889,14 @@ fn subagent_preview_popover_paints_through_real_render() {
         output.contains("jump to open transcript"),
         "jump footer missing: {output}"
     );
+    assert!(
+        output.contains("double-click row"),
+        "unselected preview should name the row as the click target: {output}"
+    );
+    assert!(
+        !output.contains("selected \u{00b7}"),
+        "unselected preview must not advertise selected-row actions: {output}"
+    );
 }
 
 #[test]
@@ -45374,11 +45382,140 @@ fn caret_cell_for_entry(
     None
 }
 
+fn toggle_cell_for_entry_at_or_after(
+    app: &TuiApp,
+    entry_id: u64,
+    min_col: u16,
+    width: u16,
+    height: u16,
+) -> Option<(u16, u16)> {
+    for row in 0..height {
+        for col in min_col..width {
+            if let Some((
+                interaction::TargetKey::Entry(id),
+                interaction::Action::ToggleEntryCollapsed(_),
+            )) = app.click_target_at(col, row)
+                && id.0 == entry_id
+            {
+                return Some((col, row));
+            }
+        }
+    }
+    None
+}
+
+fn focus_cell_for_entry_at_or_after(
+    app: &TuiApp,
+    entry_id: u64,
+    min_col: u16,
+    width: u16,
+    height: u16,
+) -> Option<(u16, u16)> {
+    for row in 0..height {
+        for col in min_col..width {
+            if let Some((interaction::TargetKey::Entry(id), interaction::Action::FocusEntry(_))) =
+                app.click_target_at(col, row)
+                && id.0 == entry_id
+            {
+                return Some((col, row));
+            }
+        }
+    }
+    None
+}
+
+fn previewable_cell_for_entry(
+    app: &TuiApp,
+    entry_id: u64,
+    width: u16,
+    height: u16,
+) -> Option<(u16, u16)> {
+    for row in 0..height {
+        for col in 0..width {
+            if let Some((interaction::TargetKey::Entry(id), _)) = app.click_target_at(col, row)
+                && id.0 == entry_id
+            {
+                return Some((col, row));
+            }
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn card_header_toggle_target_extends_past_the_narrow_caret_zone() {
+    // Tool cards paint their disclosure/status marker inside the card header, not
+    // necessarily inside the old three-column hit zone once the rail/gutter is in
+    // play. A click on the visible header row beyond that zone must still fold the
+    // card instead of feeling one row/column off.
+    let mut app = app_with_hover_preview(1);
+    let entry_id = active_transcript_entries(&app)[1].id;
+    let collapsed_before = active_transcript_entries(&app)[1].collapsed;
+
+    let _ = render_to_string(&app, 100, 30);
+    let (col, row) =
+        toggle_cell_for_entry_at_or_after(&app, entry_id, CARD_CARET_WIDTH + 1, 100, 30)
+            .expect("tool-card header registers a widened fold target");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_ne!(
+        active_transcript_entries(&app)[1].collapsed,
+        collapsed_before,
+        "clicking the visible tool-card header toggles the fold",
+    );
+}
+
+#[tokio::test]
+async fn card_header_remainder_click_selects_the_conversation_entry() {
+    // The widened fold target must not swallow the whole card header: the area to
+    // the right remains the conversation-selection target that the preview
+    // advertises.
+    let mut app = app_with_hover_preview(1);
+    let entry_id = active_transcript_entries(&app)[1].id;
+    app.selected_entry = None;
+    let collapsed_before = active_transcript_entries(&app)[1].collapsed;
+
+    let _ = render_to_string(&app, 100, 30);
+    let (col, row) =
+        focus_cell_for_entry_at_or_after(&app, entry_id, CARD_HEADER_FOLD_WIDTH + 1, 100, 30)
+            .expect("tool-card header remainder registers a focus target");
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(
+        app.selected_entry,
+        Some(1),
+        "clicking the header remainder selects the conversation entry",
+    );
+    assert_eq!(
+        active_transcript_entries(&app)[1].collapsed,
+        collapsed_before,
+        "selection click does not also toggle the fold",
+    );
+}
+
 #[tokio::test]
 async fn hover_preview_alt_1_opens_popover_for_focused_unit() {
     // Focus the tool result (detail-worthy -> the preview offers open-in-detail).
     let mut app = app_with_hover_preview(1);
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
 
     assert!(
         app.hover_preview.is_none(),
@@ -45413,19 +45550,107 @@ async fn hover_preview_alt_1_opens_popover_for_focused_unit() {
         "a keyboard-sourced preview names itself pinned in the header:\n{out}",
     );
     assert!(
-        out.contains("double-click / Ctrl+Enter to open"),
-        "activation hint paints:\n{out}",
+        out.contains("selected entry \u{00b7}"),
+        "a preview for the focused conversation entry shows selected-state state:\n{out}",
+    );
+    let expected_actions = [
+        (
+            key_hint(&app, keymap::Action::CopyFocusedEntry),
+            "copy entry",
+        ),
+        (key_hint(&app, keymap::Action::CopyAllCode), "copy code"),
+        (
+            key_hint(&app, keymap::Action::CopyCurrentToolOutput),
+            "copy tool output",
+        ),
+        (
+            key_hint(&app, keymap::Action::AnnotateEntry),
+            "annotate entry",
+        ),
+        (
+            key_hint(&app, keymap::Action::OpenFocusedInDetail),
+            "open in detail",
+        ),
+        (
+            key_hint(&app, keymap::Action::ToggleFocusedFold),
+            "expand entry",
+        ),
+        (
+            key_hint(&app, keymap::Action::ToggleRelatedLinks),
+            "related entries",
+        ),
+        (
+            format!("{} menu", key_hint(&app, keymap::Action::OpenActionPalette)),
+            "jump to this entry",
+        ),
+    ];
+    for (hint, label) in expected_actions {
+        assert!(
+            out.contains(&hint) && out.contains(label),
+            "selected preview should list {label:?} with route {hint:?}:\n{out}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn hover_preview_for_unselected_entry_names_row_click_target() {
+    let mut app = app_with_hover_preview(2);
+    let entry_id = active_transcript_entries(&app)[1].id;
+    app.selected_entry = Some(2);
+    app.hover_preview = build_entry_preview(&app, entry_id, hover_preview::PreviewSource::Hover);
+
+    let out = render_to_string(&app, 100, 30);
+    assert!(
+        out.contains("double-click row / Ctrl+Enter to open"),
+        "unselected preview names the row as the click target:\n{out}",
     );
     assert!(
-        out.contains("for actions"),
-        "a keyboard-pinned preview names the action-palette chord in context:\n{out}",
+        !out.contains("selected entry \u{00b7}"),
+        "unselected preview should not advertise selected-entry actions:\n{out}",
+    );
+}
+
+#[tokio::test]
+async fn selected_assistant_preview_lists_applicable_palette_only_actions() {
+    let mut app = app_with_hover_preview(2);
+    let entry_id = active_transcript_entries(&app)[2].id;
+    app.selected_entry = Some(2);
+    app.hover_preview = build_entry_preview(&app, entry_id, hover_preview::PreviewSource::Keyboard);
+
+    let out = render_to_string(&app, 100, 30);
+    let palette = key_hint(&app, keymap::Action::OpenActionPalette);
+    assert!(
+        out.contains("copy entry"),
+        "selected assistant preview lists copy entry:\n{out}",
+    );
+    assert!(
+        out.contains("copy code"),
+        "selected assistant preview lists copy code:\n{out}",
+    );
+    assert!(
+        out.contains("quote into")
+            && out.contains("composer")
+            && out.contains(&format!("{palette} menu")),
+        "selected assistant preview lists palette-only quote action with menu route:\n{out}",
+    );
+    assert!(
+        out.contains("jump to this entry") && out.contains(&format!("{palette} menu")),
+        "selected assistant preview lists palette-only jump action with menu route:\n{out}",
+    );
+    assert!(
+        !out.contains("copy tool output"),
+        "assistant preview must not list tool-only actions:\n{out}",
+    );
+    assert!(
+        !out.contains("open in detail"),
+        "short assistant preview must not list unavailable detail action:\n{out}",
     );
 }
 
 #[tokio::test]
 async fn hover_preview_alt_1_toggles_closed_and_esc_dismisses() {
     let mut app = app_with_hover_preview(2);
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     let chord = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT);
 
     handle_key(&mut app, &mut agent, chord).await.expect("open");
@@ -45462,7 +45687,7 @@ async fn hover_preview_any_other_key_dismisses_then_acts() {
     // A non-preview key dismisses the peek but is then allowed to do its job (the
     // peek is transient, not modal). Typing 'x' lands in the composer.
     let mut app = app_with_hover_preview(2);
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     handle_key(
         &mut app,
         &mut agent,
@@ -45494,7 +45719,7 @@ async fn hover_preview_any_other_key_dismisses_then_acts() {
 async fn hover_preview_empty_transcript_is_a_no_op() {
     let mut app = test_app(SessionMode::Build);
     app.set_test_frame_size(100, 30);
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
 
     handle_key(
         &mut app,
@@ -45570,22 +45795,12 @@ async fn hover_preview_mouse_hover_reveals_after_intent_delay() {
     let mut app = app_with_hover_preview(1);
     let entry_id = active_transcript_entries(&app)[1].id;
 
-    // Render so the header hit targets are registered, then aim at the entry's
-    // header-remainder (focus) cell — a hover-previewable Entry target.
+    // Render so the header hit targets are registered, then aim at any
+    // hover-previewable Entry target. Tool-card headers have widened fold
+    // targets, and those still preview as Entry targets on hover.
     let _ = render_to_string(&app, 100, 30);
-    let mut hover_cell = None;
-    'scan: for row in 0..30u16 {
-        for col in 0..100u16 {
-            if let Some((interaction::TargetKey::Entry(id), interaction::Action::FocusEntry(_))) =
-                app.click_target_at(col, row)
-                && id.0 == entry_id
-            {
-                hover_cell = Some((col, row));
-                break 'scan;
-            }
-        }
-    }
-    let (col, row) = hover_cell.expect("the entry header registers a focus target");
+    let (col, row) = previewable_cell_for_entry(&app, entry_id, 100, 30)
+        .expect("the entry header registers a previewable target");
 
     let moved = |col, row| crossterm::event::MouseEvent {
         kind: MouseEventKind::Moved,
@@ -45639,19 +45854,8 @@ async fn hover_preview_survives_pointer_moving_onto_the_popover() {
     let entry_id = active_transcript_entries(&app)[1].id;
 
     let _ = render_to_string(&app, 100, 30);
-    let mut hover_cell = None;
-    'scan: for row in 0..30u16 {
-        for col in 0..100u16 {
-            if let Some((interaction::TargetKey::Entry(id), interaction::Action::FocusEntry(_))) =
-                app.click_target_at(col, row)
-                && id.0 == entry_id
-            {
-                hover_cell = Some((col, row));
-                break 'scan;
-            }
-        }
-    }
-    let (col, row) = hover_cell.expect("the entry header registers a focus target");
+    let (col, row) = previewable_cell_for_entry(&app, entry_id, 100, 30)
+        .expect("the entry header registers a previewable target");
 
     let moved = |col, row| crossterm::event::MouseEvent {
         kind: MouseEventKind::Moved,
@@ -45703,7 +45907,7 @@ async fn hover_preview_survives_pointer_moving_onto_the_popover() {
 #[tokio::test]
 async fn hover_preview_renders_across_resizes_without_overflow() {
     let mut app = app_with_hover_preview(1);
-    let mut agent = test_agent(SessionMode::Build);
+    let mut agent = test_agent_without_session_log(SessionMode::Build);
     handle_key(
         &mut app,
         &mut agent,
