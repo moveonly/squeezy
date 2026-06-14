@@ -96,6 +96,13 @@ fn visit_php_node(
             extract_body_hit(node, BodyHitKind::Literal, ctx, owner_symbol.clone());
             return;
         }
+        // Property hooks are minted (and their bodies recursed with the
+        // accessor as owner) by `extract_php_property_symbols` /
+        // `extract_php_promoted_fields`. Skip the generic descent so hook
+        // bodies are not re-rooted to the enclosing class.
+        "property_hook_list" => {
+            return;
+        }
         _ => {}
     }
 
@@ -1630,7 +1637,7 @@ fn extract_php_property_symbols(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
-    scope: &PhpScope,
+    scope: &mut PhpScope,
 ) {
     let Some((parent_id, parent_kind)) = parent_symbol else {
         return;
@@ -1641,6 +1648,7 @@ fn extract_php_property_symbols(
     ) {
         return;
     }
+    let parent_id = parent_id.clone();
     let attributes_raw = php_attribute_strings(node, ctx.source);
     let modifiers = php_modifier_strings(node, ctx.source);
     let mut base_attributes = php_semantic_attributes(node, &attributes_raw, &modifiers);
@@ -1650,6 +1658,11 @@ fn extract_php_property_symbols(
         .and_then(|node| node_text(node, ctx.source).ok())
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty());
+    // PHP 8.4 property hooks (`public int $x { get => ...; set { ... } }`)
+    // sit in a single `property_hook_list` alongside the property element.
+    let hook_list = node
+        .children(&mut node.walk())
+        .find(|child| child.kind() == "property_hook_list");
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() != "property_element" {
@@ -1670,13 +1683,16 @@ fn extract_php_property_symbols(
         if let Some(type_text) = type_text.clone() {
             attributes.push(format!("type:{}", last_path_segment(&type_text)));
         }
+        if hook_list.is_some() {
+            attributes.push("php:hooked".to_string());
+        }
         attributes.sort();
         attributes.dedup();
         let signature =
             signature_text(node, child.child_by_field_name("default_value"), ctx.source);
-        let id = symbol_id(&ctx.file, Some(parent_id), SymbolKind::Field, &name, span);
+        let field_id = symbol_id(&ctx.file, Some(&parent_id), SymbolKind::Field, &name, span);
         ctx.symbols.push(ParsedSymbol {
-            id,
+            id: field_id.clone(),
             file_id: ctx.file.id.clone(),
             parent_id: Some(parent_id.clone()),
             name: name.clone(),
@@ -1704,7 +1720,91 @@ fn extract_php_property_symbols(
                 provenance: Provenance::new(PROVENANCE, "property type reference"),
             });
         }
+        if let Some(hook_list) = hook_list {
+            extract_php_property_hooks(hook_list, &field_id, &name, ctx, scope);
+        }
     }
+}
+
+/// Mint a `Method` accessor symbol for each `property_hook` (`get`/`set`) under
+/// `hook_list`, parented to the owning property `Field`, then recurse the hook
+/// body with that accessor as the owner so hook-body calls attribute to the
+/// accessor rather than leaking to the enclosing class.
+fn extract_php_property_hooks(
+    hook_list: Node<'_>,
+    field_id: &SymbolId,
+    field_name: &str,
+    ctx: &mut ExtractContext<'_>,
+    scope: &mut PhpScope,
+) {
+    // Qualify the accessor's member identity by the owning field so two fields
+    // each exposing a `get` hook do not collide on `M:Class.get`.
+    scope.callable_path.push(field_name.to_string());
+    let mut cursor = hook_list.walk();
+    for hook in hook_list.named_children(&mut cursor) {
+        if hook.kind() != "property_hook" {
+            continue;
+        }
+        let mut name_cursor = hook.walk();
+        let Some(name_node) = hook
+            .named_children(&mut name_cursor)
+            .find(|child| child.kind() == "name")
+        else {
+            continue;
+        };
+        let Ok(raw_name) = node_text(name_node, ctx.source) else {
+            continue;
+        };
+        let hook_name = raw_name.trim().to_string();
+        if hook_name.is_empty() {
+            continue;
+        }
+        let span = span_from_node(hook);
+        let body = hook.child_by_field_name("body");
+        let signature = signature_text(hook, body, ctx.source);
+        let attributes_raw = php_attribute_strings(hook, ctx.source);
+        let modifiers = php_modifier_strings(hook, ctx.source);
+        let mut attributes = php_semantic_attributes(hook, &attributes_raw, &modifiers);
+        attributes.push("php:property-hook".to_string());
+        attributes.push(format!("php:accessor:{hook_name}"));
+        attributes.sort();
+        attributes.dedup();
+        let arity = hook
+            .child_by_field_name("parameters")
+            .map(|params| u8::try_from(named_child_count(params)).unwrap_or(u8::MAX));
+        let hook_id = symbol_id(&ctx.file, Some(field_id), SymbolKind::Method, &hook_name, span);
+        ctx.symbols.push(ParsedSymbol {
+            id: hook_id.clone(),
+            file_id: ctx.file.id.clone(),
+            parent_id: Some(field_id.clone()),
+            name: hook_name.clone(),
+            kind: SymbolKind::Method,
+            language_identity: php_language_identity(SymbolKind::Method, &hook_name, scope),
+            span,
+            body_span: body.map(span_from_node),
+            signature_span: signature_span_from_nodes(hook, body),
+            signature,
+            visibility: None,
+            docs: Vec::new(),
+            attributes,
+            provenance: Provenance::new(PROVENANCE, "property hook accessor"),
+            confidence: Confidence::ExactSyntax,
+            freshness: Freshness::Fresh,
+            arity,
+        });
+        // Re-root descent: the hook body and its parameters belong to the
+        // accessor, so hook-body calls/refs own to the accessor symbol.
+        let next_parent = Some((hook_id.clone(), SymbolKind::Method));
+        let next_owner = Some(hook_id.clone());
+        let mut child_cursor = hook.walk();
+        for child in hook.named_children(&mut child_cursor) {
+            if child.kind() == "name" {
+                continue;
+            }
+            visit_php_node(child, ctx, next_parent.clone(), next_owner.clone(), scope);
+        }
+    }
+    scope.callable_path.pop();
 }
 
 fn extract_php_const_symbols(
@@ -1809,7 +1909,7 @@ fn extract_php_symbol_facts(
     node: Node<'_>,
     symbol: &ParsedSymbol,
     ctx: &mut ExtractContext<'_>,
-    scope: &PhpScope,
+    scope: &mut PhpScope,
 ) {
     if matches!(
         node.kind(),
@@ -1957,7 +2057,7 @@ fn extract_php_promoted_fields(
     method_node: Node<'_>,
     method_symbol: &ParsedSymbol,
     ctx: &mut ExtractContext<'_>,
-    scope: &PhpScope,
+    scope: &mut PhpScope,
 ) {
     // Promoted fields are parented to the enclosing class, which is the
     // constructor's own parent. Without a class parent (e.g. a stray
@@ -1996,12 +2096,20 @@ fn extract_php_promoted_fields(
         if let Some(type_text) = type_text.clone() {
             attributes.push(format!("type:{}", last_path_segment(&type_text)));
         }
+        // A hooked promoted param carries its `property_hook_list` as a plain
+        // child of the parameter.
+        let hook_list = parameter
+            .children(&mut parameter.walk())
+            .find(|child| child.kind() == "property_hook_list");
+        if hook_list.is_some() {
+            attributes.push("php:hooked".to_string());
+        }
         attributes.sort();
         attributes.dedup();
         let span = span_from_node(parameter);
-        let id = symbol_id(&ctx.file, Some(&class_id), SymbolKind::Field, &name, span);
+        let field_id = symbol_id(&ctx.file, Some(&class_id), SymbolKind::Field, &name, span);
         ctx.symbols.push(ParsedSymbol {
-            id,
+            id: field_id.clone(),
             file_id: ctx.file.id.clone(),
             parent_id: Some(class_id.clone()),
             name: name.clone(),
@@ -2033,6 +2141,9 @@ fn extract_php_promoted_fields(
                     provenance: Provenance::new(PROVENANCE, "promoted property type reference"),
                 });
             }
+        }
+        if let Some(hook_list) = hook_list {
+            extract_php_property_hooks(hook_list, &field_id, &name, ctx, scope);
         }
     }
 }
