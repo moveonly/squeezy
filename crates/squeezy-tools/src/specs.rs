@@ -407,7 +407,7 @@ pub(crate) fn repo_map_spec() -> ToolSpec {
 pub(crate) fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or Dart `with` mixers `mixin:<Type>`; prefix-free `attribute=\"<Type>\"` matches all three at once. Pipe-separate to match several (`base:A|base:B`). Pass as `attribute`, not `base:` in `query`. Set transitive=true with an inheritance attribute (base:/iface:/mixin:) to return the full transitive subtype closure, not just direct subtypes. One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". Do not also call definition_search or symbol_context with the same query in one turn unless this result is ambiguous.".to_string(),
+        description: "Search or count graph-backed declarations by signature/name or filters (kind, language, path, visibility, attribute). Use for broad lists/counts; for a single defining file prefer definition_search. For inheritance pass `attribute=\"base:<Type>\"` (extends), `iface:<Type>` (implements), or Dart `with` mixers `mixin:<Type>`; prefix-free `attribute=\"<Type>\"` matches all three at once. Pipe-separate to match several (`base:A|base:B`). Pass as `attribute`, not `base:` in `query`. Set transitive=true with an inheritance attribute (base:/iface:/mixin:) to return the full transitive subtype closure, not just direct subtypes. One call returns the whole matching set — prefer it over multiple greps when enumerating \"every X that does Y\". Do not also call definition_search or symbol_context with the same query in one turn unless this result is ambiguous. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -432,7 +432,7 @@ pub(crate) fn decl_search_spec() -> ToolSpec {
 pub(crate) fn definition_search_spec() -> ToolSpec {
     ToolSpec {
         name: "definition_search".to_string(),
-        description: "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?'. Use before flow tools when a name may be ambiguous; do not also call decl_search or symbol_context for the same query unless this result is insufficient. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query.".to_string(),
+        description: "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?'. Use before flow tools when a name may be ambiguous; do not also call decl_search or symbol_context for the same query unless this result is insufficient. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -454,7 +454,7 @@ pub(crate) fn definition_search_spec() -> ToolSpec {
 pub(crate) fn reference_search_spec() -> ToolSpec {
     ToolSpec {
         name: "reference_search".to_string(),
-        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when a prior graph call returned one. One call returns every callsite — prefer it over N greps for the same symbol name. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query.".to_string(),
+        description: "Find every reference to a name through the semantic graph. Resolves aliased imports, qualified paths, and renamed re-exports that regex misses. Pass `query` with the bare symbol name; pass `symbol_id` only when a prior graph call returned one. One call returns every callsite — prefer it over N greps for the same symbol name. A symbol_id is only valid until that file is next edited; after an edit, re-resolve by name with query. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -564,7 +564,7 @@ pub(crate) fn inheritance_hierarchy_spec() -> ToolSpec {
 pub(crate) fn impact_spec() -> ToolSpec {
     ToolSpec {
         name: "impact".to_string(),
-        description: "Return graph-computed impact for a changed symbol or file path: changed files, reverse-import affected files, affected symbols, tests, and evidence packets. Use before edits or reviews that need a bounded blast-radius view.".to_string(),
+        description: "Return graph-computed impact for a changed symbol or file path: changed files, reverse-import affected files, affected symbols, tests, and evidence packets. Use before edits or reviews that need a bounded blast-radius view. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -615,7 +615,7 @@ pub(crate) fn read_slice_spec() -> ToolSpec {
 pub(crate) fn symbol_context_spec() -> ToolSpec {
     ToolSpec {
         name: "symbol_context".to_string(),
-        description: "Return compact graph-backed context for symbols matching a declaration query: callers, callees, references, dirty/diff annotations, and evidence packets. Use for relationships, callers, references, or impact. Avoid for simple definition/file lookup that definition_search answers.".to_string(),
+        description: "Return compact graph-backed context for symbols matching a declaration query: callers, callees, references, dirty/diff annotations, and evidence packets. Use for relationships, callers, references, or impact. Avoid for simple definition/file lookup that definition_search answers. If a result includes refresh_incomplete=true (stale_pending>0), some edited files were not yet reparsed; re-issue the same call to let the queued tail settle before relying on completeness.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({
