@@ -33,6 +33,11 @@ use crate::graph_tools_read_slice::{
     DiffReadBaseline, LastReceiptDiffOutcome, ReadSliceArgs, ReadSliceDiffCtx, ReadSliceReadMode,
     ReadSliceSpanKind, diff_read_baseline_str,
 };
+pub(crate) use crate::graph_tools_scope::result_path_scope;
+use crate::graph_tools_scope::{
+    packet_matches_result_path, packet_matches_test_scope, passes_test_scope, path_is_test,
+    symbol_is_test,
+};
 use crate::{
     DEFAULT_GRAPH_MAX_DEPTH, DEFAULT_GRAPH_MAX_RESULTS, DEFAULT_READ_LIMIT,
     GRAPH_READ_SLICE_MAX_LINE_SCAN_BYTES, MAX_GRAPH_MAX_DEPTH, MAX_GRAPH_MAX_RESULTS,
@@ -1394,53 +1399,6 @@ fn decl_counts_by_kind(symbols: &[GraphSymbol]) -> Value {
     json!(counts)
 }
 
-/// True when a path looks like test code. Recognises the common per-language
-/// conventions: a `test`/`tests`/`__tests__`/`spec`/`testing` directory
-/// segment, or a file name ending in a test/spec suffix
-/// (`_test`/`_tests`/`.test`/`.spec`/`Test`/`Tests`/`Spec`). Used by the
-/// `exclude_tests`/`tests_only` scoping shared across the read tools.
-fn path_is_test(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    let dir_marker = lower.split('/').any(|segment| {
-        matches!(
-            segment,
-            "test" | "tests" | "__tests__" | "spec" | "specs" | "testing"
-        )
-    });
-    if dir_marker {
-        return true;
-    }
-    let file = lower.rsplit('/').next().unwrap_or(lower.as_str());
-    // Strip a trailing extension so `foo_test.rs` / `foo.test.ts` both match.
-    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
-    stem.ends_with("_test")
-        || stem.ends_with("_tests")
-        || stem.ends_with(".test")
-        || stem.ends_with(".spec")
-        || stem.ends_with("test")
-        || stem.ends_with("tests")
-        || stem.ends_with("spec")
-}
-
-/// True when a symbol is part of test code: either its kind is `Test` or its
-/// declaring file path looks like test code (see [`path_is_test`]).
-fn symbol_is_test(symbol: &GraphSymbol) -> bool {
-    symbol.kind == SymbolKind::Test || path_is_test(symbol.file_id.0.as_str())
-}
-
-/// Apply an `exclude_tests`/`tests_only` pair to a test-ness verdict. When both
-/// are set, `tests_only` wins (the more specific request). Returns whether the
-/// item should be KEPT.
-fn passes_test_scope(is_test: bool, exclude_tests: bool, tests_only: bool) -> bool {
-    if tests_only {
-        is_test
-    } else if exclude_tests {
-        !is_test
-    } else {
-        true
-    }
-}
-
 /// Parse an `edge_kind` filter token to an [`EdgeKind`]. Accepts the
 /// case-insensitive names the flow/symbol_context tools advertise:
 /// `calls`/`references`/`imports`/`reexports`. Returns `None` for anything
@@ -1471,80 +1429,6 @@ fn packet_matches_edge_kind(packet: &Value, want: Option<EdgeKind>) -> bool {
         .and_then(Value::as_str)
         .map(|kind| kind == want_label)
         .unwrap_or(false)
-}
-
-/// Best-effort extraction of the workspace-relative path a result packet points
-/// at, for the `result_path` filter on the flow/hierarchy/symbol_context tools.
-/// Looks at the packet bodies these tools emit: `symbol.path`, `reference.path`,
-/// the first `spans[].path`, and (for edge packets) the `edge.from` symbol's
-/// file via the `spans` entry. Returns `None` when no path can be determined.
-fn packet_path(packet: &Value) -> Option<&str> {
-    if let Some(path) = packet
-        .get("symbol")
-        .and_then(|symbol| symbol.get("path"))
-        .and_then(Value::as_str)
-    {
-        return Some(path);
-    }
-    if let Some(path) = packet
-        .get("reference")
-        .and_then(|reference| reference.get("path"))
-        .and_then(Value::as_str)
-    {
-        return Some(path);
-    }
-    if let Some(path) = packet
-        .get("caller")
-        .and_then(|caller| caller.get("path"))
-        .and_then(Value::as_str)
-    {
-        return Some(path);
-    }
-    packet
-        .get("spans")
-        .and_then(Value::as_array)
-        .and_then(|spans| spans.first())
-        .and_then(|span| span.get("path"))
-        .and_then(Value::as_str)
-}
-
-/// True when a result packet passes the optional `result_path` scope. Packets
-/// whose path can't be determined are KEPT (the filter is a positive scope, not
-/// a hard gate that would silently drop edges the extractor couldn't anchor).
-fn packet_matches_result_path(packet: &Value, filter: Option<&str>) -> bool {
-    let Some(filter) = filter.map(str::trim).filter(|value| !value.is_empty()) else {
-        return true;
-    };
-    match packet_path(packet) {
-        Some(path) => path_matches_filter(path, filter),
-        None => true,
-    }
-}
-
-/// Pick the effective path scope for RESULT packets on the flow/hierarchy tools.
-/// An explicit `result_path` wins (it lets a caller decouple the root scope from
-/// the result scope); otherwise the plain `path` argument scopes the results too,
-/// satisfying the "path scopes RESULT packets" contract. Empty/whitespace tokens
-/// are treated as absent so a blank string never collapses the result set.
-fn result_path_scope<'a>(path: Option<&'a str>, result_path: Option<&'a str>) -> Option<&'a str> {
-    result_path
-        .or(path)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-/// True when a result packet passes the `exclude_tests`/`tests_only` scope,
-/// keyed on the packet's path (see [`packet_path`]/[`path_is_test`]). Packets
-/// with no determinable path are KEPT under `exclude_tests` and DROPPED under
-/// `tests_only` (a path-less packet can't be confirmed as a test).
-fn packet_matches_test_scope(packet: &Value, exclude_tests: bool, tests_only: bool) -> bool {
-    if !exclude_tests && !tests_only {
-        return true;
-    }
-    match packet_path(packet) {
-        Some(path) => passes_test_scope(path_is_test(path), exclude_tests, tests_only),
-        None => !tests_only,
-    }
 }
 
 /// Edge kinds that count as a "use" of a declaration for dead-code analysis:

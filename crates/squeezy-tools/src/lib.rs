@@ -85,6 +85,7 @@ mod graph_tools_executor;
 mod graph_tools_filters;
 mod graph_tools_packets;
 mod graph_tools_read_slice;
+mod graph_tools_scope;
 mod ipc;
 mod patch;
 pub mod preview;
