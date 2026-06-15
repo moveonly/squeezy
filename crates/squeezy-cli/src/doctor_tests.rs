@@ -153,6 +153,22 @@ fn json_summary_counts_full_result_even_when_rows_are_filtered() {
 }
 
 #[test]
+fn doctor_registry_keeps_dynamic_probe_selectors_config_backed() {
+    let mut args = DoctorArgs::default();
+    args.only.push("probe:mcp:docs".to_string());
+
+    assert!(needs_config(&args));
+}
+
+#[test]
+fn doctor_registry_does_not_treat_invalid_sandbox_family_as_config_free() {
+    let mut args = DoctorArgs::default();
+    args.only.push("sandbox:extra".to_string());
+
+    assert!(needs_config(&args));
+}
+
+#[test]
 fn unmatched_only_selector_becomes_visible_failure() {
     // Mimics the surfacing-after-status-filter contract that the
     // `run()` post-pass enforces: an unknown selector must remain
