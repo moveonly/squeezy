@@ -1919,6 +1919,68 @@ fn raw_control_byte_normalises_to_char_plus_control() {
     }
 }
 
+#[test]
+fn esc_prefixed_letter_normalises_to_alt_letter_event() {
+    use super::normalise_legacy_alt_events;
+    let events = normalise_legacy_alt_events(vec![
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+    ]);
+
+    assert_eq!(events.len(), 1);
+    match events.first() {
+        Some(Event::Key(key)) => {
+            assert_eq!(key.code, KeyCode::Char('s'));
+            assert!(key.modifiers.contains(KeyModifiers::ALT));
+        }
+        other => panic!("expected a single Alt+s key event, got {other:?}"),
+    }
+}
+
+#[test]
+fn esc_prefixed_digit_enter_arrow_and_punctuation_normalise_to_alt() {
+    use super::normalise_legacy_alt_events;
+    for code in [
+        KeyCode::Char('1'),
+        KeyCode::Enter,
+        KeyCode::Left,
+        KeyCode::Char('/'),
+    ] {
+        let events = normalise_legacy_alt_events(vec![
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+        ]);
+        match events.first() {
+            Some(Event::Key(key)) => {
+                assert_eq!(key.code, code);
+                assert!(
+                    key.modifiers.contains(KeyModifiers::ALT),
+                    "{code:?} should gain ALT",
+                );
+            }
+            other => panic!("expected one Alt event for {code:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn bare_esc_stays_bare_esc_when_no_suffix_arrives() {
+    use super::normalise_legacy_alt_events;
+    let events = normalise_legacy_alt_events(vec![Event::Key(KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    ))]);
+
+    assert_eq!(events.len(), 1);
+    match events.first() {
+        Some(Event::Key(key)) => {
+            assert_eq!(key.code, KeyCode::Esc);
+            assert!(key.modifiers.is_empty());
+        }
+        other => panic!("expected a bare Esc key event, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn chord_leader_accepts_raw_ctrl_x_byte() {
     // Some terminals emit Ctrl+X as the literal ASCII control byte
@@ -11922,6 +11984,51 @@ async fn keypress_through_event_loop_records_a_latency_sample() {
 }
 
 #[tokio::test]
+async fn esc_prefixed_alt_r_dispatches_shortcut_without_typing_prompt() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+    assert!(!app.show_minimap);
+    dispatch_input_events(
+        &mut app,
+        &mut agent,
+        vec![
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+        ],
+    )
+    .await
+    .expect("dispatch legacy Alt+r");
+
+    assert!(
+        app.show_minimap,
+        "Esc-prefixed Alt+r should toggle the minimap",
+    );
+    assert_eq!(app.input, "", "the suffix letter must not type into prompt");
+}
+
+#[tokio::test]
+async fn esc_prefixed_alt_one_dispatches_preview_without_typing_prompt() {
+    let mut app = app_with_hover_preview(1);
+    let mut agent = test_agent(SessionMode::Build);
+    dispatch_input_events(
+        &mut app,
+        &mut agent,
+        vec![
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+        ],
+    )
+    .await
+    .expect("dispatch legacy Alt+1");
+
+    assert!(
+        app.hover_preview.is_some(),
+        "Esc-prefixed Alt+1 should pin the entry meta peek",
+    );
+    assert_eq!(app.input, "", "the suffix digit must not type into prompt");
+}
+
+#[tokio::test]
 async fn resize_event_tags_resize_redraw_interaction() {
     // The mouse-free / non-key path: a resize event must classify as the resize
     // redraw budget so the loosest budget covers the full reflow.
@@ -17511,6 +17618,34 @@ async fn alt_b_with_nonempty_composer_moves_word_left_not_bundle() {
     );
 }
 
+#[tokio::test]
+async fn esc_prefixed_alt_b_with_nonempty_composer_moves_word_left_without_typing_b() {
+    let root = temp_workspace("bundle_legacy_alt_wordnav");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    app.input = "foo bar".to_string();
+    app.input_cursor = app.input.len();
+    dispatch_input_events(
+        &mut app,
+        &mut agent,
+        vec![
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+        ],
+    )
+    .await
+    .expect("legacy Alt+b while editing");
+
+    assert_eq!(app.input_cursor, "foo ".len());
+    assert_eq!(app.input, "foo bar", "legacy Alt+b must not type b");
+    assert!(
+        walk_files(&root.join(".squeezy").join("bundles")).is_empty(),
+        "legacy Alt+b must not build a bundle while editing",
+    );
+}
+
 /// deep-review #4: the Alt+f twin. A NON-empty composer must keep readline
 /// word-right motion; Alt+f must move the cursor one word right rather than
 /// cycling the semantic filter.
@@ -17539,6 +17674,42 @@ async fn alt_f_with_nonempty_composer_moves_word_right_not_filter() {
     assert_eq!(
         app.main_semantic_filter, filter_before,
         "Alt+f must NOT cycle the semantic filter while the composer is non-empty",
+    );
+}
+
+#[tokio::test]
+async fn esc_prefixed_alt_f_and_alt_d_edit_words_without_typing_suffixes() {
+    let mut app = test_app(SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    app.input = "foo bar baz".to_string();
+    app.input_cursor = 0;
+    dispatch_input_events(
+        &mut app,
+        &mut agent,
+        vec![
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)),
+        ],
+    )
+    .await
+    .expect("legacy Alt+f while editing");
+    assert_eq!(app.input_cursor, "foo".len());
+    assert_eq!(app.input, "foo bar baz", "legacy Alt+f must not type f");
+
+    dispatch_input_events(
+        &mut app,
+        &mut agent,
+        vec![
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+        ],
+    )
+    .await
+    .expect("legacy Alt+d while editing");
+    assert_eq!(
+        app.input, "foo baz",
+        "legacy Alt+d deletes the next word instead of typing d",
     );
 }
 
@@ -23758,8 +23929,8 @@ fn main_scrollbar_uses_terminal_gray_colors() {
                 saw_track = true;
                 assert_eq!(
                     fg,
-                    Color::Rgb(45, 45, 45),
-                    "main scrollbar track is faint dark gray"
+                    Color::Rgb(96, 96, 96),
+                    "main scrollbar track is subdued but accessible gray"
                 );
             }
             other => panic!("unexpected main scrollbar symbol {other:?}"),
@@ -26084,8 +26255,8 @@ fn transcript_overlay_scrollbar_hides_until_scroll() {
                     saw_track = true;
                     assert_eq!(
                         cell.fg,
-                        Color::Rgb(45, 45, 45),
-                        "overlay scrollbar track is faint dark gray"
+                        Color::Rgb(96, 96, 96),
+                        "overlay scrollbar track is subdued but accessible gray"
                     );
                 }
                 _ => {}
@@ -45860,10 +46031,57 @@ async fn card_header_remainder_click_selects_the_conversation_entry() {
         Some(1),
         "clicking the header remainder selects the conversation entry",
     );
+    let palette = key_hint(&app, keymap::Action::OpenActionPalette);
+    let detail = key_hint(&app, keymap::Action::OpenFocusedInDetail);
+    assert!(
+        app.status.contains(&format!("{palette} actions")) && app.status.contains(&detail),
+        "selection status should point to the action palette and detail path: {}",
+        app.status
+    );
     assert_eq!(
         active_transcript_entries(&app)[1].collapsed,
         collapsed_before,
         "selection click does not also toggle the fold",
+    );
+}
+
+#[tokio::test]
+async fn consecutive_work_entry_fold_target_lands_on_visible_header_after_connector() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    app.push_tool_result(sample_tool_result("first_connector_tool", "first output"));
+    app.push_tool_result(sample_tool_result("second_connector_tool", "second output"));
+    let entry_id = active_transcript_entries(&app)[1].id;
+    let collapsed_before = active_transcript_entries(&app)[1].collapsed;
+
+    let out = render_to_string(&app, 100, 30);
+    let visible_header_row = out
+        .lines()
+        .position(|line| line.contains("second_connector_tool"))
+        .expect("the second work entry header is visible") as u16;
+    let (col, row) =
+        toggle_cell_for_entry_at_or_after(&app, entry_id, CARD_CARET_WIDTH + 1, 100, 30)
+            .expect("second work-card header registers a fold target");
+
+    assert_eq!(
+        row, visible_header_row,
+        "the fold target must sit on the visible second work header, not the connector row above:\n{out}",
+    );
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_ne!(
+        active_transcript_entries(&app)[1].collapsed,
+        collapsed_before,
+        "clicking the visible second work header toggles the fold",
     );
 }
 
@@ -45906,46 +46124,13 @@ async fn hover_preview_alt_1_opens_popover_for_focused_unit() {
         "a keyboard-sourced preview names itself pinned in the header:\n{out}",
     );
     assert!(
-        out.contains("selected entry \u{00b7}"),
-        "a preview for the focused conversation entry shows selected-state state:\n{out}",
+        out.contains("selected entry \u{00b7}") && out.contains("for actions"),
+        "a preview for the focused conversation entry points to the action palette:\n{out}",
     );
-    let expected_actions = [
-        (
-            key_hint(&app, keymap::Action::CopyFocusedEntry),
-            "copy entry",
-        ),
-        (key_hint(&app, keymap::Action::CopyAllCode), "copy code"),
-        (
-            key_hint(&app, keymap::Action::CopyCurrentToolOutput),
-            "copy tool output",
-        ),
-        (
-            key_hint(&app, keymap::Action::AnnotateEntry),
-            "annotate entry",
-        ),
-        (
-            key_hint(&app, keymap::Action::OpenFocusedInDetail),
-            "open in detail",
-        ),
-        (
-            key_hint(&app, keymap::Action::ToggleFocusedFold),
-            "expand entry",
-        ),
-        (
-            key_hint(&app, keymap::Action::ToggleRelatedLinks),
-            "related entries",
-        ),
-        (
-            format!("{} menu", key_hint(&app, keymap::Action::OpenActionPalette)),
-            "jump to this entry",
-        ),
-    ];
-    for (hint, label) in expected_actions {
-        assert!(
-            out.contains(&hint) && out.contains(label),
-            "selected preview should list {label:?} with route {hint:?}:\n{out}",
-        );
-    }
+    assert!(
+        !out.contains("copy tool output"),
+        "hover preview is a meta peek, not an action inventory:\n{out}",
+    );
 }
 
 #[tokio::test]
@@ -45967,7 +46152,7 @@ async fn hover_preview_for_unselected_entry_names_row_click_target() {
 }
 
 #[tokio::test]
-async fn selected_assistant_preview_lists_applicable_palette_only_actions() {
+async fn selected_assistant_preview_keeps_excerpt_and_omits_action_inventory() {
     let mut app = app_with_hover_preview(2);
     let entry_id = active_transcript_entries(&app)[2].id;
     app.selected_entry = Some(2);
@@ -45976,30 +46161,29 @@ async fn selected_assistant_preview_lists_applicable_palette_only_actions() {
     let out = render_to_string(&app, 100, 30);
     let palette = key_hint(&app, keymap::Action::OpenActionPalette);
     assert!(
-        out.contains("copy entry"),
-        "selected assistant preview lists copy entry:\n{out}",
+        out.contains(&format!("{palette} for actions")),
+        "selected assistant preview points to the action palette:\n{out}",
     );
     assert!(
-        out.contains("copy code"),
-        "selected assistant preview lists copy code:\n{out}",
+        out.contains("The build is clean."),
+        "selected assistant preview keeps the body excerpt:\n{out}",
     );
+    for forbidden in [
+        "copy entry",
+        "copy code",
+        "quote into",
+        "jump to this entry",
+        "open in detail",
+        "copy tool output",
+    ] {
+        assert!(
+            !out.contains(forbidden),
+            "selected preview must not list action {forbidden:?}:\n{out}",
+        );
+    }
     assert!(
-        out.contains("quote into")
-            && out.contains("composer")
-            && out.contains(&format!("{palette} menu")),
-        "selected assistant preview lists palette-only quote action with menu route:\n{out}",
-    );
-    assert!(
-        out.contains("jump to this entry") && out.contains(&format!("{palette} menu")),
-        "selected assistant preview lists palette-only jump action with menu route:\n{out}",
-    );
-    assert!(
-        !out.contains("copy tool output"),
-        "assistant preview must not list tool-only actions:\n{out}",
-    );
-    assert!(
-        !out.contains("open in detail"),
-        "short assistant preview must not list unavailable detail action:\n{out}",
+        !out.contains("Actions:"),
+        "hover preview no longer renders an action inventory:\n{out}",
     );
 }
 
@@ -51829,6 +52013,39 @@ fn entry_preview_meta_shows_turn_size_and_cost() {
     assert!(
         answer_meta.contains("2 lines"),
         "the answer shows its size: {answer_meta}",
+    );
+}
+
+#[test]
+fn hover_preview_popover_shows_prompt_and_final_answer_cost() {
+    let mut app = test_app(SessionMode::Build);
+    app.set_test_frame_size(100, 30);
+    app.push_transcript_item(TranscriptItem::user("hi")); // turn 1
+    app.push_transcript_item(TranscriptItem::assistant("final answer"));
+
+    let mut metrics = squeezy_core::TurnMetrics::default();
+    metrics.provider.estimated_usd_micros = Some(12_340);
+    metrics.provider.input_tokens = Some(1234);
+    metrics.provider.output_tokens = Some(340);
+    app.turn_costs.insert(1, metrics);
+
+    let entries = active_transcript_entries(&app);
+    let prompt_id = entries[0].id;
+    let answer_id = entries[1].id;
+    app.hover_preview = build_entry_preview(&app, prompt_id, hover_preview::PreviewSource::Hover);
+    let prompt_out = render_to_string(&app, 100, 30);
+    assert!(
+        prompt_out.contains("$0.0123"),
+        "prompt hover popover shows turn cost:\n{prompt_out}",
+    );
+
+    app.hover_preview = build_entry_preview(&app, answer_id, hover_preview::PreviewSource::Hover);
+    let answer_out = render_to_string(&app, 100, 30);
+    assert!(
+        answer_out.contains("$0.0123")
+            && answer_out.contains("1.2k in")
+            && answer_out.contains("340 out"),
+        "final answer hover popover shows cost and compact token counts:\n{answer_out}",
     );
 }
 
