@@ -146,28 +146,18 @@ impl SqueezyHelp {
     }
 
     pub fn topic_index(&self) -> HelpAnswer {
-        const GROUPS: &[(&str, &[&str])] = &[
-            ("Getting started", &["install", "doctor"]),
-            ("Models and providers", &["providers", "config"]),
-            ("Permissions and sandbox", &["permissions", "linux-sandbox"]),
-            ("Files and sessions", &["sessions", "checkpoints"]),
-            ("Context and cost", &["cost", "agent"]),
-            ("UI and interface", &["tui", "cancel"]),
-            ("Navigation", &["navigation"]),
-            (
-                "Skills and extension",
-                &["skills", "hooks", "prompt-templates"],
-            ),
-            ("Feedback", &["feedback", "telemetry"]),
-            ("MCP and web", &["mcp-web"]),
-        ];
         let mut body = String::from("Available `/help` topics:\n");
-        for (group, ids) in GROUPS {
-            let topic_list = ids
+        for group in TopicGroup::ORDER {
+            let topic_list = TOPICS
                 .iter()
-                .map(|id| format!("`{id}`"))
+                .filter(|topic| topic.group == *group)
+                .map(|topic| format!("`{}`", topic.id))
                 .collect::<Vec<_>>()
                 .join(" · ");
+            if topic_list.is_empty() {
+                continue;
+            }
+            let group = group.title();
             let _ = write!(body, "\n**{group}**  {topic_list}");
         }
         body.push_str(
@@ -265,6 +255,9 @@ impl SqueezyHelp {
                 "\n\n---\n*Grounded in local Squeezy docs and current config. For newer or broader coverage use `/help` with a different topic, or check [squeezyagent.com/docs](https://squeezyagent.com/docs/).*",
             );
         }
+        if definition.id == "tui" {
+            append_slash_command_overview(&mut body);
+        }
 
         let mut citations = definition
             .docs
@@ -330,9 +323,71 @@ impl SqueezyHelp {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct TopicGroup {
+    title: &'static str,
+}
+
+impl TopicGroup {
+    const GETTING_STARTED: Self = Self {
+        title: "Getting started",
+    };
+    const MODELS: Self = Self {
+        title: "Models and providers",
+    };
+    const PERMISSIONS: Self = Self {
+        title: "Permissions and sandbox",
+    };
+    const FILES: Self = Self {
+        title: "Files and sessions",
+    };
+    const CONTEXT: Self = Self {
+        title: "Context and cost",
+    };
+    const UI: Self = Self {
+        title: "UI and interface",
+    };
+    const NAVIGATION: Self = Self {
+        title: "Navigation",
+    };
+    const SKILLS: Self = Self {
+        title: "Skills and extension",
+    };
+    const FEEDBACK: Self = Self { title: "Feedback" };
+    const MCP: Self = Self {
+        title: "MCP and web",
+    };
+
+    const ORDER: &'static [Self] = &[
+        Self::GETTING_STARTED,
+        Self::MODELS,
+        Self::PERMISSIONS,
+        Self::FILES,
+        Self::CONTEXT,
+        Self::UI,
+        Self::NAVIGATION,
+        Self::SKILLS,
+        Self::FEEDBACK,
+        Self::MCP,
+    ];
+
+    const fn title(self) -> &'static str {
+        self.title
+    }
+}
+
+impl PartialEq for TopicGroup {
+    fn eq(&self, other: &Self) -> bool {
+        self.title == other.title
+    }
+}
+
+impl Eq for TopicGroup {}
+
+#[derive(Debug, Clone, Copy)]
 struct TopicDefinition {
     id: &'static str,
     title: &'static str,
+    group: TopicGroup,
     aliases: &'static [&'static str],
     summary: &'static str,
     docs: &'static [&'static str],
@@ -349,6 +404,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "cancel",
         title: "cancel or interrupt an in-flight Squeezy turn",
+        group: TopicGroup::UI,
         aliases: &[
             "cancel turn",
             "cancel a turn",
@@ -381,6 +437,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "tui",
         title: "TUI interface, keyboard shortcuts, and slash commands",
+        group: TopicGroup::UI,
         aliases: &[
             "tui",
             "keyboard",
@@ -412,13 +469,14 @@ const TOPICS: &[TopicDefinition] = &[
             "/fork",
             "/cheap",
         ],
-        summary: "The Squeezy TUI has a full-width composer at the bottom, a transcript pane above it, and a status footer. Key bindings: Esc or Ctrl+C cancel an in-flight turn or tool approval; Enter submits; Ctrl+J inserts a newline; Ctrl+T shows the full transcript overlay; Ctrl+P shows the task-state overlay; Ctrl+Y copies the last assistant message; Ctrl+R restores the last prompt; Shift+Tab toggles plan/build mode; Up/Down navigate input history or the slash menu. Slash commands: `/help`, `/config`, `/model`, `/permissions`, `/mcp`, `/plan`, `/build`, `/plans`, `/cost`, `/context`, `/reviewer`, `/attach`, `/compact`, `/clear`, `/diff`, `/tasks`, `/task`, `/task-cancel`, `/pin`, `/pins`, `/unpin`, `/feedback`, `/report`, `/sessions`, `/session`, `/resume`, `/fork`, `/session-export`, `/session-export-html`, `/checkpoints`, `/checkpoint`, `/undo`, `/revert-turn`, `/effort`, `/cheap`, `/parent`, `/router`, `/tool-verbosity`, `/statusline`, `/theme`, `/keymap`, `/export`, `/bundle`, `/terminal`, `/terminal-reset`. Type `/` to browse the live, categorized menu, or `/help /<command>` for one command's details. Use `/theme <name>` to switch the color theme; built-ins are `default`, `bright`, `fun`, and `starlight`. Use `/router on|off` to toggle cheap-model turn routing. Use `/keymap` to view the active key bindings. Typing any `/` opens the slash suggestion menu; arrow keys navigate it.",
+        summary: "The Squeezy TUI has a full-width composer at the bottom, a transcript pane above it, and a status footer. Key bindings: Esc or Ctrl+C cancel an in-flight turn or tool approval; Enter submits; Ctrl+J inserts a newline; Ctrl+T shows the full transcript overlay; Ctrl+P shows the task-state overlay; Ctrl+Y copies the last assistant message; Ctrl+R restores the last prompt; Shift+Tab toggles plan/build mode; Up/Down navigate input history or the slash menu. Type `/` to browse the live, categorized menu, or `/help /<command>` for one command's details. Use `/theme <name>` to switch the color theme; built-ins are `default`, `bright`, `fun`, `catppuccin`, and `high-contrast`. Use `/router on|off` to toggle cheap-model turn routing. Use `/keymap` to view the active key bindings. Typing any `/` opens the slash suggestion menu; arrow keys navigate it.",
         docs: &["docs/external/AGENT_APPROACH.md", "docs/external/TOOLS.md"],
         config: &["tui", "session"],
     },
     TopicDefinition {
         id: "agent",
         title: "agent approach, modes, tools, and local-first workflow",
+        group: TopicGroup::CONTEXT,
         aliases: &[
             "approach",
             "how does squeezy work",
@@ -445,6 +503,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "config",
         title: "configuration and source precedence",
+        group: TopicGroup::MODELS,
         aliases: &[
             "configuration",
             "settings",
@@ -474,6 +533,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "providers",
         title: "providers, models, and API key environment names",
+        group: TopicGroup::MODELS,
         aliases: &[
             "provider",
             "model",
@@ -498,6 +558,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "permissions",
         title: "permissions, approvals, and shell sandboxing",
+        group: TopicGroup::PERMISSIONS,
         aliases: &[
             "permission",
             "approval",
@@ -524,6 +585,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "linux-sandbox",
         title: "Linux shell sandbox: namespaces, Landlock, seccomp, and mode gating",
+        group: TopicGroup::PERMISSIONS,
         aliases: &[
             "linux sandbox",
             "linux-sandbox",
@@ -553,6 +615,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "skills",
         title: "local skills and built-in Squeezy help",
+        group: TopicGroup::SKILLS,
         aliases: &[
             "skill",
             "/skill",
@@ -569,6 +632,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "sessions",
         title: "sessions, logs, resume, and transcript export",
+        group: TopicGroup::FILES,
         aliases: &[
             "session",
             "resume",
@@ -584,6 +648,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "memory",
         title: "cross-session memory: what it remembers, where it lives, how to manage it",
+        group: TopicGroup::FILES,
         aliases: &[
             "remember",
             "remembered",
@@ -600,6 +665,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "feedback",
         title: "feedback, reports, redaction, and privacy",
+        group: TopicGroup::FEEDBACK,
         aliases: &[
             "report",
             "bug report",
@@ -620,6 +686,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "telemetry",
         title: "anonymous product telemetry",
+        group: TopicGroup::FEEDBACK,
         aliases: &["analytics", "opt out", "opt-out", "product observability"],
         summary: "Squeezy telemetry is anonymous product observability. It records runtime-level events and aggregate metrics, not prompts, completions, file contents, commands, URLs, repository names, paths, or environment values. It can be disabled in configuration.",
         docs: &[
@@ -631,6 +698,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "navigation",
         title: "semantic navigation and language coverage",
+        group: TopicGroup::NAVIGATION,
         aliases: &[
             "semantic",
             "graph",
@@ -670,6 +738,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "checkpoints",
         title: "checkpoints, undo, and revert",
+        group: TopicGroup::FILES,
         aliases: &["checkpoint", "undo", "revert", "revert-turn"],
         summary: "Checkpointing is disabled by default. When enabled, checkpoints preserve local before and after trees for agent edits, and TUI commands expose listing, detail, undo, and turn-level revert through the checkpoint tools.",
         docs: &["docs/external/CHECKPOINTS.md"],
@@ -678,6 +747,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "cost",
         title: "cost controls, receipts, and tool output budgets",
+        group: TopicGroup::CONTEXT,
         aliases: &[
             "costs",
             "budget",
@@ -702,6 +772,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "mcp-web",
         title: "MCP servers and external web lookup",
+        group: TopicGroup::MCP,
         aliases: &[
             "mcp",
             "web",
@@ -722,6 +793,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "install",
         title: "installation, first run, upgrades, and uninstall",
+        group: TopicGroup::GETTING_STARTED,
         aliases: &[
             "installation",
             "brew",
@@ -745,6 +817,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "doctor",
         title: "doctor command, platforms, and startup mode",
+        group: TopicGroup::GETTING_STARTED,
         aliases: &[
             "doctor",
             "health",
@@ -769,6 +842,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "hooks",
         title: "hook events, mutation points, and skill scripts",
+        group: TopicGroup::SKILLS,
         aliases: &[
             "hook",
             "hooks",
@@ -792,6 +866,7 @@ const TOPICS: &[TopicDefinition] = &[
     TopicDefinition {
         id: "prompt-templates",
         title: "prompt templates and reusable slash macros",
+        group: TopicGroup::SKILLS,
         aliases: &[
             "prompt template",
             "prompt templates",
@@ -1292,6 +1367,15 @@ static SLASH_COMMAND_HELP_TABLE: &[SlashCommandHelp] = &[
         related: &["tui", "config"],
     },
     SlashCommandHelp {
+        name: "/reveal",
+        what: "Temporarily show presentation-mode metadata without leaving presentation mode.",
+        syntax: "/reveal",
+        examples: &["/reveal  — reveal metadata hidden by presentation mode"],
+        available_during_turn: true,
+        capability_note: None,
+        related: &["tui", "statusline"],
+    },
+    SlashCommandHelp {
         name: "/cost",
         what: "Show cumulative token and cost accounting for the current session.",
         syntax: "/cost",
@@ -1533,6 +1617,13 @@ pub fn answer_slash_command(topic: &str) -> Option<HelpAnswer> {
         config_sections: Vec::new(),
         source: HelpAnswerSource::LocalCurated,
     })
+}
+
+fn append_slash_command_overview(body: &mut String) {
+    body.push_str("\n\n**Slash commands:**\n");
+    for entry in SLASH_COMMAND_HELP_TABLE {
+        let _ = write!(body, "\n`{}` - {}", entry.name, entry.what);
+    }
 }
 
 /// Suggest slash commands from `SLASH_COMMAND_HELP_TABLE` that are close to

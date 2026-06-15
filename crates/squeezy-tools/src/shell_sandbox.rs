@@ -28,6 +28,10 @@ use crate::shell_exit_signal;
 use crate::shell_program::ShellProgram;
 use crate::{ShellPermissionAnalysis, ShellRunOutcome};
 
+mod backend;
+
+pub(crate) use backend::shell_sandbox_backend_metadata;
+
 pub(crate) const SHELL_SANDBOX_BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone)]

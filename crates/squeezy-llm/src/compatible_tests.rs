@@ -1300,6 +1300,37 @@ fn preset_default_headers_include_openrouter_attribution() {
 }
 
 #[test]
+fn compat_policy_captures_known_preset_quirks() {
+    let openrouter = compat_policy(OpenAiCompatiblePreset::OpenRouter);
+    assert_eq!(openrouter.default_headers, OPENROUTER_DEFAULT_HEADERS);
+    assert!(!openrouter.allows_empty_api_key);
+
+    let mistral = compat_policy(OpenAiCompatiblePreset::Mistral);
+    assert!(mistral.rejects_prompt_cache_retention);
+
+    let workers = compat_policy(OpenAiCompatiblePreset::CloudflareWorkersAi);
+    assert!(workers.extract_inline_think);
+
+    for preset in [
+        OpenAiCompatiblePreset::LMStudio,
+        OpenAiCompatiblePreset::VLlm,
+        OpenAiCompatiblePreset::LlamaCpp,
+    ] {
+        assert!(
+            compat_policy(preset).allows_empty_api_key,
+            "local preset {preset:?} must permit unauthenticated servers"
+        );
+    }
+
+    let generic = compat_policy(OpenAiCompatiblePreset::Vercel);
+    assert_eq!(generic.preset, OpenAiCompatiblePreset::Vercel);
+    assert!(!generic.allows_empty_api_key);
+    assert!(generic.default_headers.is_empty());
+    assert!(!generic.extract_inline_think);
+    assert!(!generic.rejects_prompt_cache_retention);
+}
+
+#[test]
 fn portkey_routing_header_present_detects_user_supplied_overrides() {
     let mut headers = BTreeMap::new();
     assert!(!portkey_routing_header_present(&headers));

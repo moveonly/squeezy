@@ -15,6 +15,7 @@
 //! - `heredoc_body` subtrees are skipped wholesale.
 //! - `define_method`, `eval`/`instance_eval`/`class_eval`/`module_eval` are
 //!   not mined for symbols (documented recall gap in the spec).
+use crate::languages::common::visit_named_children_with_state;
 use crate::languages::rust::*;
 use crate::*;
 
@@ -163,16 +164,14 @@ fn visit_ruby_children(
     owner_symbol: Option<SymbolId>,
     host_class: Option<(SymbolId, SymbolKind)>,
 ) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        visit_ruby_node(
-            child,
-            ctx,
-            parent_symbol.clone(),
-            owner_symbol.clone(),
-            host_class.clone(),
-        );
-    }
+    visit_named_children_with_state(
+        node,
+        (parent_symbol, owner_symbol, host_class),
+        |child, state| {
+            let (parent_symbol, owner_symbol, host_class) = state;
+            visit_ruby_node(child, ctx, parent_symbol, owner_symbol, host_class);
+        },
+    );
 }
 
 fn ruby_symbol_from_node(

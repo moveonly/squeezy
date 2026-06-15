@@ -6,11 +6,12 @@ use std::{
     time::Duration,
 };
 
-use clap::{Args, ValueEnum};
+use clap::Args;
 use serde_json::json;
 use squeezy_core::{
     AppConfig, McpServerConfig, McpTransport, OllamaConfig, ProviderConfig, ProviderSettings,
-    Result, SettingsFile, SqueezyError, default_prompt_history_path, default_settings_path,
+    Result, SettingsFile, SqueezyError, canonical_provider_name, default_prompt_history_path,
+    default_settings_path,
 };
 use squeezy_llm::{
     KeySource, fallback_env_var, github_copilot_auth_file_path, resolve_api_key_with_inline,
@@ -27,6 +28,13 @@ use squeezy_workspace::{WorkspaceRootKind, WorkspaceRootProfile};
 use tokio_util::sync::CancellationToken;
 
 use crate::update::{self, UpdateStatus};
+
+mod registry;
+pub use registry::DoctorStatusFilter;
+use registry::{
+    Check, Status, check_counts, exit_code_for_checks, filter_checks, needs_config,
+    run_local_doctor_checks, should_include_check, unmatched_selector_checks,
+};
 
 const STATE_CACHE_WARN_BYTES: u64 = 128 * 1024 * 1024;
 const GRAPH_CACHE_WARN_BYTES: u64 = 1024 * 1024 * 1024;
@@ -90,61 +98,6 @@ pub struct DoctorArgs {
     /// Windows show paths and probe state with `class=unknown`.
     #[arg(long)]
     pub storage: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-#[clap(rename_all = "lowercase")]
-pub enum DoctorStatusFilter {
-    Ok,
-    Warn,
-    Fail,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Status {
-    Ok,
-    Warn,
-    Fail,
-}
-
-impl Status {
-    fn as_str(self) -> &'static str {
-        match self {
-            Status::Ok => "ok",
-            Status::Warn => "warn",
-            Status::Fail => "fail",
-        }
-    }
-
-    /// Severity rank for the human-readable ordering: failures first, then
-    /// warnings, then ok rows. The `--json` body keeps source order.
-    fn severity_rank(self) -> u8 {
-        match self {
-            Status::Fail => 0,
-            Status::Warn => 1,
-            Status::Ok => 2,
-        }
-    }
-
-    fn matches_filter(self, filter: DoctorStatusFilter) -> bool {
-        matches!(
-            (self, filter),
-            (Status::Ok, DoctorStatusFilter::Ok)
-                | (Status::Warn, DoctorStatusFilter::Warn)
-                | (Status::Fail, DoctorStatusFilter::Fail)
-        )
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Check {
-    name: String,
-    status: Status,
-    detail: String,
-    /// Optional structured metadata included in `--json` output. Used by the
-    /// sandbox row to expose machine-readable platform fields (`backend`,
-    /// `userns`, `landlock`, `required_mode_supported`) without scraping prose.
-    extra: Option<serde_json::Value>,
 }
 
 #[derive(Debug)]
@@ -251,16 +204,6 @@ impl DoctorReport {
             }).collect::<Vec<_>>(),
         })
     }
-}
-
-fn check_counts(checks: &[Check]) -> (usize, usize) {
-    checks
-        .iter()
-        .fold((0, 0), |(warnings, failures), check| match check.status {
-            Status::Warn => (warnings + 1, failures),
-            Status::Fail => (warnings, failures + 1),
-            Status::Ok => (warnings, failures),
-        })
 }
 
 pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
@@ -449,12 +392,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
         }
     }
 
-    if should_include_check(args, "terminal") {
-        checks.push(terminal_capability_check());
-    }
-    if should_include_check(args, "parser_health") {
-        checks.push(parser_health_check());
-    }
+    run_local_doctor_checks(args, &mut checks);
     if should_include_check(args, "sandbox") {
         checks.push(sandbox_check(config.as_ref()));
     }
@@ -567,126 +505,6 @@ fn probe_case_sensitivity(root: &std::path::Path) -> Option<bool> {
     let case_sensitive = !upper.exists();
     let _ = fs::remove_file(&lower);
     Some(case_sensitive)
-}
-
-fn needs_config(args: &DoctorArgs) -> bool {
-    if args.only.is_empty() {
-        return true;
-    }
-    args.only.iter().any(|selector| {
-        !matches!(
-            selector.as_str(),
-            "parser_health" | "sandbox" | "terminal" | "update"
-        )
-    })
-}
-
-fn exit_code_for_checks(checks: &[Check]) -> i32 {
-    let (_, failures) = check_counts(checks);
-    if failures > 0 { 1 } else { 0 }
-}
-
-fn should_include_check(args: &DoctorArgs, name: &str) -> bool {
-    args.only.iter().all(|selector| selector.trim().is_empty())
-        || args
-            .only
-            .iter()
-            .any(|selector| check_name_matches(selector, name))
-}
-
-fn check_name_matches(selector: &str, name: &str) -> bool {
-    let selector = selector.trim();
-    if selector.is_empty() {
-        return false;
-    }
-    name == selector
-        || (name.len() > selector.len()
-            && name.as_bytes().get(selector.len()) == Some(&b':')
-            && name.starts_with(selector))
-}
-
-fn filter_checks(args: &DoctorArgs, checks: Vec<Check>) -> Vec<Check> {
-    if args.status.is_empty() {
-        return checks;
-    }
-    checks
-        .into_iter()
-        .filter(|check| {
-            args.status
-                .iter()
-                .any(|filter| check.status.matches_filter(*filter))
-        })
-        .collect()
-}
-
-fn unmatched_selector_checks(
-    args: &DoctorArgs,
-    checks: &[Check],
-    config_failed: bool,
-) -> Vec<Check> {
-    // Split the unmatched selectors into two buckets:
-    //   * `unknown` -- typos / unrecognised selector names. These are
-    //     hard failures and tell the user to fix the command line.
-    //   * `skipped_due_to_config` -- selectors that *would* have been
-    //     evaluated, but config failed to load so the underlying check
-    //     never ran (e.g. `--only providers` against a corrupt
-    //     `settings.toml`). These are not user errors; they are a
-    //     downstream consequence of the `config` row already failing,
-    //     so we surface them as a single `selector` warn note instead
-    //     of silently dropping them.
-    let mut unknown = Vec::new();
-    let mut skipped_due_to_config = Vec::new();
-    for selector in &args.only {
-        let selector = selector.trim();
-        if selector.is_empty()
-            || checks
-                .iter()
-                .any(|check| check_name_matches(selector, &check.name))
-            || (selector == "update" && (args.skip_update || args.no_update_check))
-        {
-            continue;
-        }
-        if config_failed
-            && !matches!(
-                selector,
-                "parser_health" | "sandbox" | "terminal" | "update"
-            )
-        {
-            skipped_due_to_config.push(selector.to_string());
-        } else {
-            unknown.push(selector.to_string());
-        }
-    }
-    let mut out = Vec::new();
-    if !unknown.is_empty() {
-        out.push(Check {
-            name: "selector".to_string(),
-            status: Status::Fail,
-            detail: format!("unknown doctor --only selector(s): {}", unknown.join(", ")),
-            extra: None,
-        });
-    }
-    if !skipped_due_to_config.is_empty() {
-        // Distinct name so the "always re-include selector failures
-        // after status filtering" loop in `run()` does not treat this
-        // warn row and the `selector` fail row above as the same entry.
-        out.push(Check {
-            name: "selector:skipped".to_string(),
-            status: Status::Warn,
-            detail: format!(
-                "unable to evaluate {} because the `config` row failed to load; \
-                 fix the configuration to re-enable {}",
-                skipped_due_to_config.join(", "),
-                if skipped_due_to_config.len() == 1 {
-                    "this check"
-                } else {
-                    "these checks"
-                }
-            ),
-            extra: None,
-        });
-    }
-    out
 }
 
 fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Status, String)) {
@@ -1610,7 +1428,9 @@ fn providers_check(settings: &SettingsFile) -> Check {
 }
 
 fn provider_settings_state(name: &str, settings: &ProviderSettings) -> &'static str {
-    if matches!(name, "bedrock" | "ollama") {
+    if canonical_provider_name(name)
+        .is_some_and(|canonical| matches!(canonical, "bedrock" | "ollama"))
+    {
         return "keyless";
     }
     if settings
@@ -2716,7 +2536,7 @@ fn sandbox_teardown_action() -> Check {
 /// intentionally cheap — most providers expose a `GET /models` listing that
 /// doesn't count against token budgets. Bedrock has no equivalent in the
 /// runtime crate we depend on, so it reports a warn rather than fail.
-pub(crate) async fn probe_provider(provider: &ProviderConfig) -> (Status, String) {
+async fn probe_provider(provider: &ProviderConfig) -> (Status, String) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()

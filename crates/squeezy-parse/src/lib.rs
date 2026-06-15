@@ -1,10 +1,11 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
 };
 
 pub mod backend;
 mod languages;
+mod registration;
 
 use serde::{Deserialize, Serialize};
 use squeezy_core::{
@@ -20,6 +21,9 @@ pub(crate) use languages::{
     python::extract_python, ruby::extract_ruby, rust::extract_rust, scala::extract_scala,
     swift::extract_swift,
 };
+#[cfg(test)]
+pub(crate) use registration::scala_language;
+pub(crate) use registration::{ParserPool, language_for_kind, parser_for_language_kind};
 
 pub const CRATE_NAME: &str = "squeezy-parse";
 const PARALLEL_PARSE_THRESHOLD: usize = 8;
@@ -634,48 +638,6 @@ impl LanguageParser {
     }
 }
 
-#[derive(Default)]
-struct ParserPool {
-    parsers: HashMap<LanguageKind, Parser>,
-}
-
-impl ParserPool {
-    fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser> {
-        match self.parsers.entry(language) {
-            Entry::Occupied(entry) => Ok(entry.into_mut()),
-            Entry::Vacant(entry) => {
-                let parser = parser_for_language_kind(language)?;
-                Ok(entry.insert(parser))
-            }
-        }
-    }
-}
-
-fn parser_for_language_kind(language: LanguageKind) -> Result<Parser> {
-    match language {
-        LanguageKind::C => parser_with_c_language(),
-        LanguageKind::CSharp => parser_with_csharp_language(),
-        LanguageKind::Cpp => parser_with_cpp_language(),
-        LanguageKind::Dart => parser_with_dart_language(),
-        LanguageKind::Go => parser_with_go_language(),
-        LanguageKind::Java => parser_with_java_language(),
-        LanguageKind::JavaScript => parser_with_javascript_language(),
-        LanguageKind::Jsx => parser_with_jsx_language(),
-        LanguageKind::Kotlin => parser_with_kotlin_language(),
-        LanguageKind::Php => parser_with_php_language(),
-        LanguageKind::Python => parser_with_python_language(),
-        LanguageKind::Ruby => parser_with_ruby_language(),
-        LanguageKind::Rust => parser_with_rust_language(),
-        LanguageKind::Scala => parser_with_scala_language(),
-        LanguageKind::Swift => parser_with_swift_language(),
-        LanguageKind::TypeScript => parser_with_typescript_language(),
-        LanguageKind::Tsx => parser_with_tsx_language(),
-        _ => Err(SqueezyError::Parse(format!(
-            "unsupported parser language {language:?}"
-        ))),
-    }
-}
-
 // `parse_job_queue` uses a worker-local `ParserPool` so that grammar objects
 // are reused across the files this worker pulls off the shared queue.  Reuse
 // across separate `parse_records_parallel` calls is not currently possible
@@ -979,254 +941,6 @@ fn body_hit_kind_id(kind: BodyHitKind) -> &'static str {
         BodyHitKind::Macro => "macro",
         BodyHitKind::Literal => "literal",
         BodyHitKind::Attribute => "attribute",
-    }
-}
-
-fn parser_with_csharp_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = csharp_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load C# grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_rust_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = rust_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load Rust grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_go_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = go_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load Go grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_python_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = python_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load Python grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_ruby_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = ruby_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load Ruby grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_javascript_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = javascript_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load JavaScript grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_jsx_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = jsx_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load JSX grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_php_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = php_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load PHP grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_typescript_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = typescript_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load TypeScript grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_tsx_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = tsx_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load TSX grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_java_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = java_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load Java grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_kotlin_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = kotlin_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load Kotlin grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_scala_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = scala_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load Scala grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_swift_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = swift_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load Swift grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_c_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = c_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load C grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_cpp_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = cpp_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load C++ grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn parser_with_dart_language() -> Result<Parser> {
-    let mut parser = Parser::new();
-    let language = dart_language();
-    parser
-        .set_language(&language)
-        .map_err(|err| SqueezyError::Parse(format!("failed to load Dart grammar: {err}")))?;
-    Ok(parser)
-}
-
-fn csharp_language() -> tree_sitter::Language {
-    tree_sitter_c_sharp::LANGUAGE.into()
-}
-
-fn go_language() -> tree_sitter::Language {
-    tree_sitter_go::LANGUAGE.into()
-}
-
-fn rust_language() -> tree_sitter::Language {
-    tree_sitter_rust::LANGUAGE.into()
-}
-
-fn java_language() -> tree_sitter::Language {
-    tree_sitter_java::LANGUAGE.into()
-}
-
-fn kotlin_language() -> tree_sitter::Language {
-    tree_sitter_kotlin_ng::LANGUAGE.into()
-}
-
-fn scala_language() -> tree_sitter::Language {
-    tree_sitter_scala::LANGUAGE.into()
-}
-
-fn swift_language() -> tree_sitter::Language {
-    tree_sitter_swift::LANGUAGE.into()
-}
-
-fn python_language() -> tree_sitter::Language {
-    tree_sitter_python::LANGUAGE.into()
-}
-
-fn ruby_language() -> tree_sitter::Language {
-    tree_sitter_ruby::LANGUAGE.into()
-}
-
-fn javascript_language() -> tree_sitter::Language {
-    tree_sitter_javascript::LANGUAGE.into()
-}
-
-fn jsx_language() -> tree_sitter::Language {
-    tree_sitter_javascript::LANGUAGE.into()
-}
-
-fn php_language() -> tree_sitter::Language {
-    // PHP files routinely interleave inline HTML and `<?php ... ?>` blocks
-    // even when the file is "pure PHP", so the mixed-template grammar is the
-    // single right choice for the workspace. Pure-PHP files still parse fine
-    // under `LANGUAGE_PHP` (the leading `<?php` is just another `php_tag`).
-    tree_sitter_php::LANGUAGE_PHP.into()
-}
-
-fn typescript_language() -> tree_sitter::Language {
-    tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
-}
-
-fn tsx_language() -> tree_sitter::Language {
-    tree_sitter_typescript::LANGUAGE_TSX.into()
-}
-
-fn c_language() -> tree_sitter::Language {
-    tree_sitter_c::LANGUAGE.into()
-}
-
-fn cpp_language() -> tree_sitter::Language {
-    tree_sitter_cpp::LANGUAGE.into()
-}
-
-fn dart_language() -> tree_sitter::Language {
-    tree_sitter_dart::LANGUAGE.into()
-}
-
-fn language_for_kind(language: LanguageKind) -> Option<tree_sitter::Language> {
-    match language {
-        LanguageKind::C => Some(c_language()),
-        LanguageKind::CSharp => Some(csharp_language()),
-        LanguageKind::Cpp => Some(cpp_language()),
-        LanguageKind::Dart => Some(dart_language()),
-        LanguageKind::Go => Some(go_language()),
-        LanguageKind::Java => Some(java_language()),
-        LanguageKind::JavaScript => Some(javascript_language()),
-        LanguageKind::Jsx => Some(jsx_language()),
-        LanguageKind::Kotlin => Some(kotlin_language()),
-        LanguageKind::Python => Some(python_language()),
-        LanguageKind::Rust => Some(rust_language()),
-        LanguageKind::Ruby => Some(ruby_language()),
-        LanguageKind::Php => Some(php_language()),
-        LanguageKind::Scala => Some(scala_language()),
-        LanguageKind::Swift => Some(swift_language()),
-        LanguageKind::TypeScript => Some(typescript_language()),
-        LanguageKind::Tsx => Some(tsx_language()),
-        LanguageKind::Unsupported | LanguageKind::Unknown => None,
     }
 }
 

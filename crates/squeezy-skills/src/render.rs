@@ -1,4 +1,5 @@
-use crate::{LoadedSkill, SkillSummary, escape_body_breakouts, xml_escape};
+use crate::catalog::escape_body_breakouts;
+use crate::{LoadedSkill, SkillSummary, xml_escape};
 use tracing::warn;
 
 const STUB_DESCRIPTION_MAX_CHARS: usize = 240;

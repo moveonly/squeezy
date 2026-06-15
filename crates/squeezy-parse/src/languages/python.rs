@@ -1,3 +1,6 @@
+use crate::languages::common::{
+    parsed_file_from_context, record_missing_and_skip, visit_named_children_with_state,
+};
 use crate::languages::js_ts::{
     is_python_identifier, python_assignment_target, python_from_imports, python_plain_imports,
     python_simple_assignment_name, python_string_list_values,
@@ -14,18 +17,7 @@ pub(crate) fn extract_python(file: FileRecord, source: &str, tree: &Tree) -> Par
     extract_python_module_exports(&mut ctx);
     dedup_python_facts(&mut ctx);
 
-    ParsedFile {
-        file,
-        package: None,
-        symbols: ctx.symbols,
-        imports: ctx.imports,
-        calls: ctx.calls,
-        references: ctx.references,
-        body_hits: ctx.body_hits,
-        unsupported: None,
-        diagnostics: ctx.diagnostics,
-        changed_ranges: Vec::new(),
-    }
+    parsed_file_from_context(ctx, None)
 }
 
 use std::collections::HashSet;
@@ -88,8 +80,7 @@ pub(crate) fn visit_python_node(
     parent_symbol: Option<(SymbolId, SymbolKind)>,
     owner_symbol: Option<SymbolId>,
 ) {
-    if node.is_missing() {
-        record_missing_node_diagnostic(node, ctx);
+    if record_missing_and_skip(node, ctx) {
         return;
     }
 
@@ -145,10 +136,10 @@ pub(crate) fn visit_python_children(
     parent_symbol: Option<(SymbolId, SymbolKind)>,
     owner_symbol: Option<SymbolId>,
 ) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        visit_python_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
-    }
+    visit_named_children_with_state(node, (parent_symbol, owner_symbol), |child, state| {
+        let (parent_symbol, owner_symbol) = state;
+        visit_python_node(child, ctx, parent_symbol, owner_symbol);
+    });
 }
 
 /// Post-process a freshly-built Python symbol with signals the shared

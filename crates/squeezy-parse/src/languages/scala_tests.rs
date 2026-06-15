@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::scala_language;
+use tree_sitter::Parser;
 
 fn scala_record(relative_path: &str, source: &str) -> FileRecord {
     FileRecord {

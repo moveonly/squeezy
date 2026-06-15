@@ -11,6 +11,60 @@ use super::*;
 use crate::terminal_writer::TerminalWriter;
 
 #[test]
+fn render_order_documents_unique_modal_surfaces() {
+    let mut seen = Vec::new();
+    for kind in RENDER_ORDER {
+        assert!(
+            !seen.contains(kind),
+            "modal render order must not list {kind:?} twice"
+        );
+        seen.push(*kind);
+        let descriptor = kind.descriptor();
+        assert_eq!(descriptor.kind, *kind);
+        assert!(
+            !descriptor.label.is_empty(),
+            "surface label documents ownership"
+        );
+        assert!(
+            !descriptor.key_owner.is_empty(),
+            "key owner documents routing"
+        );
+        assert!(
+            !descriptor.render_owner.is_empty(),
+            "render owner documents painting"
+        );
+    }
+}
+
+#[test]
+fn descriptor_flags_preserve_known_modal_contracts() {
+    let transcript = SurfaceKind::TranscriptOverlay.descriptor();
+    assert!(transcript.blocks_session_quick_switch);
+    assert!(!transcript.consumes_macro_replay);
+    assert!(!transcript.allows_screen_selection);
+
+    let snippets = SurfaceKind::Snippets.descriptor();
+    assert!(snippets.blocks_session_quick_switch);
+    assert!(snippets.consumes_macro_replay);
+    assert!(snippets.allows_screen_selection);
+
+    let compare = SurfaceKind::SubagentCompare.descriptor();
+    assert!(!compare.blocks_session_quick_switch);
+    assert!(compare.consumes_macro_replay);
+    assert!(!compare.allows_screen_selection);
+
+    let plan_choice = SurfaceKind::PendingPlanChoice.descriptor();
+    assert_eq!(plan_choice.label, "plan choice");
+    assert!(plan_choice.blocks_session_quick_switch);
+    assert!(plan_choice.consumes_macro_replay);
+
+    let feedback = SurfaceKind::PendingFeedback.descriptor();
+    assert_eq!(feedback.label, "feedback");
+    assert!(feedback.blocks_session_quick_switch);
+    assert!(feedback.consumes_macro_replay);
+}
+
+#[test]
 fn centered_caps_to_max_and_centers() {
     let full = Rect::new(0, 0, 200, 60);
     let area = centered(full, 160, 32);

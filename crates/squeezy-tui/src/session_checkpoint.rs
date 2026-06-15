@@ -10,11 +10,11 @@
 //! the selected-entry index validated and CLAMPED on load against the current
 //! transcript.
 //!
-//! ## Model, not chrome
+//! ## Model and checkpoint surface
 //!
 //! Like its peer leaf modules ([`crate::workspace_profile`],
-//! [`crate::glyph_mode`]) this file owns only the *pure* model and the *pure*
-//! persistence math:
+//! [`crate::glyph_mode`]) this file owns the feature model, the persistence
+//! math, and the small read-only status surface:
 //!
 //!   - [`UiStateCheckpoint`]: the serialized, schema-versioned snapshot.
 //!   - [`CheckpointStore`]: the debounce gate + last-captured fingerprint. The
@@ -23,14 +23,16 @@
 //!     back-dating an `Instant` with bare subtraction (which panics on a fresh
 //!     Windows monotonic clock), so the test helpers construct past instants
 //!     with `checked_sub` + a clock-safe fallback.
+//!   - [`CheckpointUiState`]: the `TuiApp` grouping for the background store and
+//!     the optional overlay snapshot.
+//!   - [`render_surface`]: the status overlay painter for the checkpoint.
 //!   - [`checkpoint_path`] / [`load`] / [`save`] / [`clear`]: resolve the
 //!     on-disk path for a session id and round-trip the checkpoint through TOML
 //!     with an atomic `<file>.tmp` → rename write.
 //!
 //! `lib.rs` owns the side effects: capturing the live app state into a
 //! [`UiStateCheckpoint`], the debounced auto-save tick in the run loop, the
-//! restore-on-launch hook, and the small read-only status overlay + its
-//! keybinding.
+//! restore-on-launch hook, and the overlay keybinding.
 //!
 //! ## Bounds & idle cost
 //!
@@ -43,7 +45,16 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use ratatui::{
+    Frame,
+    layout::Rect,
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
+};
 use serde::{Deserialize, Serialize};
+
+use crate::{interaction, modal};
 
 /// Schema version stamped into every persisted [`UiStateCheckpoint`]. Bumped
 /// only when the on-disk shape changes incompatibly; a file with an
@@ -212,6 +223,7 @@ pub(crate) struct CheckpointStore {
 impl CheckpointStore {
     /// A fresh store with nothing saved yet — the first eligible change saves
     /// immediately (no debounce gate to clear on the very first write).
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -249,6 +261,201 @@ impl CheckpointStore {
     /// "no checkpoint saved yet" hint.
     pub(crate) fn has_saved(&self) -> bool {
         self.last_saved.is_some()
+    }
+}
+
+/// TuiApp-owned session-checkpoint state grouped under one feature field: the
+/// debounced background store plus the optional status overlay snapshot. Keeping
+/// these together makes the checkpoint domain explicit without changing the
+/// existing store semantics.
+#[derive(Debug, Default)]
+pub(crate) struct CheckpointUiState {
+    store: CheckpointStore,
+    pub(crate) overlay: Option<UiStateCheckpoint>,
+}
+
+impl CheckpointUiState {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn should_save(&self, candidate: &UiStateCheckpoint, now: Instant) -> bool {
+        self.store.should_save(candidate, now)
+    }
+
+    pub(crate) fn record_saved(&mut self, candidate: &UiStateCheckpoint, now: Instant) {
+        self.store.record_saved(candidate, now);
+    }
+
+    pub(crate) fn has_saved(&self) -> bool {
+        self.store.has_saved()
+    }
+}
+
+/// Paint the Session Auto-Save Checkpoints status overlay (§12.9.5) as a
+/// centered modal: a header naming the session whose checkpoint this is, a
+/// read-only list of the logical fields the checkpoint would restore (scroll
+/// anchor, focused entry, search, minimap pane), a `[restore]` affordance, and a
+/// footer with the verb legend. The `[restore]` line registers a
+/// [`interaction::ChromeKey::CheckpointRestore`] click target so a click restores
+/// it (the mouse twin of `r`). Reads only the captured checkpoint snapshot, so
+/// painting is constant-time and does no transcript walk.
+pub(crate) fn render_surface(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &crate::TuiApp,
+    checkpoint: &UiStateCheckpoint,
+) {
+    let title = Line::from(vec![
+        Span::styled(
+            " Session checkpoint ",
+            Style::default()
+                .fg(crate::render::theme::accent())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{2014} auto-saved UI state ",
+            Style::default().fg(crate::render::theme::quiet()),
+        ),
+    ]);
+    let inner = modal::surface(frame, area, 64, 14, title, app.glyph_mode);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let has_saved = !checkpoint.session_id.is_empty();
+
+    let header = if has_saved {
+        Line::from(vec![
+            Span::styled(
+                "saved for session ",
+                Style::default().fg(crate::render::theme::quiet()),
+            ),
+            Span::styled(
+                checkpoint.session_id.clone(),
+                Style::default().fg(crate::render::theme::secondary()),
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "no checkpoint saved yet \u{2014} one is auto-saved as you work",
+            Style::default().fg(crate::render::theme::quiet()),
+        ))
+    };
+    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
+
+    let scroll_value = if checkpoint.following_tail {
+        "following tail".to_string()
+    } else {
+        format!("{} line(s) up", checkpoint.scroll_from_bottom)
+    };
+    let selected_value = match checkpoint.selected_entry {
+        Some(index) => format!("entry #{index}"),
+        None => "\u{2014}".to_string(),
+    };
+    let search_value = checkpoint
+        .search_query
+        .clone()
+        .unwrap_or_else(|| "\u{2014}".to_string());
+    let minimap_value = if checkpoint.show_minimap {
+        "shown"
+    } else {
+        "hidden"
+    };
+    let rows: [(&str, String); 4] = [
+        ("Scroll", scroll_value),
+        ("Focused entry", selected_value),
+        ("Search", search_value),
+        ("Minimap pane", minimap_value.to_string()),
+    ];
+    let rows_top = inner.y.saturating_add(2);
+    let value_col = inner.x.saturating_add(18).min(inner.x + inner.width);
+    let rows_bottom = inner.y.saturating_add(inner.height).saturating_sub(2);
+    for (offset, (label, value)) in rows.iter().enumerate() {
+        let row_y = rows_top + offset as u16;
+        if row_y >= rows_bottom {
+            break;
+        }
+        let label_rect = Rect {
+            x: inner.x,
+            y: row_y,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                *label,
+                Style::default().fg(crate::render::theme::foreground()),
+            ))),
+            label_rect,
+        );
+        if value_col < inner.x.saturating_add(inner.width) {
+            let value_rect = Rect {
+                x: value_col,
+                y: row_y,
+                width: inner
+                    .x
+                    .saturating_add(inner.width)
+                    .saturating_sub(value_col),
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    value.clone(),
+                    Style::default().fg(crate::render::theme::secondary()),
+                ))),
+                value_rect,
+            );
+        }
+    }
+
+    let restore_y = inner.y.saturating_add(inner.height).saturating_sub(2);
+    if has_saved && restore_y >= rows_top {
+        let restore_rect = Rect {
+            x: inner.x,
+            y: restore_y,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "[restore]",
+                Style::default()
+                    .fg(crate::render::theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            restore_rect,
+        );
+        let target_rect = Rect {
+            x: inner.x,
+            y: restore_y,
+            width: 9u16.min(inner.width),
+            height: 1,
+        };
+        app.register_click(
+            target_rect,
+            interaction::TargetKey::Chrome(interaction::ChromeKey::CheckpointRestore),
+            interaction::Action::CheckpointRestore,
+        );
+    }
+
+    let footer_y = inner.y.saturating_add(inner.height).saturating_sub(1);
+    if footer_y >= rows_top {
+        let footer_rect = Rect {
+            x: inner.x,
+            y: footer_y,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "r restore \u{00b7} x forget \u{00b7} Esc close",
+                Style::default()
+                    .fg(crate::render::theme::secondary())
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            footer_rect,
+        );
     }
 }
 

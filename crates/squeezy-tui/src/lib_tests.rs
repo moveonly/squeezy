@@ -2,22 +2,22 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ratatui::backend::TestBackend;
 use squeezy_agent::{CostCapStatus, JobKind, JobStatus};
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
-    ContextAttachmentStatus, ContextEstimate, CostSnapshot, PermissionCapability, PermissionMode,
-    PermissionPolicy, PermissionRequest, PermissionRisk, PermissionScope, SessionMode,
-    StatusVerbosity, TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus,
-    TaskVerificationState, ToolOutputVerbosity, TranscriptDefault, TuiConfig,
-    TuiSynchronizedOutput, TurnId, TurnMetrics,
+    ContextAttachmentStatus, ContextEstimate, CostSnapshot, PermissionCapability,
+    PermissionRequest, PermissionRisk, PermissionScope, SessionMode, StatusVerbosity,
+    TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus, TaskVerificationState,
+    ToolOutputVerbosity, TranscriptDefault, TuiConfig, TuiSynchronizedOutput, TurnId, TurnMetrics,
 };
 use squeezy_llm::UnavailableProvider;
 use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus};
 
 use super::*;
+use crate::test_support::*;
 
 #[test]
 fn export_timestamp_millis_distinguishes_subsecond_instants() {
@@ -1519,7 +1519,7 @@ async fn freeform_modal_keeps_typing_out_of_main_composer() {
 async fn plan_choice_modal_blocks_overlay_opening_keymap_action() {
     let mut agent = test_agent(SessionMode::Plan);
     let mut app = test_app(SessionMode::Plan);
-    app.pending_plan_choice = Some(PendingPlanChoice {
+    app.plan.pending_choice = Some(PendingPlanChoice {
         plan_id: "plan-abc".to_string(),
         plan_path: app.workspace_root.join("plan-abc.md"),
         selection_index: 0,
@@ -1535,7 +1535,7 @@ async fn plan_choice_modal_blocks_overlay_opening_keymap_action() {
         "the snippets overlay must not open over a pending plan-choice modal"
     );
     assert!(
-        app.pending_plan_choice.is_some(),
+        app.plan.pending_choice.is_some(),
         "the plan-choice modal must stay up"
     );
 }
@@ -4264,473 +4264,6 @@ async fn slash_prompt_template_passes_through_when_no_match() {
 }
 
 #[tokio::test]
-async fn proposed_plan_block_opens_post_plan_choice_prompt() {
-    let root = temp_workspace("plan_choice_prompt");
-    let config = test_config_with_root(SessionMode::Plan, root.clone());
-    let mut app = test_app_with_config(&config, SessionMode::Plan);
-    let (tx, rx) = mpsc::channel(8);
-    app.turn_rx = Some(rx);
-    tx.send(AgentEvent::AssistantDelta {
-        turn_id: TurnId::new(1),
-        delta: "<proposed_plan>\nstep 1\nstep 2\n</proposed_plan>".to_string(),
-    })
-    .await
-    .expect("send delta");
-    drop(tx);
-    drain_agent_events(&mut app).await;
-
-    let pending = app
-        .pending_plan_choice
-        .as_ref()
-        .expect("prompt should be set after persist");
-    assert!(pending.plan_id.starts_with("plan-"));
-    assert!(
-        pending
-            .plan_path
-            .starts_with(root.join(proposed_plan::PLAN_DIR))
-    );
-    assert_eq!(pending.selection_index, 0);
-
-    let lines = approval_lines(&app);
-    let rendered: String = lines
-        .into_iter()
-        .flat_map(|line| line.spans.into_iter().map(|span| span.content.into_owned()))
-        .collect::<Vec<_>>()
-        .join("");
-    assert!(rendered.contains("Plan ready"), "render: {rendered}");
-    assert!(rendered.contains("[e] Execute"));
-    assert!(rendered.contains("[c] Execute (clean)"));
-    assert!(rendered.contains("[r] Refine"));
-    assert!(rendered.contains("[d] Discard"));
-    assert!(!rendered.contains("[v] View"));
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
-async fn build_mode_proposed_plan_tag_passes_through_untouched() {
-    // Outside Plan mode a literal <proposed_plan> tag is ordinary prose: it
-    // must stream verbatim with no plan card, no plan-choice modal, and no
-    // stripping of the surrounding narration.
-    let root = temp_workspace("build_plan_passthrough");
-    let config = test_config_with_root(SessionMode::Build, root.clone());
-    let mut app = test_app_with_config(&config, SessionMode::Build);
-    let (tx, rx) = mpsc::channel(8);
-    app.turn_rx = Some(rx);
-    tx.send(AgentEvent::AssistantDelta {
-        turn_id: TurnId::new(1),
-        delta: "before <proposed_plan>\nstep 1\n</proposed_plan> after".to_string(),
-    })
-    .await
-    .expect("send delta");
-    drop(tx);
-    drain_agent_events(&mut app).await;
-
-    assert_eq!(
-        app.pending_assistant.text(),
-        "before <proposed_plan>\nstep 1\n</proposed_plan> after",
-        "Build-mode delta must stream through verbatim"
-    );
-    assert!(
-        app.pending_plan_choice.is_none(),
-        "Build mode must not open a plan-choice modal"
-    );
-    let plan_cards = app
-        .transcript
-        .iter()
-        .filter(|entry| matches!(entry.kind, TranscriptEntryKind::PlanCard(_)))
-        .count();
-    assert_eq!(plan_cards, 0, "Build mode must not push a plan card");
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
-async fn completed_transcript_is_plan_free_after_stream_extraction() {
-    let root = temp_workspace("completed_plan_free");
-    let config = test_config_with_root(SessionMode::Plan, root.clone());
-    let mut app = test_app_with_config(&config, SessionMode::Plan);
-    let (tx, rx) = mpsc::channel(8);
-    app.turn_rx = Some(rx);
-    tx.send(AgentEvent::AssistantDelta {
-        turn_id: TurnId::new(1),
-        delta: "intro narration <proposed_plan>\nstep 1\nstep 2\n</proposed_plan> tail narration"
-            .to_string(),
-    })
-    .await
-    .expect("send delta");
-    // The agent strips the block before constructing the Completed
-    // TranscriptItem; this mirrors that behaviour. If the TUI ever
-    // regresses to re-injecting the block (e.g. via leftover) the
-    // assertion below catches it.
-    tx.send(AgentEvent::Completed {
-        turn_id: TurnId::new(1),
-        message: TranscriptItem::assistant("intro narration  tail narration".to_string()),
-        response_id: None,
-        cost: CostSnapshot::default(),
-        metrics: TurnMetrics::default(),
-        context_estimate: ContextEstimate::default(),
-        stop_reason: None,
-        reasoning_only_stop: false,
-        session_cost: None,
-    })
-    .await
-    .expect("send completed");
-    drop(tx);
-    drain_agent_events(&mut app).await;
-
-    let plan_cards = app
-        .transcript
-        .iter()
-        .filter(|entry| matches!(entry.kind, TranscriptEntryKind::PlanCard(_)))
-        .count();
-    assert_eq!(plan_cards, 1, "expected exactly one plan card");
-
-    for entry in &app.transcript {
-        if let TranscriptEntryKind::Message(item) = &entry.kind {
-            assert!(
-                !item.content.contains("<proposed_plan>"),
-                "transcript message must not contain raw proposed_plan markup: {:?}",
-                item.content
-            );
-            assert!(
-                !item.content.contains("step 1"),
-                "transcript message must not contain plan body: {:?}",
-                item.content
-            );
-        }
-    }
-    assert!(
-        app.pending_assistant.trim_is_empty(),
-        "pending_assistant must be empty after Completed; held {:?}",
-        app.pending_assistant.text()
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
-async fn unterminated_proposed_plan_block_does_not_duplicate_at_completion() {
-    let root = temp_workspace("unterminated_no_duplicate");
-    let config = test_config_with_root(SessionMode::Plan, root.clone());
-    let mut app = test_app_with_config(&config, SessionMode::Plan);
-    let (tx, rx) = mpsc::channel(8);
-    app.turn_rx = Some(rx);
-    tx.send(AgentEvent::AssistantDelta {
-        turn_id: TurnId::new(1),
-        delta: "intro <proposed_plan>\nstep 1\nstep 2 (no close tag)".to_string(),
-    })
-    .await
-    .expect("send delta");
-    tx.send(AgentEvent::Completed {
-        turn_id: TurnId::new(1),
-        message: TranscriptItem::assistant("intro".to_string()),
-        response_id: None,
-        cost: CostSnapshot::default(),
-        metrics: TurnMetrics::default(),
-        context_estimate: ContextEstimate::default(),
-        stop_reason: None,
-        reasoning_only_stop: false,
-        session_cost: None,
-    })
-    .await
-    .expect("send completed");
-    drop(tx);
-    drain_agent_events(&mut app).await;
-
-    assert!(
-        app.pending_assistant.trim_is_empty(),
-        "unterminated block must not leak back into pending_assistant: {:?}",
-        app.pending_assistant.text()
-    );
-    for entry in &app.transcript {
-        if let TranscriptEntryKind::Message(item) = &entry.kind {
-            assert!(
-                !item.content.contains("<proposed_plan>"),
-                "transcript must not surface the raw open tag: {:?}",
-                item.content
-            );
-            assert!(
-                !item.content.contains("step 1"),
-                "transcript must not surface body of unterminated block: {:?}",
-                item.content
-            );
-        }
-    }
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
-async fn plan_choice_execute_toggles_to_build_mode_and_queues_handoff() {
-    let root = temp_workspace("plan_choice_execute");
-    let plans_dir = root
-        .join(proposed_plan::PLAN_DIR)
-        .join(proposed_plan::FALLBACK_SESSION_ID);
-    fs::create_dir_all(&plans_dir).expect("mkdir plans");
-    let plan_id = "plan-execute1".to_string();
-    let plan_path = plans_dir.join(format!("{plan_id}.md"));
-    fs::write(&plan_path, "step 1\n").expect("write plan");
-
-    let config = test_config_with_root(SessionMode::Plan, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
-    let mut app = test_app_with_config(&config, SessionMode::Plan);
-    app.current_plan_id = Some(plan_id.clone());
-    app.pending_plan_choice = Some(PendingPlanChoice {
-        plan_id: plan_id.clone(),
-        plan_path: plan_path.clone(),
-        selection_index: 0,
-    });
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
-    )
-    .await
-    .expect("handle key");
-
-    assert_eq!(app.mode, SessionMode::Build);
-    assert!(app.pending_plan_choice.is_none());
-    // Execute auto-submits a "begin executing the plan" prompt. Under
-    // per-turn re-attach (issue 16), the handoff stays set across turns
-    // — the body is delivered on turn 1, then the lighter marker on
-    // turns 2+, until a successful apply_patch clears it. The counter
-    // advancing to 1 is the proof the body went out.
-    assert_eq!(
-        app.pending_plan_handoff.as_deref(),
-        Some(plan_path.as_path()),
-        "handoff persists for per-turn re-attach"
-    );
-    assert_eq!(
-        app.plan_handoff_turns_seen, 1,
-        "first auto-submitted turn should consume the body once"
-    );
-    assert!(
-        app.turn_rx.is_some(),
-        "Execute must start a turn so the agent actually runs the plan"
-    );
-    assert_eq!(app.status, "starting turn");
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
-async fn plan_choice_execute_clean_starts_turn_and_records_compaction_attempt() {
-    let root = temp_workspace("plan_choice_clean");
-    let plans_dir = root
-        .join(proposed_plan::PLAN_DIR)
-        .join(proposed_plan::FALLBACK_SESSION_ID);
-    fs::create_dir_all(&plans_dir).expect("mkdir plans");
-    let plan_id = "plan-clean001".to_string();
-    let plan_path = plans_dir.join(format!("{plan_id}.md"));
-    fs::write(&plan_path, "step 1\nstep 2\n").expect("write plan");
-
-    let config = test_config_with_root(SessionMode::Plan, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
-    let mut app = test_app_with_config(&config, SessionMode::Plan);
-    app.current_plan_id = Some(plan_id.clone());
-    app.pending_plan_choice = Some(PendingPlanChoice {
-        plan_id: plan_id.clone(),
-        plan_path: plan_path.clone(),
-        selection_index: 0,
-    });
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
-    )
-    .await
-    .expect("handle key");
-
-    assert_eq!(
-        app.mode,
-        SessionMode::Build,
-        "clean execute still switches to Build"
-    );
-    assert!(app.pending_plan_choice.is_none());
-    assert!(
-        app.turn_rx.is_some(),
-        "clean execute must also start a turn"
-    );
-    // We don't assert successful compaction here — the test agent has no
-    // history to compact, so the agent returns the "not enough context"
-    // error. We just verify the path is exercised: a log entry mentions
-    // either the compaction success or the skip.
-    assert!(
-        app.transcript.iter().any(|entry| matches!(
-            &entry.kind,
-            TranscriptEntryKind::Log(LogEntry { message: msg, .. }) if msg.contains("execute-clean") || msg.contains("compacted prior context")
-        )),
-        "expected an execute-clean log line; transcript={:?}",
-        app.transcript
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
-async fn plan_choice_discard_deletes_file_and_clears_handoff() {
-    let root = temp_workspace("plan_choice_discard");
-    let plans_dir = root
-        .join(proposed_plan::PLAN_DIR)
-        .join(proposed_plan::FALLBACK_SESSION_ID);
-    fs::create_dir_all(&plans_dir).expect("mkdir plans");
-    let plan_id = "plan-discard1".to_string();
-    let plan_path = plans_dir.join(format!("{plan_id}.md"));
-    fs::write(&plan_path, "step 1\n").expect("write plan");
-
-    // Point the on-disk `current` pointer at the plan so the discard path is
-    // exercised against a live pointer it must clean up.
-    proposed_plan::set_active_plan(&root, proposed_plan::FALLBACK_SESSION_ID, &plan_id)
-        .expect("set active plan");
-    assert_eq!(
-        proposed_plan::read_current_plan_id(&root, proposed_plan::FALLBACK_SESSION_ID).as_deref(),
-        Some(plan_id.as_str()),
-        "pointer is live before discard"
-    );
-
-    let config = test_config_with_root(SessionMode::Plan, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
-    let mut app = test_app_with_config(&config, SessionMode::Plan);
-    app.current_plan_id = Some(plan_id.clone());
-    app.pending_plan_handoff = Some(plan_path.clone());
-    app.pending_plan_choice = Some(PendingPlanChoice {
-        plan_id: plan_id.clone(),
-        plan_path: plan_path.clone(),
-        selection_index: 0,
-    });
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
-    )
-    .await
-    .expect("handle key");
-
-    assert!(!plan_path.exists(), "discard must delete the plan file");
-    assert!(app.pending_plan_choice.is_none());
-    assert!(app.current_plan_id.is_none());
-    assert!(app.pending_plan_handoff.is_none());
-    assert!(
-        proposed_plan::read_current_plan_id(&root, proposed_plan::FALLBACK_SESSION_ID).is_none(),
-        "discard must clear the on-disk current pointer for the deleted plan"
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
-async fn plan_choice_refine_dismisses_prompt_without_changing_mode_or_file() {
-    let root = temp_workspace("plan_choice_refine");
-    let plans_dir = root
-        .join(proposed_plan::PLAN_DIR)
-        .join(proposed_plan::FALLBACK_SESSION_ID);
-    fs::create_dir_all(&plans_dir).expect("mkdir plans");
-    let plan_id = "plan-refine01".to_string();
-    let plan_path = plans_dir.join(format!("{plan_id}.md"));
-    fs::write(&plan_path, "step\n").expect("write plan");
-
-    let config = test_config_with_root(SessionMode::Plan, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
-    let mut app = test_app_with_config(&config, SessionMode::Plan);
-    app.current_plan_id = Some(plan_id.clone());
-    app.pending_plan_choice = Some(PendingPlanChoice {
-        plan_id: plan_id.clone(),
-        plan_path: plan_path.clone(),
-        selection_index: 0,
-    });
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
-    )
-    .await
-    .expect("handle key");
-
-    assert!(app.pending_plan_choice.is_none());
-    assert!(plan_path.exists(), "refine must keep the plan file");
-    assert_eq!(app.mode, SessionMode::Plan);
-    assert_eq!(
-        app.current_plan_id.as_deref(),
-        Some(plan_id.as_str()),
-        "current_plan_id stays so the next refinement turn can find it"
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
-async fn plan_choice_arrow_keys_move_selection_without_activating() {
-    let root = temp_workspace("plan_choice_arrows");
-    let plan_path = root.join("plan-x.md");
-    fs::write(&plan_path, "step\n").expect("write plan");
-
-    let config = test_config_with_root(SessionMode::Plan, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
-    let mut app = test_app_with_config(&config, SessionMode::Plan);
-    app.pending_plan_choice = Some(PendingPlanChoice {
-        plan_id: "plan-x".to_string(),
-        plan_path: plan_path.clone(),
-        selection_index: 0,
-    });
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-    )
-    .await
-    .expect("handle key");
-    assert_eq!(app.pending_plan_choice.as_ref().unwrap().selection_index, 1);
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-    )
-    .await
-    .expect("handle key");
-    assert_eq!(app.pending_plan_choice.as_ref().unwrap().selection_index, 0);
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
-async fn plan_choice_shift_tab_falls_through_to_mode_toggle() {
-    let root = temp_workspace("plan_choice_shifttab");
-    let plan_path = root.join("plan-y.md");
-    fs::write(&plan_path, "step\n").expect("write plan");
-
-    let config = test_config_with_root(SessionMode::Plan, root.clone());
-    let mut agent = test_agent_with_config(config.clone());
-    let mut app = test_app_with_config(&config, SessionMode::Plan);
-    app.pending_plan_choice = Some(PendingPlanChoice {
-        plan_id: "plan-y".to_string(),
-        plan_path,
-        selection_index: 0,
-    });
-
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
-    )
-    .await
-    .expect("handle key");
-
-    assert_eq!(app.mode, SessionMode::Build);
-    assert!(
-        app.pending_plan_choice.is_none(),
-        "mode switch supersedes the post-plan choice prompt"
-    );
-
-    let _ = fs::remove_dir_all(&root);
-}
-
-#[tokio::test]
 async fn plan_to_build_switch_queues_plan_handoff_when_plan_file_exists() {
     let root = temp_workspace("plan_handoff_queued");
     let plans_dir = root
@@ -4744,13 +4277,13 @@ async fn plan_to_build_switch_queues_plan_handoff_when_plan_file_exists() {
     let config = test_config_with_root(SessionMode::Plan, root.clone());
     let agent = test_agent_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Plan);
-    app.current_plan_id = Some(plan_id);
+    app.plan.current_id = Some(plan_id);
 
     switch_mode(&mut app, &agent, Some(SessionMode::Build), "test");
 
     assert_eq!(app.mode, SessionMode::Build);
     assert_eq!(
-        app.pending_plan_handoff.as_deref(),
+        app.plan.pending_handoff.as_deref(),
         Some(plan_path.as_path())
     );
     assert!(
@@ -4772,12 +4305,12 @@ async fn plan_to_build_switch_skips_handoff_when_no_plan_file() {
     let agent = test_agent_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Plan);
     // current_plan_id present but the file was deleted out from under us
-    app.current_plan_id = Some("plan-never-persisted".to_string());
+    app.plan.current_id = Some("plan-never-persisted".to_string());
 
     switch_mode(&mut app, &agent, Some(SessionMode::Build), "test");
 
     assert_eq!(app.mode, SessionMode::Build);
-    assert!(app.pending_plan_handoff.is_none());
+    assert!(app.plan.pending_handoff.is_none());
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -4796,12 +4329,12 @@ async fn build_to_plan_switch_drops_pending_handoff() {
     let config = test_config_with_root(SessionMode::Plan, root.clone());
     let agent = test_agent_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Plan);
-    app.current_plan_id = Some(plan_id);
+    app.plan.current_id = Some(plan_id);
 
     switch_mode(&mut app, &agent, Some(SessionMode::Build), "test");
-    assert!(app.pending_plan_handoff.is_some());
+    assert!(app.plan.pending_handoff.is_some());
     switch_mode(&mut app, &agent, Some(SessionMode::Plan), "test");
-    assert!(app.pending_plan_handoff.is_none());
+    assert!(app.plan.pending_handoff.is_none());
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -4816,8 +4349,8 @@ async fn take_pending_plan_prefix_turn_one_returns_full_body() {
 
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.pending_plan_handoff = Some(plan_path.clone());
-    app.plan_handoff_turns_seen = 0;
+    app.plan.pending_handoff = Some(plan_path.clone());
+    app.plan.handoff_turns_seen = 0;
 
     let prefix = take_pending_plan_prefix(&mut app).expect("prefix returned");
     assert!(prefix.starts_with("[plan from previous session"));
@@ -4825,10 +4358,10 @@ async fn take_pending_plan_prefix_turn_one_returns_full_body() {
     assert!(prefix.ends_with("[end plan]\n\n"));
     // Per-turn re-attach: handoff is NOT cleared, but counter advances.
     assert_eq!(
-        app.pending_plan_handoff.as_deref(),
+        app.plan.pending_handoff.as_deref(),
         Some(plan_path.as_path())
     );
-    assert_eq!(app.plan_handoff_turns_seen, 1);
+    assert_eq!(app.plan.handoff_turns_seen, 1);
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -4843,9 +4376,9 @@ async fn take_pending_plan_prefix_subsequent_turns_return_short_marker() {
 
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.pending_plan_handoff = Some(plan_path.clone());
+    app.plan.pending_handoff = Some(plan_path.clone());
     // Simulate having already seen turn 1.
-    app.plan_handoff_turns_seen = 1;
+    app.plan.handoff_turns_seen = 1;
 
     let prefix = take_pending_plan_prefix(&mut app).expect("marker returned");
     assert!(
@@ -4863,7 +4396,7 @@ async fn take_pending_plan_prefix_subsequent_turns_return_short_marker() {
     // Handoff still set so later turns keep getting the marker until an
     // apply_patch (or mode switch) clears it.
     assert_eq!(
-        app.pending_plan_handoff.as_deref(),
+        app.plan.pending_handoff.as_deref(),
         Some(plan_path.as_path())
     );
 
@@ -4877,11 +4410,11 @@ async fn take_pending_plan_prefix_drops_handoff_when_file_missing() {
 
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.pending_plan_handoff = Some(phantom);
+    app.plan.pending_handoff = Some(phantom);
 
     let prefix = take_pending_plan_prefix(&mut app);
     assert!(prefix.is_none());
-    assert!(app.pending_plan_handoff.is_none());
+    assert!(app.plan.pending_handoff.is_none());
     assert!(
         app.transcript.iter().any(|entry| matches!(
             &entry.kind,
@@ -5645,7 +5178,7 @@ async fn slash_plans_set_active_updates_pointer_and_app() {
     .await
     .expect("handle key");
 
-    assert_eq!(app.current_plan_id.as_deref(), Some(id_a.as_str()));
+    assert_eq!(app.plan.current_id.as_deref(), Some(id_a.as_str()));
     assert_eq!(
         proposed_plan::read_current_plan_id(&root, proposed_plan::FALLBACK_SESSION_ID).as_deref(),
         Some(id_a.as_str())
@@ -5669,7 +5202,7 @@ async fn shift_tab_during_build_turn_pauses_and_switches_to_plan() {
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let agent = test_agent_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
-    app.current_plan_id = Some(plan_id.clone());
+    app.plan.current_id = Some(plan_id.clone());
     // Simulate a live model turn.
     let cancel = CancellationToken::new();
     app.cancel = Some(cancel.clone());
@@ -5683,11 +5216,11 @@ async fn shift_tab_during_build_turn_pauses_and_switches_to_plan() {
         "pause must cancel the in-flight turn"
     );
     assert!(
-        app.plan_pause.is_some(),
+        app.plan.pause.is_some(),
         "pause state must be captured for the resume marker"
     );
     assert_eq!(
-        app.plan_pause.as_ref().unwrap().plan_id,
+        app.plan.pause.as_ref().unwrap().plan_id,
         plan_id,
         "captured plan id must match the active plan"
     );
@@ -5711,16 +5244,17 @@ async fn resume_marker_announces_plan_change_during_pause() {
     let agent = test_agent_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Plan);
     // Plan id at time of pause differs from current (i.e. refined).
-    app.plan_pause = Some(PlanPauseState {
+    app.plan.pause = Some(PlanPauseState {
         plan_id: original_id.clone(),
     });
-    app.current_plan_id = Some(refined_id.clone());
+    app.plan.current_id = Some(refined_id.clone());
 
     switch_mode(&mut app, &agent, Some(SessionMode::Build), "test");
     assert_eq!(app.mode, SessionMode::Build);
-    assert!(app.plan_pause.is_none(), "pause state must be consumed");
+    assert!(app.plan.pause.is_none(), "pause state must be consumed");
     let marker = app
-        .plan_resume_marker
+        .plan
+        .resume_marker
         .as_deref()
         .expect("resume marker must be queued");
     assert!(
@@ -5753,13 +5287,13 @@ async fn resume_marker_omits_change_note_when_plan_unchanged() {
     let config = test_config_with_root(SessionMode::Plan, root.clone());
     let agent = test_agent_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Plan);
-    app.plan_pause = Some(PlanPauseState {
+    app.plan.pause = Some(PlanPauseState {
         plan_id: plan_id.clone(),
     });
-    app.current_plan_id = Some(plan_id.clone());
+    app.plan.current_id = Some(plan_id.clone());
 
     switch_mode(&mut app, &agent, Some(SessionMode::Build), "test");
-    let marker = app.plan_resume_marker.clone().unwrap_or_default();
+    let marker = app.plan.resume_marker.clone().unwrap_or_default();
     assert!(
         marker.contains("plan unchanged"),
         "marker should report no refinement: {marker}"
@@ -5780,7 +5314,7 @@ async fn mode_status_text_appends_active_plan_segment() {
         &proposed_plan::PlanMeta::default(),
     )
     .expect("persist plan");
-    app.current_plan_id = Some(plan_id.clone());
+    app.plan.current_id = Some(plan_id.clone());
     let line = mode_status_text(&app);
     assert!(line.contains("Plan mode"), "base segment intact: {line}");
     let short = format!(
@@ -10447,125 +9981,6 @@ fn finalized_reasoning_defaults_to_compact_visible_in_compact_transcript() {
     assert!(overlay.contains("▏ second thought"), "{overlay}");
 }
 
-#[test]
-fn approval_prompt_renders_actionable_menu_without_metadata_dump() {
-    let request = sample_approval_request();
-
-    let prompt = format_approval_prompt(&request);
-
-    assert!(prompt.contains("Approval needed"), "{prompt}");
-    assert!(prompt.contains("cargo test"), "{prompt}");
-    assert!(prompt.contains("Approve"), "{prompt}");
-    assert!(
-        prompt.contains("Always approve this command in this repo"),
-        "{prompt}"
-    );
-    assert!(prompt.contains("Deny"), "{prompt}");
-    assert!(!prompt.contains("output_byte_cap"), "{prompt}");
-    assert!(!prompt.contains("sandbox_network"), "{prompt}");
-    assert!(!prompt.contains("env="), "{prompt}");
-    assert!(!prompt.contains("reason="), "{prompt}");
-}
-
-#[test]
-fn approval_status_line_is_compact_single_line() {
-    let permission = PermissionRequest {
-        call_id: "call".to_string(),
-        tool_name: "shell".to_string(),
-        capability: PermissionCapability::Shell,
-        target: "shell:*".to_string(),
-        risk: PermissionRisk::High,
-        summary: "shell description=\"do stuff\"".to_string(),
-        metadata: BTreeMap::new(),
-        suggested_rules: Vec::new(),
-    };
-    let request = ToolApprovalRequest {
-        id: 1,
-        call_id: "call".to_string(),
-        tool_name: "shell".to_string(),
-        scope: PermissionScope::Shell,
-        permission,
-        matched_rule: None,
-        reason: "default shell permission is ask".to_string(),
-        context: None,
-        preview: Vec::new(),
-    };
-    let line = format_approval_status_line(&request);
-    assert!(!line.contains('\n'), "status line must be single line");
-    assert!(line.contains("approval needed"));
-    assert!(line.contains("risk=high"));
-    assert!(line.contains("target=shell:*"));
-}
-
-#[test]
-fn windows_restricted_token_posture_warns_without_claiming_no_fs_sandbox() {
-    let mut request = sample_approval_request();
-    request.permission.capability = PermissionCapability::Shell;
-    request.permission.target = "pwsh:*".to_string();
-    request
-        .permission
-        .metadata
-        .insert("shell_prefix".to_string(), "pwsh:*".to_string());
-    request.permission.metadata.insert(
-        "windows_sandbox_posture".to_string(),
-        "restricted-token-writes-only".to_string(),
-    );
-
-    let prompt = format_approval_prompt(&request);
-    assert!(
-        prompt.contains("Windows: write sandbox only; reads/network are not isolated"),
-        "{prompt}"
-    );
-    assert!(
-        !prompt.contains("no filesystem/network sandbox"),
-        "{prompt}"
-    );
-
-    let line = format_approval_status_line(&request);
-    assert!(
-        line.contains("sandbox=restricted-token-writes-only"),
-        "{line}"
-    );
-
-    let labels = approval_options_for(&request)
-        .into_iter()
-        .map(|option| option.label.into_owned())
-        .collect::<Vec<_>>();
-    assert!(
-        labels
-            .iter()
-            .any(|label| label.contains("Windows reads/network not isolated")),
-        "{labels:?}"
-    );
-}
-
-#[test]
-fn windows_broad_shell_warning_handles_resolved_binary_paths() {
-    let mut request = sample_approval_request();
-    request.permission.capability = PermissionCapability::Shell;
-    request.permission.target = "pwsh:*".to_string();
-    request.permission.metadata.insert(
-        "shell_prefix".to_string(),
-        r"C:\Program Files\PowerShell\7\pwsh.exe:*".to_string(),
-    );
-    request.permission.metadata.insert(
-        "windows_sandbox_posture".to_string(),
-        "job-object-only".to_string(),
-    );
-
-    let labels = approval_options_for(&request)
-        .into_iter()
-        .map(|option| option.label.into_owned())
-        .collect::<Vec<_>>();
-
-    assert!(
-        labels
-            .iter()
-            .any(|label| label.contains("job-object-only Windows shell")),
-        "{labels:?}"
-    );
-}
-
 #[tokio::test]
 async fn approval_menu_uses_arrows_and_enter_for_repo_rule() {
     let mut app = test_app(SessionMode::Build);
@@ -10614,31 +10029,6 @@ async fn approval_menu_esc_denies_the_run() {
         ToolApprovalDecision::DenyOnce
     );
     assert!(app.pending_approval.is_none());
-}
-
-#[test]
-fn approval_menu_offers_scope_aware_persistent_deny() {
-    let mut request = sample_approval_request();
-    request.permission.capability = PermissionCapability::Shell;
-    request.tool_name = "shell".to_string();
-    request
-        .permission
-        .metadata
-        .insert("binary".to_string(), "curl".to_string());
-
-    let options = approval_options_for(&request);
-    let deny_project = options
-        .iter()
-        .find(|opt| opt.decision == ToolApprovalDecision::DenyRuleProject)
-        .expect("persistent project-deny option missing");
-    assert_eq!(deny_project.choice, ApprovalChoice::DenyProject);
-    assert!(
-        deny_project
-            .label
-            .contains("Never allow command curl in this repo"),
-        "deny label should name the scope: {}",
-        deny_project.label
-    );
 }
 
 #[tokio::test]
@@ -20357,7 +19747,8 @@ async fn proposed_plan_block_renders_as_log_entry_and_persists_under_plans_dir()
     assert!(card_id.starts_with("plan-"));
 
     let plan_id = app
-        .current_plan_id
+        .plan
+        .current_id
         .as_ref()
         .expect("current_plan_id should be set after persistence");
     assert_eq!(plan_id, &card_id);
@@ -21366,51 +20757,6 @@ fn closing_config_applies_the_edited_zen_value_to_the_live_latch() {
     );
 }
 
-fn test_app(mode: SessionMode) -> TuiApp {
-    test_app_with_clipboard(mode, Box::new(NoopClipboard))
-}
-
-fn test_app_with_clipboard(mode: SessionMode, clipboard: Box<dyn Clipboard>) -> TuiApp {
-    let config = test_config(mode);
-    // The OSC 52 capability is now forced on at the `build_clipboard_chain`
-    // funnel under `cfg(test)`, so every app built here (and every direct
-    // `new_with_clipboard` caller) gets a host-independent OSC 52-capable chain
-    // and `deliver_copy` takes the observable `app.clipboard` fast path. Tests
-    // that model an OSC 52-ignoring terminal override it with
-    // `set_clipboard_chain_for_test` after construction.
-    TuiApp::new_with_clipboard("scripted", &config, mode, None, clipboard)
-}
-
-fn test_app_with_config(config: &AppConfig, mode: SessionMode) -> TuiApp {
-    TuiApp::new_with_clipboard("scripted", config, mode, None, Box::new(NoopClipboard))
-}
-
-fn test_config(mode: SessionMode) -> AppConfig {
-    AppConfig {
-        model: "gpt-test".to_string(),
-        session_mode: mode,
-        permissions: PermissionPolicy {
-            read: PermissionMode::Allow,
-            edit: PermissionMode::Ask,
-            shell: PermissionMode::Ask,
-            web: PermissionMode::Ask,
-            ..Default::default()
-        },
-        config_sources: vec!["defaults".to_string()],
-        // See `test_agent`: keep the test fixture off the real workspace so
-        // `Agent::new` / `TuiApp::new` don't crawl the repo on every test.
-        workspace_root: temp_workspace("config"),
-        ..Default::default()
-    }
-}
-
-fn test_config_with_root(mode: SessionMode, root: PathBuf) -> AppConfig {
-    AppConfig {
-        workspace_root: root,
-        ..test_config(mode)
-    }
-}
-
 fn sample_approval_request() -> ToolApprovalRequest {
     ToolApprovalRequest {
         id: 1,
@@ -21845,37 +21191,6 @@ fn transcript_message_contents(app: &TuiApp) -> Vec<&str> {
         .collect()
 }
 
-fn render_to_string(app: &TuiApp, width: u16, height: u16) -> String {
-    let backend = TestBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).expect("terminal");
-    terminal.draw(|frame| render(frame, app)).expect("draw");
-    let buffer = terminal.backend().buffer();
-    let mut output = String::new();
-    for y in 0..height {
-        for x in 0..width {
-            output.push_str(buffer[(x, y)].symbol());
-        }
-        output.push('\n');
-    }
-    output
-}
-
-fn lines_to_plain_text(lines: &[Line<'_>]) -> String {
-    let mut output = String::new();
-    for line in lines {
-        output.push_str(&rendered_line_text(line));
-        output.push('\n');
-    }
-    output
-}
-
-fn rendered_line_text(line: &Line<'_>) -> String {
-    line.spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>()
-}
-
 fn complete_turn_for_test(app: &mut TuiApp, visual: TurnVisualState, duration: Duration) {
     app.turn_visual = visual;
     app.last_turn_duration = Some(duration);
@@ -21911,95 +21226,6 @@ fn rendered_word_styles(app: &TuiApp, word: &str) -> Vec<(Color, Color, Modifier
         }
     }
     panic!("word {word:?} not rendered");
-}
-
-struct NoopClipboard;
-
-impl Clipboard for NoopClipboard {
-    fn copy_text(&mut self, _text: &str) -> std::result::Result<(), String> {
-        Ok(())
-    }
-}
-
-struct RecordingClipboard {
-    writes: Arc<StdMutex<Vec<String>>>,
-    error: Option<String>,
-}
-
-impl Clipboard for RecordingClipboard {
-    fn copy_text(&mut self, text: &str) -> std::result::Result<(), String> {
-        if let Some(error) = &self.error {
-            return Err(error.clone());
-        }
-        self.writes.lock().unwrap().push(text.to_string());
-        Ok(())
-    }
-}
-
-/// Clipboard double whose `read_text` / `read_image` return canned values, for
-/// exercising the in-app paste chord without touching the real system clipboard.
-#[derive(Default)]
-struct ReadableClipboard {
-    read: Option<String>,
-    image: Option<(Vec<u8>, String)>,
-}
-
-impl Clipboard for ReadableClipboard {
-    fn copy_text(&mut self, _text: &str) -> std::result::Result<(), String> {
-        Ok(())
-    }
-
-    fn read_text(&mut self) -> Option<String> {
-        self.read.clone()
-    }
-
-    fn read_image(&mut self) -> Option<(Vec<u8>, String)> {
-        self.image.clone()
-    }
-}
-
-fn test_agent(mode: SessionMode) -> Agent {
-    // Use a fresh empty temp workspace so the agent's tool registry doesn't
-    // crawl the entire repo (which adds seconds per test, especially on
-    // Windows where filesystem syscalls are slow). The TUI tests never
-    // touch the workspace; they only need a valid `AppConfig`.
-    test_agent_with_config(AppConfig {
-        session_mode: mode,
-        workspace_root: temp_workspace("agent"),
-        ..Default::default()
-    })
-}
-
-fn test_agent_with_config(config: AppConfig) -> Agent {
-    Agent::new(
-        config,
-        Arc::new(UnavailableProvider::new("scripted", "test provider")),
-    )
-}
-
-fn test_agent_without_session_log(mode: SessionMode) -> Agent {
-    test_agent_without_session_log_with_config(AppConfig {
-        session_mode: mode,
-        workspace_root: temp_workspace("agent"),
-        ..Default::default()
-    })
-}
-
-fn test_agent_without_session_log_with_config(config: AppConfig) -> Agent {
-    Agent::new_ephemeral(
-        config,
-        Arc::new(UnavailableProvider::new("scripted", "test provider")),
-    )
-}
-
-fn temp_workspace(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("squeezy_tui_{name}_{nonce}"));
-    fs::create_dir_all(&root).expect("create temp workspace");
-    root
 }
 
 #[test]
@@ -31200,7 +30426,7 @@ async fn session_checkpoint_overlay_opens_and_paints_state_through_real_render()
         .await
         .unwrap();
     assert!(
-        app.session_checkpoint_overlay.is_some(),
+        app.session_checkpoint.overlay.is_some(),
         "Ctrl+Alt+[ opens the overlay"
     );
 
@@ -31493,7 +30719,7 @@ async fn overlay_forget_removes_the_saved_checkpoint() {
     // "no checkpoint saved yet" and drops the `[restore]` affordance + its click
     // target (so a click can't restore a checkpoint that no longer exists).
     assert!(
-        app.session_checkpoint_overlay.is_some(),
+        app.session_checkpoint.overlay.is_some(),
         "forget leaves the overlay open"
     );
     let after = render_to_string(&app, 100, 30);
@@ -31535,7 +30761,7 @@ async fn overlay_status_distinguishes_on_disk_from_live_auto_save() {
         false,
     );
     crate::session_checkpoint::save(&saved).expect("save");
-    app.session_checkpoint_overlay = Some(saved);
+    app.session_checkpoint.overlay = Some(saved);
     assert!(
         !app.session_checkpoint.has_saved(),
         "precondition: the in-memory store has not recorded a save this run",
@@ -31569,13 +30795,13 @@ async fn overlay_keyboard_esc_closes_and_chord_toggles() {
     handle_key(&mut app, &mut agent, session_checkpoint_key())
         .await
         .unwrap();
-    assert!(app.session_checkpoint_overlay.is_some(), "chord opens it");
+    assert!(app.session_checkpoint.overlay.is_some(), "chord opens it");
     // The same chord closes it.
     handle_key(&mut app, &mut agent, session_checkpoint_key())
         .await
         .unwrap();
     assert!(
-        app.session_checkpoint_overlay.is_none(),
+        app.session_checkpoint.overlay.is_none(),
         "the same chord closes it"
     );
     // Reopen and close with Esc.
@@ -31590,7 +30816,7 @@ async fn overlay_keyboard_esc_closes_and_chord_toggles() {
     .await
     .unwrap();
     assert!(
-        app.session_checkpoint_overlay.is_none(),
+        app.session_checkpoint.overlay.is_none(),
         "Esc closes the overlay"
     );
 }
@@ -52401,180 +51627,6 @@ fn curated_label_on_assistant_message_is_not_tracked_here() {
     let tracked = note_help_answer_from_assistant(&mut app, &content);
     assert!(!tracked);
     assert!(app.last_help_answer.is_none());
-}
-
-// ---------------------------------------------------------------------------
-// Actionable help answers (ITEM 3): squeezy:cmd: hyperlink → composer prefill
-// ---------------------------------------------------------------------------
-
-#[test]
-fn command_hyperlink_prefills_the_composer_without_executing() {
-    let mut app = test_app(SessionMode::Build);
-    assert!(app.input.is_empty());
-
-    let handled = handle_command_hyperlink(&mut app, "squeezy:cmd:/theme");
-    assert!(handled, "an internal command URI is handled in-app");
-    // Prefilled, NOT executed: the command sits in the composer with the cursor
-    // at the end, awaiting an explicit Enter.
-    assert_eq!(app.input, "/theme");
-    assert_eq!(app.input_cursor, "/theme".len());
-}
-
-#[test]
-fn command_hyperlink_ignores_foreign_schemes() {
-    let mut app = test_app(SessionMode::Build);
-    let handled = handle_command_hyperlink(&mut app, "https://example.com/theme");
-    assert!(
-        !handled,
-        "a web URL is not ours; the caller keeps routing it as a normal link"
-    );
-    assert!(app.input.is_empty(), "the composer is untouched");
-}
-
-#[test]
-fn command_hyperlink_protects_an_in_progress_draft() {
-    let mut app = test_app(SessionMode::Build);
-    app.input = "an important half-typed prompt".to_string();
-    app.input_cursor = app.input.len();
-
-    let handled = handle_command_hyperlink(&mut app, "squeezy:cmd:/theme");
-    assert!(handled, "the URI is recognised (and consumed)");
-    // The non-command draft is preserved; nothing was overwritten.
-    assert_eq!(app.input, "an important half-typed prompt");
-}
-
-#[test]
-fn command_hyperlink_replaces_a_slash_command_draft() {
-    let mut app = test_app(SessionMode::Build);
-    // A composer that already holds a slash-command line is a fresh command line
-    // the user is mid-choosing; swapping in the clicked command is safe.
-    app.input = "/he".to_string();
-    app.input_cursor = app.input.len();
-
-    let handled = handle_command_hyperlink(&mut app, "squeezy:cmd:/help");
-    assert!(handled);
-    assert_eq!(app.input, "/help");
-}
-
-#[test]
-fn slash_command_index_round_trips_with_lookup() {
-    // The actionable-help click path carries the SLASH_COMMANDS index (so the
-    // Action stays Copy); the index must resolve back to the same command name.
-    for (i, command) in input::SLASH_COMMANDS.iter().enumerate() {
-        assert_eq!(input::slash_command_index(command.name), Some(i));
-        assert_eq!(input::SLASH_COMMANDS[i].name, command.name);
-    }
-    assert_eq!(
-        input::slash_command_index("/definitely-not-a-command"),
-        None
-    );
-}
-
-#[test]
-fn prefill_command_action_routes_to_the_composer_prefill() {
-    // A click on a command-link span dispatches PrefillCommand(index); it must
-    // resolve the index to the command and prefill the composer (not run it),
-    // sharing the exact handle_command_hyperlink path the URI would.
-    let mut app = test_app(SessionMode::Build);
-    let theme_index = input::slash_command_index("/theme").expect("/theme is registered");
-
-    dispatch_click_action(&mut app, interaction::Action::PrefillCommand(theme_index));
-    assert_eq!(app.input, "/theme");
-    assert_eq!(app.input_cursor, "/theme".len());
-}
-
-#[test]
-fn prefill_command_action_with_a_stale_index_is_a_noop() {
-    // A registry rebuilt-at-draw stale index (out of range) must resolve to a
-    // no-op rather than panic or prefill a wrong command.
-    let mut app = test_app(SessionMode::Build);
-    let out_of_range = input::SLASH_COMMANDS.len() + 10;
-    dispatch_click_action(&mut app, interaction::Action::PrefillCommand(out_of_range));
-    assert!(
-        app.input.is_empty(),
-        "an out-of-range index prefills nothing"
-    );
-}
-
-#[test]
-fn prefill_command_action_has_a_keyboard_twin() {
-    // §12.10.5 accessibility audit: the new mouse affordance must resolve to a
-    // keyboard path so the keyboard-reachability gate stays green.
-    assert!(
-        crate::accessibility::keyboard_equivalent(interaction::Action::PrefillCommand(0)).is_some(),
-        "PrefillCommand must have a keyboard equivalent"
-    );
-}
-
-#[test]
-fn register_command_link_targets_registers_a_clickable_span_in_soft_wrap() {
-    // Build a painted line with a `/theme` code span and register command-link
-    // targets over the visible window; a hit-test at the span's first cell must
-    // resolve to PrefillCommand(/theme).
-    let app = test_app(SessionMode::Build);
-    let theme_index = input::slash_command_index("/theme").expect("/theme is registered");
-    let lines = vec![Line::from(vec![
-        Span::raw("Try "), // 4 cells: columns 0..4
-        Span::styled("/theme", Style::default()),
-        Span::raw(" to switch."),
-    ])];
-    let text_area = Rect {
-        x: 2,
-        y: 3,
-        width: 40,
-        height: 5,
-    };
-    app.begin_frame_clickables();
-    register_command_link_targets(&app, text_area, &lines, 0, 5, true);
-
-    // The `/theme` span starts at column 4 within the line → screen x = 2 + 4 = 6,
-    // screen y = text_area.y + (row 0 - top 0) = 3.
-    let hit = app
-        .click_target_at(6, 3)
-        .expect("the command span is clickable");
-    assert_eq!(hit.1, interaction::Action::PrefillCommand(theme_index));
-    assert!(
-        matches!(
-            hit.0,
-            interaction::TargetKey::Chrome(interaction::ChromeKey::CommandLink(6, 3))
-        ),
-        "keyed by painted (column, row): {:?}",
-        hit.0
-    );
-    // A cell on the prose before the span is not a command-link target.
-    assert!(app.click_target_at(2, 3).is_none());
-}
-
-#[test]
-fn register_command_link_targets_skips_rows_outside_the_window_and_no_wrap() {
-    let app = test_app(SessionMode::Build);
-    let lines = vec![
-        Line::from(vec![Span::styled("/theme", Style::default())]),
-        Line::from(vec![Span::styled("/router", Style::default())]),
-    ];
-    let text_area = Rect {
-        x: 0,
-        y: 0,
-        width: 40,
-        height: 1,
-    };
-    // Window shows only row 0 (top=0, viewport_h=1): row 1 must not register.
-    app.begin_frame_clickables();
-    register_command_link_targets(&app, text_area, &lines, 0, 1, true);
-    assert!(app.click_target_at(0, 0).is_some(), "visible row registers");
-    assert!(
-        app.click_target_at(0, 1).is_none(),
-        "off-window row does not register"
-    );
-
-    // No-wrap mode is skipped entirely (per-span cell math is unreliable under a
-    // horizontal pan), so the command stays reachable only by typing it.
-    app.begin_frame_clickables();
-    register_command_link_targets(&app, text_area, &lines, 0, 2, false);
-    assert!(
-        app.click_target_at(0, 0).is_none(),
-        "no-wrap mode registers no command-link targets"
-    );
 }
 
 #[cfg(test)]

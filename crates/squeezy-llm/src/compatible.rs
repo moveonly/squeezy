@@ -100,7 +100,7 @@ impl OpenAiCompatibleProvider {
         let vertex_oauth = config.preset == OpenAiCompatiblePreset::Vertex && config.use_oauth;
         let api_key = if vertex_oauth {
             String::new()
-        } else if is_local_preset(config.preset) {
+        } else if compat_policy(config.preset).allows_empty_api_key {
             resolve_api_key_with_inline_optional(config.api_key.as_deref(), &config.api_key_env)?
                 .value
         } else {
@@ -636,6 +636,80 @@ pub(crate) static COMPAT_TABLE: &[CompatEntry] = &[
     },
 ];
 
+/// Per-preset policy for OpenAI-compatible providers.
+///
+/// Model namespace quirks live in [`COMPAT_TABLE`]; this table is for preset
+/// quirks that are independent of the requested model id: optional auth for
+/// local servers, attribution headers, strict-body gates, and stream parsing
+/// toggles. Keeping those decisions in rows prevents new preset fixes from
+/// becoming one-off `matches!(preset, ...)` checks in provider construction
+/// and streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompatPolicy {
+    pub preset: OpenAiCompatiblePreset,
+    pub allows_empty_api_key: bool,
+    pub default_headers: &'static [(&'static str, &'static str)],
+    pub extract_inline_think: bool,
+    pub rejects_prompt_cache_retention: bool,
+}
+
+const OPENROUTER_DEFAULT_HEADERS: &[(&str, &str)] = &[
+    ("HTTP-Referer", "https://github.com/esqueezy/squeezy"),
+    ("X-Title", "Squeezy"),
+];
+
+const DEFAULT_COMPAT_POLICY: CompatPolicy = CompatPolicy {
+    preset: OpenAiCompatiblePreset::Custom,
+    allows_empty_api_key: false,
+    default_headers: &[],
+    extract_inline_think: false,
+    rejects_prompt_cache_retention: false,
+};
+
+pub(crate) static COMPAT_POLICIES: &[CompatPolicy] = &[
+    CompatPolicy {
+        preset: OpenAiCompatiblePreset::OpenRouter,
+        default_headers: OPENROUTER_DEFAULT_HEADERS,
+        ..DEFAULT_COMPAT_POLICY
+    },
+    CompatPolicy {
+        preset: OpenAiCompatiblePreset::Mistral,
+        rejects_prompt_cache_retention: true,
+        ..DEFAULT_COMPAT_POLICY
+    },
+    CompatPolicy {
+        preset: OpenAiCompatiblePreset::LMStudio,
+        allows_empty_api_key: true,
+        ..DEFAULT_COMPAT_POLICY
+    },
+    CompatPolicy {
+        preset: OpenAiCompatiblePreset::VLlm,
+        allows_empty_api_key: true,
+        ..DEFAULT_COMPAT_POLICY
+    },
+    CompatPolicy {
+        preset: OpenAiCompatiblePreset::LlamaCpp,
+        allows_empty_api_key: true,
+        ..DEFAULT_COMPAT_POLICY
+    },
+    CompatPolicy {
+        preset: OpenAiCompatiblePreset::CloudflareWorkersAi,
+        extract_inline_think: true,
+        ..DEFAULT_COMPAT_POLICY
+    },
+];
+
+pub(crate) fn compat_policy(preset: OpenAiCompatiblePreset) -> CompatPolicy {
+    COMPAT_POLICIES
+        .iter()
+        .copied()
+        .find(|policy| policy.preset == preset)
+        .unwrap_or(CompatPolicy {
+            preset,
+            ..DEFAULT_COMPAT_POLICY
+        })
+}
+
 /// Classify a model id into a [`CompatFlavor`]. Returns
 /// [`CompatFlavor::Generic`] for any namespace not represented in
 /// [`COMPAT_TABLE`], preserving the historical "fall through with best-effort
@@ -824,7 +898,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 // Gemma 4 ship reasoning that way on Cloudflare's
                 // OpenAI-compat path because no `reasoning_content`
                 // field is exposed).
-                extract_inline_think: matches!(preset, OpenAiCompatiblePreset::CloudflareWorkersAi),
+                extract_inline_think: compat_policy(preset).extract_inline_think,
                 ..StreamState::default()
             };
             let mut server_model_echo = crate::ServerModelEcho::default();
@@ -1140,18 +1214,14 @@ fn portkey_routing_header_present(headers: &BTreeMap<String, String>) -> bool {
 }
 
 fn preset_default_headers(preset: OpenAiCompatiblePreset) -> BTreeMap<String, String> {
-    let mut headers = BTreeMap::new();
-    if matches!(preset, OpenAiCompatiblePreset::OpenRouter) {
-        // OpenRouter uses HTTP-Referer + X-Title to attribute traffic in its
-        // ranking dashboard. Sending them lets the OpenRouter "Squeezy" entry
-        // accumulate stats. Users can override via providers.openrouter.headers.
-        headers.insert(
-            "HTTP-Referer".to_string(),
-            "https://github.com/esqueezy/squeezy".to_string(),
-        );
-        headers.insert("X-Title".to_string(), "Squeezy".to_string());
-    }
-    headers
+    // OpenRouter uses HTTP-Referer + X-Title to attribute traffic in its
+    // ranking dashboard. Sending them lets the OpenRouter "Squeezy" entry
+    // accumulate stats. Users can override via providers.openrouter.headers.
+    compat_policy(preset)
+        .default_headers
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -1522,12 +1592,7 @@ fn collect_reasoning_delta(delta: &Value) -> Option<Cow<'_, str>> {
 /// message wants a provider-specific load-CLI hint
 /// (see [`local_jit_load_hint`]).
 fn is_local_preset(preset: OpenAiCompatiblePreset) -> bool {
-    matches!(
-        preset,
-        OpenAiCompatiblePreset::LMStudio
-            | OpenAiCompatiblePreset::VLlm
-            | OpenAiCompatiblePreset::LlamaCpp
-    )
+    compat_policy(preset).allows_empty_api_key
 }
 
 /// Append a JIT-load hint to a 400 error body from a local OpenAI-compatible
@@ -1729,7 +1794,7 @@ fn emit_reasoning_hints(
 /// safest path is to suppress the field on the Mistral preset
 /// entirely. Other presets keep the OpenAI-compat opt-in.
 fn preset_rejects_prompt_cache_retention(preset: OpenAiCompatiblePreset) -> bool {
-    matches!(preset, OpenAiCompatiblePreset::Mistral)
+    compat_policy(preset).rejects_prompt_cache_retention
 }
 
 /// H-33: derive a stable, collision-safe `prompt_cache_key` that

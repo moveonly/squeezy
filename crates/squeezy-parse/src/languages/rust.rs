@@ -1,3 +1,6 @@
+use crate::languages::common::{
+    parsed_file_from_context, record_missing_and_skip, visit_named_children,
+};
 use crate::languages::java::java_first_name_descendant;
 use crate::*;
 
@@ -8,18 +11,7 @@ pub(crate) fn extract_rust(file: FileRecord, source: &str, tree: &Tree) -> Parse
 
     visit_node(root, &mut ctx, None, None);
 
-    ParsedFile {
-        file,
-        package: None,
-        symbols: ctx.symbols,
-        imports: ctx.imports,
-        calls: ctx.calls,
-        references: ctx.references,
-        body_hits: ctx.body_hits,
-        unsupported: None,
-        diagnostics: ctx.diagnostics,
-        changed_ranges: Vec::new(),
-    }
+    parsed_file_from_context(ctx, None)
 }
 
 pub(crate) fn visit_node(
@@ -28,8 +20,7 @@ pub(crate) fn visit_node(
     parent_symbol: Option<SymbolId>,
     owner_symbol: Option<SymbolId>,
 ) {
-    if node.is_missing() {
-        record_missing_node_diagnostic(node, ctx);
+    if record_missing_and_skip(node, ctx) {
         return;
     }
 
@@ -73,10 +64,9 @@ pub(crate) fn visit_children(
     parent_symbol: Option<SymbolId>,
     owner_symbol: Option<SymbolId>,
 ) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
+    visit_named_children(node, |child| {
         visit_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
-    }
+    });
 }
 
 pub(crate) fn symbol_from_node(

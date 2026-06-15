@@ -74,17 +74,26 @@ pub struct McpToolSchemaInfo {
 use tokio_util::sync::CancellationToken;
 use unicode_normalization::UnicodeNormalization;
 
+mod catalog;
 mod checkpoint_provider;
 mod checkpoints;
 mod file_mutation_queue;
 mod file_ops;
 mod graph_tools;
+mod graph_tools_diff_ranges;
+mod graph_tools_executor;
+mod graph_tools_filters;
+mod graph_tools_packets;
+mod graph_tools_read_slice;
+mod graph_tools_scope;
 mod ipc;
 mod patch;
 pub mod preview;
 mod safety;
 mod schema;
 mod shell;
+mod shell_ask_server;
+mod shell_capture;
 mod shell_output;
 mod shell_parse;
 mod shell_program;
@@ -99,15 +108,15 @@ mod win_job;
 mod win_sandbox_spec;
 mod windows_cmd;
 
+use catalog::{FirstPartyToolExecutor, PermissionProfile};
 pub use checkpoint_provider::{
     CheckpointEditContext, CheckpointProvider, CheckpointSnapshot, JournalCheckpointProvider,
     checkpoint_record_to_json,
 };
 use checkpoints::{CheckpointRevertArgs, CheckpointShowArgs};
 use file_ops::{GlobArgs, GrepArgs, ReadFileArgs, ReadToolOutputArgs};
-use graph_tools::{
-    ReadSliceArgs, SymbolContextArgs, cargo_facts_summary_json, graph_unavailable_result,
-};
+use graph_tools::{SymbolContextArgs, cargo_facts_summary_json, graph_unavailable_result};
+use graph_tools_read_slice::ReadSliceArgs;
 pub use ipc::{IpcEndpoint, IpcStream};
 use patch::{
     ApplyPatchArgs, ApplyPatchOperation, DiffContextArgs, PATCH_SNIPPET_MAX_CHARS, PatchPlan,
@@ -139,23 +148,19 @@ use shell_parse::{shell_coverage_warnings, shell_segments};
 #[cfg(test)]
 use shell_program::ShellProgram;
 pub use shell_program::effective_shell_label;
+use specs::mcp_tool_spec;
+#[cfg(test)]
 use specs::{
-    apply_patch_spec, checkpoint_check_spec, checkpoint_doctor_spec, checkpoint_list_spec,
-    checkpoint_restore_file_spec, checkpoint_revert_spec, checkpoint_show_spec,
-    checkpoint_undo_spec, decl_search_spec, definition_search_spec, diff_context_spec,
+    apply_patch_spec, decl_search_spec, definition_search_spec, diff_context_spec,
     downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, impact_spec,
-    inheritance_hierarchy_spec, list_skills_spec, load_skill_spec,
-    mcp_list_resource_templates_spec, mcp_list_resources_spec, mcp_read_resource_spec,
-    mcp_tool_spec, memory_spec, notebook_edit_spec, notes_recall_spec, notes_remember_spec,
-    observations_spec, plan_patch_spec, prepare_path_arguments, read_file_spec, read_slice_spec,
-    read_tool_output_spec, reference_search_spec, refresh_compiler_facts_spec, repo_map_spec,
-    shell_spec, symbol_at_spec, symbol_context_spec, upstream_flow_spec, verify_spec,
-    webfetch_spec, websearch_spec, write_file_spec,
+    inheritance_hierarchy_spec, list_skills_spec, load_skill_spec, memory_spec, notebook_edit_spec,
+    notes_recall_spec, notes_remember_spec, observations_spec, plan_patch_spec, read_file_spec,
+    read_slice_spec, read_tool_output_spec, reference_search_spec, refresh_compiler_facts_spec,
+    repo_map_spec, shell_spec, symbol_context_spec, upstream_flow_spec, verify_spec, webfetch_spec,
+    websearch_spec, write_file_spec,
 };
 pub use squeezy_graph::LanguageReport;
 
-#[cfg(target_os = "macos")]
-use shell_sandbox::macos_sandbox_exec_supported;
 #[cfg(all(test, target_os = "macos"))]
 use shell_sandbox::macos_shell_sandbox_profile;
 #[cfg(test)]
@@ -168,8 +173,6 @@ use shell_sandbox::{
     ShellSandboxHealth, ShellSandboxPlan, apply_shell_sandbox_backend_health,
     prepare_shell_sandbox_plan, shell_sandbox_backend_probe_failure,
 };
-#[cfg(target_os = "linux")]
-use shell_sandbox::{linux_landlock_supported, linux_unshare_supported};
 
 /// Provision the Windows elevated sandbox tier (one-time, prompts for UAC):
 /// creates the hidden local sandbox users and installs the persistent WFP
@@ -246,6 +249,12 @@ const VERIFY_SHELL_TIMEOUT_MS: u64 = 600_000;
 pub(crate) const DEFAULT_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
 pub(crate) const MAX_SHELL_OUTPUT_BYTE_CAP: usize = 128_000;
 const DIFF_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
+
+#[cfg(test)]
+fn first_party_tool_executor(name: &str) -> Option<FirstPartyToolExecutor> {
+    catalog::descriptor(name).map(|descriptor| descriptor.executor)
+}
+
 /// Upper bound a graph tool waits for the deferred
 /// background graph-open task to finish before it
 /// falls back to `graph_unavailable_result`. The condvar fires the instant
@@ -568,81 +577,6 @@ pub struct ToolExecutionOptions {
     pub shell_ask_approver: Option<ShellAskApprover>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FirstPartyToolExecutor {
-    ApplyPatch,
-    CheckpointDoctor,
-    CheckpointList,
-    CheckpointShow,
-    CheckpointUndo,
-    CheckpointRevert,
-    CheckpointRestoreFile,
-    CheckpointCheck,
-    Graph,
-    DiffContext,
-    PlanPatch,
-    Glob,
-    Grep,
-    ReadFile,
-    ReadToolOutput,
-    RefreshCompilerFacts,
-    Verify,
-    NotebookEdit,
-    WriteFile,
-    Shell,
-    Webfetch,
-    Websearch,
-    McpListResources,
-    McpListResourceTemplates,
-    McpReadResource,
-    ListSkills,
-    LoadSkill,
-    NotesRemember,
-    NotesRecall,
-    Observations,
-    Memory,
-}
-
-fn first_party_tool_executor(name: &str) -> Option<FirstPartyToolExecutor> {
-    if ToolRegistry::is_graph_tool_name(name) {
-        return Some(FirstPartyToolExecutor::Graph);
-    }
-
-    match name {
-        "apply_patch" => Some(FirstPartyToolExecutor::ApplyPatch),
-        "checkpoint_doctor" => Some(FirstPartyToolExecutor::CheckpointDoctor),
-        "checkpoint_list" => Some(FirstPartyToolExecutor::CheckpointList),
-        "checkpoint_show" => Some(FirstPartyToolExecutor::CheckpointShow),
-        "checkpoint_undo" => Some(FirstPartyToolExecutor::CheckpointUndo),
-        "checkpoint_revert" => Some(FirstPartyToolExecutor::CheckpointRevert),
-        "checkpoint_restore_file" => Some(FirstPartyToolExecutor::CheckpointRestoreFile),
-        "checkpoint_check" => Some(FirstPartyToolExecutor::CheckpointCheck),
-        "diff_context" => Some(FirstPartyToolExecutor::DiffContext),
-        "plan_patch" => Some(FirstPartyToolExecutor::PlanPatch),
-        "glob" => Some(FirstPartyToolExecutor::Glob),
-        "grep" => Some(FirstPartyToolExecutor::Grep),
-        "read_file" => Some(FirstPartyToolExecutor::ReadFile),
-        "read_tool_output" => Some(FirstPartyToolExecutor::ReadToolOutput),
-        "refresh_compiler_facts" => Some(FirstPartyToolExecutor::RefreshCompilerFacts),
-        "verify" => Some(FirstPartyToolExecutor::Verify),
-        "notebook_edit" => Some(FirstPartyToolExecutor::NotebookEdit),
-        "write_file" => Some(FirstPartyToolExecutor::WriteFile),
-        "shell" => Some(FirstPartyToolExecutor::Shell),
-        "webfetch" => Some(FirstPartyToolExecutor::Webfetch),
-        "websearch" => Some(FirstPartyToolExecutor::Websearch),
-        "mcp_list_resources" => Some(FirstPartyToolExecutor::McpListResources),
-        "mcp_list_resource_templates" => Some(FirstPartyToolExecutor::McpListResourceTemplates),
-        "mcp_read_resource" => Some(FirstPartyToolExecutor::McpReadResource),
-        "list_skills" => Some(FirstPartyToolExecutor::ListSkills),
-        "load_skill" => Some(FirstPartyToolExecutor::LoadSkill),
-        "notes_remember" => Some(FirstPartyToolExecutor::NotesRemember),
-        "notes_recall" => Some(FirstPartyToolExecutor::NotesRecall),
-        "observations" => Some(FirstPartyToolExecutor::Observations),
-        "memory" => Some(FirstPartyToolExecutor::Memory),
-        _ => None,
-    }
-}
-
 /// Per-tool soft-validation hook. Runs against the raw `arguments` JSON
 /// **before** typed-struct deserialization (and before the live
 /// `#[serde(deny_unknown_fields)]` schema rejects unknown keys), so a spec
@@ -653,17 +587,6 @@ fn first_party_tool_executor(name: &str) -> Option<FirstPartyToolExecutor> {
 /// error, so they should only fail when a normalization *cannot* leave
 /// the JSON in a typed-deserialize-friendly shape.
 pub type PrepareArgumentsHook = fn(&mut Value) -> std::result::Result<(), String>;
-
-/// True when a tool advertises a top-level `path` argument. Drives the
-/// uniform attachment of [`specs::prepare_path_arguments`] in
-/// [`ToolRegistry::build_specs`] so every path-bearing tool accepts the
-/// same path aliases.
-fn spec_has_top_level_path(spec: &ToolSpec) -> bool {
-    spec.parameters
-        .properties
-        .as_ref()
-        .is_some_and(|props| props.contains_key("path"))
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -2120,120 +2043,7 @@ impl ToolRegistry {
     }
 
     fn build_specs(&self) -> Vec<ToolSpec> {
-        let mut specs = vec![
-            apply_patch_spec(),
-            decl_search_spec(),
-            definition_search_spec(),
-            diff_context_spec(),
-            downstream_flow_spec(),
-            glob_spec(),
-            grep_spec(),
-            hierarchy_spec(),
-            impact_spec(),
-            inheritance_hierarchy_spec(),
-            notebook_edit_spec(),
-            plan_patch_spec(),
-            read_file_spec(),
-            read_slice_spec(),
-            read_tool_output_spec(),
-            reference_search_spec(),
-            refresh_compiler_facts_spec(),
-            repo_map_spec(),
-            write_file_spec(),
-            symbol_context_spec(),
-            upstream_flow_spec(),
-            verify_spec(),
-            shell_spec(),
-            webfetch_spec(),
-            websearch_spec(),
-            list_skills_spec(),
-            load_skill_spec(),
-            notes_remember_spec(),
-            notes_recall_spec(),
-            observations_spec(),
-            // Always advertised, like the `notes_*` durable-store tools: the
-            // agent gates the memory *guidance + index* on
-            // `user_memory_max_bytes`, but the tool itself stays available so an
-            // explicit "remember this" still works and the registry needs no
-            // config handle. Disabling memory (max_bytes = 0) drops the guidance,
-            // not the tool.
-            memory_spec(),
-        ];
-        if !self.mcp.has_no_enabled_servers() {
-            specs.extend([
-                mcp_list_resources_spec(),
-                mcp_list_resource_templates_spec(),
-                mcp_read_resource_spec(),
-            ]);
-        }
-        // `checkpoint_list` is always advertised so the model and UI can
-        // discover the disabled state (the handler returns `enabled:false`)
-        // rather than treating checkpoint tools as entirely absent.
-        specs.push(checkpoint_list_spec());
-        if self.checkpoints.is_some() {
-            specs.extend([
-                checkpoint_check_spec(),
-                checkpoint_doctor_spec(),
-                checkpoint_restore_file_spec(),
-                checkpoint_revert_spec(),
-                checkpoint_show_spec(),
-                checkpoint_undo_spec(),
-            ]);
-        }
-        // `symbol_at` is a position->symbol resolver that is meaningless
-        // without a code graph, so gate it on graph availability the same
-        // way MCP resource tools gate on enabled servers and checkpoint
-        // tools gate on a configured store — never advertised as a user
-        // opt-in flag, never pushed unconditionally.
-        if self.graph_available_for_specs() {
-            specs.push(symbol_at_spec());
-        }
-        // First-party specs are statically defined inline above. Funnel them
-        // through the compaction pipeline so the budget contract holds
-        // uniformly regardless of how a spec was built.
-        for spec in specs.iter_mut() {
-            compact_typed_tool_parameters(&mut spec.parameters);
-            // Uniform path-alias policy: any first-party tool that advertises
-            // a top-level `path` argument folds the common `filepath` /
-            // `file_path` / `file` spelling drift onto `path` before typed
-            // deserialization, so a misspelled path field is accepted on every
-            // path-bearing tool instead of being a `deny_unknown_fields`
-            // hard-reject on some (write_file/grep/glob/graph) and silently
-            // accepted on others (read_file). Specs that already declare a hook
-            // keep it (shell's command rehome, verify's arg rehome); a future
-            // path-bearing tool needing a custom hook must fold path
-            // normalization into it — `path_bearing_tools_uniformly_accept_path_aliases`
-            // enforces that contract.
-            if spec.prepare_arguments.is_none() && spec_has_top_level_path(spec) {
-                spec.prepare_arguments = Some(prepare_path_arguments);
-            }
-        }
-        // `mcp_tool_spec` already compacts at construction; append after the
-        // first-party loop to avoid double work.  Annotate tools belonging to
-        // stale servers so the model knows it is calling an external tool
-        // whose palette may not reflect the server's current capability.
-        let mcp_status = self.mcp.status_snapshot();
-        specs.extend(self.mcp.tools().into_iter().map(|tool| {
-            let is_stale = matches!(
-                mcp_status.per_server.get(&tool.server),
-                Some(McpServerStatus::Stale { .. })
-            );
-            mcp_tool_spec(tool, is_stale)
-        }));
-        // Partition first-party before MCP, alphabetic within each group. The
-        // contiguous first-party prefix lets the Anthropic adapter place its
-        // tools-array `cache_control` breakpoint on the last first-party tool,
-        // so a mid-session MCP `tools/list` refresh churns only bytes after
-        // the breakpoint instead of invalidating the cached prefix for every
-        // turn.
-        specs.sort_by(|left, right| {
-            let left_mcp = left.name.starts_with("mcp__");
-            let right_mcp = right.name.starts_with("mcp__");
-            left_mcp
-                .cmp(&right_mcp)
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        specs
+        catalog::build_specs(self)
     }
 
     fn invalidate_cached_specs(&self) {
@@ -2250,10 +2060,7 @@ impl ToolRegistry {
     /// will surface `unknown tool` later) and for tools that did not
     /// declare a hook.
     pub fn prepare_arguments_for(&self, name: &str) -> Option<PrepareArgumentsHook> {
-        self.specs()
-            .iter()
-            .find(|spec| spec.name == name)
-            .and_then(|spec| spec.prepare_arguments)
+        catalog::prepare_arguments_for(self, name)
     }
 
     pub async fn refresh_mcp_tools(&self, cancel: CancellationToken) -> McpRefreshOutcome {
@@ -2413,33 +2220,15 @@ impl ToolRegistry {
         if self.mcp_tool(&call.name).is_some() {
             return PermissionScope::Mcp;
         }
-        match call.name.as_str() {
-            "apply_patch" | "checkpoint_undo" | "checkpoint_revert" | "checkpoint_restore_file" => {
-                PermissionScope::Edit
-            }
-            "write_file" | "notebook_edit" => PermissionScope::Edit,
-            "shell" | "verify" | "refresh_compiler_facts" => PermissionScope::Shell,
-            "webfetch" | "websearch" => PermissionScope::Web,
-            "mcp_read_resource" | "mcp_list_resources" | "mcp_list_resource_templates" => {
-                PermissionScope::Mcp
-            }
-            "glob" if tool_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
-            "grep" if grep_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
-            "read_file" if self.read_file_targets_ignored_policy(&call.arguments) => {
-                PermissionScope::IgnoredSearch
-            }
-            "read_slice" if self.read_slice_targets_ignored_policy(&call.arguments) => {
-                PermissionScope::IgnoredSearch
-            }
-            "checkpoint_check" | "checkpoint_doctor" | "checkpoint_list" | "checkpoint_show"
-            | "decl_search" | "definition_search" | "diff_context" | "downstream_flow" | "glob"
-            | "grep" | "hierarchy" | "plan_patch" | "read_file" | "read_slice"
-            | "read_tool_output" | "reference_search" | "repo_map" | "symbol_context"
-            | "upstream_flow" | "list_skills" | "load_skill" | "observations" => {
-                PermissionScope::Read
-            }
-            _ => PermissionScope::Read,
+        if call.name == "read_file" && self.read_file_targets_ignored_policy(&call.arguments) {
+            return PermissionScope::IgnoredSearch;
         }
+        if call.name == "read_slice" && self.read_slice_targets_ignored_policy(&call.arguments) {
+            return PermissionScope::IgnoredSearch;
+        }
+        catalog::descriptor_for_call(call)
+            .map(|descriptor| descriptor.scope)
+            .unwrap_or(PermissionScope::Read)
     }
 
     pub fn permission_request(&self, call: &ToolCall) -> PermissionRequest {
@@ -2495,8 +2284,12 @@ impl ToolRegistry {
                 _ => call.arguments.clone(),
             }
         };
-        let (capability, target, risk) = match call.name.as_str() {
-            "apply_patch" => {
+        let descriptor = catalog::descriptor_for_call(call);
+        let permission_profile = descriptor
+            .map(|descriptor| descriptor.permission_profile)
+            .unwrap_or(PermissionProfile::DefaultRead);
+        let (capability, target, risk) = match permission_profile {
+            PermissionProfile::ApplyPatch => {
                 let args = serde_json::from_value::<ApplyPatchArgs>(call.arguments.clone()).ok();
                 let paths: Vec<String> = args
                     .as_ref()
@@ -2533,12 +2326,12 @@ impl ToolRegistry {
                 }
                 (PermissionCapability::Edit, target, PermissionRisk::High)
             }
-            "checkpoint_undo" | "checkpoint_revert" | "checkpoint_restore_file" => (
+            PermissionProfile::CheckpointMutation => (
                 PermissionCapability::Edit,
                 "workspace:*".to_string(),
                 PermissionRisk::High,
             ),
-            "write_file" | "notebook_edit" => {
+            PermissionProfile::WriteFile => {
                 let path = normalized_arguments
                     .get("path")
                     .and_then(Value::as_str)
@@ -2570,7 +2363,7 @@ impl ToolRegistry {
                     PermissionRisk::High,
                 )
             }
-            "read_file" => {
+            PermissionProfile::ReadFile => {
                 let path = normalized_arguments
                     .get("path")
                     .and_then(Value::as_str)
@@ -2602,7 +2395,7 @@ impl ToolRegistry {
                     )
                 }
             }
-            "shell" => {
+            PermissionProfile::Shell => {
                 let args = serde_json::from_value::<ShellArgs>(call.arguments.clone()).ok();
                 let command = args
                     .as_ref()
@@ -2672,86 +2465,14 @@ impl ToolRegistry {
                     "sandbox_network".to_string(),
                     self.shell_sandbox.network.as_str().to_string(),
                 );
-                // Surface the active OS sandbox backend and filesystem posture at
-                // approval time so the TUI can show isolation level before spawn.
-                // Uses the same probe functions the planner calls so the displayed
-                // backend matches the one the planner will actually select.
-                #[cfg(target_os = "linux")]
-                let (sandbox_backend, sandbox_filesystem) = {
-                    let will_use_direct_syscalls = linux_unshare_supported()
-                        && !matches!(
-                            self.shell_sandbox.mode,
-                            ShellSandboxMode::Off | ShellSandboxMode::External
-                        );
-                    if will_use_direct_syscalls {
-                        let fs = if linux_landlock_supported() {
-                            "enforced"
-                        } else {
-                            "best_effort_unavailable"
-                        };
-                        ("linux-direct-syscalls", fs)
-                    } else {
-                        ("none", "not_enforced")
-                    }
-                };
-                #[cfg(target_os = "macos")]
-                let (sandbox_backend, sandbox_filesystem) = {
-                    if macos_sandbox_exec_supported()
-                        && !matches!(
-                            self.shell_sandbox.mode,
-                            ShellSandboxMode::Off | ShellSandboxMode::External
-                        )
-                    {
-                        ("macos-sandbox-exec", "enforced")
-                    } else {
-                        ("none", "not_enforced")
-                    }
-                };
-                #[cfg(target_os = "windows")]
-                let (sandbox_backend, sandbox_filesystem) = {
-                    if matches!(
-                        self.shell_sandbox.mode,
-                        ShellSandboxMode::Off | ShellSandboxMode::External
-                    ) {
-                        ("none", "not_enforced")
-                    } else {
-                        match self.shell_sandbox.windows_sandbox_level {
-                            squeezy_core::WindowsSandboxLevel::Disabled => {
-                                ("windows-job-object", "best_effort_unavailable")
-                            }
-                            squeezy_core::WindowsSandboxLevel::RestrictedToken => {
-                                ("windows-restricted-token", "enforced_writes_only")
-                            }
-                            squeezy_core::WindowsSandboxLevel::Elevated
-                                if squeezy_win_sandbox::elevated_setup_is_complete(
-                                    &win_sandbox_spec::win_state_dir(),
-                                ) =>
-                            {
-                                ("windows-elevated", "enforced")
-                            }
-                            squeezy_core::WindowsSandboxLevel::Elevated => {
-                                ("windows-restricted-token", "enforced_writes_only")
-                            }
-                        }
-                    }
-                };
-                #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-                let (sandbox_backend, sandbox_filesystem) = ("none", "not_enforced");
-                metadata.insert("sandbox_backend".to_string(), sandbox_backend.to_string());
+                let backend = shell_sandbox::shell_sandbox_backend_metadata(&self.shell_sandbox);
+                metadata.insert("sandbox_backend".to_string(), backend.backend.to_string());
                 metadata.insert(
                     "sandbox_filesystem".to_string(),
-                    sandbox_filesystem.to_string(),
+                    backend.filesystem.to_string(),
                 );
-                // On linux-direct-syscalls the seccomp filter denies AF_UNIX
-                // socket(2), so squeezy ask cannot connect from inside the child.
-                // Only emit this hint when the direct-syscalls backend will
-                // actually be used (i.e. unshare is available and sandbox is on).
-                #[cfg(target_os = "linux")]
-                if sandbox_backend == "linux-direct-syscalls" {
-                    metadata.insert(
-                        "ask_socket_unavailable".to_string(),
-                        "squeezy ask is unavailable inside this shell child because the seccomp profile blocks AF_UNIX socket(2)".to_string(),
-                    );
+                if let Some(reason) = backend.ask_socket_unavailable {
+                    metadata.insert("ask_socket_unavailable".to_string(), reason.to_string());
                 }
                 metadata.insert(
                     "sandbox_read_roots".to_string(),
@@ -2774,42 +2495,11 @@ impl ToolRegistry {
                 ) {
                     metadata.insert("filesystem".to_string(), plan.filesystem.to_string());
                 }
-                // Surface the effective Windows sandbox posture to the
-                // approval UI. The default restricted-token tier enforces
-                // workspace write boundaries, but it does not isolate reads or
-                // network. Disabled/off mode is only Job Object cleanup.
-                #[cfg(target_os = "windows")]
-                {
-                    use squeezy_core::WindowsSandboxLevel;
-                    let posture = match self.shell_sandbox.mode {
-                        ShellSandboxMode::External => None,
-                        ShellSandboxMode::Off => Some("job-object-only"),
-                        ShellSandboxMode::Required | ShellSandboxMode::BestEffort => {
-                            match self.shell_sandbox.windows_sandbox_level {
-                                WindowsSandboxLevel::Disabled => Some("job-object-only"),
-                                WindowsSandboxLevel::RestrictedToken => {
-                                    Some("restricted-token-writes-only")
-                                }
-                                WindowsSandboxLevel::Elevated
-                                    if squeezy_win_sandbox::elevated_setup_is_complete(
-                                        &crate::win_sandbox_spec::win_state_dir(),
-                                    ) =>
-                                {
-                                    None
-                                }
-                                WindowsSandboxLevel::Elevated => {
-                                    Some("restricted-token-writes-only")
-                                }
-                            }
-                        }
-                    };
-                    if let Some(posture) = posture {
-                        metadata.insert("windows_sandbox_posture".to_string(), posture.to_string());
-                        if posture == "job-object-only" {
-                            metadata
-                                .insert("windows_no_fs_sandbox".to_string(), "true".to_string());
-                        }
-                    }
+                if let Some(posture) = backend.windows_posture {
+                    metadata.insert("windows_sandbox_posture".to_string(), posture.to_string());
+                }
+                if backend.windows_no_fs_sandbox {
+                    metadata.insert("windows_no_fs_sandbox".to_string(), "true".to_string());
                 }
                 if let Some(timeout_ms) = args.as_ref().and_then(|args| args.timeout_ms) {
                     metadata.insert("timeout_ms".to_string(), timeout_ms.to_string());
@@ -2845,7 +2535,7 @@ impl ToolRegistry {
                 ));
                 (analysis.capability, analysis.rule_target, analysis.risk)
             }
-            "verify" => {
+            PermissionProfile::Verify => {
                 let target = "cargo verify:*".to_string();
                 suggested_rules.push(PermissionRule::new(
                     "compiler",
@@ -2860,7 +2550,7 @@ impl ToolRegistry {
                     PermissionRisk::Medium,
                 )
             }
-            "refresh_compiler_facts" => {
+            PermissionProfile::RefreshCompilerFacts => {
                 let args =
                     serde_json::from_value::<RefreshCompilerFactsArgs>(call.arguments.clone()).ok();
                 let diagnostics = args
@@ -2896,7 +2586,7 @@ impl ToolRegistry {
                     PermissionRisk::Medium,
                 )
             }
-            "webfetch" => {
+            PermissionProfile::Webfetch => {
                 let args = serde_json::from_value::<WebFetchArgs>(call.arguments.clone()).ok();
                 let target = args
                     .as_ref()
@@ -2916,7 +2606,7 @@ impl ToolRegistry {
                     PermissionRisk::Medium,
                 )
             }
-            "websearch" => {
+            PermissionProfile::Websearch => {
                 let args = serde_json::from_value::<WebSearchArgs>(call.arguments.clone()).ok();
                 let query = args.as_ref().map(|args| args.query.as_str()).unwrap_or("*");
                 metadata.insert("query".to_string(), truncate_text(query, 200));
@@ -2926,7 +2616,7 @@ impl ToolRegistry {
                     PermissionRisk::Medium,
                 )
             }
-            "mcp_read_resource" => {
+            PermissionProfile::McpReadResource => {
                 let server = call
                     .arguments
                     .get("server")
@@ -2954,7 +2644,7 @@ impl ToolRegistry {
                     PermissionRisk::Medium,
                 )
             }
-            "mcp_list_resources" | "mcp_list_resource_templates" => {
+            PermissionProfile::McpListResources => {
                 let server = call
                     .arguments
                     .get("server")
@@ -2975,39 +2665,15 @@ impl ToolRegistry {
                     PermissionRisk::Low,
                 )
             }
-            "glob" if tool_include_ignored(&call.arguments) => (
-                PermissionCapability::Search,
-                "ignored:*".to_string(),
-                PermissionRisk::Medium,
-            ),
-            "grep" if grep_include_ignored(&call.arguments) => (
-                PermissionCapability::Search,
-                "ignored:*".to_string(),
-                PermissionRisk::Medium,
-            ),
-            "decl_search" | "definition_search" | "reference_search" => (
-                PermissionCapability::Search,
-                "workspace:*".to_string(),
-                PermissionRisk::Low,
-            ),
-            "grep" | "glob" => (
-                PermissionCapability::Search,
-                "workspace:*".to_string(),
-                PermissionRisk::Low,
-            ),
-            "checkpoint_check" | "checkpoint_doctor" | "checkpoint_list" | "checkpoint_show"
-            | "diff_context" | "downstream_flow" | "hierarchy" | "plan_patch" | "read_slice"
-            | "read_tool_output" | "repo_map" | "symbol_context" | "upstream_flow"
-            | "list_skills" | "load_skill" => (
-                PermissionCapability::Read,
-                "workspace:*".to_string(),
-                PermissionRisk::Low,
-            ),
-            _ => (
-                PermissionCapability::Read,
-                format!("tool:{}", call.name),
-                PermissionRisk::Medium,
-            ),
+            profile => {
+                let (capability, target, risk) = catalog::default_permission_tuple(profile);
+                let target = if matches!(profile, PermissionProfile::DefaultRead) {
+                    format!("tool:{}", call.name)
+                } else {
+                    target
+                };
+                (capability, target, risk)
+            }
         };
         PermissionRequest {
             call_id: call.call_id.clone(),
@@ -3542,7 +3208,7 @@ impl ToolRegistry {
         let result = if self.mcp_tool(&call.name).is_some() {
             self.execute_mcp_tool(&call, cancel).await
         } else {
-            match first_party_tool_executor(&call.name) {
+            match catalog::descriptor(&call.name).map(|descriptor| descriptor.executor) {
                 Some(FirstPartyToolExecutor::ApplyPatch) => {
                     self.execute_apply_patch(&call, &group_id).await
                 }

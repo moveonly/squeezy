@@ -670,7 +670,7 @@ mod mouse_geometry {
         // agent makes that replay inert, but the flag + selection index the click
         // arms are the assertion target — inspect them BEFORE the pump drains them.
         let mut h = harness(120, 30, SessionMode::Plan);
-        h.app_mut().pending_plan_choice = Some(PendingPlanChoice {
+        h.app_mut().plan.pending_choice = Some(PendingPlanChoice {
             plan_id: "plan-abc".to_string(),
             plan_path: temp_workspace().join("plan-abc.md"),
             selection_index: 0,
@@ -694,7 +694,8 @@ mod mouse_geometry {
         );
         assert_eq!(
             h.app_mut()
-                .pending_plan_choice
+                .plan
+                .pending_choice
                 .as_ref()
                 .expect("plan choice still pending until the event loop replays Enter")
                 .selection_index,

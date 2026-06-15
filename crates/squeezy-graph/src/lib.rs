@@ -7,13 +7,22 @@ use std::{
 
 pub mod affected;
 pub mod backend;
+mod cache;
 pub mod cross_file;
+mod index;
 mod languages;
+mod project_facts;
+mod query;
 mod references;
 pub use references::SourceCache;
+mod refresh;
 mod resolution;
 pub mod resolver_cache;
 pub mod watcher;
+pub use query::{
+    BodySearchHit, BodySearchQuery, CallEdgeHit, HierarchyNode, ImpactSet, ReferenceHit,
+    SignatureQuery,
+};
 
 use serde::{Deserialize, Serialize};
 use squeezy_core::{
@@ -21,8 +30,8 @@ use squeezy_core::{
     Result, SourceSpan, SqueezyError, SymbolId, SymbolKind,
 };
 use squeezy_parse::{
-    BodyHit, BodyHitKind, LanguageParser, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport,
-    ParsedReference, ParsedSymbol, ReferenceKind, edge_kind_for_call,
+    BodyHit, LanguageParser, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport, ParsedReference,
+    ParsedSymbol, ReferenceKind, edge_kind_for_call,
 };
 use squeezy_store::{GraphStore, GraphStoreMetadata, GraphWriteBatch};
 use squeezy_workspace::{
@@ -31,6 +40,10 @@ use squeezy_workspace::{
     filesystem_paths_match,
 };
 use tracing::{error, warn};
+
+use crate::project_facts::{CachedJavaProjectFacts, CachedKotlinProjectFacts};
+use crate::refresh::{SkippedRefreshInput, skipped_refresh_report};
+use index::{CandidateSet, body_hits_fingerprint, rarest_indexed_trigram, unique_trigrams};
 
 use crate::languages::{
     csharp::{
@@ -284,66 +297,6 @@ pub struct CargoCompilerFacts {
     pub input_fingerprint: ContentHash,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HierarchyNode {
-    pub id: SymbolId,
-    pub name: String,
-    pub kind: SymbolKind,
-    pub span: SourceSpan,
-    pub freshness: Freshness,
-    pub children: Vec<HierarchyNode>,
-}
-
-/// Result of [`SemanticGraph::compute_impact`]: files, symbols, and test
-/// symbols reachable from a set of changed files through reverse-import
-/// propagation.
-#[derive(Debug, Clone, Default)]
-pub struct ImpactSet {
-    /// All files reachable from the changed set through reverse-import edges.
-    pub affected_files: HashSet<FileId>,
-    /// All non-file symbols whose declaring file is in `affected_files`.
-    pub affected_symbols: Vec<GraphSymbol>,
-    /// Subset of `affected_symbols` that are test functions or carry a
-    /// `TestOf` edge to a symbol in the affected set.
-    pub affected_tests: Vec<GraphSymbol>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SignatureQuery {
-    pub text: String,
-    pub kind: Option<SymbolKind>,
-    pub visibility: Option<String>,
-    pub attribute: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BodySearchQuery {
-    pub text: String,
-    pub owner_kind: Option<SymbolKind>,
-    pub hit_kind: Option<BodyHitKind>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BodySearchHit {
-    pub owner: Option<GraphSymbol>,
-    pub hit: BodyHit,
-    pub confidence: Confidence,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReferenceHit {
-    pub owner: Option<GraphSymbol>,
-    pub reference: ParsedReference,
-    pub confidence: Confidence,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CallEdgeHit {
-    pub caller: Option<GraphSymbol>,
-    pub callee: Option<GraphSymbol>,
-    pub edge: GraphEdge,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JavaProjectFact {
     pub provider: String,
@@ -504,24 +457,6 @@ pub struct SemanticGraph {
     /// repositories, non-empty on Windows when a checkout leaves two
     /// differently-cased spellings for the same logical path.
     pub(crate) case_collisions: Vec<(String, String)>,
-}
-
-#[derive(Debug, Clone)]
-struct CachedJavaProjectFacts {
-    hash: ContentHash,
-    java_paths_signature: u64,
-    dependency_values: Vec<String>,
-    configured_source_facts: Vec<(&'static str, String, &'static str)>,
-    source_root_facts: Vec<(&'static str, String, &'static str)>,
-}
-
-#[derive(Debug, Clone)]
-struct CachedKotlinProjectFacts {
-    hash: ContentHash,
-    kotlin_paths_signature: u64,
-    dependency_values: Vec<String>,
-    configured_source_facts: Vec<(&'static str, String, &'static str)>,
-    source_root_facts: Vec<(&'static str, String, &'static str)>,
 }
 
 impl SemanticGraph {
@@ -2593,65 +2528,6 @@ impl SemanticGraph {
     }
 }
 
-enum CandidateSet<'a, T> {
-    All,
-    None,
-    Indexes(&'a [T]),
-}
-
-fn rarest_indexed_trigram<'a, T>(
-    needle: &str,
-    index: &'a HashMap<[u8; 3], Vec<T>>,
-) -> CandidateSet<'a, T> {
-    let trigrams = unique_trigrams(needle);
-    if trigrams.is_empty() {
-        return CandidateSet::All;
-    }
-
-    let mut best = None;
-    for trigram in trigrams {
-        let Some(candidates) = index.get(&trigram) else {
-            return CandidateSet::None;
-        };
-        if best
-            .as_ref()
-            .map(|current: &&Vec<T>| candidates.len() < current.len())
-            .unwrap_or(true)
-        {
-            best = Some(candidates);
-        }
-    }
-
-    best.map(|candidates| CandidateSet::Indexes(candidates.as_slice()))
-        .unwrap_or(CandidateSet::All)
-}
-
-fn unique_trigrams(text: &str) -> BTreeSet<[u8; 3]> {
-    let bytes = text.as_bytes();
-    if bytes.len() < 3 {
-        return BTreeSet::new();
-    }
-    bytes
-        .windows(3)
-        .map(|window| [window[0], window[1], window[2]])
-        .collect()
-}
-
-/// Fingerprint the ordered `body_hits` text so `rebuild_indexes` can detect a
-/// no-op refresh and reuse the existing lowercase shadow + trigram index. The
-/// fingerprint covers only what those indexes derive from: the hit count and
-/// each hit's text in order. Used only for within-process equality, so the
-/// non-deterministic `DefaultHasher` seed is fine.
-fn body_hits_fingerprint(body_hits: &[BodyHit]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    body_hits.len().hash(&mut hasher);
-    for hit in body_hits {
-        hit.text.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
 #[derive(Debug, Clone)]
 pub struct RefreshConfig {
     pub debounce: Duration,
@@ -3231,13 +3107,7 @@ impl GraphManager {
         };
 
         if rewrite_import_graph {
-            let mut snapshot = resolver_cache::ResolverSnapshot::new();
-            for (target, importers) in &self.graph.importers_by_file {
-                for importer in importers {
-                    snapshot.record_edge(importer, target);
-                }
-            }
-            let _ = batch.set_import_graph(&snapshot);
+            cache::set_import_graph_snapshot(batch, &self.graph.importers_by_file);
         }
     }
 
@@ -3248,28 +3118,7 @@ impl GraphManager {
             .map(|paths| paths.is_empty())
             .unwrap_or(true);
         if pending_empty && self.last_refresh.elapsed() < self.config.idle_refresh_interval {
-            return Ok(RefreshReport {
-                refreshed: false,
-                changed_files: Vec::new(),
-                removed_files: Vec::new(),
-                reparsed_files: 0,
-                changed_paths_from_events: 0,
-                changed_paths_from_polling: 0,
-                unchanged_event_paths: 0,
-                duration_ms: 0,
-                files_seen: self.graph.files.len(),
-                excluded_files: self.build_report.excluded_files,
-                excluded_dirs: self.build_report.excluded_dirs,
-                excluded_bytes: self.build_report.excluded_bytes,
-                path_conflicts: self.build_report.path_conflicts.clone(),
-                coverage: self.build_report.coverage.clone(),
-                bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
-                bytes_reparsed: 0,
-                language: language_report(self.graph.files.values()),
-                stats: self.graph.stats(),
-                skipped_due_to_interval: true,
-                budget_exhausted: false,
-            });
+            return Ok(self.skipped_refresh_report(0));
         }
         self.refresh_now()
     }
@@ -3277,28 +3126,7 @@ impl GraphManager {
     pub fn refresh_now(&mut self) -> Result<RefreshReport> {
         let started = Instant::now();
         if self.last_refresh.elapsed() < self.config.debounce {
-            return Ok(RefreshReport {
-                refreshed: false,
-                changed_files: Vec::new(),
-                removed_files: Vec::new(),
-                reparsed_files: 0,
-                changed_paths_from_events: 0,
-                changed_paths_from_polling: 0,
-                unchanged_event_paths: 0,
-                duration_ms: started.elapsed().as_millis(),
-                files_seen: self.graph.files.len(),
-                excluded_files: self.build_report.excluded_files,
-                excluded_dirs: self.build_report.excluded_dirs,
-                excluded_bytes: self.build_report.excluded_bytes,
-                path_conflicts: self.build_report.path_conflicts.clone(),
-                coverage: self.build_report.coverage.clone(),
-                bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
-                bytes_reparsed: 0,
-                language: language_report(self.graph.files.values()),
-                stats: self.graph.stats(),
-                skipped_due_to_interval: true,
-                budget_exhausted: false,
-            });
+            return Ok(self.skipped_refresh_report(started.elapsed().as_millis()));
         }
 
         // Incremental refresh re-crawls the whole workspace, but the vast
@@ -3668,6 +3496,21 @@ impl GraphManager {
             stats: self.graph.stats(),
             skipped_due_to_interval: false,
             budget_exhausted,
+        })
+    }
+
+    fn skipped_refresh_report(&self, duration_ms: u128) -> RefreshReport {
+        skipped_refresh_report(SkippedRefreshInput {
+            duration_ms,
+            files_seen: self.graph.files.len(),
+            excluded_files: self.build_report.excluded_files,
+            excluded_dirs: self.build_report.excluded_dirs,
+            excluded_bytes: self.build_report.excluded_bytes,
+            path_conflicts: self.build_report.path_conflicts.clone(),
+            coverage: self.build_report.coverage.clone(),
+            bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
+            language: language_report(self.graph.files.values()),
+            stats: self.graph.stats(),
         })
     }
 }

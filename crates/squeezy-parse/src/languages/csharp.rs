@@ -1,5 +1,8 @@
 use std::collections::HashSet;
 
+use crate::languages::common::{
+    parsed_file_from_context, record_missing_and_skip, visit_named_children_with_state,
+};
 use crate::languages::rust::*;
 use crate::*;
 
@@ -12,22 +15,9 @@ pub(crate) fn extract_csharp(file: FileRecord, source: &str, tree: &Tree) -> Par
     visit_csharp_node(root, &mut ctx, None, None, &mut scope);
     dedup_csharp_facts(&mut ctx);
 
-    ParsedFile {
-        file,
-        // Surface the file's dominant namespace as the `package` field, the
-        // same way the Go extractor surfaces the file's `package` declaration.
-        // File-scoped `namespace Foo;` and the first encountered braced
-        // namespace both work; if neither is present this stays `None`.
-        package: scope.top_namespace.clone(),
-        symbols: ctx.symbols,
-        imports: ctx.imports,
-        calls: ctx.calls,
-        references: ctx.references,
-        body_hits: ctx.body_hits,
-        unsupported: None,
-        diagnostics: ctx.diagnostics,
-        changed_ranges: Vec::new(),
-    }
+    // Surface the file's dominant namespace as the `package` field, the same
+    // way the Go extractor surfaces the file's `package` declaration.
+    parsed_file_from_context(ctx, scope.top_namespace.clone())
 }
 
 #[derive(Debug, Default, Clone)]
@@ -64,8 +54,7 @@ fn visit_csharp_node(
     owner_symbol: Option<SymbolId>,
     scope: &mut CsharpScope,
 ) {
-    if node.is_missing() {
-        record_missing_node_diagnostic(node, ctx);
+    if record_missing_and_skip(node, ctx) {
         return;
     }
 
@@ -190,16 +179,10 @@ fn visit_csharp_children(
     owner_symbol: Option<SymbolId>,
     scope: &mut CsharpScope,
 ) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        visit_csharp_node(
-            child,
-            ctx,
-            parent_symbol.clone(),
-            owner_symbol.clone(),
-            scope,
-        );
-    }
+    visit_named_children_with_state(node, (parent_symbol, owner_symbol), |child, state| {
+        let (parent_symbol, owner_symbol) = state;
+        visit_csharp_node(child, ctx, parent_symbol, owner_symbol, scope);
+    });
 }
 
 pub(crate) fn csharp_namespace_symbol(

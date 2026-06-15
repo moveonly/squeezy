@@ -49,12 +49,19 @@
 //!
 //! Like its peer leaf modules ([`crate::diff_detail_pane`],
 //! [`crate::pinned_compare`], [`crate::interaction`]) this file holds only the
-//! pure policy + geometry plus the small overlay-state struct. The crate root
-//! owns the keybinding, the per-frame render call, the overlay open/close flag,
-//! and the hit-test registration. Keeping the math here lets every threshold and
+//! pure policy + geometry, the small overlay-state struct, and the tiny preview
+//! region drawing helper that belongs to that overlay. The crate root owns the
+//! keybinding, the per-frame render call, the overlay open/close flag, and the
+//! hit-test registration. Keeping the math here lets every threshold and
 //! placement rule be unit-tested without a terminal.
 
-use ratatui::layout::Rect;
+use ratatui::{
+    Frame,
+    layout::Rect,
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Paragraph},
+};
 
 /// The minimum content width (in cells) at which a side-by-side split is worth
 /// doing. Below this the two columns would each be uselessly narrow, so the
@@ -527,6 +534,40 @@ pub(crate) fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
         && column < rect.x.saturating_add(rect.width)
         && row >= rect.y
         && row < rect.y.saturating_add(rect.height)
+}
+
+/// Draw one region of the Smart Split preview diagram: a rounded border block
+/// with a centered label, used for both the transcript and the pane sub-rects.
+/// A no-op for a region too small to hold a border, so a tiny diagram degrades
+/// cleanly. This is the one render helper in this module; it still has no
+/// `TuiApp` dependency and only paints the geometry this module solves.
+pub(crate) fn draw_preview_region(frame: &mut Frame<'_>, rect: Rect, label: &str, color: Color) {
+    if rect.width < 2 || rect.height < 2 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(color));
+    let body = block.inner(rect);
+    frame.render_widget(block, rect);
+    let inner = pane_inner(rect);
+    if inner.width > 0 && inner.height > 0 {
+        let truncated: String = label.chars().take(inner.width as usize).collect();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncated,
+                Style::default().fg(color),
+            )))
+            .alignment(ratatui::layout::Alignment::Center),
+            Rect {
+                x: body.x,
+                y: body.y + body.height / 2,
+                width: body.width,
+                height: 1,
+            },
+        );
+    }
 }
 
 /// Which row of the Smart Split overlay the cursor is on. The overlay is a tiny

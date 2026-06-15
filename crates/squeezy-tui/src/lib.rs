@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) use approval::PendingApproval;
 use crossterm::{
     Command,
     cursor::{Hide, MoveTo},
@@ -109,6 +110,7 @@ mod editor_handoff;
 mod error_lens;
 mod events;
 mod export_destination;
+mod feedback_prompt;
 mod first_run_hints;
 mod focus_resize;
 mod fuzzy;
@@ -142,6 +144,7 @@ mod overlay;
 mod paste_preview;
 mod paste_transform;
 mod pinned_compare;
+mod plan_choice;
 mod presentation;
 mod prompt_history;
 mod prompt_queue;
@@ -185,6 +188,8 @@ mod terminal_guard;
 mod terminal_profile;
 mod terminal_restore;
 mod terminal_writer;
+#[cfg(test)]
+mod test_support;
 mod theme_editor;
 mod toast;
 mod tool_actions;
@@ -236,6 +241,7 @@ use input::{
 };
 
 use notification::DesktopNotifier;
+use plan_choice::{PLAN_CHOICES, PendingPlanChoice, PlanChoiceAction, PlanPauseState, PlanUiState};
 use render::palette::{self, blend_color};
 pub(crate) use terminal_guard::{DrawStatus, TerminalGuard};
 use toast::ToastQueue;
@@ -1563,19 +1569,19 @@ fn restore_cancelled_prompt(app: &mut TuiApp) -> bool {
 }
 
 async fn handle_plan_choice_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
-    let Some(mut pending) = app.pending_plan_choice.take() else {
+    let Some(mut pending) = app.plan.pending_choice.take() else {
         return false;
     };
     let len = PLAN_CHOICES.len();
     let activate_index = match key.code {
         KeyCode::Up => {
             pending.selection_index = pending.selection_index.saturating_sub(1);
-            app.pending_plan_choice = Some(pending);
+            app.plan.pending_choice = Some(pending);
             return true;
         }
         KeyCode::Down => {
             pending.selection_index = (pending.selection_index + 1).min(len - 1);
-            app.pending_plan_choice = Some(pending);
+            app.plan.pending_choice = Some(pending);
             return true;
         }
         KeyCode::Esc => {
@@ -1589,7 +1595,7 @@ async fn handle_plan_choice_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
             // Shift+Tab is the canonical mode toggle; let it fall through
             // so a user who pressed it while the prompt was open still
             // switches modes instead of being stuck.
-            app.pending_plan_choice = Some(pending);
+            app.plan.pending_choice = Some(pending);
             return false;
         }
         KeyCode::Enter => Some(pending.selection_index.min(len - 1)),
@@ -1602,7 +1608,7 @@ async fn handle_plan_choice_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEve
         _ => None,
     };
     let Some(idx) = activate_index else {
-        app.pending_plan_choice = Some(pending);
+        app.plan.pending_choice = Some(pending);
         return true;
     };
     apply_plan_choice(app, agent, &pending, idx).await;
@@ -1724,12 +1730,12 @@ async fn apply_plan_choice(
                         pending.plan_id,
                         compact_path(&removed)
                     ));
-                    if app.current_plan_id.as_deref() == Some(pending.plan_id.as_str()) {
-                        app.current_plan_id = None;
+                    if app.plan.current_id.as_deref() == Some(pending.plan_id.as_str()) {
+                        app.plan.current_id = None;
                     }
-                    if app.pending_plan_handoff.as_deref() == Some(pending.plan_path.as_path()) {
-                        app.pending_plan_handoff = None;
-                        app.plan_handoff_turns_seen = 0;
+                    if app.plan.pending_handoff.as_deref() == Some(pending.plan_path.as_path()) {
+                        app.plan.pending_handoff = None;
+                        app.plan.handoff_turns_seen = 0;
                     }
                 }
                 Err(err) => {
@@ -2151,66 +2157,13 @@ fn forward_config_feedback(app: &mut TuiApp, mut feedback: config_screen::Config
 /// outcome including "no session at this slot" so the user sees feedback.
 async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: usize) -> bool {
     if app.turn_rx.is_some()
-        || app.pending_approval.is_some()
-        || app.pending_mcp_elicitation.is_some()
-        || app.pending_plan_choice.is_some()
-        || app.pending_request_user_input.is_some()
-        || app.pending_feedback.is_some()
-        || app.config_screen.is_some()
-        || app.status_line_setup.is_some()
-        || app.overlay.is_some()
-        || app.paste_preview.is_some()
-        || app.paste_transform.is_some()
-        || app.clipboard_history_open
-        || app.snippets_open
-        || app.scratchpad_open
-        || app.templates_open
-        || app.transcript_index_open
-        || app.related_links_open
-        || app.duplicate_folds_open
-        || app.error_lens_open
-        || app.health_markers_open
-        || app.turn_outline_open
-        || app.lane_fold_open
-        || app.bookmarks_open
-        || app.session_timeline_open
-        || app.subagent_timeline_open
-        || app.review_board_open
-        || app.annotations_open
-        || app.changes_since_open
-        || app.action_palette.is_some()
-        || app.tool_actions.is_some()
-        || app.command_palette.is_some()
-        || app.editor_handoff.is_some()
-        || app.transcript_overlay.is_some()
-        // The Theme Editor overlay (§12.7.2) is modal: block a quick session
-        // switch while it owns the surface, like every other overlay above.
-        || app.theme_editor.is_some()
-        // The Per-Workspace UI Profile overlay (§12.7.4) is modal: block a quick
-        // session switch while it owns the surface, like every other overlay above.
-        || app.workspace_profile.is_some()
-        // The Session Auto-Save Checkpoints status overlay (§12.9.5) is modal:
-        // block the switch while it owns the surface, like every overlay above.
-        || app.session_checkpoint_overlay.is_some()
-        // The Per-Terminal Profiles overlay (§12.7.3) is modal: block the switch
-        // like every other overlay above.
-        || app.terminal_profile_editor.is_some()
-        // The Gesture Settings overlay (§12.7.5) is modal: block the switch like
-        // every other overlay above.
-        || app.gesture_settings_editor.is_some()
-        // The Minimal Glyph Mode overlay (§12.7.6) is modal: block the switch like
-        // every other overlay above.
-        || app.glyph_mode_editor.is_some()
-        // The Smart Split Panes inspector (§12.4.2) is modal: block the switch like
-        // every other overlay above.
-        || app.smart_split.is_some()
+        || modal::any_active_surface_matching(app, |surface| {
+            surface.blocks_session_quick_switch
+        })
         // While a macro is recording or replaying (§12.3.7) a quick session
         // switch would derail the in-flight workflow, so block it like every
         // other modal/overlay context above.
         || app.macro_recorder.is_active()
-        // The Keybinding Editor UI (§12.7.1) is a modal overlay; block the switch
-        // like every other overlay above.
-        || app.keybinding_editor.is_some()
     {
         return false;
     }
@@ -2317,7 +2270,7 @@ async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str
             // reset the dedup store so the first write isn't mis-gated by the
             // prior session's fingerprint.
             app.session_id = agent.session_id();
-            app.session_checkpoint = session_checkpoint::CheckpointStore::new();
+            app.session_checkpoint = session_checkpoint::CheckpointUiState::new();
             app.status = format!("resumed session {session_id}");
         }
         Err(error) => {
@@ -3048,7 +3001,7 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
         dispatch_click_action(app, action);
         return true;
     }
-    if app.pending_plan_choice.is_some()
+    if app.plan.pending_choice.is_some()
         && let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
         && let Some((
             interaction::TargetKey::Chrome(interaction::ChromeKey::PlanChoiceOption(_)),
@@ -3242,9 +3195,9 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) -> bool {
     // open: a left-click on the `[restore]` affordance restores the saved
     // checkpoint (the mouse twin of `r`). Every other click is swallowed so a
     // stray press can't fall through to the surface beneath. Hit-tested in ABSOLUTE
-    // screen coordinates against the target `render_session_checkpoint_surface`
+    // screen coordinates against the target `session_checkpoint::render_surface`
     // registered this frame.
-    if app.session_checkpoint_overlay.is_some() {
+    if app.session_checkpoint.overlay.is_some() {
         if let MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse.kind
             && let Some((
                 interaction::TargetKey::Chrome(interaction::ChromeKey::CheckpointRestore),
@@ -5304,36 +5257,11 @@ fn arm_screen_selection(app: &mut TuiApp, col: u16, row: u16) {
 /// and the Compare Subagent Outputs view — which route presses by cached
 /// geometry rather than click-targets and therefore own their entire pointer
 /// surface. The transcript overlay and status-line setup own their own
-/// text-selection / inputs and are likewise not here. Keep this list in sync with
-/// the `if app.<overlay> { …; return true }` arms in [`handle_mouse`].
+/// text-selection / inputs and are likewise not eligible. The concrete set lives
+/// in [`modal::SurfaceDescriptor::allows_screen_selection`] so input and render
+/// ownership stay documented in one place.
 fn overlay_allows_screen_selection(app: &TuiApp) -> bool {
-    app.clipboard_history_open
-        || app.snippets_open
-        || app.templates_open
-        || app.keybinding_editor.is_some()
-        || app.workspace_profile.is_some()
-        || app.session_checkpoint_overlay.is_some()
-        || app.theme_editor.is_some()
-        || app.terminal_profile_editor.is_some()
-        || app.gesture_settings_editor.is_some()
-        || app.glyph_mode_editor.is_some()
-        || app.transcript_index_open
-        || app.related_links_open
-        || app.duplicate_folds_open
-        || app.error_lens_open
-        || app.health_markers_open
-        || app.turn_outline_open
-        || app.lane_fold_open
-        || app.bookmarks_open
-        || app.session_timeline_open
-        || app.subagent_timeline_open
-        || app.review_board_open
-        || app.changes_since_open
-        || app.action_palette.is_some()
-        || app.tool_actions.is_some()
-        || app.annotations_open
-        || app.command_palette.is_some()
-        || app.editor_handoff.is_some()
+    modal::any_active_surface_matching(app, |surface| surface.allows_screen_selection)
 }
 
 /// True when `(col, row)` is on CHROME — outside both the transcript text area
@@ -6114,48 +6042,12 @@ fn pump_macro_replay(app: &mut TuiApp, agent: &mut Agent) {
 /// True when a modal overlay currently owns the keyboard, so a replayed macro step
 /// must be CONSUMED (dropped) rather than dispatched globally — mirroring how the
 /// front-of-loop modal guards in `handle_key` swallow every key before the global
-/// keymap dispatch (deep-review #32). Read-only over `app`. Lists the §12 picker /
-/// editor overlays whose key handlers return `true` for any key (i.e. fully modal);
-/// the transcript-overlay and prompt-queue-overlay cases are NOT listed here because
+/// keymap dispatch (deep-review #32). Read-only over `app`. The concrete set lives
+/// in [`modal::SurfaceDescriptor::consumes_macro_replay`]; the transcript-overlay
+/// and prompt-queue-overlay cases remain excluded because
 /// `dispatch_keymap_action_inner` already guards those internally.
 fn replay_step_consumed_by_modal(app: &TuiApp) -> bool {
-    app.config_screen.is_some()
-        || app.status_line_setup.is_some()
-        || app.paste_preview.is_some()
-        || app.paste_transform.is_some()
-        || app.clipboard_history_open
-        || app.keybinding_editor.is_some()
-        || app.snippets_open
-        || app.templates_open
-        || app.transcript_index_open
-        || app.related_links_open
-        || app.duplicate_folds_open
-        || app.error_lens_open
-        || app.health_markers_open
-        || app.turn_outline_open
-        || app.rename_edit.is_some()
-        || app.lane_fold_open
-        || app.bookmarks_open
-        || app.session_timeline_open
-        || app.subagent_timeline_open
-        || app.subagent_compare.is_some()
-        || app.review_board_open
-        || app.changes_since_open
-        || app.action_palette.is_some()
-        || app.tool_actions.is_some()
-        || app.scratchpad_open
-        || app.theme_editor.is_some()
-        || app.workspace_profile.is_some()
-        || app.session_checkpoint_overlay.is_some()
-        || app.annotations_open
-        || app.command_palette.is_some()
-        || app.terminal_profile_editor.is_some()
-        || app.gesture_settings_editor.is_some()
-        || app.glyph_mode_editor.is_some()
-        || app.smart_split.is_some()
-        || app.pending_approval.is_some()
-        || app.pending_mcp_elicitation.is_some()
-        || app.pending_request_user_input.is_some()
+    modal::any_active_surface_matching(app, |surface| surface.consumes_macro_replay)
 }
 
 // ===========================================================================
@@ -6750,8 +6642,8 @@ fn restore_session_checkpoint_on_launch(app: &mut TuiApp) {
 /// the toggle paints immediately, but leaves the idle redraw cadence untouched
 /// once settled.
 fn toggle_session_checkpoint_overlay(app: &mut TuiApp) {
-    if app.session_checkpoint_overlay.is_some() {
-        app.session_checkpoint_overlay = None;
+    if app.session_checkpoint.overlay.is_some() {
+        app.session_checkpoint.overlay = None;
         app.status = "checkpoint status closed".to_string();
         app.needs_redraw = true;
         return;
@@ -6760,7 +6652,7 @@ fn toggle_session_checkpoint_overlay(app: &mut TuiApp) {
         .session_id
         .as_ref()
         .and_then(|id| session_checkpoint::load(id));
-    app.session_checkpoint_overlay = Some(saved.unwrap_or_default());
+    app.session_checkpoint.overlay = Some(saved.unwrap_or_default());
     app.status = session_checkpoint_status(app);
     app.needs_redraw = true;
 }
@@ -6772,7 +6664,8 @@ fn toggle_session_checkpoint_overlay(app: &mut TuiApp) {
 /// recorded a save), so the user can tell auto-save is live.
 fn session_checkpoint_status(app: &TuiApp) -> String {
     let has_on_disk = app
-        .session_checkpoint_overlay
+        .session_checkpoint
+        .overlay
         .as_ref()
         .is_some_and(|c| !c.session_id.is_empty());
     let lead = if app.session_checkpoint.has_saved() {
@@ -6821,8 +6714,8 @@ fn forget_session_checkpoint(app: &mut TuiApp) {
         }
     }
     // Refresh the overlay snapshot to the now-empty state so the panel reflects it.
-    if app.session_checkpoint_overlay.is_some() {
-        app.session_checkpoint_overlay = Some(session_checkpoint::UiStateCheckpoint::default());
+    if app.session_checkpoint.overlay.is_some() {
+        app.session_checkpoint.overlay = Some(session_checkpoint::UiStateCheckpoint::default());
     }
     app.needs_redraw = true;
 }
@@ -6833,7 +6726,7 @@ fn forget_session_checkpoint(app: &mut TuiApp) {
 /// modal: its own toggle chord and Esc close; `r` restores the saved checkpoint
 /// onto the running session; `x`/Delete forgets it.
 fn handle_session_checkpoint_key(app: &mut TuiApp, key: KeyEvent) -> bool {
-    if app.session_checkpoint_overlay.is_none() {
+    if app.session_checkpoint.overlay.is_none() {
         return false;
     }
     // The overlay's own toggle chord closes it (the same key opens and closes).
@@ -8702,13 +8595,8 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         // wait so a wedged clipboard helper never freezes the event loop; a
         // timeout falls through to the same unavailable handling as no helper.
         if app.config_screen.is_none()
-            && app.theme_editor.is_none()
             && !app.scratchpad_open
-            && app.pending_approval.is_none()
-            && app.pending_mcp_elicitation.is_none()
-            && app.paste_preview.is_none()
-            && app.paste_transform.is_none()
-            && app.editor_handoff.is_none()
+            && !modal::any_active_surface_matching(app, |surface| surface.blocks_composer_paste())
         {
             let image = match app.clipboard.read_image() {
                 Some(image) => Some(image),
@@ -8782,6 +8670,33 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // emulator's tab/window stops showing the bulb glyph.
     if app.terminal_title_state == TerminalTitleState::Notification {
         app.terminal_title_state = TerminalTitleState::Cleared;
+    }
+
+    // App-level interrupt keys must resolve a pending approval before the
+    // approval menu consumes raw keys. The menu handler's direct Esc behavior is
+    // still a one-shot deny; fullscreen Esc/Ctrl+C cancel the parked turn.
+    if app.pending_approval.is_some()
+        && (key.code == KeyCode::Esc
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')))
+        && request_turn_interrupt(app)
+    {
+        app.exit_confirm_armed = false;
+        return Ok(false);
+    }
+
+    // Approval/MCP/user-input prompts are injected by the agent/tool loop and
+    // must take priority over an already-open paste decision: a paste prompt is
+    // only a composer safety gate, while these prompts unblock the active turn.
+    if handle_approval_key(app, key) {
+        return Ok(false);
+    }
+
+    if handle_mcp_elicitation_key(app, key) {
+        return Ok(false);
+    }
+
+    if handle_request_user_input_key(app, key) {
+        return Ok(false);
     }
 
     // The inline large-paste question (§11G.6) is modal in behavior: while it is
@@ -9087,7 +9002,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // any selection-clear, search, chord, or keymap dispatch, so a stray key never
     // leaks into the composer underneath. Sits beside the other front-of-loop
     // overlays for the same reason.
-    if app.session_checkpoint_overlay.is_some() && handle_session_checkpoint_key(app, key) {
+    if app.session_checkpoint.overlay.is_some() && handle_session_checkpoint_key(app, key) {
         return Ok(false);
     }
 
@@ -9478,14 +9393,6 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
         return Ok(false);
     }
 
-    if handle_mcp_elicitation_key(app, key) {
-        return Ok(false);
-    }
-
-    if handle_request_user_input_key(app, key) {
-        return Ok(false);
-    }
-
     if handle_plan_choice_key(app, agent, key).await {
         return Ok(false);
     }
@@ -9606,10 +9513,6 @@ pub(crate) async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEven
     // when there is actually something to interrupt, so a bare Esc with
     // nothing running still falls through to reset the pane view.
     if key.code == KeyCode::Esc && !app.subagent_pane.focused && request_turn_interrupt(app) {
-        return Ok(false);
-    }
-
-    if handle_approval_key(app, key) {
         return Ok(false);
     }
 
@@ -9866,7 +9769,7 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
     // The Session Auto-Save Checkpoints overlay (§12.9.5) is modal and has no text
     // field, so it swallows paste entirely rather than letting it leak into the
     // composer beneath.
-    if app.session_checkpoint_overlay.is_some() {
+    if app.session_checkpoint.overlay.is_some() {
         return Ok(());
     }
     // The remaining §12.7 fullscreen overlays — the Keybinding Editor (§12.7.1),
@@ -9902,16 +9805,10 @@ async fn handle_paste(app: &mut TuiApp, _agent: &mut Agent, text: String) -> Res
         insert_input_text(app, &normalized);
         return Ok(());
     }
-    if app.pending_approval.is_some() || app.pending_mcp_elicitation.is_some() {
-        app.status = "paste unavailable while a modal prompt is open".to_string();
-        return Ok(());
-    }
-    // The paste/editor questions (§11G.6 preview, §12.6.4 transform,
-    // §12.6.5 editor handoff) are modal in behavior even though they render
-    // inline. A second paste while one is open must be rejected, not silently
-    // overwrite the pending text or leak into the composer beneath.
-    if app.paste_preview.is_some() || app.paste_transform.is_some() || app.editor_handoff.is_some()
-    {
+    // Descriptor-backed modal paste gate: pending prompts and inline
+    // paste/editor questions own the composer while active, so a second paste
+    // must not overwrite their pending text or leak underneath.
+    if modal::any_active_surface_matching(app, |surface| surface.blocks_composer_paste()) {
         app.status = "paste unavailable while a paste/editor question is open".to_string();
         return Ok(());
     }
@@ -10606,12 +10503,7 @@ fn dispatch_keymap_action_inner(
     // which run after this dispatch; each consumes raw key codes, not keymap
     // actions. Blocking every keymap action here keeps an overlay-opening chord
     // (e.g. ToggleSnippets) from firing on top of the modal.
-    if app.pending_request_user_input.is_some()
-        || app.pending_plan_choice.is_some()
-        || app.pending_approval.is_some()
-        || app.pending_mcp_elicitation.is_some()
-        || app.pending_feedback.is_some()
-    {
+    if modal::any_active_surface_matching(app, |surface| surface.blocks_keymap_actions()) {
         return false;
     }
     match action {
@@ -15436,7 +15328,7 @@ fn first_run_hint_suppressed(app: &TuiApp) -> bool {
         || app.theme_editor.is_some()
         || app.workspace_profile.is_some()
         // The Session Auto-Save Checkpoints overlay (§12.9.5) owns the surface too.
-        || app.session_checkpoint_overlay.is_some()
+        || app.session_checkpoint.overlay.is_some()
         // The remaining §12.7 fullscreen overlays own the surface too, so the hint
         // would paint behind them — suppress for all six consistently.
         || app.keybinding_editor.is_some()
@@ -19660,7 +19552,7 @@ fn dispatch_click_action(app: &mut TuiApp, action: interaction::Action) {
             // not in scope on the click path. Arm it; the event loop drains it
             // where the agent is available (mirrors the command-palette / theme-
             // editor click path), so mouse and keyboard run the same handler.
-            if let Some(pending) = app.pending_plan_choice.as_mut() {
+            if let Some(pending) = app.plan.pending_choice.as_mut() {
                 pending.selection_index = index;
             }
             app.plan_choice_click_activate = true;
@@ -22982,10 +22874,10 @@ fn plans_delete(app: &mut TuiApp, sid: &str, plan_id: &str, flag: Option<&str>) 
         Ok(path) => {
             // Clear the in-memory active plan id if this was it; the
             // pointer file has already been cleaned by `delete_plan`.
-            if app.current_plan_id.as_deref() == Some(plan_id) {
-                app.current_plan_id = None;
-                app.pending_plan_handoff = None;
-                app.plan_handoff_turns_seen = 0;
+            if app.plan.current_id.as_deref() == Some(plan_id) {
+                app.plan.current_id = None;
+                app.plan.pending_handoff = None;
+                app.plan.handoff_turns_seen = 0;
             }
             app.status = format!("deleted plan {plan_id}");
             app.push_log(format!("plan {plan_id} deleted ({})", compact_path(&path)));
@@ -22997,7 +22889,7 @@ fn plans_delete(app: &mut TuiApp, sid: &str, plan_id: &str, flag: Option<&str>) 
 fn plans_set_active(app: &mut TuiApp, sid: &str, plan_id: &str) {
     match proposed_plan::set_active_plan(&app.workspace_root, sid, plan_id) {
         Ok(()) => {
-            app.current_plan_id = Some(plan_id.to_string());
+            app.plan.current_id = Some(plan_id.to_string());
             app.status = format!("active plan → {plan_id}");
             app.push_log(format!("set active plan: {plan_id}"));
         }
@@ -25559,17 +25451,8 @@ pub(crate) async fn drain_prompt_queue_if_idle(app: &mut TuiApp, agent: &mut Age
 }
 
 fn prompt_queue_drain_blocked(app: &TuiApp) -> bool {
-    app.config_screen.is_some()
-        || app.status_line_setup.is_some()
-        || app.transcript_overlay.is_some()
-        || app.overlay.is_some()
-        || app.paste_preview.is_some()
-        || app.paste_transform.is_some()
-        || app.pending_approval.is_some()
-        || app.pending_mcp_elicitation.is_some()
-        || app.pending_request_user_input.is_some()
-        || app.pending_plan_choice.is_some()
-        || app.pending_feedback.is_some()
+    app.status_line_setup.is_some()
+        || modal::any_active_surface_matching(app, |surface| surface.blocks_prompt_queue_drain())
         || app.editing_queue_id.is_some()
 }
 
@@ -25735,8 +25618,8 @@ pub(crate) fn strip_plan_handoff_prefix(content: &str) -> Option<String> {
 }
 
 fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
-    let plan_path = app.pending_plan_handoff.clone()?;
-    if app.plan_handoff_turns_seen > 0 {
+    let plan_path = app.plan.pending_handoff.clone()?;
+    if app.plan.handoff_turns_seen > 0 {
         // Subsequent turns: lightweight marker.
         let marker = proposed_plan::BUILD_PLAN_STILL_IN_EFFECT_FORMAT
             .replace("{path}", &plan_path.display().to_string());
@@ -25748,12 +25631,12 @@ fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
     match proposed_plan::read_plan_body(&plan_path) {
         Ok(body) => {
             let trimmed = body.trim_end();
-            app.plan_handoff_turns_seen = app.plan_handoff_turns_seen.saturating_add(1);
+            app.plan.handoff_turns_seen = app.plan.handoff_turns_seen.saturating_add(1);
             // PR-G item 6: when this Plan→Build crossing is a resume
             // from a Shift+Tab pause, prefix the body with a short
             // marker so the model knows it's mid-execution and learns
             // whether the plan was refined during the pause window.
-            let resume_marker = app.plan_resume_marker.take().unwrap_or_default();
+            let resume_marker = app.plan.resume_marker.take().unwrap_or_default();
             Some(format!(
                 "{resume_marker}[plan from previous session — {path}]\n{trimmed}\n[end plan]\n\n",
                 path = plan_path.display(),
@@ -25764,8 +25647,8 @@ fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
                 "could not read plan file {} for Build handoff: {err}",
                 compact_path(&plan_path)
             ));
-            app.pending_plan_handoff = None;
-            app.plan_handoff_turns_seen = 0;
+            app.plan.pending_handoff = None;
+            app.plan.handoff_turns_seen = 0;
             None
         }
     }
@@ -25788,11 +25671,12 @@ fn switch_mode(
     let is_build_to_plan_pause = app.mode == SessionMode::Build
         && target == SessionMode::Plan
         && app.turn_rx.is_some()
-        && app.current_plan_id.is_some();
+        && app.plan.current_id.is_some();
     if is_build_to_plan_pause {
         request_turn_interrupt(app);
-        app.plan_pause = app
-            .current_plan_id
+        app.plan.pause = app
+            .plan
+            .current_id
             .clone()
             .map(|plan_id| PlanPauseState { plan_id });
         app.push_status("plan execution paused (Shift+Tab)".to_string());
@@ -25819,23 +25703,23 @@ fn switch_mode(
         app.status = format!("mode switched to {}", app.mode.as_str());
         // A mode switch supersedes any post-plan choice prompt — the
         // user's decision has been made by toggling the mode itself.
-        app.pending_plan_choice = None;
+        app.plan.pending_choice = None;
         match (previous, target) {
             (SessionMode::Plan, SessionMode::Build) => {
-                if let Some(plan_id) = app.current_plan_id.as_deref() {
+                if let Some(plan_id) = app.plan.current_id.as_deref() {
                     let sid = app.plan_session_id().to_string();
                     let plan_path =
                         proposed_plan::plan_file_for(&app.workspace_root, &sid, plan_id);
                     if plan_path.exists() {
-                        app.pending_plan_handoff = Some(plan_path.clone());
+                        app.plan.pending_handoff = Some(plan_path.clone());
                         // Fresh handoff: next Build turn gets the full plan
                         // body; turns 2+ get the lighter marker.
-                        app.plan_handoff_turns_seen = 0;
+                        app.plan.handoff_turns_seen = 0;
                         // Resume marker (PR-G item 6): if the previous
                         // Build→Plan was a pause, tell the model which
                         // plan id it resumes from and whether the body
                         // changed during the pause window.
-                        if let Some(pause) = app.plan_pause.take() {
+                        if let Some(pause) = app.plan.pause.take() {
                             let refined = pause.plan_id != plan_id;
                             let note = if refined {
                                 format!(
@@ -25845,7 +25729,7 @@ fn switch_mode(
                             } else {
                                 format!("[resuming from plan {plan_id} — plan unchanged]\n")
                             };
-                            app.plan_resume_marker = Some(note);
+                            app.plan.resume_marker = Some(note);
                         }
                         app.push_status(format!(
                             "plan attached for next Build turn: {}",
@@ -25859,8 +25743,8 @@ fn switch_mode(
                 // longer relevant once the user goes back to Plan; drop it
                 // so the next Build entry recomputes from the current
                 // plan file instead of attaching a stale path.
-                app.pending_plan_handoff = None;
-                app.plan_handoff_turns_seen = 0;
+                app.plan.pending_handoff = None;
+                app.plan.handoff_turns_seen = 0;
             }
             _ => {}
         }
@@ -26627,85 +26511,11 @@ fn mcp_elicitation_response_preview(input: &str) -> String {
 }
 
 fn format_plan_choice_menu_lines(pending: &PendingPlanChoice) -> Vec<Line<'static>> {
-    let selected = pending.selection_index.min(PLAN_CHOICES.len() - 1);
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            "Plan ready",
-            Style::default()
-                .fg(crate::render::theme::secondary())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" · {}", pending.plan_id),
-            Style::default().fg(crate::render::theme::quiet()),
-        ),
-    ])];
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            compact_path(&pending.plan_path),
-            Style::default().fg(palette::muted_fg()),
-        ),
-    ]));
-    for (idx, option) in PLAN_CHOICES.iter().enumerate() {
-        let is_selected = idx == selected;
-        let marker = if is_selected { "› " } else { "  " };
-        let label_style = if is_selected {
-            Style::default().fg(crate::render::theme::secondary())
-        } else {
-            Style::default().fg(palette::muted_fg())
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                marker,
-                Style::default().fg(if is_selected {
-                    crate::render::theme::secondary()
-                } else {
-                    crate::render::theme::quiet()
-                }),
-            ),
-            Span::styled(
-                format!("[{}] {}", option.shortcut, option.label),
-                label_style,
-            ),
-            Span::styled(
-                format!(" · {}", option.hint),
-                Style::default().fg(crate::render::theme::quiet()),
-            ),
-        ]));
-    }
-    lines
+    plan_choice::menu_lines(pending, compact_path(&pending.plan_path))
 }
 
 fn format_feedback_prompt_lines(feedback: &PreparedFeedback) -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![
-            Span::styled(
-                "Send feedback?",
-                Style::default()
-                    .fg(crate::render::theme::secondary())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" · {}", feedback.feedback_id),
-                Style::default().fg(crate::render::theme::quiet()),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                compact_text(&feedback.message, 160),
-                Style::default().fg(palette::muted_fg()),
-            ),
-        ]),
-        // Keybind hint — styled as a footer row (2-space indent, footer tier,
-        // no `›` cursor) so it reads as guidance, not a selectable option. The
-        // prior `› ` marker made this line look like a highlighted choice.
-        Line::from(Span::styled(
-            "  Enter/Y send · Esc/N discard",
-            Style::default().fg(crate::render::theme::footer()),
-        )),
-    ]
+    feedback_prompt::menu_lines(&feedback.feedback_id, compact_text(&feedback.message, 160))
 }
 
 /// Visual `a) `, `b) `, … label for the Nth multiple-choice option. Past the
@@ -27590,8 +27400,8 @@ fn render_surfaces(frame: &mut Frame<'_>, app: &TuiApp) {
     // fullscreen modal over the main surface while open, registering its
     // `[restore]` click target every frame. Checked before the config screen so
     // its target registers and it owns the surface while open.
-    if let Some(checkpoint) = &app.session_checkpoint_overlay {
-        render_session_checkpoint_surface(frame, area, app, checkpoint);
+    if let Some(checkpoint) = &app.session_checkpoint.overlay {
+        session_checkpoint::render_surface(frame, area, app, checkpoint);
         return;
     }
     // The Per-Terminal Profiles overlay (§12.7.3) paints as a fullscreen modal over
@@ -30051,179 +29861,6 @@ fn render_workspace_profile_surface(
     }
 }
 
-/// Paint the Session Auto-Save Checkpoints status overlay (§12.9.5) as a centered
-/// modal: a header naming the session whose checkpoint this is, a read-only list
-/// of the logical fields the checkpoint would restore (scroll anchor, focused
-/// entry, search, minimap pane), a `[restore]` affordance, and a footer with the
-/// verb legend. The `[restore]` line registers a
-/// [`interaction::ChromeKey::CheckpointRestore`] click target so a click restores
-/// it (the mouse twin of `r`). Reads only the captured checkpoint snapshot, so
-/// painting is constant-time and does no transcript walk.
-fn render_session_checkpoint_surface(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    app: &TuiApp,
-    checkpoint: &session_checkpoint::UiStateCheckpoint,
-) {
-    let title = Line::from(vec![
-        Span::styled(
-            " Session checkpoint ",
-            Style::default()
-                .fg(crate::render::theme::accent())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "\u{2014} auto-saved UI state ",
-            Style::default().fg(crate::render::theme::quiet()),
-        ),
-    ]);
-    let inner = modal::surface(frame, area, 64, 14, title, app.glyph_mode);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    let has_saved = !checkpoint.session_id.is_empty();
-
-    // Header: whether a checkpoint exists for this session, and for which session.
-    let header = if has_saved {
-        Line::from(vec![
-            Span::styled(
-                "saved for session ",
-                Style::default().fg(crate::render::theme::quiet()),
-            ),
-            Span::styled(
-                checkpoint.session_id.clone(),
-                Style::default().fg(crate::render::theme::secondary()),
-            ),
-        ])
-    } else {
-        Line::from(Span::styled(
-            "no checkpoint saved yet \u{2014} one is auto-saved as you work",
-            Style::default().fg(crate::render::theme::quiet()),
-        ))
-    };
-    frame.render_widget(Paragraph::new(header), Rect { height: 1, ..inner });
-
-    // The logical fields the checkpoint would restore, as read-only rows.
-    let scroll_value = if checkpoint.following_tail {
-        "following tail".to_string()
-    } else {
-        format!("{} line(s) up", checkpoint.scroll_from_bottom)
-    };
-    let selected_value = match checkpoint.selected_entry {
-        Some(index) => format!("entry #{index}"),
-        None => "\u{2014}".to_string(),
-    };
-    let search_value = checkpoint
-        .search_query
-        .clone()
-        .unwrap_or_else(|| "\u{2014}".to_string());
-    let minimap_value = if checkpoint.show_minimap {
-        "shown"
-    } else {
-        "hidden"
-    };
-    let rows: [(&str, String); 4] = [
-        ("Scroll", scroll_value),
-        ("Focused entry", selected_value),
-        ("Search", search_value),
-        ("Minimap pane", minimap_value.to_string()),
-    ];
-    let rows_top = inner.y.saturating_add(2);
-    let value_col = inner.x.saturating_add(18).min(inner.x + inner.width);
-    let rows_bottom = inner.y.saturating_add(inner.height).saturating_sub(2);
-    for (offset, (label, value)) in rows.iter().enumerate() {
-        let row_y = rows_top + offset as u16;
-        if row_y >= rows_bottom {
-            break;
-        }
-        let label_rect = Rect {
-            x: inner.x,
-            y: row_y,
-            width: inner.width,
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                *label,
-                Style::default().fg(crate::render::theme::foreground()),
-            ))),
-            label_rect,
-        );
-        if value_col < inner.x.saturating_add(inner.width) {
-            let value_rect = Rect {
-                x: value_col,
-                y: row_y,
-                width: inner
-                    .x
-                    .saturating_add(inner.width)
-                    .saturating_sub(value_col),
-                height: 1,
-            };
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    value.clone(),
-                    Style::default().fg(crate::render::theme::secondary()),
-                ))),
-                value_rect,
-            );
-        }
-    }
-
-    // The `[restore]` affordance row (the mouse twin of `r`), painted just above
-    // the footer when there is a checkpoint to restore.
-    let restore_y = inner.y.saturating_add(inner.height).saturating_sub(2);
-    if has_saved && restore_y >= rows_top {
-        let restore_rect = Rect {
-            x: inner.x,
-            y: restore_y,
-            width: inner.width,
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "[restore]",
-                Style::default()
-                    .fg(crate::render::theme::accent())
-                    .add_modifier(Modifier::BOLD),
-            ))),
-            restore_rect,
-        );
-        // Register the click target over the `[restore]` glyph (9 cells wide).
-        let target_rect = Rect {
-            x: inner.x,
-            y: restore_y,
-            width: 9u16.min(inner.width),
-            height: 1,
-        };
-        app.register_click(
-            target_rect,
-            interaction::TargetKey::Chrome(interaction::ChromeKey::CheckpointRestore),
-            interaction::Action::CheckpointRestore,
-        );
-    }
-
-    // Footer: the in-overlay verb legend on the last inner row.
-    let footer_y = inner.y.saturating_add(inner.height).saturating_sub(1);
-    if footer_y >= rows_top {
-        let footer_rect = Rect {
-            x: inner.x,
-            y: footer_y,
-            width: inner.width,
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "r restore \u{00b7} x forget \u{00b7} Esc close",
-                Style::default()
-                    .fg(crate::render::theme::secondary())
-                    .add_modifier(Modifier::BOLD),
-            ))),
-            footer_rect,
-        );
-    }
-}
-
 /// Paint one R/G/B channel bar (§12.7.2): a single-letter label, a proportional
 /// filled track in the channel's own hue, and the numeric value. The focused
 /// channel's label is bolded so the keyboard +/- target is obvious.
@@ -30943,7 +30580,7 @@ fn render_smart_split_surface(
         let shape =
             diagram_solver.solve(box_rect, state.kind(), state.orientation(), state.ratio());
         // Draw the main (transcript) region.
-        draw_split_region(
+        smart_split::draw_preview_region(
             frame,
             shape.main(),
             "transcript",
@@ -30975,7 +30612,7 @@ fn render_smart_split_surface(
         }
         // Draw the pane region (when the diagram split), labelled with the pane kind.
         if let Some(pane) = shape.pane() {
-            draw_split_region(
+            smart_split::draw_preview_region(
                 frame,
                 pane,
                 state.kind().label(),
@@ -30995,39 +30632,6 @@ fn render_smart_split_surface(
         // No room for the diagram: clear the cache so a stale rect never routes a
         // pointer to a pane that is not painted this frame.
         app.smart_split_rect_cache.set(None);
-    }
-}
-
-/// Draw one region of the Smart Split preview diagram: a rounded border block with
-/// a centered label, used for both the transcript and the pane sub-rects. A no-op
-/// for a region too small to hold a border (so a tiny diagram degrades cleanly).
-fn draw_split_region(frame: &mut Frame<'_>, rect: Rect, label: &str, color: ratatui::style::Color) {
-    if rect.width < 2 || rect.height < 2 {
-        return;
-    }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(color));
-    let body = block.inner(rect);
-    frame.render_widget(block, rect);
-    // Center the (truncated) label in the bordered body.
-    let inner = smart_split::pane_inner(rect);
-    if inner.width > 0 && inner.height > 0 {
-        let truncated: String = label.chars().take(inner.width as usize).collect();
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncated,
-                Style::default().fg(color),
-            )))
-            .alignment(ratatui::layout::Alignment::Center),
-            Rect {
-                x: body.x,
-                y: body.y + body.height / 2,
-                width: body.width,
-                height: 1,
-            },
-        );
     }
 }
 
@@ -35106,40 +34710,68 @@ fn approval_menu_height(app: &TuiApp, width: u16) -> u16 {
     // long verbose labels — see squeezy-xtvg / wave2-06 Anthropic run.
     // `visual_line_count` mirrors the wrap pass used for the transcript
     // and live regions and is safe (it rounds up per line, never down).
-    if let Some(pending) = app.pending_approval.as_ref() {
-        visual_line_count(
-            &approval_block_full(&pending.request, app.approval_selection_index, width),
-            width,
-        )
-    } else if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
-        visual_line_count(
-            &format_mcp_elicitation_menu_lines(
-                &pending.request,
-                app.mcp_elicitation_selection_index,
-                &pending.answer,
-            ),
-            width,
-        )
-    } else if let Some(pending) = app.pending_request_user_input.as_ref() {
-        visual_line_count(
-            &format_request_user_input_menu_lines(
-                &pending.request,
-                pending.selection_index,
-                &pending.answer,
-                pending.answer_cursor,
-            ),
-            width,
-        )
-    } else if let Some(pending) = app.pending_plan_choice.as_ref() {
-        visual_line_count(&format_plan_choice_menu_lines(pending), width)
-    } else if let Some(feedback) = app.pending_feedback.as_ref() {
-        visual_line_count(&format_feedback_prompt_lines(feedback), width)
-    } else if let Some(preview) = app.paste_preview.as_ref() {
-        visual_line_count(&paste_preview_inline_lines(preview, width), width)
-    } else if let Some(menu) = app.paste_transform.as_ref() {
-        visual_line_count(&paste_transform_inline_lines(menu), width)
-    } else {
-        0
+    match modal::active_inline_decision_surface(app) {
+        Some(modal::SurfaceKind::PendingApproval) => app
+            .pending_approval
+            .as_ref()
+            .map(|pending| {
+                visual_line_count(
+                    &approval_block_full(&pending.request, app.approval_selection_index, width),
+                    width,
+                )
+            })
+            .unwrap_or(0),
+        Some(modal::SurfaceKind::PendingMcpElicitation) => app
+            .pending_mcp_elicitation
+            .as_ref()
+            .map(|pending| {
+                visual_line_count(
+                    &format_mcp_elicitation_menu_lines(
+                        &pending.request,
+                        app.mcp_elicitation_selection_index,
+                        &pending.answer,
+                    ),
+                    width,
+                )
+            })
+            .unwrap_or(0),
+        Some(modal::SurfaceKind::PendingUserInput) => app
+            .pending_request_user_input
+            .as_ref()
+            .map(|pending| {
+                visual_line_count(
+                    &format_request_user_input_menu_lines(
+                        &pending.request,
+                        pending.selection_index,
+                        &pending.answer,
+                        pending.answer_cursor,
+                    ),
+                    width,
+                )
+            })
+            .unwrap_or(0),
+        Some(modal::SurfaceKind::PendingPlanChoice) => app
+            .plan
+            .pending_choice
+            .as_ref()
+            .map(|pending| visual_line_count(&format_plan_choice_menu_lines(pending), width))
+            .unwrap_or(0),
+        Some(modal::SurfaceKind::PendingFeedback) => app
+            .pending_feedback
+            .as_ref()
+            .map(|feedback| visual_line_count(&format_feedback_prompt_lines(feedback), width))
+            .unwrap_or(0),
+        Some(modal::SurfaceKind::PastePreview) => app
+            .paste_preview
+            .as_ref()
+            .map(|preview| visual_line_count(&paste_preview_inline_lines(preview, width), width))
+            .unwrap_or(0),
+        Some(modal::SurfaceKind::PasteTransform) => app
+            .paste_transform
+            .as_ref()
+            .map(|menu| visual_line_count(&paste_transform_inline_lines(menu), width))
+            .unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -35183,13 +34815,20 @@ fn register_modal_option_targets(
 }
 
 fn render_approval(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    if let Some(preview) = app.paste_preview.as_ref() {
-        render_paste_preview_inline(frame, area, app, preview);
-        return;
-    }
-    if let Some(menu) = app.paste_transform.as_ref() {
-        render_paste_transform_inline(frame, area, app, menu);
-        return;
+    match modal::active_inline_decision_surface(app) {
+        Some(modal::SurfaceKind::PastePreview) => {
+            if let Some(preview) = app.paste_preview.as_ref() {
+                render_paste_preview_inline(frame, area, app, preview);
+            }
+            return;
+        }
+        Some(modal::SurfaceKind::PasteTransform) => {
+            if let Some(menu) = app.paste_transform.as_ref() {
+                render_paste_transform_inline(frame, area, app, menu);
+            }
+            return;
+        }
+        _ => {}
     }
     // Approvals render through the height-capped builder so the decision
     // options always fit the chunk the layout reserved for them; the other
@@ -35247,7 +34886,7 @@ fn render_approval(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                     )
                 },
             );
-        } else if app.pending_plan_choice.is_some() {
+        } else if app.plan.pending_choice.is_some() {
             // The plan choices are the trailing rows of the block.
             let count = PLAN_CHOICES.len();
             register_modal_option_targets(
@@ -35274,29 +34913,52 @@ fn render_approval(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
-    if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
-        format_mcp_elicitation_menu_lines(
-            &pending.request,
-            app.mcp_elicitation_selection_index,
-            &pending.answer,
-        )
-    } else if let Some(pending) = app.pending_request_user_input.as_ref() {
-        format_request_user_input_menu_lines(
-            &pending.request,
-            pending.selection_index,
-            &pending.answer,
-            pending.answer_cursor,
-        )
-    } else if let Some(pending) = app.pending_plan_choice.as_ref() {
-        format_plan_choice_menu_lines(pending)
-    } else if let Some(feedback) = app.pending_feedback.as_ref() {
-        format_feedback_prompt_lines(feedback)
-    } else if let Some(preview) = app.paste_preview.as_ref() {
-        paste_preview_inline_lines(preview, 80)
-    } else if let Some(menu) = app.paste_transform.as_ref() {
-        paste_transform_inline_lines(menu)
-    } else {
-        Vec::new()
+    match modal::active_inline_decision_surface(app) {
+        Some(modal::SurfaceKind::PendingMcpElicitation) => app
+            .pending_mcp_elicitation
+            .as_ref()
+            .map(|pending| {
+                format_mcp_elicitation_menu_lines(
+                    &pending.request,
+                    app.mcp_elicitation_selection_index,
+                    &pending.answer,
+                )
+            })
+            .unwrap_or_default(),
+        Some(modal::SurfaceKind::PendingUserInput) => app
+            .pending_request_user_input
+            .as_ref()
+            .map(|pending| {
+                format_request_user_input_menu_lines(
+                    &pending.request,
+                    pending.selection_index,
+                    &pending.answer,
+                    pending.answer_cursor,
+                )
+            })
+            .unwrap_or_default(),
+        Some(modal::SurfaceKind::PendingPlanChoice) => app
+            .plan
+            .pending_choice
+            .as_ref()
+            .map(format_plan_choice_menu_lines)
+            .unwrap_or_default(),
+        Some(modal::SurfaceKind::PendingFeedback) => app
+            .pending_feedback
+            .as_ref()
+            .map(format_feedback_prompt_lines)
+            .unwrap_or_default(),
+        Some(modal::SurfaceKind::PastePreview) => app
+            .paste_preview
+            .as_ref()
+            .map(|preview| paste_preview_inline_lines(preview, 80))
+            .unwrap_or_default(),
+        Some(modal::SurfaceKind::PasteTransform) => app
+            .paste_transform
+            .as_ref()
+            .map(paste_transform_inline_lines)
+            .unwrap_or_default(),
+        _ => Vec::new(),
     }
 }
 
@@ -45819,7 +45481,7 @@ fn compact_token_count(tokens: u64) -> String {
 
 fn mode_status_text(app: &TuiApp) -> String {
     let base = format!("{} mode (Shift+Tab to cycle)", title_case_mode(app.mode));
-    let Some(plan_id) = app.current_plan_id.as_deref() else {
+    let Some(plan_id) = app.plan.current_id.as_deref() else {
         return base;
     };
     // Truncate the hex tail so the status bar stays compact on narrow
@@ -46937,7 +46599,7 @@ fn format_status_hint_base(app: &TuiApp) -> String {
         return String::new();
     } else if app.pending_feedback.is_some() {
         return "Enter/Y send feedback · Esc/N discard".to_string();
-    } else if app.pending_plan_choice.is_some() {
+    } else if app.plan.pending_choice.is_some() {
         // The per-option `[e]/[c]/[r]/[d]` tags document the shortcuts inline;
         // the status row teaches movement and the dismiss/mode-switch verbs the
         // panel itself doesn't show.
@@ -48059,38 +47721,11 @@ pub(crate) struct TuiApp {
     /// hands one back; in that window plan IO falls back to
     /// [`proposed_plan::FALLBACK_SESSION_ID`].
     pub(crate) session_id: Option<String>,
-    /// Plan id of the most recent `<proposed_plan>` block persisted under
-    /// `.squeezy/plans/`. Used by Build-mode handoff and refinement turns
-    /// to identify which plan file is active without scanning the dir.
-    pub(crate) current_plan_id: Option<String>,
-    /// Path to a plan file that should be re-attached to upcoming Build-mode
-    /// turns. Set when the user switches Plan→Build while a plan is active.
-    /// Cleared on Build→Plan switch, on plan discard, and on the first
-    /// successful apply_patch / write_file in Build mode (the plan is "in
-    /// motion" — re-attaching it from there is just noise).
-    pub(crate) pending_plan_handoff: Option<PathBuf>,
-    /// Number of Build-mode turns since the current `pending_plan_handoff`
-    /// was queued. Turn 0 receives the full plan body as a prefix; turns
-    /// 1+ receive a lighter `[plan still in effect — <path>]` marker so
-    /// the model is reminded the plan applies without re-paying the
-    /// body's tokens on every turn (issue 16).
-    pub(crate) plan_handoff_turns_seen: u32,
-    /// Interactive Execute/Refine/Discard/View prompt rendered right after a
-    /// `<proposed_plan>` block lands. Set once on persist; cleared by an
-    /// explicit user choice. Blocks other input while present.
-    pub(crate) pending_plan_choice: Option<PendingPlanChoice>,
-    /// Pause/resume state for Build-mode plan execution (PR-G item 6).
-    /// Set when the user presses Shift+Tab while a Build turn is in
-    /// flight and an active plan exists: the turn is cancelled, the
-    /// captured plan id rides through Plan-mode, and the next Plan→
-    /// Build crossing surfaces a resume marker telling the model
-    /// whether the plan was refined while paused.
-    pub(crate) plan_pause: Option<PlanPauseState>,
-    /// One-shot resume marker queued during a Plan→Build crossing that
-    /// resumes from a pause. Consumed by [`take_pending_plan_prefix`]
-    /// on the first Build turn after the crossing so the marker rides
-    /// alongside the plan body.
-    pub(crate) plan_resume_marker: Option<String>,
+    /// Plan-mode UI/runtime cluster: active plan id, Build-mode handoff,
+    /// post-plan choice prompt, and pause/resume markers. Kept together so
+    /// plan surfaces own their state instead of scattering adjacent fields
+    /// across the app struct.
+    pub(crate) plan: PlanUiState,
     pub(crate) task_state: Option<TaskStateSnapshot>,
     pub(crate) mcp_status: Option<McpStatusSnapshot>,
     pub(crate) task_panel_collapsed: bool,
@@ -48362,20 +47997,13 @@ pub(crate) struct TuiApp {
     /// profile itself is persisted under the Squeezy projects state dir, keyed by
     /// the resolved workspace root, never inside the repo.
     pub(crate) workspace_profile: Option<workspace_profile::WorkspaceProfileState>,
-    /// Session Auto-Save Checkpoints For UI State (§12.9.5): the debounce gate +
-    /// last-saved fingerprint for the background auto-save. Reads/records the live
-    /// UI state (scroll anchor, focused entry, search, minimap pane) keyed by the
-    /// session id; the on-disk write is debounced so a burst of interaction never
-    /// becomes a write storm. Costs nothing at idle — the auto-save tick only runs
-    /// on iterations the UI already changed on.
-    pub(crate) session_checkpoint: session_checkpoint::CheckpointStore,
-    /// Session Auto-Save Checkpoints (§12.9.5): the read-only checkpoint status
-    /// overlay, or `None` when closed (the resting state, which paints nothing
-    /// extra and schedules no redraw). `Some` carries the last-saved checkpoint
-    /// snapshot to display; the overlay's `r` verb (or its `[restore]` click)
-    /// restores it onto the running session. Opened by the `OpenSessionCheckpoint`
-    /// keymap action.
-    pub(crate) session_checkpoint_overlay: Option<session_checkpoint::UiStateCheckpoint>,
+    /// Session Auto-Save Checkpoints For UI State (§12.9.5): grouped checkpoint
+    /// TUI state containing the debounced background store plus the optional
+    /// read-only status overlay snapshot. The store reads/records the live UI
+    /// state (scroll anchor, focused entry, search, minimap pane) keyed by the
+    /// session id; the overlay's `r` verb (or `[restore]` click) restores it onto
+    /// the running session.
+    pub(crate) session_checkpoint: session_checkpoint::CheckpointUiState,
     /// Per-Terminal Profiles (§12.7.3): the interactive terminal-profile editor
     /// overlay, or `None` when closed (the resting state, which paints nothing
     /// extra and schedules no redraw). `Some` = the fullscreen overlay owns
@@ -49556,12 +49184,7 @@ impl TuiApp {
             proposed_plan: proposed_plan::ProposedPlanExtractor::new(),
             workspace_root: config.workspace_root.clone(),
             session_id: None,
-            current_plan_id: None,
-            pending_plan_handoff: None,
-            plan_handoff_turns_seen: 0,
-            pending_plan_choice: None,
-            plan_pause: None,
-            plan_resume_marker: None,
+            plan: PlanUiState::default(),
             task_state: None,
             mcp_status: None,
             task_panel_collapsed: false,
@@ -49652,8 +49275,7 @@ impl TuiApp {
             keybinding_editor: None,
             theme_editor: None,
             workspace_profile: None,
-            session_checkpoint: session_checkpoint::CheckpointStore::new(),
-            session_checkpoint_overlay: None,
+            session_checkpoint: session_checkpoint::CheckpointUiState::new(),
             terminal_profile_editor: None,
             terminal_profile_override: None,
             gesture_settings_editor: None,
@@ -51222,11 +50844,6 @@ pub(crate) struct TurnProgress {
     pub(crate) micro_usd: u64,
 }
 
-pub(crate) struct PendingApproval {
-    pub(crate) request: ToolApprovalRequest,
-    pub(crate) decision_tx: oneshot::Sender<ToolApprovalDecision>,
-}
-
 pub(crate) struct PendingMcpElicitation {
     pub(crate) request: McpElicitationRequest,
     pub(crate) response_tx: oneshot::Sender<McpElicitationResponse>,
@@ -51251,67 +50868,6 @@ pub(crate) struct PendingRequestUserInput {
     /// Byte cursor into `answer`.
     pub(crate) answer_cursor: usize,
 }
-
-/// Interactive prompt that appears after a `<proposed_plan>` block lands
-/// and persists. Lets the user execute, refine, discard, or view the
-/// plan file without typing a slash command.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingPlanChoice {
-    pub(crate) plan_id: String,
-    pub(crate) plan_path: PathBuf,
-    pub(crate) selection_index: usize,
-}
-
-/// Captured plan-execution state at the moment of a Shift+Tab pause
-/// (PR-G item 6). `plan_id` is compared against `current_plan_id` on
-/// the next Plan→Build crossing so the resume marker can tell the
-/// model whether the plan body was refined while paused.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PlanPauseState {
-    plan_id: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PlanChoiceAction {
-    Execute,
-    ExecuteClean,
-    Refine,
-    Discard,
-}
-
-struct PlanChoiceOption {
-    action: PlanChoiceAction,
-    label: &'static str,
-    hint: &'static str,
-    shortcut: char,
-}
-
-const PLAN_CHOICES: &[PlanChoiceOption] = &[
-    PlanChoiceOption {
-        action: PlanChoiceAction::Execute,
-        label: "Execute",
-        hint: "switch to Build; keep history; run the plan",
-        shortcut: 'e',
-    },
-    PlanChoiceOption {
-        action: PlanChoiceAction::ExecuteClean,
-        label: "Execute (clean)",
-        hint: "compact prior chat to a summary, then run the plan",
-        shortcut: 'c',
-    },
-    PlanChoiceOption {
-        action: PlanChoiceAction::Refine,
-        label: "Refine",
-        hint: "stay in Plan; describe what to change",
-        shortcut: 'r',
-    },
-    PlanChoiceOption {
-        action: PlanChoiceAction::Discard,
-        label: "Discard",
-        hint: "delete the plan file and dismiss this prompt",
-        shortcut: 'd',
-    },
-];
 
 pub(crate) fn exit_hint(session_id: Option<&str>) -> Option<String> {
     session_id.map(|session_id| {

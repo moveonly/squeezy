@@ -10,6 +10,11 @@
 //! first refresh without a one-time backfill. Moving the actual resolver onto
 //! these structures to eliminate whole-workspace scans is the next planned
 //! step.
+//!
+//! Boundary: this module owns resolver inputs and path-resolution contracts.
+//! It should not mutate graph indexes or emit final semantic edges; those
+//! side effects stay in `resolution` until a language is explicitly flipped to
+//! the phased pipeline.
 
 pub mod scheduler;
 

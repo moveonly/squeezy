@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
-    pin::Pin,
     process::Stdio,
     sync::{
         Arc, Mutex,
@@ -30,7 +29,6 @@ use rmcp::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use squeezy_core::{McpServerConfig, McpTransport, PermissionMode};
 use squeezy_store::SqueezyStore;
 use tokio::{
@@ -39,59 +37,49 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod elicitation;
+mod palette;
+mod resources;
 mod schema_compaction;
 mod sse;
+mod transport;
 
+use elicitation::{
+    AutoElicitationDecision, MCP_AUDIT_LOG_CAPACITY, classify_elicitation, elicitation_kind,
+    elicitation_request_for_ui, push_elicitation_audit,
+};
+pub use elicitation::{
+    McpElicitationAction, McpElicitationAuditEvent, McpElicitationAuditOutcome,
+    McpElicitationHandler, McpElicitationKind, McpElicitationRequest, McpElicitationResponse,
+};
+#[cfg(test)]
+use palette::external_tool_name;
+use palette::{
+    MCP_TOOL_CACHE_SCHEMA_VERSION, external_tool_name_prefix, external_tool_name_with_prefix,
+    normalize_palette, tool_cache_key,
+};
+#[cfg(test)]
+use resources::RESOURCE_READ_CACHE_CAPACITY;
+use resources::{
+    CachedResourceDeclarations, CachedResourceRead, RESOURCE_DECLARATION_CACHE_TTL,
+    RESOURCE_READ_CACHE_TTL, insert_resource_read,
+};
 use schema_compaction::{compact_tool_schema, schema_object};
+#[cfg(test)]
+use transport::DEFAULT_MCP_TIMEOUT_MS;
+use transport::{discovery_timeout_ms, tool_call_timeout_ms};
 
-const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
-
-/// Timeout applied to MCP tool discovery (including the implicit session
-/// bring-up on the first call). Falls back to `timeout_ms`, then to the
-/// crate-wide default.
-fn discovery_timeout_ms(server: &McpServerConfig) -> u64 {
-    server
-        .discovery_timeout_ms
-        .or(server.timeout_ms)
-        .unwrap_or(DEFAULT_MCP_TIMEOUT_MS)
-}
-
-/// Timeout applied to MCP tool invocations and follow-on requests (tool
-/// calls, resource listing, resource reads). Falls back to `timeout_ms`,
-/// then to the crate-wide default.
-fn tool_call_timeout_ms(server: &McpServerConfig) -> u64 {
-    server
-        .tool_call_timeout_ms
-        .or(server.timeout_ms)
-        .unwrap_or(DEFAULT_MCP_TIMEOUT_MS)
-}
-
-const MCP_TOOL_CACHE_SCHEMA_VERSION: u64 = 1;
-const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
-const HASH_SUFFIX_BYTES: usize = 12;
-const RESOURCE_READ_CACHE_TTL: Duration = Duration::from_secs(300);
-const RESOURCE_DECLARATION_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Maximum number of stderr lines kept per stdio MCP session.
 const STDERR_RING_CAPACITY: usize = 20;
 /// Maximum bytes per stderr line before truncation. Lines from an untrusted
 /// child process are capped before logging or surfacing to avoid log injection
 /// and unbounded memory growth from long unterminated writes.
 const STDERR_LINE_MAX_BYTES: usize = 256;
-/// Cap on retained resource-read cache entries. The registry lives for the
-/// whole session, so without a bound a server (or agent loop) that reads many
-/// distinct URIs would accumulate their full bodies indefinitely. Mirrors the
-/// `MCP_AUDIT_LOG_CAPACITY` defense: prune expired entries, then evict the
-/// oldest, so memory stays bounded by the working set.
-const RESOURCE_READ_CACHE_CAPACITY: usize = 256;
 const MAX_TOOL_SCHEMA_BYTES: usize = 4096;
 
 pub type McpResult<T> = Result<T, McpError>;
 
 type McpService = rmcp::service::RunningService<RoleClient, SqueezyMcpClientHandler>;
-type McpElicitationFuture = Pin<Box<dyn Future<Output = McpElicitationResponse> + Send>>;
-pub type McpElicitationHandler =
-    Arc<dyn Fn(McpElicitationRequest) -> McpElicitationFuture + Send + Sync>;
-
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
     #[error("MCP server {server:?} is missing command for stdio transport")]
@@ -196,109 +184,6 @@ pub struct McpRefreshOutcome {
     pub status: McpStatusSnapshot,
     pub discovery_stats: Option<McpDiscoveryStats>,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum McpElicitationKind {
-    Form,
-    Url,
-}
-
-impl McpElicitationKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Form => "form",
-            Self::Url => "url",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpElicitationRequest {
-    pub server: String,
-    pub request_id: String,
-    pub kind: McpElicitationKind,
-    pub message: String,
-    pub schema: Option<Value>,
-    pub url: Option<String>,
-    pub elicitation_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum McpElicitationAction {
-    Accept,
-    Decline,
-    Cancel,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpElicitationResponse {
-    pub action: McpElicitationAction,
-    pub content: Option<Value>,
-}
-
-impl McpElicitationResponse {
-    pub fn accept(content: Option<Value>) -> Self {
-        Self {
-            action: McpElicitationAction::Accept,
-            content,
-        }
-    }
-
-    pub fn decline() -> Self {
-        Self {
-            action: McpElicitationAction::Decline,
-            content: None,
-        }
-    }
-
-    pub fn cancel() -> Self {
-        Self {
-            action: McpElicitationAction::Cancel,
-            content: None,
-        }
-    }
-}
-
-/// Outcome of a single elicitation policy check, surfaced for audit/UI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum McpElicitationAuditOutcome {
-    /// Policy + content allowed silent acceptance; no user was prompted.
-    AutoAccepted,
-    /// Policy denied without prompting.
-    AutoDeclined,
-    /// Forwarded to the host handler (UI) for a user decision.
-    Forwarded,
-}
-
-impl McpElicitationAuditOutcome {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::AutoAccepted => "auto_accepted",
-            Self::AutoDeclined => "auto_declined",
-            Self::Forwarded => "forwarded",
-        }
-    }
-}
-
-/// Record emitted every time the MCP client takes an elicitation decision.
-///
-/// Provides a structured audit trail so a malicious server spamming empty
-/// `Form` elicitations cannot silently flip behavior — each decision is
-/// observable from the host without scraping `tracing` logs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpElicitationAuditEvent {
-    pub server: String,
-    pub request_id: String,
-    pub kind: McpElicitationKind,
-    pub policy: PermissionMode,
-    pub outcome: McpElicitationAuditOutcome,
-    pub unix_millis: u128,
-}
-
-/// Cap on retained audit entries. Older records are dropped FIFO; this is
-/// purely a defense against runaway memory if a misbehaving server floods
-/// elicitations — the host is expected to drain via `audit_log_snapshot`.
-const MCP_AUDIT_LOG_CAPACITY: usize = 256;
 
 #[derive(Clone)]
 pub struct McpClientRegistry {
@@ -1669,21 +1554,6 @@ struct SessionEntry {
     stderr_ring: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
 }
 
-#[derive(Debug)]
-struct CachedResourceRead {
-    value: Value,
-    fetched_at: Instant,
-}
-
-#[derive(Debug, Clone)]
-struct CachedResourceDeclarations {
-    resource_uris: BTreeSet<String>,
-    resource_templates: Vec<String>,
-    resource_uris_complete: bool,
-    resource_templates_complete: bool,
-    fetched_at: Instant,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct McpToolCacheRecord {
     schema_version: u64,
@@ -2587,38 +2457,6 @@ fn arguments_object(tool: &str, arguments: Value) -> McpResult<JsonObject> {
     }
 }
 
-#[cfg(test)]
-fn external_tool_name(server: &str, tool: &str) -> String {
-    external_tool_name_with_prefix(&external_tool_name_prefix(server), tool)
-}
-
-fn external_tool_name_prefix(server: &str) -> String {
-    format!("mcp__{}__", sanitize_name(server))
-}
-
-fn external_tool_name_with_prefix(prefix: &str, tool: &str) -> String {
-    format!("{prefix}{}", sanitize_name(tool))
-}
-
-fn sanitize_name(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push('_');
-        }
-    }
-    let trimmed = out.trim_matches('_');
-    if trimmed.is_empty() {
-        "tool".to_string()
-    } else if trimmed.len() == out.len() {
-        out
-    } else {
-        trimmed.to_string()
-    }
-}
-
 fn starting_status_snapshot(
     servers: &BTreeMap<String, McpServerConfig>,
     mut prior: BTreeMap<String, McpServerStatus>,
@@ -2628,73 +2466,6 @@ fn starting_status_snapshot(
         prior.insert(name.clone(), McpServerStatus::Starting);
     }
     prior
-}
-
-fn normalize_palette(tools: Vec<ExternalMcpTool>) -> BTreeMap<String, ExternalMcpTool> {
-    let mut tools = tools;
-    tools.sort_by(|left, right| {
-        (&left.server, &left.raw_name, &left.model_name).cmp(&(
-            &right.server,
-            &right.raw_name,
-            &right.model_name,
-        ))
-    });
-    let mut by_base: BTreeMap<String, usize> = BTreeMap::new();
-    for tool in &tools {
-        *by_base.entry(tool.model_name.clone()).or_default() += 1;
-    }
-    let mut next = BTreeMap::new();
-    for mut tool in tools {
-        let force_hash = by_base
-            .get(tool.model_name.as_str())
-            .copied()
-            .unwrap_or_default()
-            > 1
-            || tool.model_name.len() > MAX_MODEL_TOOL_NAME_BYTES;
-        if force_hash || next.contains_key(tool.model_name.as_str()) {
-            ensure_unique_model_name(&mut tool, &next, force_hash);
-        }
-        next.insert(tool.model_name.clone(), tool);
-    }
-    next
-}
-
-fn ensure_unique_model_name(
-    tool: &mut ExternalMcpTool,
-    existing: &BTreeMap<String, ExternalMcpTool>,
-    force_initial_hash: bool,
-) {
-    let base = tool.model_name.clone();
-    let raw_identity = format!("{}\0{}", tool.server, tool.raw_name);
-    if force_initial_hash {
-        tool.model_name = fit_model_name(&base, &raw_identity, true);
-    }
-    let mut attempt = 0u32;
-    while existing.contains_key(tool.model_name.as_str()) {
-        attempt = attempt.saturating_add(1);
-        tool.model_name = fit_model_name(&base, &format!("{raw_identity}\0{attempt}"), true);
-    }
-}
-
-fn fit_model_name(base: &str, raw_identity: &str, force_hash: bool) -> String {
-    if !force_hash && base.len() <= MAX_MODEL_TOOL_NAME_BYTES {
-        return base.to_string();
-    }
-    let hash = sha256_hex_prefix(raw_identity.as_bytes(), HASH_SUFFIX_BYTES);
-    let max_prefix = MAX_MODEL_TOOL_NAME_BYTES.saturating_sub(1 + hash.len());
-    let prefix = truncate_ascii(base, max_prefix);
-    let mut out = String::with_capacity(prefix.len() + 1 + hash.len());
-    out.push_str(&prefix);
-    out.push('_');
-    out.push_str(&hash);
-    out
-}
-
-fn truncate_ascii(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_string();
-    }
-    value.chars().take(max_bytes).collect()
 }
 
 fn strip_untrusted_meta(mut value: Value) -> Value {
@@ -2726,119 +2497,6 @@ fn service_error_to_mcp(server: &str, err: rmcp::ServiceError) -> McpError {
     McpError::Transport {
         server: server.to_string(),
         message,
-    }
-}
-
-fn can_auto_accept_elicitation(request: &CreateElicitationRequestParams) -> bool {
-    match request {
-        CreateElicitationRequestParams::FormElicitationParams {
-            requested_schema, ..
-        } => requested_schema
-            .required
-            .as_ref()
-            .map(|required| required.is_empty())
-            .unwrap_or(true),
-        CreateElicitationRequestParams::UrlElicitationParams { .. } => false,
-    }
-}
-
-fn elicitation_kind(request: &CreateElicitationRequestParams) -> McpElicitationKind {
-    match request {
-        CreateElicitationRequestParams::FormElicitationParams { .. } => McpElicitationKind::Form,
-        CreateElicitationRequestParams::UrlElicitationParams { .. } => McpElicitationKind::Url,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AutoElicitationDecision {
-    AutoAccept,
-    AutoDecline,
-    Forward,
-}
-
-/// Resolve the per-request elicitation decision against the host policy. Pure
-/// function so the gate can be exercised in tests without spinning up an
-/// `rmcp` peer; the audit ring and tracing are applied around it.
-fn classify_elicitation(
-    policy: PermissionMode,
-    request: &CreateElicitationRequestParams,
-) -> AutoElicitationDecision {
-    match policy {
-        PermissionMode::Deny => AutoElicitationDecision::AutoDecline,
-        PermissionMode::Allow if can_auto_accept_elicitation(request) => {
-            AutoElicitationDecision::AutoAccept
-        }
-        PermissionMode::Allow | PermissionMode::Ask => AutoElicitationDecision::Forward,
-    }
-}
-
-fn push_elicitation_audit(
-    log: &Arc<Mutex<std::collections::VecDeque<McpElicitationAuditEvent>>>,
-    event: McpElicitationAuditEvent,
-) {
-    if let Ok(mut log) = log.lock() {
-        if log.len() >= MCP_AUDIT_LOG_CAPACITY {
-            log.pop_front();
-        }
-        log.push_back(event);
-    }
-}
-
-/// Insert a resource-read entry while keeping the cache bounded. Expired
-/// entries are dropped first (cheap, and keeps the working set roughly
-/// proportional to one TTL window), then — if still at capacity — the oldest
-/// surviving entry by `fetched_at` is evicted so a session that reads many
-/// distinct URIs cannot grow the map without limit.
-fn insert_resource_read(
-    cache: &mut BTreeMap<(String, String), CachedResourceRead>,
-    key: (String, String),
-    entry: CachedResourceRead,
-) {
-    cache.retain(|_, v| v.fetched_at.elapsed() <= RESOURCE_READ_CACHE_TTL);
-    while cache.len() >= RESOURCE_READ_CACHE_CAPACITY
-        && let Some(oldest) = cache
-            .iter()
-            .min_by_key(|(_, v)| v.fetched_at)
-            .map(|(k, _)| k.clone())
-    {
-        cache.remove(&oldest);
-    }
-    cache.insert(key, entry);
-}
-
-fn elicitation_request_for_ui(
-    server: &str,
-    context: &RequestContext<RoleClient>,
-    request: &CreateElicitationRequestParams,
-) -> McpElicitationRequest {
-    match request {
-        CreateElicitationRequestParams::FormElicitationParams {
-            message,
-            requested_schema,
-            ..
-        } => McpElicitationRequest {
-            server: server.to_string(),
-            request_id: format!("{:?}", context.id),
-            kind: McpElicitationKind::Form,
-            message: message.clone(),
-            schema: serde_json::to_value(requested_schema).ok(),
-            url: None,
-            elicitation_id: None,
-        },
-        CreateElicitationRequestParams::UrlElicitationParams {
-            message,
-            url,
-            elicitation_id,
-            ..
-        } => McpElicitationRequest {
-            server: server.to_string(),
-            request_id: format!("{:?}", context.id),
-            kind: McpElicitationKind::Url,
-            message: message.clone(),
-            schema: None,
-            url: Some(url.clone()),
-            elicitation_id: Some(elicitation_id.clone()),
-        },
     }
 }
 
@@ -2905,86 +2563,6 @@ fn uri_template_placeholder_delimiter(ch: char, allows_slashes: bool) -> bool {
 fn uri_template_placeholder_allows_slashes(placeholder: &str) -> bool {
     let placeholder = placeholder.to_ascii_lowercase();
     placeholder == "path" || placeholder.ends_with("_path") || placeholder.ends_with("-path")
-}
-
-fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {
-    // Hash secret values before including them in the fingerprint so the key
-    // is safe to store in the on-disk DB while still invalidating when a
-    // credential rotates.  We include enough signal to detect any auth/header
-    // change without embedding the raw secrets:
-    //   - env key → SHA-256-prefix(value) — env values are runtime secrets.
-    //   - static header key → SHA-256-prefix(value) — header values may be
-    //     tokens; hashed so the key is safe to persist.
-    //   - bearer_token_env_var name — static config, safe to store as-is.
-    //   - env_http_headers key → env-var-name pairs — both the HTTP header
-    //     name and the env-var name that backs it are static config. If an
-    //     operator changes `{ "X-Auth" = "OLD_TOKEN_VAR" }` to
-    //     `{ "X-Auth" = "NEW_TOKEN_VAR" }`, the fingerprint must change.
-    let env_value_hashes: Vec<(&str, String)> = server
-        .env
-        .iter()
-        .map(|(k, v)| (k.as_str(), sha256_hex_prefix(v.as_bytes(), 16)))
-        .collect();
-    let header_value_hashes: Vec<(&str, String)> = server
-        .http_headers
-        .iter()
-        .map(|(k, v)| (k.as_str(), sha256_hex_prefix(v.as_bytes(), 16)))
-        .collect();
-    // `env_http_headers` maps HTTP-header-name → env-var-name.  Both parts
-    // are static config that affect which credential is loaded at session
-    // start; include both so renaming either the header or the env-var
-    // triggers cache eviction.
-    let env_http_headers_pairs: Vec<(&str, &str)> = server
-        .env_http_headers
-        .iter()
-        .map(|(header, env_var)| (header.as_str(), env_var.as_str()))
-        .collect();
-    let fingerprint = json!({
-        "schema": MCP_TOOL_CACHE_SCHEMA_VERSION,
-        "server": server_name,
-        "transport": server.transport.as_str(),
-        "command": &server.command,
-        "args": &server.args,
-        "url": &server.url,
-        "cwd": &server.cwd,
-        "timeout_ms": server.timeout_ms,
-        "discovery_timeout_ms": server.discovery_timeout_ms,
-        "tool_call_timeout_ms": server.tool_call_timeout_ms,
-        "env_value_hashes": env_value_hashes,
-        "enabled_tools": &server.enabled_tools,
-        "disabled_tools": &server.disabled_tools,
-        "bearer_token_env_var": &server.bearer_token_env_var,
-        "header_value_hashes": header_value_hashes,
-        "env_http_headers": env_http_headers_pairs,
-    });
-    format!(
-        "{server_name}\0{}",
-        sha256_hex(fingerprint.to_string().as_bytes())
-    )
-}
-
-fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
-    use std::fmt::Write as _;
-
-    let digest = Sha256::digest(bytes.as_ref());
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    output
-}
-
-fn sha256_hex_prefix(bytes: impl AsRef<[u8]>, max_hex_chars: usize) -> String {
-    use std::fmt::Write as _;
-
-    let digest = Sha256::digest(bytes.as_ref());
-    let digest_bytes = max_hex_chars.div_ceil(2).min(digest.len());
-    let mut output = String::with_capacity(digest_bytes * 2);
-    for &byte in digest.iter().take(digest_bytes) {
-        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    output.truncate(max_hex_chars);
-    output
 }
 
 fn unix_millis() -> u128 {

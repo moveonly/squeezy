@@ -1,3 +1,4 @@
+use crate::languages::common::visit_named_children_with_state;
 use crate::languages::rust::*;
 use crate::*;
 
@@ -195,10 +196,10 @@ fn visit_dart_children(
     parent_symbol: Option<(SymbolId, SymbolKind)>,
     owner_symbol: Option<SymbolId>,
 ) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        visit_dart_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
-    }
+    visit_named_children_with_state(node, (parent_symbol, owner_symbol), |child, state| {
+        let (parent_symbol, owner_symbol) = state;
+        visit_dart_node(child, ctx, parent_symbol, owner_symbol);
+    });
 }
 
 fn dart_top_level_symbol_from_node(

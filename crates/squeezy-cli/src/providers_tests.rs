@@ -23,7 +23,7 @@ fn registry_includes_every_known_provider_id() {
     assert!(names.contains(&"deepseek"));
     assert_eq!(
         entries.len(),
-        BASE_PROVIDERS.len() + OpenAiCompatiblePreset::all().len(),
+        squeezy_core::BASE_PROVIDER_METADATA.len() + OpenAiCompatiblePreset::all().len(),
         "registry size must equal base + preset counts: {names:?}",
     );
 }
@@ -80,10 +80,10 @@ fn env_set_treats_blank_strings_as_unset() {
     map.insert("FILLED", "yes");
     map.insert("BLANK", "   ");
     let lookup = lookup_from(map);
-    assert!(env_set(&lookup, "FILLED"));
-    assert!(!env_set(&lookup, "BLANK"));
-    assert!(!env_set(&lookup, "MISSING"));
-    assert!(!env_set(&lookup, ""));
+    assert!(squeezy_core::env_value_set(&lookup, "FILLED"));
+    assert!(!squeezy_core::env_value_set(&lookup, "BLANK"));
+    assert!(!squeezy_core::env_value_set(&lookup, "MISSING"));
+    assert!(!squeezy_core::env_value_set(&lookup, ""));
 }
 
 #[test]

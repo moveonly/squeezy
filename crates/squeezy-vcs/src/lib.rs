@@ -18,13 +18,22 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use squeezy_core::{Result, SqueezyError};
 
+mod diff;
 mod git_command;
+mod rollback;
 pub mod worktree;
+pub use diff::parse_patch_hunks;
+use diff::{
+    FileStat, Patch, capped_patch, diff_large_files, diff_raw_files, nul_fields,
+    op_preview_from_operation, op_preview_from_search_replace, parse_numstat, split_unified_patch,
+    status_kind,
+};
 use git_command::{
     git_output, git_output_allow_status, git_output_vec_allow_status,
     git_output_vec_with_stdin_allow_status, git_text, hooks_off_value,
     is_add_ignored_advisory_only,
 };
+use rollback::{rollback_file_has_conflict, rollback_write_paths};
 pub use worktree::{Worktree, WorktreeCleanup, validate_worktree_slug};
 
 pub const CRATE_NAME: &str = "squeezy-vcs";
@@ -3082,19 +3091,6 @@ struct RollbackBackup {
     bytes: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FileStat {
-    additions: u64,
-    deletions: u64,
-    binary: bool,
-}
-
-#[derive(Debug, Clone)]
-struct Patch {
-    text: String,
-    truncated: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TreeEntry {
     mode: String,
@@ -3486,21 +3482,6 @@ fn same_inode(left: &Path, right: &Path) -> Result<bool> {
     Ok(left.dev() == right.dev() && left.ino() == right.ino())
 }
 
-fn rollback_file_has_conflict(
-    result: &RollbackResult,
-    record: &CheckpointRecord,
-    file: &CheckpointFile,
-) -> bool {
-    result.conflicts.iter().any(|conflict| {
-        conflict.checkpoint_id == record.id
-            && (conflict.path == file.path
-                || file
-                    .from_path
-                    .as_deref()
-                    .is_some_and(|from_path| conflict.path == from_path))
-    })
-}
-
 fn path_exists_no_follow(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
@@ -3864,24 +3845,6 @@ fn collect_workspace_file_entries(
     Ok(())
 }
 
-fn rollback_write_paths(file: &CheckpointFile) -> Vec<String> {
-    let mut paths = if file.status == DiffFileStatus::Renamed {
-        let mut paths = vec![file.path.clone()];
-        if let Some(from_path) = file.from_path.clone() {
-            paths.push(from_path);
-        }
-        paths
-    } else {
-        vec![file.path.clone()]
-    };
-    if let Some(group) = file.before_hardlink_paths.as_ref() {
-        paths.extend(group.iter().cloned());
-    }
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
 fn filesystem_preflight_conflict(
     checkpoint_id: &str,
     path: &str,
@@ -4200,40 +4163,6 @@ fn mtime_parts(metadata: &fs::Metadata) -> (i64, u32) {
     }
 }
 
-fn diff_large_files(
-    before: &[LargeFileFingerprint],
-    after: &[LargeFileFingerprint],
-) -> Vec<String> {
-    let before_map: BTreeMap<&str, &LargeFileFingerprint> = before
-        .iter()
-        .map(|file| (file.path.as_str(), file))
-        .collect();
-    let after_map: BTreeMap<&str, &LargeFileFingerprint> = after
-        .iter()
-        .map(|file| (file.path.as_str(), file))
-        .collect();
-    let mut changed = BTreeSet::<String>::new();
-    for path in before_map.keys().chain(after_map.keys()) {
-        if before_map.get(path) != after_map.get(path) {
-            changed.insert((*path).to_string());
-        }
-    }
-    changed.into_iter().collect()
-}
-
-fn diff_raw_files(
-    before: &BTreeMap<String, RawFileSnapshot>,
-    after: &BTreeMap<String, RawFileSnapshot>,
-) -> Vec<String> {
-    let mut changed = BTreeSet::<String>::new();
-    for path in before.keys().chain(after.keys()) {
-        if before.get(path) != after.get(path) {
-            changed.insert(path.clone());
-        }
-    }
-    changed.into_iter().collect()
-}
-
 fn rel_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -4294,156 +4223,6 @@ fn transient_operation_state(git_dir: &Path) -> Option<String> {
     None
 }
 
-fn status_kind(code: &str) -> DiffFileStatus {
-    if code == "??" || (code.contains('A') && !code.contains('D')) {
-        DiffFileStatus::Added
-    } else if code.contains('D') && !code.contains('A') {
-        DiffFileStatus::Deleted
-    } else {
-        DiffFileStatus::Modified
-    }
-}
-
-fn nul_fields(bytes: &[u8]) -> Vec<String> {
-    bytes
-        .split(|byte| *byte == 0)
-        .filter(|field| !field.is_empty())
-        .map(|field| String::from_utf8_lossy(field).to_string())
-        .collect()
-}
-
-fn parse_numstat(bytes: &[u8]) -> BTreeMap<String, FileStat> {
-    let mut output = BTreeMap::new();
-    let text = String::from_utf8_lossy(bytes);
-    for record in text.split('\0').filter(|record| !record.trim().is_empty()) {
-        let mut parts = record.splitn(3, '\t');
-        let Some(additions) = parts.next() else {
-            continue;
-        };
-        let Some(deletions) = parts.next() else {
-            continue;
-        };
-        let Some(path) = parts.next() else {
-            continue;
-        };
-        if path.is_empty() {
-            continue;
-        }
-        let binary = additions == "-" || deletions == "-";
-        output.insert(
-            path.to_string(),
-            FileStat {
-                additions: parse_count(additions),
-                deletions: parse_count(deletions),
-                binary,
-            },
-        );
-    }
-    output
-}
-
-fn parse_count(value: &str) -> u64 {
-    if value == "-" {
-        0
-    } else {
-        value.parse().unwrap_or(0)
-    }
-}
-
-/// Split combined `git diff --patch` output into per-file slices. The
-/// stream looks like:
-///
-/// ```text
-/// diff --git a/foo b/foo
-/// index ...
-/// --- a/foo
-/// +++ b/foo
-/// @@ ...
-/// diff --git a/bar b/bar
-/// ...
-/// ```
-///
-/// Each `diff --git a/<path> b/<path>` line opens a new file section
-/// that runs until the next such line (or EOF). We match the trailing
-/// `b/<path>` against `expected_files` so paths with embedded spaces
-/// still resolve correctly — git omits the trailing whitespace.
-fn split_unified_patch(
-    bytes: &[u8],
-    expected_files: &[String],
-    max_bytes: usize,
-) -> BTreeMap<String, Patch> {
-    let text = String::from_utf8_lossy(bytes);
-    let expected: BTreeSet<&str> = expected_files.iter().map(String::as_str).collect();
-    let mut out: BTreeMap<String, Patch> = BTreeMap::new();
-    let mut current_path: Option<String> = None;
-    let mut buffer = String::new();
-    let flush = |path: Option<String>, buffer: &mut String, out: &mut BTreeMap<String, Patch>| {
-        if let Some(path) = path {
-            let truncated = buffer.len() > max_bytes;
-            let text = if truncated {
-                // `max_bytes` is a raw byte cap; snap it down to the nearest
-                // UTF-8 char boundary so slicing never lands mid-codepoint.
-                // Indices 0..=max_bytes are valid here (max_bytes <= len) and
-                // 0 is always a boundary, so the search always succeeds.
-                let end = (0..=max_bytes)
-                    .rev()
-                    .find(|&i| buffer.is_char_boundary(i))
-                    .unwrap_or(0);
-                buffer[..end].to_string()
-            } else {
-                std::mem::take(buffer)
-            };
-            out.insert(path, Patch { text, truncated });
-        }
-        buffer.clear();
-    };
-    for line in text.split_inclusive('\n') {
-        if let Some(rest) = line.strip_prefix("diff --git a/")
-            && let Some(path) = extract_diff_git_path(rest, &expected)
-        {
-            flush(current_path.take(), &mut buffer, &mut out);
-            current_path = Some(path);
-        }
-        buffer.push_str(line);
-    }
-    flush(current_path, &mut buffer, &mut out);
-    out
-}
-
-/// Extract the `b/<path>` half of a `diff --git a/<path> b/<path>` line,
-/// matching against the known file list to handle paths with embedded
-/// spaces. The input is the suffix that follows `diff --git a/`.
-fn extract_diff_git_path<'a>(suffix: &'a str, expected: &BTreeSet<&'a str>) -> Option<String> {
-    let trimmed = suffix.trim_end_matches('\n').trim_end_matches('\r');
-    // The canonical no-spaces form: `<path> b/<path>`. Try it first.
-    if let Some(idx) = trimmed.find(" b/") {
-        let candidate = &trimmed[..idx];
-        if expected.contains(candidate) {
-            return Some(candidate.to_string());
-        }
-    }
-    // Fallback for paths with spaces: scan every ` b/<known-path>` suffix.
-    for &path in expected {
-        if let Some(prefix) = trimmed.strip_suffix(path)
-            && let Some(prefix) = prefix.strip_suffix(" b/")
-            && prefix == path
-        {
-            return Some(path.to_string());
-        }
-    }
-    None
-}
-
-fn capped_patch(bytes: Vec<u8>, max_bytes: usize) -> Patch {
-    let truncated = bytes.len() > max_bytes;
-    let text = if truncated {
-        String::from_utf8_lossy(&bytes[..max_bytes]).to_string()
-    } else {
-        String::from_utf8_lossy(&bytes).to_string()
-    };
-    Patch { text, truncated }
-}
-
 /// Walk an `apply_patch` JSON payload and emit one [`PatchOpPreview`] per op
 /// in payload order.
 ///
@@ -4469,7 +4248,7 @@ where
     let mut index = 0usize;
     if let Some(operations) = value.get("operations").and_then(|ops| ops.as_array()) {
         for op in operations {
-            if let Some(preview) = op_preview_from_operation(index, op) {
+            if let Some(preview) = op_preview_from_operation(index, op, sha256_hex) {
                 sink(preview);
                 index += 1;
             }
@@ -4477,158 +4256,13 @@ where
     }
     if let Some(patches) = value.get("patches").and_then(|patches| patches.as_array()) {
         for patch in patches {
-            if let Some(preview) = op_preview_from_search_replace(index, patch) {
+            if let Some(preview) = op_preview_from_search_replace(index, patch, sha256_hex) {
                 sink(preview);
                 index += 1;
             }
         }
     }
     Ok(index)
-}
-
-fn op_preview_from_operation(index: usize, op: &serde_json::Value) -> Option<PatchOpPreview> {
-    let kind = op.get("kind").and_then(|kind| kind.as_str())?;
-    match kind {
-        "search_replace" => {
-            let path = op.get("path").and_then(|path| path.as_str())?.to_string();
-            Some(PatchOpPreview {
-                index,
-                kind: PatchOpKind::SearchReplace,
-                path,
-                from_path: None,
-                search_hash: op
-                    .get("search")
-                    .and_then(|value| value.as_str())
-                    .map(|text| sha256_hex(text.as_bytes())),
-                replace_hash: op
-                    .get("replace")
-                    .and_then(|value| value.as_str())
-                    .map(|text| sha256_hex(text.as_bytes())),
-                contents_hash: None,
-            })
-        }
-        "create_file" => {
-            let path = op.get("path").and_then(|path| path.as_str())?.to_string();
-            Some(PatchOpPreview {
-                index,
-                kind: PatchOpKind::CreateFile,
-                path,
-                from_path: None,
-                search_hash: None,
-                replace_hash: None,
-                contents_hash: op
-                    .get("contents")
-                    .and_then(|value| value.as_str())
-                    .map(|text| sha256_hex(text.as_bytes())),
-            })
-        }
-        "delete_file" => {
-            let path = op.get("path").and_then(|path| path.as_str())?.to_string();
-            Some(PatchOpPreview {
-                index,
-                kind: PatchOpKind::DeleteFile,
-                path,
-                from_path: None,
-                search_hash: None,
-                replace_hash: None,
-                contents_hash: None,
-            })
-        }
-        "move_file" => {
-            let from = op.get("from").and_then(|from| from.as_str())?.to_string();
-            let to = op.get("to").and_then(|to| to.as_str())?.to_string();
-            Some(PatchOpPreview {
-                index,
-                kind: PatchOpKind::MoveFile,
-                path: to,
-                from_path: Some(from),
-                search_hash: None,
-                replace_hash: None,
-                contents_hash: None,
-            })
-        }
-        _ => None,
-    }
-}
-
-fn op_preview_from_search_replace(
-    index: usize,
-    patch: &serde_json::Value,
-) -> Option<PatchOpPreview> {
-    let path = patch
-        .get("path")
-        .and_then(|path| path.as_str())?
-        .to_string();
-    Some(PatchOpPreview {
-        index,
-        kind: PatchOpKind::SearchReplace,
-        path,
-        from_path: None,
-        search_hash: patch
-            .get("search")
-            .and_then(|value| value.as_str())
-            .map(|text| sha256_hex(text.as_bytes())),
-        replace_hash: patch
-            .get("replace")
-            .and_then(|value| value.as_str())
-            .map(|text| sha256_hex(text.as_bytes())),
-        contents_hash: None,
-    })
-}
-
-pub fn parse_patch_hunks(patch: &str) -> Vec<DiffHunk> {
-    let mut seen = BTreeSet::new();
-    let mut hunks = Vec::new();
-    for line in patch.lines() {
-        let Some(header) = line.strip_prefix("@@ ") else {
-            continue;
-        };
-        let Some(end) = header.find(" @@") else {
-            continue;
-        };
-        let ranges = &header[..end];
-        let mut parts = ranges.split_whitespace();
-        let old = parts.next().unwrap_or_default().trim_start_matches('-');
-        let new = parts.next().unwrap_or_default().trim_start_matches('+');
-        let (old_start, old_lines) = parse_hunk_range(old);
-        let (new_start, new_lines) = parse_hunk_range(new);
-        let start_line = new_start.saturating_sub(1);
-        let end_line = if new_lines == 0 {
-            start_line
-        } else {
-            new_start.saturating_add(new_lines).saturating_sub(2)
-        };
-        let hunk = DiffHunk {
-            old_start,
-            old_lines,
-            new_start,
-            new_lines,
-            start_line,
-            end_line,
-        };
-        if seen.insert((
-            hunk.old_start,
-            hunk.new_start,
-            hunk.old_lines,
-            hunk.new_lines,
-        )) {
-            hunks.push(hunk);
-        }
-    }
-    hunks
-}
-
-fn parse_hunk_range(value: &str) -> (u32, u32) {
-    let mut parts = value.split(',');
-    let start = parts
-        .next()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    let lines = parts
-        .next()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1);
-    (start, lines)
 }
 
 /// Treat a user-supplied `0` as "use the built-in default" rather than

