@@ -122,3 +122,10 @@ pub async fn run_echo_smoke(
     let stream = provider.stream_response(request, CancellationToken::new());
     collect_text(stream, label).await
 }
+
+pub fn assert_echo_response(output: &str) {
+    assert!(
+        output.to_ascii_lowercase().contains("squeezy-ok"),
+        "expected response to contain `squeezy-ok`, got: {output:?}"
+    );
+}
