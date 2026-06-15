@@ -131,3 +131,7 @@ pub(crate) fn menu_lines(
     }
     lines
 }
+
+#[cfg(test)]
+#[path = "plan_choice_tests.rs"]
+mod tests;
