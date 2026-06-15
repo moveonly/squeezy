@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::languages::common::visit_named_children_with_state;
+use crate::languages::common::{
+    parsed_file_from_context, record_missing_and_skip, visit_named_children_with_state,
+};
 use crate::languages::rust::*;
 use crate::*;
 
@@ -19,18 +21,7 @@ pub(crate) fn extract_go(file: FileRecord, source: &str, tree: &Tree) -> ParsedF
     visit_go_node(root, &mut ctx, None, None);
     dedup_go_facts(&mut ctx);
 
-    ParsedFile {
-        file,
-        package,
-        symbols: ctx.symbols,
-        imports: ctx.imports,
-        calls: ctx.calls,
-        references: ctx.references,
-        body_hits: ctx.body_hits,
-        unsupported: None,
-        diagnostics: ctx.diagnostics,
-        changed_ranges: Vec::new(),
-    }
+    parsed_file_from_context(ctx, package)
 }
 
 pub(crate) fn visit_go_node(
@@ -39,8 +30,7 @@ pub(crate) fn visit_go_node(
     parent_symbol: Option<SymbolId>,
     owner_symbol: Option<SymbolId>,
 ) {
-    if node.is_missing() {
-        record_missing_node_diagnostic(node, ctx);
+    if record_missing_and_skip(node, ctx) {
         return;
     }
 
