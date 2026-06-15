@@ -917,7 +917,7 @@ async fn stalled_model_stream_fails_after_idle_timeout() {
         stream_idle_timeout: Duration::from_millis(10),
         ..Default::default()
     };
-    let agent = Agent::new(config, provider.clone());
+    let agent = Box::new(Agent::new(config, provider.clone()));
 
     let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
     let mut saw_timeout = false;
@@ -2726,89 +2726,91 @@ async fn session_approval_installs_in_memory_rule_without_persisting() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn ai_reviewer_allows_allowlisted_read_without_user_prompt() {
-    let root = temp_workspace("agent_ai_reviewer_allow");
-    fs::write(root.join("README.md"), "hello\n").expect("write readme");
-    let provider = Arc::new(MockProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "read_1".to_string(),
-                name: "read_file".to_string(),
-                arguments: json!({"path": "README.md"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_1".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta(
-                r#"{"action":"allow","reason":"read is in scope"}"#.to_string(),
-            )),
-            Ok(LlmEvent::Completed {
-                response_id: Some("reviewer".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("done".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let mut config = AppConfig {
-        workspace_root: root.clone(),
-        permissions: PermissionPolicy {
-            read: PermissionMode::Ask,
+#[test]
+fn ai_reviewer_allows_allowlisted_read_without_user_prompt() {
+    run_high_stack_async_test(async {
+        let root = temp_workspace("agent_ai_reviewer_allow");
+        fs::write(root.join("README.md"), "hello\n").expect("write readme");
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "read_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({"path": "README.md"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta(
+                    r#"{"action":"allow","reason":"read is in scope"}"#.to_string(),
+                )),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("reviewer".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let mut config = AppConfig {
+            workspace_root: root.clone(),
+            permissions: PermissionPolicy {
+                read: PermissionMode::Ask,
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    };
-    config.permissions.ai_reviewer.enabled = true;
-    let agent = Agent::new(config, provider.clone());
+        };
+        config.permissions.ai_reviewer.enabled = true;
+        let agent = Agent::new(config, provider.clone());
 
-    let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
-    let mut approvals_seen = 0usize;
-    let mut read_result = None;
-    while let Some(event) = rx.recv().await {
-        match event {
-            AgentEvent::ApprovalRequested { decision_tx, .. } => {
-                approvals_seen += 1;
-                let _ = decision_tx.send(ToolApprovalDecision::Denied);
+        let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
+        let mut approvals_seen = 0usize;
+        let mut read_result = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::ApprovalRequested { decision_tx, .. } => {
+                    approvals_seen += 1;
+                    let _ = decision_tx.send(ToolApprovalDecision::Denied);
+                }
+                AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "read_1" => {
+                    read_result = Some(result);
+                }
+                _ => {}
             }
-            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "read_1" => {
-                read_result = Some(result);
-            }
-            _ => {}
         }
-    }
 
-    assert_eq!(approvals_seen, 0);
-    assert_eq!(
-        read_result.expect("read result").status,
-        ToolStatus::Success
-    );
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 3);
-    assert!(
-        matches!(&requests[1].input[0], LlmInputItem::UserText(text) if text.contains("Approval policy") && text.contains("\"tool_name\":\"read_file\"")),
-        "reviewer prompt should carry policy and request: {:?}",
-        requests[1].input
-    );
+        assert_eq!(approvals_seen, 0);
+        assert_eq!(
+            read_result.expect("read result").status,
+            ToolStatus::Success
+        );
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            matches!(&requests[1].input[0], LlmInputItem::UserText(text) if text.contains("Approval policy") && text.contains("\"tool_name\":\"read_file\"")),
+            "reviewer prompt should carry policy and request: {:?}",
+            requests[1].input
+        );
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]
@@ -7081,159 +7083,163 @@ impl squeezy_hooks::HookHandler for DenyToolByName {
     }
 }
 
-#[tokio::test]
-async fn pretooluse_hook_denies_tool_call() {
-    use squeezy_hooks::HookRegistry;
+#[test]
+fn pretooluse_hook_denies_tool_call() {
+    run_high_stack_async_test(async {
+        use squeezy_hooks::HookRegistry;
 
-    let root = temp_workspace("pretooluse_hook_denies_tool_call");
-    fs::write(root.join("README.md"), "hello\n").expect("write readme");
-    let provider = Arc::new(MockProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "read_1".to_string(),
-                name: "read_file".to_string(),
-                arguments: json!({"path": "README.md"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_1".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("done".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let config = AppConfig {
-        workspace_root: root.clone(),
-        permissions: PermissionPolicy {
-            read: PermissionMode::Allow,
-            ..Default::default()
-        },
-        ..AppConfig::default()
-    };
-    let mut agent = Agent::new(config, provider);
-    let mut registry = HookRegistry::new();
-    registry.register(Box::new(DenyToolByName {
-        tool_name: "read_file",
-        reason: "blocked by org policy",
-    }));
-    agent.set_hooks(Some(Arc::new(registry)));
+        let root = temp_workspace("pretooluse_hook_denies_tool_call");
+        fs::write(root.join("README.md"), "hello\n").expect("write readme");
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "read_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({"path": "README.md"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let config = AppConfig {
+            workspace_root: root.clone(),
+            permissions: PermissionPolicy {
+                read: PermissionMode::Allow,
+                ..Default::default()
+            },
+            ..AppConfig::default()
+        };
+        let mut agent = Agent::new(config, provider);
+        let mut registry = HookRegistry::new();
+        registry.register(Box::new(DenyToolByName {
+            tool_name: "read_file",
+            reason: "blocked by org policy",
+        }));
+        agent.set_hooks(Some(Arc::new(registry)));
 
-    let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
-    let mut approvals_seen = 0usize;
-    let mut read_result = None;
-    while let Some(event) = rx.recv().await {
-        match event {
-            AgentEvent::ApprovalRequested { decision_tx, .. } => {
-                approvals_seen += 1;
-                let _ = decision_tx.send(ToolApprovalDecision::Denied);
+        let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
+        let mut approvals_seen = 0usize;
+        let mut read_result = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::ApprovalRequested { decision_tx, .. } => {
+                    approvals_seen += 1;
+                    let _ = decision_tx.send(ToolApprovalDecision::Denied);
+                }
+                AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "read_1" => {
+                    read_result = Some(result);
+                }
+                _ => {}
             }
-            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "read_1" => {
-                read_result = Some(result);
-            }
-            _ => {}
         }
-    }
 
-    assert_eq!(
-        approvals_seen, 0,
-        "PreToolUse deny must short-circuit before the permission engine asks the user",
-    );
-    let read_result = read_result.expect("ToolCallCompleted with read_1 must arrive");
-    assert_eq!(read_result.status, ToolStatus::Denied);
-    let reason = read_result.content["reason"]
-        .as_str()
-        .expect("denied result carries a reason string");
-    assert_eq!(reason, "blocked by org policy");
-    assert_eq!(
-        read_result.content["permission_denied"],
-        json!(true),
-        "denied result must mark permission_denied for downstream consumers",
-    );
+        assert_eq!(
+            approvals_seen, 0,
+            "PreToolUse deny must short-circuit before the permission engine asks the user",
+        );
+        let read_result = read_result.expect("ToolCallCompleted with read_1 must arrive");
+        assert_eq!(read_result.status, ToolStatus::Denied);
+        let reason = read_result.content["reason"]
+            .as_str()
+            .expect("denied result carries a reason string");
+        assert_eq!(reason, "blocked by org policy");
+        assert_eq!(
+            read_result.content["permission_denied"],
+            json!(true),
+            "denied result must mark permission_denied for downstream consumers",
+        );
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
-#[tokio::test]
-async fn pretooluse_hook_allow_lets_tool_run() {
-    use squeezy_hooks::HookRegistry;
+#[test]
+fn pretooluse_hook_allow_lets_tool_run() {
+    run_high_stack_async_test(async {
+        use squeezy_hooks::HookRegistry;
 
-    let root = temp_workspace("pretooluse_hook_allow_lets_tool_run");
-    fs::write(root.join("README.md"), "hello\n").expect("write readme");
-    let provider = Arc::new(MockProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "read_1".to_string(),
-                name: "read_file".to_string(),
-                arguments: json!({"path": "README.md"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_1".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("done".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let config = AppConfig {
-        workspace_root: root.clone(),
-        permissions: PermissionPolicy {
-            read: PermissionMode::Allow,
-            ..Default::default()
-        },
-        ..AppConfig::default()
-    };
-    let mut agent = Agent::new(config, provider);
-    // Handler denies a *different* tool, so the read_file call must run
-    // to completion. This guards against the change short-circuiting
-    // unrelated tool calls.
-    let mut registry = HookRegistry::new();
-    registry.register(Box::new(DenyToolByName {
-        tool_name: "shell",
-        reason: "shell blocked",
-    }));
-    agent.set_hooks(Some(Arc::new(registry)));
+        let root = temp_workspace("pretooluse_hook_allow_lets_tool_run");
+        fs::write(root.join("README.md"), "hello\n").expect("write readme");
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "read_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({"path": "README.md"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let config = AppConfig {
+            workspace_root: root.clone(),
+            permissions: PermissionPolicy {
+                read: PermissionMode::Allow,
+                ..Default::default()
+            },
+            ..AppConfig::default()
+        };
+        let mut agent = Agent::new(config, provider);
+        // Handler denies a *different* tool, so the read_file call must run
+        // to completion. This guards against the change short-circuiting
+        // unrelated tool calls.
+        let mut registry = HookRegistry::new();
+        registry.register(Box::new(DenyToolByName {
+            tool_name: "shell",
+            reason: "shell blocked",
+        }));
+        agent.set_hooks(Some(Arc::new(registry)));
 
-    let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
-    let mut read_result = None;
-    while let Some(event) = rx.recv().await {
-        if let AgentEvent::ToolCallCompleted { result, .. } = event
-            && result.call_id == "read_1"
-        {
-            read_result = Some(result);
+        let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
+        let mut read_result = None;
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::ToolCallCompleted { result, .. } = event
+                && result.call_id == "read_1"
+            {
+                read_result = Some(result);
+            }
         }
-    }
 
-    let read_result = read_result.expect("ToolCallCompleted with read_1 must arrive");
-    assert_eq!(
-        read_result.status,
-        ToolStatus::Success,
-        "deny aimed at another tool must not block read_file: {:?}",
-        read_result.content,
-    );
+        let read_result = read_result.expect("ToolCallCompleted with read_1 must arrive");
+        assert_eq!(
+            read_result.status,
+            ToolStatus::Success,
+            "deny aimed at another tool must not block read_file: {:?}",
+            read_result.content,
+        );
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 /// Counts every `HookEvent` variant the registry observed. Used by
@@ -7362,80 +7368,82 @@ async fn session_lifecycle_hooks_fire_around_clean_turn() {
 /// untouched. The provider drives one happy-path read and a
 /// guaranteed failure (path that does not exist) so the same
 /// registry observes both shapes inside a single turn.
-#[tokio::test]
-async fn post_tool_and_failure_hooks_split_success_and_failure_paths() {
-    use squeezy_hooks::{HookEvent, HookRegistry};
+#[test]
+fn post_tool_and_failure_hooks_split_success_and_failure_paths() {
+    run_high_stack_async_test(async {
+        use squeezy_hooks::{HookEvent, HookRegistry};
 
-    let root = temp_workspace("post_tool_and_failure_hooks");
-    fs::write(root.join("README.md"), "hi\n").expect("write readme");
-    let provider = Arc::new(MockProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "ok_1".to_string(),
-                name: "read_file".to_string(),
-                arguments: json!({ "path": "README.md" }),
-            })),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "fail_1".to_string(),
-                name: "read_file".to_string(),
-                arguments: json!({ "path": "does-not-exist.txt" }),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_1".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("done".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let config = AppConfig {
-        workspace_root: root.clone(),
-        permissions: PermissionPolicy {
-            read: PermissionMode::Allow,
-            ..Default::default()
-        },
-        ..AppConfig::default()
-    };
-    let mut agent = Agent::new(config, provider);
-    let counter = EventCounter::new();
-    let mut registry = HookRegistry::new();
-    registry.register(Box::new(EventCounterRef(counter.clone())));
-    agent.set_hooks(Some(Arc::new(registry)));
+        let root = temp_workspace("post_tool_and_failure_hooks");
+        fs::write(root.join("README.md"), "hi\n").expect("write readme");
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "ok_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "README.md" }),
+                })),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "fail_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "does-not-exist.txt" }),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_1".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let config = AppConfig {
+            workspace_root: root.clone(),
+            permissions: PermissionPolicy {
+                read: PermissionMode::Allow,
+                ..Default::default()
+            },
+            ..AppConfig::default()
+        };
+        let mut agent = Agent::new(config, provider);
+        let counter = EventCounter::new();
+        let mut registry = HookRegistry::new();
+        registry.register(Box::new(EventCounterRef(counter.clone())));
+        agent.set_hooks(Some(Arc::new(registry)));
 
-    let mut rx = agent.start_turn(
-        "read README and a missing file".to_string(),
-        CancellationToken::new(),
-    );
-    while let Some(_event) = rx.recv().await {}
+        let mut rx = agent.start_turn(
+            "read README and a missing file".to_string(),
+            CancellationToken::new(),
+        );
+        while let Some(_event) = rx.recv().await {}
 
-    assert_eq!(
-        counter.count(HookEvent::PostToolUse),
-        2,
-        "PostToolUse must fire for every tool call regardless of status",
-    );
-    assert_eq!(
-        counter.count(HookEvent::PostTool),
-        2,
-        "PostTool must fire once per FunctionCallOutput appended to the conversation",
-    );
-    assert_eq!(
-        counter.count(HookEvent::PostToolUseFailure),
-        1,
-        "PostToolUseFailure must fire exactly once, for the failed tool call",
-    );
+        assert_eq!(
+            counter.count(HookEvent::PostToolUse),
+            2,
+            "PostToolUse must fire for every tool call regardless of status",
+        );
+        assert_eq!(
+            counter.count(HookEvent::PostTool),
+            2,
+            "PostTool must fire once per FunctionCallOutput appended to the conversation",
+        );
+        assert_eq!(
+            counter.count(HookEvent::PostToolUseFailure),
+            1,
+            "PostToolUseFailure must fire exactly once, for the failed tool call",
+        );
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 /// `PermissionRequest` must fire on every permission evaluation, and

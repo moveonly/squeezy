@@ -2000,11 +2000,15 @@ impl Agent {
                 .expect("validated redaction config must compile"),
         );
         // Open only the small session-side state store synchronously. The
-        // graph cache lives in `graph.redb` and is opened by the registry's
-        // deferred graph task so a large semantic cache cannot block prompt
-        // entry during session startup.
-        let store = match SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref()) {
-            Ok(s) => Some(Arc::new(s)),
+        // graph cache is opened by the registry's deferred graph task through
+        // the same `WorkspaceStores` owner so a large semantic cache cannot
+        // block prompt entry or contend with an independent redb open.
+        let workspace_stores = Arc::new(squeezy_store::WorkspaceStores::new(
+            config.workspace_root.clone(),
+            config.cache.root.clone(),
+        ));
+        let store = match workspace_stores.state() {
+            Ok(s) => Some(s),
             Err(ref e) => {
                 // On Windows, redb uses exclusive file locks; a second
                 // Squeezy process (or a leftover handle) can prevent the
@@ -2015,10 +2019,7 @@ impl Agent {
                 tracing::warn!(
                     target: "squeezy::store",
                     error = %e,
-                    path = %squeezy_store::state_path(
-                        std::path::Path::new(&config.workspace_root),
-                        config.cache.root.as_deref(),
-                    ).display(),
+                    path = %workspace_stores.state_path().display(),
                     "state.redb could not be opened; tool receipt persistence and \
                      read-snapshot cache are unavailable for this session \
                      (another Squeezy instance may hold the lock)",
@@ -2061,6 +2062,7 @@ impl Agent {
             redactor.clone(),
             config.cache.root.clone(),
         )
+        .with_workspace_stores(Arc::clone(&workspace_stores))
         .with_telemetry(telemetry.clone());
         let tools = ToolRegistry::new_with_configs_skills_and_mcp(
             config.workspace_root.clone(),

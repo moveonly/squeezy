@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Serialises tests that mutate `XDG_CACHE_HOME` to avoid data races in
 /// parallel test threads (Rust 2024: `env::set_var` is `unsafe`).
@@ -23,13 +23,14 @@ fn with_xdg_cache_home<R>(xdg: &Path, body: impl FnOnce() -> R) -> R {
 
 use redb::{Database, TableDefinition};
 use serde_json::json;
-use squeezy_core::AppConfig;
 use squeezy_core::FileId;
+use squeezy_core::{AppConfig, LanguageKind};
 
 use crate::{
-    CompactionCheckpoint, GRAPH_FILE_NAME, GraphStore, GraphStoreMetadata, GraphWriteBatch,
-    STATE_FILE_NAME, SqueezyStore, cache_dir_path, fs_util, graph_path, sessions::ResumeItem,
-    state_path,
+    CompactionCheckpoint, GRAPH_FILE_NAME, GRAPH_PARTITIONS, GRAPH_SCHEMA_VERSION, GraphStore,
+    GraphStoreMetadata, GraphWriteBatch, META, STATE_FILE_NAME, SqueezyStore, WorkspaceStores,
+    cache_dir_path, encode_graph, fs_util, graph_manifest_path, graph_path, graph_v3_dir_path,
+    insert_json, sessions::ResumeItem, state_path,
 };
 
 fn temp_root(label: &str) -> PathBuf {
@@ -371,6 +372,10 @@ fn state_open_creates_state_only_store() {
         !graph_path(&root, None).exists(),
         "{GRAPH_FILE_NAME} should remain unopened until graph persistence is needed"
     );
+    assert!(
+        !graph_v3_dir_path(&root, None).exists(),
+        "graph v3 cache should remain unopened until graph persistence is needed"
+    );
 
     let metadata = GraphStoreMetadata {
         workspace_root: root.display().to_string(),
@@ -391,7 +396,113 @@ fn state_open_creates_state_only_store() {
 fn graph_open_creates_split_graph_store() {
     let (root, _store) = open_graph_store("graph-only");
     assert!(
-        graph_path(&root, None).exists(),
-        "{GRAPH_FILE_NAME} should be created by GraphStore::open"
+        graph_manifest_path(&root, None).exists(),
+        "graph v3 manifest should be created by GraphStore::open"
     );
+    assert!(
+        !graph_path(&root, None).exists(),
+        "{GRAPH_FILE_NAME} should remain a legacy fallback"
+    );
+}
+
+#[test]
+fn workspace_stores_reuses_state_and_graph_handles() {
+    let root = temp_root("workspace-stores");
+    let stores = WorkspaceStores::new(root.clone(), None);
+
+    let first_state = stores.state().expect("first state open");
+    let second_state = stores.state().expect("second state open");
+    assert!(Arc::ptr_eq(&first_state, &second_state));
+
+    let first_graph = stores.graph().expect("first graph open");
+    let second_graph = stores.graph().expect("second graph open");
+    assert!(Arc::ptr_eq(&first_graph, &second_graph));
+    assert!(graph_manifest_path(&root, None).exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn graph_write_batch_uses_language_bucket_shards() {
+    let (root, store) = open_graph_store("graph-shards");
+    let file_id = FileId::new("src/lib.rs");
+    let mut batch = GraphWriteBatch::new();
+    batch
+        .upsert_partition_for_language(
+            &file_id,
+            LanguageKind::Rust,
+            &json!({ "symbols": ["rust"] }),
+        )
+        .expect("encode rust partition");
+    store.apply_graph_batch(&batch).expect("apply shard batch");
+
+    let shard_dir = graph_v3_dir_path(&root, None).join("shards").join("rust");
+    let shard_files = std::fs::read_dir(&shard_dir)
+        .expect("read rust shard dir")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "redb"))
+        .count();
+    assert_eq!(shard_files, 1, "expected one rust shard file");
+    let stored: serde_json::Value = store
+        .graph_partition(&file_id)
+        .expect("read graph partition")
+        .expect("partition exists");
+    assert_eq!(stored["symbols"][0], "rust");
+
+    let mut resolver_batch = GraphWriteBatch::new();
+    resolver_batch
+        .upsert_resolver_entry_for_language(
+            &file_id,
+            LanguageKind::Rust,
+            &json!({"exports": ["Rust"]}),
+        )
+        .expect("encode resolver entry");
+    store
+        .apply_graph_batch(&resolver_batch)
+        .expect("write resolver entry");
+    let mut remove_resolver = GraphWriteBatch::new();
+    remove_resolver.remove_resolver_entry(&file_id);
+    store
+        .apply_graph_batch(&remove_resolver)
+        .expect("remove resolver entry");
+    assert!(
+        store
+            .graph_partition::<serde_json::Value>(&file_id)
+            .expect("read partition after resolver removal")
+            .is_some(),
+        "resolver-only removal must not orphan the graph partition"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn graph_store_reads_legacy_graph_redb_as_best_effort_fallback() {
+    let root = temp_root("legacy-graph-fallback");
+    let file_id = FileId::new("src/legacy.rs");
+    let legacy_path = graph_path(&root, None);
+    std::fs::create_dir_all(legacy_path.parent().unwrap()).expect("create cache dir");
+    let database = Database::create(&legacy_path).expect("create legacy graph");
+    let write = database.begin_write().expect("legacy write");
+    {
+        let mut meta = write.open_table(META).expect("meta");
+        insert_json(&mut meta, "schema_version", &GRAPH_SCHEMA_VERSION).expect("schema");
+        let mut partitions = write.open_table(GRAPH_PARTITIONS).expect("partitions");
+        let encoded = encode_graph(&json!({ "symbols": ["legacy"] })).expect("encode");
+        partitions
+            .insert(file_id.0.as_str(), encoded.as_slice())
+            .expect("insert legacy partition");
+    }
+    write.commit().expect("commit legacy");
+    drop(database);
+
+    let store = GraphStore::open(&root, None).expect("open v3 graph");
+    let stored: serde_json::Value = store
+        .graph_partition(&file_id)
+        .expect("read legacy partition")
+        .expect("legacy partition exists");
+    assert_eq!(stored["symbols"][0], "legacy");
+    assert!(graph_manifest_path(&root, None).exists());
+
+    let _ = std::fs::remove_dir_all(&root);
 }

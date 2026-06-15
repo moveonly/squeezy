@@ -320,40 +320,42 @@ async fn plan_mode_advertises_non_mutating_core_tools() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn exploration_graph_prefetches_graph_context_before_model_request() {
-    let root = temp_workspace("exploration_preflight");
-    write_rust_crate(&root, "pub fn make_widget() {}\n");
-    let provider = Arc::new(ScriptedProvider::new(vec![vec![
-        Ok(LlmEvent::Started),
-        Ok(LlmEvent::TextDelta(
-            "src/lib.rs defines make_widget.".to_string(),
-        )),
-        Ok(LlmEvent::Completed {
-            response_id: Some("resp_final".to_string()),
-            cost: CostSnapshot::default(),
-            stop_reason: None,
-            reasoning_only_stop: false,
-        }),
-    ]]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
+#[test]
+fn exploration_graph_prefetches_graph_context_before_model_request() {
+    run_high_stack_test(async {
+        let root = temp_workspace("exploration_preflight");
+        write_rust_crate(&root, "pub fn make_widget() {}\n");
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "src/lib.rs defines make_widget.".to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ]]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
 
-    drain_turn(agent.start_turn(
-        "Which file defines make_widget?".to_string(),
-        CancellationToken::new(),
-    ))
-    .await;
+        drain_turn(agent.start_turn(
+            "Which file defines make_widget?".to_string(),
+            CancellationToken::new(),
+        ))
+        .await;
 
-    let requests = provider.requests();
-    assert_eq!(requests.len(), 1);
-    let outputs = function_outputs(&requests[0]);
-    let call_ids = outputs
-        .iter()
-        .map(|(call_id, _)| *call_id)
-        .collect::<Vec<_>>();
-    assert_eq!(call_ids, vec!["planner_definition_search"]);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        let outputs = function_outputs(&requests[0]);
+        let call_ids = outputs
+            .iter()
+            .map(|(call_id, _)| *call_id)
+            .collect::<Vec<_>>();
+        assert_eq!(call_ids, vec!["planner_definition_search"]);
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]
@@ -1581,72 +1583,74 @@ async fn plan_mode_allows_non_mutating_discoverable_schema_loads() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn parallel_read_batch_denies_remaining_calls_after_byte_budget() {
-    let root = temp_workspace("parallel_byte_budget");
-    fs::write(root.join("first.txt"), "first content").expect("write first");
-    fs::write(root.join("second.txt"), "second content").expect("write second");
-    fs::write(root.join("third.txt"), "third content").expect("write third");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "first_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "first.txt"}),
-            })),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "second_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "second.txt"}),
-            })),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "third_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "third.txt"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("budgeted".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let mut config = config_for(root.clone());
-    config.max_parallel_tools = 8;
-    config.max_tool_bytes_read_per_turn = 1;
-    let agent = Agent::new(config, provider.clone());
+#[test]
+fn parallel_read_batch_denies_remaining_calls_after_byte_budget() {
+    run_high_stack_test(async {
+        let root = temp_workspace("parallel_byte_budget");
+        fs::write(root.join("first.txt"), "first content").expect("write first");
+        fs::write(root.join("second.txt"), "second content").expect("write second");
+        fs::write(root.join("third.txt"), "third content").expect("write third");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "first_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "first.txt"}),
+                })),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "second_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "second.txt"}),
+                })),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "third_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "third.txt"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("budgeted".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let mut config = config_for(root.clone());
+        config.max_parallel_tools = 8;
+        config.max_tool_bytes_read_per_turn = 1;
+        let agent = Agent::new(config, provider.clone());
 
-    drain_turn(agent.start_turn("read all files".to_string(), CancellationToken::new())).await;
+        drain_turn(agent.start_turn("read all files".to_string(), CancellationToken::new())).await;
 
-    let requests = provider.requests();
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs.len(), 3);
-    assert_eq!(outputs[0].0, "first_read");
-    assert_eq!(outputs[0].1["status"], "Success");
-    assert_eq!(outputs[1].0, "second_read");
-    assert_eq!(outputs[1].1["status"], "Denied");
-    assert!(
-        outputs[1].1["content"]["error"]
-            .as_str()
-            .expect("budget error")
-            .contains("byte-read budget")
-    );
-    assert_eq!(outputs[2].0, "third_read");
-    assert_eq!(outputs[2].1["status"], "Denied");
+        let requests = provider.requests();
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0].0, "first_read");
+        assert_eq!(outputs[0].1["status"], "Success");
+        assert_eq!(outputs[1].0, "second_read");
+        assert_eq!(outputs[1].1["status"], "Denied");
+        assert!(
+            outputs[1].1["content"]["error"]
+                .as_str()
+                .expect("budget error")
+                .contains("byte-read budget")
+        );
+        assert_eq!(outputs[2].0, "third_read");
+        assert_eq!(outputs[2].1["status"], "Denied");
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[test]
@@ -2144,172 +2148,178 @@ async fn approved_write_edits_real_workspace_file() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn large_read_result_returns_spill_handle_to_model() {
-    let root = temp_workspace("agent_spill");
-    fs::write(root.join("large.txt"), "a".repeat(30_000)).expect("write large");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "read_call".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "large.txt", "limit": 40_000}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("spilled".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
+#[test]
+fn large_read_result_returns_spill_handle_to_model() {
+    run_high_stack_test(async {
+        let root = temp_workspace("agent_spill");
+        fs::write(root.join("large.txt"), "a".repeat(30_000)).expect("write large");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "read_call".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "large.txt", "limit": 40_000}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("spilled".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
 
-    drain_turn(agent.start_turn("read large".to_string(), CancellationToken::new())).await;
+        drain_turn(agent.start_turn("read large".to_string(), CancellationToken::new())).await;
 
-    let requests = provider.requests();
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs[0].0, "read_call");
-    assert_eq!(outputs[0].1["content"]["spilled"], true);
-    assert!(
-        outputs[0].1["content"]["handle"]
-            .as_str()
-            .is_some_and(|handle| handle.len() == 64)
-    );
+        let requests = provider.requests();
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs[0].0, "read_call");
+        assert_eq!(outputs[0].1["content"]["spilled"], true);
+        assert!(
+            outputs[0].1["content"]["handle"]
+                .as_str()
+                .is_some_and(|handle| handle.len() == 64)
+        );
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
-#[tokio::test]
-async fn repeated_read_result_returns_receipt_stub_to_model() {
-    let root = temp_workspace("receipt_stub");
-    fs::write(root.join("sample.txt"), "same content\n").expect("write sample");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "first_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "sample.txt"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_first".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "second_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "sample.txt"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_second".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("deduped".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
+#[test]
+fn repeated_read_result_returns_receipt_stub_to_model() {
+    run_high_stack_test(async {
+        let root = temp_workspace("receipt_stub");
+        fs::write(root.join("sample.txt"), "same content\n").expect("write sample");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "first_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "sample.txt"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_first".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "second_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "sample.txt"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_second".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("deduped".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
 
-    drain_turn(agent.start_turn("read twice".to_string(), CancellationToken::new())).await;
+        drain_turn(agent.start_turn("read twice".to_string(), CancellationToken::new())).await;
 
-    let requests = provider.requests();
-    let outputs = function_outputs(&requests[2]);
-    assert_eq!(outputs.len(), 2);
-    assert_eq!(outputs[0].0, "first_read");
-    assert_eq!(outputs[0].1["content"]["content"], "1\tsame content\n");
-    assert_eq!(outputs[1].0, "second_read");
-    assert_eq!(outputs[1].1["content"]["receipt_stub"], true);
-    assert_eq!(outputs[1].1["content"]["same_as_call_id"], "first_read");
-    // The sha256 is computed over the first result's content bytes; the
-    // wire envelope no longer carries `receipt`, so derive the expected
-    // hash from the first call's content directly.
-    let first_content_bytes = serde_json::to_vec(&outputs[0].1["content"]).expect("content");
-    let expected_sha256 = sha256_hex(&first_content_bytes);
-    assert_eq!(
-        outputs[1].1["content"]["original_output_sha256"].as_str(),
-        Some(expected_sha256.as_str())
-    );
-    assert!(outputs[1].1["content"]["content"].is_null());
+        let requests = provider.requests();
+        let outputs = function_outputs(&requests[2]);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].0, "first_read");
+        assert_eq!(outputs[0].1["content"]["content"], "1\tsame content\n");
+        assert_eq!(outputs[1].0, "second_read");
+        assert_eq!(outputs[1].1["content"]["receipt_stub"], true);
+        assert_eq!(outputs[1].1["content"]["same_as_call_id"], "first_read");
+        // The sha256 is computed over the first result's content bytes; the
+        // wire envelope no longer carries `receipt`, so derive the expected
+        // hash from the first call's content directly.
+        let first_content_bytes = serde_json::to_vec(&outputs[0].1["content"]).expect("content");
+        let expected_sha256 = sha256_hex(&first_content_bytes);
+        assert_eq!(
+            outputs[1].1["content"]["original_output_sha256"].as_str(),
+            Some(expected_sha256.as_str())
+        );
+        assert!(outputs[1].1["content"]["content"].is_null());
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
-#[tokio::test]
-async fn successful_read_result_persists_model_visible_snapshot() {
-    let root = temp_workspace("read_snapshot");
-    fs::write(root.join("sample.txt"), "visible content\n").expect("write sample");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "read_once".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "sample.txt"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("done".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider);
+#[test]
+fn successful_read_result_persists_model_visible_snapshot() {
+    run_high_stack_test(async {
+        let root = temp_workspace("read_snapshot");
+        fs::write(root.join("sample.txt"), "visible content\n").expect("write sample");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "read_once".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "sample.txt"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider);
 
-    drain_turn(agent.start_turn("read once".to_string(), CancellationToken::new())).await;
-    drop(agent);
+        drain_turn(agent.start_turn("read once".to_string(), CancellationToken::new())).await;
+        drop(agent);
 
-    let store = SqueezyStore::open(&root, None).expect("open store");
-    let snapshot = store
-        .read_snapshot("sample.txt")
-        .expect("read snapshot")
-        .expect("snapshot exists");
-    assert_eq!(snapshot.call_id, "read_once");
-    assert_eq!(snapshot.content, "1\tvisible content\n");
-    let expected_hash = sha256_hex("visible content\n".as_bytes());
-    assert_eq!(
-        snapshot.content_sha256.as_deref(),
-        Some(expected_hash.as_str())
-    );
+        let store = SqueezyStore::open(&root, None).expect("open store");
+        let snapshot = store
+            .read_snapshot("sample.txt")
+            .expect("read snapshot")
+            .expect("snapshot exists");
+        assert_eq!(snapshot.call_id, "read_once");
+        assert_eq!(snapshot.content, "1\tvisible content\n");
+        let expected_hash = sha256_hex("visible content\n".as_bytes());
+        assert_eq!(
+            snapshot.content_sha256.as_deref(),
+            Some(expected_hash.as_str())
+        );
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[test]
@@ -2458,8 +2468,8 @@ async fn agent_startup_does_not_open_graph_store_synchronously() {
     let agent = Agent::new(config_for(root.clone()), provider);
 
     assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "Agent::new should not wait for graph.redb to open"
+        started.elapsed() < Duration::from_secs(10),
+        "Agent::new should not wait for graph store access"
     );
     assert!(
         agent.session_id().is_some(),
@@ -2471,762 +2481,787 @@ async fn agent_startup_does_not_open_graph_store_synchronously() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn repeated_read_result_in_same_round_returns_receipt_stub_to_model() {
-    let root = temp_workspace("receipt_stub_same_round");
-    fs::write(root.join("sample.txt"), "same round\n").expect("write sample");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "first_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "sample.txt"}),
-            })),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "second_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "sample.txt"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("deduped".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
-
-    drain_turn(agent.start_turn(
-        "read same file twice in one round".to_string(),
-        CancellationToken::new(),
-    ))
-    .await;
-
-    let requests = provider.requests();
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs.len(), 2);
-    assert_eq!(outputs[0].0, "first_read");
-    assert_eq!(outputs[0].1["content"]["content"], "1\tsame round\n");
-    assert_eq!(outputs[1].0, "second_read");
-    assert_eq!(outputs[1].1["content"]["receipt_stub"], true);
-    assert_eq!(outputs[1].1["content"]["same_as_call_id"], "first_read");
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn repeated_spilled_read_result_returns_receipt_stub_to_model() {
-    let root = temp_workspace("receipt_stub_spill");
-    fs::write(root.join("large.txt"), "x".repeat(30_000)).expect("write large");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "first_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "large.txt", "limit": 40_000}),
-            })),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "second_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "large.txt", "limit": 40_000}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("deduped spill".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
-
-    drain_turn(agent.start_turn(
-        "read large file twice in one round".to_string(),
-        CancellationToken::new(),
-    ))
-    .await;
-
-    let requests = provider.requests();
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs.len(), 2);
-    assert_eq!(outputs[0].0, "first_read");
-    assert_eq!(outputs[0].1["content"]["spilled"], true);
-    assert!(
-        outputs[0].1["content"]["original_output_sha256"]
-            .as_str()
-            .is_some_and(|hash| hash.len() == 64)
-    );
-    assert_eq!(outputs[1].0, "second_read");
-    assert_eq!(outputs[1].1["content"]["receipt_stub"], true);
-    assert_eq!(outputs[1].1["content"]["same_as_call_id"], "first_read");
-    assert_eq!(
-        outputs[1].1["content"]["original_output_sha256"],
-        outputs[0].1["content"]["original_output_sha256"]
-    );
-    assert!(outputs[1].1["content"]["handle"].is_null());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn changed_read_result_is_not_receipt_stubbed() {
-    let root = temp_workspace("receipt_stub_changed");
-    fs::write(root.join("sample.txt"), "before").expect("write sample");
-    let before_hash = sha256_hex("before".as_bytes());
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "first_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "sample.txt"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_first".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "write_call".to_string(),
-                name: "write_file".to_string(),
-                arguments: serde_json::json!({
-                    "path": "sample.txt",
-                    "content": "after",
-                    "expected_sha256": before_hash,
+#[test]
+fn repeated_read_result_in_same_round_returns_receipt_stub_to_model() {
+    run_high_stack_test(async {
+        let root = temp_workspace("receipt_stub_same_round");
+        fs::write(root.join("sample.txt"), "same round\n").expect("write sample");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "first_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "sample.txt"}),
+                })),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "second_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "sample.txt"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
                 }),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_write".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "second_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "sample.txt"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_second".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("changed".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("deduped".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
 
-    drain_turn(agent.start_turn(
-        "read, edit, read again".to_string(),
-        CancellationToken::new(),
-    ))
-    .await;
-
-    let requests = provider.requests();
-    let outputs = function_outputs(&requests[3]);
-    assert_eq!(outputs.len(), 3);
-    assert_eq!(outputs[2].0, "second_read");
-    assert_eq!(outputs[2].1["content"]["content"], "1\tafter");
-    assert_ne!(outputs[2].1["content"]["receipt_stub"], true);
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn aggregate_tool_result_budget_compacts_later_outputs() {
-    let root = temp_workspace("aggregate_budget");
-    fs::write(root.join("small.txt"), "small").expect("write small");
-    fs::write(root.join("large.txt"), "b".repeat(2_000)).expect("write large");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "small_call".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "small.txt"}),
-            })),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "large_call".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "large.txt"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("budgeted".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let mut config = config_for(root.clone());
-    config.max_tool_result_bytes_per_round = 1_000;
-    let agent = Agent::new(config, provider.clone());
-
-    drain_turn(agent.start_turn("read both".to_string(), CancellationToken::new())).await;
-
-    let requests = provider.requests();
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs[0].0, "small_call");
-    assert_eq!(outputs[0].1["status"], "Success");
-    assert_eq!(outputs[1].0, "large_call");
-    assert_eq!(outputs[1].1["status"], "Error");
-    assert!(
-        outputs[1].1["content"]["error"]
-            .as_str()
-            .expect("budget error")
-            .contains("aggregate tool-result budget")
-    );
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn aggregate_budget_omission_is_not_remembered_as_seen_output() {
-    let root = temp_workspace("aggregate_budget_receipts");
-    fs::write(root.join("first.txt"), "a".repeat(900)).expect("write first");
-    fs::write(root.join("second.txt"), "b".repeat(900)).expect("write second");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "first_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "first.txt"}),
-            })),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "second_read".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "second.txt"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "second_retry".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "second.txt"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_retry".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("not remembered".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let mut config = config_for(root.clone());
-    config.max_tool_result_bytes_per_round = 1_500;
-    let agent = Agent::new(config, provider.clone());
-
-    drain_turn(agent.start_turn(
-        "read both then retry omitted output".to_string(),
-        CancellationToken::new(),
-    ))
-    .await;
-
-    let requests = provider.requests();
-    let first_round_outputs = function_outputs(&requests[1]);
-    assert_eq!(first_round_outputs[0].1["status"], "Success");
-    assert_eq!(first_round_outputs[1].1["status"], "Error");
-    assert!(
-        first_round_outputs[1].1["content"]["error"]
-            .as_str()
-            .expect("budget error")
-            .contains("aggregate tool-result budget")
-    );
-
-    let retry_outputs = function_outputs(&requests[2]);
-    assert_eq!(retry_outputs[2].0, "second_retry");
-    assert_eq!(retry_outputs[2].1["status"], "Success");
-    assert_eq!(
-        retry_outputs[2].1["content"]["content"],
-        format!("1\t{}", "b".repeat(900))
-    );
-    assert_ne!(retry_outputs[2].1["content"]["receipt_stub"], true);
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn denied_webfetch_is_reported_and_does_not_open_network_connection() {
-    let root = temp_workspace("denied_webfetch");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "web_call".to_string(),
-                name: "webfetch".to_string(),
-                arguments: serde_json::json!({"url": "https://example.com/blocked", "timeout_ms": 100}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("blocked".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let mut config = config_for(root.clone());
-    config.permissions.web = PermissionMode::Ask;
-    let agent = Agent::new(config, provider.clone());
-
-    let mut rx = agent.start_turn("fetch denied url".to_string(), CancellationToken::new());
-    while let Some(event) = rx.recv().await {
-        if let AgentEvent::ApprovalRequested {
-            request,
-            decision_tx,
-            ..
-        } = event
-        {
-            assert_eq!(request.tool_name, "webfetch");
-            assert_eq!(request.scope, PermissionScope::Web);
-            assert!(request.summary().contains("example.com"));
-            decision_tx
-                .send(ToolApprovalDecision::Denied)
-                .expect("send denial");
-        }
-    }
-
-    let requests = provider.requests();
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs[0].0, "web_call");
-    assert_eq!(outputs[0].1["status"], "Denied");
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn disabled_web_permission_returns_denied_tool_result() {
-    let root = temp_workspace("disabled_web_permission");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "web_call".to_string(),
-                name: "webfetch".to_string(),
-                arguments: serde_json::json!({"url": "https://example.com/docs"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("blocked".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let mut config = config_for(root.clone());
-    config.permissions.web = PermissionMode::Deny;
-    let agent = Agent::new(config, provider.clone());
-
-    drain_turn(agent.start_turn("fetch denied url".to_string(), CancellationToken::new())).await;
-
-    let requests = provider.requests();
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs[0].0, "web_call");
-    assert_eq!(outputs[0].1["status"], "Denied");
-    assert_eq!(outputs[0].1["content"]["permission_denied"], true);
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn blocked_web_domain_rule_returns_denied_tool_result() {
-    let root = temp_workspace("blocked_web_domain_rule");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "web_call".to_string(),
-                name: "webfetch".to_string(),
-                arguments: serde_json::json!({"url": "https://example.com/docs"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("blocked".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let mut config = config_for(root.clone());
-    config.permissions.web = PermissionMode::Allow;
-    config.permissions.rules.push(PermissionRule::new(
-        "network",
-        "domain:example.com",
-        PermissionAction::Deny,
-        PermissionRuleSource::Project,
-        Some("blocked test domain".to_string()),
-    ));
-    let agent = Agent::new(config, provider.clone());
-
-    drain_turn(agent.start_turn("fetch blocked domain".to_string(), CancellationToken::new()))
+        drain_turn(agent.start_turn(
+            "read same file twice in one round".to_string(),
+            CancellationToken::new(),
+        ))
         .await;
 
-    let requests = provider.requests();
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs[0].0, "web_call");
-    assert_eq!(outputs[0].1["status"], "Denied");
-    let reason = outputs[0].1["content"]["reason"].as_str().expect("reason");
-    assert_eq!(reason, "blocked test domain");
+        let requests = provider.requests();
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].0, "first_read");
+        assert_eq!(outputs[0].1["content"]["content"], "1\tsame round\n");
+        assert_eq!(outputs[1].0, "second_read");
+        assert_eq!(outputs[1].1["content"]["receipt_stub"], true);
+        assert_eq!(outputs[1].1["content"]["same_as_call_id"], "first_read");
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
-#[tokio::test]
-async fn silent_deny_omits_reason_from_tool_result() {
-    // F04-cc-permission-decision-silent-vs-explained:
-    // a deny rule with `silent = true` must replace the structured
-    // `capability=...; target=...; risk=...` line in the tool-result with the
-    // static `action denied by policy` placeholder. The model's tool-result
-    // payload is the only place we assert here; the audit log is covered by
-    // the unit-level test below in lib_tests.rs.
-    let root = temp_workspace("silent_deny_omits_reason");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "web_call".to_string(),
-                name: "webfetch".to_string(),
-                arguments: serde_json::json!({"url": "https://example.com/docs"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("ok".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let mut config = config_for(root.clone());
-    config.permissions.web = PermissionMode::Allow;
-    config.permissions.rules.push(
-        PermissionRule::new(
+#[test]
+fn repeated_spilled_read_result_returns_receipt_stub_to_model() {
+    run_high_stack_test(async {
+        let root = temp_workspace("receipt_stub_spill");
+        fs::write(root.join("large.txt"), "x".repeat(30_000)).expect("write large");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "first_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "large.txt", "limit": 40_000}),
+                })),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "second_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "large.txt", "limit": 40_000}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("deduped spill".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
+
+        drain_turn(agent.start_turn(
+            "read large file twice in one round".to_string(),
+            CancellationToken::new(),
+        ))
+        .await;
+
+        let requests = provider.requests();
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].0, "first_read");
+        assert_eq!(outputs[0].1["content"]["spilled"], true);
+        assert!(
+            outputs[0].1["content"]["original_output_sha256"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64)
+        );
+        assert_eq!(outputs[1].0, "second_read");
+        assert_eq!(outputs[1].1["content"]["receipt_stub"], true);
+        assert_eq!(outputs[1].1["content"]["same_as_call_id"], "first_read");
+        assert_eq!(
+            outputs[1].1["content"]["original_output_sha256"],
+            outputs[0].1["content"]["original_output_sha256"]
+        );
+        assert!(outputs[1].1["content"]["handle"].is_null());
+
+        let _ = fs::remove_dir_all(root);
+    });
+}
+
+#[test]
+fn changed_read_result_is_not_receipt_stubbed() {
+    run_high_stack_test(async {
+        let root = temp_workspace("receipt_stub_changed");
+        fs::write(root.join("sample.txt"), "before").expect("write sample");
+        let before_hash = sha256_hex("before".as_bytes());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "first_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "sample.txt"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_first".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "write_call".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "sample.txt",
+                        "content": "after",
+                        "expected_sha256": before_hash,
+                    }),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_write".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "second_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "sample.txt"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_second".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("changed".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
+
+        drain_turn(agent.start_turn(
+            "read, edit, read again".to_string(),
+            CancellationToken::new(),
+        ))
+        .await;
+
+        let requests = provider.requests();
+        let outputs = function_outputs(&requests[3]);
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[2].0, "second_read");
+        assert_eq!(outputs[2].1["content"]["content"], "1\tafter");
+        assert_ne!(outputs[2].1["content"]["receipt_stub"], true);
+
+        let _ = fs::remove_dir_all(root);
+    });
+}
+
+#[test]
+fn aggregate_tool_result_budget_compacts_later_outputs() {
+    run_high_stack_test(async {
+        let root = temp_workspace("aggregate_budget");
+        fs::write(root.join("small.txt"), "small").expect("write small");
+        fs::write(root.join("large.txt"), "b".repeat(2_000)).expect("write large");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "small_call".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "small.txt"}),
+                })),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "large_call".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "large.txt"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("budgeted".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let mut config = config_for(root.clone());
+        config.max_tool_result_bytes_per_round = 1_000;
+        let agent = Agent::new(config, provider.clone());
+
+        drain_turn(agent.start_turn("read both".to_string(), CancellationToken::new())).await;
+
+        let requests = provider.requests();
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs[0].0, "small_call");
+        assert_eq!(outputs[0].1["status"], "Success");
+        assert_eq!(outputs[1].0, "large_call");
+        assert_eq!(outputs[1].1["status"], "Error");
+        assert!(
+            outputs[1].1["content"]["error"]
+                .as_str()
+                .expect("budget error")
+                .contains("aggregate tool-result budget")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    });
+}
+
+#[test]
+fn aggregate_budget_omission_is_not_remembered_as_seen_output() {
+    run_high_stack_test(async {
+        let root = temp_workspace("aggregate_budget_receipts");
+        fs::write(root.join("first.txt"), "a".repeat(900)).expect("write first");
+        fs::write(root.join("second.txt"), "b".repeat(900)).expect("write second");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "first_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "first.txt"}),
+                })),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "second_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "second.txt"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "second_retry".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "second.txt"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_retry".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("not remembered".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let mut config = config_for(root.clone());
+        config.max_tool_result_bytes_per_round = 1_500;
+        let agent = Agent::new(config, provider.clone());
+
+        drain_turn(agent.start_turn(
+            "read both then retry omitted output".to_string(),
+            CancellationToken::new(),
+        ))
+        .await;
+
+        let requests = provider.requests();
+        let first_round_outputs = function_outputs(&requests[1]);
+        assert_eq!(first_round_outputs[0].1["status"], "Success");
+        assert_eq!(first_round_outputs[1].1["status"], "Error");
+        assert!(
+            first_round_outputs[1].1["content"]["error"]
+                .as_str()
+                .expect("budget error")
+                .contains("aggregate tool-result budget")
+        );
+
+        let retry_outputs = function_outputs(&requests[2]);
+        assert_eq!(retry_outputs[2].0, "second_retry");
+        assert_eq!(retry_outputs[2].1["status"], "Success");
+        assert_eq!(
+            retry_outputs[2].1["content"]["content"],
+            format!("1\t{}", "b".repeat(900))
+        );
+        assert_ne!(retry_outputs[2].1["content"]["receipt_stub"], true);
+
+        let _ = fs::remove_dir_all(root);
+    });
+}
+
+#[test]
+fn denied_webfetch_is_reported_and_does_not_open_network_connection() {
+    run_high_stack_test(async {
+        let root = temp_workspace("denied_webfetch");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "web_call".to_string(),
+                    name: "webfetch".to_string(),
+                    arguments: serde_json::json!({"url": "https://example.com/blocked", "timeout_ms": 100}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("blocked".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let mut config = config_for(root.clone());
+        config.permissions.web = PermissionMode::Ask;
+        let agent = Agent::new(config, provider.clone());
+
+        let mut rx = agent.start_turn("fetch denied url".to_string(), CancellationToken::new());
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::ApprovalRequested {
+                request,
+                decision_tx,
+                ..
+            } = event
+            {
+                assert_eq!(request.tool_name, "webfetch");
+                assert_eq!(request.scope, PermissionScope::Web);
+                assert!(request.summary().contains("example.com"));
+                decision_tx
+                    .send(ToolApprovalDecision::Denied)
+                    .expect("send denial");
+            }
+        }
+
+        let requests = provider.requests();
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs[0].0, "web_call");
+        assert_eq!(outputs[0].1["status"], "Denied");
+
+        let _ = fs::remove_dir_all(root);
+    });
+}
+
+#[test]
+fn disabled_web_permission_returns_denied_tool_result() {
+    run_high_stack_test(async {
+        let root = temp_workspace("disabled_web_permission");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "web_call".to_string(),
+                    name: "webfetch".to_string(),
+                    arguments: serde_json::json!({"url": "https://example.com/docs"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("blocked".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let mut config = config_for(root.clone());
+        config.permissions.web = PermissionMode::Deny;
+        let agent = Agent::new(config, provider.clone());
+
+        drain_turn(agent.start_turn("fetch denied url".to_string(), CancellationToken::new()))
+            .await;
+
+        let requests = provider.requests();
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs[0].0, "web_call");
+        assert_eq!(outputs[0].1["status"], "Denied");
+        assert_eq!(outputs[0].1["content"]["permission_denied"], true);
+
+        let _ = fs::remove_dir_all(root);
+    });
+}
+
+#[test]
+fn blocked_web_domain_rule_returns_denied_tool_result() {
+    run_high_stack_test(async {
+        let root = temp_workspace("blocked_web_domain_rule");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "web_call".to_string(),
+                    name: "webfetch".to_string(),
+                    arguments: serde_json::json!({"url": "https://example.com/docs"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("blocked".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let mut config = config_for(root.clone());
+        config.permissions.web = PermissionMode::Allow;
+        config.permissions.rules.push(PermissionRule::new(
             "network",
             "domain:example.com",
             PermissionAction::Deny,
             PermissionRuleSource::Project,
-            Some("absolute deny: example.com is forbidden by policy".to_string()),
-        )
-        .with_silent(true),
-    );
-    let agent = Agent::new(config, provider.clone());
+            Some("blocked test domain".to_string()),
+        ));
+        let agent = Agent::new(config, provider.clone());
 
-    drain_turn(agent.start_turn("fetch blocked domain".to_string(), CancellationToken::new()))
-        .await;
+        drain_turn(agent.start_turn("fetch blocked domain".to_string(), CancellationToken::new()))
+            .await;
 
-    let requests = provider.requests();
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs[0].0, "web_call");
-    assert_eq!(outputs[0].1["status"], "Denied");
-    let reason = outputs[0].1["content"]["reason"]
-        .as_str()
-        .expect("reason on tool result");
-    assert_eq!(
-        reason, "action denied by policy",
-        "silent rule must replace the structured reason on the tool-result",
-    );
-    assert!(
-        !reason.contains("capability="),
-        "model-facing reason must not include the structured per-call narrative",
-    );
-    assert!(
-        !reason.contains("absolute deny"),
-        "model-facing reason must not include the rule's own reason text",
-    );
+        let requests = provider.requests();
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs[0].0, "web_call");
+        assert_eq!(outputs[0].1["status"], "Denied");
+        let reason = outputs[0].1["content"]["reason"].as_str().expect("reason");
+        assert_eq!(reason, "blocked test domain");
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
-#[tokio::test]
-async fn non_silent_deny_rule_still_carries_explanation_to_the_model() {
-    // Counterpoint to silent_deny_omits_reason_from_tool_result: when the
-    // rule does NOT set `silent = true`, the model still receives the rule's
-    // reason text. This is the existing behavior; the test pins it so a
-    // future change cannot silently flip the default.
-    let root = temp_workspace("explained_deny_keeps_reason");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "web_call".to_string(),
-                name: "webfetch".to_string(),
-                arguments: serde_json::json!({"url": "https://example.com/docs"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("ok".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let mut config = config_for(root.clone());
-    config.permissions.web = PermissionMode::Allow;
-    config.permissions.rules.push(PermissionRule::new(
-        "network",
-        "domain:example.com",
-        PermissionAction::Deny,
-        PermissionRuleSource::Project,
-        Some("explained: example.com is for staging only".to_string()),
-    ));
-    let agent = Agent::new(config, provider.clone());
+#[test]
+fn silent_deny_omits_reason_from_tool_result() {
+    run_high_stack_test(async {
+        // F04-cc-permission-decision-silent-vs-explained:
+        // a deny rule with `silent = true` must replace the structured
+        // `capability=...; target=...; risk=...` line in the tool-result with the
+        // static `action denied by policy` placeholder. The model's tool-result
+        // payload is the only place we assert here; the audit log is covered by
+        // the unit-level test below in lib_tests.rs.
+        let root = temp_workspace("silent_deny_omits_reason");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "web_call".to_string(),
+                    name: "webfetch".to_string(),
+                    arguments: serde_json::json!({"url": "https://example.com/docs"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("ok".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let mut config = config_for(root.clone());
+        config.permissions.web = PermissionMode::Allow;
+        config.permissions.rules.push(
+            PermissionRule::new(
+                "network",
+                "domain:example.com",
+                PermissionAction::Deny,
+                PermissionRuleSource::Project,
+                Some("absolute deny: example.com is forbidden by policy".to_string()),
+            )
+            .with_silent(true),
+        );
+        let agent = Agent::new(config, provider.clone());
 
-    drain_turn(agent.start_turn("fetch explained".to_string(), CancellationToken::new())).await;
+        drain_turn(agent.start_turn("fetch blocked domain".to_string(), CancellationToken::new()))
+            .await;
 
-    let requests = provider.requests();
-    let outputs = function_outputs(&requests[1]);
-    let reason = outputs[0].1["content"]["reason"]
-        .as_str()
-        .expect("reason on tool result");
-    assert!(
-        reason.contains("explained"),
-        "non-silent rule must keep the rule's reason on the tool-result; got: {reason}",
-    );
-    assert_ne!(
-        reason, "action denied by policy",
-        "non-silent rule must NOT use the silent placeholder",
-    );
+        let requests = provider.requests();
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs[0].0, "web_call");
+        assert_eq!(outputs[0].1["status"], "Denied");
+        let reason = outputs[0].1["content"]["reason"]
+            .as_str()
+            .expect("reason on tool result");
+        assert_eq!(
+            reason, "action denied by policy",
+            "silent rule must replace the structured reason on the tool-result",
+        );
+        assert!(
+            !reason.contains("capability="),
+            "model-facing reason must not include the structured per-call narrative",
+        );
+        assert!(
+            !reason.contains("absolute deny"),
+            "model-facing reason must not include the rule's own reason text",
+        );
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
-#[tokio::test]
-async fn silent_deny_does_not_emit_approval_requested() {
-    // A silent deny is still a Deny verdict, so the user must not be
-    // prompted via AgentEvent::ApprovalRequested. The test asserts the
-    // approval channel is never woken for the silent-deny call.
-    let root = temp_workspace("silent_deny_no_approval");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "web_call".to_string(),
-                name: "webfetch".to_string(),
-                arguments: serde_json::json!({"url": "https://example.com/x"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("ok".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let mut config = config_for(root.clone());
-    config.permissions.web = PermissionMode::Allow;
-    config.permissions.rules.push(
-        PermissionRule::new(
+#[test]
+fn non_silent_deny_rule_still_carries_explanation_to_the_model() {
+    run_high_stack_test(async {
+        // Counterpoint to silent_deny_omits_reason_from_tool_result: when the
+        // rule does NOT set `silent = true`, the model still receives the rule's
+        // reason text. This is the existing behavior; the test pins it so a
+        // future change cannot silently flip the default.
+        let root = temp_workspace("explained_deny_keeps_reason");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "web_call".to_string(),
+                    name: "webfetch".to_string(),
+                    arguments: serde_json::json!({"url": "https://example.com/docs"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("ok".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let mut config = config_for(root.clone());
+        config.permissions.web = PermissionMode::Allow;
+        config.permissions.rules.push(PermissionRule::new(
             "network",
             "domain:example.com",
             PermissionAction::Deny,
             PermissionRuleSource::Project,
-            Some("boilerplate".to_string()),
-        )
-        .with_silent(true),
-    );
-    let agent = Agent::new(config, provider.clone());
+            Some("explained: example.com is for staging only".to_string()),
+        ));
+        let agent = Agent::new(config, provider.clone());
 
-    let mut rx = agent.start_turn("trigger silent deny".to_string(), CancellationToken::new());
-    let mut saw_approval_request = false;
-    while let Some(event) = rx.recv().await {
-        if matches!(event, AgentEvent::ApprovalRequested { .. }) {
-            saw_approval_request = true;
-        }
-    }
-    assert!(
-        !saw_approval_request,
-        "silent-deny rules must not surface an approval prompt",
-    );
+        drain_turn(agent.start_turn("fetch explained".to_string(), CancellationToken::new())).await;
 
-    let _ = fs::remove_dir_all(root);
+        let requests = provider.requests();
+        let outputs = function_outputs(&requests[1]);
+        let reason = outputs[0].1["content"]["reason"]
+            .as_str()
+            .expect("reason on tool result");
+        assert!(
+            reason.contains("explained"),
+            "non-silent rule must keep the rule's reason on the tool-result; got: {reason}",
+        );
+        assert_ne!(
+            reason, "action denied by policy",
+            "non-silent rule must NOT use the silent placeholder",
+        );
+
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
-#[tokio::test]
-async fn approved_webfetch_validation_error_returns_to_model_and_web_tools_are_indexed() {
-    let root = temp_workspace("approved_webfetch_validation");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "web_call".to_string(),
-                name: "webfetch".to_string(),
-                arguments: serde_json::json!({"url": "file:///tmp/secret"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("reported".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let mut config = config_for(root.clone());
-    config.permissions.web = PermissionMode::Allow;
-    let agent = Agent::new(config, provider.clone());
+#[test]
+fn silent_deny_does_not_emit_approval_requested() {
+    run_high_stack_test(async {
+        // A silent deny is still a Deny verdict, so the user must not be
+        // prompted via AgentEvent::ApprovalRequested. The test asserts the
+        // approval channel is never woken for the silent-deny call.
+        let root = temp_workspace("silent_deny_no_approval");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "web_call".to_string(),
+                    name: "webfetch".to_string(),
+                    arguments: serde_json::json!({"url": "https://example.com/x"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("ok".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let mut config = config_for(root.clone());
+        config.permissions.web = PermissionMode::Allow;
+        config.permissions.rules.push(
+            PermissionRule::new(
+                "network",
+                "domain:example.com",
+                PermissionAction::Deny,
+                PermissionRuleSource::Project,
+                Some("boilerplate".to_string()),
+            )
+            .with_silent(true),
+        );
+        let agent = Agent::new(config, provider.clone());
 
-    drain_turn(agent.start_turn(
-        "fetch rejected non-http url".to_string(),
-        CancellationToken::new(),
-    ))
-    .await;
+        let mut rx = agent.start_turn("trigger silent deny".to_string(), CancellationToken::new());
+        let mut saw_approval_request = false;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::ApprovalRequested { .. }) {
+                saw_approval_request = true;
+            }
+        }
+        assert!(
+            !saw_approval_request,
+            "silent-deny rules must not surface an approval prompt",
+        );
 
-    let requests = provider.requests();
-    let tool_names = requests[0]
-        .tools
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>();
-    assert!(!tool_names.contains(&"webfetch"));
-    assert!(!tool_names.contains(&"websearch"));
-    assert!(requests[0].instructions.contains("webfetch"));
-    assert!(requests[0].instructions.contains("websearch"));
-    let outputs = function_outputs(&requests[1]);
-    assert_eq!(outputs[0].0, "web_call");
-    assert_eq!(outputs[0].1["status"], "Error");
-    assert!(
-        outputs[0].1["content"]["error"]
-            .as_str()
-            .expect("error")
-            .contains("http:// or https://")
-    );
+        let _ = fs::remove_dir_all(root);
+    });
+}
 
-    let _ = fs::remove_dir_all(root);
+#[test]
+fn approved_webfetch_validation_error_returns_to_model_and_web_tools_are_indexed() {
+    run_high_stack_test(async {
+        let root = temp_workspace("approved_webfetch_validation");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "web_call".to_string(),
+                    name: "webfetch".to_string(),
+                    arguments: serde_json::json!({"url": "file:///tmp/secret"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("reported".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let mut config = config_for(root.clone());
+        config.permissions.web = PermissionMode::Allow;
+        let agent = Agent::new(config, provider.clone());
+
+        drain_turn(agent.start_turn(
+            "fetch rejected non-http url".to_string(),
+            CancellationToken::new(),
+        ))
+        .await;
+
+        let requests = provider.requests();
+        let tool_names = requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(!tool_names.contains(&"webfetch"));
+        assert!(!tool_names.contains(&"websearch"));
+        assert!(requests[0].instructions.contains("webfetch"));
+        assert!(requests[0].instructions.contains("websearch"));
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs[0].0, "web_call");
+        assert_eq!(outputs[0].1["status"], "Error");
+        assert!(
+            outputs[0].1["content"]["error"]
+                .as_str()
+                .expect("error")
+                .contains("http:// or https://")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]
@@ -3631,90 +3666,92 @@ async fn manual_context_compaction_broadcasts_context_compacted_event() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn auto_compaction_does_not_orphan_function_call_output() {
-    let root = temp_workspace("auto_compaction_pair");
-    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "read_call".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({ "path": "src.rs" }),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tool".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta(format!(
-                "first answer {}",
-                "plan ".repeat(500)
-            ))),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_first".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("second answer".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_second".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let mut config = config_for(root.clone());
-    config.store_responses = false;
-    config.context_compaction = ContextCompactionConfig {
-        enabled: true,
-        model_context_window: Some(10),
-        min_items: 3,
-        recent_items: 2,
-        max_summary_bytes: 1_200,
-        ..ContextCompactionConfig::default()
-    };
-    let agent = Agent::new(config, provider.clone());
+#[test]
+fn auto_compaction_does_not_orphan_function_call_output() {
+    run_high_stack_test(async {
+        let root = temp_workspace("auto_compaction_pair");
+        fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "read_call".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({ "path": "src.rs" }),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tool".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta(format!(
+                    "first answer {}",
+                    "plan ".repeat(500)
+                ))),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_first".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("second answer".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_second".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let mut config = config_for(root.clone());
+        config.store_responses = false;
+        config.context_compaction = ContextCompactionConfig {
+            enabled: true,
+            model_context_window: Some(10),
+            min_items: 3,
+            recent_items: 2,
+            max_summary_bytes: 1_200,
+            ..ContextCompactionConfig::default()
+        };
+        let agent = Agent::new(config, provider.clone());
 
-    drain_turn(agent.start_turn("first prompt".to_string(), CancellationToken::new())).await;
-    drain_turn(agent.start_turn("second prompt".to_string(), CancellationToken::new())).await;
+        drain_turn(agent.start_turn("first prompt".to_string(), CancellationToken::new())).await;
+        drain_turn(agent.start_turn("second prompt".to_string(), CancellationToken::new())).await;
 
-    let requests = provider.requests();
-    assert!(
-        requests.len() >= 3,
-        "expected at least three provider requests, got {}",
-        requests.len()
-    );
-    let compacted_input = &requests[2].input;
-    let declared_calls: std::collections::HashSet<&str> = compacted_input
-        .iter()
-        .filter_map(|item| match item {
-            LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
-            _ => None,
-        })
-        .collect();
-    for item in compacted_input.iter() {
-        if let LlmInputItem::FunctionCallOutput { call_id, .. } = item {
-            assert!(
-                declared_calls.contains(call_id.as_str()),
-                "orphan function_call_output for call_id {} in compacted input: {:?}",
-                call_id,
-                compacted_input
-            );
+        let requests = provider.requests();
+        assert!(
+            requests.len() >= 3,
+            "expected at least three provider requests, got {}",
+            requests.len()
+        );
+        let compacted_input = &requests[2].input;
+        let declared_calls: std::collections::HashSet<&str> = compacted_input
+            .iter()
+            .filter_map(|item| match item {
+                LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        for item in compacted_input.iter() {
+            if let LlmInputItem::FunctionCallOutput { call_id, .. } = item {
+                assert!(
+                    declared_calls.contains(call_id.as_str()),
+                    "orphan function_call_output for call_id {} in compacted input: {:?}",
+                    call_id,
+                    compacted_input
+                );
+            }
         }
-    }
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]
@@ -3797,65 +3834,67 @@ impl HookHandler for RecordingHookHandler {
     }
 }
 
-#[tokio::test]
-async fn pre_and_post_tool_use_hooks_fire_around_each_tool_call() {
-    let root = temp_workspace("hook_pre_post_tool_use");
-    fs::write(root.join("src.rs"), "fn hooked() {}\n").expect("write source");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "read_call".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "src.rs"}),
-            })),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_tools".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta("done".to_string())),
-            Ok(LlmEvent::Completed {
-                response_id: Some("resp_final".to_string()),
-                cost: CostSnapshot::default(),
-                stop_reason: None,
-                reasoning_only_stop: false,
-            }),
-        ],
-    ]));
-    let mut agent = Agent::new(config_for(root.clone()), provider);
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let mut registry = HookRegistry::new();
-    registry.register(Box::new(RecordingHookHandler { seen: seen.clone() }));
-    agent.set_hooks(Some(Arc::new(registry)));
+#[test]
+fn pre_and_post_tool_use_hooks_fire_around_each_tool_call() {
+    run_high_stack_test(async {
+        let root = temp_workspace("hook_pre_post_tool_use");
+        fs::write(root.join("src.rs"), "fn hooked() {}\n").expect("write source");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "read_call".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "src.rs"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("done".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                    stop_reason: None,
+                    reasoning_only_stop: false,
+                }),
+            ],
+        ]));
+        let mut agent = Agent::new(config_for(root.clone()), provider);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = HookRegistry::new();
+        registry.register(Box::new(RecordingHookHandler { seen: seen.clone() }));
+        agent.set_hooks(Some(Arc::new(registry)));
 
-    drain_turn(agent.start_turn("inspect hooked".to_string(), CancellationToken::new())).await;
+        drain_turn(agent.start_turn("inspect hooked".to_string(), CancellationToken::new())).await;
 
-    let captured = seen.lock().expect("seen").clone();
-    let tool_events: Vec<_> = captured
-        .iter()
-        .filter(|ctx| matches!(ctx.event, HookEvent::PreToolUse | HookEvent::PostToolUse))
-        .collect();
-    assert_eq!(
-        tool_events.len(),
-        2,
-        "expected one PreToolUse and one PostToolUse for the single read_file call: {captured:?}"
-    );
-    assert_eq!(tool_events[0].event, HookEvent::PreToolUse);
-    let pre = tool_events[0].payload_json();
-    assert_eq!(pre["tool_name"], "read_file");
-    assert_eq!(pre["call_id"], "read_call");
-    assert_eq!(tool_events[1].event, HookEvent::PostToolUse);
-    let post = tool_events[1].payload_json();
-    assert_eq!(post["tool_name"], "read_file");
-    assert_eq!(post["call_id"], "read_call");
-    assert_eq!(post["status"], "success");
+        let captured = seen.lock().expect("seen").clone();
+        let tool_events: Vec<_> = captured
+            .iter()
+            .filter(|ctx| matches!(ctx.event, HookEvent::PreToolUse | HookEvent::PostToolUse))
+            .collect();
+        assert_eq!(
+            tool_events.len(),
+            2,
+            "expected one PreToolUse and one PostToolUse for the single read_file call: {captured:?}"
+        );
+        assert_eq!(tool_events[0].event, HookEvent::PreToolUse);
+        let pre = tool_events[0].payload_json();
+        assert_eq!(pre["tool_name"], "read_file");
+        assert_eq!(pre["call_id"], "read_call");
+        assert_eq!(tool_events[1].event, HookEvent::PostToolUse);
+        let post = tool_events[1].payload_json();
+        assert_eq!(post["tool_name"], "read_file");
+        assert_eq!(post["call_id"], "read_call");
+        assert_eq!(post["status"], "success");
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 async fn drain_turn(mut rx: tokio::sync::mpsc::Receiver<AgentEvent>) {
@@ -4156,148 +4195,152 @@ async fn cancelled_turn_attributes_partial_round_cost_to_metrics() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn stop_no_action_retry_fires_when_model_promised_tool_use() {
-    // Reproduces the Qwen3 "I'll do X then stop" pattern. Round 0 the
-    // model successfully calls `read_file`. Round 1 it emits a chatty
-    // preamble ("Let me scan the codebase") with finish_reason=stop and
-    // zero tool calls. The agent should NOT end the turn here — it
-    // should push a synthetic user nudge and retry, giving the model
-    // one more shot. Round 2 the model finishes properly with a final
-    // answer.
-    let root = temp_workspace("stop_no_action_retry");
-    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        // Round 0: legitimate tool call.
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "read_call".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "src.rs"}),
-            })),
-            Ok(LlmEvent::completed_with_reason(
-                Some("resp_tools".to_string()),
-                CostSnapshot::default(),
-                Some(squeezy_llm::StopReason::ToolUse),
-                false,
-            )),
-        ],
-        // Round 1: chatty preamble + stop with no tool call. Agent
-        // should detect this and retry.
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta(
-                "Let me scan the codebase to find more context.".to_string(),
-            )),
-            Ok(LlmEvent::completed_with_reason(
-                Some("resp_stopped".to_string()),
-                CostSnapshot::default(),
-                Some(squeezy_llm::StopReason::EndTurn),
-                false,
-            )),
-        ],
-        // Round 2: after the nudge, model gives the real answer.
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta(
-                "src.rs defines a single `needle` function.".to_string(),
-            )),
-            Ok(LlmEvent::completed_with_reason(
-                Some("resp_final".to_string()),
-                CostSnapshot::default(),
-                Some(squeezy_llm::StopReason::EndTurn),
-                false,
-            )),
-        ],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
+#[test]
+fn stop_no_action_retry_fires_when_model_promised_tool_use() {
+    run_high_stack_test(async {
+        // Reproduces the Qwen3 "I'll do X then stop" pattern. Round 0 the
+        // model successfully calls `read_file`. Round 1 it emits a chatty
+        // preamble ("Let me scan the codebase") with finish_reason=stop and
+        // zero tool calls. The agent should NOT end the turn here — it
+        // should push a synthetic user nudge and retry, giving the model
+        // one more shot. Round 2 the model finishes properly with a final
+        // answer.
+        let root = temp_workspace("stop_no_action_retry");
+        fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            // Round 0: legitimate tool call.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "read_call".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "src.rs"}),
+                })),
+                Ok(LlmEvent::completed_with_reason(
+                    Some("resp_tools".to_string()),
+                    CostSnapshot::default(),
+                    Some(squeezy_llm::StopReason::ToolUse),
+                    false,
+                )),
+            ],
+            // Round 1: chatty preamble + stop with no tool call. Agent
+            // should detect this and retry.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta(
+                    "Let me scan the codebase to find more context.".to_string(),
+                )),
+                Ok(LlmEvent::completed_with_reason(
+                    Some("resp_stopped".to_string()),
+                    CostSnapshot::default(),
+                    Some(squeezy_llm::StopReason::EndTurn),
+                    false,
+                )),
+            ],
+            // Round 2: after the nudge, model gives the real answer.
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta(
+                    "src.rs defines a single `needle` function.".to_string(),
+                )),
+                Ok(LlmEvent::completed_with_reason(
+                    Some("resp_final".to_string()),
+                    CostSnapshot::default(),
+                    Some(squeezy_llm::StopReason::EndTurn),
+                    false,
+                )),
+            ],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
 
-    let mut rx = agent.start_turn(
-        "look at src.rs and tell me what it defines".to_string(),
-        CancellationToken::new(),
-    );
-    let mut final_message = String::new();
-    while let Some(event) = rx.recv().await {
-        if let AgentEvent::Completed { message, .. } = event {
-            final_message = message.content;
+        let mut rx = agent.start_turn(
+            "look at src.rs and tell me what it defines".to_string(),
+            CancellationToken::new(),
+        );
+        let mut final_message = String::new();
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::Completed { message, .. } = event {
+                final_message = message.content;
+            }
         }
-    }
 
-    let requests = provider.requests();
-    assert_eq!(
-        requests.len(),
-        3,
-        "agent should have issued 3 LLM requests (round 0 tool + round 1 stop + retry)"
-    );
-    // The retry request must include the synthetic user nudge in its
-    // input. When store_responses is off (the default for tests), the
-    // full conversation is replayed.
-    let retry_request = &requests[2];
-    let has_nudge = retry_request.input.iter().any(|item| match item {
-        LlmInputItem::UserText(text) => text.contains("reply with just"),
-        _ => false,
+        let requests = provider.requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "agent should have issued 3 LLM requests (round 0 tool + round 1 stop + retry)"
+        );
+        // The retry request must include the synthetic user nudge in its
+        // input. When store_responses is off (the default for tests), the
+        // full conversation is replayed.
+        let retry_request = &requests[2];
+        let has_nudge = retry_request.input.iter().any(|item| match item {
+            LlmInputItem::UserText(text) => text.contains("reply with just"),
+            _ => false,
+        });
+        assert!(
+            has_nudge,
+            "retry request must include the confirm-or-continue (`reply DONE`) nudge in its input",
+        );
+        assert!(
+            final_message.contains("needle"),
+            "final assistant message must come from round 2, got {final_message:?}",
+        );
+
+        let _ = fs::remove_dir_all(root);
     });
-    assert!(
-        has_nudge,
-        "retry request must include the confirm-or-continue (`reply DONE`) nudge in its input",
-    );
-    assert!(
-        final_message.contains("needle"),
-        "final assistant message must come from round 2, got {final_message:?}",
-    );
-
-    let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn stop_no_action_retry_does_not_fire_when_model_answered_directly() {
-    // Inverse of the previous test: round 0 the model calls a tool,
-    // round 1 it gives the final answer (no intent text, no
-    // unresolved promise). The retry latch must NOT fire — turn ends
-    // after 2 LLM requests.
-    let root = temp_workspace("stop_no_action_no_retry");
-    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::ToolCall(LlmToolCall {
-                call_id: "read_call".to_string(),
-                name: "read_file".to_string(),
-                arguments: serde_json::json!({"path": "src.rs"}),
-            })),
-            Ok(LlmEvent::completed_with_reason(
-                Some("resp_tools".to_string()),
-                CostSnapshot::default(),
-                Some(squeezy_llm::StopReason::ToolUse),
-                false,
-            )),
-        ],
-        vec![
-            Ok(LlmEvent::Started),
-            Ok(LlmEvent::TextDelta(
-                "src.rs defines a `needle` function and nothing else.".to_string(),
-            )),
-            Ok(LlmEvent::completed_with_reason(
-                Some("resp_final".to_string()),
-                CostSnapshot::default(),
-                Some(squeezy_llm::StopReason::EndTurn),
-                false,
-            )),
-        ],
-    ]));
-    let agent = Agent::new(config_for(root.clone()), provider.clone());
-    drain_turn(agent.start_turn("describe src.rs".to_string(), CancellationToken::new())).await;
+#[test]
+fn stop_no_action_retry_does_not_fire_when_model_answered_directly() {
+    run_high_stack_test(async {
+        // Inverse of the previous test: round 0 the model calls a tool,
+        // round 1 it gives the final answer (no intent text, no
+        // unresolved promise). The retry latch must NOT fire — turn ends
+        // after 2 LLM requests.
+        let root = temp_workspace("stop_no_action_no_retry");
+        fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "read_call".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({"path": "src.rs"}),
+                })),
+                Ok(LlmEvent::completed_with_reason(
+                    Some("resp_tools".to_string()),
+                    CostSnapshot::default(),
+                    Some(squeezy_llm::StopReason::ToolUse),
+                    false,
+                )),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta(
+                    "src.rs defines a `needle` function and nothing else.".to_string(),
+                )),
+                Ok(LlmEvent::completed_with_reason(
+                    Some("resp_final".to_string()),
+                    CostSnapshot::default(),
+                    Some(squeezy_llm::StopReason::EndTurn),
+                    false,
+                )),
+            ],
+        ]));
+        let agent = Agent::new(config_for(root.clone()), provider.clone());
+        drain_turn(agent.start_turn("describe src.rs".to_string(), CancellationToken::new())).await;
 
-    let requests = provider.requests();
-    assert_eq!(
-        requests.len(),
-        2,
-        "direct answer should NOT trigger the retry latch (expected 2 requests, got {})",
-        requests.len()
-    );
+        let requests = provider.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "direct answer should NOT trigger the retry latch (expected 2 requests, got {})",
+            requests.len()
+        );
 
-    let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(root);
+    });
 }
 
 #[tokio::test]

@@ -1242,7 +1242,7 @@ async fn print_mode_runs_tools_through_agent_loop_in_text_mode() {
     ]));
 
     let config = print_mode_test_config(root.clone());
-    let agent = Agent::new(config, provider);
+    let agent = Box::new(Agent::new(config, provider));
     let rx = agent.start_turn(
         "read README.md and tell me the title".to_string(),
         tokio_util::sync::CancellationToken::new(),
@@ -1317,7 +1317,7 @@ async fn print_mode_emits_tool_events_as_jsonl() {
     ]));
 
     let config = print_mode_test_config(root.clone());
-    let agent = Agent::new(config, provider);
+    let agent = Box::new(Agent::new(config, provider));
     let rx = agent.start_turn(
         "read README.md".to_string(),
         tokio_util::sync::CancellationToken::new(),
@@ -1614,7 +1614,7 @@ async fn pump_prompts_runs_bang_bang_prompt_in_text_mode_without_llm_context() {
     ]]));
 
     let config = print_mode_test_config(root.clone());
-    let agent = Agent::new(config, provider.clone());
+    let agent = Box::new(Agent::new(config, provider.clone()));
     let prompts = vec![
         print_mode::PromptInput {
             content: "printf quiet-bang".to_string(),
@@ -1678,7 +1678,7 @@ async fn pump_prompts_emits_bang_bang_tool_events_in_json_mode() {
 
     let provider = Arc::new(PrintModeScriptedProvider::new(Vec::new()));
     let config = print_mode_test_config(root.clone());
-    let agent = Agent::new(config, provider.clone());
+    let agent = Box::new(Agent::new(config, provider.clone()));
     let prompts = vec![print_mode::PromptInput {
         content: "printf json-bang".to_string(),
         exclude_from_context: true,
@@ -1762,7 +1762,7 @@ async fn pump_prompts_runs_normal_prompts_unchanged_when_no_bang_bang_present() 
         ],
     ]));
     let config = print_mode_test_config(root.clone());
-    let agent = Agent::new(config, provider.clone());
+    let agent = Box::new(Agent::new(config, provider.clone()));
     let prompts = vec![
         print_mode::PromptInput {
             content: "first prompt".to_string(),
