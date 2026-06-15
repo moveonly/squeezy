@@ -2536,7 +2536,7 @@ fn sandbox_teardown_action() -> Check {
 /// intentionally cheap — most providers expose a `GET /models` listing that
 /// doesn't count against token budgets. Bedrock has no equivalent in the
 /// runtime crate we depend on, so it reports a warn rather than fail.
-pub(crate) async fn probe_provider(provider: &ProviderConfig) -> (Status, String) {
+async fn probe_provider(provider: &ProviderConfig) -> (Status, String) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
